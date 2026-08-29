@@ -98,7 +98,7 @@ def get_settings() -> Settings:
             if scope
         ),
         sync_lookback_days=_nonnegative_int("SYNC_LOOKBACK_DAYS", 0),
-        sync_interval_seconds=_positive_int("SYNC_INTERVAL_SECONDS", 180, 30),
+        sync_interval_seconds=_positive_int("SYNC_INTERVAL_SECONDS", 300, 30),
         sync_overlap_seconds=_positive_int("SYNC_OVERLAP_SECONDS", 600, 60),
         member_count_refresh_seconds=_positive_int("MEMBER_COUNT_REFRESH_SECONDS", 86400, 300),
         max_pages_per_job=_positive_int("MAX_PAGES_PER_JOB", 30, 1),
