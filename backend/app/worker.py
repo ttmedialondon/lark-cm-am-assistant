@@ -43,6 +43,8 @@ class MemberCountMeasurement:
 
 def run_forever() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # httpx otherwise logs full request URLs, including Lark chat IDs, at INFO.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     settings = get_settings()
     if not settings.app_secret_configured:
         LOGGER.warning("Lark App Secret is not configured; worker is waiting for administrator input")
