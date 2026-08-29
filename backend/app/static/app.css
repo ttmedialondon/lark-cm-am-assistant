@@ -1,0 +1,14 @@
+body { min-height: 100vh; }
+.container-tight { max-width: 30rem; }
+.brand-mark {
+  display: inline-flex;
+  width: 3rem;
+  height: 3rem;
+  align-items: center;
+  justify-content: center;
+  border-radius: .75rem;
+  color: var(--tblr-primary-fg);
+  background: var(--tblr-primary-lt);
+  font-weight: 700;
+  letter-spacing: .04em;
+}

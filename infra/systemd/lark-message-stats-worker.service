@@ -1,0 +1,25 @@
+[Unit]
+Description=Lark Message Stats sync worker
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=larkstats
+Group=larkstats
+WorkingDirectory=/opt/lark-message-stats
+EnvironmentFile=/etc/lark-message-stats/app.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/lark-message-stats/venv/bin/python -m app.worker
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/lark-message-stats
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

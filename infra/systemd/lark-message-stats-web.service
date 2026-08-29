@@ -1,0 +1,25 @@
+[Unit]
+Description=Lark Message Stats Web application
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=larkstats
+Group=larkstats
+WorkingDirectory=/opt/lark-message-stats
+EnvironmentFile=/etc/lark-message-stats/app.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/lark-message-stats/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8100 --proxy-headers --forwarded-allow-ips=127.0.0.1 --no-access-log
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/lark-message-stats
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

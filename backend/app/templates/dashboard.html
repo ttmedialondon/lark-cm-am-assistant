@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}我的统计 · Lark Message Stats{% endblock %}
+{% block body %}
+<div class="page">
+  <header class="navbar navbar-expand-md d-print-none">
+    <div class="container-xl">
+      <a class="navbar-brand" href="/">Lark Message Stats</a>
+      <div class="navbar-nav flex-row order-md-last">
+        <div class="nav-item"><span class="nav-link text-secondary">{{ authorization.display_name or "CM / AM" }}</span></div>
+      </div>
+    </div>
+  </header>
+  <div class="page-wrapper">
+    <div class="page-header d-print-none">
+      <div class="container-xl">
+        <div class="row g-2 align-items-center">
+          <div class="col">
+            <h2 class="page-title">我的群聊消息统计</h2>
+            <div class="text-secondary mt-1">只展示你授权范围内、当前可见的群聊统计。页面每 5 秒更新一次。</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="page-body">
+      <div class="container-xl">
+        {% include "partials/stats.html" %}
+        <div class="card mt-4">
+          <div class="card-body">
+            <h3 class="card-title">数据说明</h3>
+            <p class="text-secondary mb-0">“已同步消息总数”仅统计 Lark API 可返回且未撤回的群消息记录。“我发送的消息数”仅在 Lark 返回的发送者 Open ID 与当前授权用户一致时计入。测试版不保存消息正文。</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

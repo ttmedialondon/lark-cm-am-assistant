@@ -1,0 +1,27 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Node / frontend build output
+frontend/node_modules/
+frontend/dist/
+
+# Coverage, logs, and local artifacts
+coverage/
+htmlcov/
+*.log
+.DS_Store
+
+# Editor state
+.idea/
+.vscode/

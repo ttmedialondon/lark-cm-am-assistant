@@ -1,0 +1,17 @@
+# Production entry point for the Lark Message Stats test release.
+# Caddy renews the existing HTTPS certificate automatically.
+larkbot.ttapp.help {
+	encode zstd gzip
+
+	@secret_paths path /.env /.env.* /.git/* /config/*
+	respond @secret_paths 404
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	reverse_proxy 127.0.0.1:8100
+}
