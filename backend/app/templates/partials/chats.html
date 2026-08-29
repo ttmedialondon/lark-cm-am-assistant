@@ -1,11 +1,14 @@
-<div id="dashboard-chats" hx-get="/dashboard/chats" hx-trigger="load, every 15s" hx-swap="outerHTML">
+<div id="dashboard-chats" hx-get="/dashboard/chats" hx-trigger="every 15s" hx-swap="outerHTML">
   <div class="card mt-4">
     <div class="card-header">
       <div>
         <h3 class="card-title mb-1">当前可见群聊</h3>
-        <div class="text-secondary small">成员人数是 Lark 返回的用户总数；服务不保存成员名单或消息正文。</div>
+        <div class="text-secondary small">成员人数是 Lark 返回的用户总数；服务不保存成员名单或消息正文。点击“同步全部历史”会重新扫描 Lark API 可返回的历史，已有消息自动去重。</div>
       </div>
     </div>
+    {% if sync_notice %}
+    <div class="card-body pb-0"><div class="alert alert-success mb-0" role="status">{{ sync_notice }}</div></div>
+    {% endif %}
     {% if chats %}
     <div class="table-responsive">
       <table class="table table-vcenter card-table">
@@ -16,6 +19,7 @@
             <th>已同步消息记录</th>
             <th>同步状态</th>
             <th>最后同步</th>
+            <th class="text-end">操作</th>
           </tr>
         </thead>
         <tbody>
@@ -29,6 +33,22 @@
             <td>{{ chat.message_count }}</td>
             <td><span class="badge bg-{{ chat.sync_badge }}-lt">{{ chat.sync_label }}</span></td>
             <td class="text-secondary text-nowrap">{{ chat.last_synced_at }}</td>
+            <td class="text-end">
+              {% if chat.manual_backfill_state == "running" %}
+              <button class="btn btn-sm btn-outline-primary" type="button" disabled>正在主动同步</button>
+              {% elif chat.manual_backfill_state == "queued" %}
+              <button class="btn btn-sm btn-outline-secondary" type="button" disabled>已请求同步</button>
+              {% else %}
+              <button
+                class="btn btn-sm btn-outline-primary"
+                type="button"
+                hx-post="/dashboard/chats/{{ chat.chat_id }}/sync-all"
+                hx-headers='{"X-CSRF-Token":"{{ csrf_token }}"}'
+                hx-target="#dashboard-chats"
+                hx-swap="outerHTML"
+              >同步全部历史</button>
+              {% endif %}
+            </td>
           </tr>
           {% endfor %}
         </tbody>

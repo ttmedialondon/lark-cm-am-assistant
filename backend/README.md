@@ -9,10 +9,11 @@
 - 当前授权用户发送的消息数；
 - 每个可见群的 Lark 人类成员总数；
 - 最近一次同步状态。
+- 对单个群手动请求重新扫描 Lark API 可返回的全部历史。
 
 ## 数据边界
 
-- 仅调用用户身份的 `im:chat:read`、`im:chat.members:read` 与只读的 `im:message:readonly`，并使用 `offline_access` 刷新授权。
+- 消息统计仅调用用户身份的 `im:chat:read` 与只读的 `im:message:readonly`，并使用 `offline_access` 刷新授权；`im:chat.members:read` 仅在管理员额外启用成员总数展示时使用。
 - 不读取或处理 P2P 单聊，不发送 Lark 消息。
 - 不保存消息正文、附件、@ 提及、发送者姓名或完整发送者资料。
 - 为了分页断点、去重和计数，数据库仅保存 `message_id`、`chat_id`、创建时间和“是否为授权用户发送”的布尔值；成员信息只保存 Lark 返回的人类成员总数，不保存成员名单。
@@ -29,6 +30,8 @@ FastAPI + Jinja2 + HTMX + Tabler    ←→ PostgreSQL
 ```
 
 `app/main.py` 只处理网页和 OAuth；`app/worker.py` 作为独立进程领取 PostgreSQL 任务。历史回填不使用 FastAPI `BackgroundTasks`。
+
+仪表盘的“同步全部历史”按钮不会直接清除分页游标，也不会创建并发 worker。它只为当前授权用户的该群写入一个请求标记；现有串行 worker 会在当前分页安全结束后，从头回填该群。`message_ledger` 以消息 ID 去重，因此重扫不会重复统计。
 
 ## 本地开发
 

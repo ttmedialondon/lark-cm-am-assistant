@@ -7,7 +7,7 @@
 - Hetzner 主机已有 PostgreSQL、Caddy、`larkstats` 系统用户、`/etc/lark-message-stats/app.env` 和 Python 虚拟环境。
 - 仓库位于 `/opt/lark-message-stats`，虚拟环境位于 `/opt/lark-message-stats/venv`。
 - `app.env` 不进入 Git，且权限保持为 `root:larkstats` / `0640`。
-- Lark 应用已启用用户权限：`offline_access`、`im:chat:read`、`im:chat.members:read`、`im:message:readonly`。
+- Lark 应用已启用消息统计所需的用户权限：`offline_access`、`im:chat:read`、`im:message:readonly`。`im:chat.members:read` 仅在需要展示成员总数时额外启用。
 - Lark OAuth 回调地址为 `https://larkbot.ttapp.help/auth/lark/callback`；服务器公网出口 IP 已在应用白名单中。
 
 ## 发布步骤
@@ -40,10 +40,10 @@ sudo journalctl -u lark-message-stats-web.service -u lark-message-stats-worker.s
 
 ## Lark 权限与验收
 
-1. 在 Lark 开发者后台为应用开启并发布用户权限 `im:chat.members:read`。
-2. 测试 CM/AM 打开 `https://larkbot.ttapp.help/` 并重新完成 OAuth；新权限必须通过新的授权令牌生效。
-3. 回到仪表盘。群列表通常会先出现，随后每群的“已同步消息记录”和同步状态持续更新；成员人数来自 Lark 的 `user_total`。
-4. 若某一群显示“Lark 未返回”，仅代表该群成员总数不可取；它不会阻塞该群的消息统计。
+1. 测试 CM/AM 打开 `https://larkbot.ttapp.help/` 并完成 OAuth。
+2. 回到仪表盘。群列表通常会先出现，随后每群的“已同步消息记录”和同步状态持续更新。
+3. 需要重新核对一个群的历史时，点击该行的“同步全部历史”。页面会显示“已请求同步”或“正在主动同步”；Worker 串行重新扫描 Lark API 可返回的历史，已有消息 ID 自动去重。
+4. 若管理员启用成员人数功能，需在 Lark 开发者后台发布 `im:chat.members:read`，并让测试用户重新 OAuth；成员人数来自 Lark 的 `user_total`。未启用时显示“Lark 未返回”，但不会阻塞消息统计。
 
 ## 回退原则
 

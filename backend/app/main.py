@@ -184,6 +184,7 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 backfill_window_start_at = NULL, backfill_window_end_at = NULL,
                 incremental_page_token = NULL, incremental_job_id = NULL,
                 incremental_window_start_at = NULL, incremental_window_end_at = NULL,
+                sync_generation = sync_generation + 1,
                 sync_status = CASE WHEN sync_status = 'not_readable' THEN 'pending' ELSE sync_status END,
                 last_error = CASE WHEN sync_status = 'not_readable' THEN NULL ELSE last_error END,
                 member_count_status = 'pending', member_count_checked_at = NULL
@@ -224,7 +225,16 @@ def dashboard(request: Request):
         return RedirectResponse(url="/", status_code=303)
     stats = _dashboard_stats(authorization["id"])
     chats = _dashboard_chats(authorization["id"])
-    return _template(request, "dashboard.html", {"authorization": authorization, "stats": stats, "chats": chats})
+    return _template(
+        request,
+        "dashboard.html",
+        {
+            "authorization": authorization,
+            "stats": stats,
+            "chats": chats,
+            "csrf_token": _csrf_token(request),
+        },
+    )
 
 
 @app.get("/dashboard/stats")
@@ -240,7 +250,67 @@ def dashboard_chats(request: Request):
     authorization = _current_authorization(request)
     if not authorization:
         raise HTTPException(status_code=401, detail="sign in required")
-    return _template(request, "partials/chats.html", {"chats": _dashboard_chats(authorization["id"])})
+    return _template(
+        request,
+        "partials/chats.html",
+        {"chats": _dashboard_chats(authorization["id"]), "csrf_token": _csrf_token(request)},
+    )
+
+
+@app.post("/dashboard/chats/{chat_id}/sync-all")
+def request_group_full_sync(request: Request, chat_id: str):
+    """Queue a safe, idempotent full-history rescan for one visible group."""
+
+    authorization = _current_authorization(request)
+    if not authorization:
+        raise HTTPException(status_code=401, detail="sign in required")
+    if authorization["status"] != "active":
+        raise HTTPException(status_code=409, detail="Lark authorization needs attention")
+    _require_csrf(request)
+
+    with connection() as conn, conn.transaction():
+        chat = conn.execute(
+            """
+            SELECT name, manual_backfill_requested_at
+            FROM user_chats
+            WHERE authorization_id = %s AND chat_id = %s
+              AND sync_enabled AND is_visible
+              AND COALESCE(chat_status, 'normal') = 'normal'
+            FOR UPDATE
+            """,
+            (authorization["id"], chat_id),
+        ).fetchone()
+        if not chat:
+            raise HTTPException(status_code=404, detail="group not found")
+
+        group_name = chat["name"] or "该群聊"
+        if chat["manual_backfill_requested_at"]:
+            notice = f"{group_name} 已在全量同步队列中。"
+        else:
+            conn.execute(
+                """
+                UPDATE user_chats
+                SET manual_backfill_requested_at = NOW(),
+                    manual_backfill_started_at = NULL,
+                    sync_generation = sync_generation + 1
+                WHERE authorization_id = %s AND chat_id = %s
+                """,
+                (authorization["id"], chat_id),
+            )
+            _audit(conn, authorization["id"], "manual_group_backfill_requested")
+            notice = f"已请求重新同步 {group_name} 的全部可读取历史。已有消息会按消息 ID 去重，不会重复计数。"
+
+        _queue_or_wake_backfill(conn, authorization["id"])
+
+    return _template(
+        request,
+        "partials/chats.html",
+        {
+            "chats": _dashboard_chats(authorization["id"]),
+            "csrf_token": _csrf_token(request),
+            "sync_notice": notice,
+        },
+    )
 
 
 def _current_authorization(request: Request) -> dict[str, Any] | None:
@@ -263,6 +333,20 @@ def _current_authorization(request: Request) -> dict[str, Any] | None:
                 (_sha256(raw_session),),
             )
         return row
+
+
+def _csrf_token(request: Request) -> str:
+    raw_session = request.cookies.get(SESSION_COOKIE)
+    if not raw_session:
+        return ""
+    return hmac.new(get_settings().token_encryption_key, raw_session.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _require_csrf(request: Request) -> None:
+    expected = _csrf_token(request)
+    supplied = request.headers.get("X-CSRF-Token", "")
+    if not expected or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=403, detail="invalid request token")
 
 
 def _dashboard_stats(authorization_id: uuid.UUID) -> dict[str, Any]:
@@ -323,6 +407,8 @@ def _dashboard_chats(authorization_id: uuid.UUID) -> list[dict[str, Any]]:
                 c.last_error,
                 c.last_backfill_at,
                 c.last_incremental_at,
+                c.manual_backfill_requested_at,
+                c.manual_backfill_started_at,
                 COUNT(m.message_id) FILTER (WHERE NOT m.is_deleted) AS message_count
             FROM user_chats c
             LEFT JOIN message_ledger m
@@ -333,7 +419,8 @@ def _dashboard_chats(authorization_id: uuid.UUID) -> list[dict[str, Any]]:
             GROUP BY
                 c.authorization_id, c.chat_id, c.name, c.external, c.member_count,
                 c.member_count_status, c.sync_status, c.last_error,
-                c.last_backfill_at, c.last_incremental_at
+                c.last_backfill_at, c.last_incremental_at,
+                c.manual_backfill_requested_at, c.manual_backfill_started_at
             ORDER BY LOWER(COALESCE(c.name, '')), c.chat_id
             """,
             (authorization_id,),
@@ -344,6 +431,7 @@ def _dashboard_chats(authorization_id: uuid.UUID) -> list[dict[str, Any]]:
         sync_label, sync_badge = _chat_sync_status(row["sync_status"])
         chats.append(
             {
+                "chat_id": row["chat_id"],
                 "name": row["name"] or "未命名群聊",
                 "external": bool(row["external"]),
                 "member_count": _member_count_label(row["member_count"], row["member_count_status"]),
@@ -351,6 +439,9 @@ def _dashboard_chats(authorization_id: uuid.UUID) -> list[dict[str, Any]]:
                 "sync_label": sync_label,
                 "sync_badge": sync_badge,
                 "last_synced_at": _format_time(row["last_incremental_at"] or row["last_backfill_at"]),
+                "manual_backfill_state": _manual_backfill_state(
+                    row["manual_backfill_requested_at"], row["manual_backfill_started_at"]
+                ),
             }
         )
     return chats
@@ -370,13 +461,19 @@ def _job_status(job: dict[str, Any] | None) -> tuple[str, str, str]:
 
 def _chat_sync_status(value: str | None) -> tuple[str, str]:
     mapping = {
-        "pending": ("等待同步", "secondary"),
+        "pending": ("等待首次回填", "secondary"),
         "syncing": ("正在同步", "primary"),
         "succeeded": ("已同步", "success"),
         "not_readable": ("Lark 未允许读取", "warning"),
         "failed_retryable": ("等待重试", "warning"),
     }
     return mapping.get(value or "", ("状态未知", "secondary"))
+
+
+def _manual_backfill_state(requested_at: datetime | None, started_at: datetime | None) -> str | None:
+    if not requested_at:
+        return None
+    return "running" if started_at else "queued"
 
 
 def _member_count_label(count: int | None, status: str | None) -> str:
@@ -387,14 +484,31 @@ def _member_count_label(count: int | None, status: str | None) -> str:
     return "Lark 未返回"
 
 
-def _queue_job(conn: psycopg.Connection, authorization_id: uuid.UUID, mode: str) -> None:
-    conn.execute(
+def _queue_job(conn: psycopg.Connection, authorization_id: uuid.UUID, mode: str) -> bool:
+    row = conn.execute(
         """
         INSERT INTO sync_jobs (id, authorization_id, mode, status, scheduled_at)
         VALUES (%s, %s, %s, 'queued', NOW())
         ON CONFLICT (authorization_id) WHERE status IN ('queued', 'running') DO NOTHING
+        RETURNING id
         """,
         (uuid.uuid4(), authorization_id, mode),
+    ).fetchone()
+    return row is not None
+
+
+def _queue_or_wake_backfill(conn: psycopg.Connection, authorization_id: uuid.UUID) -> None:
+    if _queue_job(conn, authorization_id, "backfill"):
+        return
+    # A queued incremental job will switch to backfill before processing its
+    # next page. Wake it now; a running job checks at its next page boundary.
+    conn.execute(
+        """
+        UPDATE sync_jobs
+        SET scheduled_at = NOW(), updated_at = NOW()
+        WHERE authorization_id = %s AND status = 'queued'
+        """,
+        (authorization_id,),
     )
 
 

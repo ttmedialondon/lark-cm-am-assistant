@@ -118,7 +118,10 @@ def _execute_job(job: SyncJob, settings: Settings) -> None:
         discovered = _discover_groups(job, authorization, access_token, client, settings)
         _set_job_discovered(job.id, discovered)
 
-        if job.mode == "backfill":
+        # A newly discovered group can appear while an incremental job is
+        # running. Always drain pending full-history backfills first so those
+        # rows never remain at "waiting" indefinitely.
+        if job.mode == "backfill" or _has_pending_backfill(job.authorization_id):
             complete = _run_backfill(job, authorization, access_token, client, settings)
         else:
             complete = _run_incremental(job, authorization, access_token, client, settings)
@@ -320,7 +323,11 @@ def _discover_groups(
     with connection() as conn, conn.transaction():
         conn.execute(
             """
-            UPDATE user_chats SET is_visible = FALSE
+            UPDATE user_chats
+            SET is_visible = FALSE,
+                manual_backfill_requested_at = NULL,
+                manual_backfill_started_at = NULL,
+                sync_generation = sync_generation + 1
             WHERE authorization_id = %s AND last_seen_at < %s
             """,
             (authorization["id"], seen_at),
@@ -372,12 +379,21 @@ def _run_backfill(
         if not chat:
             return True
         now = datetime.now(UTC)
+        generation = int(chat["sync_generation"])
         start_at = chat["backfill_window_start_at"]
         end_at = chat["backfill_window_end_at"]
         if not end_at:
             end_at = now
-            start_at = now - timedelta(days=settings.sync_lookback_days) if settings.sync_lookback_days else None
-            _start_backfill_window(authorization["id"], chat["chat_id"], start_at, end_at)
+            # A user-requested rescan intentionally ignores the optional
+            # default lookback: it means every message Lark can return.
+            start_at = (
+                None
+                if chat["manual_backfill_requested_at"]
+                else now - timedelta(days=settings.sync_lookback_days)
+                if settings.sync_lookback_days
+                else None
+            )
+            _start_backfill_window(authorization["id"], chat["chat_id"], start_at, end_at, generation)
 
         try:
             data = client.list_chat_messages(
@@ -391,7 +407,7 @@ def _run_backfill(
         except LarkApiError as exc:
             if exc.retryable or exc.likely_auth_problem:
                 raise
-            _mark_chat_not_readable(authorization["id"], chat["chat_id"])
+            _mark_chat_not_readable(authorization["id"], chat["chat_id"], generation)
             continue
 
         next_page_token = _continuation_token(data)
@@ -403,6 +419,7 @@ def _run_backfill(
             _items(data),
             next_page_token=next_page_token,
             backfill=True,
+            generation=generation,
         )
         pages += 1
         _add_job_progress(job.id, pages=1, messages=inserted, own_messages=own_inserted)
@@ -414,9 +431,15 @@ def _run_incremental(
 ) -> bool:
     pages = 0
     while pages < settings.max_pages_per_job:
+        # Finish the current page before yielding to a requested full rescan.
+        # The requeued job will claim that request before reading another
+        # incremental page for this authorization.
+        if _has_manual_backfill_request(authorization["id"]):
+            return False
         chat = _next_incremental_chat(authorization["id"], job.id)
         if not chat:
             return True
+        generation = int(chat["sync_generation"])
         start_at = chat["incremental_window_start_at"]
         end_at = chat["incremental_window_end_at"]
         if not end_at:
@@ -427,7 +450,7 @@ def _run_incremental(
             else:
                 start_at = end_at - timedelta(days=settings.sync_lookback_days or 1)
         if chat["incremental_job_id"] != job.id:
-            _start_incremental_window(authorization["id"], chat["chat_id"], job.id, start_at, end_at)
+            _start_incremental_window(authorization["id"], chat["chat_id"], job.id, start_at, end_at, generation)
 
         try:
             data = client.list_chat_messages(
@@ -441,7 +464,7 @@ def _run_incremental(
         except LarkApiError as exc:
             if exc.retryable or exc.likely_auth_problem:
                 raise
-            _mark_chat_not_readable(authorization["id"], chat["chat_id"])
+            _mark_chat_not_readable(authorization["id"], chat["chat_id"], generation)
             continue
 
         next_page_token = _continuation_token(data)
@@ -453,6 +476,7 @@ def _run_incremental(
             _items(data),
             next_page_token=next_page_token,
             backfill=False,
+            generation=generation,
         )
         pages += 1
         _add_job_progress(job.id, pages=1, messages=inserted, own_messages=own_inserted)
@@ -460,6 +484,29 @@ def _run_incremental(
 
 
 def _next_backfill_chat(authorization_id: uuid.UUID) -> dict[str, Any] | None:
+    """Return the next full-history group, honoring requested rescans first."""
+
+    with connection() as conn:
+        manual_in_progress = conn.execute(
+            """
+            SELECT * FROM user_chats
+            WHERE authorization_id = %s AND sync_enabled AND is_visible
+              AND COALESCE(chat_status, 'normal') = 'normal'
+              AND manual_backfill_requested_at IS NOT NULL
+              AND manual_backfill_started_at IS NOT NULL
+              AND NOT backfill_complete
+            ORDER BY manual_backfill_requested_at, chat_id
+            LIMIT 1
+            """,
+            (authorization_id,),
+        ).fetchone()
+        if manual_in_progress:
+            return manual_in_progress
+
+    claimed = _claim_requested_backfill(authorization_id)
+    if claimed:
+        return claimed
+
     with connection() as conn:
         return conn.execute(
             """
@@ -471,6 +518,85 @@ def _next_backfill_chat(authorization_id: uuid.UUID) -> dict[str, Any] | None:
             """,
             (authorization_id,),
         ).fetchone()
+
+
+def _claim_requested_backfill(authorization_id: uuid.UUID) -> dict[str, Any] | None:
+    """Atomically reset and claim one manual full-history rescan request."""
+
+    with connection() as conn, conn.transaction():
+        return conn.execute(
+            """
+            WITH requested_chat AS (
+                SELECT authorization_id, chat_id
+                FROM user_chats
+                WHERE authorization_id = %s AND sync_enabled AND is_visible
+                  AND COALESCE(chat_status, 'normal') = 'normal'
+                  AND manual_backfill_requested_at IS NOT NULL
+                  AND manual_backfill_started_at IS NULL
+                ORDER BY manual_backfill_requested_at, chat_id
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            )
+            UPDATE user_chats AS chats
+            SET backfill_page_token = NULL,
+                backfill_complete = FALSE,
+                backfill_started_at = NULL,
+                backfill_window_start_at = NULL,
+                backfill_window_end_at = NULL,
+                incremental_page_token = NULL,
+                incremental_job_id = NULL,
+                incremental_window_start_at = NULL,
+                incremental_window_end_at = NULL,
+                sync_status = 'pending',
+                last_error = NULL,
+                manual_backfill_started_at = NOW(),
+                sync_generation = chats.sync_generation + 1
+            FROM requested_chat
+            WHERE chats.authorization_id = requested_chat.authorization_id
+              AND chats.chat_id = requested_chat.chat_id
+            RETURNING chats.*
+            """,
+            (authorization_id,),
+        ).fetchone()
+
+
+def _has_pending_backfill(authorization_id: uuid.UUID) -> bool:
+    with connection() as conn:
+        return _has_pending_backfill_in_connection(conn, authorization_id)
+
+
+def _has_pending_backfill_in_connection(conn: psycopg.Connection, authorization_id: uuid.UUID) -> bool:
+    row = conn.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM user_chats
+            WHERE authorization_id = %s AND sync_enabled AND is_visible
+              AND COALESCE(chat_status, 'normal') = 'normal'
+              AND (
+                    manual_backfill_requested_at IS NOT NULL
+                 OR (NOT backfill_complete AND sync_status <> 'not_readable')
+              )
+        ) AS pending
+        """,
+        (authorization_id,),
+    ).fetchone()
+    return bool(row["pending"])
+
+
+def _has_manual_backfill_request(authorization_id: uuid.UUID) -> bool:
+    with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM user_chats
+                WHERE authorization_id = %s AND sync_enabled AND is_visible
+                  AND COALESCE(chat_status, 'normal') = 'normal'
+                  AND manual_backfill_requested_at IS NOT NULL
+            ) AS pending
+            """,
+            (authorization_id,),
+        ).fetchone()
+    return bool(row["pending"])
 
 
 def _next_incremental_chat(authorization_id: uuid.UUID, job_id: uuid.UUID) -> dict[str, Any] | None:
@@ -495,7 +621,7 @@ def _next_incremental_chat(authorization_id: uuid.UUID, job_id: uuid.UUID) -> di
 
 
 def _start_backfill_window(
-    authorization_id: uuid.UUID, chat_id: str, start_at: datetime | None, end_at: datetime
+    authorization_id: uuid.UUID, chat_id: str, start_at: datetime | None, end_at: datetime, generation: int
 ) -> None:
     with connection() as conn, conn.transaction():
         conn.execute(
@@ -505,14 +631,19 @@ def _start_backfill_window(
                 backfill_window_start_at = COALESCE(backfill_window_start_at, %s),
                 backfill_window_end_at = COALESCE(backfill_window_end_at, %s),
                 sync_status = 'syncing', last_error = NULL
-            WHERE authorization_id = %s AND chat_id = %s
+            WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
             """,
-            (start_at, end_at, authorization_id, chat_id),
+            (start_at, end_at, authorization_id, chat_id, generation),
         )
 
 
 def _start_incremental_window(
-    authorization_id: uuid.UUID, chat_id: str, job_id: uuid.UUID, start_at: datetime, end_at: datetime
+    authorization_id: uuid.UUID,
+    chat_id: str,
+    job_id: uuid.UUID,
+    start_at: datetime,
+    end_at: datetime,
+    generation: int,
 ) -> None:
     with connection() as conn, conn.transaction():
         conn.execute(
@@ -522,9 +653,9 @@ def _start_incremental_window(
                 incremental_window_start_at = COALESCE(incremental_window_start_at, %s),
                 incremental_window_end_at = COALESCE(incremental_window_end_at, %s),
                 sync_status = 'syncing', last_error = NULL
-            WHERE authorization_id = %s AND chat_id = %s
+            WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
             """,
-            (job_id, start_at, end_at, authorization_id, chat_id),
+            (job_id, start_at, end_at, authorization_id, chat_id, generation),
         )
 
 
@@ -536,6 +667,7 @@ def _record_page(
     *,
     next_page_token: str | None,
     backfill: bool,
+    generation: int,
 ) -> tuple[int, int]:
     inserted = 0
     own_inserted = 0
@@ -585,16 +717,23 @@ def _record_page(
                     backfill_complete = %s,
                     last_backfill_at = CASE WHEN %s THEN NOW() ELSE last_backfill_at END,
                     sync_status = CASE WHEN %s THEN 'succeeded' ELSE 'syncing' END,
+                    manual_backfill_requested_at = CASE
+                        WHEN %s THEN NULL ELSE manual_backfill_requested_at
+                    END,
+                    manual_backfill_started_at = CASE WHEN %s THEN NULL ELSE manual_backfill_started_at END,
                     last_error = NULL
-                WHERE authorization_id = %s AND chat_id = %s
+                WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
                 """,
                 (
                     next_page_token,
                     next_page_token is None,
                     next_page_token is None,
                     next_page_token is None,
+                    next_page_token is None,
+                    next_page_token is None,
                     authorization["id"],
                     chat_id,
+                    generation,
                 ),
             )
         else:
@@ -607,7 +746,7 @@ def _record_page(
                     last_incremental_at = CASE WHEN %s THEN NOW() ELSE last_incremental_at END,
                     sync_status = CASE WHEN %s THEN 'succeeded' ELSE 'syncing' END,
                     last_error = NULL
-                WHERE authorization_id = %s AND chat_id = %s
+                WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
                 """,
                 (
                     next_page_token,
@@ -617,21 +756,25 @@ def _record_page(
                     next_page_token is None,
                     authorization["id"],
                     chat_id,
+                    generation,
                 ),
             )
     return inserted, own_inserted
 
 
-def _mark_chat_not_readable(authorization_id: uuid.UUID, chat_id: str) -> None:
+def _mark_chat_not_readable(authorization_id: uuid.UUID, chat_id: str, generation: int) -> None:
     with connection() as conn, conn.transaction():
         conn.execute(
             """
             UPDATE user_chats
             SET sync_status = 'not_readable', backfill_complete = TRUE,
-                incremental_page_token = NULL, last_error = 'This group is not readable with the current authorization.'
-            WHERE authorization_id = %s AND chat_id = %s
+                incremental_page_token = NULL,
+                manual_backfill_requested_at = NULL,
+                manual_backfill_started_at = NULL,
+                last_error = 'This group is not readable with the current authorization.'
+            WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
             """,
-            (authorization_id, chat_id),
+            (authorization_id, chat_id, generation),
         )
 
 
@@ -677,13 +820,17 @@ def _finish_and_schedule_incremental(job: SyncJob) -> None:
             """,
             (job.id,),
         )
+        mode = "backfill" if _has_pending_backfill_in_connection(conn, job.authorization_id) else "incremental"
         conn.execute(
             """
             INSERT INTO sync_jobs (id, authorization_id, mode, status, scheduled_at)
-            VALUES (%s, %s, 'incremental', 'queued', NOW() + (%s * INTERVAL '1 second'))
+            VALUES (
+                %s, %s, %s, 'queued',
+                CASE WHEN %s = 'backfill' THEN NOW() ELSE NOW() + (%s * INTERVAL '1 second') END
+            )
             ON CONFLICT (authorization_id) WHERE status IN ('queued', 'running') DO NOTHING
             """,
-            (uuid.uuid4(), job.authorization_id, settings.sync_interval_seconds),
+            (uuid.uuid4(), job.authorization_id, mode, mode, settings.sync_interval_seconds),
         )
 
 
