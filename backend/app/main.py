@@ -18,6 +18,8 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from .admin import create_admin_router
+from .admin_reporting import admin_role_for
 from .config import get_settings
 from .crypto import TokenCipher
 from .db import connection, database_is_ready
@@ -179,7 +181,7 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
         # A re-authorization is the explicit opportunity to retry any group that was previously unreadable.
         conn.execute(
             """
-            UPDATE user_chats
+            UPDATE authorization_chats
             SET backfill_complete = FALSE, backfill_page_token = NULL,
                 backfill_window_start_at = NULL, backfill_window_end_at = NULL,
                 incremental_page_token = NULL, incremental_job_id = NULL,
@@ -230,6 +232,7 @@ def dashboard(request: Request):
         "dashboard.html",
         {
             "authorization": authorization,
+            "admin_role": admin_role_for(authorization["id"]),
             "stats": stats,
             "chats": chats,
             "csrf_token": _csrf_token(request),
@@ -271,11 +274,12 @@ def request_group_full_sync(request: Request, chat_id: str):
     with connection() as conn, conn.transaction():
         chat = conn.execute(
             """
-            SELECT name, manual_backfill_requested_at
-            FROM user_chats
-            WHERE authorization_id = %s AND chat_id = %s
-              AND sync_enabled AND is_visible
-              AND COALESCE(chat_status, 'normal') = 'normal'
+            SELECT c.name, access.manual_backfill_requested_at
+            FROM authorization_chats AS access
+            JOIN chats AS c ON c.chat_id = access.chat_id
+            WHERE access.authorization_id = %s AND access.chat_id = %s
+              AND access.sync_enabled AND access.is_visible
+              AND COALESCE(c.chat_status, 'normal') = 'normal'
             FOR UPDATE
             """,
             (authorization["id"], chat_id),
@@ -289,7 +293,7 @@ def request_group_full_sync(request: Request, chat_id: str):
         else:
             conn.execute(
                 """
-                UPDATE user_chats
+                UPDATE authorization_chats
                 SET manual_backfill_requested_at = NOW(),
                     manual_backfill_started_at = NULL,
                     sync_generation = sync_generation + 1
@@ -354,19 +358,35 @@ def _dashboard_stats(authorization_id: uuid.UUID) -> dict[str, Any]:
         counts = conn.execute(
             """
             SELECT
-                (SELECT COUNT(*) FROM user_chats c
-                  WHERE c.authorization_id = %s AND c.is_visible
+                (SELECT COUNT(*)
+                   FROM authorization_chats AS access
+                   JOIN chats AS c ON c.chat_id = access.chat_id
+                  WHERE access.authorization_id = %s AND access.is_visible
                         AND COALESCE(c.chat_status, 'normal') = 'normal') AS group_count,
-                (SELECT COUNT(*) FROM message_ledger m
-                   JOIN user_chats c ON c.authorization_id = m.authorization_id AND c.chat_id = m.chat_id
-                  WHERE m.authorization_id = %s AND c.is_visible
-                        AND NOT m.is_deleted) AS message_count,
-                (SELECT COUNT(*) FROM message_ledger m
-                   JOIN user_chats c ON c.authorization_id = m.authorization_id AND c.chat_id = m.chat_id
-                  WHERE m.authorization_id = %s AND c.is_visible
-                        AND m.sent_by_author AND NOT m.is_deleted) AS own_message_count,
-                (SELECT MAX(COALESCE(c.last_incremental_at, c.last_backfill_at))
-                   FROM user_chats c WHERE c.authorization_id = %s) AS last_synced_at
+                (SELECT COUNT(*)
+                   FROM authorization_message_observations AS observation
+                   JOIN authorization_chats AS access
+                     ON access.authorization_id = observation.authorization_id
+                    AND access.chat_id = observation.chat_id
+                   JOIN chats AS c ON c.chat_id = access.chat_id
+                   JOIN chat_messages AS message
+                     ON message.chat_id = observation.chat_id AND message.message_id = observation.message_id
+                  WHERE observation.authorization_id = %s AND access.is_visible
+                        AND COALESCE(c.chat_status, 'normal') = 'normal'
+                        AND NOT message.is_deleted) AS message_count,
+                (SELECT COUNT(*)
+                   FROM authorization_message_observations AS observation
+                   JOIN authorization_chats AS access
+                     ON access.authorization_id = observation.authorization_id
+                    AND access.chat_id = observation.chat_id
+                   JOIN chats AS c ON c.chat_id = access.chat_id
+                   JOIN chat_messages AS message
+                     ON message.chat_id = observation.chat_id AND message.message_id = observation.message_id
+                  WHERE observation.authorization_id = %s AND access.is_visible
+                        AND COALESCE(c.chat_status, 'normal') = 'normal'
+                        AND observation.sent_by_author AND NOT message.is_deleted) AS own_message_count,
+                (SELECT MAX(COALESCE(access.last_incremental_at, access.last_backfill_at))
+                   FROM authorization_chats AS access WHERE access.authorization_id = %s) AS last_synced_at
             """,
             (authorization_id, authorization_id, authorization_id, authorization_id),
         ).fetchone()
@@ -398,30 +418,33 @@ def _dashboard_chats(authorization_id: uuid.UUID) -> list[dict[str, Any]]:
         rows = conn.execute(
             """
             SELECT
-                c.chat_id,
+                access.chat_id,
                 c.name,
                 c.external,
-                c.member_count,
-                c.member_count_status,
-                c.sync_status,
-                c.last_error,
-                c.last_backfill_at,
-                c.last_incremental_at,
-                c.manual_backfill_requested_at,
-                c.manual_backfill_started_at,
-                COUNT(m.message_id) FILTER (WHERE NOT m.is_deleted) AS message_count
-            FROM user_chats c
-            LEFT JOIN message_ledger m
-                ON m.authorization_id = c.authorization_id AND m.chat_id = c.chat_id
-            WHERE c.authorization_id = %s
-              AND c.is_visible
+                access.member_count,
+                access.member_count_status,
+                access.sync_status,
+                access.last_error,
+                access.last_backfill_at,
+                access.last_incremental_at,
+                access.manual_backfill_requested_at,
+                access.manual_backfill_started_at,
+                COUNT(observation.message_id) FILTER (WHERE NOT message.is_deleted) AS message_count
+            FROM authorization_chats AS access
+            JOIN chats AS c ON c.chat_id = access.chat_id
+            LEFT JOIN authorization_message_observations AS observation
+                ON observation.authorization_id = access.authorization_id AND observation.chat_id = access.chat_id
+            LEFT JOIN chat_messages AS message
+                ON message.chat_id = observation.chat_id AND message.message_id = observation.message_id
+            WHERE access.authorization_id = %s
+              AND access.is_visible
               AND COALESCE(c.chat_status, 'normal') = 'normal'
             GROUP BY
-                c.authorization_id, c.chat_id, c.name, c.external, c.member_count,
-                c.member_count_status, c.sync_status, c.last_error,
-                c.last_backfill_at, c.last_incremental_at,
-                c.manual_backfill_requested_at, c.manual_backfill_started_at
-            ORDER BY LOWER(COALESCE(c.name, '')), c.chat_id
+                access.authorization_id, access.chat_id, c.name, c.external, access.member_count,
+                access.member_count_status, access.sync_status, access.last_error,
+                access.last_backfill_at, access.last_incremental_at,
+                access.manual_backfill_requested_at, access.manual_backfill_started_at
+            ORDER BY LOWER(COALESCE(c.name, '')), access.chat_id
             """,
             (authorization_id,),
         ).fetchall()
@@ -536,3 +559,11 @@ def _format_time(value: datetime | None) -> str:
     if not value:
         return "尚未完成"
     return value.astimezone(LONDON_TIME_ZONE).strftime("%Y-%m-%d %H:%M %Z")
+
+
+app.include_router(
+    create_admin_router(
+        current_authorization=_current_authorization,
+        render_template=_template,
+    )
+)

@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}{{ user.display_name }} · 管理台{% endblock %}
+{% block body %}
+<div class="page">
+  {% include "admin/_nav.html" %}
+  <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
+    <div class="d-flex align-items-center mb-3"><a class="btn btn-sm btn-outline-secondary" href="/admin/users">返回人员列表</a></div>
+    <div class="card mb-4"><div class="card-body">
+      <div class="row g-3 align-items-center">
+        <div class="col-md"><h3 class="mb-1">{{ user.display_name }}</h3><div class="text-secondary">授权于 {{ user.authorized_at_label }} · 最近更新 {{ user.updated_at_label }}</div></div>
+        <div class="col-md-auto"><span class="badge bg-{{ user.authorization_status_badge }}-lt">{{ user.authorization_status_label }}</span>{% if user.admin_role %}<span class="badge bg-azure-lt ms-1">{{ user.admin_role }}</span>{% endif %}</div>
+      </div>
+      <div class="row row-cards mt-2">
+        <div class="col-sm-4"><div class="subheader">当前群聊</div><div class="h2">{{ user.group_count }}</div></div>
+        <div class="col-sm-4"><div class="subheader">可见消息索引</div><div class="h2">{{ user.message_count }}</div></div>
+        <div class="col-sm-4"><div class="subheader">本人消息</div><div class="h2">{{ user.own_message_count }}</div></div>
+      </div>
+    </div></div>
+
+    <div class="card mb-4">
+      <div class="card-header"><div><h3 class="card-title mb-1">当前可见群聊</h3><div class="text-secondary small">群名称和成员人数来自共享的群目录；同步状态属于该人员的授权关系。</div></div></div>
+      {% if groups %}
+      <div class="table-responsive"><table class="table table-vcenter card-table">
+        <thead><tr><th>群聊</th><th>成员人数</th><th>消息索引</th><th>同步状态</th><th>最近同步</th></tr></thead>
+        <tbody>{% for group in groups %}<tr>
+          <td><div class="text-truncate group-name-cell" title="{{ group.name }}">{{ group.name }}</div>{% if group.external %}<span class="badge bg-azure-lt mt-1">外部群</span>{% endif %}</td>
+          <td>{{ group.member_count_label }}</td><td>{{ group.message_count }}</td>
+          <td><span class="badge bg-{{ group.sync_status_badge }}-lt">{{ group.sync_status_label }}</span></td><td class="text-secondary text-nowrap">{{ group.last_synced_at_label }}</td>
+        </tr>{% endfor %}</tbody>
+      </table></div>
+      {% else %}<div class="card-body text-secondary">该用户目前没有可展示的群聊。</div>{% endif %}
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">最近 20 个同步任务</h3></div>
+      {% if jobs %}
+      <div class="table-responsive"><table class="table table-vcenter card-table">
+        <thead><tr><th>模式</th><th>状态</th><th>页数</th><th>发现群聊</th><th>新增消息</th><th>创建时间</th><th>结束时间</th></tr></thead>
+        <tbody>{% for job in jobs %}<tr><td>{{ job.mode }}</td><td><span class="badge bg-{{ job.status_badge }}-lt">{{ job.status_label }}</span></td><td>{{ job.pages_processed }}</td><td>{{ job.chats_discovered }}</td><td>{{ job.messages_indexed }}</td><td class="text-secondary text-nowrap">{{ job.created_at_label }}</td><td class="text-secondary text-nowrap">{{ job.finished_at_label }}</td></tr>{% endfor %}</tbody>
+      </table></div>
+      {% else %}<div class="card-body text-secondary">尚未创建同步任务。</div>{% endif %}
+    </div>
+  </div></div></div>
+</div>
+{% endblock %}

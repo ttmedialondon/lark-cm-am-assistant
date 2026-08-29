@@ -20,7 +20,7 @@
 | 我发送的消息数 | 发送者为 `user`、`id_type=open_id` 且 ID 与 OAuth 用户 `open_id` 一致的未撤回消息。 |
 | 最近一次同步 | 某个可读群最后完成回填或增量同步的时间。 |
 
-`message_ledger` 仅保存：`authorization_id`、`chat_id`、`message_id`、创建时间、本人发送布尔值与撤回布尔值。它用于分页断点后的去重和可重复统计，绝不保存 `content`。
+`chat_messages` 是公司级唯一消息索引，仅保存：`chat_id`、`message_id`、创建时间与撤回布尔值；`authorization_message_observations` 仅保存某授权用户是否见过该消息、以及是否为本人发送。两者用于分页断点后的去重和可重复统计，绝不保存 `content`。`authorization_chats` 保存用户—群可见性与同步游标，`chats` 保存唯一群元数据。
 
 ## 服务组件
 
@@ -82,6 +82,7 @@ offline_access
 - 首次回填完成后，每 300 秒创建一次增量 job；增量窗口包含 10 分钟重叠，以防边界漏记，重复消息不会重复计数。
 - 若单个群不可读，标记为 `not_readable`，不把它误计为“零消息”；重新 OAuth 后会重新尝试。
 - 仪表盘可对一个当前可见群请求“同步全部历史”。Web 端只写入群级请求标记；同一授权用户仍只允许一个活动 job。Worker 在当前分页边界优先接手请求、原子重置该群游标并回填 Lark API 可返回的全部历史。每次请求递增群的同步代次，过期 worker 不能覆盖新游标或清除新请求。既有 `message_id` 会去重，消息正文不会写入数据库。
+- `/admin` 使用 `admin_roles` 强制授权，初始只分配一个 `owner`；全局群/消息指标读取 `chats` 与 `chat_messages`，个人指标读取授权观察关系，因此多人共享一个群不会造成重复计数。
 
 ## 验证结果
 

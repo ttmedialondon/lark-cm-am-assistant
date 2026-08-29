@@ -276,37 +276,44 @@ def _discover_groups(
                 member_count_checked_at = measurement.checked_at if measurement else None
                 conn.execute(
                     """
-                    INSERT INTO user_chats (
-                        authorization_id, chat_id, name, external, chat_status, chat_mode,
-                        is_visible, last_seen_at,
-                        member_count, member_count_status, member_count_checked_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s)
-                    ON CONFLICT (authorization_id, chat_id) DO UPDATE SET
+                    INSERT INTO chats (
+                        chat_id, name, external, chat_status, chat_mode,
+                        first_seen_at, last_seen_at, metadata_updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (chat_id) DO UPDATE SET
                         name = EXCLUDED.name,
                         external = EXCLUDED.external,
                         chat_status = EXCLUDED.chat_status,
                         chat_mode = EXCLUDED.chat_mode,
+                        last_seen_at = EXCLUDED.last_seen_at,
+                        metadata_updated_at = EXCLUDED.metadata_updated_at
+                    """,
+                    (chat_id, name, external, chat_status, chat_mode, seen_at, seen_at, seen_at),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO authorization_chats (
+                        authorization_id, chat_id, is_visible, last_seen_at,
+                        member_count, member_count_status, member_count_checked_at
+                    ) VALUES (%s, %s, TRUE, %s, %s, %s, %s)
+                    ON CONFLICT (authorization_id, chat_id) DO UPDATE SET
                         is_visible = TRUE,
                         last_seen_at = EXCLUDED.last_seen_at,
                         member_count = CASE
-                            WHEN EXCLUDED.member_count_checked_at IS NULL THEN user_chats.member_count
+                            WHEN EXCLUDED.member_count_checked_at IS NULL THEN authorization_chats.member_count
                             ELSE EXCLUDED.member_count
                         END,
                         member_count_status = CASE
-                            WHEN EXCLUDED.member_count_checked_at IS NULL THEN user_chats.member_count_status
+                            WHEN EXCLUDED.member_count_checked_at IS NULL THEN authorization_chats.member_count_status
                             ELSE EXCLUDED.member_count_status
                         END,
                         member_count_checked_at = COALESCE(
-                            EXCLUDED.member_count_checked_at, user_chats.member_count_checked_at
+                            EXCLUDED.member_count_checked_at, authorization_chats.member_count_checked_at
                         )
                     """,
                     (
                         authorization["id"],
                         chat_id,
-                        name,
-                        external,
-                        chat_status,
-                        chat_mode,
                         seen_at,
                         member_count,
                         member_count_status,
@@ -323,7 +330,7 @@ def _discover_groups(
     with connection() as conn, conn.transaction():
         conn.execute(
             """
-            UPDATE user_chats
+            UPDATE authorization_chats
             SET is_visible = FALSE,
                 manual_backfill_requested_at = NULL,
                 manual_backfill_started_at = NULL,
@@ -340,7 +347,7 @@ def _member_count_check_times(authorization_id: uuid.UUID) -> dict[str, datetime
         rows = conn.execute(
             """
             SELECT chat_id, member_count_checked_at
-            FROM user_chats
+            FROM authorization_chats
             WHERE authorization_id = %s
             """,
             (authorization_id,),
@@ -489,13 +496,15 @@ def _next_backfill_chat(authorization_id: uuid.UUID) -> dict[str, Any] | None:
     with connection() as conn:
         manual_in_progress = conn.execute(
             """
-            SELECT * FROM user_chats
-            WHERE authorization_id = %s AND sync_enabled AND is_visible
-              AND COALESCE(chat_status, 'normal') = 'normal'
-              AND manual_backfill_requested_at IS NOT NULL
-              AND manual_backfill_started_at IS NOT NULL
-              AND NOT backfill_complete
-            ORDER BY manual_backfill_requested_at, chat_id
+            SELECT access.*
+            FROM authorization_chats AS access
+            JOIN chats AS c ON c.chat_id = access.chat_id
+            WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
+              AND COALESCE(c.chat_status, 'normal') = 'normal'
+              AND access.manual_backfill_requested_at IS NOT NULL
+              AND access.manual_backfill_started_at IS NOT NULL
+              AND NOT access.backfill_complete
+            ORDER BY access.manual_backfill_requested_at, access.chat_id
             LIMIT 1
             """,
             (authorization_id,),
@@ -510,11 +519,13 @@ def _next_backfill_chat(authorization_id: uuid.UUID) -> dict[str, Any] | None:
     with connection() as conn:
         return conn.execute(
             """
-            SELECT * FROM user_chats
-            WHERE authorization_id = %s AND sync_enabled AND is_visible
-              AND COALESCE(chat_status, 'normal') = 'normal' AND NOT backfill_complete
-              AND sync_status <> 'not_readable'
-            ORDER BY discovered_at, chat_id LIMIT 1
+            SELECT access.*
+            FROM authorization_chats AS access
+            JOIN chats AS c ON c.chat_id = access.chat_id
+            WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
+              AND COALESCE(c.chat_status, 'normal') = 'normal' AND NOT access.backfill_complete
+              AND access.sync_status <> 'not_readable'
+            ORDER BY access.discovered_at, access.chat_id LIMIT 1
             """,
             (authorization_id,),
         ).fetchone()
@@ -527,17 +538,18 @@ def _claim_requested_backfill(authorization_id: uuid.UUID) -> dict[str, Any] | N
         return conn.execute(
             """
             WITH requested_chat AS (
-                SELECT authorization_id, chat_id
-                FROM user_chats
-                WHERE authorization_id = %s AND sync_enabled AND is_visible
-                  AND COALESCE(chat_status, 'normal') = 'normal'
-                  AND manual_backfill_requested_at IS NOT NULL
-                  AND manual_backfill_started_at IS NULL
-                ORDER BY manual_backfill_requested_at, chat_id
+                SELECT access.authorization_id, access.chat_id
+                FROM authorization_chats AS access
+                JOIN chats AS c ON c.chat_id = access.chat_id
+                WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
+                  AND COALESCE(c.chat_status, 'normal') = 'normal'
+                  AND access.manual_backfill_requested_at IS NOT NULL
+                  AND access.manual_backfill_started_at IS NULL
+                ORDER BY access.manual_backfill_requested_at, access.chat_id
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
             )
-            UPDATE user_chats AS chats
+            UPDATE authorization_chats AS access
             SET backfill_page_token = NULL,
                 backfill_complete = FALSE,
                 backfill_started_at = NULL,
@@ -550,11 +562,11 @@ def _claim_requested_backfill(authorization_id: uuid.UUID) -> dict[str, Any] | N
                 sync_status = 'pending',
                 last_error = NULL,
                 manual_backfill_started_at = NOW(),
-                sync_generation = chats.sync_generation + 1
+                sync_generation = access.sync_generation + 1
             FROM requested_chat
-            WHERE chats.authorization_id = requested_chat.authorization_id
-              AND chats.chat_id = requested_chat.chat_id
-            RETURNING chats.*
+            WHERE access.authorization_id = requested_chat.authorization_id
+              AND access.chat_id = requested_chat.chat_id
+            RETURNING access.*
             """,
             (authorization_id,),
         ).fetchone()
@@ -569,12 +581,14 @@ def _has_pending_backfill_in_connection(conn: psycopg.Connection, authorization_
     row = conn.execute(
         """
         SELECT EXISTS (
-            SELECT 1 FROM user_chats
-            WHERE authorization_id = %s AND sync_enabled AND is_visible
-              AND COALESCE(chat_status, 'normal') = 'normal'
+            SELECT 1
+            FROM authorization_chats AS access
+            JOIN chats AS c ON c.chat_id = access.chat_id
+            WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
+              AND COALESCE(c.chat_status, 'normal') = 'normal'
               AND (
-                    manual_backfill_requested_at IS NOT NULL
-                 OR (NOT backfill_complete AND sync_status <> 'not_readable')
+                    access.manual_backfill_requested_at IS NOT NULL
+                 OR (NOT access.backfill_complete AND access.sync_status <> 'not_readable')
               )
         ) AS pending
         """,
@@ -588,10 +602,12 @@ def _has_manual_backfill_request(authorization_id: uuid.UUID) -> bool:
         row = conn.execute(
             """
             SELECT EXISTS (
-                SELECT 1 FROM user_chats
-                WHERE authorization_id = %s AND sync_enabled AND is_visible
-                  AND COALESCE(chat_status, 'normal') = 'normal'
-                  AND manual_backfill_requested_at IS NOT NULL
+                SELECT 1
+                FROM authorization_chats AS access
+                JOIN chats AS c ON c.chat_id = access.chat_id
+                WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
+                  AND COALESCE(c.chat_status, 'normal') = 'normal'
+                  AND access.manual_backfill_requested_at IS NOT NULL
             ) AS pending
             """,
             (authorization_id,),
@@ -603,17 +619,22 @@ def _next_incremental_chat(authorization_id: uuid.UUID, job_id: uuid.UUID) -> di
     with connection() as conn:
         return conn.execute(
             """
-            SELECT * FROM user_chats
-            WHERE authorization_id = %s AND sync_enabled AND is_visible
-              AND COALESCE(chat_status, 'normal') = 'normal' AND backfill_complete
-              AND sync_status <> 'not_readable'
+            SELECT access.*
+            FROM authorization_chats AS access
+            JOIN chats AS c ON c.chat_id = access.chat_id
+            WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
+              AND COALESCE(c.chat_status, 'normal') = 'normal' AND access.backfill_complete
+              AND access.sync_status <> 'not_readable'
               AND (
-                    (incremental_job_id = %s AND incremental_page_token IS NOT NULL)
-                 OR incremental_job_id IS DISTINCT FROM %s
+                    (access.incremental_job_id = %s AND access.incremental_page_token IS NOT NULL)
+                 OR access.incremental_job_id IS DISTINCT FROM %s
               )
             ORDER BY
-                CASE WHEN incremental_job_id = %s AND incremental_page_token IS NOT NULL THEN 0 ELSE 1 END,
-                COALESCE(last_incremental_at, last_backfill_at), chat_id
+                CASE
+                    WHEN access.incremental_job_id = %s AND access.incremental_page_token IS NOT NULL THEN 0
+                    ELSE 1
+                END,
+                COALESCE(access.last_incremental_at, access.last_backfill_at), access.chat_id
             LIMIT 1
             """,
             (authorization_id, job_id, job_id, job_id),
@@ -626,7 +647,7 @@ def _start_backfill_window(
     with connection() as conn, conn.transaction():
         conn.execute(
             """
-            UPDATE user_chats
+            UPDATE authorization_chats
             SET backfill_started_at = COALESCE(backfill_started_at, NOW()),
                 backfill_window_start_at = COALESCE(backfill_window_start_at, %s),
                 backfill_window_end_at = COALESCE(backfill_window_end_at, %s),
@@ -648,7 +669,7 @@ def _start_incremental_window(
     with connection() as conn, conn.transaction():
         conn.execute(
             """
-            UPDATE user_chats
+            UPDATE authorization_chats
             SET incremental_job_id = %s,
                 incremental_window_start_at = COALESCE(incremental_window_start_at, %s),
                 incremental_window_end_at = COALESCE(incremental_window_end_at, %s),
@@ -678,41 +699,43 @@ def _record_page(
                 continue
             is_own = _is_author_message(message, authorization["open_id"])
             is_deleted = _bool(message.get("deleted"))
-            row = conn.execute(
+            conn.execute(
                 """
-                INSERT INTO message_ledger (
-                    authorization_id, chat_id, message_id, message_create_time, sent_by_author, is_deleted
-                ) VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (authorization_id, chat_id, message_id) DO NOTHING
-                RETURNING sent_by_author
+                INSERT INTO chat_messages (
+                    chat_id, message_id, message_create_time, is_deleted, first_indexed_at, last_observed_at
+                ) VALUES (%s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (chat_id, message_id) DO UPDATE SET
+                    message_create_time = COALESCE(chat_messages.message_create_time, EXCLUDED.message_create_time),
+                    is_deleted = chat_messages.is_deleted OR EXCLUDED.is_deleted,
+                    last_observed_at = NOW()
                 """,
                 (
-                    authorization["id"],
                     chat_id,
                     message_id,
                     _lark_time(message.get("create_time")),
-                    is_own,
                     is_deleted,
                 ),
+            )
+            observation = conn.execute(
+                """
+                INSERT INTO authorization_message_observations (
+                    authorization_id, chat_id, message_id, sent_by_author, observed_at
+                ) VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (authorization_id, chat_id, message_id) DO UPDATE SET
+                    sent_by_author = authorization_message_observations.sent_by_author OR EXCLUDED.sent_by_author,
+                    observed_at = NOW()
+                RETURNING sent_by_author, (xmax = 0) AS is_new
+                """,
+                (authorization["id"], chat_id, message_id, is_own),
             ).fetchone()
-            if row:
+            if observation["is_new"]:
                 inserted += 1
-                own_inserted += int(bool(row["sent_by_author"]))
-            else:
-                conn.execute(
-                    """
-                    UPDATE message_ledger
-                    SET is_deleted = %s, indexed_at = NOW()
-                    WHERE authorization_id = %s AND chat_id = %s AND message_id = %s
-                      AND is_deleted IS DISTINCT FROM %s
-                    """,
-                    (is_deleted, authorization["id"], chat_id, message_id, is_deleted),
-                )
+                own_inserted += int(bool(observation["sent_by_author"]))
 
         if backfill:
             conn.execute(
                 """
-                UPDATE user_chats
+                UPDATE authorization_chats
                 SET backfill_page_token = %s,
                     backfill_complete = %s,
                     last_backfill_at = CASE WHEN %s THEN NOW() ELSE last_backfill_at END,
@@ -739,7 +762,7 @@ def _record_page(
         else:
             conn.execute(
                 """
-                UPDATE user_chats
+                UPDATE authorization_chats
                 SET incremental_page_token = %s,
                     incremental_window_start_at = CASE WHEN %s THEN NULL ELSE incremental_window_start_at END,
                     incremental_window_end_at = CASE WHEN %s THEN NULL ELSE incremental_window_end_at END,
@@ -766,7 +789,7 @@ def _mark_chat_not_readable(authorization_id: uuid.UUID, chat_id: str, generatio
     with connection() as conn, conn.transaction():
         conn.execute(
             """
-            UPDATE user_chats
+            UPDATE authorization_chats
             SET sync_status = 'not_readable', backfill_complete = TRUE,
                 incremental_page_token = NULL,
                 manual_backfill_requested_at = NULL,

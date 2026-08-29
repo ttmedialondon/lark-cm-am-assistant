@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}授权人员 · 管理台{% endblock %}
+{% block body %}
+<div class="page">
+  {% include "admin/_nav.html" %}
+  <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
+    <div class="card">
+      <div class="card-header"><div><h3 class="card-title mb-1">已授权人员</h3><div class="text-secondary small">每一行是一个 Lark 用户授权；消息数按该用户实际可见的消息观察记录计算。</div></div></div>
+      {% if users %}
+      <div class="table-responsive"><table class="table table-vcenter card-table">
+        <thead><tr><th>人员</th><th>授权状态</th><th>管理角色</th><th>当前群聊</th><th>消息索引</th><th>本人消息</th><th>待处理</th><th>最新任务</th><th>最近同步</th></tr></thead>
+        <tbody>{% for user in users %}<tr>
+          <td><a href="/admin/users/{{ user.id }}">{{ user.display_name }}</a></td>
+          <td><span class="badge bg-{{ user.authorization_status_badge }}-lt">{{ user.authorization_status_label }}</span></td>
+          <td>{{ user.admin_role or "—" }}</td>
+          <td>{{ user.group_count }}</td><td>{{ user.message_count }}</td><td>{{ user.own_message_count }}</td><td>{{ user.pending_group_count }}</td>
+          <td><span class="badge bg-{{ user.job_status_badge }}-lt">{{ user.job_status_label }}</span></td>
+          <td class="text-secondary text-nowrap">{{ user.last_synced_at_label }}</td>
+        </tr>{% endfor %}</tbody>
+      </table></div>
+      {% else %}
+      <div class="card-body text-secondary">尚未有用户完成授权。</div>
+      {% endif %}
+    </div>
+  </div></div></div>
+</div>
+{% endblock %}

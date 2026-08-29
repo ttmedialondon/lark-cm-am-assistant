@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}管理台概览 · Lark Message Stats{% endblock %}
+{% block body %}
+<div class="page">
+  {% include "admin/_nav.html" %}
+  <div class="page-wrapper">
+    <div class="page-body pt-0">
+      <div class="container-xl">
+        <div class="alert alert-info" role="status">管理台当前为只读：展示公司范围内的授权、群聊关系和同步状态；不展示 OAuth 令牌、应用密钥或消息正文。</div>
+        <div class="row row-deck row-cards">
+          {% for metric in metrics %}
+          <div class="col-sm-6 col-lg-4">
+            <div class="card"><div class="card-body">
+              <div class="subheader">{{ metric.label }}</div>
+              <div class="h1 mb-1">{{ metric.value }}</div>
+              <div class="text-secondary small">{{ metric.hint }}</div>
+            </div></div>
+          </div>
+          {% endfor %}
+        </div>
+
+        <div class="row mt-4">
+          <div class="col-lg-6">
+            <div class="card h-100">
+              <div class="card-header"><h3 class="card-title">需要关注的授权或同步</h3></div>
+              {% if attention %}
+              <div class="table-responsive"><table class="table table-vcenter card-table">
+                <thead><tr><th>人员</th><th>授权</th><th>群聊</th><th>待处理</th><th>最近同步</th></tr></thead>
+                <tbody>{% for item in attention %}<tr>
+                  <td><a href="/admin/users/{{ item.id }}">{{ item.display_name }}</a></td>
+                  <td><span class="badge bg-{{ item.authorization_status_badge }}-lt">{{ item.authorization_status_label }}</span></td>
+                  <td>{{ item.group_count }}</td>
+                  <td>{{ item.pending_group_count }}</td>
+                  <td class="text-secondary text-nowrap">{{ item.last_synced_at_label }}</td>
+                </tr>{% endfor %}</tbody>
+              </table></div>
+              {% else %}
+              <div class="card-body text-secondary">当前没有需要特别处理的授权或同步任务。</div>
+              {% endif %}
+            </div>
+          </div>
+          <div class="col-lg-6">
+            <div class="card h-100">
+              <div class="card-header"><h3 class="card-title">最近同步任务</h3><div class="card-actions"><a href="/admin/jobs" class="btn btn-sm btn-outline-secondary">查看全部</a></div></div>
+              {% if recent_jobs %}
+              <div class="table-responsive"><table class="table table-vcenter card-table">
+                <thead><tr><th>人员</th><th>模式</th><th>状态</th><th>新增消息</th><th>创建时间</th></tr></thead>
+                <tbody>{% for job in recent_jobs %}<tr>
+                  <td>{{ job.display_name }}</td><td>{{ job.mode }}</td>
+                  <td><span class="badge bg-{{ job.status_badge }}-lt">{{ job.status_label }}</span></td>
+                  <td>{{ job.messages_indexed }}</td><td class="text-secondary text-nowrap">{{ job.created_at_label }}</td>
+                </tr>{% endfor %}</tbody>
+              </table></div>
+              {% else %}
+              <div class="card-body text-secondary">尚未创建同步任务。</div>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+        <div class="card mt-4">
+          <div class="card-header"><div><h3 class="card-title mb-1">当前运行参数</h3><div class="text-secondary small">来自服务器运行配置；不展示数据库连接、令牌、密钥或其他可复用凭证。</div></div></div>
+          <div class="table-responsive"><table class="table table-vcenter card-table mb-0">
+            <tbody>{% for item in runtime %}<tr><td>{{ item.label }}</td><td class="text-secondary">{{ item.value }}</td></tr>{% endfor %}</tbody>
+          </table></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

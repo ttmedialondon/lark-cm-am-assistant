@@ -12,7 +12,7 @@
 
 ## 发布步骤
 
-在服务器上执行。命令不会打印 App Secret 或 OAuth Token。
+在服务器上执行。命令不会打印 App Secret 或 OAuth Token。`004_normalize_chats_and_admin.sql` 会规范化群和消息表，因此发布该版本前必须短暂停止 Web/Worker 并完成数据库备份。
 
 ```bash
 cd /opt/lark-message-stats
@@ -22,7 +22,13 @@ sudo install -m 0644 infra/systemd/lark-message-stats-web.service /etc/systemd/s
 sudo install -m 0644 infra/systemd/lark-message-stats-worker.service /etc/systemd/system/lark-message-stats-worker.service
 sudo install -m 0644 infra/caddy/Caddyfile /etc/caddy/Caddyfile
 sudo caddy validate --config /etc/caddy/Caddyfile
-sudo bash -c 'set -a; . /etc/lark-message-stats/app.env; set +a; cd /opt/lark-message-stats/backend && /opt/lark-message-stats/venv/bin/python scripts/migrate.py'
+sudo systemctl stop lark-message-stats-web.service lark-message-stats-worker.service
+sudo bash -c 'db_url=$(sed -n "s/^DATABASE_URL=//p" /etc/lark-message-stats/app.env | head -n1); pg_dump --dbname="$db_url" | gzip -9 > /var/backups/lark-message-stats/pre-release-$(date -u +%Y%m%dT%H%M%SZ).sql.gz'
+sudo systemd-run --quiet --wait --pipe --collect \
+  --property=User=larkstats --property=Group=larkstats \
+  --property=EnvironmentFile=/etc/lark-message-stats/app.env \
+  --property=WorkingDirectory=/opt/lark-message-stats/backend \
+  /opt/lark-message-stats/venv/bin/python scripts/migrate.py
 sudo systemctl daemon-reload
 sudo systemctl reload caddy
 sudo systemctl restart lark-message-stats-web.service lark-message-stats-worker.service
@@ -47,4 +53,4 @@ sudo journalctl -u lark-message-stats-web.service -u lark-message-stats-worker.s
 
 ## 回退原则
 
-先停止发布并保留数据库。不得通过删除数据库或令牌来“回退”。若新版本异常，恢复上一个已验证的 Git 提交和对应 systemd 单元，然后重启 Web/Worker；`002_chat_member_counts.sql` 只增加可空/默认字段，旧版本可以安全忽略它。
+先停止发布并保留数据库。不得通过删除数据库或令牌来“回退”。`004_normalize_chats_and_admin.sql` 会替换旧的 `message_ledger`，因此不能在已迁移数据库上直接启动旧版代码。若新版本异常，停止服务、恢复发布前的 PostgreSQL 备份，再恢复上一个已验证的 Git 提交和对应 systemd 单元。
