@@ -246,8 +246,13 @@ def _discover_groups(
             if _member_count_refresh_due(
                 last_member_count_checks.get(chat_id), seen_at, settings.member_count_refresh_seconds
             ):
-                _renew_lease(job.id)
-                measurement = _read_member_count(client, access_token, chat_id)
+                if "im:chat.members:read" in settings.oauth_scopes:
+                    _renew_lease(job.id)
+                    measurement = _read_member_count(client, access_token, chat_id)
+                else:
+                    # Do not issue hundreds of known-to-fail API calls before
+                    # the administrator has enabled the optional user scope.
+                    measurement = MemberCountMeasurement(count=None, status="unavailable", checked_at=seen_at)
                 if measurement.checked_at:
                     last_member_count_checks[chat_id] = measurement.checked_at
             rows.append(
