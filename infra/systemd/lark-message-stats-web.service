@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=larkstats
 Group=larkstats
-WorkingDirectory=/opt/lark-message-stats
+WorkingDirectory=/opt/lark-message-stats/backend
 EnvironmentFile=/etc/lark-message-stats/app.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1

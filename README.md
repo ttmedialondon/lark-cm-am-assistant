@@ -12,7 +12,7 @@ Internal system for managing CM/AM night-time Lark messages, generating auditabl
 
 - `backend/` — FastAPI, PostgreSQL migrations, worker, and backend tests.
 - `frontend/` — future React/TypeScript workbench.
-- `infra/` — Caddy, systemd, deployment, backup, and smoke-test assets.
+- `infra/` — Caddy, systemd and deployment assets; operational procedures live in `docs/runbooks/`.
 - `docs/` — product requirements, target architecture, current deployed baseline, ADRs, runbooks, and archived documents.
 
 ## Engineering rules

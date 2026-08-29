@@ -24,10 +24,11 @@
     <div class="page-body">
       <div class="container-xl">
         {% include "partials/stats.html" %}
+        {% include "partials/chats.html" %}
         <div class="card mt-4">
           <div class="card-body">
             <h3 class="card-title">数据说明</h3>
-            <p class="text-secondary mb-0">“已同步消息总数”仅统计 Lark API 可返回且未撤回的群消息记录。“我发送的消息数”仅在 Lark 返回的发送者 Open ID 与当前授权用户一致时计入。测试版不保存消息正文。</p>
+            <p class="text-secondary mb-0">“已同步消息总数”仅统计 Lark API 可返回且未撤回的群消息记录。“我发送的消息数”仅在 Lark 返回的发送者 Open ID 与当前授权用户一致时计入。成员人数只保留 Lark 返回的总数。测试版不保存消息正文、附件或成员名单。</p>
           </div>
         </div>
       </div>

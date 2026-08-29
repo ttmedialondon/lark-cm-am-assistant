@@ -7,14 +7,15 @@
 - 已加入群聊数；
 - 已同步消息总数；
 - 当前授权用户发送的消息数；
+- 每个可见群的 Lark 人类成员总数；
 - 最近一次同步状态。
 
 ## 数据边界
 
-- 仅调用用户身份的 `im:chat:read` 与只读的 `im:message:readonly`，并使用 `offline_access` 刷新授权。
+- 仅调用用户身份的 `im:chat:read`、`im:chat.members:read` 与只读的 `im:message:readonly`，并使用 `offline_access` 刷新授权。
 - 不读取或处理 P2P 单聊，不发送 Lark 消息。
 - 不保存消息正文、附件、@ 提及、发送者姓名或完整发送者资料。
-- 为了分页断点、去重和计数，数据库仅保存 `message_id`、`chat_id`、创建时间和“是否为授权用户发送”的布尔值。
+- 为了分页断点、去重和计数，数据库仅保存 `message_id`、`chat_id`、创建时间和“是否为授权用户发送”的布尔值；成员信息只保存 Lark 返回的人类成员总数，不保存成员名单。
 
 ## 架构
 
@@ -38,4 +39,4 @@ cp .env.example .env  # 仅本地；不要提交真实密钥
 .venv/bin/python -m pytest
 ```
 
-生产部署使用 `deploy/` 中的 systemd 和 Caddy 配置。App Secret 必须由管理员在服务器终端的隐藏输入提示中录入，不能提交到 Git 或发送到聊天。
+生产部署使用仓库根目录 `../infra/` 中的 systemd 和 Caddy 配置；具体步骤见 [`docs/runbooks/deploy-mvp.md`](../docs/runbooks/deploy-mvp.md)。App Secret 必须由管理员在服务器终端的隐藏输入提示中录入，不能提交到 Git 或发送到聊天。

@@ -10,6 +10,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import psycopg
 from fastapi import FastAPI, HTTPException, Request
@@ -30,6 +31,7 @@ app.mount("/static", StaticFiles(directory=str(APP_ROOT / "static")), name="stat
 SESSION_COOKIE = "__Host-lark_message_stats"
 OAUTH_STATE_COOKIE = "__Host-lark_oauth_state"
 SESSION_DAYS = 30
+LONDON_TIME_ZONE = ZoneInfo("Europe/London")
 
 
 def _template(request: Request, name: str, context: dict[str, Any], status_code: int = 200):
@@ -182,8 +184,10 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 backfill_window_start_at = NULL, backfill_window_end_at = NULL,
                 incremental_page_token = NULL, incremental_job_id = NULL,
                 incremental_window_start_at = NULL, incremental_window_end_at = NULL,
-                sync_status = 'pending', last_error = NULL
-            WHERE authorization_id = %s AND sync_status = 'not_readable'
+                sync_status = CASE WHEN sync_status = 'not_readable' THEN 'pending' ELSE sync_status END,
+                last_error = CASE WHEN sync_status = 'not_readable' THEN NULL ELSE last_error END,
+                member_count_status = 'pending', member_count_checked_at = NULL
+            WHERE authorization_id = %s
             """,
             (authorization_id,),
         )
@@ -219,7 +223,8 @@ def dashboard(request: Request):
     if not authorization:
         return RedirectResponse(url="/", status_code=303)
     stats = _dashboard_stats(authorization["id"])
-    return _template(request, "dashboard.html", {"authorization": authorization, "stats": stats})
+    chats = _dashboard_chats(authorization["id"])
+    return _template(request, "dashboard.html", {"authorization": authorization, "stats": stats, "chats": chats})
 
 
 @app.get("/dashboard/stats")
@@ -228,6 +233,14 @@ def dashboard_stats(request: Request):
     if not authorization:
         raise HTTPException(status_code=401, detail="sign in required")
     return _template(request, "partials/stats.html", {"stats": _dashboard_stats(authorization["id"])})
+
+
+@app.get("/dashboard/chats")
+def dashboard_chats(request: Request):
+    authorization = _current_authorization(request)
+    if not authorization:
+        raise HTTPException(status_code=401, detail="sign in required")
+    return _template(request, "partials/chats.html", {"chats": _dashboard_chats(authorization["id"])})
 
 
 def _current_authorization(request: Request) -> dict[str, Any] | None:
@@ -258,15 +271,15 @@ def _dashboard_stats(authorization_id: uuid.UUID) -> dict[str, Any]:
             """
             SELECT
                 (SELECT COUNT(*) FROM user_chats c
-                  WHERE c.authorization_id = %s AND c.sync_enabled AND c.is_visible
+                  WHERE c.authorization_id = %s AND c.is_visible
                         AND COALESCE(c.chat_status, 'normal') = 'normal') AS group_count,
                 (SELECT COUNT(*) FROM message_ledger m
                    JOIN user_chats c ON c.authorization_id = m.authorization_id AND c.chat_id = m.chat_id
-                  WHERE m.authorization_id = %s AND c.sync_enabled AND c.is_visible
+                  WHERE m.authorization_id = %s AND c.is_visible
                         AND NOT m.is_deleted) AS message_count,
                 (SELECT COUNT(*) FROM message_ledger m
                    JOIN user_chats c ON c.authorization_id = m.authorization_id AND c.chat_id = m.chat_id
-                  WHERE m.authorization_id = %s AND c.sync_enabled AND c.is_visible
+                  WHERE m.authorization_id = %s AND c.is_visible
                         AND m.sent_by_author AND NOT m.is_deleted) AS own_message_count,
                 (SELECT MAX(COALESCE(c.last_incremental_at, c.last_backfill_at))
                    FROM user_chats c WHERE c.authorization_id = %s) AS last_synced_at
@@ -296,6 +309,53 @@ def _dashboard_stats(authorization_id: uuid.UUID) -> dict[str, Any]:
     }
 
 
+def _dashboard_chats(authorization_id: uuid.UUID) -> list[dict[str, Any]]:
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                c.chat_id,
+                c.name,
+                c.external,
+                c.member_count,
+                c.member_count_status,
+                c.sync_status,
+                c.last_error,
+                c.last_backfill_at,
+                c.last_incremental_at,
+                COUNT(m.message_id) FILTER (WHERE NOT m.is_deleted) AS message_count
+            FROM user_chats c
+            LEFT JOIN message_ledger m
+                ON m.authorization_id = c.authorization_id AND m.chat_id = c.chat_id
+            WHERE c.authorization_id = %s
+              AND c.is_visible
+              AND COALESCE(c.chat_status, 'normal') = 'normal'
+            GROUP BY
+                c.authorization_id, c.chat_id, c.name, c.external, c.member_count,
+                c.member_count_status, c.sync_status, c.last_error,
+                c.last_backfill_at, c.last_incremental_at
+            ORDER BY LOWER(COALESCE(c.name, '')), c.chat_id
+            """,
+            (authorization_id,),
+        ).fetchall()
+
+    chats: list[dict[str, Any]] = []
+    for row in rows:
+        sync_label, sync_badge = _chat_sync_status(row["sync_status"])
+        chats.append(
+            {
+                "name": row["name"] or "未命名群聊",
+                "external": bool(row["external"]),
+                "member_count": _member_count_label(row["member_count"], row["member_count_status"]),
+                "message_count": int(row["message_count"] or 0),
+                "sync_label": sync_label,
+                "sync_badge": sync_badge,
+                "last_synced_at": _format_time(row["last_incremental_at"] or row["last_backfill_at"]),
+            }
+        )
+    return chats
+
+
 def _job_status(job: dict[str, Any] | None) -> tuple[str, str, str]:
     if not job:
         return "等待首次同步", "授权完成后，后台服务会自动枚举你当前可见的群聊。", "secondary"
@@ -306,6 +366,25 @@ def _job_status(job: dict[str, Any] | None) -> tuple[str, str, str]:
     if job["status"] == "attention_required":
         return "需要重新授权", "Lark 授权或权限需要处理，请返回首页重新授权。", "warning"
     return "同步遇到问题", "后台会安全重试；若持续失败，请联系管理员检查应用权限。", "danger"
+
+
+def _chat_sync_status(value: str | None) -> tuple[str, str]:
+    mapping = {
+        "pending": ("等待同步", "secondary"),
+        "syncing": ("正在同步", "primary"),
+        "succeeded": ("已同步", "success"),
+        "not_readable": ("Lark 未允许读取", "warning"),
+        "failed_retryable": ("等待重试", "warning"),
+    }
+    return mapping.get(value or "", ("状态未知", "secondary"))
+
+
+def _member_count_label(count: int | None, status: str | None) -> str:
+    if count is not None:
+        return str(count)
+    if status == "pending":
+        return "正在获取"
+    return "Lark 未返回"
 
 
 def _queue_job(conn: psycopg.Connection, authorization_id: uuid.UUID, mode: str) -> None:
@@ -342,4 +421,4 @@ def _expiry(seconds: int | None) -> datetime | None:
 def _format_time(value: datetime | None) -> str:
     if not value:
         return "尚未完成"
-    return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    return value.astimezone(LONDON_TIME_ZONE).strftime("%Y-%m-%d %H:%M %Z")

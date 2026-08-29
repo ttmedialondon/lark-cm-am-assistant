@@ -1,0 +1,41 @@
+<div id="dashboard-chats" hx-get="/dashboard/chats" hx-trigger="load, every 15s" hx-swap="outerHTML">
+  <div class="card mt-4">
+    <div class="card-header">
+      <div>
+        <h3 class="card-title mb-1">当前可见群聊</h3>
+        <div class="text-secondary small">成员人数是 Lark 返回的用户总数；服务不保存成员名单或消息正文。</div>
+      </div>
+    </div>
+    {% if chats %}
+    <div class="table-responsive">
+      <table class="table table-vcenter card-table">
+        <thead>
+          <tr>
+            <th>群聊</th>
+            <th>成员人数</th>
+            <th>已同步消息记录</th>
+            <th>同步状态</th>
+            <th>最后同步</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for chat in chats %}
+          <tr>
+            <td class="group-name-cell">
+              <div class="text-truncate" title="{{ chat.name }}">{{ chat.name }}</div>
+              {% if chat.external %}<span class="badge bg-azure-lt mt-1">外部群</span>{% endif %}
+            </td>
+            <td>{{ chat.member_count }}</td>
+            <td>{{ chat.message_count }}</td>
+            <td><span class="badge bg-{{ chat.sync_badge }}-lt">{{ chat.sync_label }}</span></td>
+            <td class="text-secondary text-nowrap">{{ chat.last_synced_at }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="card-body text-secondary">暂未发现群聊。授权后的首次同步正在后台执行时，请稍候刷新。</div>
+    {% endif %}
+  </div>
+</div>

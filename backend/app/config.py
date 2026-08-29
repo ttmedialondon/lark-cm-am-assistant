@@ -63,6 +63,7 @@ class Settings:
     sync_lookback_days: int
     sync_interval_seconds: int
     sync_overlap_seconds: int
+    member_count_refresh_seconds: int
     max_pages_per_job: int
     worker_idle_seconds: int
 
@@ -92,13 +93,14 @@ def get_settings() -> Settings:
         oauth_scopes=tuple(
             scope
             for scope in os.environ.get(
-                "LARK_OAUTH_SCOPES", "offline_access im:chat:read im:message:readonly"
+                "LARK_OAUTH_SCOPES", "offline_access im:chat:read im:chat.members:read im:message:readonly"
             ).split()
             if scope
         ),
         sync_lookback_days=_nonnegative_int("SYNC_LOOKBACK_DAYS", 0),
         sync_interval_seconds=_positive_int("SYNC_INTERVAL_SECONDS", 180, 30),
         sync_overlap_seconds=_positive_int("SYNC_OVERLAP_SECONDS", 600, 60),
+        member_count_refresh_seconds=_positive_int("MEMBER_COUNT_REFRESH_SECONDS", 86400, 300),
         max_pages_per_job=_positive_int("MAX_PAGES_PER_JOB", 30, 1),
         worker_idle_seconds=_positive_int("WORKER_IDLE_SECONDS", 3, 1),
     )

@@ -5,7 +5,7 @@
 **状态：** 技术评审稿  
 **最近更新日期：** 2026-08-28  
 **对应 PRD：** [Lark助手机器人_PRD_v2.0_飞书版.md](./Lark助手机器人_PRD_v2.0_飞书版.md)  
-**当前代码基线：** [lark-message-stats](../lark-message-stats/)  
+**当前代码基线：** [backend/](../../backend/)
 **适用读者：** 技术负责人、后端、前端、测试、产品、安全与运维  
 **保密级别：** 内部使用
 
@@ -121,7 +121,7 @@ v2.0 不实施：
 
 ### 3.1 可以直接复用的能力
 
-当前主工程为 [lark-message-stats](../lark-message-stats/)，已经具备：
+当前主工程为 [backend/](../../backend/)，已经具备：
 
 - Lark OAuth、PKCE 和一次性 state。
 - Secure、HttpOnly、SameSite Cookie。
@@ -139,11 +139,11 @@ v2.0 不实施：
 
 主要代码入口：
 
-- [app/main.py](../lark-message-stats/app/main.py)：网页、OAuth、Session 和统计看板。
-- [app/worker.py](../lark-message-stats/app/worker.py)：群发现、历史回填、增量同步、任务租约和 Token 刷新。
-- [app/lark_api.py](../lark-message-stats/app/lark_api.py)：Lark API 封装。
-- [app/crypto.py](../lark-message-stats/app/crypto.py)：Token 加解密。
-- [migrations/001_initial.sql](../lark-message-stats/migrations/001_initial.sql)：当前数据库结构。
+- [app/main.py](../../backend/app/main.py)：网页、OAuth、Session 和统计看板。
+- [app/worker.py](../../backend/app/worker.py)：群发现、历史回填、增量同步、任务租约和 Token 刷新。
+- [app/lark_api.py](../../backend/app/lark_api.py)：Lark API 封装。
+- [app/crypto.py](../../backend/app/crypto.py)：Token 加解密。
+- [migrations/001_initial.sql](../../backend/migrations/001_initial.sql)：当前数据库结构。
 
 ### 3.2 当前不能满足 PRD 的部分
 

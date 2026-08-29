@@ -17,6 +17,7 @@ def settings() -> Settings:
         sync_lookback_days=0,
         sync_interval_seconds=180,
         sync_overlap_seconds=600,
+        member_count_refresh_seconds=86400,
         max_pages_per_job=30,
         worker_idle_seconds=3,
     )
@@ -30,3 +31,22 @@ def test_authorization_url_uses_oauth_client_id_and_pkce() -> None:
     assert "code_challenge=challenge-value" in url
     assert "code_challenge_method=S256" in url
     assert "scope=offline_access+im%3Achat%3Aread" in url
+
+
+def test_chat_member_total_requests_only_the_aggregate_user_bucket(monkeypatch) -> None:
+    client = LarkClient(settings())
+    captured = {}
+
+    def fake_request(method, url, **kwargs):
+        captured.update(method=method, url=url, **kwargs)
+        return {"user_total": "17", "users": [{"member_id": "ou_not_saved"}]}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    total = client.chat_member_total("user-token", "oc_test")
+
+    assert total.user_total == 17
+    assert captured["method"] == "GET"
+    assert captured["url"].endswith("/open-apis/im/v1/chats/oc_test/members/list")
+    assert captured["access_token"] == "user-token"
+    assert captured["params"] == {"member_id_type": "open_id", "member_types": "user", "page_size": 1}

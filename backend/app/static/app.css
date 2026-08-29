@@ -12,3 +12,4 @@ body { min-height: 100vh; }
   font-weight: 700;
   letter-spacing: .04em;
 }
+.group-name-cell { max-width: 26rem; }

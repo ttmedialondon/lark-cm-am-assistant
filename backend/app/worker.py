@@ -32,6 +32,15 @@ class SyncJob:
     attempts: int
 
 
+@dataclass(frozen=True)
+class MemberCountMeasurement:
+    """A non-sensitive aggregate returned for one chat."""
+
+    count: int | None
+    status: str
+    checked_at: datetime | None
+
+
 def run_forever() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = get_settings()
@@ -104,7 +113,7 @@ def _execute_job(job: SyncJob, settings: Settings) -> None:
 
         client = LarkClient(settings)
         access_token = _usable_access_token(job.authorization_id, authorization, client, settings)
-        discovered = _discover_groups(job, authorization, access_token, client)
+        discovered = _discover_groups(job, authorization, access_token, client, settings)
         _set_job_discovered(job.id, discovered)
 
         if job.mode == "backfill":
@@ -205,41 +214,93 @@ def _store_refreshed_tokens(
     )
 
 
-def _discover_groups(job: SyncJob, authorization: dict[str, Any], access_token: str, client: LarkClient) -> int:
+def _discover_groups(
+    job: SyncJob,
+    authorization: dict[str, Any],
+    access_token: str,
+    client: LarkClient,
+    settings: Settings,
+) -> int:
+    """Discover visible groups and periodically refresh only their member totals.
+
+    Group discovery and message ingestion must stay independent: an unavailable
+    member-total API must never make an otherwise readable group look empty or
+    prevent its message history from being indexed.
+    """
+
     page_token: str | None = None
     discovered = 0
     seen_at = datetime.now(UTC)
+    last_member_count_checks = _member_count_check_times(authorization["id"])
     while True:
         _renew_lease(job.id)
         data = client.list_group_chats(access_token, page_token)
-        items = _items(data)
+        rows: list[tuple[str, str | None, bool, str, str, MemberCountMeasurement | None]] = []
+        for chat in _items(data):
+            chat_id = _text(chat.get("chat_id"))
+            if not chat_id:
+                continue
+            measurement: MemberCountMeasurement | None = None
+            if _member_count_refresh_due(
+                last_member_count_checks.get(chat_id), seen_at, settings.member_count_refresh_seconds
+            ):
+                _renew_lease(job.id)
+                measurement = _read_member_count(client, access_token, chat_id)
+                if measurement.checked_at:
+                    last_member_count_checks[chat_id] = measurement.checked_at
+            rows.append(
+                (
+                    chat_id,
+                    _text(chat.get("name")),
+                    _bool(chat.get("external")),
+                    _text(chat.get("chat_status")) or "normal",
+                    _text(chat.get("chat_mode")) or "group",
+                    measurement,
+                )
+            )
+
         with connection() as conn, conn.transaction():
-            for chat in items:
-                chat_id = _text(chat.get("chat_id"))
-                if not chat_id:
-                    continue
+            for chat_id, name, external, chat_status, chat_mode, measurement in rows:
+                member_count = measurement.count if measurement else None
+                member_count_status = measurement.status if measurement else "pending"
+                member_count_checked_at = measurement.checked_at if measurement else None
                 conn.execute(
                     """
                     INSERT INTO user_chats (
                         authorization_id, chat_id, name, external, chat_status, chat_mode,
-                        is_visible, last_seen_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s)
+                        is_visible, last_seen_at,
+                        member_count, member_count_status, member_count_checked_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s)
                     ON CONFLICT (authorization_id, chat_id) DO UPDATE SET
                         name = EXCLUDED.name,
                         external = EXCLUDED.external,
                         chat_status = EXCLUDED.chat_status,
                         chat_mode = EXCLUDED.chat_mode,
                         is_visible = TRUE,
-                        last_seen_at = EXCLUDED.last_seen_at
+                        last_seen_at = EXCLUDED.last_seen_at,
+                        member_count = CASE
+                            WHEN EXCLUDED.member_count_checked_at IS NULL THEN user_chats.member_count
+                            ELSE EXCLUDED.member_count
+                        END,
+                        member_count_status = CASE
+                            WHEN EXCLUDED.member_count_checked_at IS NULL THEN user_chats.member_count_status
+                            ELSE EXCLUDED.member_count_status
+                        END,
+                        member_count_checked_at = COALESCE(
+                            EXCLUDED.member_count_checked_at, user_chats.member_count_checked_at
+                        )
                     """,
                     (
                         authorization["id"],
                         chat_id,
-                        _text(chat.get("name")),
-                        _bool(chat.get("external")),
-                        _text(chat.get("chat_status")) or "normal",
-                        _text(chat.get("chat_mode")) or "group",
+                        name,
+                        external,
+                        chat_status,
+                        chat_mode,
                         seen_at,
+                        member_count,
+                        member_count_status,
+                        member_count_checked_at,
                     ),
                 )
                 discovered += 1
@@ -258,6 +319,41 @@ def _discover_groups(job: SyncJob, authorization: dict[str, Any], access_token: 
             (authorization["id"], seen_at),
         )
     return discovered
+
+
+def _member_count_check_times(authorization_id: uuid.UUID) -> dict[str, datetime | None]:
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT chat_id, member_count_checked_at
+            FROM user_chats
+            WHERE authorization_id = %s
+            """,
+            (authorization_id,),
+        ).fetchall()
+    return {row["chat_id"]: row["member_count_checked_at"] for row in rows}
+
+
+def _member_count_refresh_due(
+    last_checked_at: datetime | None, now: datetime, refresh_seconds: int
+) -> bool:
+    return last_checked_at is None or last_checked_at <= now - timedelta(seconds=refresh_seconds)
+
+
+def _read_member_count(client: LarkClient, access_token: str, chat_id: str) -> MemberCountMeasurement:
+    checked_at = datetime.now(UTC)
+    try:
+        total = client.chat_member_total(access_token, chat_id).user_total
+    except LarkApiError as exc:
+        # This is secondary metadata. Preserve the group and primary message
+        # sync even when a tenant policy or a missing scope denies this call.
+        status = "pending" if exc.retryable else "unavailable"
+        LOGGER.info("member-count metadata unavailable: status=%s code=%s", exc.status_code, exc.lark_code)
+        return MemberCountMeasurement(count=None, status=status, checked_at=checked_at)
+    if total is None:
+        LOGGER.info("member-count metadata response omitted a usable user total")
+        return MemberCountMeasurement(count=None, status="unavailable", checked_at=checked_at)
+    return MemberCountMeasurement(count=total, status="succeeded", checked_at=checked_at)
 
 
 def _run_backfill(
