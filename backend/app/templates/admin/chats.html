@@ -5,13 +5,13 @@
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
     <div class="card">
-      <div class="card-header"><div><h3 class="card-title mb-1">公司群聊目录</h3><div class="text-secondary small">一个 Lark 群或专题群只保存为一个规范化会话记录；下方同时显示有多少已授权 CM / AM 当前可见该会话。</div></div></div>
+      <div class="card-header"><div><h3 class="card-title mb-1">公司群聊目录</h3><div class="text-secondary small">一个 Lark 群或专题群只保存为一个规范化会话记录；已发现但尚无消息的群也会保留在此。</div></div></div>
       {% if chats %}
       <div class="table-responsive"><table class="table table-vcenter card-table">
         <thead><tr><th>会话</th><th>类型</th><th>成员人数</th><th>可见授权人员</th><th>待处理关系</th><th>去重消息索引</th><th>最近同步</th><th>最近发现</th></tr></thead>
         <tbody>{% for chat in chats %}<tr>
           <td><div class="text-truncate group-name-cell" title="{{ chat.name }}">{{ chat.name }}</div>{% if chat.external %}<span class="badge bg-azure-lt mt-1">外部群</span>{% endif %}</td>
-          <td>{{ chat.chat_mode_label }}</td><td>{{ chat.member_count_label }}</td><td>{{ chat.visible_authorization_count }}</td><td>{{ chat.pending_authorization_count }}</td><td>{{ chat.message_count }}</td>
+          <td>{{ chat.chat_mode_label }}</td><td>{{ chat.member_count_label }}</td><td>{{ chat.visible_authorization_count }}</td><td>{{ chat.pending_authorization_count }}</td><td>{{ chat.message_count_label }}</td>
           <td class="text-secondary text-nowrap">{{ chat.last_synced_at_label }}</td><td class="text-secondary text-nowrap">{{ chat.last_seen_at_label }}</td>
         </tr>{% endfor %}</tbody>
       </table></div>

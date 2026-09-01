@@ -73,10 +73,8 @@ def create_admin_router(
             "csrf_token": csrf_token(access_context["authorization"]),
         }
 
-    def pagination(
-        page_data: dict[str, Any], path: str, *, page_name: str = "page", **query: object
-    ) -> dict[str, Any]:
-        """Add stable previous/next links to a limit-plus-one result page."""
+    def pagination(page_data: dict[str, Any], path: str, *, page_name: str = "page", **query: object) -> dict[str, Any]:
+        """Build compact, numbered navigation while retaining every query value."""
 
         page = int(page_data["page"])
         query = {key: value for key, value in query.items() if value is not None}
@@ -84,10 +82,48 @@ def create_admin_router(
         def url(target_page: int) -> str:
             return f"{path}?{urlencode({**query, page_name: target_page})}"
 
+        total_count = page_data.get("total_count")
+        page_size = page_data.get("page_size")
+        total_pages = page_data.get("total_pages")
+        if not isinstance(total_pages, int):
+            total_pages = (
+                (total_count + page_size - 1) // page_size
+                if isinstance(total_count, int) and isinstance(page_size, int) and page_size > 0
+                else None
+            )
+        if total_pages is not None:
+            total_pages = max(0, total_pages)
+            page = min(page, max(1, total_pages))
+
+        page_numbers: list[int] = []
+        if total_pages and total_pages > 1:
+            if total_pages <= 7:
+                page_numbers = list(range(1, total_pages + 1))
+            elif page <= 3:
+                page_numbers = [1, 2, 3, total_pages]
+            elif page >= total_pages - 2:
+                page_numbers = [1, total_pages - 2, total_pages - 1, total_pages]
+            else:
+                page_numbers = [1, page - 1, page, page + 1, total_pages]
+
+        pages: list[dict[str, Any]] = []
+        previous_number = 0
+        for number in page_numbers:
+            if number > previous_number + 1:
+                pages.append({"ellipsis": True})
+            pages.append({"page": number, "url": url(number), "current": number == page})
+            previous_number = number
+
+        has_next = page < total_pages if total_pages is not None else bool(page_data["has_next"])
+
         return {
             **page_data,
+            "page": page,
+            "total_count": total_count,
+            "total_pages": total_pages,
+            "pages": pages,
             "previous_url": url(page - 1) if page > 1 else None,
-            "next_url": url(page + 1) if page_data["has_next"] else None,
+            "next_url": url(page + 1) if has_next else None,
         }
 
     def owner_access(request: Request) -> tuple[dict[str, Any] | None, Response | None]:
@@ -260,9 +296,7 @@ def create_admin_router(
                 selected_user["id"], conversation_page, conversation_query, conversation_type
             )
             conversations = conversation_page_data["items"]
-            selected_chat = (
-                admin_reporting.message_conversation(selected_user["id"], chat_id) if chat_id else None
-            )
+            selected_chat = admin_reporting.message_conversation(selected_user["id"], chat_id) if chat_id else None
             if selected_chat:
                 content_page = admin_reporting.message_page(selected_user["id"], selected_chat["chat_id"], page)
                 admin_reporting.record_message_view(
@@ -377,9 +411,7 @@ def create_admin_router(
                 **page_context(access_context, "candidates"),
                 "candidate": detail["candidate"],
                 "evidence": evidence["items"],
-                "evidence_page": pagination(
-                    evidence, f"/admin/candidates/{candidate_id}", page_name="evidence_page"
-                ),
+                "evidence_page": pagination(evidence, f"/admin/candidates/{candidate_id}", page_name="evidence_page"),
             },
         )
         response.headers["Cache-Control"] = "no-store, max-age=0"

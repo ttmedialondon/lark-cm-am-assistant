@@ -7,8 +7,8 @@ from fastapi.testclient import TestClient
 from app import admin, admin_reporting, creator_registry
 
 
-def _page(items, page=1, has_next=False):
-    return {"items": items, "page": page, "has_next": has_next}
+def _page(items, page=1, has_next=False, **metadata):
+    return {"items": items, "page": page, "has_next": has_next, **metadata}
 
 
 def _client(current_authorization, contexts=None):
@@ -72,6 +72,26 @@ def test_admin_users_uses_server_pagination(monkeypatch):
     assert pages == [2]
     assert contexts[-1][1]["user_page"]["previous_url"] == "/admin/users?page=1"
     assert contexts[-1][1]["user_page"]["next_url"] == "/admin/users?page=3"
+
+
+def test_admin_users_numbered_pagination_keeps_edge_pages(monkeypatch):
+    contexts = []
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(
+        admin_reporting,
+        "users",
+        lambda page: _page([], page=page, total_count=850, total_pages=17, page_size=50),
+    )
+    client = _client(lambda _request: {"id": uuid4(), "status": "active"}, contexts)
+
+    assert client.get("/admin/users?page=1").status_code == 200
+    first = contexts[-1][1]["user_page"]
+    assert [item.get("page", "…") for item in first["pages"]] == [1, 2, 3, "…", 17]
+
+    assert client.get("/admin/users?page=8").status_code == 200
+    middle = contexts[-1][1]["user_page"]
+    assert [item.get("page", "…") for item in middle["pages"]] == [1, "…", 7, 8, 9, "…", 17]
+    assert middle["pages"][-1]["url"] == "/admin/users?page=17"
 
 
 def test_message_content_page_is_owner_only(monkeypatch):
@@ -191,12 +211,17 @@ def test_message_conversation_search_and_type_stay_with_the_selected_user(monkey
         admin_reporting,
         "message_conversations",
         lambda *args: conversation_queries.append(args)
-        or _page([{"chat_id": "oc_visible", "chat_mode": "p2p"}], page=2, has_next=True),
+        or _page(
+            [{"chat_id": "oc_visible", "chat_mode": "p2p"}],
+            page=2,
+            total_count=85,
+            total_pages=17,
+            page_size=5,
+        ),
     )
 
     response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get(
-        f"/admin/messages?user_id={selected_id}&conversation_page=2"
-        "&conversation_query=Creator&conversation_type=p2p"
+        f"/admin/messages?user_id={selected_id}&conversation_page=2&conversation_query=Creator&conversation_type=p2p"
     )
 
     assert response.status_code == 200
@@ -206,6 +231,8 @@ def test_message_conversation_search_and_type_stay_with_the_selected_user(monkey
     assert context["conversation_type"] == "p2p"
     assert "conversation_query=Creator" in context["conversation_page"]["next_url"]
     assert "conversation_type=p2p" in context["conversation_page"]["next_url"]
+    assert "conversation_query=Creator" in context["conversation_page"]["pages"][-1]["url"]
+    assert "conversation_type=p2p" in context["conversation_page"]["pages"][-1]["url"]
 
 
 def test_owner_reads_only_an_explicit_visible_conversation(monkeypatch):

@@ -1,7 +1,17 @@
-{% if pager.previous_url or pager.next_url %}
-<div class="card-footer d-flex align-items-center justify-content-between">
-  {% if pager.previous_url %}<a class="btn btn-sm btn-outline-secondary" href="{{ pager.previous_url }}">上一页</a>{% else %}<span></span>{% endif %}
-  <span class="text-secondary small">第 {{ pager.page }} 页</span>
-  {% if pager.next_url %}<a class="btn btn-sm btn-outline-secondary" href="{{ pager.next_url }}">下一页</a>{% else %}<span></span>{% endif %}
+{% if pager.previous_url or pager.next_url or pager.pages %}
+<div class="card-footer d-flex flex-wrap align-items-center justify-content-between gap-2">
+  <span class="text-secondary small">
+    {% if pager.total_pages is not none %}第 {{ pager.page }} / {{ pager.total_pages }} 页{% else %}第 {{ pager.page }} 页{% endif %}
+    {% if pager.total_count is not none %} · 共 {{ pager.total_count }} 条{% endif %}
+  </span>
+  <nav aria-label="分页"><ul class="pagination pagination-sm mb-0">
+    {% if pager.previous_url %}<li class="page-item"><a class="page-link" href="{{ pager.previous_url }}" aria-label="上一页">‹</a></li>{% endif %}
+    {% for item in pager.pages %}
+      {% if item.ellipsis %}<li class="page-item disabled" aria-hidden="true"><span class="page-link">…</span></li>
+      {% elif item.current %}<li class="page-item active" aria-current="page"><span class="page-link">{{ item.page }}</span></li>
+      {% else %}<li class="page-item"><a class="page-link" href="{{ item.url }}">{{ item.page }}</a></li>{% endif %}
+    {% endfor %}
+    {% if pager.next_url %}<li class="page-item"><a class="page-link" href="{{ pager.next_url }}" aria-label="下一页">›</a></li>{% endif %}
+  </ul></nav>
 </div>
 {% endif %}

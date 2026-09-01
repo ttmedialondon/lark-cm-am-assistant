@@ -71,7 +71,7 @@
             <div class="message-console__conversation-meta">
               {% if chat.external %}<span>外部</span>{% endif %}
               {% if chat.chat_mode != 'p2p' %}<span>{{ chat.member_count_label }} 人</span>{% endif %}
-              <span>{{ chat.message_count }} 条消息</span>
+              <span>{{ chat.message_count_label }}</span>
               <span>{{ chat.content_count }} 条正文</span>
             </div>
           </a>

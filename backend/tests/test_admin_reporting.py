@@ -9,6 +9,22 @@ def test_reporting_page_window_is_bounded_and_fetches_one_extra_row():
     assert admin_reporting._page_window(99_999) == (admin_reporting.MAX_PAGE, 51, 499_950)
 
 
+def test_reporting_pagination_uses_exact_totals_and_preserves_empty_results():
+    assert admin_reporting._page_window(99, 5, total_count=17) == (4, 6, 15)
+
+    page = admin_reporting._page_result([], 1, 5, total_count=0)
+
+    assert page == {
+        "items": [],
+        "page": 1,
+        "page_size": 5,
+        "total_count": 0,
+        "total_pages": 0,
+        "has_next": False,
+    }
+    assert admin_reporting._message_count_label(0) == "尚无消息"
+
+
 def test_message_conversation_filter_values_are_bounded_and_allowlisted():
     assert admin_reporting._page_window(2, admin_reporting.MESSAGE_CONVERSATION_PAGE_SIZE) == (2, 6, 5)
     assert admin_reporting.normalize_message_conversation_query("  Creator  ") == "Creator"

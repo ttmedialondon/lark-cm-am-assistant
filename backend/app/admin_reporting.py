@@ -51,6 +51,18 @@ MESSAGE_CONVERSATION_DIRECTORY_SQL = """
       AND ac.is_visible
       AND COALESCE(c.chat_status, 'normal') = 'normal'
 """
+MESSAGE_CONVERSATION_FILTER_SQL = """
+      AND (
+        %s = ''
+        OR POSITION(LOWER(%s) IN LOWER(COALESCE(c.name, ''))) > 0
+        OR POSITION(LOWER(%s) IN LOWER(COALESCE(counterpart.display_name, ''))) > 0
+      )
+      AND (
+        %s = 'all'
+        OR (%s = 'p2p' AND COALESCE(c.chat_mode, 'group') = 'p2p')
+        OR (%s = 'group' AND COALESCE(c.chat_mode, 'group') <> 'p2p')
+      )
+"""
 MESSAGE_CONVERSATION_COUNTS_SQL = """
     SELECT
         conversations.chat_id,
@@ -312,8 +324,11 @@ def runtime_settings() -> tuple[dict[str, str], ...]:
 def users(page: int = 1) -> dict[str, Any]:
     """Return per-user statistics without double-counting canonical messages."""
 
-    page, limit, offset = _page_window(page)
     with connection() as conn:
+        total_count = int(
+            conn.execute("SELECT COUNT(*) AS total_count FROM authorizations").fetchone()["total_count"] or 0
+        )
+        page, limit, offset = _page_window(page, total_count=total_count)
         rows = conn.execute(
             f"""
             WITH conversation_counts AS (
@@ -375,14 +390,12 @@ def users(page: int = 1) -> dict[str, Any]:
             """,
             (limit, offset),
         ).fetchall()
-    return _page_result([_decorate_user(row) for row in rows], page)
+    return _page_result([_decorate_user(row) for row in rows], page, total_count=total_count)
 
 
 def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: int = 1) -> dict[str, Any] | None:
     """Return one user plus their current conversation relationships and jobs."""
 
-    conversation_page, conversation_limit, conversation_offset = _page_window(conversation_page)
-    job_page, job_limit, job_offset = _page_window(job_page)
     with connection() as conn:
         user = conn.execute(
             f"""
@@ -450,6 +463,32 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
         if not user:
             return None
 
+        conversation_total_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS total_count
+                FROM authorization_chats ac
+                LEFT JOIN chats c ON c.chat_id = ac.chat_id
+                WHERE ac.authorization_id = %s
+                  AND ac.is_visible
+                  AND COALESCE(c.chat_status, 'normal') = 'normal'
+                """,
+                (authorization_id,),
+            ).fetchone()["total_count"]
+            or 0
+        )
+        job_total_count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS total_count FROM sync_jobs WHERE authorization_id = %s",
+                (authorization_id,),
+            ).fetchone()["total_count"]
+            or 0
+        )
+        conversation_page, conversation_limit, conversation_offset = _page_window(
+            conversation_page, total_count=conversation_total_count
+        )
+        job_page, job_limit, job_offset = _page_window(job_page, total_count=job_total_count)
+
         conversations = conn.execute(
             """
             SELECT
@@ -498,17 +537,30 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
     return {
         "user": _decorate_user(user),
         "conversations": _page_result(
-            [_decorate_conversation_membership(row) for row in conversations], conversation_page
+            [_decorate_conversation_membership(row) for row in conversations],
+            conversation_page,
+            total_count=conversation_total_count,
         ),
-        "jobs": _page_result([_decorate_job(row) for row in jobs], job_page),
+        "jobs": _page_result([_decorate_job(row) for row in jobs], job_page, total_count=job_total_count),
     }
 
 
 def chats(page: int = 1) -> dict[str, Any]:
     """Return canonical groups and how many authorised users currently see each."""
 
-    page, limit, offset = _page_window(page)
     with connection() as conn:
+        total_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS total_count
+                FROM chats
+                WHERE COALESCE(chat_status, 'normal') = 'normal'
+                  AND COALESCE(chat_mode, 'group') <> 'p2p'
+                """
+            ).fetchone()["total_count"]
+            or 0
+        )
+        page, limit, offset = _page_window(page, total_count=total_count)
         rows = conn.execute(
             """
             WITH memberships AS (
@@ -572,14 +624,15 @@ def chats(page: int = 1) -> dict[str, Any]:
             """,
             (limit, offset),
         ).fetchall()
-    return _page_result([_decorate_chat(row) for row in rows], page)
+    return _page_result([_decorate_chat(row) for row in rows], page, total_count=total_count)
 
 
 def jobs(page: int = 1) -> dict[str, Any]:
     """Return recent worker jobs. Token material is never selected."""
 
-    page, limit, offset = _page_window(page)
     with connection() as conn:
+        total_count = int(conn.execute("SELECT COUNT(*) AS total_count FROM sync_jobs").fetchone()["total_count"] or 0)
+        page, limit, offset = _page_window(page, total_count=total_count)
         rows = conn.execute(
             """
             SELECT
@@ -604,14 +657,15 @@ def jobs(page: int = 1) -> dict[str, Any]:
             """,
             (limit, offset),
         ).fetchall()
-    return _page_result([_decorate_job(row) for row in rows], page)
+    return _page_result([_decorate_job(row) for row in rows], page, total_count=total_count)
 
 
 def creators(page: int = 1) -> dict[str, Any]:
     """Return the compact owner-maintained creator identity library."""
 
-    page, limit, offset = _page_window(page)
     with connection() as conn:
+        total_count = int(conn.execute("SELECT COUNT(*) AS total_count FROM creators").fetchone()["total_count"] or 0)
+        page, limit, offset = _page_window(page, total_count=total_count)
         rows = conn.execute(
             """
             SELECT
@@ -631,11 +685,10 @@ def creators(page: int = 1) -> dict[str, Any]:
             """,
             (limit, offset),
         ).fetchall()
-    return _page_result([_decorate_creator(row) for row in rows], page)
+    return _page_result([_decorate_creator(row) for row in rows], page, total_count=total_count)
 
 
 def creator_detail(creator_id: UUID, identifier_page: int = 1) -> dict[str, Any] | None:
-    identifier_page, identifier_limit, identifier_offset = _page_window(identifier_page)
     with connection() as conn:
         creator = conn.execute(
             """
@@ -655,6 +708,16 @@ def creator_detail(creator_id: UUID, identifier_page: int = 1) -> dict[str, Any]
         ).fetchone()
         if not creator:
             return None
+        identifier_total_count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS total_count FROM creator_identifiers WHERE creator_id = %s",
+                (creator_id,),
+            ).fetchone()["total_count"]
+            or 0
+        )
+        identifier_page, identifier_limit, identifier_offset = _page_window(
+            identifier_page, total_count=identifier_total_count
+        )
         identifiers = conn.execute(
             """
             SELECT id, kind, platform, display_value, created_at, updated_at
@@ -667,15 +730,23 @@ def creator_detail(creator_id: UUID, identifier_page: int = 1) -> dict[str, Any]
         ).fetchall()
     return {
         "creator": _decorate_creator(creator),
-        "identifiers": _page_result([_decorate_creator_identifier(row) for row in identifiers], identifier_page),
+        "identifiers": _page_result(
+            [_decorate_creator_identifier(row) for row in identifiers],
+            identifier_page,
+            total_count=identifier_total_count,
+        ),
     }
 
 
 def creator_candidates(page: int = 1) -> dict[str, Any]:
     """Return rule-generated creator candidates without reading message bodies."""
 
-    page, limit, offset = _page_window(page)
     with connection() as conn:
+        total_count = int(
+            conn.execute("SELECT COUNT(*) AS total_count FROM creator_identity_candidates").fetchone()["total_count"]
+            or 0
+        )
+        page, limit, offset = _page_window(page, total_count=total_count)
         rows = conn.execute(
             """
             SELECT
@@ -707,13 +778,12 @@ def creator_candidates(page: int = 1) -> dict[str, Any]:
             """,
             (limit, offset),
         ).fetchall()
-    return _page_result([_decorate_creator_candidate(row) for row in rows], page)
+    return _page_result([_decorate_creator_candidate(row) for row in rows], page, total_count=total_count)
 
 
 def creator_candidate_detail(candidate_id: UUID, evidence_page: int = 1) -> dict[str, Any] | None:
     """Return one owner-reviewable candidate and only its linked evidence."""
 
-    evidence_page, evidence_limit, evidence_offset = _page_window(evidence_page)
     with connection() as conn:
         candidate = conn.execute(
             """
@@ -738,6 +808,14 @@ def creator_candidate_detail(candidate_id: UUID, evidence_page: int = 1) -> dict
         ).fetchone()
         if not candidate:
             return None
+        evidence_total_count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS total_count FROM creator_candidate_evidence WHERE candidate_id = %s",
+                (candidate_id,),
+            ).fetchone()["total_count"]
+            or 0
+        )
+        evidence_page, evidence_limit, evidence_offset = _page_window(evidence_page, total_count=evidence_total_count)
         evidence = conn.execute(
             """
             SELECT
@@ -767,7 +845,11 @@ def creator_candidate_detail(candidate_id: UUID, evidence_page: int = 1) -> dict
     cipher = message_body_cipher(get_settings().token_encryption_key)
     return {
         "candidate": _decorate_creator_candidate(candidate),
-        "evidence": _page_result([_decorate_candidate_evidence(row, cipher) for row in evidence], evidence_page),
+        "evidence": _page_result(
+            [_decorate_candidate_evidence(row, cipher) for row in evidence],
+            evidence_page,
+            total_count=evidence_total_count,
+        ),
     }
 
 
@@ -793,42 +875,40 @@ def message_conversations(
 
     query = normalize_message_conversation_query(query)
     chat_type = normalize_message_conversation_type(chat_type)
-    page, limit, offset = _page_window(page, MESSAGE_CONVERSATION_PAGE_SIZE)
+    directory_params = (authorization_id, query, query, query, chat_type, chat_type, chat_type)
     with connection() as conn:
+        total_count = int(
+            conn.execute(
+                f"""
+                SELECT COUNT(*) AS total_count
+                FROM (
+                    {MESSAGE_CONVERSATION_DIRECTORY_SQL}
+                    {MESSAGE_CONVERSATION_FILTER_SQL}
+                ) AS filtered_conversations
+                """,
+                directory_params,
+            ).fetchone()["total_count"]
+            or 0
+        )
+        page, limit, offset = _page_window(page, MESSAGE_CONVERSATION_PAGE_SIZE, total_count=total_count)
         rows = conn.execute(
             f"""
             WITH conversations AS (
                 {MESSAGE_CONVERSATION_DIRECTORY_SQL}
-                  AND (
-                    %s = ''
-                    OR POSITION(LOWER(%s) IN LOWER(COALESCE(c.name, ''))) > 0
-                    OR POSITION(LOWER(%s) IN LOWER(COALESCE(counterpart.display_name, ''))) > 0
-                  )
-                  AND (
-                    %s = 'all'
-                    OR (%s = 'p2p' AND COALESCE(c.chat_mode, 'group') = 'p2p')
-                    OR (%s = 'group' AND COALESCE(c.chat_mode, 'group') <> 'p2p')
-                  )
+                {MESSAGE_CONVERSATION_FILTER_SQL}
                 ORDER BY LOWER(COALESCE(c.name, counterpart.display_name, '')), ac.chat_id
                 LIMIT %s OFFSET %s
             )
             {MESSAGE_CONVERSATION_COUNTS_SQL}
             ORDER BY LOWER(COALESCE(name, counterpart_display_name, '')), chat_id
             """,
-            (
-                authorization_id,
-                query,
-                query,
-                query,
-                chat_type,
-                chat_type,
-                chat_type,
-                limit,
-                offset,
-            ),
+            (*directory_params, limit, offset),
         ).fetchall()
     return _page_result(
-        [_decorate_message_conversation(row) for row in rows], page, MESSAGE_CONVERSATION_PAGE_SIZE
+        [_decorate_message_conversation(row) for row in rows],
+        page,
+        MESSAGE_CONVERSATION_PAGE_SIZE,
+        total_count=total_count,
     )
 
 
@@ -856,7 +936,6 @@ def message_page(
 ) -> dict[str, Any]:
     """Return one explicit conversation's readable, consented message content page."""
 
-    page, limit, offset = _page_window(page, MESSAGE_PAGE_SIZE)
     filters = (authorization_id, chat_id)
     with connection() as conn:
         metrics = conn.execute(
@@ -886,6 +965,8 @@ def message_page(
             """,
             filters,
         ).fetchone()
+        total_count = int(metrics["content_count"] or 0)
+        page, limit, offset = _page_window(page, MESSAGE_PAGE_SIZE, total_count=total_count)
         rows = conn.execute(
             """
             WITH visible_messages AS (
@@ -920,9 +1001,7 @@ def message_page(
     items = [_decorate_message(row, cipher) for row in rows[:MESSAGE_PAGE_SIZE]]
     return {
         "metrics": {key: int(metrics[key] or 0) for key in metrics},
-        "items": items,
-        "page": page,
-        "has_next": len(rows) > MESSAGE_PAGE_SIZE,
+        **_page_result(items, page, MESSAGE_PAGE_SIZE, total_count=total_count),
     }
 
 
@@ -955,18 +1034,42 @@ def record_candidate_view(viewer_id: UUID, candidate_id: UUID) -> None:
         )
 
 
-def _page_window(page: int, page_size: int = LIST_PAGE_SIZE) -> tuple[int, int, int]:
+def _page_window(page: int, page_size: int = LIST_PAGE_SIZE, *, total_count: int | None = None) -> tuple[int, int, int]:
     page = max(1, min(page, MAX_PAGE))
+    if total_count is not None:
+        page = min(page, max(1, _total_pages(total_count, page_size)))
     return page, page_size + 1, (page - 1) * page_size
 
 
-def _page_result(items: list[dict[str, Any]], page: int, page_size: int = LIST_PAGE_SIZE) -> dict[str, Any]:
-    return {"items": items[:page_size], "page": page, "has_next": len(items) > page_size}
+def _page_result(
+    items: list[dict[str, Any]],
+    page: int,
+    page_size: int = LIST_PAGE_SIZE,
+    *,
+    total_count: int | None = None,
+) -> dict[str, Any]:
+    if total_count is None:
+        total_count = (page - 1) * page_size + len(items)
+    total_count = max(0, int(total_count))
+    total_pages = _total_pages(total_count, page_size)
+    return {
+        "items": items[:page_size],
+        "page": page,
+        "page_size": page_size,
+        "total_count": total_count,
+        "total_pages": total_pages,
+        "has_next": page < total_pages,
+    }
+
+
+def _total_pages(total_count: int, page_size: int) -> int:
+    return (max(0, total_count) + page_size - 1) // page_size
 
 
 def _decorate_user(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     item["display_name"] = item.get("display_name") or "未命名用户"
+    item["message_count_label"] = _message_count_label(item.get("message_count"))
     for field in ("authorized_at", "updated_at", "last_synced_at", "job_scheduled_at", "job_updated_at"):
         item[f"{field}_label"] = _format_time(item.get(field))
     item["authorization_status_label"], item["authorization_status_badge"] = _authorization_status(
@@ -990,11 +1093,12 @@ def _decorate_conversation_membership(row: dict[str, Any]) -> dict[str, Any]:
     item["chat_mode"] = item.get("chat_mode") or "group"
     item["chat_mode_label"] = _chat_mode_label(item["chat_mode"])
     item["name"] = _conversation_name(item.get("name"), item["chat_mode"], item.get("chat_id"))
-    item["member_count_label"] = "—" if item["chat_mode"] == "p2p" else _member_count(
-        item.get("member_count"), item.get("member_count_status")
+    item["member_count_label"] = (
+        "—" if item["chat_mode"] == "p2p" else _member_count(item.get("member_count"), item.get("member_count_status"))
     )
     item["sync_status_label"], item["sync_status_badge"] = _sync_status(item.get("sync_status"))
     item["last_synced_at_label"] = _format_time(item.get("last_incremental_at") or item.get("last_backfill_at"))
+    item["message_count_label"] = _message_count_label(item.get("message_count"))
     return item
 
 
@@ -1003,6 +1107,7 @@ def _decorate_chat(row: dict[str, Any]) -> dict[str, Any]:
     item["name"] = item.get("name") or "未命名群聊"
     item["chat_mode_label"] = _chat_mode_label(item.get("chat_mode"))
     item["member_count_label"] = _member_count(item.get("member_count"), item.get("member_count_status"))
+    item["message_count_label"] = _message_count_label(item.get("message_count"))
     for field in ("last_seen_at", "last_synced_at"):
         item[f"{field}_label"] = _format_time(item.get(field))
     return item
@@ -1014,9 +1119,10 @@ def _decorate_message_conversation(row: dict[str, Any]) -> dict[str, Any]:
     item["chat_mode_label"] = _chat_mode_label(item["chat_mode"])
     name = item.get("name") or item.get("counterpart_display_name")
     item["name"] = _conversation_name(name, item["chat_mode"], item.get("chat_id"))
-    item["member_count_label"] = "—" if item["chat_mode"] == "p2p" else _member_count(
-        item.get("member_count"), item.get("member_count_status")
+    item["member_count_label"] = (
+        "—" if item["chat_mode"] == "p2p" else _member_count(item.get("member_count"), item.get("member_count_status"))
     )
+    item["message_count_label"] = _message_count_label(item.get("message_count"))
     return item
 
 
@@ -1026,10 +1132,7 @@ def _decorate_message(row: dict[str, Any], cipher: TokenCipher) -> dict[str, Any
     item["chat_mode_label"] = _chat_mode_label(item["chat_mode"])
     item["chat_name"] = _conversation_name(item.get("name"), item["chat_mode"], item.get("chat_id"))
     item["sender_label"] = (
-        "本人"
-        if item.get("sent_by_author")
-        else item.get("sender_display_name")
-        or "会话对方 / 群成员"
+        "本人" if item.get("sent_by_author") else item.get("sender_display_name") or "会话对方 / 群成员"
     )
     item["created_at_label"] = _message_time(item.get("message_create_time"))
     try:
@@ -1119,9 +1222,9 @@ def _decorate_creator_candidate(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     item["subject_label"] = item.get("subject_display_name") or "未知 Lark 参与者"
     item["creator_label"] = item.get("creator_display_name") or "尚未匹配达人库"
-    item["identifier_label"] = " · ".join(
-        value for value in (item.get("platform"), item.get("display_value")) if value
-    ) or "未命名标识"
+    item["identifier_label"] = (
+        " · ".join(value for value in (item.get("platform"), item.get("display_value")) if value) or "未命名标识"
+    )
     item["status_label"], item["status_badge"] = _candidate_status(item.get("status"))
     item["created_at_label"] = _format_time(item.get("created_at"))
     item["updated_at_label"] = _format_time(item.get("updated_at"))
@@ -1319,3 +1422,7 @@ def _member_count(count: int | None, status: str | None) -> str:
     if status == "pending":
         return "正在获取"
     return "Lark 未返回"
+
+
+def _message_count_label(count: int | None) -> str:
+    return f"{int(count or 0)} 条消息" if count else "尚无消息"
