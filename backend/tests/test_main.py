@@ -1,33 +1,14 @@
-from types import SimpleNamespace
-
 import pytest
-from fastapi import HTTPException
 from starlette.requests import Request
 
 from app import main
 
 
-def _request_with_session(session: str | None = None, csrf: str | None = None) -> Request:
+def _request_with_session(session: str | None = None) -> Request:
     headers: list[tuple[bytes, bytes]] = []
     if session:
         headers.append((b"cookie", f"{main.SESSION_COOKIE}={session}".encode()))
-    if csrf:
-        headers.append((b"x-csrf-token", csrf.encode()))
     return Request({"type": "http", "method": "POST", "path": "/", "headers": headers})
-
-
-def test_csrf_token_is_bound_to_the_http_only_session(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(main, "get_settings", lambda: SimpleNamespace(token_encryption_key=b"k" * 32))
-    request = _request_with_session("session-a")
-    token = main._csrf_token(request)
-
-    assert token
-    assert token != main._csrf_token(_request_with_session("session-b"))
-    main._require_csrf(_request_with_session("session-a", token))
-
-    with pytest.raises(HTTPException) as error:
-        main._require_csrf(_request_with_session("session-a", "wrong"))
-    assert error.value.status_code == 403
 
 
 def test_index_starts_lark_oauth_without_a_session(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -48,8 +29,20 @@ def test_index_keeps_authenticated_users_on_the_dashboard(monkeypatch: pytest.Mo
     assert response.headers["location"] == "/dashboard"
 
 
-def test_manual_backfill_state_and_pending_copy_are_clear() -> None:
-    assert main._manual_backfill_state(None, None) is None
-    assert main._manual_backfill_state(object(), None) == "queued"
-    assert main._manual_backfill_state(object(), object()) == "running"
-    assert main._chat_sync_status("pending") == ("等待首次回填", "secondary")
+def test_dashboard_is_reminder_focused_and_transparent() -> None:
+    rendered = main.templates.get_template("dashboard.html").render(
+        authorization={"display_name": "CM", "p2p_discovery_status": "succeeded"},
+        admin_role=None,
+        body_consent=True,
+        stats={
+            "badge": "success",
+            "status": "接入完成",
+            "detail": "提醒规则正在测试中；当前不会自动发送消息。",
+            "last_synced_at": "2026-09-01 12:00 BST",
+            "job": {"status": "succeeded"},
+        },
+    )
+
+    assert "消息提醒中心" in rendered
+    assert "权限与数据使用" in rendered
+    assert "已同步消息总数" not in rendered

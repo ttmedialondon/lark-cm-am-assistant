@@ -47,10 +47,9 @@ sudo journalctl -u lark-message-stats-web.service -u lark-message-stats-worker.s
 ## Lark 权限与验收
 
 1. 已有 CM/AM 必须打开 `https://larkbot.ttapp.help/` 并重新完成 OAuth；这是正文和 P2P 采集的明确授权边界。
-2. 回到仪表盘。会话列表通常会先出现，随后每个会话的“已同步消息记录”和同步状态持续更新。
-3. 需要重新核对一个会话的历史时，点击该行的“同步全部历史”。页面会显示“已请求同步”或“正在主动同步”；Worker 串行重新扫描 Lark API 可返回的历史，已有消息 ID 自动去重。
-4. 若管理员启用成员人数功能，需在 Lark 开发者后台发布 `im:chat.members:read`，并让测试用户重新 OAuth；成员人数来自 Lark 的 `user_total`。未启用时显示“Lark 未返回”，但不会阻塞消息统计。
-5. owner 重新登录后进入 `https://larkbot.ttapp.help/admin/messages`，选择 CM/AM 和会话，确认仅在新版授权后的回填完成后出现正文。不要在终端、日志或 Git 中输出正文。
+2. 回到“消息提醒中心”，确认显示接入状态和最近检查时间；个人页不展示会话或消息统计。
+3. 若管理员启用成员人数功能，需在 Lark 开发者后台发布 `im:chat.members:read`，并让测试用户重新 OAuth；该数据仅用于内部管理台，不会阻塞消息同步。
+4. owner 重新登录后进入 `https://larkbot.ttapp.help/admin/messages`，选择 CM/AM 和会话，确认仅在新版授权后的回填完成后出现正文。不要在终端、日志或 Git 中输出正文。
 
 ## 回退原则
 

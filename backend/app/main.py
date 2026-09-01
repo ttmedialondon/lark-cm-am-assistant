@@ -231,7 +231,6 @@ def dashboard(request: Request):
     if not authorization:
         return RedirectResponse(url="/", status_code=303)
     stats = _dashboard_stats(authorization["id"])
-    chats = _dashboard_chats(authorization["id"])
     return _template(
         request,
         "dashboard.html",
@@ -239,9 +238,7 @@ def dashboard(request: Request):
             "authorization": authorization,
             "admin_role": admin_role_for(authorization["id"]),
             "stats": stats,
-            "chats": chats,
             "body_consent": bool(authorization["body_consent_at"]),
-            "csrf_token": _csrf_token(request),
         },
     )
 
@@ -252,80 +249,6 @@ def dashboard_stats(request: Request):
     if not authorization:
         raise HTTPException(status_code=401, detail="sign in required")
     return _template(request, "partials/stats.html", {"stats": _dashboard_stats(authorization["id"])})
-
-
-@app.get("/dashboard/chats")
-def dashboard_chats(request: Request):
-    authorization = _current_authorization(request)
-    if not authorization:
-        raise HTTPException(status_code=401, detail="sign in required")
-    return _template(
-        request,
-        "partials/chats.html",
-        {
-            "chats": _dashboard_chats(authorization["id"]),
-            "body_consent": bool(authorization["body_consent_at"]),
-            "csrf_token": _csrf_token(request),
-        },
-    )
-
-
-@app.post("/dashboard/chats/{chat_id}/sync-all")
-def request_conversation_full_sync(request: Request, chat_id: str):
-    """Queue a safe, idempotent full-history rescan for one visible conversation."""
-
-    authorization = _current_authorization(request)
-    if not authorization:
-        raise HTTPException(status_code=401, detail="sign in required")
-    if authorization["status"] != "active":
-        raise HTTPException(status_code=409, detail="Lark authorization needs attention")
-    _require_csrf(request)
-
-    with connection() as conn, conn.transaction():
-        chat = conn.execute(
-            """
-            SELECT c.name, access.manual_backfill_requested_at
-            FROM authorization_chats AS access
-            JOIN chats AS c ON c.chat_id = access.chat_id
-            WHERE access.authorization_id = %s AND access.chat_id = %s
-              AND access.sync_enabled AND access.is_visible
-              AND COALESCE(c.chat_status, 'normal') = 'normal'
-            FOR UPDATE
-            """,
-            (authorization["id"], chat_id),
-        ).fetchone()
-        if not chat:
-            raise HTTPException(status_code=404, detail="conversation not found")
-
-        chat_name = chat["name"] or "该会话"
-        if chat["manual_backfill_requested_at"]:
-            notice = f"{chat_name} 已在全量同步队列中。"
-        else:
-            conn.execute(
-                """
-                UPDATE authorization_chats
-                SET manual_backfill_requested_at = NOW(),
-                    manual_backfill_started_at = NULL,
-                    sync_generation = sync_generation + 1
-                WHERE authorization_id = %s AND chat_id = %s
-                """,
-                (authorization["id"], chat_id),
-            )
-            _audit(conn, authorization["id"], "manual_conversation_backfill_requested")
-            notice = f"已请求重新同步 {chat_name} 的全部可读取历史。已有消息会按消息 ID 去重，不会重复计数。"
-
-        _queue_or_wake_backfill(conn, authorization["id"])
-
-    return _template(
-        request,
-        "partials/chats.html",
-        {
-            "chats": _dashboard_chats(authorization["id"]),
-            "body_consent": bool(authorization["body_consent_at"]),
-            "csrf_token": _csrf_token(request),
-            "sync_notice": notice,
-        },
-    )
 
 
 def _current_authorization(request: Request) -> dict[str, Any] | None:
@@ -351,66 +274,18 @@ def _current_authorization(request: Request) -> dict[str, Any] | None:
         return row
 
 
-def _csrf_token(request: Request) -> str:
-    raw_session = request.cookies.get(SESSION_COOKIE)
-    if not raw_session:
-        return ""
-    return hmac.new(get_settings().token_encryption_key, raw_session.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-def _require_csrf(request: Request) -> None:
-    expected = _csrf_token(request)
-    supplied = request.headers.get("X-CSRF-Token", "")
-    if not expected or not hmac.compare_digest(supplied, expected):
-        raise HTTPException(status_code=403, detail="invalid request token")
-
-
 def _dashboard_stats(authorization_id: uuid.UUID) -> dict[str, Any]:
     with connection() as conn:
-        counts = conn.execute(
+        last_sync = conn.execute(
             """
             SELECT
-                (SELECT COUNT(*)
-                   FROM authorization_chats AS access
-                   JOIN chats AS c ON c.chat_id = access.chat_id
-                  WHERE access.authorization_id = %s AND access.is_visible
-                        AND COALESCE(c.chat_status, 'normal') = 'normal'
-                        AND COALESCE(c.chat_mode, 'group') = 'group') AS group_count,
-                (SELECT COUNT(*)
-                   FROM authorization_chats AS access
-                   JOIN chats AS c ON c.chat_id = access.chat_id
-                  WHERE access.authorization_id = %s AND access.is_visible
-                        AND COALESCE(c.chat_status, 'normal') = 'normal'
-                        AND c.chat_mode = 'p2p') AS p2p_count,
-                (SELECT COUNT(*)
-                   FROM authorization_message_observations AS observation
-                   JOIN authorization_chats AS access
-                     ON access.authorization_id = observation.authorization_id
-                    AND access.chat_id = observation.chat_id
-                   JOIN chats AS c ON c.chat_id = access.chat_id
-                   JOIN chat_messages AS message
-                     ON message.chat_id = observation.chat_id AND message.message_id = observation.message_id
-                  WHERE observation.authorization_id = %s AND access.is_visible
-                        AND COALESCE(c.chat_status, 'normal') = 'normal'
-                        AND NOT message.is_deleted) AS message_count,
-                (SELECT COUNT(*)
-                   FROM authorization_message_observations AS observation
-                   JOIN authorization_chats AS access
-                     ON access.authorization_id = observation.authorization_id
-                    AND access.chat_id = observation.chat_id
-                   JOIN chats AS c ON c.chat_id = access.chat_id
-                   JOIN chat_messages AS message
-                     ON message.chat_id = observation.chat_id AND message.message_id = observation.message_id
-                  WHERE observation.authorization_id = %s AND access.is_visible
-                        AND COALESCE(c.chat_status, 'normal') = 'normal'
-                        AND observation.sent_by_author AND NOT message.is_deleted) AS own_message_count,
-                (SELECT MAX(COALESCE(access.last_incremental_at, access.last_backfill_at))
-                   FROM authorization_chats AS access
-                   JOIN chats AS c ON c.chat_id = access.chat_id
-                  WHERE access.authorization_id = %s AND access.is_visible
-                    AND COALESCE(c.chat_status, 'normal') = 'normal') AS last_synced_at
+                MAX(COALESCE(access.last_incremental_at, access.last_backfill_at)) AS last_synced_at
+            FROM authorization_chats AS access
+            JOIN chats AS c ON c.chat_id = access.chat_id
+            WHERE access.authorization_id = %s AND access.is_visible
+              AND COALESCE(c.chat_status, 'normal') = 'normal'
             """,
-            (authorization_id, authorization_id, authorization_id, authorization_id, authorization_id),
+            (authorization_id,),
         ).fetchone()
         job = conn.execute(
             """
@@ -424,11 +299,7 @@ def _dashboard_stats(authorization_id: uuid.UUID) -> dict[str, Any]:
 
     status, detail, badge = _job_status(job)
     return {
-        "group_count": int(counts["group_count"] or 0),
-        "p2p_count": int(counts["p2p_count"] or 0),
-        "message_count": int(counts["message_count"] or 0),
-        "own_message_count": int(counts["own_message_count"] or 0),
-        "last_synced_at": _format_time(counts["last_synced_at"]),
+        "last_synced_at": _format_time(last_sync["last_synced_at"]),
         "status": status,
         "detail": detail,
         "badge": badge,
@@ -436,104 +307,16 @@ def _dashboard_stats(authorization_id: uuid.UUID) -> dict[str, Any]:
     }
 
 
-def _dashboard_chats(authorization_id: uuid.UUID) -> list[dict[str, Any]]:
-    with connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                access.chat_id,
-                c.name,
-                c.external,
-                c.chat_mode,
-                access.member_count,
-                access.member_count_status,
-                access.sync_status,
-                access.last_error,
-                access.last_backfill_at,
-                access.last_incremental_at,
-                access.manual_backfill_requested_at,
-                access.manual_backfill_started_at,
-                COUNT(observation.message_id) FILTER (WHERE NOT message.is_deleted) AS message_count
-            FROM authorization_chats AS access
-            JOIN chats AS c ON c.chat_id = access.chat_id
-            LEFT JOIN authorization_message_observations AS observation
-                ON observation.authorization_id = access.authorization_id AND observation.chat_id = access.chat_id
-            LEFT JOIN chat_messages AS message
-                ON message.chat_id = observation.chat_id AND message.message_id = observation.message_id
-            WHERE access.authorization_id = %s
-              AND access.is_visible
-              AND COALESCE(c.chat_status, 'normal') = 'normal'
-            GROUP BY
-                access.authorization_id, access.chat_id, c.name, c.external, c.chat_mode, access.member_count,
-                access.member_count_status, access.sync_status, access.last_error,
-                access.last_backfill_at, access.last_incremental_at,
-                access.manual_backfill_requested_at, access.manual_backfill_started_at
-            ORDER BY LOWER(COALESCE(c.name, '')), access.chat_id
-            """,
-            (authorization_id,),
-        ).fetchall()
-
-    chats: list[dict[str, Any]] = []
-    for row in rows:
-        sync_label, sync_badge = _chat_sync_status(row["sync_status"])
-        chats.append(
-            {
-                "chat_id": row["chat_id"],
-                "name": row["name"]
-                or (f"未命名私聊 · {row['chat_id'][-8:]}" if row["chat_mode"] == "p2p" else "未命名群聊"),
-                "external": bool(row["external"]),
-                "chat_mode": row["chat_mode"] or "group",
-                "chat_mode_label": "私聊" if row["chat_mode"] == "p2p" else "群聊",
-                "member_count": "—"
-                if row["chat_mode"] == "p2p"
-                else _member_count_label(row["member_count"], row["member_count_status"]),
-                "message_count": int(row["message_count"] or 0),
-                "sync_label": sync_label,
-                "sync_badge": sync_badge,
-                "last_synced_at": _format_time(row["last_incremental_at"] or row["last_backfill_at"]),
-                "manual_backfill_state": _manual_backfill_state(
-                    row["manual_backfill_requested_at"], row["manual_backfill_started_at"]
-                ),
-            }
-        )
-    return chats
-
-
 def _job_status(job: dict[str, Any] | None) -> tuple[str, str, str]:
     if not job:
-        return "等待首次同步", "授权完成后，后台服务会自动枚举你当前可见的会话。", "secondary"
+        return "准备接入", "授权完成后，系统会开始建立提醒所需的连接。", "secondary"
     if job["status"] in {"queued", "running"}:
-        return "正在同步", "正在枚举会话并按页同步消息；刷新页面不会重复计数。", "primary"
+        return "正在接入", "正在建立提醒所需的连接。", "primary"
     if job["status"] == "succeeded":
-        return "同步完成", "后台会按固定间隔继续增量统计新消息。", "success"
+        return "接入完成", "提醒规则正在测试中；当前不会自动发送消息。", "success"
     if job["status"] == "attention_required":
-        return "需要重新授权", "Lark 授权或权限需要处理，请返回首页重新授权。", "warning"
-    return "同步遇到问题", "后台会安全重试；若持续失败，请联系管理员检查应用权限。", "danger"
-
-
-def _chat_sync_status(value: str | None) -> tuple[str, str]:
-    mapping = {
-        "pending": ("等待首次回填", "secondary"),
-        "syncing": ("正在同步", "primary"),
-        "succeeded": ("已同步", "success"),
-        "not_readable": ("Lark 未允许读取", "warning"),
-        "failed_retryable": ("等待重试", "warning"),
-    }
-    return mapping.get(value or "", ("状态未知", "secondary"))
-
-
-def _manual_backfill_state(requested_at: datetime | None, started_at: datetime | None) -> str | None:
-    if not requested_at:
-        return None
-    return "running" if started_at else "queued"
-
-
-def _member_count_label(count: int | None, status: str | None) -> str:
-    if count is not None:
-        return str(count)
-    if status == "pending":
-        return "正在获取"
-    return "Lark 未返回"
+        return "需要重新授权", "提醒所需的授权需要重新确认。", "warning"
+    return "接入遇到问题", "系统会安全重试；若持续失败，请联系管理员。", "danger"
 
 
 def _queue_job(conn: psycopg.Connection, authorization_id: uuid.UUID, mode: str) -> bool:
@@ -547,21 +330,6 @@ def _queue_job(conn: psycopg.Connection, authorization_id: uuid.UUID, mode: str)
         (uuid.uuid4(), authorization_id, mode),
     ).fetchone()
     return row is not None
-
-
-def _queue_or_wake_backfill(conn: psycopg.Connection, authorization_id: uuid.UUID) -> None:
-    if _queue_job(conn, authorization_id, "backfill"):
-        return
-    # A queued incremental job will switch to backfill before processing its
-    # next page. Wake it now; a running job checks at its next page boundary.
-    conn.execute(
-        """
-        UPDATE sync_jobs
-        SET scheduled_at = NOW(), updated_at = NOW()
-        WHERE authorization_id = %s AND status = 'queued'
-        """,
-        (authorization_id,),
-    )
 
 
 def _audit(conn: psycopg.Connection, authorization_id: uuid.UUID, action: str) -> None:

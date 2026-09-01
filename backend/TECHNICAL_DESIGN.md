@@ -23,14 +23,7 @@
 
 ## 页面口径
 
-个人仪表盘展示：
-
-| 项目 | 口径 |
-|---|---|
-| 已加入群聊 / 私聊 | 当前可见、`chat_status=normal` 的会话数。 |
-| 已同步消息总数 | 当前可见会话中 Lark 返回、未撤回的唯一消息 ID。 |
-| 我发送的消息数 | 发送者的 `open_id` 与当前 OAuth 用户一致。 |
-| 最近一次同步 | 某个当前可见会话最后完成回填或增量同步的时间。 |
+CM/AM 的个人页面是“消息提醒中心”：仅展示接入状态和最近检查时间，不展示会话名称、成员人数、消息数量或消息正文，也不提供手动历史回填。页面保留可折叠、明确的“权限与数据使用”说明：系统会在用户授权范围内读取群聊和私聊内容用于分析，正文会加密保存并由内部 owner 按该用户授权范围查看。
 
 `/admin` 展示公司级统计、人员、群聊和同步任务。`/admin/messages` 仅数据库 `admin_roles` 中的 `owner` 可访问：可用 CM/AM、会话类型和会话下拉筛选，展示最近 100 条已加密存储的正文。每次内容页查看写入 `audit_events`，但审计记录不含消息正文。
 
@@ -40,7 +33,11 @@
 2. Worker 使用稳定创建时间顺序分页发现会话（每页 100）并读取消息（每页 50）。
 3. 一页中的 canonical 消息、用户观察关系与游标在同一 PostgreSQL 事务写入，重启可安全续跑。
 4. 首次回填完成后，每 300 秒创建增量 job；每次重叠 600 秒，重复消息按 `(chat_id, message_id)` 去重。
-5. “同步全部历史”只为当前用户—会话关系写入请求标记；同一用户仍只有一个活动 job，旧 worker 不能覆盖新游标。
+5. 同一用户同一时刻最多一个 worker job；个人页面不创建手动同步任务。
+
+## 后续紧急提醒跳转
+
+Lark 的消息模型可返回 `message_app_link`、`message_position` 与 `thread_message_position`。真正实现紧急提醒时，worker 应原样保存 `message_app_link`，提醒卡使用普通 HTTPS 链接“在 Lark 中打开”；不要用 `message_id` 猜 URL。无精确消息链接时，可用会话 fallback：`https://applink.larksuite.com/client/chat/open?openChatId=oc_xxx`。点击人仍必须拥有该会话权限。
 
 ## 运行组件
 
@@ -68,3 +65,5 @@ Caddy → FastAPI + Jinja2/HTMX/Tabler → PostgreSQL
 - [Lark user access token](https://open.larksuite.com/document/uAjLw4CM/ukTMukTMukTM/authentication-management/access-token/get-user-access-token)
 - [Lark 会话历史消息](https://open.larksuite.com/document/server-docs/im-v1/message/list)
 - [Lark IM CLI 的 chat list 参数说明](https://github.com/larksuite/cli/blob/main/skills/lark-im/references/lark-im-chat-list.md)
+- [Lark SDK 的 Message AppLink 字段](https://pkg.go.dev/github.com/larksuite/oapi-sdk-go/v3/service/im/v1)
+- [Lark CLI 的 AppLink 说明](https://github.com/larksuite/cli/blob/main/skills/lark-im/SKILL.md)
