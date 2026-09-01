@@ -12,6 +12,7 @@ from typing import Any
 
 import psycopg
 
+from . import contact_assessments
 from .config import Settings, get_settings
 from .creator_rules import extract_creator_claims
 from .crypto import TokenCipher, message_body_cipher
@@ -56,19 +57,30 @@ def run_forever() -> None:
     while True:
         try:
             _recover_expired_leases()
-            if not settings.app_secret_configured:
-                time.sleep(settings.worker_idle_seconds)
+            # Synchronisation always wins: an assessment only uses already
+            # stored, authorised content and must never delay a Lark sync.
+            job = _claim_job() if settings.app_secret_configured else None
+            if job:
+                _execute_job(job, settings)
                 continue
-            job = _claim_job()
-            if not job:
-                time.sleep(settings.worker_idle_seconds)
+            if _run_contact_assessment(settings):
                 continue
-            _execute_job(job, settings)
+            time.sleep(settings.worker_idle_seconds)
         except KeyboardInterrupt:
             raise
         except Exception:  # Unexpected failures must not terminate the systemd worker loop.
             LOGGER.exception("worker loop failed without exposing user data")
             time.sleep(settings.worker_idle_seconds)
+
+
+def _run_contact_assessment(settings: Settings) -> bool:
+    """Run one manually requested assessment without taking down sync processing."""
+
+    try:
+        return contact_assessments.run_next_contact_assessment(settings)
+    except Exception:
+        LOGGER.exception("contact assessment worker failed without exposing user data")
+        return False
 
 
 def _recover_expired_leases() -> None:

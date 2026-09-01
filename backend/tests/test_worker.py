@@ -203,3 +203,27 @@ def test_normal_pagination_requeue_does_not_increment_retry_count(monkeypatch) -
     assert calls[0][1][1:4] == (False, None, None)
     assert "attempts = attempts + CASE WHEN %s THEN 1 ELSE 0 END" in calls[0][0]
     assert "last_error_code = %s" in calls[0][0]
+
+
+def test_contact_assessment_runner_isolated_from_sync_loop(monkeypatch) -> None:
+    settings = object()
+    calls = []
+
+    monkeypatch.setattr(
+        worker.contact_assessments,
+        "run_next_contact_assessment",
+        lambda received_settings: calls.append(received_settings) or True,
+    )
+
+    assert worker._run_contact_assessment(settings) is True
+    assert calls == [settings]
+
+
+def test_contact_assessment_runner_keeps_worker_alive_on_unexpected_failure(monkeypatch) -> None:
+    monkeypatch.setattr(
+        worker.contact_assessments,
+        "run_next_contact_assessment",
+        lambda _settings: (_ for _ in ()).throw(RuntimeError("untrusted details")),
+    )
+
+    assert worker._run_contact_assessment(object()) is False

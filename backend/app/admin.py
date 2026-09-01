@@ -17,7 +17,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse, Response
 
-from . import admin_reporting, ai_feature_config, creator_registry
+from . import admin_reporting, ai_feature_config, contact_assessments, creator_registry
 from .config import get_settings
 from .db import connection
 
@@ -185,6 +185,44 @@ def create_admin_router(
             },
             status_code,
         )
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
+    def render_contact_assessment(
+        request: Request,
+        access_context: dict[str, Any],
+        *,
+        open_id: str,
+        assessment_id: UUID,
+        source_page: int = 1,
+        error: str | None = None,
+        status_code: int = 200,
+    ) -> Response:
+        """Render one advisory result; only this page can include evidence text."""
+
+        detail = contact_assessments.assessment_detail(assessment_id)
+        if not detail or not contact_assessments.assessment_matches_contact(assessment_id, open_id):
+            response = render_template(
+                request,
+                "error.html",
+                {"title": "未找到 AI 判定", "detail": "该判定不存在，或不属于当前联系人。"},
+                404,
+            )
+        else:
+            if any(item.get("available") for item in detail.get("evidence", ())):
+                contact_assessments.record_assessment_view(access_context["authorization"]["id"], assessment_id)
+            response = render_template(
+                request,
+                "admin/contact_assessment.html",
+                {
+                    **page_context(access_context, "contacts"),
+                    "assessment": detail,
+                    "route_open_id": open_id,
+                    "source_page": source_page,
+                    "form_error": error,
+                },
+                status_code,
+            )
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 
@@ -445,6 +483,7 @@ def create_admin_router(
             )
         conversations = detail["conversations"]
         accounts = detail["accounts"]
+        latest_assessment = contact_assessments.latest_contact_assessment(detail["contact"]["contact_id"])
         response = render_template(
             request,
             "admin/contact_detail.html",
@@ -453,6 +492,8 @@ def create_admin_router(
                 "contact": detail["contact"],
                 "identities": detail["identities"],
                 "source_page": page,
+                "assessment": latest_assessment,
+                "assessment_available": contact_assessments.assessment_available(),
                 "conversations": conversations["items"],
                 "conversation_page": pagination(
                     conversations,
@@ -470,6 +511,176 @@ def create_admin_router(
                     conversations_page=conversations["page"],
                 ),
             },
+        )
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
+    @router.post("/admin/contacts/{open_id}/assessment")
+    async def admin_queue_contact_assessment(request: Request, open_id: str, page: int = 1) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        form = await _form_fields(request)
+        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
+            response = render_template(
+                request,
+                "error.html",
+                {"title": "请求校验失败", "detail": "请返回联系人详情页面后重试。"},
+                400,
+            )
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
+
+        contact = admin_reporting.contact_detail(open_id)
+        if not contact:
+            response = render_template(
+                request,
+                "error.html",
+                {"title": "未找到 Lark 参与者", "detail": "该参与者尚未被同步，或不在外部联系人目录中。"},
+                404,
+            )
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
+        try:
+            contact_assessments.queue_contact_assessment(
+                access_context["authorization"]["id"], contact["contact"]["contact_id"]
+            )
+        except contact_assessments.ContactAssessmentInputError as exc:
+            response = render_template(
+                request,
+                "error.html",
+                {"title": "无法发起 AI 判定", "detail": str(exc)},
+                400,
+            )
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
+        response = RedirectResponse(url=f"/admin/contacts/{open_id}?{urlencode({'page': page})}", status_code=303)
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
+    @router.get("/admin/contacts/{open_id}/assessments/{assessment_id}")
+    def admin_contact_assessment(
+        request: Request,
+        open_id: str,
+        assessment_id: UUID,
+        page: int = 1,
+    ) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        return render_contact_assessment(
+            request,
+            access_context,
+            open_id=open_id,
+            assessment_id=assessment_id,
+            source_page=page,
+        )
+
+    @router.post("/admin/contacts/{open_id}/assessments/{assessment_id}/roles")
+    async def admin_confirm_assessment_role(
+        request: Request,
+        open_id: str,
+        assessment_id: UUID,
+        page: int = 1,
+    ) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        if not contact_assessments.assessment_matches_contact(assessment_id, open_id):
+            response = render_template(
+                request,
+                "error.html",
+                {"title": "未找到 AI 判定", "detail": "该判定不存在，或不属于当前联系人。"},
+                404,
+            )
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
+        form = await _form_fields(request)
+        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
+            return render_contact_assessment(
+                request,
+                access_context,
+                open_id=open_id,
+                assessment_id=assessment_id,
+                source_page=page,
+                error="请求校验失败，请返回此页面后重试。",
+                status_code=400,
+            )
+        try:
+            contact_assessments.confirm_assessment_role(
+                access_context["authorization"]["id"], assessment_id, form.get("role", "")
+            )
+        except contact_assessments.ContactAssessmentInputError as exc:
+            return render_contact_assessment(
+                request,
+                access_context,
+                open_id=open_id,
+                assessment_id=assessment_id,
+                source_page=page,
+                error=str(exc),
+                status_code=400,
+            )
+        response = RedirectResponse(
+            url=f"/admin/contacts/{open_id}/assessments/{assessment_id}?{urlencode({'page': page})}",
+            status_code=303,
+        )
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
+    @router.post("/admin/contacts/{open_id}/assessments/{assessment_id}/account-relations")
+    async def admin_confirm_assessment_account_relation(
+        request: Request,
+        open_id: str,
+        assessment_id: UUID,
+        page: int = 1,
+    ) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        if not contact_assessments.assessment_matches_contact(assessment_id, open_id):
+            response = render_template(
+                request,
+                "error.html",
+                {"title": "未找到 AI 判定", "detail": "该判定不存在，或不属于当前联系人。"},
+                404,
+            )
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
+        form = await _form_fields(request)
+        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
+            return render_contact_assessment(
+                request,
+                access_context,
+                open_id=open_id,
+                assessment_id=assessment_id,
+                source_page=page,
+                error="请求校验失败，请返回此页面后重试。",
+                status_code=400,
+            )
+        try:
+            contact_assessments.confirm_assessment_account_relation(
+                access_context["authorization"]["id"],
+                assessment_id,
+                form.get("account_ref", ""),
+                form.get("relationship", ""),
+            )
+        except contact_assessments.ContactAssessmentInputError as exc:
+            return render_contact_assessment(
+                request,
+                access_context,
+                open_id=open_id,
+                assessment_id=assessment_id,
+                source_page=page,
+                error=str(exc),
+                status_code=400,
+            )
+        response = RedirectResponse(
+            url=f"/admin/contacts/{open_id}/assessments/{assessment_id}?{urlencode({'page': page})}",
+            status_code=303,
         )
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response

@@ -1,6 +1,6 @@
 # 达人项目：外部联系人、账号与达人归属的 OpenAI 辅助判定方案
 
-状态：**非 AI 的联系人、独立账号与账号出现记录基础已实现；尚未配置 OpenAI API Key 或调用 Luna。**
+状态：**联系人、独立账号、账号出现记录与 owner 手动 AI 影子判定已实现。**
 
 这份文档是本阶段唯一的实现契约。它取代“发过账号的人就是达人候选”的旧口径。
 
@@ -71,11 +71,9 @@ Worker 从**所有已授权、可读取的消息**中提取明确的 TikTok、In
 
 ```json
 {
-  "roles": ["creator"],
-  "primary_role": "creator",
-  "confidence": 0.0,
-  "evidence_refs": ["M1", "H2"],
-  "reason": "不超过 400 字、不复制聊天原文的可审计说明"
+  "roles": [
+    {"role": "creator", "confidence": 0.0, "evidence_refs": ["M1", "M2"]}
+  ]
 }
 ```
 
@@ -88,10 +86,8 @@ Worker 从**所有已授权、可读取的消息**中提取明确的 TikTok、In
 ```json
 {
   "relationship": "owner | representative | mentioned_other | unrelated | insufficient",
-  "evidence_strength": "self_declared | contextual | weak | insufficient",
   "confidence": 0.0,
-  "evidence_refs": ["M1"],
-  "reason": "不超过 400 字、不复制聊天原文的可审计说明"
+  "evidence_refs": ["M1"]
 }
 ```
 
@@ -132,18 +128,19 @@ Builder 每次只构造一个固定大小的证据包：
 
 OpenAI 的成本归属应以 **Project** 为单位，而不是让所有功能共用一个组织级 key：生产环境每个成本中心/功能一个 Project，并在该 Project 下创建专用 service account 与 key。当前功能建议命名为 `TT Lark – Contact Assessment – Production` 和 `contact-assessment-worker`；翻译、回复建议等后续功能各自建立 Project 和 key。这样 Project 用量、预算和告警能直接对应功能，必要时也可按 key 进一步核对。
 
-本阶段尚未存储任何 OpenAI 凭证。配置功能合入后，只有 owner 可访问 `/admin/ai`，并且当前只会出现 `contact_assessment` 这一项。owner 粘贴 Project 的 service-account key 一次后，服务端将以独立加密域保存；页面只显示遮罩尾号，审计事件只记录“已配置/已轮换/已启停”等动作和非敏感配置，不记录 key。本页同时显示 Project ID、模型、启用状态、最近测试时间/状态，并允许轮换密钥或停用功能；留空密钥字段表示保留已存密钥。
+只有 owner 可访问 `/admin/ai`，且当前只会出现 `contact_assessment` 这一项。owner 粘贴 Project 的 service-account key 一次后，服务端以独立加密域保存；页面只显示遮罩尾号，审计事件只记录“已配置/已轮换/已启停”等动作和非敏感配置，不记录 key。本页同时显示 Project ID、模型、启用状态、最近测试时间/状态，并允许轮换密钥或停用功能；留空密钥字段表示保留已存密钥。
 
-这里不使用 OpenAI Organization Admin Key，也不允许浏览器直接调用 OpenAI。即使完成配置，在 Context Builder、评估任务和 worker 接入完成前，也不会产生实际模型调用或费用。
+这里不使用 OpenAI Organization Admin Key，也不允许浏览器直接调用 OpenAI。只有 owner 在一个外部联系人详情页点击“AI 影子判定”后，worker 才会发起一次模型调用。
 
 使用一次性 Responses 请求：`model: gpt-5.6-luna`、`reasoning.effort: low`、`store: false`、无工具、严格 JSON Schema Structured Outputs。先以 `low` 作为延迟/成本基线；只在人工标注集上比较 `medium`。Luna 支持 Responses API 和 Structured Outputs，适合高频、固定证据包的分类任务。[GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
 
 服务端必须验证：
 
-- 角色/关系枚举、置信度范围和原因长度；
-- `M1` 必须被引用；
+- 角色/关系枚举、置信度范围和证据引用；
 - 每个 `evidence_ref` 必须属于本次证据包；
 - 任何无效 JSON、编造引用、拒答或 API 失败都只产生 `invalid` / `failed` 评估。
+
+评估结果只保存角色/关系枚举、置信度、账号引用和消息引用；不保存 Prompt、模型摘要或模型理由，避免把消息正文的派生复述再写入另一张表。每一次人工确认都会在同一数据库事务中再次检查所有引用消息仍属于原始授权范围；若授权已失效，只能查看尚可显示的证据，不能写入业务事实。
 
 Responses API 支持 `store: false` 和 JSON Schema 约束输出。`store: false` 表示响应不留作 API 检索，不等于 Zero Data Retention，因此生产正文发送前仍需按公司数据政策批准。[Responses API 参考](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)
 
@@ -180,7 +177,7 @@ social_account_observations
   仅表示账号出现于某条消息，不表达归属
 
 contact_assessments / contact_assessment_refs
-  保存影子模型任务、用量、加密结果与输入引用，不复制正文或 Prompt
+  保存影子模型任务、用量、结构化建议与输入引用，不复制正文、Prompt 或模型自由文本
 ```
 
 现有达人主档迁入 `contacts` 并写入已确认 `creator` 角色；已维护的平台账号迁入 `social_accounts` 和已确认 `owner` 关系；邮箱、电话、CRM ID、别名迁入 `contact_identifiers`。现有规则候选和证据只迁成 `social_account_observations`，保留消息和授权边界，**绝不**把“旧候选的发言人”自动迁成账号 `owner` 或 `representative`。
@@ -198,7 +195,7 @@ AI 永远只给建议，唯一可以写入业务事实的是 owner：
 
 管理台应新增“外部联系人”工作台：先按联系人筛选，再查看该联系人的会话、角色建议、账号线索、AI 引用证据和人工结论。原“达人识别候选”页面改为“账号出现记录 / 账号关系核验”，不再暗示每一条都是达人。
 
-网页按钮只入队，不能在 HTTP 请求内调用模型。复用现有 worker：只有没有到期 Lark 同步任务时，才使用 `FOR UPDATE SKIP LOCKED` 领取一个 AI 任务，避免影响 5 分钟增量同步。429、网络错误和 5xx 最多三次指数退避；普通 4xx、拒答、结构化输出或引用校验失败不自动重试。日志不记录正文或原始输出。
+网页按钮只入队，不能在 HTTP 请求内调用模型。复用现有 worker：只有没有到期 Lark 同步任务时，才使用 `FOR UPDATE SKIP LOCKED` 领取一个 AI 任务，避免影响 5 分钟增量同步。当前手动试验版不会自动重试：网络、4xx、拒答、结构化输出或引用校验失败都会保留失败状态，由 owner 明确重新发起，避免意外重复收费。日志不记录正文或原始输出。
 
 ## 上线标准
 
@@ -215,7 +212,7 @@ AI 永远只给建议，唯一可以写入业务事实的是 owner：
 
 1. 已迁移为联系人、独立账号和账号出现记录模型，并将旧规则候选无损迁入；同时对已有、仍在授权范围内的本地正文重建账号出现记录。
 2. 已扩展 worker：从 P2P 人类对端、消息发送者、@ 提及和成员快照发现联系人；从所有授权可见消息提取账号出现记录。P2P bot 不会再被建成人类联系人。
-3. 实现 Context Builder、受限 OpenAI 配置、评估任务表和 owner 手动“AI 影子核验”。
-4. 实现外部联系人工作台与人工确认事务。
+3. 已实现 Context Builder、受限 OpenAI 配置、评估任务表和 owner 手动“AI 影子核验”。
+4. 已在外部联系人详情页实现结果展示与人工确认事务。
 5. 对已授权人员安排可续跑重扫，补齐回复链、话题和 @ 关系字段。
-6. 以人工标注集评估并迭代 Prompt；后续才接入 CRM、经纪人关系和负责人归属。
+6. 以人工标注集评估枚举/置信度/引用；后续才接入 CRM、经纪人关系和负责人归属。

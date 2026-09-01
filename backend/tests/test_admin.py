@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from fastapi.testclient import TestClient
 
-from app import admin, admin_reporting, creator_registry
+from app import admin, admin_reporting, contact_assessments, creator_registry
 
 
 def _page(items, page=1, has_next=False, **metadata):
@@ -127,8 +127,15 @@ def test_owner_contact_detail_reads_only_that_contact_without_message_content(mo
         admin_reporting,
         "contact_detail",
         lambda *args: reads.append(args)
-        or {"contact": {}, "identities": [], "conversations": _page([]), "accounts": _page([])},
+        or {
+            "contact": {"contact_id": uuid4()},
+            "identities": [],
+            "conversations": _page([]),
+            "accounts": _page([]),
+        },
     )
+    monkeypatch.setattr(contact_assessments, "latest_contact_assessment", lambda _contact_id: None)
+    monkeypatch.setattr(contact_assessments, "assessment_available", lambda: True)
 
     response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get(
         "/admin/contacts/ou_contact?conversations_page=2&accounts_page=3"
@@ -138,6 +145,123 @@ def test_owner_contact_detail_reads_only_that_contact_without_message_content(mo
     assert response.headers["cache-control"] == "no-store, max-age=0"
     assert reads == [("ou_contact", 2, 3)]
     assert contexts[-1][0] == "admin/contact_detail.html"
+    assert contexts[-1][1]["assessment"] is None
+    assert contexts[-1][1]["assessment_available"] is True
+
+
+def test_owner_can_queue_one_contact_assessment_with_csrf(monkeypatch):
+    owner_id = uuid4()
+    contact_id = uuid4()
+    queued = []
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(
+        admin_reporting,
+        "contact_detail",
+        lambda _open_id: {"contact": {"contact_id": contact_id}},
+    )
+    monkeypatch.setattr(contact_assessments, "queue_contact_assessment", lambda *args: queued.append(args))
+
+    response = _client(lambda _request: {"id": owner_id, "status": "active"}).post(
+        "/admin/contacts/ou_contact/assessment?page=3",
+        data={"csrf_token": "csrf"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/contacts/ou_contact?page=3"
+    assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert queued == [(owner_id, contact_id)]
+
+
+def test_owner_can_view_assessment_evidence_and_it_is_audited(monkeypatch):
+    owner_id = uuid4()
+    assessment_id = uuid4()
+    contexts = []
+    viewed = []
+    detail = {
+        "id": assessment_id,
+        "contact": {"open_id": "ou_contact", "display_name": "Contact"},
+        "status": "succeeded",
+        "role_suggestions": [],
+        "account_suggestions": [],
+        "evidence": [{"label": "M1", "content": "Scoped evidence", "available": True}],
+    }
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(contact_assessments, "assessment_matches_contact", lambda *_args: True)
+    monkeypatch.setattr(contact_assessments, "assessment_detail", lambda _assessment_id: detail)
+    monkeypatch.setattr(contact_assessments, "record_assessment_view", lambda *args: viewed.append(args))
+
+    response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get(
+        f"/admin/contacts/ou_contact/assessments/{assessment_id}?page=2"
+    )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert contexts[-1][0] == "admin/contact_assessment.html"
+    assert contexts[-1][1]["assessment"] is detail
+    assert viewed == [(owner_id, assessment_id)]
+
+
+def test_owner_confirmation_uses_only_suggested_form_values(monkeypatch):
+    owner_id = uuid4()
+    assessment_id = uuid4()
+    confirmed = []
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(contact_assessments, "assessment_matches_contact", lambda *_args: True)
+    monkeypatch.setattr(
+        contact_assessments,
+        "confirm_assessment_role",
+        lambda *args: confirmed.append(args),
+    )
+
+    response = _client(lambda _request: {"id": owner_id, "status": "active"}).post(
+        f"/admin/contacts/ou_contact/assessments/{assessment_id}/roles?page=4",
+        data={"csrf_token": "csrf", "role": "creator"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/admin/contacts/ou_contact/assessments/{assessment_id}?page=4"
+    assert confirmed == [(owner_id, assessment_id, "creator")]
+
+
+def test_owner_can_confirm_one_suggested_account_relation(monkeypatch):
+    owner_id = uuid4()
+    assessment_id = uuid4()
+    confirmed = []
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(contact_assessments, "assessment_matches_contact", lambda *_args: True)
+    monkeypatch.setattr(
+        contact_assessments,
+        "confirm_assessment_account_relation",
+        lambda *args: confirmed.append(args),
+    )
+
+    response = _client(lambda _request: {"id": owner_id, "status": "active"}).post(
+        f"/admin/contacts/ou_contact/assessments/{assessment_id}/account-relations",
+        data={"csrf_token": "csrf", "account_ref": "A1", "relationship": "owner"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert confirmed == [(owner_id, assessment_id, "A1", "owner")]
+
+
+def test_owner_cannot_confirm_an_assessment_through_another_contact_path(monkeypatch):
+    owner_id = uuid4()
+    assessment_id = uuid4()
+    confirmed = []
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(contact_assessments, "assessment_matches_contact", lambda *_args: False)
+    monkeypatch.setattr(contact_assessments, "confirm_assessment_role", lambda *args: confirmed.append(args))
+
+    response = _client(lambda _request: {"id": owner_id, "status": "active"}).post(
+        f"/admin/contacts/ou_other/assessments/{assessment_id}/roles",
+        data={"csrf_token": "csrf", "role": "creator"},
+    )
+
+    assert response.status_code == 404
+    assert confirmed == []
 
 
 def test_owner_account_detail_reads_only_that_account_and_audits(monkeypatch):

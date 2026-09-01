@@ -4,7 +4,7 @@
 <div class="page">
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
-    <div class="alert alert-info">此页只配置“联系人判定”功能。请使用该 OpenAI Project 下的 service-account key；不要粘贴 Organization Admin Key。密钥提交后立即加密保存，完整值不会再次显示。本版不会发起模型调用。</div>
+    <div class="alert alert-info">此页只配置“联系人判定”功能。请使用该 OpenAI Project 下的 service-account key；不要粘贴 Organization Admin Key。密钥提交后立即加密保存，完整值不会再次显示。模型只会在所有者从某个联系人详情页手动发起“AI 影子判定”后调用。</div>
     {% if form_error %}<div class="alert alert-danger" role="alert">{{ form_error }}</div>{% endif %}
     <div class="row row-deck row-cards mb-4">
       <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">功能状态</div><div class="h3 mb-0"><span class="badge bg-{{ config.enabled_badge }}-lt">{{ config.enabled_label }}</span></div></div></div></div>

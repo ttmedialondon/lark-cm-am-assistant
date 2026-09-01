@@ -7,6 +7,21 @@
     <div class="d-flex align-items-center mb-3"><div><h2 class="page-title">{{ contact.display_name }}</h2><div class="text-secondary">稳定 Lark 身份 · {{ contact.open_id }}</div></div><a class="btn btn-outline-secondary ms-auto" href="/admin/contacts?page={{ source_page }}">返回外部联系人</a></div>
     <div class="alert alert-info">以下是此 Lark 联系人的会话事实和账号出现记录。账号出现不等于该联系人拥有、运营或代表该账号。</div>
     <div class="card mb-4">
+      <div class="card-header"><div><h3 class="card-title mb-1">AI 影子判定</h3><div class="text-secondary small">仅在你点击后运行；结果只作为建议，不会自动写入达人、经纪人或账号归属。</div></div></div>
+      <div class="card-body d-flex flex-wrap align-items-center gap-3">
+        {% if assessment %}
+        <div><span class="badge bg-{{ assessment.status_badge }}-lt">{{ assessment.status_label }}</span><span class="text-secondary small ms-2">{{ assessment.created_at_label }}{% if assessment.model %} · {{ assessment.model }}{% endif %}</span>{% if assessment.error_label %}<div class="text-danger small mt-1">{{ assessment.error_label }}</div>{% endif %}</div>
+        {% if assessment.status == 'succeeded' %}<a class="btn btn-outline-primary ms-auto" href="/admin/contacts/{{ contact.open_id }}/assessments/{{ assessment.id }}?page={{ source_page }}">查看建议与证据</a>{% endif %}
+        {% if assessment_available and assessment.status not in ('queued', 'running') %}<form action="/admin/contacts/{{ contact.open_id }}/assessment?page={{ source_page }}" method="post" class="ms-auto"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary" type="submit">重新进行 AI 判定</button></form>{% endif %}
+        {% elif assessment_available %}
+        <div class="text-secondary small">后台只会选取当前联系人在有效授权范围内的少量相关消息；不会把整段聊天或结果直接写成业务事实。</div>
+        <form action="/admin/contacts/{{ contact.open_id }}/assessment?page={{ source_page }}" method="post" class="ms-auto"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary" type="submit">AI 影子判定</button></form>
+        {% else %}
+        <div class="text-secondary">AI 功能尚未启用。请先在 <a href="/admin/ai">AI 功能配置</a> 中保存有效的 OpenAI 配置。</div>
+        {% endif %}
+      </div>
+    </div>
+    <div class="card mb-4">
       <div class="card-header"><h3 class="card-title">稳定身份</h3></div>
       <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>名称</th><th>Lark Open ID</th><th>租户</th><th>首次发现</th><th>最近活动</th></tr></thead>
         <tbody>{% for identity in identities %}<tr><td>{{ identity.display_name }}</td><td><code>{{ identity.open_id }}</code></td><td><span class="badge bg-{{ identity.tenant_classification_badge }}-lt">{{ identity.tenant_classification_label }}</span></td><td>{{ identity.first_seen_at_label }}</td><td>{{ identity.last_seen_at_label }}</td></tr>{% endfor %}</tbody>
