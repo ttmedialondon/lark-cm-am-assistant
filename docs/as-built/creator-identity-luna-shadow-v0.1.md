@@ -1,190 +1,213 @@
-# 达人身份识别：OpenAI 辅助判定方案（影子阶段）
+# 达人项目：外部联系人、账号与达人归属的 OpenAI 辅助判定方案
 
-状态：**方案已定稿；尚未配置 OpenAI API Key 或调用 Luna。**
+状态：**方案修正完成；尚未配置 OpenAI API Key 或调用 Luna。**
 
-这份说明是下一阶段唯一的实现契约。它不替代当前的规则候选，也不让模型自动确认达人、写入达人主档或分配 CM/AM。
+这份文档是本阶段唯一的实现契约。它取代“发过账号的人就是达人候选”的旧口径。
 
-## 要解决的判断
+## 先纠正一个关键前提
 
-规则已经能从一位参与者发出的明确社媒主页链接或带平台标签的账号中生成候选。它不能判断该账号是否属于发言人本人：链接可能是经纪人转发、品牌方提及，或只是普通参考。
+CM/AM 对接的是达人生态，而不是只对接“主动发送自己社媒链接的人”。因此：
 
-Luna 只处理一个小的、可追溯的问题：
+- 达人本人可能只谈报价、寄样、脚本、发布时间或交付，完全不发送账号；
+- 经纪人/机构可能代达人发送账号，这不是错误数据，而是有效的代表关系；
+- CM/AM、品牌方或推品商也可能在群里提及达人账号，账号出现的发言人不等于账号主人；
+- 一个外部联系人可以同时有多个角色，例如达人本人也经营机构。
 
-```text
-candidate_id + anchor_evidence_id + observed_by_authorization_id
-    → 该身份与账号的关系分类 + 只引用输入内的证据编号
-```
+所以，社媒账号规则只能是**账号出现证据**，不能是达人识别的总体。模型也不应回答单一的“此人是不是达人”，而应分别判断联系人角色和联系人与账号的关系。
 
-`anchor_evidence` 是产生候选的那条消息；`observed_by_authorization_id` 是看见该消息的 CM/AM。后者是硬边界：即使同一条消息已在公司级表中去重，也不能把另一位 CM/AM 才有权看到的上下文发给模型。
-
-## v1 决策边界
-
-模型只回答：**“这个平台账号是否属于发送锚点消息的这位 Lark 参与者本人？”**
-
-它不得推断真实姓名、联系方式、合作状态、负责人或其他未在证据包内的事实；也不得自动把候选写成 `confirmed`、创建达人主档或改变 CM/AM 归属。当前规则仍只表达“外部稳定 Lark 身份发过这个账号”，模型只补足“本人账号、他人账号，还是信息不足”的语义。
-
-## 已保存与即将保存的数据
+## 统一业务模型
 
 ```text
-Lark 消息
-  └─ chat_messages（公司级去重、正文加密）
-       ├─ sender open_id / tenant_key / sender_type
-       ├─ root_id / parent_id / thread_id
-       ├─ mentions_json（Lark 的 key、稳定 ID、ID 类型、名称、tenant_key）
-       └─ message_app_link / message_position / thread_message_position
+Lark 身份（稳定 open_id）
+  └─ 外部联系人 / 组织（Contact）
+       ├─ 已确认角色：达人 / 经纪人或机构 / 品牌 / 商家 / 供应商 / 其他
+       ├─ 可关联多个 Lark 身份，但绝不按昵称自动合并
+       └─ 可关联多个社媒账号：本人拥有 / 代表
 
-authorization_message_observations
-  └─ 限定某一 CM/AM 是否确实可见该消息
+社媒账号（平台 + 规范化账号）
+  └─ 原始出现记录：哪条授权可见消息提到了它
 
-chat_members / authorization_chats
-  └─ 最新群成员快照，或 P2P 对端稳定身份
+AI Assessment
+  └─ 联系人角色建议，或“该联系人与该账号”的关系建议
 
-creators / creator_identifiers
-  └─ 已人工验证的账号、邮箱、电话、CRM ID、别名
-
-creator_identity_candidates / creator_candidate_evidence
-  └─ 规则候选与其锚点证据
+人工确认的业务事实
+  └─ 联系人角色、达人主档、账号归属、经纪/代表关系
 ```
 
-消息关系字段由消息列表接口同次返回时直接保存；不额外请求聊天记录，也不为 `root_id`、`parent_id`、`thread_id` 建外键。父消息可能未被授权用户看见、尚未同步或已删除。
+“外部联系人”不是“已确认达人”。它是系统在 CM/AM 授权可见范围内发现的外部业务对象；名称可能缺失，但稳定身份仍可跨群、跨私聊聚合。
 
-这类字段无法从已加密的旧正文反推。迁移前的历史行保持 `NULL`，直到 worker 在后续增量或一次显式全量重扫中重新观察到该消息；接入 Luna 前应为已授权人员安排一次可续跑的全量重扫。
+达人主档是联系人中的一个已确认角色，而不是独立于联系人、又与 Lark 身份重复的一套人。模型永远不能自动创建或修改达人主档、账号归属或负责人 CM/AM。
 
-`chat_members` 是按群保存的最新快照，不是按 CM/AM 保存的历史名册。因此 v1 只有当该行由锚点消息的同一授权人最后观察到时，才把“当前群成员”作为弱背景发送；否则省略该事实。不会因为名册缺人就推断其已离群。
+## 发现总体：先找联系人，再找达人关系
 
-### 外部身份的安全口径
+系统应从每位已授权 CM/AM 可见范围内持续发现联系人，按稳定 Lark 身份合并：
 
-“尚未 OAuth 授权”不等于“外部达人”。规则候选只允许来自：
+1. 私聊的 P2P 对端：最强的直接业务联系信号；
+2. 群聊中实际发言的非公司参与者：有互动证据；
+3. 当前群成员快照中的已知非公司参与者：补充发现，优先级较低；
+4. 回复链、@ 提及或 CRM 标识明确指向的参与者。
 
-1. `sender_type = user`；
-2. 有稳定 `open_id` 和 `tenant_key`；
-3. `tenant_key` 已知且不属于已授权 CM/AM 的公司租户。
+身份租户属性应标为 `internal`、`known_external` 或 `unresolved`。已知公司租户不进入外部联系人工作台；租户未知不被静默丢弃，但显示为“待核验联系人”，不因一次群成员快照就当成达人。
 
-租户未知时不生成候选，宁可漏掉也不把未接入的公司同事误作达人。历史候选不静默改写，继续由 owner 核验。
+这保证了覆盖面不依赖账号链接。Lark 可见范围仍只是“CM/AM 授权可见的联系人总体”，不能宣称为公司全部达人库；真正的达人召回率要在后续与 CRM 或人工基准名单对账后才可计算。
 
-## Context Builder
+## 社媒账号：原始出现与归属是两回事
 
-Builder 是普通数据库查询与解密逻辑，不是 Agent、向量库或长期模型会话。它每次只构造一个固定大小的证据包：
+Worker 从**所有已授权、可读取的消息**中提取明确的 TikTok、Instagram、YouTube、Twitch 账号或主页链接；不再限制为外部发言者自己的消息。每一次出现只保存一个客观事实：
 
-1. 取锚点消息为 `M1`。
-2. 在同一会话、同一授权可见范围内，按时间取前后各最多 8 条为 `M2…`；不跨到其他人的可见范围。
-3. 取同一 `sender_open_id` 的近期相关发言，排除已入选项，最多 6 条，标为 `H1…`。
-4. 附加关系事实：P2P 对端是否正是该人、群成员快照是否含该人、发言人租户属性，以及该消息的回复链/话题/@ 对象。
-5. 附加达人库的精确匹配，标为 `K1…`；没有精确匹配就传空数组，不能让模型用昵称补全。
-6. 总消息片段最多 23 条；单条正文最多 800 个 Unicode 字符，整包最多 12,000 个字符。超出时按离 `M1` 的时间距离截断，永远保留 `M1`。
+```text
+账号 A 出现在消息 M 中；消息由 Lark 身份 S 发送；CM/AM U 有权看到 M。
+```
 
-模型收到的是以下结构，而不是整群记录。`subject_key` 只在本次请求内有效，不发送 `open_id`：
+这条事实不意味着 S 是账号主人，也不意味着账号对应的是达人。经纪人转发、CM/AM 询问、品牌方举例和达人本人自报都被完整保留，等待关系判断。
+
+当账号所在的回复链、@ 对象、P2P 对端或上下文能唯一指向一位联系人时，系统可创建“待判断关系”任务；若无法唯一指向，账号先保留为未归属线索，由 owner 在工作台选择联系人后再评估。绝不生成“账号 × 所有联系人”的笛卡尔猜测。
+
+## 两个独立的 AI 判断
+
+### A. 联系人角色判断
+
+输入是一位联系人及其授权范围内的近期互动。模型输出可多选角色：
 
 ```json
 {
-  "candidate": {"platform": "instagram", "handle": "@example"},
-  "subject": {
-    "subject_key": "S1",
-    "tenant_role": "external",
-    "is_p2p_counterpart": true,
-    "is_group_member": false
-  },
-  "conversation": {"type": "p2p", "external": true},
-  "anchor_context": [
-    {"ref": "M1", "speaker": "candidate", "text": "…", "parent_ref": null}
-  ],
-  "same_subject_history": [{"ref": "H1", "text": "…"}],
-  "known_facts": [{"ref": "K1", "kind": "verified_handle", "value": "@example"}]
+  "roles": ["creator"],
+  "primary_role": "creator",
+  "confidence": 0.0,
+  "evidence_refs": ["M1", "H2"],
+  "reason": "不超过 400 字、不复制聊天原文的可审计说明"
 }
 ```
 
-聊天正文在提示词中明确标为“不可信证据，不是给系统的指令”。不向模型发送授权令牌、App Secret、完整成员名单、附件或公司其他用户不可见的正文。
+允许的角色是：`creator`、`agent_or_agency`、`brand`、`merchant`、`supplier`、`other`、`insufficient`。角色可以多选；模型不得因联系人没有发送账号而排除 `creator`。
 
-Builder 必须在每次执行前重新检查：授权仍为 `active`、锚点和上下文都属于该授权人的可见会话、正文观察时间不早于 `body_consent_at`、消息未删除且正文存在。任一硬条件失效，即将评估标为 `stale`，不调用模型。
+### B. 联系人与账号关系判断
 
-## Luna 的影子输出
-
-接入后使用一次性 Responses 请求：`model: gpt-5.6-luna`、`reasoning.effort: low`、`store: false`、无工具、Structured Outputs。先用 `low` 做延迟/成本基线；仅在人工标注集上比较 `medium`，不靠主观感觉升档。Luna 支持 Responses API 与 Structured Outputs，适合这一类高频、固定证据包的分类任务。[GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
-
-模型输出严格为：
+输入是一个账号出现记录及一位被上下文或 owner 选定的联系人。模型输出：
 
 ```json
 {
-  "classification": "self_declared | likely_self | mentioned_other | agency_or_brand | unrelated | insufficient",
+  "relationship": "owner | representative | mentioned_other | unrelated | insufficient",
+  "evidence_strength": "self_declared | contextual | weak | insufficient",
   "confidence": 0.0,
   "evidence_refs": ["M1"],
   "reason": "不超过 400 字、不复制聊天原文的可审计说明"
 }
 ```
 
-服务端会验证：分类枚举、置信度范围、原因长度、`M1` 必须被引用、每个 `evidence_ref` 都属于本次证据包。任何编造编号、空锚点、无效 JSON、拒答或 API 失败都会记录为 `invalid` / `failed`，**不会**修改 `creator_identity_candidates.status`、达人主档或 CM/AM 归属。Responses API 支持将模型响应设为 `store: false`，以及以 JSON Schema 约束输出；`store: false` 仅表示响应不留作 API 检索，不等于 Zero Data Retention。[Responses API 参考](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)
+- `owner`：证据支持账号属于该联系人本人；
+- `representative`：联系人代表、经纪或管理该账号所属的达人；
+- `mentioned_other`：联系人只是在谈论或转发其他人的账号；
+- `unrelated`：证据表明账号与该联系人无关；
+- `insufficient`：无法安全判断。
 
-### 置信度只用于排序，不用于自动确权
+经纪人得到 `representative` 是成功识别，不是误报；达人本人得到 `owner` 也不依赖他必须主动发账号。
 
-| 模型结果 | 条件 | 管理台标签 | 自动业务动作 |
-| --- | --- | --- | --- |
-| `self_declared` | `confidence >= 0.90` 且引用 `M1` | 强支持，建议确认 | 无 |
-| `likely_self` | `confidence >= 0.80` 且引用 `M1` | 优先核验 | 无 |
-| `mentioned_other` / `agency_or_brand` / `unrelated` | `confidence >= 0.80` 且引用 `M1` | 建议排除 | 无 |
-| 其他情况 | 任意 | 信息不足 | 无 |
+## Context Builder：小证据包，而不是整群聊天
 
-`confidence` 是本次证据包下的模型自评，不是准确率承诺。名称未返回的 Lark 外部参与者仍只按稳定身份聚合，模型不得补姓名。
-
-## 审计与界面
-
-真正接入 API Key 时再新增两张表，避免现在留下无调用方的空表：
+每次评估只有一个固定的授权边界：
 
 ```text
-creator_candidate_assessments
-  id, candidate_id, anchor_evidence_id, observed_by_authorization_id,
-  status (queued/running/succeeded/failed/invalid/stale), attempts,
-  provider, model, prompt_version, schema_version, context_fingerprint,
-  classification, confidence, reason_ciphertext, response_id,
-  input_tokens, output_tokens, latency_ms, estimated_cost_micros,
-  scheduled_at, started_at, completed_at, error_code, created_at
-
-creator_candidate_assessment_refs
-  assessment_id, ref_code, relation (anchor/context/history/known_fact),
-  chat_id, message_id, creator_identifier_id
+contact_id + optional_social_account_id + anchor_message_id + observed_by_authorization_id
 ```
 
-不复制保存模型提示词、输入正文或原始响应；`reason` 也加密保存。审计以本次的消息/主档引用定位即可。对同一 `candidate + anchor + prompt_version + context_fingerprint`，成功结果直接复用；活动中的相同任务以唯一索引阻止重复入队。
+`observed_by_authorization_id` 是硬边界。即使公司级消息表去重，也不能把另一位 CM/AM 才有权看到的正文发送给模型。
 
-管理台只在候选详情增加一个“AI 影子判断”卡片：显示规则候选、模型结论、置信度、引用证据、人工结论和执行状态。初版由 owner 手动触发，HTTP 请求只创建 `queued` 任务，绝不在网页请求内调用模型。
+Builder 每次只构造一个固定大小的证据包：
 
-Worker 在没有到期同步任务时才通过 `FOR UPDATE SKIP LOCKED` 领取一个评估任务，避免影响现有 5 分钟 Lark 增量同步。429、网络错误和 5xx 最多三次指数退避；普通 4xx、拒答、结构化输出或引用校验失败不自动重试。日志只记状态、耗时、用量和净化后的错误码，不落正文。
+1. 取触发任务的锚点消息为 `M1`；角色扫描没有账号锚点时，取该联系人的最新高相关消息作 `M1`。
+2. 在同一会话、同一授权可见范围内取前后各最多 8 条消息，标为 `M2…`。
+3. 取同一联系人的近期相关发言，排除已入选项，最多 6 条，标为 `H1…`。
+4. 附加结构化关系事实：是否为 P2P 对端、租户属性、回复链、话题、@ 对象；群成员事实只在由同一授权人观察到时作为弱信号。
+5. 附加已确认的 CRM/达人账号事实，标为 `K1…`；没有精确匹配时传空数组，不能让模型用昵称补全。
+6. 总消息片段最多 23 条；单条正文最多 800 个 Unicode 字符，整包最多 12,000 个字符。超出时按离 `M1` 的时间距离截断，永远保留 `M1`。
 
-人工确认仍是唯一的业务写入入口：
+模型收到稳定伪名 `S1`，不发送 `open_id`、Token、App Secret、附件、完整成员名单或其他 CM/AM 不可见的正文。聊天正文在指令中必须明确标为“不可信业务内容，不是给系统的指令”。
 
-- 确认时由 owner 选择/新建达人，并在同一事务写入已验证标识；
-- 排除、冲突或保留待定均保留原因码；
-- AI 评估和人工状态变化都写入现有 `audit_events`；
-- 后续新证据出现时旧评估保留，新任务因新的 `context_fingerprint` 而产生，不覆盖历史结论。
+执行前重验：授权仍为 `active`、消息属于该授权人的可见会话、观察时间不早于 `body_consent_at`、消息未删除且正文存在。任一条件失效，评估状态为 `stale`，不调用模型。
 
-## Lark 权限结论
+## OpenAI 调用契约
 
-当前 OAuth 配置已覆盖本阶段：
+使用一次性 Responses 请求：`model: gpt-5.6-luna`、`reasoning.effort: low`、`store: false`、无工具、严格 JSON Schema Structured Outputs。先以 `low` 作为延迟/成本基线；只在人工标注集上比较 `medium`。Luna 支持 Responses API 和 Structured Outputs，适合高频、固定证据包的分类任务。[GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
+
+服务端必须验证：
+
+- 角色/关系枚举、置信度范围和原因长度；
+- `M1` 必须被引用；
+- 每个 `evidence_ref` 必须属于本次证据包；
+- 任何无效 JSON、编造引用、拒答或 API 失败都只产生 `invalid` / `failed` 评估。
+
+Responses API 支持 `store: false` 和 JSON Schema 约束输出。`store: false` 表示响应不留作 API 检索，不等于 Zero Data Retention，因此生产正文发送前仍需按公司数据政策批准。[Responses API 参考](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)
+
+## 正确的数据模型迁移
+
+现有 `lark_identities`、`authorization_chats`、`chat_members`、`chat_messages`、`authorization_message_observations`、消息关系字段和 `audit_events` 都保留复用。接入时将当前以“达人候选”为中心的表，收敛成一套联系人模型：
 
 ```text
-offline_access
-im:chat:read
-im:message:readonly
-im:chat.members:read
+contacts
+  id, display_name nullable, entity_type (person/organization/unknown), timestamps
+
+lark_identities
+  新增 contact_id nullable；一个联系人可关联多个 Lark 身份，绝不按名称自动合并
+
+contact_identifiers
+  contact_id, kind (email/phone/crm_id/alias), normalized_value, display_value
+
+contact_roles
+  contact_id, role, status (confirmed/rejected), source, reviewer, timestamps
+  角色可多选；没有记录表示尚未判断
+
+social_accounts
+  id, platform, normalized_handle, display_handle, timestamps
+  平台 + 规范化账号全局唯一；账号主人不需要先在 Lark 发言
+
+contact_social_accounts
+  contact_id, social_account_id, relationship (owner/representative),
+  status (confirmed/rejected), source, reviewer, timestamps
+  只保存人工或 CRM 确认的业务关系
+
+social_account_observations
+  social_account_id, source_open_id nullable, chat_id, message_id,
+  observed_by_authorization_id, extractor, metadata, timestamps
+  仅表示账号出现于某条消息，不表达归属
+
+contact_assessments / contact_assessment_refs
+  保存影子模型任务、用量、加密结果与输入引用，不复制正文或 Prompt
 ```
 
-开发者后台也已启用用户身份的群聊与私聊消息读取、群信息和群成员读取。回复链、线程与 @ 提及是消息对象字段，不需要为了它们新增通讯录、CRM 或泛数据权限。已用真实 user token 做无正文预检：`GET /im/v1/chats/{chat_id}` 返回 200，并返回名称、描述、群主、外部标志、会话模式和状态；消息列表也返回 200，样本包含 `message_position`。其余关系字段是按消息可选出现，缺失时保存为 `NULL`，不推断。后续只在 Lark 返回明确的 403/缺少 scope 时申请对应的最小新增权限。
+现有达人主档迁入 `contacts` 并写入已确认 `creator` 角色；已维护的平台账号迁入 `social_accounts` 和已确认 `owner` 关系；邮箱、电话、CRM ID、别名迁入 `contact_identifiers`。现有规则候选和证据只迁成 `social_account_observations`，保留消息和授权边界，**绝不**把“旧候选的发言人”自动迁成账号 `owner` 或 `representative`。
 
-## OpenAI 接入前置与评估闸门
+暂不建立“经纪人联系人 → 达人联系人”的自动关系。当前通常只能证明其代表一个账号；等 CRM 或明确业务证据能确认具体达人时再连，避免制造虚假关系。
 
-当前底座已经能构造影子证据包；不需要为了 Luna 再申请 Lark 权限。接入前只需：
+## 人工确认、队列与界面
 
-1. 为已授权人员安排一次可续跑的历史重扫，补齐 009 迁移后才会保存的回复链、话题和 @ 字段；缺失字段自然降级，不猜测。
-2. 在服务器受限环境变量中配置 `OPENAI_API_KEY`；仓库、日志和数据库不得出现 API Key。
-3. 新增 `OPENAI_CREATOR_MODEL`、`OPENAI_CREATOR_REASONING_EFFORT`、超时、最大输出、单日预算和总开关；默认总开关为关闭。
-4. 复用现有 `httpx` 实现一个很小的 OpenAI Responses 客户端，不先建多供应商抽象；第二家获批供应商真实接入时再抽象。
-5. 所有 API 调用使用 `store: false`、无工具、固定 JSON Schema、请求超时和 `safety_identifier` 的不可逆哈希值。
+AI 永远只给建议，唯一可以写入业务事实的是 owner：
 
-首批只运行影子模式。先让 owner 对当前全部候选给出人工结论，并按平台、群聊/P2P、具名/姓名未返回分层比较：输出与引用校验通过率、强支持建议的 precision、建议排除的 precision、人工推翻率、失败率、延迟和成本。现有候选量不足以支持自动确权；即使指标稳定，下一阶段也只自动生成“建议”，不自动修改任何业务事实。
+- 确认角色：写入 `contact_roles`；
+- 确认账号本人：写入 `contact_social_accounts(owner)`；若尚无达人主档，则在同一事务创建/选择联系人并确认 `creator` 角色；
+- 确认经纪/机构：写入 `contact_social_accounts(representative)`，账号仍归真正达人；
+- 排除、冲突或保留待定：保留原因码和历史，不删除证据。
 
-## 实施顺序
+管理台应新增“外部联系人”工作台：先按联系人筛选，再查看该联系人的会话、角色建议、账号线索、AI 引用证据和人工结论。原“达人识别候选”页面改为“账号出现记录 / 账号关系核验”，不再暗示每一条都是达人。
 
-1. 已完成：保存消息关系字段，修正内部/外部判断与候选展示。
-2. OpenAI API Key 就绪：实现 Context Builder、评估迁移、受限配置和 owner 手动“AI 影子核验”。
-3. 用人工结论校准准确率；模型仍不改变候选状态。
-4. 再导入 CRM、达人归属、经纪人等强业务事实；它们只作为有来源的 `K` 类事实，不替代人工确认。
-5. 只有准确率、失败率和人工流程稳定后，才考虑自动排队或自动推荐；不自动确权。
+网页按钮只入队，不能在 HTTP 请求内调用模型。复用现有 worker：只有没有到期 Lark 同步任务时，才使用 `FOR UPDATE SKIP LOCKED` 领取一个 AI 任务，避免影响 5 分钟增量同步。429、网络错误和 5xx 最多三次指数退避；普通 4xx、拒答、结构化输出或引用校验失败不自动重试。日志不记录正文或原始输出。
+
+## 上线标准
+
+第一阶段是纯影子模式：AI 不改变任何角色、主档、账号关系或负责人。owner 对当前账号出现记录及一批无账号外部联系人做人工标注，然后按以下维度统计：
+
+- 角色判断：`creator`、`agent_or_agency`、品牌/商家等的 precision；
+- 账号关系：`owner`、`representative`、`mentioned_other` 的 precision；
+- 引用有效率、结构化输出有效率、人工推翻率、失败率、延迟和成本；
+- P2P / 群聊、具名 / 姓名未返回、平台和租户属性的分层表现。
+
+没有 CRM 或人工基准名单时，无法客观计算“达人召回率”；只能报告授权可见联系人覆盖率。即使后续指标稳定，也只自动生成建议，不自动确认达人或负责人。
+
+## 接入顺序
+
+1. 迁移为联系人、独立账号和账号出现记录模型，并把现有规则候选无损迁入。
+2. 扩展 worker：从 P2P 对端、外部发言者和成员快照发现外部联系人；从所有授权可见消息提取账号出现记录。
+3. 实现 Context Builder、受限 OpenAI 配置、评估任务表和 owner 手动“AI 影子核验”。
+4. 实现外部联系人工作台与人工确认事务。
+5. 对已授权人员安排可续跑重扫，补齐回复链、话题和 @ 关系字段。
+6. 以人工标注集评估并迭代 Prompt；后续才接入 CRM、经纪人关系和负责人归属。
