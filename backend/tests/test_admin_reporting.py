@@ -4,9 +4,15 @@ from app import admin_reporting
 
 
 def test_reporting_page_window_is_bounded_and_fetches_one_extra_row():
-    assert admin_reporting._page_window(0) == (1, 51, 0)
-    assert admin_reporting._page_window(2) == (2, 51, 50)
-    assert admin_reporting._page_window(99_999) == (admin_reporting.MAX_PAGE, 51, 499_950)
+    page_size = admin_reporting.LIST_PAGE_SIZE
+    assert admin_reporting._page_window(0) == (1, page_size + 1, 0)
+    assert admin_reporting._page_window(2) == (2, page_size + 1, page_size)
+    assert admin_reporting._page_window(99_999) == (
+        admin_reporting.MAX_PAGE,
+        page_size + 1,
+        (admin_reporting.MAX_PAGE - 1) * page_size,
+    )
+    assert admin_reporting._page_window(2, admin_reporting.DETAIL_PAGE_SIZE) == (2, 11, 10)
 
 
 def test_reporting_pagination_uses_exact_totals_and_preserves_empty_results():

@@ -1,13 +1,13 @@
 {% extends "base.html" %}
 {% block title %}授权人员 · 管理台{% endblock %}
 {% block body %}
-<div class="page">
+<div class="page admin-directory">
   {% include "admin/_nav.html" %}
-  <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
-    <div class="card">
+  <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl admin-directory__container">
+    <div class="card admin-directory__card">
       <div class="card-header"><div><h3 class="card-title mb-1">已授权人员</h3><div class="text-secondary small">先看“接入状态”：它把发现、首次回填和定时更新收敛成一个阶段。即使还没有消息索引，已授权人员也会保留在列表中。</div></div></div>
       {% if users %}
-      <div class="table-responsive"><table class="table table-vcenter card-table">
+      <div class="table-responsive admin-directory__table"><table class="table table-vcenter card-table">
         <thead><tr><th>人员</th><th>授权</th><th>接入状态</th><th>会话范围</th><th>首次回填</th><th>消息索引</th><th>最近同步</th></tr></thead>
         <tbody>{% for user in users %}<tr>
           <td><a href="/admin/users/{{ user.id }}?page={{ user_page.page }}">{{ user.display_name }}</a></td>

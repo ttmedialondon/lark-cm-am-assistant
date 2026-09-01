@@ -26,7 +26,8 @@ from .crypto import TokenCipher, message_body_cipher
 from .db import connection
 
 LONDON_TIME_ZONE = ZoneInfo("Europe/London")
-LIST_PAGE_SIZE = 50
+LIST_PAGE_SIZE = 25
+DETAIL_PAGE_SIZE = 10
 MAX_PAGE = 10_000
 MESSAGE_PAGE_SIZE = 100
 MESSAGE_CONVERSATION_PAGE_SIZE = 5
@@ -485,9 +486,9 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
             or 0
         )
         conversation_page, conversation_limit, conversation_offset = _page_window(
-            conversation_page, total_count=conversation_total_count
+            conversation_page, DETAIL_PAGE_SIZE, total_count=conversation_total_count
         )
-        job_page, job_limit, job_offset = _page_window(job_page, total_count=job_total_count)
+        job_page, job_limit, job_offset = _page_window(job_page, DETAIL_PAGE_SIZE, total_count=job_total_count)
 
         conversations = conn.execute(
             """
@@ -539,9 +540,12 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
         "conversations": _page_result(
             [_decorate_conversation_membership(row) for row in conversations],
             conversation_page,
+            DETAIL_PAGE_SIZE,
             total_count=conversation_total_count,
         ),
-        "jobs": _page_result([_decorate_job(row) for row in jobs], job_page, total_count=job_total_count),
+        "jobs": _page_result(
+            [_decorate_job(row) for row in jobs], job_page, DETAIL_PAGE_SIZE, total_count=job_total_count
+        ),
     }
 
 
@@ -716,7 +720,7 @@ def creator_detail(creator_id: UUID, identifier_page: int = 1) -> dict[str, Any]
             or 0
         )
         identifier_page, identifier_limit, identifier_offset = _page_window(
-            identifier_page, total_count=identifier_total_count
+            identifier_page, DETAIL_PAGE_SIZE, total_count=identifier_total_count
         )
         identifiers = conn.execute(
             """
@@ -733,6 +737,7 @@ def creator_detail(creator_id: UUID, identifier_page: int = 1) -> dict[str, Any]
         "identifiers": _page_result(
             [_decorate_creator_identifier(row) for row in identifiers],
             identifier_page,
+            DETAIL_PAGE_SIZE,
             total_count=identifier_total_count,
         ),
     }
@@ -815,7 +820,9 @@ def creator_candidate_detail(candidate_id: UUID, evidence_page: int = 1) -> dict
             ).fetchone()["total_count"]
             or 0
         )
-        evidence_page, evidence_limit, evidence_offset = _page_window(evidence_page, total_count=evidence_total_count)
+        evidence_page, evidence_limit, evidence_offset = _page_window(
+            evidence_page, DETAIL_PAGE_SIZE, total_count=evidence_total_count
+        )
         evidence = conn.execute(
             """
             SELECT
@@ -848,6 +855,7 @@ def creator_candidate_detail(candidate_id: UUID, evidence_page: int = 1) -> dict
         "evidence": _page_result(
             [_decorate_candidate_evidence(row, cipher) for row in evidence],
             evidence_page,
+            DETAIL_PAGE_SIZE,
             total_count=evidence_total_count,
         ),
     }
