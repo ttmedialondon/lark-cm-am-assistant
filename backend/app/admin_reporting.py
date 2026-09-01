@@ -494,7 +494,7 @@ def jobs(limit: int = 200) -> list[dict[str, Any]]:
     return [_decorate_job(row) for row in rows]
 
 
-def message_conversations(authorization_id: UUID, chat_mode: str | None = None) -> list[dict[str, Any]]:
+def message_conversations(authorization_id: UUID) -> list[dict[str, Any]]:
     """Return conversations that may be selected on the owner-only content page."""
 
     with connection() as conn:
@@ -523,25 +523,23 @@ def message_conversations(authorization_id: UUID, chat_mode: str | None = None) 
             WHERE a.id = %s
               AND ac.is_visible
               AND COALESCE(c.chat_status, 'normal') = 'normal'
-              AND (%s::text IS NULL OR COALESCE(c.chat_mode, 'group') = %s)
             GROUP BY ac.chat_id, c.name, c.external, c.chat_mode, ac.member_count, ac.member_count_status
             ORDER BY LOWER(COALESCE(c.name, '')), ac.chat_id
             LIMIT %s
             """,
-            (authorization_id, chat_mode, chat_mode, MAX_LIST_LIMIT),
+            (authorization_id, MAX_LIST_LIMIT),
         ).fetchall()
     return [_decorate_message_conversation(row) for row in rows]
 
 
 def message_page(
     authorization_id: UUID,
-    chat_mode: str | None,
-    chat_id: str | None,
+    chat_id: str,
     page: int,
 ) -> dict[str, Any]:
-    """Return one selected user's readable, consented message content page."""
+    """Return one explicit conversation's readable, consented message content page."""
 
-    filters = (authorization_id, chat_mode, chat_mode, chat_id, chat_id)
+    filters = (authorization_id, chat_id)
     with connection() as conn:
         metrics = conn.execute(
             """
@@ -559,8 +557,7 @@ def message_page(
                   AND ac.is_visible
                   AND COALESCE(c.chat_status, 'normal') = 'normal'
                   AND NOT m.is_deleted
-                  AND (%s::text IS NULL OR COALESCE(c.chat_mode, 'group') = %s)
-                  AND (%s::text IS NULL OR m.chat_id = %s)
+                  AND m.chat_id = %s
             )
             SELECT
                 COUNT(*) AS message_count,
@@ -587,8 +584,7 @@ def message_page(
                   AND ac.is_visible
                   AND COALESCE(c.chat_status, 'normal') = 'normal'
                   AND NOT m.is_deleted
-                  AND (%s::text IS NULL OR COALESCE(c.chat_mode, 'group') = %s)
-                  AND (%s::text IS NULL OR m.chat_id = %s)
+                  AND m.chat_id = %s
             )
             SELECT *
             FROM visible_messages

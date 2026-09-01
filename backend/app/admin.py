@@ -167,9 +167,7 @@ def create_admin_router(
             conversations = admin_reporting.message_conversations(selected_user["id"])
             selected_chat = next((item for item in conversations if item["chat_id"] == chat_id), None)
             if selected_chat:
-                content_page = admin_reporting.message_page(
-                    selected_user["id"], selected_chat["chat_mode"], selected_chat["chat_id"], page
-                )
+                content_page = admin_reporting.message_page(selected_user["id"], selected_chat["chat_id"], page)
                 admin_reporting.record_message_view(
                     access_context["authorization"]["id"], selected_user["id"], selected_chat["chat_id"]
                 )

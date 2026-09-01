@@ -122,7 +122,7 @@ def test_owner_reads_only_an_explicit_visible_conversation(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert page_reads == [(selected_id, "p2p", "oc_visible", 1)]
+    assert page_reads == [(selected_id, "oc_visible", 1)]
     assert audits == [(owner_id, selected_id, "oc_visible")]
 
 
