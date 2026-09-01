@@ -30,6 +30,24 @@ def test_csrf_token_is_bound_to_the_http_only_session(monkeypatch: pytest.Monkey
     assert error.value.status_code == 403
 
 
+def test_index_starts_lark_oauth_without_a_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main, "_current_authorization", lambda _: None)
+
+    response = main.index(_request_with_session())
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/auth/lark/start"
+
+
+def test_index_keeps_authenticated_users_on_the_dashboard(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main, "_current_authorization", lambda _: {"id": "authorized"})
+
+    response = main.index(_request_with_session("active-session"))
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/dashboard"
+
+
 def test_manual_backfill_state_and_pending_copy_are_clear() -> None:
     assert main._manual_backfill_state(None, None) is None
     assert main._manual_backfill_state(object(), None) == "queued"

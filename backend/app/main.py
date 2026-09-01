@@ -57,8 +57,7 @@ def index(request: Request):
     authorization = _current_authorization(request)
     if authorization:
         return RedirectResponse(url="/dashboard", status_code=303)
-    settings = get_settings()
-    return _template(request, "landing.html", {"secret_configured": settings.app_secret_configured})
+    return RedirectResponse(url="/auth/lark/start", status_code=303)
 
 
 @app.get("/auth/lark/start")
@@ -67,8 +66,8 @@ def start_lark_authorization(request: Request):
     if not settings.app_secret_configured:
         return _template(
             request,
-            "landing.html",
-            {"secret_configured": False, "configuration_error": "管理员尚未在服务器完成 App Secret 的安全录入。"},
+            "error.html",
+            {"title": "服务尚未配置", "detail": "管理员尚未在服务器完成 App Secret 的安全录入。"},
             status_code=503,
         )
 
