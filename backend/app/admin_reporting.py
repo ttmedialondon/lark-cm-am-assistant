@@ -953,13 +953,23 @@ def contact_detail(
                 COALESCE(chat.chat_mode, 'group') AS chat_mode,
                 chat.external,
                 member_counts.member_count,
+                member_counts.member_count_status,
                 message_counts.message_count,
                 message_counts.contact_message_count,
                 message_counts.last_message_at
             FROM conversation_ids ids
             JOIN chats chat ON chat.chat_id = ids.chat_id
-            JOIN LATERAL (
-                SELECT COUNT(*) AS member_count FROM chat_members member WHERE member.chat_id = chat.chat_id
+            LEFT JOIN LATERAL (
+                SELECT access.member_count, access.member_count_status
+                FROM authorization_chats access
+                WHERE access.chat_id = chat.chat_id
+                  AND access.is_visible
+                  AND access.sync_enabled
+                ORDER BY
+                    CASE WHEN access.member_count_status = 'succeeded' THEN 0 ELSE 1 END,
+                    access.member_count_checked_at DESC NULLS LAST,
+                    access.last_seen_at DESC
+                LIMIT 1
             ) AS member_counts ON TRUE
             JOIN LATERAL (
                 SELECT
@@ -1144,7 +1154,8 @@ def account_detail(account_id: UUID, evidence_page: int = 1) -> dict[str, Any] |
                 message.message_create_time,
                 message.is_deleted,
                 CASE
-                    WHEN authorization_chat.is_visible
+                    WHEN authorization.status = 'active'
+                     AND authorization_chat.is_visible
                      AND authorization.body_consent_at IS NOT NULL
                      AND scope.observed_at >= authorization.body_consent_at
                      AND NOT message.is_deleted
@@ -1579,7 +1590,9 @@ def _decorate_contact_conversation(row: dict[str, Any]) -> dict[str, Any]:
     item["chat_mode"] = item.get("chat_mode") or "group"
     item["chat_mode_label"] = _chat_mode_label(item["chat_mode"])
     item["name"] = _conversation_name(item.get("name"), item["chat_mode"], item.get("chat_id"))
-    item["member_count_label"] = "—" if item["chat_mode"] == "p2p" else str(int(item.get("member_count") or 0))
+    item["member_count_label"] = (
+        "—" if item["chat_mode"] == "p2p" else _member_count(item.get("member_count"), item.get("member_count_status"))
+    )
     item["message_count"] = int(item.get("message_count") or 0)
     item["contact_message_count"] = int(item.get("contact_message_count") or 0)
     item["last_message_at_label"] = _format_time(item.get("last_message_at"))

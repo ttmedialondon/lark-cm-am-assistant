@@ -6,12 +6,14 @@ from app import worker
 from app.worker import (
     _body_content,
     _is_author_message,
-    _is_external_creator_sender,
     _lark_time,
     _member_count_refresh_due,
     _message_relation_metadata,
+    _p2p_counterpart_open_id,
     _read_member_snapshot,
+    _record_social_account_observations,
     _sender_metadata,
+    _tenant_classification,
 )
 
 
@@ -105,27 +107,58 @@ def test_message_relationship_metadata_keeps_only_context_fields() -> None:
     }
 
 
-def test_creator_candidates_require_a_known_non_company_tenant() -> None:
+def test_tenant_classification_keeps_unknown_people_neutral() -> None:
     internal_tenants = {"tenant_tt_media"}
 
-    assert not _is_external_creator_sender(
-        sender_open_id="ou_colleague",
-        sender_tenant_key="tenant_tt_media",
-        sender_type="user",
+    assert _tenant_classification(
+        tenant_key="tenant_tt_media",
+        identity_type="user",
         internal_tenant_keys=internal_tenants,
-    )
-    assert not _is_external_creator_sender(
-        sender_open_id="ou_unknown",
-        sender_tenant_key=None,
-        sender_type="user",
+    ) == "internal"
+    assert _tenant_classification(
+        tenant_key=None,
+        identity_type="user",
         internal_tenant_keys=internal_tenants,
-    )
-    assert _is_external_creator_sender(
-        sender_open_id="ou_creator",
-        sender_tenant_key="tenant_external",
-        sender_type="user",
+    ) == "unresolved"
+    assert _tenant_classification(
+        tenant_key="tenant_external",
+        identity_type="user",
         internal_tenant_keys=internal_tenants,
+    ) == "known_external"
+
+
+def test_p2p_contact_discovery_skips_bots() -> None:
+    assert _p2p_counterpart_open_id("ou_person", "user") == "ou_person"
+    assert _p2p_counterpart_open_id("cli_bot", "bot") is None
+
+
+def test_social_account_observation_does_not_assign_an_owner() -> None:
+    account_id = uuid4()
+    calls = []
+
+    class Result:
+        def fetchone(self):
+            return {"id": account_id}
+
+    class Connection:
+        def execute(self, query, params):
+            calls.append((query, params))
+            return Result()
+
+    authorization_id = uuid4()
+    _record_social_account_observations(
+        Connection(),
+        source_open_id="ou_sender",
+        chat_id="oc_group",
+        message_id="om_message",
+        observed_by_authorization_id=authorization_id,
+        body_content='{"text":"https://instagram.com/example"}',
     )
+
+    assert len(calls) == 2
+    assert "social_accounts" in calls[0][0]
+    assert "social_account_observations" in calls[1][0]
+    assert calls[1][1][1:6] == (account_id, "ou_sender", "oc_group", "om_message", authorization_id)
 
 
 def test_member_snapshot_follows_lark_pagination_and_keeps_member_facts() -> None:

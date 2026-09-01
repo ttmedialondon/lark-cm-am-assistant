@@ -22,49 +22,48 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.config import get_settings
-from app.creator_rules import extract_creator_claims
-from app.crypto import TokenCipher, message_body_cipher
-from app.db import connection
-
+from app.config import get_settings  # noqa: E402
+from app.creator_rules import extract_creator_claims  # noqa: E402
+from app.crypto import TokenCipher, message_body_cipher  # noqa: E402
+from app.db import connection  # noqa: E402
 
 DEFAULT_BATCH_SIZE = 250
 
-# Select exactly one currently-valid authorization for each canonical message.
-# The schema has one raw observation per account/message, so this is the scope
-# recorded alongside the reindexed evidence.
+# Keep every currently valid authorization-specific observation. A single
+# canonical message can be visible through more than one CM/AM grant.
 READABLE_MESSAGES_SQL = """
-WITH scoped_messages AS (
-    SELECT DISTINCT ON (message.chat_id, message.message_id)
+SELECT
+    message.chat_id,
+    message.message_id,
+    message.body_ciphertext,
+    message.sender_open_id,
+    observation.authorization_id AS observed_by_authorization_id,
+    COALESCE(message.message_create_time, message.first_indexed_at, observation.observed_at) AS sort_time
+FROM chat_messages message
+JOIN authorization_message_observations observation
+  ON observation.chat_id = message.chat_id
+ AND observation.message_id = message.message_id
+JOIN authorizations authorization ON authorization.id = observation.authorization_id
+JOIN authorization_chats chat_scope
+  ON chat_scope.authorization_id = observation.authorization_id
+ AND chat_scope.chat_id = message.chat_id
+WHERE message.body_ciphertext IS NOT NULL
+  AND NOT message.is_deleted
+  AND authorization.status = 'active'
+  AND authorization.body_consent_at IS NOT NULL
+  AND observation.observed_at >= authorization.body_consent_at
+  AND chat_scope.is_visible
+  AND chat_scope.sync_enabled
+  AND (
+    %s::timestamptz IS NULL
+    OR (
+        COALESCE(message.message_create_time, message.first_indexed_at, observation.observed_at),
         message.chat_id,
         message.message_id,
-        message.body_ciphertext,
-        message.sender_open_id,
-        observation.authorization_id AS observed_by_authorization_id,
-        COALESCE(message.message_create_time, message.first_indexed_at) AS sort_time
-    FROM chat_messages message
-    JOIN authorization_message_observations observation
-      ON observation.chat_id = message.chat_id
-     AND observation.message_id = message.message_id
-    JOIN authorizations authorization ON authorization.id = observation.authorization_id
-    JOIN authorization_chats chat_scope
-      ON chat_scope.authorization_id = observation.authorization_id
-     AND chat_scope.chat_id = message.chat_id
-    WHERE message.body_ciphertext IS NOT NULL
-      AND NOT message.is_deleted
-      AND authorization.status = 'active'
-      AND authorization.body_consent_at IS NOT NULL
-      AND observation.observed_at >= authorization.body_consent_at
-      AND chat_scope.is_visible
-      AND chat_scope.sync_enabled
-    ORDER BY message.chat_id, message.message_id, observation.observed_at DESC, observation.authorization_id DESC
-)
-SELECT chat_id, message_id, body_ciphertext, sender_open_id,
-       observed_by_authorization_id, sort_time
-FROM scoped_messages
-WHERE %s::timestamptz IS NULL
-   OR (sort_time, chat_id, message_id) > (%s, %s, %s)
-ORDER BY sort_time, chat_id, message_id
+        observation.authorization_id
+    ) > (%s, %s, %s, %s)
+  )
+ORDER BY sort_time, message.chat_id, message.message_id, observation.authorization_id
 LIMIT %s
 """
 
@@ -108,9 +107,8 @@ def _index_rows(
                     id, social_account_id, source_open_id, chat_id, message_id,
                     observed_by_authorization_id, extractor, metadata
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
-                ON CONFLICT (social_account_id, chat_id, message_id) DO UPDATE SET
+                ON CONFLICT (social_account_id, observed_by_authorization_id, chat_id, message_id) DO UPDATE SET
                     source_open_id = COALESCE(EXCLUDED.source_open_id, social_account_observations.source_open_id),
-                    observed_by_authorization_id = EXCLUDED.observed_by_authorization_id,
                     extractor = EXCLUDED.extractor,
                     metadata = EXCLUDED.metadata,
                     last_observed_at = NOW()
@@ -136,13 +134,14 @@ def reindex(conn: Any, cipher: TokenCipher, batch_size: int) -> ReindexStats:
         raise ValueError("batch_size must be positive")
 
     stats = ReindexStats()
-    cursor: tuple[datetime, str, str] | None = None
+    cursor: tuple[datetime, str, str, object] | None = None
     while True:
         params = (
             cursor[0] if cursor else None,
             cursor[0] if cursor else None,
             cursor[1] if cursor else None,
             cursor[2] if cursor else None,
+            cursor[3] if cursor else None,
             batch_size,
         )
         with conn.transaction():
@@ -151,7 +150,12 @@ def reindex(conn: Any, cipher: TokenCipher, batch_size: int) -> ReindexStats:
                 break
             _index_rows(conn, rows, cipher, stats)
         last = rows[-1]
-        cursor = (last["sort_time"], last["chat_id"], last["message_id"])
+        cursor = (
+            last["sort_time"],
+            last["chat_id"],
+            last["message_id"],
+            last["observed_by_authorization_id"],
+        )
     return stats
 
 

@@ -302,6 +302,7 @@ def _discover_chats(
             )
 
         with connection() as conn, conn.transaction():
+            internal_tenant_keys = _internal_tenant_keys(conn)
             for (
                 chat_id,
                 name,
@@ -333,8 +334,16 @@ def _discover_chats(
                     """,
                     (chat_id, name, external, chat_status, chat_mode, seen_at, seen_at, seen_at),
                 )
-                if counterpart_id:
-                    _upsert_lark_identity(conn, counterpart_id, seen_at=seen_at)
+                counterpart_open_id = _p2p_counterpart_open_id(counterpart_id, counterpart_type)
+                if counterpart_open_id:
+                    _upsert_lark_identity(conn, counterpart_open_id, seen_at=seen_at)
+                    _ensure_contact_for_identity(
+                        conn,
+                        counterpart_open_id,
+                        tenant_classification="unresolved",
+                        identity_type="user",
+                        seen_at=seen_at,
+                    )
                 conn.execute(
                     """
                     INSERT INTO authorization_chats (
@@ -372,10 +381,9 @@ def _discover_chats(
                         p2p_counterpart_type = COALESCE(
                             EXCLUDED.p2p_counterpart_type, authorization_chats.p2p_counterpart_type
                         ),
-                        p2p_counterpart_open_id = COALESCE(
-                            EXCLUDED.p2p_counterpart_open_id, authorization_chats.p2p_counterpart_open_id
-                        ),
+                        p2p_counterpart_open_id = EXCLUDED.p2p_counterpart_open_id,
                         p2p_counterpart_seen_at = CASE
+                            WHEN EXCLUDED.p2p_counterpart_type = 'bot' THEN NULL
                             WHEN EXCLUDED.p2p_counterpart_open_id IS NULL
                                 THEN authorization_chats.p2p_counterpart_seen_at
                             ELSE EXCLUDED.p2p_counterpart_seen_at
@@ -392,12 +400,19 @@ def _discover_chats(
                         snapshot_checked_at,
                         counterpart_id,
                         counterpart_type,
-                        counterpart_id,
-                        seen_at if counterpart_id else None,
+                        counterpart_open_id,
+                        seen_at if counterpart_open_id else None,
                     ),
                 )
                 if measurement:
-                    _store_member_snapshot(conn, authorization["id"], chat_id, measurement, seen_at)
+                    _store_member_snapshot(
+                        conn,
+                        authorization["id"],
+                        chat_id,
+                        measurement,
+                        seen_at,
+                        internal_tenant_keys,
+                    )
                 discovered += 1
         if not _has_more(data):
             break
@@ -482,6 +497,12 @@ def _member_count_refresh_due(
     return last_checked_at is None or last_checked_at <= now - timedelta(seconds=refresh_seconds)
 
 
+def _p2p_counterpart_open_id(counterpart_id: str | None, counterpart_type: str | None) -> str | None:
+    """Only a Lark user target has an open ID suitable for a contact."""
+
+    return counterpart_id if counterpart_type == "user" else None
+
+
 def _read_member_snapshot(client: LarkClient, access_token: str, chat_id: str) -> MemberSnapshotMeasurement:
     checked_at = datetime.now(UTC)
     page_token: str | None = None
@@ -546,6 +567,7 @@ def _store_member_snapshot(
     chat_id: str,
     measurement: MemberSnapshotMeasurement,
     seen_at: datetime,
+    internal_tenant_keys: set[str],
 ) -> None:
     for member in measurement.members:
         open_id = member["open_id"]
@@ -556,6 +578,18 @@ def _store_member_snapshot(
             tenant_key=member["tenant_key"],
             display_name=member["display_name"],
             identity_type=member["member_type"] or "user",
+            seen_at=seen_at,
+        )
+        _ensure_contact_for_identity(
+            conn,
+            open_id,
+            tenant_classification=_tenant_classification(
+                tenant_key=member["tenant_key"],
+                identity_type=member["member_type"] or "user",
+                internal_tenant_keys=internal_tenant_keys,
+            ),
+            identity_type=member["member_type"] or "user",
+            display_name=member["display_name"],
             seen_at=seen_at,
         )
         conn.execute(
@@ -607,6 +641,115 @@ def _upsert_lark_identity(
         """,
         (open_id, tenant_key, display_name, identity_type, observed_at, observed_at),
     )
+
+
+def _internal_tenant_keys(conn: psycopg.Connection) -> set[str]:
+    """Tenant keys proven internal by an authorised user's own identity or message."""
+
+    rows = conn.execute(
+        """
+        SELECT DISTINCT tenant_key
+        FROM (
+            SELECT identity.tenant_key
+            FROM authorizations authorization
+            JOIN lark_identities identity ON identity.open_id = authorization.open_id
+            WHERE identity.tenant_key IS NOT NULL
+            UNION
+            SELECT message.sender_tenant_key
+            FROM authorizations authorization
+            JOIN chat_messages message ON message.sender_open_id = authorization.open_id
+            WHERE message.sender_tenant_key IS NOT NULL
+        ) tenant_facts
+        """
+    ).fetchall()
+    return {row["tenant_key"] for row in rows}
+
+
+def _tenant_classification(
+    *, tenant_key: str | None, identity_type: str, internal_tenant_keys: set[str]
+) -> str:
+    if identity_type != "user":
+        return "internal"
+    if not tenant_key:
+        return "unresolved"
+    return "internal" if tenant_key in internal_tenant_keys else "known_external"
+
+
+def _refresh_tenant_classifications(conn: psycopg.Connection, internal_tenant_keys: set[str]) -> None:
+    """Reclassify identities when a newly authorised tenant key is learned."""
+
+    conn.execute(
+        """
+        UPDATE lark_identities
+        SET tenant_classification = CASE
+            WHEN identity_type <> 'user' THEN 'internal'
+            WHEN tenant_key IS NULL THEN 'unresolved'
+            WHEN tenant_key = ANY(%s) THEN 'internal'
+            ELSE 'known_external'
+        END
+        """,
+        (list(internal_tenant_keys),),
+    )
+
+
+def _ensure_contact_for_identity(
+    conn: psycopg.Connection,
+    open_id: str,
+    *,
+    tenant_classification: str,
+    identity_type: str,
+    display_name: str | None = None,
+    seen_at: datetime | None = None,
+) -> None:
+    """Link one human Lark identity to one neutral contact without inferring a role."""
+
+    conn.execute(
+        """
+        UPDATE lark_identities
+        SET tenant_classification = CASE
+            WHEN %s = 'unresolved' AND tenant_classification <> 'unresolved'
+                THEN tenant_classification
+            ELSE %s
+        END
+        WHERE open_id = %s
+        """,
+        (tenant_classification, tenant_classification, open_id),
+    )
+    if identity_type != "user":
+        return
+
+    identity = conn.execute(
+        "SELECT contact_id, display_name FROM lark_identities WHERE open_id = %s FOR UPDATE",
+        (open_id,),
+    ).fetchone()
+    if not identity:
+        return
+    contact_id = identity["contact_id"]
+    if not contact_id:
+        contact_id = uuid.uuid4()
+        conn.execute(
+            """
+            INSERT INTO contacts (id, display_name, entity_type, created_at, updated_at)
+            VALUES (%s, %s, 'person', %s, %s)
+            """,
+            (
+                contact_id,
+                display_name or identity["display_name"],
+                seen_at or datetime.now(UTC),
+                seen_at or datetime.now(UTC),
+            ),
+        )
+        conn.execute("UPDATE lark_identities SET contact_id = %s WHERE open_id = %s", (contact_id, open_id))
+        return
+    if display_name:
+        conn.execute(
+            """
+            UPDATE contacts
+            SET display_name = COALESCE(display_name, %s), updated_at = NOW()
+            WHERE id = %s
+            """,
+            (display_name, contact_id),
+        )
 
 
 def _run_backfill(
@@ -934,20 +1077,7 @@ def _record_page(
     inserted = 0
     own_inserted = 0
     with connection() as conn, conn.transaction():
-        # An un-authorised colleague is still an internal participant.  Learn
-        # the tenant keys only from messages conclusively sent by an authoriser;
-        # an unknown tenant is deliberately not eligible for a creator claim.
-        internal_tenant_keys = {
-            row["sender_tenant_key"]
-            for row in conn.execute(
-                """
-                SELECT DISTINCT m.sender_tenant_key
-                FROM chat_messages m
-                JOIN authorizations a ON a.open_id = m.sender_open_id
-                WHERE m.sender_tenant_key IS NOT NULL
-                """
-            ).fetchall()
-        }
+        internal_tenant_keys = _internal_tenant_keys(conn)
         for message in messages:
             message_id = _text(message.get("message_id"))
             if not message_id:
@@ -960,22 +1090,59 @@ def _record_page(
                 sender_type,
                 sender_name,
             ) = _sender_metadata(message)
+            is_own = _is_author_message(message, authorization["open_id"])
+            if is_own and sender_tenant_key:
+                internal_tenant_keys.add(sender_tenant_key)
             if sender_open_id:
+                identity_type = sender_type or "user"
                 _upsert_lark_identity(
                     conn,
                     sender_open_id,
                     tenant_key=sender_tenant_key,
                     display_name=sender_name,
+                    identity_type=identity_type,
                 )
-            is_own = _is_author_message(message, authorization["open_id"])
-            if is_own and sender_tenant_key:
-                internal_tenant_keys.add(sender_tenant_key)
+                _ensure_contact_for_identity(
+                    conn,
+                    sender_open_id,
+                    tenant_classification=_tenant_classification(
+                        tenant_key=sender_tenant_key,
+                        identity_type=identity_type,
+                        internal_tenant_keys=internal_tenant_keys,
+                    ),
+                    identity_type=identity_type,
+                    display_name=sender_name,
+                )
             is_deleted = _bool(message.get("deleted"))
             body_content = _body_content(message)
             body_ciphertext = (
                 content_cipher.encrypt(body_content) if content_cipher and body_content and not is_deleted else None
             )
             relations = _message_relation_metadata(message)
+            for mention in relations["mentions"] or []:
+                if mention.get("id_type") != "open_id" or not mention.get("id"):
+                    continue
+                mention_open_id = mention["id"]
+                mention_tenant_key = mention.get("tenant_key")
+                mention_name = mention.get("name")
+                _upsert_lark_identity(
+                    conn,
+                    mention_open_id,
+                    tenant_key=mention_tenant_key,
+                    display_name=mention_name,
+                    identity_type="user",
+                )
+                _ensure_contact_for_identity(
+                    conn,
+                    mention_open_id,
+                    tenant_classification=_tenant_classification(
+                        tenant_key=mention_tenant_key,
+                        identity_type="user",
+                        internal_tenant_keys=internal_tenant_keys,
+                    ),
+                    identity_type="user",
+                    display_name=mention_name,
+                )
             conn.execute(
                 """
                 INSERT INTO chat_messages (
@@ -1049,20 +1216,10 @@ def _record_page(
                 """,
                 (authorization["id"], chat_id, message_id, is_own),
             ).fetchone()
-            if (
-                content_cipher
-                and body_content
-                and not is_deleted
-                and _is_external_creator_sender(
-                    sender_open_id=sender_open_id,
-                    sender_tenant_key=sender_tenant_key,
-                    sender_type=sender_type,
-                    internal_tenant_keys=internal_tenant_keys,
-                )
-            ):
-                _record_creator_claims(
+            if content_cipher and body_content and not is_deleted:
+                _record_social_account_observations(
                     conn,
-                    subject_open_id=sender_open_id,
+                    source_open_id=sender_open_id,
                     chat_id=chat_id,
                     message_id=message_id,
                     observed_by_authorization_id=authorization["id"],
@@ -1071,6 +1228,8 @@ def _record_page(
             if observation["is_new"]:
                 inserted += 1
                 own_inserted += int(bool(observation["sent_by_author"]))
+
+        _refresh_tenant_classifications(conn, internal_tenant_keys)
 
         if backfill:
             conn.execute(
@@ -1125,66 +1284,57 @@ def _record_page(
     return inserted, own_inserted
 
 
-def _record_creator_claims(
+def _record_social_account_observations(
     conn: psycopg.Connection,
     *,
-    subject_open_id: str,
+    source_open_id: str | None,
     chat_id: str,
     message_id: str,
     observed_by_authorization_id: uuid.UUID,
     body_content: str,
 ) -> None:
-    """Store high-precision account claims as reviewable evidence, never as facts."""
+    """Store high-precision social-account occurrences without assigning ownership."""
 
     for claim in extract_creator_claims(body_content):
-        creator = conn.execute(
+        account = conn.execute(
             """
-            SELECT creator_id
-            FROM creator_identifiers
-            WHERE kind = 'handle' AND platform = %s AND normalized_value = %s
-            """,
-            (claim.platform, claim.normalized_value),
-        ).fetchone()
-        candidate = conn.execute(
-            """
-            INSERT INTO creator_identity_candidates (
-                id, subject_open_id, creator_id, identifier_kind, platform,
-                normalized_value, display_value, source
-            ) VALUES (%s, %s, %s, 'handle', %s, %s, %s, %s)
-            ON CONFLICT (subject_open_id, identifier_kind, platform, normalized_value)
-            WHERE subject_open_id IS NOT NULL
-            DO UPDATE SET
-                creator_id = COALESCE(creator_identity_candidates.creator_id, EXCLUDED.creator_id),
+            INSERT INTO social_accounts (
+                id, platform, normalized_handle, display_handle
+            ) VALUES (%s, %s, %s, %s)
+            ON CONFLICT (platform, normalized_handle) DO UPDATE SET
+                display_handle = EXCLUDED.display_handle,
                 updated_at = NOW()
             RETURNING id
             """,
             (
                 uuid.uuid4(),
-                subject_open_id,
-                creator["creator_id"] if creator else None,
                 claim.platform,
                 claim.normalized_value,
                 claim.display_value,
-                f"rule:{claim.source}",
             ),
         ).fetchone()
         conn.execute(
             """
-            INSERT INTO creator_candidate_evidence (
-                id, candidate_id, chat_id, message_id, source_open_id,
-                observed_by_authorization_id, evidence_type, metadata
-            ) VALUES (%s, %s, %s, %s, %s, %s, 'message', %s::jsonb)
-            ON CONFLICT (candidate_id, chat_id, message_id)
-            WHERE message_id IS NOT NULL DO NOTHING
+            INSERT INTO social_account_observations (
+                id, social_account_id, source_open_id, chat_id, message_id,
+                observed_by_authorization_id, extractor, metadata
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (social_account_id, observed_by_authorization_id, chat_id, message_id)
+            DO UPDATE SET
+                source_open_id = COALESCE(EXCLUDED.source_open_id, social_account_observations.source_open_id),
+                extractor = EXCLUDED.extractor,
+                metadata = EXCLUDED.metadata,
+                last_observed_at = NOW()
             """,
             (
                 uuid.uuid4(),
-                candidate["id"],
+                account["id"],
+                source_open_id,
                 chat_id,
                 message_id,
-                subject_open_id,
                 observed_by_authorization_id,
-                json.dumps({"extractor": "rule-v1", "rule": claim.source}),
+                f"rule:{claim.source}",
+                json.dumps({"extractor": "social-account-rules-v1", "rule": claim.source}),
             ),
         )
 
@@ -1380,23 +1530,6 @@ def _message_relation_metadata(message: dict[str, Any]) -> dict[str, object]:
         "message_position": _nonnegative_int(message.get("message_position")),
         "thread_message_position": _nonnegative_int(message.get("thread_message_position")),
     }
-
-
-def _is_external_creator_sender(
-    *,
-    sender_open_id: str | None,
-    sender_tenant_key: str | None,
-    sender_type: str | None,
-    internal_tenant_keys: set[str],
-) -> bool:
-    """Return true only for a human from a known non-company tenant."""
-
-    return bool(
-        sender_type == "user"
-        and sender_open_id
-        and sender_tenant_key
-        and sender_tenant_key not in internal_tenant_keys
-    )
 
 
 def _sender_metadata(message: dict[str, Any]) -> tuple[

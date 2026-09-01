@@ -57,7 +57,10 @@ def test_reindex_rows_records_a_raw_account_observation_without_ownership() -> N
         "rule:labeled_handle",
     )
     assert "contact_social_accounts" not in observation_call[0]
-    assert "ON CONFLICT (social_account_id, chat_id, message_id) DO UPDATE" in observation_call[0]
+    assert (
+        "ON CONFLICT (social_account_id, observed_by_authorization_id, chat_id, message_id) DO UPDATE"
+        in observation_call[0]
+    )
 
 
 def test_reindex_query_requires_active_consent_valid_visible_message_scope() -> None:
