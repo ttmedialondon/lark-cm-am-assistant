@@ -20,6 +20,7 @@
           <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="/admin/candidates/{{ candidate.id }}">查看证据</a></td>
         </tr>{% endfor %}</tbody>
       </table></div>
+      {% with pager=candidate_page %}{% include "admin/_pagination.html" %}{% endwith %}
       {% else %}<div class="card-body text-secondary">还没有规则识别出的候选。完成一次历史回填或出现符合规则的新消息后会显示在这里。</div>{% endif %}
     </div>
   </div></div></div>

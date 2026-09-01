@@ -3,10 +3,10 @@ from datetime import UTC, datetime, timedelta
 from app import admin_reporting
 
 
-def test_reporting_limit_is_bounded_for_unpaginated_admin_views():
-    assert admin_reporting._list_limit(0) == 1
-    assert admin_reporting._list_limit(200) == 200
-    assert admin_reporting._list_limit(999) == admin_reporting.MAX_LIST_LIMIT
+def test_reporting_page_window_is_bounded_and_fetches_one_extra_row():
+    assert admin_reporting._page_window(0) == (1, 51, 0)
+    assert admin_reporting._page_window(2) == (2, 51, 50)
+    assert admin_reporting._page_window(99_999) == (admin_reporting.MAX_PAGE, 51, 499_950)
 
 
 def test_member_count_labels_preserve_pending_and_unavailable_states():

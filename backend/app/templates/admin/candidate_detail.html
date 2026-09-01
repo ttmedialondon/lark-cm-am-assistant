@@ -23,6 +23,7 @@
         </div>
         {% endfor %}
       </div>
+      {% with pager=evidence_page %}{% include "admin/_pagination.html" %}{% endwith %}
       {% else %}<div class="card-body text-secondary">该候选目前没有可展示的证据。</div>{% endif %}
     </div>
   </div></div></div>

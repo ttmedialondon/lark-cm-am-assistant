@@ -23,6 +23,7 @@
           <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="/admin/creators/{{ creator.id }}">查看</a></td>
         </tr>{% endfor %}</tbody>
       </table></div>
+      {% with pager=creator_page %}{% include "admin/_pagination.html" %}{% endwith %}
       {% else %}<div class="card-body text-secondary">尚未建立达人档案。</div>{% endif %}
     </div>
   </div></div></div>

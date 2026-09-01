@@ -1271,6 +1271,8 @@ def _requeue(
 ) -> None:
     """Put a job back on the queue without treating normal pagination as an error."""
 
+    error_code = code if retry else None
+    error_detail = detail if retry else None
     with connection() as conn, conn.transaction():
         conn.execute(
             """
@@ -1278,12 +1280,12 @@ def _requeue(
             SET status = 'queued', scheduled_at = NOW() + (%s * INTERVAL '1 second'),
                 lease_until = NULL,
                 attempts = attempts + CASE WHEN %s THEN 1 ELSE 0 END,
-                last_error_code = CASE WHEN %s THEN %s ELSE NULL END,
-                last_error = CASE WHEN %s THEN %s ELSE NULL END,
+                last_error_code = %s,
+                last_error = %s,
                 updated_at = NOW()
             WHERE id = %s
             """,
-            (delay_seconds, retry, retry, code, retry, detail, job_id),
+            (delay_seconds, retry, error_code, error_detail, job_id),
         )
 
 

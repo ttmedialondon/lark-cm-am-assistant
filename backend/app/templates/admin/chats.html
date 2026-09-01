@@ -15,6 +15,7 @@
           <td class="text-secondary text-nowrap">{{ chat.last_synced_at_label }}</td><td class="text-secondary text-nowrap">{{ chat.last_seen_at_label }}</td>
         </tr>{% endfor %}</tbody>
       </table></div>
+      {% with pager=chat_page %}{% include "admin/_pagination.html" %}{% endwith %}
       {% else %}<div class="card-body text-secondary">尚未发现群聊。</div>{% endif %}
     </div>
   </div></div></div>

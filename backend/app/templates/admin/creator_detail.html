@@ -22,6 +22,7 @@
         <thead><tr><th>类型</th><th>平台</th><th>值</th><th>加入时间</th></tr></thead>
         <tbody>{% for identifier in identifiers %}<tr><td>{{ identifier.kind_label }}</td><td>{{ identifier.platform_label }}</td><td>{{ identifier.display_value }}</td><td>{{ identifier.created_at_label }}</td></tr>{% endfor %}</tbody>
       </table></div>
+      {% with pager=identifier_page %}{% include "admin/_pagination.html" %}{% endwith %}
       {% else %}<div class="card-body text-secondary">还没有身份标识。</div>{% endif %}
     </div>
   </div></div></div>

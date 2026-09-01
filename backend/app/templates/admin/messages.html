@@ -6,21 +6,25 @@
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
     <div class="alert alert-warning" role="status">仅所有者可查看。先选择 CM / AM，再选择会话；只有打开一个会话时才读取消息正文并记入审计日志。</div>
 
-    {% if not users %}
+    {% if not users and not user_page.previous_url %}
     <div class="card"><div class="card-body text-secondary">尚未有 CM / AM 完成 Lark 授权。</div></div>
     {% else %}
     <div class="card mb-4"><div class="card-body">
       <form action="/admin/messages" method="get" class="row g-3 align-items-end">
+        <input type="hidden" name="user_page" value="{{ user_page.page }}">
         <div class="col-md-8">
           <label class="form-label" for="message-user">选择 CM / AM</label>
           <select class="form-select" id="message-user" name="user_id" required>
             <option value="" disabled {% if not selected_user %}selected{% endif %}>请选择人员</option>
+            {% if selected_user and not selected_user_in_page %}<option value="{{ selected_user.id }}" selected>{{ selected_user.display_name }} · {{ selected_user.content_access_label }}</option>{% endif %}
             {% for user in users %}<option value="{{ user.id }}" {% if selected_user and user.id == selected_user.id %}selected{% endif %}>{{ user.display_name }} · {{ user.content_access_label }}</option>{% endfor %}
           </select>
         </div>
         <div class="col-md-4"><button class="btn btn-primary w-100" type="submit">查看会话</button></div>
       </form>
-    </div></div>
+    </div>
+    {% with pager=user_page %}{% include "admin/_pagination.html" %}{% endwith %}
+    </div>
 
     {% if selected_user %}
     <div class="mb-3"><strong>{{ selected_user.display_name }}</strong><span class="text-secondary ms-2">{{ selected_user.group_count }} 个群聊 · {{ selected_user.p2p_count }} 个私聊</span></div>
@@ -37,9 +41,10 @@
         <tbody>{% for chat in conversations %}<tr {% if selected_chat and chat.chat_id == selected_chat.chat_id %}class="table-active"{% endif %}>
           <td><div class="text-truncate group-name-cell" title="{{ chat.name }}">{{ chat.name }}</div>{% if chat.external %}<span class="badge bg-azure-lt mt-1">外部群</span>{% endif %}</td>
           <td>{{ chat.chat_mode_label }}</td><td>{{ chat.member_count_label }}</td><td>{{ chat.message_count }}</td><td>{{ chat.content_count }}</td>
-          <td class="text-end">{% if selected_chat and chat.chat_id == selected_chat.chat_id %}<span class="text-secondary small">正在查看</span>{% else %}<a class="btn btn-sm btn-outline-primary" href="/admin/messages?user_id={{ selected_user.id }}&amp;chat_id={{ chat.chat_id | urlencode }}">查看记录</a>{% endif %}</td>
+          <td class="text-end">{% if selected_chat and chat.chat_id == selected_chat.chat_id %}<span class="text-secondary small">正在查看</span>{% else %}<a class="btn btn-sm btn-outline-primary" href="/admin/messages?user_id={{ selected_user.id }}&amp;chat_id={{ chat.chat_id | urlencode }}&amp;user_page={{ user_page.page }}&amp;conversation_page={{ conversation_page.page }}">查看记录</a>{% endif %}</td>
         </tr>{% endfor %}</tbody>
       </table></div>
+      {% with pager=conversation_page %}{% include "admin/_pagination.html" %}{% endwith %}
       {% else %}<div class="card-body text-secondary">该人员当前没有可展示的会话。</div>{% endif %}
     </div>
 
@@ -62,12 +67,7 @@
         </div>
         {% endfor %}
       </div>
-      {% if content_page.page > 1 or content_page.has_next %}
-      <div class="card-footer d-flex justify-content-between">
-        {% if content_page.page > 1 %}<a class="btn btn-sm btn-outline-secondary" href="/admin/messages?user_id={{ selected_user.id }}&amp;chat_id={{ selected_chat.chat_id | urlencode }}&amp;page={{ content_page.page - 1 }}">上一页</a>{% else %}<span></span>{% endif %}
-        {% if content_page.has_next %}<a class="btn btn-sm btn-outline-secondary" href="/admin/messages?user_id={{ selected_user.id }}&amp;chat_id={{ selected_chat.chat_id | urlencode }}&amp;page={{ content_page.page + 1 }}">下一页</a>{% endif %}
-      </div>
-      {% endif %}
+      {% with pager=message_page %}{% include "admin/_pagination.html" %}{% endwith %}
       {% else %}<div class="card-body text-secondary">该会话中暂时没有已加密保存且可展示的消息正文。</div>{% endif %}
     </div>
     {% else %}

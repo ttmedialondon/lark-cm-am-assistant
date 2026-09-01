@@ -15,6 +15,7 @@
           <td class="text-secondary text-nowrap">{{ job.scheduled_at_label }}</td><td class="text-secondary text-nowrap">{{ job.finished_at_label }}</td>
         </tr>{% endfor %}</tbody>
       </table></div>
+      {% with pager=job_page %}{% include "admin/_pagination.html" %}{% endwith %}
       {% else %}<div class="card-body text-secondary">尚未创建同步任务。</div>{% endif %}
     </div>
   </div></div></div>

@@ -7,6 +7,10 @@ from fastapi.testclient import TestClient
 from app import admin, admin_reporting, creator_registry
 
 
+def _page(items, page=1, has_next=False):
+    return {"items": items, "page": page, "has_next": has_next}
+
+
 def _client(current_authorization, contexts=None):
     app = FastAPI()
 
@@ -52,6 +56,24 @@ def test_active_owner_can_reach_the_overview(monkeypatch):
     assert response.status_code == 200
 
 
+def test_admin_users_uses_server_pagination(monkeypatch):
+    contexts = []
+    pages = []
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(
+        admin_reporting,
+        "users",
+        lambda page: pages.append(page) or _page([], page=page, has_next=True),
+    )
+
+    response = _client(lambda _request: {"id": uuid4(), "status": "active"}, contexts).get("/admin/users?page=2")
+
+    assert response.status_code == 200
+    assert pages == [2]
+    assert contexts[-1][1]["user_page"]["previous_url"] == "/admin/users?page=1"
+    assert contexts[-1][1]["user_page"]["next_url"] == "/admin/users?page=3"
+
+
 def test_message_content_page_is_owner_only(monkeypatch):
     monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "operator")
 
@@ -62,7 +84,7 @@ def test_message_content_page_is_owner_only(monkeypatch):
 
 def test_creator_library_is_owner_only_and_uses_the_owner_context(monkeypatch):
     monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
-    monkeypatch.setattr(admin_reporting, "creators", lambda: [])
+    monkeypatch.setattr(admin_reporting, "creators", lambda *_args: _page([]))
     response = _client(lambda _request: {"id": uuid4(), "status": "active"}).get("/admin/creators")
 
     assert response.status_code == 200
@@ -86,7 +108,7 @@ def test_owner_candidate_detail_reads_only_that_candidate_and_audits(monkeypatch
     monkeypatch.setattr(
         admin_reporting,
         "creator_candidate_detail",
-        lambda value: reads.append(value) or {"candidate": {}, "evidence": []},
+        lambda *args: reads.append(args) or {"candidate": {}, "evidence": _page([])},
     )
     monkeypatch.setattr(admin_reporting, "record_candidate_view", lambda *args: audits.append(args))
 
@@ -96,7 +118,7 @@ def test_owner_candidate_detail_reads_only_that_candidate_and_audits(monkeypatch
 
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store, max-age=0"
-    assert reads == [candidate_id]
+    assert reads == [(candidate_id, 1)]
     assert audits == [(owner_id, candidate_id)]
     assert contexts[-1][0] == "admin/candidate_detail.html"
 
@@ -129,12 +151,12 @@ def test_selecting_a_user_lists_conversations_without_reading_message_content(mo
     monkeypatch.setattr(
         admin_reporting,
         "users",
-        lambda: [{"id": selected_id, "display_name": "CM", "body_consent_at": object()}],
+        lambda *_args: _page([{"id": selected_id, "display_name": "CM", "body_consent_at": object()}]),
     )
     monkeypatch.setattr(
         admin_reporting,
         "message_conversations",
-        lambda *_args: [{"chat_id": "oc_visible", "chat_mode": "group"}],
+        lambda *_args: _page([{"chat_id": "oc_visible", "chat_mode": "group"}]),
     )
     monkeypatch.setattr(
         admin_reporting,
@@ -163,12 +185,17 @@ def test_owner_reads_only_an_explicit_visible_conversation(monkeypatch):
     monkeypatch.setattr(
         admin_reporting,
         "users",
-        lambda: [{"id": selected_id, "display_name": "CM", "body_consent_at": object()}],
+        lambda *_args: _page([{"id": selected_id, "display_name": "CM", "body_consent_at": object()}]),
     )
     monkeypatch.setattr(
         admin_reporting,
         "message_conversations",
-        lambda *_args: [{"chat_id": "oc_visible", "chat_mode": "p2p"}],
+        lambda *_args: _page([{"chat_id": "oc_visible", "chat_mode": "p2p"}]),
+    )
+    monkeypatch.setattr(
+        admin_reporting,
+        "message_conversation",
+        lambda *_args: {"chat_id": "oc_visible", "chat_mode": "p2p"},
     )
     monkeypatch.setattr(
         admin_reporting,
@@ -195,13 +222,14 @@ def test_unknown_conversation_does_not_fall_back_to_all_messages(monkeypatch):
     monkeypatch.setattr(
         admin_reporting,
         "users",
-        lambda: [{"id": selected_id, "display_name": "CM", "body_consent_at": object()}],
+        lambda *_args: _page([{"id": selected_id, "display_name": "CM", "body_consent_at": object()}]),
     )
     monkeypatch.setattr(
         admin_reporting,
         "message_conversations",
-        lambda *_args: [{"chat_id": "oc_visible", "chat_mode": "group"}],
+        lambda *_args: _page([{"chat_id": "oc_visible", "chat_mode": "group"}]),
     )
+    monkeypatch.setattr(admin_reporting, "message_conversation", lambda *_args: None)
     monkeypatch.setattr(admin_reporting, "message_page", lambda *_args: page_reads.append(_args))
     monkeypatch.setattr(admin_reporting, "record_message_view", lambda *_args: audits.append(_args))
 

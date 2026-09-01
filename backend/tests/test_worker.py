@@ -167,5 +167,6 @@ def test_normal_pagination_requeue_does_not_increment_retry_count(monkeypatch) -
 
     worker._requeue(uuid4(), delay_seconds=0, retry=False)
 
-    assert calls[0][1][1:6] == (False, False, None, False, None)
+    assert calls[0][1][1:4] == (False, None, None)
     assert "attempts = attempts + CASE WHEN %s THEN 1 ELSE 0 END" in calls[0][0]
+    assert "last_error_code = %s" in calls[0][0]
