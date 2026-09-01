@@ -8,23 +8,22 @@
 
     {% if not users %}
     <div class="card"><div class="card-body text-secondary">尚未有 CM / AM 完成 Lark 授权。</div></div>
-    {% elif not selected_user %}
-    <div class="card">
-      <div class="card-header"><div><h3 class="card-title mb-1">选择 CM / AM</h3><div class="text-secondary small">点击人员后，只显示该人员当前可见的会话，不会读取消息正文。</div></div></div>
-      <div class="table-responsive"><table class="table table-vcenter card-table">
-        <thead><tr><th>人员</th><th>群聊</th><th>私聊</th><th>消息索引</th><th>授权状态</th><th></th></tr></thead>
-        <tbody>{% for user in users %}<tr>
-          <td>{{ user.display_name }}</td><td>{{ user.group_count }}</td><td>{{ user.p2p_count }}</td><td>{{ user.message_count }}</td>
-          <td><span class="badge bg-{{ user.content_access_badge }}-lt">{{ user.content_access_label }}</span></td>
-          <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="/admin/messages?user_id={{ user.id }}">查看会话</a></td>
-        </tr>{% endfor %}</tbody>
-      </table></div>
-    </div>
     {% else %}
-    <div class="d-flex flex-wrap align-items-center gap-2 mb-3">
-      <a class="btn btn-sm btn-outline-secondary" href="/admin/messages">切换人员</a>
-      <div><strong>{{ selected_user.display_name }}</strong><span class="text-secondary ms-2">{{ selected_user.group_count }} 个群聊 · {{ selected_user.p2p_count }} 个私聊</span></div>
-    </div>
+    <div class="card mb-4"><div class="card-body">
+      <form action="/admin/messages" method="get" class="row g-3 align-items-end">
+        <div class="col-md-8">
+          <label class="form-label" for="message-user">选择 CM / AM</label>
+          <select class="form-select" id="message-user" name="user_id" required>
+            <option value="" disabled {% if not selected_user %}selected{% endif %}>请选择人员</option>
+            {% for user in users %}<option value="{{ user.id }}" {% if selected_user and user.id == selected_user.id %}selected{% endif %}>{{ user.display_name }} · {{ user.content_access_label }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="col-md-4"><button class="btn btn-primary w-100" type="submit">查看会话</button></div>
+      </form>
+    </div></div>
+
+    {% if selected_user %}
+    <div class="mb-3"><strong>{{ selected_user.display_name }}</strong><span class="text-secondary ms-2">{{ selected_user.group_count }} 个群聊 · {{ selected_user.p2p_count }} 个私聊</span></div>
 
     {% if not selected_user.body_consent_at %}
     <div class="alert alert-info">{{ selected_user.display_name }} 尚未完成新版授权。可查看其会话目录，但不会展示消息正文；请让该用户重新授权后开始回填。</div>
@@ -73,6 +72,7 @@
     </div>
     {% else %}
     <div class="alert alert-secondary mb-0">请选择上方一个会话以查看记录。</div>
+    {% endif %}
     {% endif %}
     {% endif %}
   </div></div></div>
