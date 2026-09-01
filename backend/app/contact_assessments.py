@@ -970,7 +970,7 @@ def _structured_output_format() -> dict[str, Any]:
         "properties": {
             "role": {"type": "string", "enum": sorted(MODEL_ROLES)},
             "confidence": {"type": "number"},
-            "evidence_refs": {"type": "array", "items": {"type": "string"}},
+            "evidence_refs": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4},
         },
     }
     account_item = {
@@ -981,7 +981,7 @@ def _structured_output_format() -> dict[str, Any]:
             "account_ref": {"type": "string"},
             "relationship": {"type": "string", "enum": sorted(ACCOUNT_RELATIONSHIPS)},
             "confidence": {"type": "number"},
-            "evidence_refs": {"type": "array", "items": {"type": "string"}},
+            "evidence_refs": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4},
         },
     }
     return {
@@ -1013,7 +1013,7 @@ cannot support a business role.
 For an account candidate, use `owner` only when S1 likely identifies it as
 their own account; `representative` means S1 likely represents it. Do not
 invent account references, message references, identities, facts, or quotes.
-Every suggestion must cite only supplied M references. Do not produce a
+Every suggestion must cite one to four supplied M references. Do not produce a
 summary, rationale, quotation, or any other free text. The response is
 advisory only; a human will decide whether to write any business fact."""
 

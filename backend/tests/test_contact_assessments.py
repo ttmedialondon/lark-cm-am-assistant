@@ -198,6 +198,9 @@ def test_responses_request_is_nonpersistent_and_uses_configured_model(monkeypatc
     schema = captured["json"]["text"]["format"]["schema"]
     assert "summary" not in schema["properties"]
     assert "reason" not in schema["properties"]["roles"]["items"]["properties"]
+    evidence_refs = schema["properties"]["roles"]["items"]["properties"]["evidence_refs"]
+    assert evidence_refs["minItems"] == 1
+    assert evidence_refs["maxItems"] == 4
     assert result["usage"] == {"input_tokens": 12, "output_tokens": 8}
 
 
