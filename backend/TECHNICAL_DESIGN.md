@@ -5,11 +5,11 @@
 ## 当前范围
 
 - 每位 CM/AM 以自己的 Lark OAuth user access token 授权；系统只读取该用户原本可见、且 Lark API 实际返回的会话与历史消息。
-- 群聊和私聊使用同一套 `chats`、`authorization_chats`、`chat_messages` 与同步队列。每条消息保存 Lark 返回的发送者 ID、ID 类型、`open_id`（适用时）、`tenant_key` 与发送者类型。
+- 群聊和私聊使用同一套 `chats`、`authorization_chats`、`chat_messages` 与同步队列。每条消息保存 Lark 返回的发送者 ID、ID 类型、`open_id`（适用时）、`tenant_key`、发送者类型、回复链/话题/`@` 关系及可用的 Lark 跳转定位字段。
 - 群聊在成员数刷新时分页保存最新成员快照：`open_id`、名称、`tenant_key` 与成员类型；不把 API 未返回的人误判为已离群，也不保存成员历史版本。私聊的对端稳定 ID 保存在该授权用户的 `authorization_chats` 关系上。
-- `creators` 与 `creator_identifiers` 是 owner 维护的达人身份库，支持平台账号、邮箱、电话、CRM ID 与别名。规则 V1 会从已加密保存、由非授权 Lark 参与者发送的正文中提取明确的平台主页链接或带平台标签的账号，生成待核验候选与证据；不会因昵称、群名、普通 `@` 提及或模型猜测而确认达人。
+- `creators` 与 `creator_identifiers` 是 owner 维护的达人身份库，支持平台账号、邮箱、电话、CRM ID 与别名。规则 V1 只从已加密保存、已知非公司租户的人类参与者正文中提取明确的平台主页链接或带平台标签的账号，生成待核验候选与证据；租户未知或属于公司租户时不生成候选，不会因昵称、群名、普通 `@` 提及或模型猜测而确认达人。
 - OAuth 成功后回填 Lark API 可返回的历史，并每 5 分钟增量同步、回看 10 分钟以避免边界漏记。
-- 不发送 Lark 消息，不运行 AI，不保存附件二进制；成员快照和消息发送者身份仅用于公司内部的后续归属与提醒链路。
+- 不发送 Lark 消息，不运行 AI，不保存附件二进制；成员快照和消息发送者身份仅用于公司内部的后续归属与提醒链路。Luna 的影子判断设计见 [`creator-identity-luna-shadow-v0.1.md`](../docs/as-built/creator-identity-luna-shadow-v0.1.md)，当前尚未调用模型。
 
 `GET /im/v1/chats?types=p2p` 的用户身份支持在当前租户已做 metadata-only 预检；因公开网页文档仍有滞后描述，Worker 将 P2P 发现状态单独记为 `succeeded`、`unavailable` 或 `attention_required`。P2P 不可用不会阻塞群聊同步。
 
@@ -38,7 +38,7 @@ CM/AM 的个人页面是“消息提醒中心”：仅展示接入状态和最�
 3. 一页中的 canonical 消息、用户观察关系与游标在同一 PostgreSQL 事务写入，重启可安全续跑。
 4. 首次回填完成后，每 300 秒创建增量 job；每次重叠 600 秒，重复消息按 `(chat_id, message_id)` 去重。
 5. 同一用户同一时刻最多一个 worker job；个人页面不创建手动同步任务。
-6. 对每次重新观察到的消息，规则 V1 仅识别 TikTok、Instagram、YouTube、Twitch 的明确主页链接和带平台标签的账号；候选和证据使用唯一约束去重，可安全在重叠增量或手动全量回填时重复执行。
+6. 对每次重新观察到的消息，规则 V1 仅识别已知非公司租户的人类参与者发送的 TikTok、Instagram、YouTube、Twitch 明确主页链接和带平台标签的账号；候选和证据使用唯一约束去重，可安全在重叠增量或手动全量回填时重复执行。
 7. `MAX_PAGES_PER_JOB` 到达时是正常分页让出：同一 job 会立刻续跑，但不增加 `attempts` 或写入 `last_error`。`attempts` 只记录实际的临时错误、租约过期或需要退避的重试。
 8. Lark 返回 `chat_status` 非 `normal` 的会话（例如已归档/解散）仍保留发现事实，但不纳入回填进度，也不计划请求消息正文。`topic` 会话计入群聊并在 UI 标为“专题群”。
 
@@ -64,7 +64,7 @@ Caddy → FastAPI + Jinja2/HTMX/Tabler → PostgreSQL
 | Web 本机端口 | `127.0.0.1:8100` |
 | 运行配置 | `/etc/lark-message-stats/app.env`，`root:larkstats` / `0640` |
 
-实际 OAuth scopes 为：`offline_access`、`im:chat:read`、`im:message:readonly`、`im:chat.members:read`。最后一项用于群成员快照；本版本不需要新增 Lark 权限。
+实际 OAuth scopes 为：`offline_access`、`im:chat:read`、`im:message:readonly`、`im:chat.members:read`。最后一项用于群成员快照；消息的回复链、线程、`@` 提及随消息对象保存，本版本不需要为它们新增 Lark 权限。群详情仅在实际需要时用真实 user token 预检，明确缺 scope 后再申请。
 
 参考：
 

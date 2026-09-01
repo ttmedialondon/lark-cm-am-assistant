@@ -934,9 +934,19 @@ def _record_page(
     inserted = 0
     own_inserted = 0
     with connection() as conn, conn.transaction():
-        authorized_open_ids = {
-            row["open_id"]
-            for row in conn.execute("SELECT open_id FROM authorizations").fetchall()
+        # An un-authorised colleague is still an internal participant.  Learn
+        # the tenant keys only from messages conclusively sent by an authoriser;
+        # an unknown tenant is deliberately not eligible for a creator claim.
+        internal_tenant_keys = {
+            row["sender_tenant_key"]
+            for row in conn.execute(
+                """
+                SELECT DISTINCT m.sender_tenant_key
+                FROM chat_messages m
+                JOIN authorizations a ON a.open_id = m.sender_open_id
+                WHERE m.sender_tenant_key IS NOT NULL
+                """
+            ).fetchall()
         }
         for message in messages:
             message_id = _text(message.get("message_id"))
@@ -958,19 +968,27 @@ def _record_page(
                     display_name=sender_name,
                 )
             is_own = _is_author_message(message, authorization["open_id"])
+            if is_own and sender_tenant_key:
+                internal_tenant_keys.add(sender_tenant_key)
             is_deleted = _bool(message.get("deleted"))
             body_content = _body_content(message)
             body_ciphertext = (
                 content_cipher.encrypt(body_content) if content_cipher and body_content and not is_deleted else None
             )
+            relations = _message_relation_metadata(message)
             conn.execute(
                 """
                 INSERT INTO chat_messages (
                     chat_id, message_id, message_create_time, message_update_time,
                     message_type, body_ciphertext,
+                    root_id, parent_id, thread_id, mentions_json,
+                    message_app_link, message_position, thread_message_position,
                     sender_id, sender_id_type, sender_open_id, sender_tenant_key, sender_type,
                     is_deleted, first_indexed_at, last_observed_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, NOW(), NOW()
+                )
                 ON CONFLICT (chat_id, message_id) DO UPDATE SET
                     message_create_time = COALESCE(chat_messages.message_create_time, EXCLUDED.message_create_time),
                     message_update_time = COALESCE(EXCLUDED.message_update_time, chat_messages.message_update_time),
@@ -980,6 +998,15 @@ def _record_page(
                         WHEN EXCLUDED.body_ciphertext IS NULL THEN chat_messages.body_ciphertext
                         ELSE EXCLUDED.body_ciphertext
                     END,
+                    root_id = COALESCE(EXCLUDED.root_id, chat_messages.root_id),
+                    parent_id = COALESCE(EXCLUDED.parent_id, chat_messages.parent_id),
+                    thread_id = COALESCE(EXCLUDED.thread_id, chat_messages.thread_id),
+                    mentions_json = COALESCE(EXCLUDED.mentions_json, chat_messages.mentions_json),
+                    message_app_link = COALESCE(EXCLUDED.message_app_link, chat_messages.message_app_link),
+                    message_position = COALESCE(EXCLUDED.message_position, chat_messages.message_position),
+                    thread_message_position = COALESCE(
+                        EXCLUDED.thread_message_position, chat_messages.thread_message_position
+                    ),
                     sender_id = COALESCE(EXCLUDED.sender_id, chat_messages.sender_id),
                     sender_id_type = COALESCE(EXCLUDED.sender_id_type, chat_messages.sender_id_type),
                     sender_open_id = COALESCE(EXCLUDED.sender_open_id, chat_messages.sender_open_id),
@@ -995,6 +1022,13 @@ def _record_page(
                     _lark_time(message.get("update_time")),
                     _text(message.get("msg_type")),
                     body_ciphertext,
+                    relations["root_id"],
+                    relations["parent_id"],
+                    relations["thread_id"],
+                    json.dumps(relations["mentions"]) if relations["mentions"] is not None else None,
+                    relations["message_app_link"],
+                    relations["message_position"],
+                    relations["thread_message_position"],
                     sender_id,
                     sender_id_type,
                     sender_open_id,
@@ -1019,9 +1053,12 @@ def _record_page(
                 content_cipher
                 and body_content
                 and not is_deleted
-                and sender_type == "user"
-                and sender_open_id
-                and sender_open_id not in authorized_open_ids
+                and _is_external_creator_sender(
+                    sender_open_id=sender_open_id,
+                    sender_tenant_key=sender_tenant_key,
+                    sender_type=sender_type,
+                    internal_tenant_keys=internal_tenant_keys,
+                )
             ):
                 _record_creator_claims(
                     conn,
@@ -1312,6 +1349,52 @@ def _bool(value: object) -> bool:
 def _body_content(message: dict[str, Any]) -> str | None:
     body = message.get("body")
     return _text(body.get("content")) if isinstance(body, dict) else None
+
+
+def _message_relation_metadata(message: dict[str, Any]) -> dict[str, object]:
+    """Keep only Lark relationship fields that can anchor later evidence."""
+
+    raw_mentions = message.get("mentions")
+    mentions: list[dict[str, str]] | None = None
+    if isinstance(raw_mentions, list):
+        mentions = []
+        for mention in raw_mentions:
+            if not isinstance(mention, dict):
+                continue
+            item = {
+                key: value
+                for key in ("key", "id", "id_type", "name", "tenant_key")
+                if (value := _text(mention.get(key)))
+            }
+            if item:
+                mentions.append(item)
+    return {
+        "root_id": _text(message.get("root_id")),
+        "parent_id": _text(message.get("parent_id")),
+        "thread_id": _text(message.get("thread_id")),
+        # None means the API did not include this field; [] means it did.
+        "mentions": mentions,
+        "message_app_link": _text(message.get("message_app_link")),
+        "message_position": _nonnegative_int(message.get("message_position")),
+        "thread_message_position": _nonnegative_int(message.get("thread_message_position")),
+    }
+
+
+def _is_external_creator_sender(
+    *,
+    sender_open_id: str | None,
+    sender_tenant_key: str | None,
+    sender_type: str | None,
+    internal_tenant_keys: set[str],
+) -> bool:
+    """Return true only for a human from a known non-company tenant."""
+
+    return bool(
+        sender_type == "user"
+        and sender_open_id
+        and sender_tenant_key
+        and sender_tenant_key not in internal_tenant_keys
+    )
 
 
 def _sender_metadata(message: dict[str, Any]) -> tuple[

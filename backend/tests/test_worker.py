@@ -6,8 +6,10 @@ from app import worker
 from app.worker import (
     _body_content,
     _is_author_message,
+    _is_external_creator_sender,
     _lark_time,
     _member_count_refresh_due,
+    _message_relation_metadata,
     _read_member_snapshot,
     _sender_metadata,
 )
@@ -59,6 +61,71 @@ def test_sender_metadata_keeps_open_id_only_when_lark_marks_it_as_open_id() -> N
         "Creator",
     )
     assert _sender_metadata(app)[2] is None
+
+
+def test_message_relationship_metadata_keeps_only_context_fields() -> None:
+    relations = _message_relation_metadata(
+        {
+            "root_id": "om_root",
+            "parent_id": "om_parent",
+            "thread_id": "omt_thread",
+            "message_app_link": "https://applink.larksuite.com/client/chat/open?openChatId=oc_test",
+            "message_position": "12",
+            "thread_message_position": 3,
+            "mentions": [
+                {
+                    "key": "@_user_1",
+                    "id": "ou_mentioned",
+                    "id_type": "open_id",
+                    "name": "Mentioned person",
+                    "tenant_key": "tenant_external",
+                    "ignored": "not stored",
+                },
+                "not-a-mention",
+            ],
+        }
+    )
+
+    assert relations == {
+        "root_id": "om_root",
+        "parent_id": "om_parent",
+        "thread_id": "omt_thread",
+        "mentions": [
+            {
+                "key": "@_user_1",
+                "id": "ou_mentioned",
+                "id_type": "open_id",
+                "name": "Mentioned person",
+                "tenant_key": "tenant_external",
+            }
+        ],
+        "message_app_link": "https://applink.larksuite.com/client/chat/open?openChatId=oc_test",
+        "message_position": 12,
+        "thread_message_position": 3,
+    }
+
+
+def test_creator_candidates_require_a_known_non_company_tenant() -> None:
+    internal_tenants = {"tenant_tt_media"}
+
+    assert not _is_external_creator_sender(
+        sender_open_id="ou_colleague",
+        sender_tenant_key="tenant_tt_media",
+        sender_type="user",
+        internal_tenant_keys=internal_tenants,
+    )
+    assert not _is_external_creator_sender(
+        sender_open_id="ou_unknown",
+        sender_tenant_key=None,
+        sender_type="user",
+        internal_tenant_keys=internal_tenants,
+    )
+    assert _is_external_creator_sender(
+        sender_open_id="ou_creator",
+        sender_tenant_key="tenant_external",
+        sender_type="user",
+        internal_tenant_keys=internal_tenants,
+    )
 
 
 def test_member_snapshot_follows_lark_pagination_and_keeps_member_facts() -> None:
