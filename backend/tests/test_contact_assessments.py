@@ -200,7 +200,8 @@ def test_responses_request_is_nonpersistent_and_uses_configured_model(monkeypatc
     assert "reason" not in schema["properties"]["roles"]["items"]["properties"]
     evidence_refs = schema["properties"]["roles"]["items"]["properties"]["evidence_refs"]
     assert evidence_refs["minItems"] == 1
-    assert evidence_refs["maxItems"] == 4
+    assert evidence_refs["maxItems"] == 12
+    assert schema["properties"]["roles"]["maxItems"] == 3
     assert result["usage"] == {"input_tokens": 12, "output_tokens": 8}
 
 
@@ -226,7 +227,7 @@ def test_context_history_uses_the_anchor_authorization_only() -> None:
     query, params = conn.calls[0]
     assert "observation.authorization_id = %s" in query
     assert params == (contact_id, authorization_id)
-    assert "LIMIT 6" in query
+    assert "LIMIT 12" in query
 
 
 def test_saved_refs_record_the_single_source_authorization(monkeypatch) -> None:

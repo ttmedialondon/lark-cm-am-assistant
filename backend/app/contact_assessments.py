@@ -28,9 +28,12 @@ from .db import connection
 
 LOGGER = logging.getLogger("lark_message_stats.contact_assessments")
 FEATURE = "contact_assessment"
-MAX_FRAGMENTS = 23
+MAX_FRAGMENTS = 60
 MAX_BODY_CHARS = 800
-MAX_INPUT_BODY_CHARS = 12_000
+MAX_INPUT_BODY_CHARS = 32_000
+MAX_ROLE_SUGGESTIONS = 3
+MAX_ACCOUNT_SUGGESTIONS = 3
+MAX_EVIDENCE_REFS = 12
 MODEL_ROLES = {"creator", "agent_or_agency", "brand", "merchant", "supplier", "other", "insufficient"}
 FACT_ROLES = MODEL_ROLES - {"insufficient"}
 ACCOUNT_RELATIONSHIPS = {"owner", "representative", "mentioned_other", "unrelated", "insufficient"}
@@ -682,7 +685,7 @@ def _conversation_context(
         base
         + """
           AND (message.message_create_time < %s OR (message.message_create_time = %s AND message.message_id <= %s))
-        ORDER BY message.message_create_time DESC, message.message_id DESC LIMIT 9
+        ORDER BY message.message_create_time DESC, message.message_id DESC LIMIT 24
         """,
         (
             anchor["authorization_id"],
@@ -696,7 +699,7 @@ def _conversation_context(
         base
         + """
           AND (message.message_create_time > %s OR (message.message_create_time = %s AND message.message_id > %s))
-        ORDER BY message.message_create_time ASC, message.message_id ASC LIMIT 8
+        ORDER BY message.message_create_time ASC, message.message_id ASC LIMIT 24
         """,
         (
             anchor["authorization_id"],
@@ -743,10 +746,10 @@ def _recent_subject_history(
         )
         SELECT * FROM visible_subject_messages
         ORDER BY message_create_time DESC, message_id DESC
-        LIMIT 6
+        LIMIT 12
         """,
         (contact_id, authorization_id),
-    ).fetchall()[:6]
+    ).fetchall()
 
 
 def _known_facts(conn: psycopg.Connection, contact_id: UUID) -> list[str]:
@@ -969,8 +972,13 @@ def _structured_output_format() -> dict[str, Any]:
         "required": ["role", "confidence", "evidence_refs"],
         "properties": {
             "role": {"type": "string", "enum": sorted(MODEL_ROLES)},
-            "confidence": {"type": "number"},
-            "evidence_refs": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "evidence_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": MAX_EVIDENCE_REFS,
+            },
         },
     }
     account_item = {
@@ -980,8 +988,13 @@ def _structured_output_format() -> dict[str, Any]:
         "properties": {
             "account_ref": {"type": "string"},
             "relationship": {"type": "string", "enum": sorted(ACCOUNT_RELATIONSHIPS)},
-            "confidence": {"type": "number"},
-            "evidence_refs": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "evidence_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": MAX_EVIDENCE_REFS,
+            },
         },
     }
     return {
@@ -993,8 +1006,17 @@ def _structured_output_format() -> dict[str, Any]:
             "additionalProperties": False,
             "required": ["roles", "account_relations"],
             "properties": {
-                "roles": {"type": "array", "items": evidence_item},
-                "account_relations": {"type": "array", "items": account_item},
+                "roles": {
+                    "type": "array",
+                    "items": evidence_item,
+                    "minItems": 1,
+                    "maxItems": MAX_ROLE_SUGGESTIONS,
+                },
+                "account_relations": {
+                    "type": "array",
+                    "items": account_item,
+                    "maxItems": MAX_ACCOUNT_SUGGESTIONS,
+                },
             },
         },
     }
@@ -1013,7 +1035,7 @@ cannot support a business role.
 For an account candidate, use `owner` only when S1 likely identifies it as
 their own account; `representative` means S1 likely represents it. Do not
 invent account references, message references, identities, facts, or quotes.
-Every suggestion must cite one to four supplied M references. Do not produce a
+Every suggestion must cite one to twelve supplied M references. Do not produce a
 summary, rationale, quotation, or any other free text. The response is
 advisory only; a human will decide whether to write any business fact."""
 
@@ -1036,7 +1058,7 @@ def _validate_model_result(raw: str, labels: set[str], accounts: Mapping[str, Ma
     if not isinstance(payload, dict):
         raise _ModelOutputError("not object")
     raw_roles = _json_list(payload.get("roles"))
-    if not raw_roles or len(raw_roles) > 3:
+    if not raw_roles or len(raw_roles) > MAX_ROLE_SUGGESTIONS:
         raise _ModelOutputError("roles")
     roles: list[dict[str, Any]] = []
     seen_roles: set[str] = set()
@@ -1059,7 +1081,7 @@ def _validate_model_result(raw: str, labels: set[str], accounts: Mapping[str, Ma
     relations: list[dict[str, Any]] = []
     seen_accounts: set[str] = set()
     for raw_relation in _json_list(payload.get("account_relations")):
-        if not isinstance(raw_relation, Mapping) or len(relations) >= 3:
+        if not isinstance(raw_relation, Mapping) or len(relations) >= MAX_ACCOUNT_SUGGESTIONS:
             raise _ModelOutputError("account shape")
         account_ref = raw_relation.get("account_ref")
         relationship = raw_relation.get("relationship")
@@ -1261,7 +1283,7 @@ def _confidence_label(value: object) -> str:
 
 def _evidence_refs(value: object, labels: set[str]) -> list[str]:
     refs = _json_list(value)
-    if not refs or len(refs) > 4 or any(not isinstance(ref, str) or ref not in labels for ref in refs):
+    if not refs or len(refs) > MAX_EVIDENCE_REFS or any(not isinstance(ref, str) or ref not in labels for ref in refs):
         raise _ModelOutputError("evidence refs")
     return list(dict.fromkeys(refs))
 
