@@ -5,9 +5,9 @@
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
     <div class="d-flex align-items-center mb-3"><div><div class="d-flex flex-wrap align-items-center gap-2"><h2 class="page-title mb-0">{{ contact.display_name }}</h2>{% for label in contact.confirmed_role_labels %}<span class="badge bg-success-lt">{{ label }}</span>{% endfor %}</div><div class="text-secondary">稳定 Lark 身份 · {{ contact.open_id }}</div></div><a class="btn btn-outline-secondary ms-auto" href="/admin/contacts?page={{ source_page }}">返回外部联系人</a></div>
-    <div class="alert alert-info">以下是此 Lark 联系人的会话事实和账号出现记录。账号出现不等于该联系人拥有、运营或代表该账号。</div>
+    <div class="alert alert-info">以下是此 Lark 联系人的会话事实和账号出现记录。账号出现不等于该联系人拥有、运营或代表该账号，也不是确认达人身份的前提；AI 可仅根据可核验的消息证据确认联系人角色。</div>
     <div class="card mb-4">
-      <div class="card-header"><div><h3 class="card-title mb-1">AI 自动识别</h3><div class="text-secondary small">联系人具备可读的授权消息后，后台会自动识别。90% 及以上、单一且无冲突的身份会自动确认；其余可执行建议进入待人工确认队列。</div></div></div>
+      <div class="card-header"><div><h3 class="card-title mb-1">AI 自动识别</h3><div class="text-secondary small">联系人具备可读的授权消息后，后台会自动识别。无需账号出现记录；90% 及以上、唯一且无高置信冲突的身份会自动确认，其余可执行建议进入待人工确认队列。</div></div></div>
       <div class="card-body d-flex flex-wrap align-items-center gap-3">
         {% if assessment %}
         <div><span class="badge bg-{{ assessment.status_badge }}-lt">{{ assessment.status_label }}</span>{% if assessment.outcome_label %}<span class="text-secondary small ms-2">{{ assessment.outcome_label }}</span>{% endif %}<span class="text-secondary small ms-2">{{ assessment.created_at_label }}{% if assessment.model %} · {{ assessment.model }}{% endif %}</span>{% if assessment.error_label %}<div class="text-danger small mt-1">{{ assessment.error_label }}</div>{% endif %}</div>

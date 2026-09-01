@@ -1281,6 +1281,10 @@ Return one to three role items. Use `creator` only when S1 is likely the
 creator/influencer themselves; use `agent_or_agency` when S1 represents
 creators or an agency. Use `insufficient` as the only role when the evidence
 cannot support a business role.
+An account candidate can strengthen a conclusion, but is never required for a
+`creator` role: if the supplied message evidence supports it, classify S1 as a
+creator even when `account_candidates` is empty. Account relations are a
+separate optional judgment; return an empty list when none can be supported.
 For an account candidate, use `owner` only when S1 likely identifies it as
 their own account; `representative` means S1 likely represents it. Do not
 invent account references, message references, identities, facts, or quotes.
@@ -1333,11 +1337,16 @@ def _validate_model_result(raw: str, labels: set[str], accounts: Mapping[str, Ma
     seen_accounts: set[str] = set()
     for raw_relation in _json_list(payload.get("account_relations")):
         if not isinstance(raw_relation, Mapping) or len(relations) >= MAX_ACCOUNT_SUGGESTIONS:
-            raise _ModelOutputError("account shape")
+            continue
         account_ref = raw_relation.get("account_ref")
         relationship = raw_relation.get("relationship")
         if account_ref not in accounts or account_ref in seen_accounts or relationship not in ACCOUNT_RELATIONSHIPS:
-            raise _ModelOutputError("account relation")
+            continue
+        try:
+            confidence = _confidence(raw_relation.get("confidence"))
+            evidence_refs = _evidence_refs(raw_relation.get("evidence_refs"), labels)
+        except _ModelOutputError:
+            continue
         seen_accounts.add(account_ref)
         relations.append(
             {
@@ -1345,8 +1354,8 @@ def _validate_model_result(raw: str, labels: set[str], accounts: Mapping[str, Ma
                 "account_id": accounts[account_ref]["id"],
                 "account_label": accounts[account_ref]["label"],
                 "relationship": relationship,
-                "confidence": _confidence(raw_relation.get("confidence")),
-                "evidence_refs": _evidence_refs(raw_relation.get("evidence_refs"), labels),
+                "confidence": confidence,
+                "evidence_refs": evidence_refs,
             }
         )
     return {"roles": roles, "account_relations": relations}
@@ -1446,19 +1455,21 @@ def _apply_automatic_decision(
         for suggestion in _json_list(result.get("roles"))
         if isinstance(suggestion, Mapping) and suggestion.get("role") in FACT_ROLES
     ]
-    if len(factual_roles) == 1:
-        role_suggestion = factual_roles[0]
+    high_confidence_roles = [
+        suggestion for suggestion in factual_roles if float(suggestion.get("confidence", 0)) >= threshold
+    ]
+    if len(high_confidence_roles) == 1:
+        role_suggestion = high_confidence_roles[0]
         role = role_suggestion["role"]
-        if float(role_suggestion.get("confidence", 0)) >= threshold:
-            state = _auto_confirm_role(conn, contact_id, role)
-            if state == "confirmed":
-                confirmed_roles.append(role)
-            else:
-                review_required = True
+        state = _auto_confirm_role(conn, contact_id, role)
+        if state == "confirmed":
+            confirmed_roles.append(role)
         else:
             review_required = True
+        if len(factual_roles) > 1:
+            review_required = True
     elif factual_roles:
-        # More than one business role is not a safe automatic classification.
+        # More than one high-confidence business role is not a safe automatic classification.
         review_required = True
 
     for suggestion in _json_list(result.get("account_relations")):

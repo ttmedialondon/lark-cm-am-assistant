@@ -40,6 +40,31 @@ def test_model_result_rejects_an_invented_message_reference() -> None:
         )
 
 
+def test_model_result_keeps_a_valid_role_when_an_optional_account_suggestion_is_invalid() -> None:
+    result = contact_assessments._validate_model_result(
+        json.dumps(
+            {
+                "roles": [{"role": "creator", "confidence": 0.95, "evidence_refs": ["M1"]}],
+                "account_relations": [
+                    {
+                        "account_ref": "A999",
+                        "relationship": "owner",
+                        "confidence": 0.99,
+                        "evidence_refs": ["M1"],
+                    }
+                ],
+            }
+        ),
+        {"M1"},
+        {},
+    )
+
+    assert result == {
+        "roles": [{"role": "creator", "confidence": 0.95, "evidence_refs": ["M1"]}],
+        "account_relations": [],
+    }
+
+
 def test_model_result_rejects_insufficient_mixed_with_a_business_role() -> None:
     payload = json.loads(_valid_result())
     payload["roles"].append({"role": "insufficient", "confidence": 0.2, "evidence_refs": ["M1"]})
@@ -269,7 +294,7 @@ def test_saved_refs_record_the_single_source_authorization(monkeypatch) -> None:
     assert update_params == (source_authorization_id, 1, 42, assessment_id)
 
 
-def test_auto_decision_confirms_only_one_unambiguous_high_confidence_role(monkeypatch) -> None:
+def test_auto_decision_confirms_creator_without_an_account_suggestion(monkeypatch) -> None:
     confirmed: list[str] = []
     monkeypatch.setattr(
         contact_assessments,
@@ -286,6 +311,32 @@ def test_auto_decision_confirms_only_one_unambiguous_high_confidence_role(monkey
     )
 
     assert (outcome, review_status, roles, relations) == ("auto_confirmed", "not_required", ["creator"], [])
+    assert confirmed == ["creator"]
+
+
+def test_auto_decision_confirms_a_high_confidence_creator_and_keeps_a_low_role_for_review(monkeypatch) -> None:
+    confirmed: list[str] = []
+    monkeypatch.setattr(
+        contact_assessments,
+        "_auto_confirm_role",
+        lambda _conn, _contact_id, role: confirmed.append(role) or "confirmed",
+    )
+
+    outcome, review_status, roles, relations = contact_assessments._apply_automatic_decision(
+        object(),
+        uuid4(),
+        uuid4(),
+        {
+            "roles": [
+                {"role": "creator", "confidence": 0.95},
+                {"role": "agent_or_agency", "confidence": 0.20},
+            ],
+            "account_relations": [],
+        },
+        0.9,
+    )
+
+    assert (outcome, review_status, roles, relations) == ("review_required", "pending", ["creator"], [])
     assert confirmed == ["creator"]
 
 
