@@ -33,23 +33,28 @@ def test_authorization_url_uses_oauth_client_id_and_pkce() -> None:
     assert "scope=offline_access+im%3Achat%3Aread" in url
 
 
-def test_chat_member_total_requests_only_the_aggregate_user_bucket(monkeypatch) -> None:
+def test_chat_member_list_requests_a_paginated_user_roster(monkeypatch) -> None:
     client = LarkClient(settings())
     captured = {}
 
     def fake_request(method, url, **kwargs):
         captured.update(method=method, url=url, **kwargs)
-        return {"user_total": "17", "users": [{"member_id": "ou_not_saved"}]}
+        return {"user_total": "17", "users": [{"member_id": "ou_saved"}]}
 
     monkeypatch.setattr(client, "_request", fake_request)
 
-    total = client.chat_member_total("user-token", "oc_test")
+    page = client.list_chat_members("user-token", "oc_test", "page-2")
 
-    assert total.user_total == 17
+    assert page["user_total"] == "17"
     assert captured["method"] == "GET"
     assert captured["url"].endswith("/open-apis/im/v1/chats/oc_test/members/list")
     assert captured["access_token"] == "user-token"
-    assert captured["params"] == {"member_id_type": "open_id", "member_types": "user", "page_size": 1}
+    assert captured["params"] == {
+        "member_id_type": "open_id",
+        "member_types": "user",
+        "page_size": 100,
+        "page_token": "page-2",
+    }
 
 
 def test_p2p_discovery_uses_the_user_chat_type_filter(monkeypatch) -> None:

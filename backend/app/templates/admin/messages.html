@@ -30,7 +30,7 @@
     {% endif %}
 
     <div class="card mb-4">
-      <div class="card-header"><div><h3 class="card-title mb-1">{{ selected_user.display_name }} 的可见会话</h3><div class="text-secondary small">点击“查看记录”才会读取该会话中已加密保存的消息正文。群成员人数仅保存总数，不保存成员名单。</div></div></div>
+      <div class="card-header"><div><h3 class="card-title mb-1">{{ selected_user.display_name }} 的可见会话</h3><div class="text-secondary small">点击“查看记录”才会读取该会话中已加密保存的消息正文。群成员信息以最近一次 Lark 快照为准。</div></div></div>
       {% if conversations %}
       <div class="table-responsive"><table class="table table-vcenter card-table">
         <thead><tr><th>会话</th><th>类型</th><th>群成员</th><th>消息索引</th><th>可展示正文</th><th></th></tr></thead>

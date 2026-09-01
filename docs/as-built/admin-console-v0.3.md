@@ -6,7 +6,7 @@
 
 每个请求都会把 Secure + HttpOnly Web Session 映射回 Lark 授权记录，再查询 `admin_roles`：
 
-- `owner`：查看运营统计、人员/群目录、同步任务，以及 `/admin/messages` 的正文；
+- `owner`：查看运营统计、人员/群目录、同步任务、`/admin/messages` 的正文，以及 `/admin/creators` 的达人身份库；
 - `operator` / `viewer`：查看管理台统计，但不能进入正文页；
 - 无活动角色：403。
 
@@ -26,6 +26,12 @@ chats (公司级唯一群聊或私聊)     authorization_message_observations
        │ 1:n                         (该用户见过该消息；是否由该用户发送)
        ▼
 chat_messages (公司级唯一消息 ID；加密正文与必要元数据)
+       │
+       ├── lark_identities（发送者 / 成员的稳定 Lark 身份）
+       └── creator_candidate_evidence（后续归属候选的可追溯证据）
+
+chats ──< chat_members（最新群成员快照）
+creators ──< creator_identifiers（平台账号、邮箱、电话、CRM ID、别名）
 ```
 
 同一个 Lark 群被多位 CM/AM 授权时，群元数据和正文只保留一份；每位 CM/AM 的可见性、游标、同步状态和“本人发送”判断仍独立保存。因此，公司级计数不会重复，人员视图也不会误显示未重新授权的正文。
@@ -39,6 +45,7 @@ chat_messages (公司级唯一消息 ID；加密正文与必要元数据)
 | `/admin/users/{authorization_id}` | 某一授权用户的当前可见会话与近期任务。 |
 | `/admin/chats` | 公司级唯一群、已授权可见人数、去重消息数、同步覆盖与成员人数状态。 |
 | `/admin/messages` | **仅 owner**：按 CM/AM、群/私聊、具体会话筛选，最近 100 条正文分页展示。 |
+| `/admin/creators` | **仅 owner**：人工维护达人及稳定身份标识；候选/证据自动生成尚未启用。 |
 | `/admin/jobs` | 最近同步任务及不含敏感内容的运行统计。 |
 
 ## 当前同步参数
@@ -49,3 +56,4 @@ chat_messages (公司级唯一消息 ID；加密正文与必要元数据)
 - 每个授权用户：同一时刻最多一个 worker 任务；
 - 正文：新版授权后 AES-GCM 加密存储，不进日志；
 - 私聊：以 `types=p2p` 尝试发现，状态会在用户记录上可见，失败不会影响群聊。
+- 群成员：每次成员刷新分页更新最新快照；Lark 未返回的成员不会被删除或标为离群。

@@ -494,6 +494,67 @@ def jobs(limit: int = 200) -> list[dict[str, Any]]:
     return [_decorate_job(row) for row in rows]
 
 
+def creators(limit: int = 500) -> list[dict[str, Any]]:
+    """Return the compact owner-maintained creator identity library."""
+
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                c.id,
+                c.display_name,
+                c.created_at,
+                c.updated_at,
+                COUNT(DISTINCT i.id) AS identifier_count,
+                COUNT(DISTINCT candidate.id) AS candidate_count,
+                COUNT(DISTINCT candidate.id) FILTER (WHERE candidate.status = 'pending') AS pending_candidate_count
+            FROM creators c
+            LEFT JOIN creator_identifiers i ON i.creator_id = c.id
+            LEFT JOIN creator_identity_candidates candidate ON candidate.creator_id = c.id
+            GROUP BY c.id, c.display_name, c.created_at, c.updated_at
+            ORDER BY LOWER(c.display_name), c.id
+            LIMIT %s
+            """,
+            (_list_limit(limit),),
+        ).fetchall()
+    return [_decorate_creator(row) for row in rows]
+
+
+def creator_detail(creator_id: UUID) -> dict[str, Any] | None:
+    with connection() as conn:
+        creator = conn.execute(
+            """
+            SELECT
+                c.id,
+                c.display_name,
+                c.created_at,
+                c.updated_at,
+                COUNT(DISTINCT candidate.id) AS candidate_count,
+                COUNT(DISTINCT candidate.id) FILTER (WHERE candidate.status = 'pending') AS pending_candidate_count
+            FROM creators c
+            LEFT JOIN creator_identity_candidates candidate ON candidate.creator_id = c.id
+            WHERE c.id = %s
+            GROUP BY c.id, c.display_name, c.created_at, c.updated_at
+            """,
+            (creator_id,),
+        ).fetchone()
+        if not creator:
+            return None
+        identifiers = conn.execute(
+            """
+            SELECT id, kind, platform, display_value, created_at, updated_at
+            FROM creator_identifiers
+            WHERE creator_id = %s
+            ORDER BY kind, platform, normalized_value
+            """,
+            (creator_id,),
+        ).fetchall()
+    return {
+        "creator": _decorate_creator(creator),
+        "identifiers": [_decorate_creator_identifier(row) for row in identifiers],
+    }
+
+
 def message_conversations(authorization_id: UUID) -> list[dict[str, Any]]:
     """Return conversations that may be selected on the owner-only content page."""
 
@@ -571,13 +632,16 @@ def message_page(
         rows = conn.execute(
             """
             WITH visible_messages AS (
-                SELECT m.*, o.sent_by_author, c.name, COALESCE(c.chat_mode, 'group') AS chat_mode
+                SELECT
+                    m.*, o.sent_by_author, c.name, COALESCE(c.chat_mode, 'group') AS chat_mode,
+                    identity.display_name AS sender_display_name
                 FROM authorizations a
                 JOIN authorization_chats ac ON ac.authorization_id = a.id
                 JOIN chats c ON c.chat_id = ac.chat_id
                 JOIN authorization_message_observations o
                   ON o.authorization_id = ac.authorization_id AND o.chat_id = ac.chat_id
                 JOIN chat_messages m ON m.chat_id = o.chat_id AND m.message_id = o.message_id
+                LEFT JOIN lark_identities identity ON identity.open_id = m.sender_open_id
                 WHERE a.id = %s
                   AND a.body_consent_at IS NOT NULL
                   AND o.observed_at >= a.body_consent_at
@@ -678,7 +742,12 @@ def _decorate_message(row: dict[str, Any], cipher: TokenCipher) -> dict[str, Any
     item["chat_mode"] = item.get("chat_mode") or "group"
     item["chat_mode_label"] = "私聊" if item["chat_mode"] == "p2p" else "群聊"
     item["chat_name"] = _conversation_name(item.get("name"), item["chat_mode"], item.get("chat_id"))
-    item["sender_label"] = "本人" if item.get("sent_by_author") else "会话对方 / 群成员"
+    item["sender_label"] = (
+        "本人"
+        if item.get("sent_by_author")
+        else item.get("sender_display_name")
+        or "会话对方 / 群成员"
+    )
     item["created_at_label"] = _message_time(item.get("message_create_time"))
     try:
         body = cipher.decrypt(item["body_ciphertext"])
@@ -736,6 +805,27 @@ def _decorate_job(row: dict[str, Any]) -> dict[str, Any]:
     for field in ("created_at", "started_at", "finished_at", "updated_at"):
         item[f"{field}_label"] = _format_time(item.get(field))
     item["status_label"], item["status_badge"] = _job_status(item.get("status"))
+    return item
+
+
+def _decorate_creator(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    for field in ("created_at", "updated_at"):
+        item[f"{field}_label"] = _format_time(item.get(field))
+    return item
+
+
+def _decorate_creator_identifier(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    item["kind_label"] = {
+        "handle": "平台账号",
+        "email": "邮箱",
+        "phone": "电话",
+        "crm_id": "CRM ID",
+        "alias": "别名",
+    }.get(item.get("kind"), "身份标识")
+    item["platform_label"] = item.get("platform") or "—"
+    item["created_at_label"] = _format_time(item.get("created_at"))
     return item
 
 

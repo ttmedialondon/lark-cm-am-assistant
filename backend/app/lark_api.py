@@ -55,13 +55,6 @@ class LarkProfile:
     avatar_url: str | None
 
 
-@dataclass(frozen=True)
-class LarkChatMemberTotal:
-    """Only the server-reported human-member total; never a member roster."""
-
-    user_total: int | None
-
-
 class LarkClient:
     """Uses user tokens only for the authorised user's conversation discovery and history."""
 
@@ -165,25 +158,24 @@ class LarkClient:
             params=params,
         )
 
-    def chat_member_total(self, access_token: str, chat_id: str) -> LarkChatMemberTotal:
-        """Read one aggregate from Lark without retaining member identities.
+    def list_chat_members(
+        self, access_token: str, chat_id: str, page_token: str | None = None
+    ) -> dict[str, Any]:
+        """List the human roster with user IDs represented as open IDs."""
 
-        The API returns server-side bucket totals even with a page size of one.
-        Requesting only the `user` bucket keeps this application from fetching
-        bot records or a full member list that it does not need.
-        """
-
-        data = self._request(
+        params: dict[str, str | int] = {
+            "member_id_type": "open_id",
+            "member_types": "user",
+            "page_size": 100,
+        }
+        if page_token:
+            params["page_token"] = page_token
+        return self._request(
             "GET",
             f"{self.settings.lark_api_base_url}/open-apis/im/v1/chats/{quote(chat_id, safe='')}/members/list",
             access_token=access_token,
-            params={
-                "member_id_type": "open_id",
-                "member_types": "user",
-                "page_size": 1,
-            },
+            params=params,
         )
-        return LarkChatMemberTotal(user_total=_nonnegative_int(data.get("user_total")))
 
     def _token_request(self, payload: dict[str, str]) -> TokenBundle:
         data = self._request("POST", self.settings.oauth_token_url, json=payload)
@@ -256,8 +248,3 @@ def _optional_int(value: object) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
-
-
-def _nonnegative_int(value: object) -> int | None:
-    parsed = _optional_int(value)
-    return parsed if parsed is not None and parsed >= 0 else None

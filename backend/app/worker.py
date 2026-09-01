@@ -33,12 +33,14 @@ class SyncJob:
 
 
 @dataclass(frozen=True)
-class MemberCountMeasurement:
-    """A non-sensitive aggregate returned for one chat."""
+class MemberSnapshotMeasurement:
+    """The latest roster fact and its safe-to-display aggregate."""
 
     count: int | None
-    status: str
+    count_status: str
+    snapshot_status: str
     checked_at: datetime | None
+    members: tuple[dict[str, str | None], ...] = ()
 
 
 def run_forever() -> None:
@@ -237,55 +239,79 @@ def _discover_chats(
     *,
     chat_type: str,
 ) -> int:
-    """Discover one conversation type and retain its user-specific visibility.
-
-    Member totals are group-only secondary metadata: a failure there must never
-    make an otherwise readable conversation look empty or block message sync.
-    """
+    """Discover one conversation type and retain its user-specific visibility."""
 
     page_token: str | None = None
     discovered = 0
     seen_at = datetime.now(UTC)
-    last_member_count_checks = _member_count_check_times(authorization["id"])
+    last_member_snapshot_checks = _member_snapshot_check_times(authorization["id"])
     while True:
         _renew_lease(job.id)
         data = client.list_chats(access_token, page_token, types="p2p" if chat_type == "p2p" else None)
-        rows: list[tuple[str, str | None, bool, str, str, MemberCountMeasurement | None]] = []
+        rows: list[
+            tuple[
+                str,
+                str | None,
+                bool,
+                str,
+                str,
+                MemberSnapshotMeasurement | None,
+                str | None,
+                str | None,
+            ]
+        ] = []
         for chat in _items(data):
             chat_id = _text(chat.get("chat_id"))
             if not chat_id:
                 continue
-            measurement: MemberCountMeasurement | None = None
-            if chat_type == "p2p":
-                measurement = MemberCountMeasurement(count=None, status="unavailable", checked_at=seen_at)
-            elif _member_count_refresh_due(
-                last_member_count_checks.get(chat_id), seen_at, settings.member_count_refresh_seconds
+            chat_mode = _text(chat.get("chat_mode")) or chat_type
+            if chat_type == "group" and chat_mode == "p2p":
+                continue
+            measurement: MemberSnapshotMeasurement | None = None
+            if chat_type == "group" and _member_count_refresh_due(
+                last_member_snapshot_checks.get(chat_id), seen_at, settings.member_count_refresh_seconds
             ):
                 if "im:chat.members:read" in settings.oauth_scopes:
                     _renew_lease(job.id)
-                    measurement = _read_member_count(client, access_token, chat_id)
+                    measurement = _read_member_snapshot(client, access_token, chat_id)
                 else:
-                    # Do not issue hundreds of known-to-fail API calls before
-                    # the administrator has enabled the optional user scope.
-                    measurement = MemberCountMeasurement(count=None, status="unavailable", checked_at=seen_at)
+                    measurement = MemberSnapshotMeasurement(
+                        count=None,
+                        count_status="unavailable",
+                        snapshot_status="unavailable",
+                        checked_at=seen_at,
+                    )
                 if measurement.checked_at:
-                    last_member_count_checks[chat_id] = measurement.checked_at
+                    last_member_snapshot_checks[chat_id] = measurement.checked_at
             rows.append(
                 (
                     chat_id,
                     _text(chat.get("name")),
                     _bool(chat.get("external")),
                     _text(chat.get("chat_status")) or "normal",
-                    _text(chat.get("chat_mode")) or chat_type,
+                    chat_mode,
                     measurement,
+                    _text(chat.get("p2p_target_id")) if chat_type == "p2p" else None,
+                    _text(chat.get("p2p_target_type")) if chat_type == "p2p" else None,
                 )
             )
 
         with connection() as conn, conn.transaction():
-            for chat_id, name, external, chat_status, chat_mode, measurement in rows:
+            for (
+                chat_id,
+                name,
+                external,
+                chat_status,
+                chat_mode,
+                measurement,
+                counterpart_id,
+                counterpart_type,
+            ) in rows:
                 member_count = measurement.count if measurement else None
-                member_count_status = measurement.status if measurement else "pending"
+                member_count_status = measurement.count_status if measurement else "pending"
                 member_count_checked_at = measurement.checked_at if measurement else None
+                snapshot_status = measurement.snapshot_status if measurement else "pending"
+                snapshot_checked_at = measurement.checked_at if measurement else None
                 conn.execute(
                     """
                     INSERT INTO chats (
@@ -302,12 +328,17 @@ def _discover_chats(
                     """,
                     (chat_id, name, external, chat_status, chat_mode, seen_at, seen_at, seen_at),
                 )
+                if counterpart_id:
+                    _upsert_lark_identity(conn, counterpart_id, seen_at=seen_at)
                 conn.execute(
                     """
                     INSERT INTO authorization_chats (
                         authorization_id, chat_id, is_visible, last_seen_at,
-                        member_count, member_count_status, member_count_checked_at
-                    ) VALUES (%s, %s, TRUE, %s, %s, %s, %s)
+                        member_count, member_count_status, member_count_checked_at,
+                        member_snapshot_status, member_snapshot_checked_at,
+                        p2p_counterpart_id, p2p_counterpart_type,
+                        p2p_counterpart_open_id, p2p_counterpart_seen_at
+                    ) VALUES (%s, %s, TRUE, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (authorization_id, chat_id) DO UPDATE SET
                         is_visible = TRUE,
                         last_seen_at = EXCLUDED.last_seen_at,
@@ -321,7 +352,29 @@ def _discover_chats(
                         END,
                         member_count_checked_at = COALESCE(
                             EXCLUDED.member_count_checked_at, authorization_chats.member_count_checked_at
-                        )
+                        ),
+                        member_snapshot_status = CASE
+                            WHEN EXCLUDED.member_snapshot_checked_at IS NULL
+                                THEN authorization_chats.member_snapshot_status
+                            ELSE EXCLUDED.member_snapshot_status
+                        END,
+                        member_snapshot_checked_at = COALESCE(
+                            EXCLUDED.member_snapshot_checked_at, authorization_chats.member_snapshot_checked_at
+                        ),
+                        p2p_counterpart_id = COALESCE(
+                            EXCLUDED.p2p_counterpart_id, authorization_chats.p2p_counterpart_id
+                        ),
+                        p2p_counterpart_type = COALESCE(
+                            EXCLUDED.p2p_counterpart_type, authorization_chats.p2p_counterpart_type
+                        ),
+                        p2p_counterpart_open_id = COALESCE(
+                            EXCLUDED.p2p_counterpart_open_id, authorization_chats.p2p_counterpart_open_id
+                        ),
+                        p2p_counterpart_seen_at = CASE
+                            WHEN EXCLUDED.p2p_counterpart_open_id IS NULL
+                                THEN authorization_chats.p2p_counterpart_seen_at
+                            ELSE EXCLUDED.p2p_counterpart_seen_at
+                        END
                     """,
                     (
                         authorization["id"],
@@ -330,8 +383,16 @@ def _discover_chats(
                         member_count,
                         member_count_status,
                         member_count_checked_at,
+                        snapshot_status,
+                        snapshot_checked_at,
+                        counterpart_id,
+                        counterpart_type,
+                        counterpart_id,
+                        seen_at if counterpart_id else None,
                     ),
                 )
+                if measurement:
+                    _store_member_snapshot(conn, authorization["id"], chat_id, measurement, seen_at)
                 discovered += 1
         if not _has_more(data):
             break
@@ -397,17 +458,17 @@ def _set_p2p_discovery(authorization_id: uuid.UUID, status: str, detail: str | N
         )
 
 
-def _member_count_check_times(authorization_id: uuid.UUID) -> dict[str, datetime | None]:
+def _member_snapshot_check_times(authorization_id: uuid.UUID) -> dict[str, datetime | None]:
     with connection() as conn:
         rows = conn.execute(
             """
-            SELECT chat_id, member_count_checked_at
+            SELECT chat_id, member_snapshot_checked_at
             FROM authorization_chats
             WHERE authorization_id = %s
             """,
             (authorization_id,),
         ).fetchall()
-    return {row["chat_id"]: row["member_count_checked_at"] for row in rows}
+    return {row["chat_id"]: row["member_snapshot_checked_at"] for row in rows}
 
 
 def _member_count_refresh_due(
@@ -416,20 +477,131 @@ def _member_count_refresh_due(
     return last_checked_at is None or last_checked_at <= now - timedelta(seconds=refresh_seconds)
 
 
-def _read_member_count(client: LarkClient, access_token: str, chat_id: str) -> MemberCountMeasurement:
+def _read_member_snapshot(client: LarkClient, access_token: str, chat_id: str) -> MemberSnapshotMeasurement:
     checked_at = datetime.now(UTC)
+    page_token: str | None = None
+    members: list[dict[str, str | None]] = []
+    reported_total: int | None = None
+    partial = False
     try:
-        total = client.chat_member_total(access_token, chat_id).user_total
+        while True:
+            data = client.list_chat_members(access_token, chat_id, page_token)
+            if reported_total is None:
+                reported_total = _nonnegative_int(data.get("user_total"))
+            members.extend(_member_records(data))
+            partial = partial or bool(data.get("truncations"))
+            if not _has_more(data):
+                break
+            page_token = _continuation_token(data)
     except LarkApiError as exc:
-        # This is secondary metadata. Preserve the conversation and primary message
-        # sync even when a tenant policy or a missing scope denies this call.
         status = "pending" if exc.retryable else "unavailable"
-        LOGGER.info("member-count metadata unavailable: status=%s code=%s", exc.status_code, exc.lark_code)
-        return MemberCountMeasurement(count=None, status=status, checked_at=checked_at)
+        LOGGER.info("member snapshot unavailable: status=%s code=%s", exc.status_code, exc.lark_code)
+        return MemberSnapshotMeasurement(None, status, status, checked_at)
+
+    unique_members = {member["open_id"]: member for member in members}
+    total = reported_total if reported_total is not None else len(unique_members) if unique_members else None
     if total is None:
-        LOGGER.info("member-count metadata response omitted a usable user total")
-        return MemberCountMeasurement(count=None, status="unavailable", checked_at=checked_at)
-    return MemberCountMeasurement(count=total, status="succeeded", checked_at=checked_at)
+        LOGGER.info("member snapshot response omitted a usable user total")
+        return MemberSnapshotMeasurement(None, "unavailable", "unavailable", checked_at)
+    snapshot_status = "partial" if partial else "succeeded"
+    return MemberSnapshotMeasurement(
+        count=total,
+        count_status="succeeded",
+        snapshot_status=snapshot_status,
+        checked_at=checked_at,
+        members=tuple(unique_members.values()),
+    )
+
+
+def _member_records(data: dict[str, Any]) -> list[dict[str, str | None]]:
+    raw = data.get("users")
+    if not isinstance(raw, list):
+        raw = data.get("items")
+    records: list[dict[str, str | None]] = []
+    for member in raw if isinstance(raw, list) else []:
+        if not isinstance(member, dict):
+            continue
+        open_id = _text(member.get("member_id")) or _text(member.get("open_id"))
+        if not open_id:
+            continue
+        records.append(
+            {
+                "open_id": open_id,
+                "tenant_key": _text(member.get("tenant_key")),
+                "display_name": _text(member.get("name")) or _text(member.get("en_name")),
+                "member_type": _text(member.get("member_type")) or "user",
+            }
+        )
+    return records
+
+
+def _store_member_snapshot(
+    conn: psycopg.Connection,
+    authorization_id: uuid.UUID,
+    chat_id: str,
+    measurement: MemberSnapshotMeasurement,
+    seen_at: datetime,
+) -> None:
+    for member in measurement.members:
+        open_id = member["open_id"]
+        assert open_id is not None
+        _upsert_lark_identity(
+            conn,
+            open_id,
+            tenant_key=member["tenant_key"],
+            display_name=member["display_name"],
+            identity_type=member["member_type"] or "user",
+            seen_at=seen_at,
+        )
+        conn.execute(
+            """
+            INSERT INTO chat_members (
+                chat_id, open_id, tenant_key, display_name, member_type,
+                first_seen_at, last_seen_at, last_observed_by_authorization_id
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (chat_id, open_id) DO UPDATE SET
+                tenant_key = COALESCE(EXCLUDED.tenant_key, chat_members.tenant_key),
+                display_name = COALESCE(EXCLUDED.display_name, chat_members.display_name),
+                member_type = COALESCE(EXCLUDED.member_type, chat_members.member_type),
+                last_seen_at = EXCLUDED.last_seen_at,
+                last_observed_by_authorization_id = EXCLUDED.last_observed_by_authorization_id
+            """,
+            (
+                chat_id,
+                open_id,
+                member["tenant_key"],
+                member["display_name"],
+                member["member_type"] or "user",
+                seen_at,
+                seen_at,
+                authorization_id,
+            ),
+        )
+
+
+def _upsert_lark_identity(
+    conn: psycopg.Connection,
+    open_id: str,
+    *,
+    tenant_key: str | None = None,
+    display_name: str | None = None,
+    identity_type: str = "user",
+    seen_at: datetime | None = None,
+) -> None:
+    observed_at = seen_at or datetime.now(UTC)
+    conn.execute(
+        """
+        INSERT INTO lark_identities (
+            open_id, tenant_key, display_name, identity_type, first_seen_at, last_seen_at
+        ) VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (open_id) DO UPDATE SET
+            tenant_key = COALESCE(EXCLUDED.tenant_key, lark_identities.tenant_key),
+            display_name = COALESCE(EXCLUDED.display_name, lark_identities.display_name),
+            identity_type = COALESCE(EXCLUDED.identity_type, lark_identities.identity_type),
+            last_seen_at = EXCLUDED.last_seen_at
+        """,
+        (open_id, tenant_key, display_name, identity_type, observed_at, observed_at),
+    )
 
 
 def _run_backfill(
@@ -761,6 +933,21 @@ def _record_page(
             message_id = _text(message.get("message_id"))
             if not message_id:
                 continue
+            (
+                sender_id,
+                sender_id_type,
+                sender_open_id,
+                sender_tenant_key,
+                sender_type,
+                sender_name,
+            ) = _sender_metadata(message)
+            if sender_open_id:
+                _upsert_lark_identity(
+                    conn,
+                    sender_open_id,
+                    tenant_key=sender_tenant_key,
+                    display_name=sender_name,
+                )
             is_own = _is_author_message(message, authorization["open_id"])
             is_deleted = _bool(message.get("deleted"))
             body_content = _body_content(message)
@@ -772,8 +959,9 @@ def _record_page(
                 INSERT INTO chat_messages (
                     chat_id, message_id, message_create_time, message_update_time,
                     message_type, body_ciphertext,
+                    sender_id, sender_id_type, sender_open_id, sender_tenant_key, sender_type,
                     is_deleted, first_indexed_at, last_observed_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
                 ON CONFLICT (chat_id, message_id) DO UPDATE SET
                     message_create_time = COALESCE(chat_messages.message_create_time, EXCLUDED.message_create_time),
                     message_update_time = COALESCE(EXCLUDED.message_update_time, chat_messages.message_update_time),
@@ -783,6 +971,11 @@ def _record_page(
                         WHEN EXCLUDED.body_ciphertext IS NULL THEN chat_messages.body_ciphertext
                         ELSE EXCLUDED.body_ciphertext
                     END,
+                    sender_id = COALESCE(EXCLUDED.sender_id, chat_messages.sender_id),
+                    sender_id_type = COALESCE(EXCLUDED.sender_id_type, chat_messages.sender_id_type),
+                    sender_open_id = COALESCE(EXCLUDED.sender_open_id, chat_messages.sender_open_id),
+                    sender_tenant_key = COALESCE(EXCLUDED.sender_tenant_key, chat_messages.sender_tenant_key),
+                    sender_type = COALESCE(EXCLUDED.sender_type, chat_messages.sender_type),
                     is_deleted = chat_messages.is_deleted OR EXCLUDED.is_deleted,
                     last_observed_at = NOW()
                 """,
@@ -793,6 +986,11 @@ def _record_page(
                     _lark_time(message.get("update_time")),
                     _text(message.get("msg_type")),
                     body_ciphertext,
+                    sender_id,
+                    sender_id_type,
+                    sender_open_id,
+                    sender_tenant_key,
+                    sender_type,
                     is_deleted,
                 ),
             )
@@ -1014,6 +1212,29 @@ def _body_content(message: dict[str, Any]) -> str | None:
     return _text(body.get("content")) if isinstance(body, dict) else None
 
 
+def _sender_metadata(message: dict[str, Any]) -> tuple[
+    str | None,
+    str | None,
+    str | None,
+    str | None,
+    str | None,
+    str | None,
+]:
+    sender = message.get("sender")
+    if not isinstance(sender, dict):
+        return None, None, None, None, None, None
+    sender_id = _text(sender.get("id"))
+    sender_id_type = _text(sender.get("id_type"))
+    return (
+        sender_id,
+        sender_id_type,
+        sender_id if sender_id_type == "open_id" else None,
+        _text(sender.get("tenant_key")),
+        _text(sender.get("sender_type")),
+        _text(sender.get("sender_name")) or _text(sender.get("name")),
+    )
+
+
 def _is_author_message(message: dict[str, Any], open_id: str) -> bool:
     sender = message.get("sender")
     if not isinstance(sender, dict):
@@ -1031,6 +1252,14 @@ def _lark_time(value: object) -> datetime | None:
         return datetime.fromtimestamp(milliseconds / 1000, tz=UTC)
     except (TypeError, ValueError, OSError):
         return None
+
+
+def _nonnegative_int(value: object) -> int | None:
+    try:
+        parsed = int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed is not None and parsed >= 0 else None
 
 
 def _expiry(seconds: int | None) -> datetime | None:

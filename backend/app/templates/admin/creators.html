@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}达人 · 管理台{% endblock %}
+{% block body %}
+<div class="page">
+  {% include "admin/_nav.html" %}
+  <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
+    <div class="alert alert-info">这是人工维护的达人身份库。当前仅存达人与稳定身份标识；自动候选与证据会在下一阶段的规则或模型接入后写入。</div>
+    {% if form_error %}<div class="alert alert-danger" role="alert">{{ form_error }}</div>{% endif %}
+    <div class="card mb-4"><div class="card-body">
+      <form action="/admin/creators" method="post" class="row g-3 align-items-end">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="col-md-9"><label class="form-label" for="creator-name">达人名称</label><input class="form-control" id="creator-name" name="display_name" maxlength="160" required autofocus></div>
+        <div class="col-md-3"><button class="btn btn-primary w-100" type="submit">新建达人</button></div>
+      </form>
+    </div></div>
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">达人身份库</h3></div>
+      {% if creators %}
+      <div class="table-responsive"><table class="table table-vcenter card-table">
+        <thead><tr><th>达人</th><th>身份标识</th><th>候选</th><th>最后更新</th><th></th></tr></thead>
+        <tbody>{% for creator in creators %}<tr>
+          <td>{{ creator.display_name }}</td><td>{{ creator.identifier_count }}</td><td>{{ creator.pending_candidate_count }} 待处理 / {{ creator.candidate_count }} 总计</td><td>{{ creator.updated_at_label }}</td>
+          <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="/admin/creators/{{ creator.id }}">查看</a></td>
+        </tr>{% endfor %}</tbody>
+      </table></div>
+      {% else %}<div class="card-body text-secondary">尚未建立达人档案。</div>{% endif %}
+    </div>
+  </div></div></div>
+</div>
+{% endblock %}

@@ -1,6 +1,13 @@
 from datetime import UTC, datetime, timedelta
 
-from app.worker import _body_content, _is_author_message, _lark_time, _member_count_refresh_due
+from app.worker import (
+    _body_content,
+    _is_author_message,
+    _lark_time,
+    _member_count_refresh_due,
+    _read_member_snapshot,
+    _sender_metadata,
+)
 
 
 def test_author_message_requires_open_id_semantics() -> None:
@@ -26,3 +33,51 @@ def test_member_count_refresh_is_due_only_when_missing_or_stale() -> None:
 def test_message_body_content_is_kept_as_the_lark_payload() -> None:
     assert _body_content({"body": {"content": '{"text":"hello"}'}}) == '{"text":"hello"}'
     assert _body_content({"body": {}}) is None
+
+
+def test_sender_metadata_keeps_open_id_only_when_lark_marks_it_as_open_id() -> None:
+    user = {
+        "sender": {
+            "id": "ou_sender",
+            "id_type": "open_id",
+            "tenant_key": "tenant_external",
+            "sender_type": "user",
+            "sender_name": "Creator",
+        }
+    }
+    app = {"sender": {"id": "cli_app", "id_type": "app_id", "sender_type": "app"}}
+
+    assert _sender_metadata(user) == (
+        "ou_sender",
+        "open_id",
+        "ou_sender",
+        "tenant_external",
+        "user",
+        "Creator",
+    )
+    assert _sender_metadata(app)[2] is None
+
+
+def test_member_snapshot_follows_lark_pagination_and_keeps_member_facts() -> None:
+    class Client:
+        def __init__(self):
+            self.tokens = []
+
+        def list_chat_members(self, _token, _chat_id, page_token=None):
+            self.tokens.append(page_token)
+            if page_token is None:
+                return {
+                    "user_total": 2,
+                    "has_more": True,
+                    "page_token": "next",
+                    "users": [{"member_id": "ou_one", "name": "One", "tenant_key": "tenant_a"}],
+                }
+            return {"user_total": 2, "items": [{"member_id": "ou_two", "name": "Two"}]}
+
+    client = Client()
+    snapshot = _read_member_snapshot(client, "token", "oc_test")
+
+    assert client.tokens == [None, "next"]
+    assert snapshot.count == 2
+    assert snapshot.snapshot_status == "succeeded"
+    assert {member["open_id"] for member in snapshot.members} == {"ou_one", "ou_two"}

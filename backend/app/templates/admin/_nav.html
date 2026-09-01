@@ -15,6 +15,7 @@
       <a class="btn btn-sm {% if active_page == 'users' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/users">人员</a>
       <a class="btn btn-sm {% if active_page == 'chats' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/chats">群聊</a>
       {% if admin_role == 'owner' %}<a class="btn btn-sm {% if active_page == 'messages' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/messages">消息内容</a>{% endif %}
+      {% if admin_role == 'owner' %}<a class="btn btn-sm {% if active_page == 'creators' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/creators">达人</a>{% endif %}
       <a class="btn btn-sm {% if active_page == 'jobs' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/jobs">同步任务</a>
     </div>
   </div>

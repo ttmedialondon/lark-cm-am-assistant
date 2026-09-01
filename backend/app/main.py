@@ -182,6 +182,16 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
             ),
         ).fetchone()
         authorization_id = row["id"]
+        conn.execute(
+            """
+            INSERT INTO lark_identities (open_id, display_name, first_seen_at, last_seen_at)
+            VALUES (%s, %s, NOW(), NOW())
+            ON CONFLICT (open_id) DO UPDATE SET
+                display_name = COALESCE(EXCLUDED.display_name, lark_identities.display_name),
+                last_seen_at = EXCLUDED.last_seen_at
+            """,
+            (profile.open_id, profile.name),
+        )
         # A re-authorization is the explicit opportunity to retry unreadable
         # conversations and collect content under the revised agreement.
         conn.execute(
@@ -194,7 +204,8 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 sync_generation = sync_generation + 1,
                 sync_status = CASE WHEN sync_status = 'not_readable' THEN 'pending' ELSE sync_status END,
                 last_error = CASE WHEN sync_status = 'not_readable' THEN NULL ELSE last_error END,
-                member_count_status = 'pending', member_count_checked_at = NULL
+                member_count_status = 'pending', member_count_checked_at = NULL,
+                member_snapshot_status = 'pending', member_snapshot_checked_at = NULL
             WHERE authorization_id = %s
             """,
             (authorization_id,),
@@ -358,9 +369,18 @@ def _format_time(value: datetime | None) -> str:
     return value.astimezone(LONDON_TIME_ZONE).strftime("%Y-%m-%d %H:%M %Z")
 
 
+def _admin_csrf_token(authorization: dict[str, Any]) -> str:
+    return hmac.new(
+        get_settings().token_encryption_key,
+        f"admin-write:{authorization['id']}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 app.include_router(
     create_admin_router(
         current_authorization=_current_authorization,
         render_template=_template,
+        csrf_token=_admin_csrf_token,
     )
 )

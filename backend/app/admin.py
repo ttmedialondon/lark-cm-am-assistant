@@ -1,4 +1,4 @@
-"""Small, read-only internal admin router.
+"""Small internal admin router with owner-only creator registry writes.
 
 The router receives the session and rendering functions from ``main``.  That
 keeps it independent from the web application's module-level globals and
@@ -7,14 +7,16 @@ avoids importing ``main`` back into an admin module.
 
 from __future__ import annotations
 
+import hmac
 from collections.abc import Callable
 from typing import Any, Protocol
+from urllib.parse import parse_qs
 from uuid import UUID
 
 from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse, Response
 
-from . import admin_reporting
+from . import admin_reporting, creator_registry
 
 
 class TemplateRenderer(Protocol):
@@ -28,12 +30,14 @@ class TemplateRenderer(Protocol):
 
 
 CurrentAuthorization = Callable[[Request], dict[str, Any] | None]
+CsrfToken = Callable[[dict[str, Any]], str]
 
 
 def create_admin_router(
     *,
     current_authorization: CurrentAuthorization,
     render_template: TemplateRenderer,
+    csrf_token: CsrfToken,
 ) -> APIRouter:
     """Build the internal routes with dependencies supplied by the app shell."""
 
@@ -66,6 +70,7 @@ def create_admin_router(
             **access_context,
             "active_page": active_page,
             "admin_role_label": _role_label(access_context["admin_role"]),
+            "csrf_token": csrf_token(access_context["authorization"]),
         }
 
     def owner_access(request: Request) -> tuple[dict[str, Any] | None, Response | None]:
@@ -77,10 +82,24 @@ def create_admin_router(
             return None, render_template(
                 request,
                 "error.html",
-                {"title": "消息内容仅限所有者", "detail": "当前管理角色不能查看 CM / AM 的具体消息内容。"},
+                {"title": "内部数据仅限所有者", "detail": "当前管理角色不能访问此内部数据页面。"},
                 403,
             )
         return access_context, None
+
+    def render_creators(
+        request: Request,
+        access_context: dict[str, Any],
+        *,
+        error: str | None = None,
+        status_code: int = 200,
+    ) -> Response:
+        return render_template(
+            request,
+            "admin/creators.html",
+            {**page_context(access_context, "creators"), "creators": admin_reporting.creators(), "form_error": error},
+            status_code,
+        )
 
     @router.get("/admin")
     def admin_overview(request: Request) -> Response:
@@ -187,6 +206,95 @@ def create_admin_router(
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 
+    @router.get("/admin/creators")
+    def admin_creators(request: Request) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        return render_creators(request, access_context)
+
+    @router.post("/admin/creators")
+    async def admin_create_creator(request: Request) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        form = await _form_fields(request)
+        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
+            return render_template(
+                request,
+                "error.html",
+                {"title": "请求校验失败", "detail": "请返回达人库页面后重试。"},
+                400,
+            )
+        try:
+            creator_id = creator_registry.create_creator(
+                access_context["authorization"]["id"], form.get("display_name", "")
+            )
+        except creator_registry.CreatorInputError as exc:
+            return render_creators(request, access_context, error=str(exc), status_code=400)
+        return RedirectResponse(url=f"/admin/creators/{creator_id}", status_code=303)
+
+    @router.get("/admin/creators/{creator_id}")
+    def admin_creator_detail(request: Request, creator_id: UUID) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        detail = admin_reporting.creator_detail(creator_id)
+        if not detail:
+            return render_template(
+                request,
+                "error.html",
+                {"title": "未找到达人", "detail": "该达人可能已被删除。"},
+                404,
+            )
+        return render_template(
+            request,
+            "admin/creator_detail.html",
+            {**page_context(access_context, "creators"), **detail},
+        )
+
+    @router.post("/admin/creators/{creator_id}/identifiers")
+    async def admin_create_creator_identifier(request: Request, creator_id: UUID) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        form = await _form_fields(request)
+        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
+            return render_template(
+                request,
+                "error.html",
+                {"title": "请求校验失败", "detail": "请返回达人详情页面后重试。"},
+                400,
+            )
+        try:
+            creator_registry.add_identifier(
+                access_context["authorization"]["id"],
+                creator_id,
+                kind=form.get("kind", ""),
+                platform=form.get("platform", ""),
+                value=form.get("value", ""),
+            )
+        except creator_registry.CreatorInputError as exc:
+            detail = admin_reporting.creator_detail(creator_id)
+            if not detail:
+                return render_template(
+                    request,
+                    "error.html",
+                    {"title": "未找到达人", "detail": "该达人可能已被删除。"},
+                    404,
+                )
+            return render_template(
+                request,
+                "admin/creator_detail.html",
+                {**page_context(access_context, "creators"), **detail, "form_error": str(exc)},
+                400,
+            )
+        return RedirectResponse(url=f"/admin/creators/{creator_id}", status_code=303)
+
     @router.get("/admin/jobs")
     def admin_jobs(request: Request) -> Response:
         access_context, denied = access(request)
@@ -200,6 +308,22 @@ def create_admin_router(
         )
 
     return router
+
+
+async def _form_fields(request: Request) -> dict[str, str]:
+    content_type = request.headers.get("content-type", "").split(";", 1)[0]
+    if content_type != "application/x-www-form-urlencoded":
+        return {}
+    body = await request.body()
+    if len(body) > 4096:
+        return {}
+    parsed = parse_qs(body.decode("utf-8", "replace"), keep_blank_values=True)
+    return {key: values[-1] for key, values in parsed.items() if values}
+
+
+def _csrf_matches(form: dict[str, str], expected: str) -> bool:
+    supplied = form.get("csrf_token")
+    return bool(supplied) and hmac.compare_digest(supplied, expected)
 
 
 def _role_label(role: str) -> str:

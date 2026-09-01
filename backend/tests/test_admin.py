@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from fastapi.testclient import TestClient
 
-from app import admin, admin_reporting
+from app import admin, admin_reporting, creator_registry
 
 
 def _client(current_authorization, contexts=None):
@@ -19,6 +19,7 @@ def _client(current_authorization, contexts=None):
         admin.create_admin_router(
             current_authorization=current_authorization,
             render_template=render,
+            csrf_token=lambda _authorization: "csrf",
         )
     )
     return TestClient(app)
@@ -57,6 +58,32 @@ def test_message_content_page_is_owner_only(monkeypatch):
     response = _client(lambda _request: {"id": uuid4(), "status": "active"}).get("/admin/messages")
 
     assert response.status_code == 403
+
+
+def test_creator_library_is_owner_only_and_uses_the_owner_context(monkeypatch):
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(admin_reporting, "creators", lambda: [])
+    response = _client(lambda _request: {"id": uuid4(), "status": "active"}).get("/admin/creators")
+
+    assert response.status_code == 200
+
+
+def test_creator_write_requires_csrf_and_redirects_after_a_valid_post(monkeypatch):
+    owner_id = uuid4()
+    creator_id = uuid4()
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(creator_registry, "create_creator", lambda *_args: creator_id)
+    client = _client(lambda _request: {"id": owner_id, "status": "active"})
+
+    assert client.post("/admin/creators", data={"display_name": "Creator"}).status_code == 400
+    response = client.post(
+        "/admin/creators",
+        data={"display_name": "Creator", "csrf_token": "csrf"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/admin/creators/{creator_id}"
 
 
 def test_selecting_a_user_lists_conversations_without_reading_message_content(monkeypatch):
