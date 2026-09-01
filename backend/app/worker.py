@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
@@ -12,6 +13,7 @@ from typing import Any
 import psycopg
 
 from .config import Settings, get_settings
+from .creator_rules import extract_creator_claims
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
 from .lark_api import LarkApiError, LarkClient, TokenBundle
@@ -929,6 +931,10 @@ def _record_page(
     inserted = 0
     own_inserted = 0
     with connection() as conn, conn.transaction():
+        authorized_open_ids = {
+            row["open_id"]
+            for row in conn.execute("SELECT open_id FROM authorizations").fetchall()
+        }
         for message in messages:
             message_id = _text(message.get("message_id"))
             if not message_id:
@@ -1006,6 +1012,22 @@ def _record_page(
                 """,
                 (authorization["id"], chat_id, message_id, is_own),
             ).fetchone()
+            if (
+                content_cipher
+                and body_content
+                and not is_deleted
+                and sender_type == "user"
+                and sender_open_id
+                and sender_open_id not in authorized_open_ids
+            ):
+                _record_creator_claims(
+                    conn,
+                    subject_open_id=sender_open_id,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    observed_by_authorization_id=authorization["id"],
+                    body_content=body_content,
+                )
             if observation["is_new"]:
                 inserted += 1
                 own_inserted += int(bool(observation["sent_by_author"]))
@@ -1061,6 +1083,70 @@ def _record_page(
                 ),
             )
     return inserted, own_inserted
+
+
+def _record_creator_claims(
+    conn: psycopg.Connection,
+    *,
+    subject_open_id: str,
+    chat_id: str,
+    message_id: str,
+    observed_by_authorization_id: uuid.UUID,
+    body_content: str,
+) -> None:
+    """Store high-precision account claims as reviewable evidence, never as facts."""
+
+    for claim in extract_creator_claims(body_content):
+        creator = conn.execute(
+            """
+            SELECT creator_id
+            FROM creator_identifiers
+            WHERE kind = 'handle' AND platform = %s AND normalized_value = %s
+            """,
+            (claim.platform, claim.normalized_value),
+        ).fetchone()
+        candidate = conn.execute(
+            """
+            INSERT INTO creator_identity_candidates (
+                id, subject_open_id, creator_id, identifier_kind, platform,
+                normalized_value, display_value, source
+            ) VALUES (%s, %s, %s, 'handle', %s, %s, %s, %s)
+            ON CONFLICT (subject_open_id, identifier_kind, platform, normalized_value)
+            WHERE subject_open_id IS NOT NULL
+            DO UPDATE SET
+                creator_id = COALESCE(creator_identity_candidates.creator_id, EXCLUDED.creator_id),
+                updated_at = NOW()
+            RETURNING id
+            """,
+            (
+                uuid.uuid4(),
+                subject_open_id,
+                creator["creator_id"] if creator else None,
+                claim.platform,
+                claim.normalized_value,
+                claim.display_value,
+                f"rule:{claim.source}",
+            ),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO creator_candidate_evidence (
+                id, candidate_id, chat_id, message_id, source_open_id,
+                observed_by_authorization_id, evidence_type, metadata
+            ) VALUES (%s, %s, %s, %s, %s, %s, 'message', %s::jsonb)
+            ON CONFLICT (candidate_id, chat_id, message_id)
+            WHERE message_id IS NOT NULL DO NOTHING
+            """,
+            (
+                uuid.uuid4(),
+                candidate["id"],
+                chat_id,
+                message_id,
+                subject_open_id,
+                observed_by_authorization_id,
+                json.dumps({"extractor": "rule-v1", "rule": claim.source}),
+            ),
+        )
 
 
 def _mark_chat_not_readable(authorization_id: uuid.UUID, chat_id: str, generation: int) -> None:

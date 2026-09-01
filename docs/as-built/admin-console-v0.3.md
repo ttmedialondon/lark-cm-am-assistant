@@ -6,7 +6,7 @@
 
 每个请求都会把 Secure + HttpOnly Web Session 映射回 Lark 授权记录，再查询 `admin_roles`：
 
-- `owner`：查看运营统计、人员/群目录、同步任务、`/admin/messages` 的正文，以及 `/admin/creators` 的达人身份库；
+- `owner`：查看运营统计、人员/群目录、同步任务、`/admin/messages` 的正文、`/admin/creators` 的达人身份库，以及 `/admin/candidates` 的规则候选证据；
 - `operator` / `viewer`：查看管理台统计，但不能进入正文页；
 - 无活动角色：403。
 
@@ -28,7 +28,7 @@ chats (公司级唯一群聊或私聊)     authorization_message_observations
 chat_messages (公司级唯一消息 ID；加密正文与必要元数据)
        │
        ├── lark_identities（发送者 / 成员的稳定 Lark 身份）
-       └── creator_candidate_evidence（后续归属候选的可追溯证据）
+       └── creator_candidate_evidence（规则候选的可追溯消息证据）
 
 chats ──< chat_members（最新群成员快照）
 creators ──< creator_identifiers（平台账号、邮箱、电话、CRM ID、别名）
@@ -45,7 +45,8 @@ creators ──< creator_identifiers（平台账号、邮箱、电话、CRM ID�
 | `/admin/users/{authorization_id}` | 某一授权用户的当前可见会话与近期任务。 |
 | `/admin/chats` | 公司级唯一群、已授权可见人数、去重消息数、同步覆盖与成员人数状态。 |
 | `/admin/messages` | **仅 owner**：按 CM/AM、群/私聊、具体会话筛选，最近 100 条正文分页展示。 |
-| `/admin/creators` | **仅 owner**：人工维护达人及稳定身份标识；候选/证据自动生成尚未启用。 |
+| `/admin/creators` | **仅 owner**：人工维护达人及稳定身份标识。 |
+| `/admin/candidates` | **仅 owner**：查看规则 V1 生成的平台账号候选及其消息证据，判断识别是否正确。 |
 | `/admin/jobs` | 最近同步任务及不含敏感内容的运行统计。 |
 
 ## 当前同步参数
@@ -57,3 +58,4 @@ creators ──< creator_identifiers（平台账号、邮箱、电话、CRM ID�
 - 正文：新版授权后 AES-GCM 加密存储，不进日志；
 - 私聊：以 `types=p2p` 尝试发现，状态会在用户记录上可见，失败不会影响群聊。
 - 群成员：每次成员刷新分页更新最新快照；Lark 未返回的成员不会被删除或标为离群。
+- 识别规则 V1：仅提取外部参与者正文中明确的 TikTok、Instagram、YouTube、Twitch 主页链接或带平台标签的账号。结果始终为 `pending` 候选；不基于昵称、群名、普通 @ 提及或模型输出自动确认达人。

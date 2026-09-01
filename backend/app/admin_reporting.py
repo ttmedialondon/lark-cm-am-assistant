@@ -555,6 +555,104 @@ def creator_detail(creator_id: UUID) -> dict[str, Any] | None:
     }
 
 
+def creator_candidates(limit: int = 200) -> list[dict[str, Any]]:
+    """Return rule-generated creator candidates without reading message bodies."""
+
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                candidate.id,
+                candidate.identifier_kind,
+                candidate.platform,
+                candidate.display_value,
+                candidate.status,
+                candidate.source,
+                candidate.created_at,
+                candidate.updated_at,
+                subject.display_name AS subject_display_name,
+                creator.display_name AS creator_display_name,
+                COUNT(evidence.id) AS evidence_count,
+                MAX(evidence.created_at) AS last_evidence_at
+            FROM creator_identity_candidates candidate
+            LEFT JOIN lark_identities subject ON subject.open_id = candidate.subject_open_id
+            LEFT JOIN creators creator ON creator.id = candidate.creator_id
+            LEFT JOIN creator_candidate_evidence evidence ON evidence.candidate_id = candidate.id
+            GROUP BY
+                candidate.id, candidate.identifier_kind, candidate.platform, candidate.display_value,
+                candidate.status, candidate.source, candidate.created_at, candidate.updated_at,
+                subject.display_name, creator.display_name
+            ORDER BY
+                CASE candidate.status WHEN 'pending' THEN 0 ELSE 1 END,
+                MAX(evidence.created_at) DESC NULLS LAST,
+                candidate.updated_at DESC
+            LIMIT %s
+            """,
+            (_list_limit(limit),),
+        ).fetchall()
+    return [_decorate_creator_candidate(row) for row in rows]
+
+
+def creator_candidate_detail(candidate_id: UUID) -> dict[str, Any] | None:
+    """Return one owner-reviewable candidate and only its linked evidence."""
+
+    with connection() as conn:
+        candidate = conn.execute(
+            """
+            SELECT
+                candidate.id,
+                candidate.identifier_kind,
+                candidate.platform,
+                candidate.display_value,
+                candidate.status,
+                candidate.source,
+                candidate.created_at,
+                candidate.updated_at,
+                subject.display_name AS subject_display_name,
+                creator.id AS creator_id,
+                creator.display_name AS creator_display_name
+            FROM creator_identity_candidates candidate
+            LEFT JOIN lark_identities subject ON subject.open_id = candidate.subject_open_id
+            LEFT JOIN creators creator ON creator.id = candidate.creator_id
+            WHERE candidate.id = %s
+            """,
+            (candidate_id,),
+        ).fetchone()
+        if not candidate:
+            return None
+        evidence = conn.execute(
+            """
+            SELECT
+                evidence.id,
+                evidence.evidence_type,
+                evidence.created_at,
+                evidence.chat_id,
+                chat.name AS chat_name,
+                COALESCE(chat.chat_mode, 'group') AS chat_mode,
+                source.display_name AS source_display_name,
+                message.body_ciphertext,
+                message.message_type,
+                message.message_create_time,
+                message.is_deleted
+            FROM creator_candidate_evidence evidence
+            LEFT JOIN chats chat ON chat.chat_id = evidence.chat_id
+            LEFT JOIN lark_identities source ON source.open_id = evidence.source_open_id
+            LEFT JOIN chat_messages message
+              ON message.chat_id = evidence.chat_id AND message.message_id = evidence.message_id
+            WHERE evidence.candidate_id = %s
+            ORDER BY evidence.created_at DESC, evidence.id DESC
+            LIMIT %s
+            """,
+            (candidate_id, MAX_LIST_LIMIT),
+        ).fetchall()
+
+    cipher = message_body_cipher(get_settings().token_encryption_key)
+    return {
+        "candidate": _decorate_creator_candidate(candidate),
+        "evidence": [_decorate_candidate_evidence(row, cipher) for row in evidence],
+    }
+
+
 def message_conversations(authorization_id: UUID) -> list[dict[str, Any]]:
     """Return conversations that may be selected on the owner-only content page."""
 
@@ -682,6 +780,19 @@ def record_message_view(viewer_id: UUID, target_authorization_id: UUID, chat_id:
             VALUES (%s, %s, 'admin_message_content_viewed', %s::jsonb)
             """,
             (uuid4(), viewer_id, json.dumps(metadata)),
+        )
+
+
+def record_candidate_view(viewer_id: UUID, candidate_id: UUID) -> None:
+    """Audit a candidate evidence view without putting message text in the log."""
+
+    with connection() as conn, conn.transaction():
+        conn.execute(
+            """
+            INSERT INTO audit_events (id, authorization_id, action, metadata)
+            VALUES (%s, %s, 'admin_creator_candidate_viewed', %s::jsonb)
+            """,
+            (uuid4(), viewer_id, json.dumps({"candidate_id": str(candidate_id)})),
         )
 
 
@@ -829,6 +940,47 @@ def _decorate_creator_identifier(row: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _decorate_creator_candidate(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    item["subject_label"] = item.get("subject_display_name") or "未知 Lark 参与者"
+    item["creator_label"] = item.get("creator_display_name") or "尚未匹配达人库"
+    item["identifier_label"] = " · ".join(
+        value for value in (item.get("platform"), item.get("display_value")) if value
+    ) or "未命名标识"
+    item["status_label"], item["status_badge"] = _candidate_status(item.get("status"))
+    item["created_at_label"] = _format_time(item.get("created_at"))
+    item["updated_at_label"] = _format_time(item.get("updated_at"))
+    item["last_evidence_at_label"] = _format_time(item.get("last_evidence_at"))
+    return item
+
+
+def _decorate_candidate_evidence(row: dict[str, Any], cipher: TokenCipher) -> dict[str, Any]:
+    item = dict(row)
+    item["chat_mode"] = item.get("chat_mode") or "group"
+    item["chat_name"] = _conversation_name(item.get("chat_name"), item["chat_mode"], item.get("chat_id"))
+    item["source_label"] = item.get("source_display_name") or "会话参与者"
+    item["evidence_type_label"] = {
+        "message": "消息规则",
+        "member": "群成员快照",
+        "p2p": "私聊对端",
+        "crm": "CRM",
+        "manual": "人工录入",
+    }.get(item.get("evidence_type"), "识别证据")
+    item["created_at_label"] = _message_time(item.get("message_create_time") or item.get("created_at"))
+    if item.get("is_deleted"):
+        item["content"] = "（该消息已删除）"
+    elif not item.get("body_ciphertext"):
+        item["content"] = "（消息正文未保存）"
+    else:
+        try:
+            body = cipher.decrypt(item["body_ciphertext"])
+        except (InvalidTag, UnicodeDecodeError, ValueError):
+            item["content"] = "（正文无法读取）"
+        else:
+            item["content"] = _readable_body(body, item.get("message_type"))
+    return item
+
+
 def _format_time(value: datetime | None) -> str:
     if not value:
         return "尚未完成"
@@ -889,6 +1041,16 @@ def _p2p_status(value: str | None) -> tuple[str, str]:
         "attention_required": ("需要重新授权", "warning"),
     }
     return mapping.get(value or "", ("尚未检查", "secondary"))
+
+
+def _candidate_status(value: str | None) -> tuple[str, str]:
+    mapping = {
+        "pending": ("待核验", "warning"),
+        "confirmed": ("已确认", "success"),
+        "rejected": ("已排除", "secondary"),
+        "conflict": ("存在冲突", "danger"),
+    }
+    return mapping.get(value or "", ("状态未知", "secondary"))
 
 
 def _member_count(count: int | None, status: str | None) -> str:

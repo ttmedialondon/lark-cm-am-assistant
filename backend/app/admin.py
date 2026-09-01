@@ -214,6 +214,43 @@ def create_admin_router(
         assert access_context is not None
         return render_creators(request, access_context)
 
+    @router.get("/admin/candidates")
+    def admin_creator_candidates(request: Request) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        response = render_template(
+            request,
+            "admin/candidates.html",
+            {**page_context(access_context, "candidates"), "candidates": admin_reporting.creator_candidates()},
+        )
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
+    @router.get("/admin/candidates/{candidate_id}")
+    def admin_creator_candidate_detail(request: Request, candidate_id: UUID) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        detail = admin_reporting.creator_candidate_detail(candidate_id)
+        if not detail:
+            return render_template(
+                request,
+                "error.html",
+                {"title": "未找到识别候选", "detail": "该候选可能尚未生成，或已被删除。"},
+                404,
+            )
+        admin_reporting.record_candidate_view(access_context["authorization"]["id"], candidate_id)
+        response = render_template(
+            request,
+            "admin/candidate_detail.html",
+            {**page_context(access_context, "candidates"), **detail},
+        )
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
     @router.post("/admin/creators")
     async def admin_create_creator(request: Request) -> Response:
         access_context, denied = owner_access(request)

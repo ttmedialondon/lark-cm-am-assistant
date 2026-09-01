@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}识别候选 · 管理台{% endblock %}
+{% block body %}
+<div class="page">
+  {% include "admin/_nav.html" %}
+  <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
+    <div class="alert alert-warning">仅所有者可查看。候选只由高精度规则生成，不会自动确认达人归属；打开详情才会读取对应的已加密消息正文并记入审计日志。</div>
+    <div class="card">
+      <div class="card-header"><div><h3 class="card-title mb-1">达人识别候选</h3><div class="text-secondary small">每条候选均保留其来源规则与证据数，便于先核验准确率。</div></div></div>
+      {% if candidates %}
+      <div class="table-responsive"><table class="table table-vcenter card-table">
+        <thead><tr><th>Lark 参与者</th><th>发现的账号</th><th>达人库匹配</th><th>状态</th><th>证据</th><th>最后发现</th><th></th></tr></thead>
+        <tbody>{% for candidate in candidates %}<tr>
+          <td>{{ candidate.subject_label }}</td>
+          <td><div>{{ candidate.identifier_label }}</div><div class="text-secondary small">{{ candidate.source }}</div></td>
+          <td>{{ candidate.creator_label }}</td>
+          <td><span class="badge bg-{{ candidate.status_badge }}-lt">{{ candidate.status_label }}</span></td>
+          <td>{{ candidate.evidence_count }}</td>
+          <td class="text-secondary text-nowrap">{{ candidate.last_evidence_at_label }}</td>
+          <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="/admin/candidates/{{ candidate.id }}">查看证据</a></td>
+        </tr>{% endfor %}</tbody>
+      </table></div>
+      {% else %}<div class="card-body text-secondary">还没有规则识别出的候选。完成一次历史回填或出现符合规则的新消息后会显示在这里。</div>{% endif %}
+    </div>
+  </div></div></div>
+</div>
+{% endblock %}

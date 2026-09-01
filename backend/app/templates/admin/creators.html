@@ -4,7 +4,7 @@
 <div class="page">
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
-    <div class="alert alert-info">这是人工维护的达人身份库。当前仅存达人与稳定身份标识；自动候选与证据会在下一阶段的规则或模型接入后写入。</div>
+    <div class="alert alert-info">这是人工维护的达人身份库。规则生成的账号候选不会自动确认；请在<a class="alert-link" href="/admin/candidates">识别候选</a>中先核验其消息证据。</div>
     {% if form_error %}<div class="alert alert-danger" role="alert">{{ form_error }}</div>{% endif %}
     <div class="card mb-4"><div class="card-body">
       <form action="/admin/creators" method="post" class="row g-3 align-items-end">
