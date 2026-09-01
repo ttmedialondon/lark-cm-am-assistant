@@ -206,9 +206,9 @@ def assessment_detail(assessment_id: UUID | str) -> dict[str, Any] | None:
                 message.message_create_time, message.message_type,
                 chat.name AS chat_name, sender.display_name AS sender_display_name,
                 CASE
-                    WHEN authorization.status = 'active'
-                     AND authorization.body_consent_at IS NOT NULL
-                     AND observation.observed_at >= authorization.body_consent_at
+                    WHEN auth.status = 'active'
+                     AND auth.body_consent_at IS NOT NULL
+                     AND observation.observed_at >= auth.body_consent_at
                      AND access.is_visible AND access.sync_enabled
                      AND NOT message.is_deleted
                     THEN message.body_ciphertext
@@ -218,7 +218,7 @@ def assessment_detail(assessment_id: UUID | str) -> dict[str, Any] | None:
               ON observation.authorization_id = reference.authorization_id
              AND observation.chat_id = reference.chat_id
              AND observation.message_id = reference.message_id
-            JOIN authorizations authorization ON authorization.id = reference.authorization_id
+            JOIN authorizations auth ON auth.id = reference.authorization_id
             JOIN authorization_chats access
               ON access.authorization_id = reference.authorization_id
              AND access.chat_id = reference.chat_id
@@ -619,16 +619,16 @@ def _anchor_row(conn: psycopg.Connection, contact_id: UUID) -> Mapping[str, Any]
         JOIN chat_messages message ON message.sender_open_id = subject.open_id
         JOIN authorization_message_observations observation
           ON observation.chat_id = message.chat_id AND observation.message_id = message.message_id
-        JOIN authorizations authorization ON authorization.id = observation.authorization_id
+        JOIN authorizations auth ON auth.id = observation.authorization_id
         JOIN authorization_chats access
           ON access.authorization_id = observation.authorization_id AND access.chat_id = message.chat_id
         JOIN chats chat ON chat.chat_id = message.chat_id
         LEFT JOIN lark_identities sender ON sender.open_id = message.sender_open_id
         WHERE subject.contact_id = %s
           AND subject.identity_type = 'user'
-          AND authorization.status = 'active'
-          AND authorization.body_consent_at IS NOT NULL
-          AND observation.observed_at >= authorization.body_consent_at
+          AND auth.status = 'active'
+          AND auth.body_consent_at IS NOT NULL
+          AND observation.observed_at >= auth.body_consent_at
           AND access.is_visible AND access.sync_enabled
           AND NOT message.is_deleted AND message.body_ciphertext IS NOT NULL
           AND message.message_create_time IS NOT NULL
@@ -663,7 +663,7 @@ def _conversation_context(
             chat.external, sender.tenant_classification AS sender_tenant_classification,
             access.p2p_counterpart_open_id
         FROM authorization_message_observations observation
-        JOIN authorizations authorization ON authorization.id = observation.authorization_id
+        JOIN authorizations auth ON auth.id = observation.authorization_id
         JOIN authorization_chats access
           ON access.authorization_id = observation.authorization_id AND access.chat_id = observation.chat_id
         JOIN chat_messages message
@@ -671,9 +671,9 @@ def _conversation_context(
         JOIN chats chat ON chat.chat_id = message.chat_id
         LEFT JOIN lark_identities sender ON sender.open_id = message.sender_open_id
         WHERE observation.authorization_id = %s AND observation.chat_id = %s
-          AND authorization.status = 'active'
-          AND authorization.body_consent_at IS NOT NULL
-          AND observation.observed_at >= authorization.body_consent_at
+          AND auth.status = 'active'
+          AND auth.body_consent_at IS NOT NULL
+          AND observation.observed_at >= auth.body_consent_at
           AND access.is_visible AND access.sync_enabled
           AND NOT message.is_deleted AND message.body_ciphertext IS NOT NULL
           AND message.message_create_time IS NOT NULL
@@ -726,7 +726,7 @@ def _recent_subject_history(
             JOIN chat_messages message ON message.sender_open_id = subject.open_id
             JOIN authorization_message_observations observation
               ON observation.chat_id = message.chat_id AND observation.message_id = message.message_id
-            JOIN authorizations authorization ON authorization.id = observation.authorization_id
+            JOIN authorizations auth ON auth.id = observation.authorization_id
             JOIN authorization_chats access
               ON access.authorization_id = observation.authorization_id AND access.chat_id = message.chat_id
             JOIN chats chat ON chat.chat_id = message.chat_id
@@ -734,9 +734,9 @@ def _recent_subject_history(
             WHERE subject.contact_id = %s
               AND subject.identity_type = 'user'
               AND observation.authorization_id = %s
-              AND authorization.status = 'active'
-              AND authorization.body_consent_at IS NOT NULL
-              AND observation.observed_at >= authorization.body_consent_at
+              AND auth.status = 'active'
+              AND auth.body_consent_at IS NOT NULL
+              AND observation.observed_at >= auth.body_consent_at
               AND access.is_visible AND access.sync_enabled
               AND NOT message.is_deleted AND message.body_ciphertext IS NOT NULL
               AND message.message_create_time IS NOT NULL
@@ -899,9 +899,9 @@ def _refs_are_still_authorized_in(conn: psycopg.Connection, assessment_id: UUID)
         SELECT
             COUNT(reference.label) AS all_count,
             COUNT(reference.label) FILTER (
-                WHERE authorization.status = 'active'
-                  AND authorization.body_consent_at IS NOT NULL
-                  AND observation.observed_at >= authorization.body_consent_at
+                WHERE auth.status = 'active'
+                  AND auth.body_consent_at IS NOT NULL
+                  AND observation.observed_at >= auth.body_consent_at
                   AND access.is_visible AND access.sync_enabled
                   AND NOT message.is_deleted AND message.body_ciphertext IS NOT NULL
                   AND reference.authorization_id = assessment.source_authorization_id
@@ -912,7 +912,7 @@ def _refs_are_still_authorized_in(conn: psycopg.Connection, assessment_id: UUID)
           ON observation.authorization_id = reference.authorization_id
          AND observation.chat_id = reference.chat_id
          AND observation.message_id = reference.message_id
-        JOIN authorizations authorization ON authorization.id = reference.authorization_id
+        JOIN authorizations auth ON auth.id = reference.authorization_id
         JOIN authorization_chats access
           ON access.authorization_id = reference.authorization_id AND access.chat_id = reference.chat_id
         JOIN chat_messages message
