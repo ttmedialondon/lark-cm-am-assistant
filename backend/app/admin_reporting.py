@@ -503,7 +503,10 @@ def message_conversations(authorization_id: UUID, chat_mode: str | None = None) 
             SELECT
                 ac.chat_id,
                 c.name,
+                c.external,
                 c.chat_mode,
+                ac.member_count,
+                ac.member_count_status,
                 COUNT(o.message_id) FILTER (WHERE NOT m.is_deleted) AS message_count,
                 COUNT(o.message_id) FILTER (
                     WHERE NOT m.is_deleted
@@ -521,7 +524,7 @@ def message_conversations(authorization_id: UUID, chat_mode: str | None = None) 
               AND ac.is_visible
               AND COALESCE(c.chat_status, 'normal') = 'normal'
               AND (%s::text IS NULL OR COALESCE(c.chat_mode, 'group') = %s)
-            GROUP BY ac.chat_id, c.name, c.chat_mode
+            GROUP BY ac.chat_id, c.name, c.external, c.chat_mode, ac.member_count, ac.member_count_status
             ORDER BY LOWER(COALESCE(c.name, '')), ac.chat_id
             LIMIT %s
             """,
@@ -668,6 +671,9 @@ def _decorate_message_conversation(row: dict[str, Any]) -> dict[str, Any]:
     item["chat_mode"] = item.get("chat_mode") or "group"
     item["chat_mode_label"] = "私聊" if item["chat_mode"] == "p2p" else "群聊"
     item["name"] = _conversation_name(item.get("name"), item["chat_mode"], item.get("chat_id"))
+    item["member_count_label"] = "—" if item["chat_mode"] == "p2p" else _member_count(
+        item.get("member_count"), item.get("member_count_status")
+    )
     return item
 
 

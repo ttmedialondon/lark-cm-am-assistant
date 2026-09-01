@@ -16,7 +16,7 @@
         <div class="col-sm-3"><div class="subheader">可见消息索引</div><div class="h2">{{ user.message_count }}</div></div>
         <div class="col-sm-3"><div class="subheader">本人消息</div><div class="h2">{{ user.own_message_count }}</div></div>
       </div>
-      {% if admin_role == 'owner' %}<a class="btn btn-sm btn-outline-primary mt-3" href="/admin/messages?user_id={{ user.id }}">查看此人的消息内容</a>{% endif %}
+      {% if admin_role == 'owner' %}<a class="btn btn-sm btn-outline-primary mt-3" href="/admin/messages?user_id={{ user.id }}">查看此人的会话</a>{% endif %}
     </div></div>
 
     <div class="card mb-4">

@@ -143,7 +143,6 @@ def create_admin_router(
         request: Request,
         user_id: UUID | None = None,
         chat_id: str | None = None,
-        chat_mode: str | None = None,
         page: int = 1,
     ) -> Response:
         access_context, denied = owner_access(request)
@@ -151,8 +150,6 @@ def create_admin_router(
             return denied
         assert access_context is not None
 
-        if chat_mode not in {"group", "p2p"}:
-            chat_mode = None
         page = max(1, min(page, 10_000))
         users = admin_reporting.users()
         selected_user = next((item for item in users if item["id"] == user_id), None)
@@ -163,17 +160,19 @@ def create_admin_router(
                 {"title": "未找到授权用户", "detail": "该用户不存在，或尚未完成 Lark 授权。"},
                 404,
             )
-        if selected_user is None and users:
-            selected_user = users[0]
-
         conversations: list[dict[str, Any]] = []
-        content_page = {"metrics": {}, "items": [], "page": page, "has_next": False}
+        selected_chat: dict[str, Any] | None = None
+        content_page: dict[str, Any] | None = None
         if selected_user:
-            conversations = admin_reporting.message_conversations(selected_user["id"], chat_mode)
-            if chat_id not in {item["chat_id"] for item in conversations}:
-                chat_id = None
-            content_page = admin_reporting.message_page(selected_user["id"], chat_mode, chat_id, page)
-            admin_reporting.record_message_view(access_context["authorization"]["id"], selected_user["id"], chat_id)
+            conversations = admin_reporting.message_conversations(selected_user["id"])
+            selected_chat = next((item for item in conversations if item["chat_id"] == chat_id), None)
+            if selected_chat:
+                content_page = admin_reporting.message_page(
+                    selected_user["id"], selected_chat["chat_mode"], selected_chat["chat_id"], page
+                )
+                admin_reporting.record_message_view(
+                    access_context["authorization"]["id"], selected_user["id"], selected_chat["chat_id"]
+                )
 
         response = render_template(
             request,
@@ -182,8 +181,7 @@ def create_admin_router(
                 **page_context(access_context, "messages"),
                 "users": users,
                 "selected_user": selected_user,
-                "selected_chat_id": chat_id,
-                "selected_chat_mode": chat_mode,
+                "selected_chat": selected_chat,
                 "conversations": conversations,
                 "content_page": content_page,
             },
