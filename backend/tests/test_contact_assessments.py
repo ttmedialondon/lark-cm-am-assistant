@@ -267,3 +267,136 @@ def test_saved_refs_record_the_single_source_authorization(monkeypatch) -> None:
 
     update_params = next(params for query, params in conn.calls if "SET source_authorization_id" in query)
     assert update_params == (source_authorization_id, 1, 42, assessment_id)
+
+
+def test_auto_decision_confirms_only_one_unambiguous_high_confidence_role(monkeypatch) -> None:
+    confirmed: list[str] = []
+    monkeypatch.setattr(
+        contact_assessments,
+        "_auto_confirm_role",
+        lambda _conn, _contact_id, role: confirmed.append(role) or "confirmed",
+    )
+
+    outcome, review_status, roles, relations = contact_assessments._apply_automatic_decision(
+        object(),
+        uuid4(),
+        uuid4(),
+        {"roles": [{"role": "creator", "confidence": 0.9}], "account_relations": []},
+        0.9,
+    )
+
+    assert (outcome, review_status, roles, relations) == ("auto_confirmed", "not_required", ["creator"], [])
+    assert confirmed == ["creator"]
+
+
+def test_auto_decision_sends_low_or_ambiguous_roles_to_review(monkeypatch) -> None:
+    monkeypatch.setattr(
+        contact_assessments,
+        "_auto_confirm_role",
+        lambda *_args: pytest.fail("ambiguous role must not be automatically written"),
+    )
+
+    outcome, review_status, roles, relations = contact_assessments._apply_automatic_decision(
+        object(),
+        uuid4(),
+        uuid4(),
+        {
+            "roles": [
+                {"role": "creator", "confidence": 0.99},
+                {"role": "agent_or_agency", "confidence": 0.91},
+            ],
+            "account_relations": [],
+        },
+        0.9,
+    )
+
+    assert (outcome, review_status, roles, relations) == ("review_required", "pending", [], [])
+
+
+def test_run_skips_every_confirmed_contact_before_loading_ai_or_sending_content(monkeypatch) -> None:
+    assessment_id = uuid4()
+    contact_id = uuid4()
+    finished: list[tuple[object, ...]] = []
+
+    class Result:
+        @staticmethod
+        def fetchone():
+            return {"has_facts": True}
+
+    class Connection:
+        @staticmethod
+        def execute(query, _params):
+            assert "SELECT EXISTS" in query
+            return Result()
+
+    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(Connection()))
+    monkeypatch.setattr(
+        contact_assessments,
+        "_configured_openai",
+        lambda *_args: pytest.fail("confirmed contact must not load or call AI"),
+    )
+    monkeypatch.setattr(
+        contact_assessments,
+        "_finish",
+        lambda *args, **kwargs: finished.append((*args, kwargs)),
+    )
+
+    contact_assessments._run({"id": assessment_id, "contact_id": contact_id}, object())
+
+    assert finished == [
+        (
+            assessment_id,
+            "cancelled",
+            "联系人已有已确认身份事实；判定未运行。",
+            {"outcome": "no_action"},
+        )
+    ]
+
+
+def test_run_rechecks_confirmation_immediately_before_the_model_call(monkeypatch) -> None:
+    assessment_id = uuid4()
+    contact_id = uuid4()
+    checks = iter((False, True))
+    finished: list[tuple[object, ...]] = []
+
+    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(object()))
+    monkeypatch.setattr(contact_assessments, "_contact_has_confirmed_facts", lambda *_args: next(checks))
+    monkeypatch.setattr(
+        contact_assessments,
+        "_configured_openai",
+        lambda _settings: ({"model": "gpt-5.6-luna"}, "sk-test"),
+    )
+    monkeypatch.setattr(
+        contact_assessments,
+        "_build_evidence",
+        lambda *_args: {
+            "fragments": [{}],
+            "refs": [],
+            "char_count": 0,
+            "source_authorization_id": uuid4(),
+            "pack": {},
+        },
+    )
+    monkeypatch.setattr(contact_assessments, "_save_refs", lambda *_args: None)
+    monkeypatch.setattr(contact_assessments, "_refs_are_still_authorized", lambda *_args: True)
+    monkeypatch.setattr(
+        contact_assessments,
+        "_call_openai",
+        lambda *_args: pytest.fail("a newly confirmed contact must not reach OpenAI"),
+    )
+    monkeypatch.setattr(
+        contact_assessments,
+        "_finish",
+        lambda *args, **kwargs: finished.append((*args, kwargs)),
+    )
+
+    contact_assessments._run({"id": assessment_id, "contact_id": contact_id}, object())
+
+    assert finished == [
+        (
+            assessment_id,
+            "cancelled",
+            "联系人已有已确认身份事实；未向模型发送消息内容。",
+            {"outcome": "no_action"},
+        )
+    ]

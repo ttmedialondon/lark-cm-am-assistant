@@ -42,7 +42,8 @@ class _Connection:
                 "project_id": params[2],
                 "model": params[3],
                 "enabled": params[4],
-                "key_suffix": params[6] or (self.row or {}).get("key_suffix"),
+                "auto_confirm_threshold": params[5],
+                "key_suffix": params[7] or (self.row or {}).get("key_suffix"),
                 "key_updated_at": None,
                 "last_tested_at": None,
                 "last_test_status": "never",
@@ -81,9 +82,9 @@ def test_save_encrypts_key_and_only_returns_safe_fields() -> None:
     )
 
     inserted = conn.calls[-1][1]
-    assert inserted[5] != api_key
+    assert inserted[6] != api_key
     assert api_key not in inserted
-    assert cipher.decrypt(inserted[5]) == api_key
+    assert cipher.decrypt(inserted[6]) == api_key
     assert saved["key_suffix"] == "1234"
     assert "api_key_ciphertext" not in saved
     assert api_key not in repr(saved)
@@ -107,7 +108,7 @@ def test_blank_key_retains_existing_credential() -> None:
     )
 
     inserted = conn.calls[-1][1]
-    assert inserted[5] is None
+    assert inserted[6] is None
     assert conn.row["key_suffix"] == "9876"
 
 

@@ -1,9 +1,4 @@
-"""Manual, review-only AI assessments for one external Lark contact at a time.
-
-The worker sends a short, currently authorized evidence pack to OpenAI.  It
-stores message references and suggestions only; confirmed roles and account
-links are written exclusively by an owner action below.
-"""
+"""Automatic, evidence-bound AI assessments for external Lark contacts."""
 
 from __future__ import annotations
 
@@ -21,7 +16,7 @@ import psycopg
 from cryptography.exceptions import InvalidTag
 from psycopg.errors import UniqueViolation
 
-from .ai_feature_config import api_key_cipher
+from .ai_feature_config import DEFAULT_AUTO_CONFIRM_THRESHOLD, api_key_cipher
 from .config import Settings, get_settings
 from .crypto import message_body_cipher
 from .db import connection
@@ -34,6 +29,11 @@ MAX_INPUT_BODY_CHARS = 32_000
 MAX_ROLE_SUGGESTIONS = 3
 MAX_ACCOUNT_SUGGESTIONS = 3
 MAX_EVIDENCE_REFS = 12
+CANDIDATE_PAGE_SIZE = 20
+MAX_PAGE = 10_000
+MAX_AUTOMATIC_ATTEMPTS_PER_WATERMARK = 3
+AUTOMATIC_RETRY_COOLDOWN_MINUTES = 15
+AUTOMATIC_FAILURE_COOLDOWN_MINUTES = 15
 MODEL_ROLES = {"creator", "agent_or_agency", "brand", "merchant", "supplier", "other", "insufficient"}
 FACT_ROLES = MODEL_ROLES - {"insufficient"}
 ACCOUNT_RELATIONSHIPS = {"owner", "representative", "mentioned_other", "unrelated", "insufficient"}
@@ -60,7 +60,7 @@ STATUS_LABELS = {
     "succeeded": "已生成建议",
     "failed": "判定未完成",
     "invalid": "结果不可用",
-    "cancelled": "授权范围已变化",
+    "cancelled": "已取消",
 }
 STATUS_BADGES = {
     "queued": "secondary",
@@ -69,6 +69,28 @@ STATUS_BADGES = {
     "failed": "danger",
     "invalid": "warning",
     "cancelled": "warning",
+}
+OUTCOME_LABELS = {
+    "pending": "等待结果",
+    "auto_confirmed": "已自动确认",
+    "review_required": "待人工处理",
+    "no_action": "无可执行建议",
+}
+OUTCOME_BADGES = {
+    "pending": "secondary",
+    "auto_confirmed": "success",
+    "review_required": "warning",
+    "no_action": "secondary",
+}
+REVIEW_STATUS_LABELS = {
+    "not_required": "无需处理",
+    "pending": "待处理",
+    "ignored": "已处理",
+}
+REVIEW_STATUS_BADGES = {
+    "not_required": "secondary",
+    "pending": "warning",
+    "ignored": "secondary",
 }
 LONDON = ZoneInfo("Europe/London")
 
@@ -98,14 +120,46 @@ def assessment_available() -> bool:
     return bool(row and row["enabled"] and row["provider"].casefold() == "openai" and row["api_key_ciphertext"])
 
 
-def queue_contact_assessment(actor_id: UUID | str, contact_id: UUID | str) -> dict[str, Any]:
-    """Queue one owner-requested review; an existing live request is reused."""
+def _automatic_execution_allowed() -> bool:
+    """Pause the whole automatic queue briefly after a feature-level failure."""
 
-    actor_id = _as_uuid(actor_id, "管理员")
-    contact_id = _as_uuid(contact_id, "联系人")
+    with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT enabled, provider, api_key_ciphertext,
+                CASE
+                    WHEN last_test_status = 'failed'
+                     AND last_tested_at > NOW() - (%s * INTERVAL '1 minute')
+                    THEN FALSE
+                    ELSE TRUE
+                END AS retry_allowed
+            FROM ai_feature_configs
+            WHERE feature = %s
+            """,
+            (AUTOMATIC_FAILURE_COOLDOWN_MINUTES, FEATURE),
+        ).fetchone()
+        if (
+            not row
+            or not row["enabled"]
+            or row["provider"].casefold() != "openai"
+            or not row["api_key_ciphertext"]
+        ):
+            return False
+    return bool(row["retry_allowed"])
+
+
+def queue_eligible_contact_assessments(limit: int = 5) -> int:
+    """Keep at most five automatic reviews queued for contacts with new messages.
+
+    ``first_observed_at`` is immutable, so ordinary incremental re-reads do
+    not make a contact eligible again.  Any completed outcome consumes the
+    current watermark. Review candidates never retry automatically; a
+    successful no-action result needs five new valid contact messages before
+    retrying. Transient task failures retry at most three times per watermark.
+    """
+
+    limit = min(max(int(limit), 1), 5)
     with connection() as conn, conn.transaction():
-        if not conn.execute("SELECT 1 FROM contacts WHERE id = %s", (contact_id,)).fetchone():
-            raise ContactAssessmentInputError("未找到该联系人。")
         config = conn.execute(
             "SELECT enabled, provider, api_key_ciphertext FROM ai_feature_configs WHERE feature = %s",
             (FEATURE,),
@@ -116,48 +170,115 @@ def queue_contact_assessment(actor_id: UUID | str, contact_id: UUID | str) -> di
             or config["provider"].casefold() != "openai"
             or not config["api_key_ciphertext"]
         ):
-            raise ContactAssessmentInputError("请先在 AI 功能配置中启用 Luna 并保存 API Key。")
-        if not _anchor_row(conn, contact_id):
-            raise ContactAssessmentInputError("该联系人没有可用于判定的有效授权消息。")
-        active = conn.execute(
+            return 0
+        rows = conn.execute(
             """
-            SELECT id, status FROM contact_assessments
-            WHERE contact_id = %s AND status IN ('queued', 'running')
-            ORDER BY created_at DESC LIMIT 1
-            """,
-            (contact_id,),
-        ).fetchone()
-        if active:
-            return {"assessment_id": str(active["id"]), "status": active["status"], "reused": True}
-        assessment_id = uuid4()
-        created = conn.execute(
-            """
-            INSERT INTO contact_assessments (id, contact_id, requested_by_authorization_id)
-            VALUES (%s, %s, %s)
+            WITH queue_slots AS (
+                SELECT GREATEST(0, %s - COUNT(*))::integer AS queue_limit
+                FROM contact_assessments
+                WHERE status IN ('queued', 'running')
+            ), eligible_messages AS (
+                SELECT
+                    identity.contact_id,
+                    observation.first_observed_at,
+                    message.chat_id,
+                    message.message_id
+                FROM lark_identities identity
+                JOIN contacts contact ON contact.id = identity.contact_id
+                JOIN chat_messages message ON message.sender_open_id = identity.open_id
+                JOIN authorization_message_observations observation
+                  ON observation.chat_id = message.chat_id AND observation.message_id = message.message_id
+                JOIN authorizations auth ON auth.id = observation.authorization_id
+                JOIN authorization_chats access
+                  ON access.authorization_id = observation.authorization_id AND access.chat_id = message.chat_id
+                WHERE identity.identity_type = 'user'
+                  AND identity.tenant_classification <> 'internal'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM contact_roles role
+                      WHERE role.contact_id = identity.contact_id AND role.status = 'confirmed'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM contact_social_accounts account_relation
+                      WHERE account_relation.contact_id = identity.contact_id
+                        AND account_relation.status = 'confirmed'
+                  )
+                  AND auth.status = 'active'
+                  AND auth.body_consent_at IS NOT NULL
+                  AND observation.observed_at >= auth.body_consent_at
+                  AND access.is_visible AND access.sync_enabled
+                  AND NOT message.is_deleted AND message.body_ciphertext IS NOT NULL
+            ), eligible AS (
+                SELECT contact_id, MAX(first_observed_at) AS source_message_seen_at
+                FROM eligible_messages
+                GROUP BY contact_id
+            ), latest_watermark AS (
+                SELECT contact_id, MAX(source_message_seen_at) AS source_message_seen_at
+                FROM contact_assessments
+                WHERE status = 'succeeded'
+                GROUP BY contact_id
+            ), latest_assessment AS (
+                SELECT DISTINCT ON (contact_id)
+                    contact_id, outcome, review_status, source_message_seen_at
+                FROM contact_assessments
+                WHERE status = 'succeeded'
+                ORDER BY contact_id, created_at DESC, id DESC
+            ), retry_attempts AS (
+                SELECT
+                    contact_id,
+                    source_message_seen_at,
+                    COUNT(*)::integer AS attempt_count,
+                    MAX(finished_at) AS last_finished_at
+                FROM contact_assessments
+                WHERE trigger = 'automatic'
+                  AND status IN ('failed', 'invalid', 'cancelled')
+                  AND source_message_seen_at IS NOT NULL
+                GROUP BY contact_id, source_message_seen_at
+            ), stale AS (
+                SELECT eligible.contact_id, eligible.source_message_seen_at
+                FROM eligible
+                LEFT JOIN latest_watermark watermark ON watermark.contact_id = eligible.contact_id
+                LEFT JOIN latest_assessment previous ON previous.contact_id = eligible.contact_id
+                LEFT JOIN retry_attempts retry
+                  ON retry.contact_id = eligible.contact_id
+                 AND retry.source_message_seen_at = eligible.source_message_seen_at
+                WHERE (watermark.source_message_seen_at IS NULL
+                       OR watermark.source_message_seen_at < eligible.source_message_seen_at)
+                  AND COALESCE(previous.outcome, '') <> 'review_required'
+                  AND COALESCE(previous.review_status, '') <> 'ignored'
+                  AND (
+                      previous.outcome IS DISTINCT FROM 'no_action'
+                      OR previous.source_message_seen_at IS NULL
+                      OR (
+                          SELECT COUNT(DISTINCT (fresh.chat_id, fresh.message_id))
+                          FROM eligible_messages fresh
+                          WHERE fresh.contact_id = eligible.contact_id
+                            AND fresh.first_observed_at > previous.source_message_seen_at
+                      ) >= 5
+                  )
+                  AND COALESCE(retry.attempt_count, 0) < %s
+                  AND (
+                      retry.last_finished_at IS NULL
+                      OR retry.last_finished_at <= NOW() - (%s * INTERVAL '1 minute')
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM contact_assessments active
+                    WHERE active.contact_id = eligible.contact_id
+                      AND active.status IN ('queued', 'running')
+                )
+                ORDER BY eligible.source_message_seen_at, eligible.contact_id
+                LIMIT (SELECT queue_limit FROM queue_slots)
+            )
+            INSERT INTO contact_assessments (
+                id, contact_id, trigger, source_message_seen_at
+            )
+            SELECT gen_random_uuid(), contact_id, 'automatic', source_message_seen_at
+            FROM stale
             ON CONFLICT (contact_id) WHERE status IN ('queued', 'running') DO NOTHING
             RETURNING id
             """,
-            (assessment_id, contact_id, actor_id),
-        ).fetchone()
-        if not created:
-            active = conn.execute(
-                """
-                SELECT id, status FROM contact_assessments
-                WHERE contact_id = %s AND status IN ('queued', 'running')
-                ORDER BY created_at DESC LIMIT 1
-                """,
-                (contact_id,),
-            ).fetchone()
-            if active:
-                return {"assessment_id": str(active["id"]), "status": active["status"], "reused": True}
-            raise ContactAssessmentInputError("无法创建判定任务；请重试。")
-        _audit(
-            conn,
-            actor_id,
-            "contact_assessment_queued",
-            {"assessment_id": str(assessment_id), "contact_id": str(contact_id)},
-        )
-    return {"assessment_id": str(assessment_id), "status": "queued", "reused": False}
+            (limit, MAX_AUTOMATIC_ATTEMPTS_PER_WATERMARK, AUTOMATIC_RETRY_COOLDOWN_MINUTES),
+        ).fetchall()
+    return len(rows)
 
 
 def latest_contact_assessment(contact_id: UUID | str) -> dict[str, Any] | None:
@@ -167,7 +288,9 @@ def latest_contact_assessment(contact_id: UUID | str) -> dict[str, Any] | None:
     with connection() as conn:
         row = conn.execute(
             """
-            SELECT id, status, model, created_at, started_at, finished_at, error_message, result
+            SELECT
+                id, status, trigger, outcome, review_status, model,
+                created_at, started_at, finished_at, error_message, result
             FROM contact_assessments
             WHERE contact_id = %s
             ORDER BY created_at DESC LIMIT 1
@@ -301,6 +424,106 @@ def record_assessment_view(viewer_id: UUID | str, assessment_id: UUID | str) -> 
         _audit(conn, viewer_id, "contact_assessment_viewed", {"assessment_id": str(assessment_id)})
 
 
+def candidate_page(page: int = 1, review: str = "pending") -> dict[str, Any]:
+    """Return an owner-safe page of assessments that still need a decision."""
+
+    if review not in {"pending", "ignored"}:
+        raise ContactAssessmentInputError("候选状态无效。")
+    page = min(max(int(page), 1), MAX_PAGE)
+    with connection() as conn:
+        total = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS total_count
+                FROM contact_assessments assessment
+                WHERE assessment.status = 'succeeded'
+                  AND assessment.outcome = 'review_required'
+                  AND assessment.review_status = %s
+                  AND EXISTS (
+                      SELECT 1 FROM lark_identities identity
+                      WHERE identity.contact_id = assessment.contact_id
+                        AND identity.identity_type = 'user'
+                        AND identity.tenant_classification <> 'internal'
+                  )
+                """,
+                (review,),
+            ).fetchone()["total_count"]
+            or 0
+        )
+        total_pages = max(1, (total + CANDIDATE_PAGE_SIZE - 1) // CANDIDATE_PAGE_SIZE)
+        page = min(page, total_pages)
+        rows = conn.execute(
+            """
+            SELECT
+                assessment.id AS assessment_id, assessment.result, assessment.evidence_count,
+                assessment.created_at, assessment.status, assessment.outcome, assessment.review_status,
+                contact.display_name AS contact_display_name, identity.open_id AS contact_open_id
+            FROM contact_assessments assessment
+            JOIN contacts contact ON contact.id = assessment.contact_id
+            JOIN LATERAL (
+                SELECT open_id
+                FROM lark_identities identity
+                WHERE identity.contact_id = contact.id
+                  AND identity.identity_type = 'user'
+                  AND identity.tenant_classification <> 'internal'
+                ORDER BY identity.last_seen_at DESC, identity.open_id
+                LIMIT 1
+            ) identity ON TRUE
+            WHERE assessment.status = 'succeeded'
+              AND assessment.outcome = 'review_required'
+              AND assessment.review_status = %s
+            ORDER BY assessment.created_at DESC, assessment.id DESC
+            LIMIT %s OFFSET %s
+            """,
+            (review, CANDIDATE_PAGE_SIZE, (page - 1) * CANDIDATE_PAGE_SIZE),
+        ).fetchall()
+    return {
+        "items": [_candidate_item(row) for row in rows],
+        "page": page,
+        "page_size": CANDIDATE_PAGE_SIZE,
+        "total_count": total,
+        "total_pages": total_pages,
+        "has_next": page < total_pages,
+    }
+
+
+def dismiss_assessment(actor_id: UUID | str, assessment_id: UUID | str) -> dict[str, str]:
+    """Remove a reviewed candidate from the queue without changing any fact."""
+
+    actor_id = _as_uuid(actor_id, "管理员")
+    assessment_id = _as_uuid(assessment_id, "判定")
+    with connection() as conn, conn.transaction():
+        assessment = conn.execute(
+            """
+            SELECT id, contact_id, status, outcome, review_status
+            FROM contact_assessments WHERE id = %s FOR UPDATE
+            """,
+            (assessment_id,),
+        ).fetchone()
+        if not assessment or assessment["status"] != "succeeded" or assessment.get("outcome") != "review_required":
+            raise ContactAssessmentInputError("该判定不是可处理的候选。")
+        if assessment.get("review_status") == "ignored":
+            return {"assessment_id": str(assessment_id), "review_status": "ignored"}
+        if assessment.get("review_status") != "pending":
+            raise ContactAssessmentInputError("该候选当前不能标记为已处理。")
+        conn.execute(
+            """
+            UPDATE contact_assessments
+            SET review_status = 'ignored', reviewed_by_authorization_id = %s,
+                reviewed_at = NOW(), updated_at = NOW()
+            WHERE id = %s
+            """,
+            (actor_id, assessment_id),
+        )
+        _audit(
+            conn,
+            actor_id,
+            "contact_assessment_review_ignored",
+            {"assessment_id": str(assessment_id), "contact_id": str(assessment["contact_id"])},
+        )
+    return {"assessment_id": str(assessment_id), "review_status": "ignored"}
+
+
 def assessment_matches_contact(assessment_id: UUID | str, open_id: str) -> bool:
     """Bind an owner route's external-contact path to the requested assessment."""
 
@@ -330,6 +553,7 @@ def confirm_assessment_role(actor_id: UUID | str, assessment_id: UUID | str, rol
         assessment = _successful_assessment(conn, assessment_id)
         if not _refs_are_still_authorized_in(conn, assessment_id):
             raise ContactAssessmentInputError("判定证据已不在当前授权范围内；请重新发起判定。")
+        _lock_contact(conn, assessment["contact_id"])
         suggested = {item.get("role") for item in _json_list(_json_object(assessment["result"]).get("roles"))}
         if role not in suggested:
             raise ContactAssessmentInputError("该角色不在此判定建议中。")
@@ -337,9 +561,9 @@ def confirm_assessment_role(actor_id: UUID | str, assessment_id: UUID | str, rol
             """
             INSERT INTO contact_roles (
                 contact_id, role, status, source, reviewed_by_authorization_id, reviewed_at
-            ) VALUES (%s, %s, 'confirmed', 'ai_shadow_confirmed', %s, NOW())
+            ) VALUES (%s, %s, 'confirmed', 'ai_manual_confirmed', %s, NOW())
             ON CONFLICT (contact_id, role) DO UPDATE SET
-                status = 'confirmed', source = 'ai_shadow_confirmed',
+                status = 'confirmed', source = 'ai_manual_confirmed',
                 reviewed_by_authorization_id = EXCLUDED.reviewed_by_authorization_id,
                 reviewed_at = EXCLUDED.reviewed_at, updated_at = NOW()
             """,
@@ -348,7 +572,7 @@ def confirm_assessment_role(actor_id: UUID | str, assessment_id: UUID | str, rol
         _audit(
             conn,
             actor_id,
-            "contact_assessment_role_confirmed",
+            "contact_assessment_role_manually_confirmed",
             {"assessment_id": str(assessment_id), "contact_id": str(assessment["contact_id"]), "role": role},
         )
     return {"contact_id": str(assessment["contact_id"]), "role": role}
@@ -373,6 +597,7 @@ def confirm_assessment_account_relation(
             assessment = _successful_assessment(conn, assessment_id)
             if not _refs_are_still_authorized_in(conn, assessment_id):
                 raise ContactAssessmentInputError("判定证据已不在当前授权范围内；请重新发起判定。")
+            _lock_contact(conn, assessment["contact_id"])
             suggestions = _json_list(_json_object(assessment["result"]).get("account_relations"))
             suggestion = next(
                 (
@@ -390,9 +615,9 @@ def confirm_assessment_account_relation(
                 INSERT INTO contact_social_accounts (
                     contact_id, social_account_id, relationship, status, source,
                     reviewed_by_authorization_id, reviewed_at
-                ) VALUES (%s, %s, %s, 'confirmed', 'ai_shadow_confirmed', %s, NOW())
+                ) VALUES (%s, %s, %s, 'confirmed', 'ai_manual_confirmed', %s, NOW())
                 ON CONFLICT (contact_id, social_account_id, relationship) DO UPDATE SET
-                    status = 'confirmed', source = 'ai_shadow_confirmed',
+                    status = 'confirmed', source = 'ai_manual_confirmed',
                     reviewed_by_authorization_id = EXCLUDED.reviewed_by_authorization_id,
                     reviewed_at = EXCLUDED.reviewed_at, updated_at = NOW()
                 """,
@@ -401,7 +626,7 @@ def confirm_assessment_account_relation(
             _audit(
                 conn,
                 actor_id,
-                "contact_assessment_account_relation_confirmed",
+                "contact_assessment_account_relation_manually_confirmed",
                 {
                     "assessment_id": str(assessment_id),
                     "contact_id": str(assessment["contact_id"]),
@@ -415,10 +640,17 @@ def confirm_assessment_account_relation(
 
 
 def run_next_contact_assessment(settings: Settings) -> bool:
-    """Run one queued review.  The regular Lark sync worker calls this only when idle."""
+    """Queue eligible contacts and run one review while the Lark worker is idle."""
 
     _expire_leases()
+    if not _automatic_execution_allowed():
+        return False
     job = _claim_next()
+    if not job:
+        # ponytail: five-task batches trade promptness for a bounded, cheap
+        # scan; add a durable pending-contact queue only if this becomes slow.
+        queue_eligible_contact_assessments()
+        job = _claim_next()
     if not job:
         return False
     _run(job, settings)
@@ -433,6 +665,7 @@ def _expire_leases() -> None:
             """
             UPDATE contact_assessments
             SET status = 'failed', finished_at = NOW(), lease_until = NULL,
+                outcome = 'no_action', review_status = 'not_required',
                 error_message = '工作进程中断；请重新发起判定。', updated_at = NOW()
             WHERE status = 'running' AND lease_until < NOW()
             """
@@ -443,7 +676,7 @@ def _claim_next() -> dict[str, Any] | None:
     with connection() as conn, conn.transaction():
         row = conn.execute(
             """
-            SELECT id, contact_id, attempts
+            SELECT id, contact_id, trigger, attempts
             FROM contact_assessments
             WHERE status = 'queued' AND scheduled_at <= NOW()
             ORDER BY scheduled_at, created_at
@@ -468,6 +701,16 @@ def _claim_next() -> dict[str, Any] | None:
 def _run(job: Mapping[str, Any], settings: Settings) -> None:
     assessment_id = job["id"]
     try:
+        with connection() as conn:
+            already_confirmed = _contact_has_confirmed_facts(conn, job["contact_id"])
+        if already_confirmed:
+            _finish(
+                assessment_id,
+                "cancelled",
+                "联系人已有已确认身份事实；判定未运行。",
+                outcome="no_action",
+            )
+            return
         config, api_key = _configured_openai(settings)
         evidence = _build_evidence(job["contact_id"], settings)
         if not evidence["fragments"]:
@@ -479,29 +722,50 @@ def _run(job: Mapping[str, Any], settings: Settings) -> None:
             evidence["source_authorization_id"],
         )
         if not _refs_are_still_authorized(assessment_id):
-            _finish(assessment_id, "cancelled", "授权范围已变化；未向模型发送消息内容。")
+            _finish(
+                assessment_id,
+                "cancelled",
+                "授权范围已变化；未向模型发送消息内容。",
+                outcome="no_action",
+            )
+            return
+        with connection() as conn:
+            already_confirmed = _contact_has_confirmed_facts(conn, job["contact_id"])
+        if already_confirmed:
+            _finish(
+                assessment_id,
+                "cancelled",
+                "联系人已有已确认身份事实；未向模型发送消息内容。",
+                outcome="no_action",
+            )
             return
         response = _call_openai(config, api_key, evidence["pack"], job["contact_id"])
         result = _validate_model_result(response["text"], evidence["labels"], evidence["accounts"])
-        _finish(
+        completed = _finish_with_decision(
             assessment_id,
-            "succeeded",
-            None,
+            job["contact_id"],
+            config,
             model=config["model"],
             result=result,
             response_id=response.get("response_id"),
             usage=response.get("usage"),
         )
-        _mark_feature_test("succeeded")
+        if completed:
+            _mark_feature_test("succeeded")
     except _ModelOutputError:
-        _finish(assessment_id, "invalid", "模型未返回可核验的建议；未写入任何联系人事实。")
+        _finish(
+            assessment_id,
+            "invalid",
+            "模型未返回可核验的建议；未写入任何联系人事实。",
+            outcome="no_action",
+        )
         _mark_feature_test("failed")
     except ContactAssessmentInputError as exc:
-        _finish(assessment_id, "failed", str(exc))
+        _finish(assessment_id, "failed", str(exc), outcome="no_action")
         _mark_feature_test("failed")
     except Exception:
         LOGGER.exception("contact assessment failed without logging user content")
-        _finish(assessment_id, "failed", "AI 服务暂时不可用；请稍后重新发起。")
+        _finish(assessment_id, "failed", "AI 服务暂时不可用；请稍后重新发起。", outcome="no_action")
         _mark_feature_test("failed")
 
 
@@ -509,7 +773,7 @@ def _configured_openai(settings: Settings) -> tuple[dict[str, Any], str]:
     with connection() as conn:
         config = conn.execute(
             """
-            SELECT provider, project_id, model, enabled, api_key_ciphertext
+            SELECT provider, project_id, model, enabled, auto_confirm_threshold, api_key_ciphertext
             FROM ai_feature_configs WHERE feature = %s
             """,
             (FEATURE,),
@@ -1037,7 +1301,9 @@ their own account; `representative` means S1 likely represents it. Do not
 invent account references, message references, identities, facts, or quotes.
 Every suggestion must cite one to twelve supplied M references. Do not produce a
 summary, rationale, quotation, or any other free text. The response is
-advisory only; a human will decide whether to write any business fact."""
+used for automatic confirmation only at a strict configured confidence
+threshold. Reserve high confidence for unambiguous evidence; otherwise use a
+lower confidence so the owner can review it."""
 
 
 def _response_text(data: Mapping[str, Any]) -> str:
@@ -1101,6 +1367,223 @@ def _validate_model_result(raw: str, labels: set[str], accounts: Mapping[str, Ma
     return {"roles": roles, "account_relations": relations}
 
 
+def _finish_with_decision(
+    assessment_id: UUID,
+    contact_id: UUID,
+    config: Mapping[str, Any],
+    *,
+    model: str,
+    result: Mapping[str, Any],
+    response_id: str | None,
+    usage: Mapping[str, int | None] | None,
+) -> bool:
+    """Persist a successful result and only its safe high-confidence facts."""
+
+    with connection() as conn, conn.transaction():
+        assessment = conn.execute(
+            """
+            SELECT id, contact_id, trigger, status
+            FROM contact_assessments
+            WHERE id = %s AND contact_id = %s
+            FOR UPDATE
+            """,
+            (assessment_id, contact_id),
+        ).fetchone()
+        if not assessment or assessment["status"] != "running":
+            return False
+        if not _refs_are_still_authorized_in(conn, assessment_id):
+            _finish_in(
+                conn,
+                assessment_id,
+                "cancelled",
+                "授权范围已变化；模型结果未写入联系人事实。",
+                outcome="no_action",
+            )
+            return False
+        _lock_contact(conn, contact_id)
+        if _contact_has_confirmed_facts(conn, contact_id):
+            _finish_in(
+                conn,
+                assessment_id,
+                "cancelled",
+                "联系人已有已确认身份事实；判定结果未写入。",
+                outcome="no_action",
+            )
+            return False
+
+        outcome, review_status, confirmed_roles, confirmed_relations = _apply_automatic_decision(
+            conn,
+            assessment_id,
+            contact_id,
+            result,
+            _auto_confirm_threshold(config),
+        )
+        _finish_in(
+            conn,
+            assessment_id,
+            "succeeded",
+            None,
+            model=model,
+            result=result,
+            response_id=response_id,
+            usage=usage,
+            outcome=outcome,
+            review_status=review_status,
+        )
+        metadata = {
+            "assessment_id": str(assessment_id),
+            "contact_id": str(contact_id),
+            "threshold": f"{_auto_confirm_threshold(config):.3f}",
+            "role_count": str(len(confirmed_roles)),
+            "account_relation_count": str(len(confirmed_relations)),
+        }
+        if confirmed_roles or confirmed_relations:
+            _audit(conn, None, "contact_assessment_auto_confirmed", metadata)
+        if outcome == "review_required":
+            _audit(conn, None, "contact_assessment_review_required", metadata)
+    return True
+
+
+def _apply_automatic_decision(
+    conn: psycopg.Connection,
+    assessment_id: UUID,
+    contact_id: UUID,
+    result: Mapping[str, Any],
+    threshold: float,
+) -> tuple[str, str, list[str], list[tuple[str, str]]]:
+    """Write only independent high-confidence facts; preserve all ambiguity for review."""
+
+    review_required = False
+    confirmed_roles: list[str] = []
+    confirmed_relations: list[tuple[str, str]] = []
+    factual_roles = [
+        suggestion
+        for suggestion in _json_list(result.get("roles"))
+        if isinstance(suggestion, Mapping) and suggestion.get("role") in FACT_ROLES
+    ]
+    if len(factual_roles) == 1:
+        role_suggestion = factual_roles[0]
+        role = role_suggestion["role"]
+        if float(role_suggestion.get("confidence", 0)) >= threshold:
+            state = _auto_confirm_role(conn, contact_id, role)
+            if state == "confirmed":
+                confirmed_roles.append(role)
+            else:
+                review_required = True
+        else:
+            review_required = True
+    elif factual_roles:
+        # More than one business role is not a safe automatic classification.
+        review_required = True
+
+    for suggestion in _json_list(result.get("account_relations")):
+        if not isinstance(suggestion, Mapping):
+            continue
+        relationship = suggestion.get("relationship")
+        if relationship not in CONFIRMABLE_RELATIONSHIPS:
+            continue
+        if float(suggestion.get("confidence", 0)) < threshold:
+            review_required = True
+            continue
+        account_id = suggestion.get("account_id")
+        if not account_id:
+            review_required = True
+            continue
+        state = _auto_confirm_account_relation(
+            conn,
+            contact_id,
+            _as_uuid(account_id, "账号"),
+            relationship,
+        )
+        if state == "confirmed":
+            confirmed_relations.append((str(account_id), relationship))
+        else:
+            review_required = True
+
+    if review_required:
+        return "review_required", "pending", confirmed_roles, confirmed_relations
+    if confirmed_roles or confirmed_relations:
+        return "auto_confirmed", "not_required", confirmed_roles, confirmed_relations
+    return "no_action", "not_required", confirmed_roles, confirmed_relations
+
+
+def _auto_confirm_role(conn: psycopg.Connection, contact_id: UUID, role: str) -> str:
+    inserted = conn.execute(
+        """
+        INSERT INTO contact_roles (contact_id, role, status, source, reviewed_at)
+        VALUES (%s, %s, 'confirmed', 'ai_auto_confirmed', NOW())
+        ON CONFLICT DO NOTHING
+        RETURNING contact_id
+        """,
+        (contact_id, role),
+    ).fetchone()
+    if inserted:
+        return "confirmed"
+    existing = conn.execute(
+        "SELECT status FROM contact_roles WHERE contact_id = %s AND role = %s",
+        (contact_id, role),
+    ).fetchone()
+    return "confirmed" if existing and existing["status"] == "confirmed" else "conflict"
+
+
+def _auto_confirm_account_relation(
+    conn: psycopg.Connection,
+    contact_id: UUID,
+    account_id: UUID,
+    relationship: str,
+) -> str:
+    inserted = conn.execute(
+        """
+        INSERT INTO contact_social_accounts (
+            contact_id, social_account_id, relationship, status, source, reviewed_at
+        ) VALUES (%s, %s, %s, 'confirmed', 'ai_auto_confirmed', NOW())
+        ON CONFLICT DO NOTHING
+        RETURNING contact_id
+        """,
+        (contact_id, account_id, relationship),
+    ).fetchone()
+    if inserted:
+        return "confirmed"
+    existing = conn.execute(
+        """
+        SELECT contact_id, status
+        FROM contact_social_accounts
+        WHERE contact_id = %s AND social_account_id = %s AND relationship = %s
+        """,
+        (contact_id, account_id, relationship),
+    ).fetchone()
+    return "confirmed" if existing and existing["status"] == "confirmed" else "conflict"
+
+
+def _auto_confirm_threshold(config: Mapping[str, Any]) -> float:
+    try:
+        threshold = float(config.get("auto_confirm_threshold", DEFAULT_AUTO_CONFIRM_THRESHOLD))
+    except (TypeError, ValueError) as exc:
+        raise ContactAssessmentInputError("自动确认阈值无效；请在 AI 功能配置中重新保存。") from exc
+    if not 0.5 <= threshold <= 1:
+        raise ContactAssessmentInputError("自动确认阈值无效；请在 AI 功能配置中重新保存。")
+    return threshold
+
+
+def _contact_has_confirmed_facts(conn: psycopg.Connection, contact_id: UUID) -> bool:
+    row = conn.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM contact_roles WHERE contact_id = %s AND status = 'confirmed'
+        ) OR EXISTS (
+            SELECT 1 FROM contact_social_accounts WHERE contact_id = %s AND status = 'confirmed'
+        ) AS has_facts
+        """,
+        (contact_id, contact_id),
+    ).fetchone()
+    return bool(row and row["has_facts"])
+
+
+def _lock_contact(conn: psycopg.Connection, contact_id: UUID) -> None:
+    if not conn.execute("SELECT 1 FROM contacts WHERE id = %s FOR UPDATE", (contact_id,)).fetchone():
+        raise ContactAssessmentInputError("未找到该联系人。")
+
+
 def _finish(
     assessment_id: UUID,
     status: str,
@@ -1110,29 +1593,61 @@ def _finish(
     result: Mapping[str, Any] | None = None,
     response_id: str | None = None,
     usage: Mapping[str, int | None] | None = None,
+    outcome: str | None = None,
+    review_status: str | None = None,
 ) -> None:
     with connection() as conn, conn.transaction():
-        conn.execute(
-            """
-            UPDATE contact_assessments
-            SET status = %s, finished_at = NOW(), lease_until = NULL,
-                model = COALESCE(%s, model), result = COALESCE(%s::jsonb, result),
-                response_id = COALESCE(%s, response_id),
-                input_tokens = COALESCE(%s, input_tokens), output_tokens = COALESCE(%s, output_tokens),
-                error_message = %s, updated_at = NOW()
-            WHERE id = %s AND status = 'running'
-            """,
-            (
-                status,
-                model,
-                json.dumps(result) if result is not None else None,
-                response_id,
-                usage.get("input_tokens") if usage else None,
-                usage.get("output_tokens") if usage else None,
-                _bounded_text(error_message, 400) if error_message else None,
-                assessment_id,
-            ),
+        _finish_in(
+            conn,
+            assessment_id,
+            status,
+            error_message,
+            model=model,
+            result=result,
+            response_id=response_id,
+            usage=usage,
+            outcome=outcome,
+            review_status=review_status,
         )
+
+
+def _finish_in(
+    conn: psycopg.Connection,
+    assessment_id: UUID,
+    status: str,
+    error_message: str | None,
+    *,
+    model: str | None = None,
+    result: Mapping[str, Any] | None = None,
+    response_id: str | None = None,
+    usage: Mapping[str, int | None] | None = None,
+    outcome: str | None = None,
+    review_status: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE contact_assessments
+        SET status = %s, finished_at = NOW(), lease_until = NULL,
+            model = COALESCE(%s, model), result = COALESCE(%s::jsonb, result),
+            response_id = COALESCE(%s, response_id),
+            input_tokens = COALESCE(%s, input_tokens), output_tokens = COALESCE(%s, output_tokens),
+            outcome = COALESCE(%s, outcome), review_status = COALESCE(%s, review_status),
+            error_message = %s, updated_at = NOW()
+        WHERE id = %s AND status = 'running'
+        """,
+        (
+            status,
+            model,
+            json.dumps(result) if result is not None else None,
+            response_id,
+            usage.get("input_tokens") if usage else None,
+            usage.get("output_tokens") if usage else None,
+            outcome,
+            review_status,
+            _bounded_text(error_message, 400) if error_message else None,
+            assessment_id,
+        ),
+    )
 
 
 def _mark_feature_test(status: str) -> None:
@@ -1163,6 +1678,8 @@ def _successful_assessment(conn: psycopg.Connection, assessment_id: UUID) -> Map
 def _summary(row: Mapping[str, Any]) -> dict[str, Any]:
     result = _json_object(row.get("result"))
     status = row["status"]
+    outcome = row.get("outcome") or ("review_required" if status == "succeeded" else "pending")
+    review_status = row.get("review_status") or ("pending" if status == "succeeded" else "not_required")
     return {
         "id": str(row["id"]),
         "status": status,
@@ -1173,9 +1690,60 @@ def _summary(row: Mapping[str, Any]) -> dict[str, Any]:
         "started_at_label": _time_label(row.get("started_at"), "尚未开始"),
         "finished_at_label": _time_label(row.get("finished_at"), "尚未结束"),
         "error_label": row.get("error_message") or "",
+        "trigger": row.get("trigger") or "manual",
+        "trigger_label": "自动" if row.get("trigger") == "automatic" else "手动",
+        "outcome": outcome,
+        "outcome_label": OUTCOME_LABELS.get(outcome, outcome),
+        "outcome_badge": OUTCOME_BADGES.get(outcome, "secondary"),
+        "review_status": review_status,
+        "review_status_label": REVIEW_STATUS_LABELS.get(review_status, review_status),
+        "review_status_badge": REVIEW_STATUS_BADGES.get(review_status, "secondary"),
         "role_count": len(_json_list(result.get("roles"))),
         "account_relation_count": len(_json_list(result.get("account_relations"))),
     }
+
+
+def _candidate_item(row: Mapping[str, Any]) -> dict[str, Any]:
+    result = _json_object(row.get("result"))
+    suggestions: list[tuple[str, float | None]] = []
+    for suggestion in _json_list(result.get("roles")):
+        if isinstance(suggestion, Mapping) and suggestion.get("role") in FACT_ROLES:
+            suggestions.append((ROLE_LABELS[suggestion["role"]], _candidate_confidence(suggestion.get("confidence"))))
+    for suggestion in _json_list(result.get("account_relations")):
+        if isinstance(suggestion, Mapping) and suggestion.get("relationship") in CONFIRMABLE_RELATIONSHIPS:
+            suggestions.append(
+                (
+                    f"账号归属：{RELATIONSHIP_LABELS[suggestion['relationship']]}",
+                    _candidate_confidence(suggestion.get("confidence")),
+                )
+            )
+    label, confidence = max(
+        suggestions,
+        key=lambda item: item[1] if item[1] is not None else -1,
+        default=("待人工判断", None),
+    )
+    return {
+        "assessment_id": str(row["assessment_id"]),
+        "contact_open_id": row.get("contact_open_id") or "",
+        "contact_display_name": row.get("contact_display_name") or "未命名联系人",
+        "role_label": label,
+        "confidence_label": _confidence_label(confidence),
+        "evidence_count": int(row.get("evidence_count") or 0),
+        "created_at_label": _time_label(row.get("created_at"), "时间未知"),
+        "review_status": row.get("review_status") or "pending",
+        "review_status_label": REVIEW_STATUS_LABELS.get(
+            row.get("review_status"), row.get("review_status") or "pending"
+        ),
+        "status_label": STATUS_LABELS.get(row.get("status"), row.get("status") or "succeeded"),
+        "outcome": row.get("outcome") or "review_required",
+    }
+
+
+def _candidate_confidence(value: object) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _detail_role(item: Any, confirmed_roles: set[str]) -> dict[str, Any]:
@@ -1209,7 +1777,7 @@ def _detail_account_relation(
     }
 
 
-def _audit(conn: psycopg.Connection, actor_id: UUID, action: str, metadata: Mapping[str, str]) -> None:
+def _audit(conn: psycopg.Connection, actor_id: UUID | None, action: str, metadata: Mapping[str, str]) -> None:
     conn.execute(
         "INSERT INTO audit_events (id, authorization_id, action, metadata) VALUES (%s, %s, %s, %s::jsonb)",
         (uuid4(), actor_id, action, json.dumps(metadata)),

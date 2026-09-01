@@ -7,9 +7,9 @@
 - 每位 CM/AM 以自己的 Lark OAuth user access token 授权；系统只读取该用户原本可见、且 Lark API 实际返回的会话与历史消息。
 - 群聊和私聊使用同一套 `chats`、`authorization_chats`、`chat_messages` 与同步队列。每条消息保存 Lark 返回的发送者 ID、ID 类型、`open_id`（适用时）、`tenant_key`、发送者类型、回复链/话题/`@` 关系及可用的 Lark 跳转定位字段。
 - 群聊在成员数刷新时分页保存最新成员快照：`open_id`、名称、`tenant_key` 与成员类型；不把 API 未返回的人误判为已离群，也不保存成员历史版本。私聊的对端稳定 ID 保存在该授权用户的 `authorization_chats` 关系上。
-- `creators` 与 `creator_identifiers` 是 owner 维护的达人身份库，支持平台账号、邮箱、电话、CRM ID 与别名。规则 V1 只从已加密保存、已知非公司租户的人类参与者正文中提取明确的平台主页链接或带平台标签的账号，生成待核验候选与证据；租户未知或属于公司租户时不生成候选，不会因昵称、群名、普通 `@` 提及或模型猜测而确认达人。
+- `creators` 与 `creator_identifiers` 是 owner 维护的达人身份库，支持平台账号、邮箱、电话、CRM ID 与别名。规则 V1 只从已加密保存、已知非公司租户的人类参与者正文中提取明确的平台主页链接或带平台标签的账号，生成待核验候选与证据；租户未知或属于公司租户时不生成候选，不会因昵称、群名或普通 `@` 提及确认达人。独立的联系人自动识别任务会以受限证据包调用 Luna；仅达到 owner 配置阈值、引用可核验且无事实冲突的结果才能自动确认，其他建议进入人工队列。
 - OAuth 成功后回填 Lark API 可返回的历史，并每 5 分钟增量同步、回看 10 分钟以避免边界漏记。
-- 不发送 Lark 消息，不运行 AI，不保存附件二进制；成员快照和消息发送者身份仅用于公司内部的后续归属与提醒链路。Luna 的影子判断设计见 [`creator-identity-luna-shadow-v0.1.md`](../docs/as-built/creator-identity-luna-shadow-v0.1.md)，当前尚未调用模型。
+- 不发送 Lark 消息，不保存附件二进制；成员快照和消息发送者身份仅用于公司内部的后续归属与提醒链路。Luna 仅用于联系人自动识别，使用 `store: false`、严格 JSON Schema 和消息引用校验；具体口径见 [`contact-assessment-automatic-v0.2.md`](../docs/as-built/contact-assessment-automatic-v0.2.md)。
 
 `GET /im/v1/chats?types=p2p` 的用户身份支持在当前租户已做 metadata-only 预检；因公开网页文档仍有滞后描述，Worker 将 P2P 发现状态单独记为 `succeeded`、`unavailable` 或 `attention_required`。P2P 不可用不会阻塞群聊同步。
 
@@ -27,7 +27,7 @@
 
 CM/AM 的个人页面是“消息提醒中心”：仅展示接入状态和最近检查时间，不展示会话名称、成员人数、消息数量或消息正文，也不提供手动历史回填。页面保留可折叠、明确的“权限与数据使用”说明：系统会在用户授权范围内读取群聊和私聊内容用于分析，正文会加密保存并由内部 owner 按该用户授权范围查看。
 
-`/admin` 展示公司级统计、人员、群聊和同步任务。`/admin/messages` 仅数据库 `admin_roles` 中的 `owner` 可访问：可用 CM/AM、会话类型和会话下拉筛选，展示最近 100 条已加密存储的正文。发送者名称优先使用最近成员快照。`/admin/creators` 用于人工维护达人身份库，`/admin/candidates` 用于核验规则生成的账号候选及其关联消息证据；两者均为 owner-only。候选绝不自动确认，也不会自动改写 CM/AM 归属。每次正文或候选证据页查看均写入 `audit_events`，但审计记录不含消息正文。
+`/admin` 展示公司级统计、人员、群聊和同步任务。`/admin/messages` 仅数据库 `admin_roles` 中的 `owner` 可访问：可用 CM/AM、会话类型和会话下拉筛选，展示最近 100 条已加密存储的正文。发送者名称优先使用最近成员快照。`/admin/creators` 用于人工维护达人身份库，`/admin/candidates` 用于核验规则生成的账号候选及其关联消息证据，`/admin/ai-candidates` 用于处理自动识别中未达自动确认条件的建议；均为 owner-only。每次正文或候选证据页查看均写入 `audit_events`，但审计记录不含消息正文。
 
 管理台的人员状态以一个主阶段展示：`正在发现会话`、`首次同步中`、`已接入 · 定时同步`、`定时更新中` 或需要处理。该主阶段由授权状态、可同步会话数、首次回填完成数、当前 job 和下一次计划时间派生，不会把“已发现私聊目录”“群成员快照”或“下一轮定时 job 已排程”误显示成消息同步失败。页面另列出群聊/私聊的正文回填进度；P2P 的目录发现与 P2P 正文回填始终分开。
 

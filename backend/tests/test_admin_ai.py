@@ -51,6 +51,8 @@ def _config():
         "provider_label": "OpenAI",
         "project_id": "proj_contact_assessment",
         "model": "gpt-5.6-luna",
+        "auto_confirm_threshold": 0.9,
+        "auto_confirm_threshold_label": "90%",
         "enabled": False,
         "enabled_label": "已停用",
         "enabled_badge": "secondary",
@@ -114,6 +116,7 @@ def test_owner_post_passes_key_to_encrypted_store_without_rendering_it(monkeypat
             "project_id": "proj_contact_assessment",
             "model": "gpt-5.6-luna",
             "enabled": "1",
+            "auto_confirm_threshold": "0.90",
             "api_key": "sk-secret-never-rendered",
         },
         follow_redirects=False,
@@ -132,6 +135,7 @@ def test_owner_post_passes_key_to_encrypted_store_without_rendering_it(monkeypat
         "enabled": True,
         "api_key": "sk-secret-never-rendered",
         "updated_by_authorization_id": owner_id,
+        "auto_confirm_threshold": "0.90",
     }
     audit = connections[0].calls[-1][1]
     assert audit[2] == "ai_feature_config_updated"

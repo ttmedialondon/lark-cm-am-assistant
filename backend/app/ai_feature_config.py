@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 from collections.abc import Mapping
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -16,9 +17,10 @@ from .crypto import TokenCipher
 _KEY_AAD = b"lark-message-stats/ai-feature-config/v1"
 _KEY_DERIVATION = b"lark-message-stats/ai-feature-config-key/v1"
 _LONDON = ZoneInfo("Europe/London")
+DEFAULT_AUTO_CONFIRM_THRESHOLD = Decimal("0.900")
 _SAFE_COLUMNS = """
     feature, provider, project_id, model, enabled, key_suffix, key_updated_at,
-    last_tested_at, last_test_status, created_at, updated_at
+    last_tested_at, last_test_status, auto_confirm_threshold, created_at, updated_at
 """
 
 
@@ -54,6 +56,7 @@ def save_feature_config(
     enabled: bool,
     api_key: str | None,
     updated_by_authorization_id: UUID,
+    auto_confirm_threshold: Decimal | float | str = DEFAULT_AUTO_CONFIRM_THRESHOLD,
 ) -> dict[str, Any]:
     """Upsert one feature config; a blank key retains the existing credential."""
 
@@ -62,6 +65,7 @@ def save_feature_config(
     project_id = _required_text(project_id, "Project ID", 160)
     model = _required_text(model, "模型", 160)
     api_key = _normalize_api_key(api_key)
+    auto_confirm_threshold = _normalize_auto_confirm_threshold(auto_confirm_threshold)
 
     current = conn.execute(
         "SELECT api_key_ciphertext, key_suffix FROM ai_feature_configs WHERE feature = %s FOR UPDATE",
@@ -74,10 +78,10 @@ def save_feature_config(
     row = conn.execute(
         f"""
         INSERT INTO ai_feature_configs (
-            feature, provider, project_id, model, enabled,
+            feature, provider, project_id, model, enabled, auto_confirm_threshold,
             api_key_ciphertext, key_suffix, key_updated_at, key_updated_by_authorization_id
         ) VALUES (
-            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s,
             %s, %s,
             CASE WHEN %s THEN NOW() ELSE NULL END,
             CASE WHEN %s THEN %s ELSE NULL END
@@ -87,6 +91,7 @@ def save_feature_config(
             project_id = EXCLUDED.project_id,
             model = EXCLUDED.model,
             enabled = EXCLUDED.enabled,
+            auto_confirm_threshold = EXCLUDED.auto_confirm_threshold,
             api_key_ciphertext = COALESCE(EXCLUDED.api_key_ciphertext, ai_feature_configs.api_key_ciphertext),
             key_suffix = COALESCE(EXCLUDED.key_suffix, ai_feature_configs.key_suffix),
             key_updated_at = CASE
@@ -97,6 +102,8 @@ def save_feature_config(
                 WHEN EXCLUDED.api_key_ciphertext IS NULL THEN ai_feature_configs.key_updated_by_authorization_id
                 ELSE EXCLUDED.key_updated_by_authorization_id
             END,
+            last_tested_at = NULL,
+            last_test_status = 'never',
             updated_at = NOW()
         RETURNING {_SAFE_COLUMNS}
         """,
@@ -106,6 +113,7 @@ def save_feature_config(
             project_id,
             model,
             enabled,
+            auto_confirm_threshold,
             ciphertext if api_key else None,
             api_key[-4:] if api_key else None,
             bool(api_key),
@@ -132,6 +140,10 @@ def display_config(row: Mapping[str, Any] | None) -> dict[str, Any]:
         "provider_label": "OpenAI" if values.get("provider", "openai") == "openai" else values.get("provider"),
         "project_id": values.get("project_id") or "",
         "model": values.get("model") or "",
+        "auto_confirm_threshold": values.get("auto_confirm_threshold") or DEFAULT_AUTO_CONFIRM_THRESHOLD,
+        "auto_confirm_threshold_label": (
+            f"{float(values.get('auto_confirm_threshold') or DEFAULT_AUTO_CONFIRM_THRESHOLD):.0%}"
+        ),
         "enabled": enabled,
         "enabled_label": "已启用" if enabled else "已停用",
         "enabled_badge": "success" if enabled else "secondary",
@@ -152,6 +164,20 @@ def _normalize_api_key(value: str | None) -> str | None:
     if len(key) < 12 or len(key) > 1024 or not key.isascii() or any(character.isspace() for character in key):
         raise FeatureConfigInputError("API Key 格式无效。")
     return key
+
+
+def _normalize_auto_confirm_threshold(value: Decimal | float | str) -> Decimal:
+    try:
+        threshold = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise FeatureConfigInputError("自动确认阈值必须是 0.50 到 1.00 之间的数字。") from exc
+    if (
+        not threshold.is_finite()
+        or threshold.as_tuple().exponent < -3
+        or not Decimal("0.500") <= threshold <= Decimal("1.000")
+    ):
+        raise FeatureConfigInputError("自动确认阈值必须在 0.50 到 1.00 之间。")
+    return threshold.quantize(Decimal("0.001"))
 
 
 def _required_text(value: str, label: str, limit: int) -> str:

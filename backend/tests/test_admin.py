@@ -149,28 +149,43 @@ def test_owner_contact_detail_reads_only_that_contact_without_message_content(mo
     assert contexts[-1][1]["assessment_available"] is True
 
 
-def test_owner_can_queue_one_contact_assessment_with_csrf(monkeypatch):
+def test_owner_can_view_pending_ai_candidates(monkeypatch):
     owner_id = uuid4()
-    contact_id = uuid4()
-    queued = []
+    contexts = []
     monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
     monkeypatch.setattr(
-        admin_reporting,
-        "contact_detail",
-        lambda _open_id: {"contact": {"contact_id": contact_id}},
+        contact_assessments,
+        "candidate_page",
+        lambda page: _page([], page=page, total_count=0, total_pages=0, page_size=25),
     )
-    monkeypatch.setattr(contact_assessments, "queue_contact_assessment", lambda *args: queued.append(args))
+
+    response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get(
+        "/admin/ai-candidates?page=2"
+    )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert contexts[-1][0] == "admin/ai_candidates.html"
+    assert contexts[-1][1]["candidate_page"]["page"] == 1
+
+
+def test_owner_can_mark_one_ai_candidate_processed(monkeypatch):
+    owner_id = uuid4()
+    assessment_id = uuid4()
+    dismissed = []
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(contact_assessments, "dismiss_assessment", lambda *args: dismissed.append(args))
 
     response = _client(lambda _request: {"id": owner_id, "status": "active"}).post(
-        "/admin/contacts/ou_contact/assessment?page=3",
+        f"/admin/ai-candidates/{assessment_id}/dismiss?page=3",
         data={"csrf_token": "csrf"},
         follow_redirects=False,
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/admin/contacts/ou_contact?page=3"
+    assert response.headers["location"] == "/admin/ai-candidates?page=3"
     assert response.headers["cache-control"] == "no-store, max-age=0"
-    assert queued == [(owner_id, contact_id)]
+    assert dismissed == [(owner_id, assessment_id)]
 
 
 def test_owner_can_view_assessment_evidence_and_it_is_audited(monkeypatch):

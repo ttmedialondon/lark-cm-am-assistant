@@ -188,6 +188,29 @@ def create_admin_router(
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 
+    def render_ai_candidates(
+        request: Request,
+        access_context: dict[str, Any],
+        *,
+        page: int = 1,
+        error: str | None = None,
+        status_code: int = 200,
+    ) -> Response:
+        candidate_page = contact_assessments.candidate_page(page)
+        response = render_template(
+            request,
+            "admin/ai_candidates.html",
+            {
+                **page_context(access_context, "ai_candidates"),
+                "candidates": candidate_page["items"],
+                "candidate_page": pagination(candidate_page, "/admin/ai-candidates"),
+                "form_error": error,
+            },
+            status_code,
+        )
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
     def render_contact_assessment(
         request: Request,
         access_context: dict[str, Any],
@@ -442,6 +465,37 @@ def create_admin_router(
         assert access_context is not None
         return render_ai_config(request, access_context)
 
+    @router.get("/admin/ai-candidates")
+    def admin_ai_candidates(request: Request, page: int = 1) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        return render_ai_candidates(request, access_context, page=page)
+
+    @router.post("/admin/ai-candidates/{assessment_id}/dismiss")
+    async def admin_dismiss_ai_candidate(request: Request, assessment_id: UUID, page: int = 1) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        form = await _form_fields(request)
+        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
+            return render_ai_candidates(
+                request,
+                access_context,
+                page=page,
+                error="请求校验失败，请返回候选队列后重试。",
+                status_code=400,
+            )
+        try:
+            contact_assessments.dismiss_assessment(access_context["authorization"]["id"], assessment_id)
+        except contact_assessments.ContactAssessmentInputError as exc:
+            return render_ai_candidates(request, access_context, page=page, error=str(exc), status_code=400)
+        response = RedirectResponse(url=f"/admin/ai-candidates?{urlencode({'page': page})}", status_code=303)
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
     @router.get("/admin/contacts")
     def admin_contacts(request: Request, page: int = 1) -> Response:
         access_context, denied = owner_access(request)
@@ -512,50 +566,6 @@ def create_admin_router(
                 ),
             },
         )
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-        return response
-
-    @router.post("/admin/contacts/{open_id}/assessment")
-    async def admin_queue_contact_assessment(request: Request, open_id: str, page: int = 1) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        form = await _form_fields(request)
-        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
-            response = render_template(
-                request,
-                "error.html",
-                {"title": "请求校验失败", "detail": "请返回联系人详情页面后重试。"},
-                400,
-            )
-            response.headers["Cache-Control"] = "no-store, max-age=0"
-            return response
-
-        contact = admin_reporting.contact_detail(open_id)
-        if not contact:
-            response = render_template(
-                request,
-                "error.html",
-                {"title": "未找到 Lark 参与者", "detail": "该参与者尚未被同步，或不在外部联系人目录中。"},
-                404,
-            )
-            response.headers["Cache-Control"] = "no-store, max-age=0"
-            return response
-        try:
-            contact_assessments.queue_contact_assessment(
-                access_context["authorization"]["id"], contact["contact"]["contact_id"]
-            )
-        except contact_assessments.ContactAssessmentInputError as exc:
-            response = render_template(
-                request,
-                "error.html",
-                {"title": "无法发起 AI 判定", "detail": str(exc)},
-                400,
-            )
-            response.headers["Cache-Control"] = "no-store, max-age=0"
-            return response
-        response = RedirectResponse(url=f"/admin/contacts/{open_id}?{urlencode({'page': page})}", status_code=303)
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 
@@ -784,6 +794,9 @@ def create_admin_router(
                     enabled=form.get("enabled") == "1",
                     api_key=form.get("api_key", ""),
                     updated_by_authorization_id=access_context["authorization"]["id"],
+                    auto_confirm_threshold=form.get(
+                        "auto_confirm_threshold", str(ai_feature_config.DEFAULT_AUTO_CONFIRM_THRESHOLD)
+                    ),
                 )
                 conn.execute(
                     "INSERT INTO audit_events (id, authorization_id, action, metadata) "
@@ -799,6 +812,7 @@ def create_admin_router(
                                 "project_id": form.get("project_id", "").strip(),
                                 "model": form.get("model", "").strip(),
                                 "enabled": form.get("enabled") == "1",
+                                "auto_confirm_threshold": form.get("auto_confirm_threshold", "").strip(),
                                 "key_rotated": key_rotated,
                             }
                         ),

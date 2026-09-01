@@ -1,11 +1,11 @@
 {% extends "base.html" %}
-{% block title %}{{ assessment.contact.display_name }} · AI 影子判定{% endblock %}
+{% block title %}{{ assessment.contact.display_name }} · AI 识别结果{% endblock %}
 {% block body %}
 <div class="page">
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
-    <div class="d-flex align-items-center mb-3"><div><h2 class="page-title">{{ assessment.contact.display_name }} · AI 影子判定</h2><div class="text-secondary">任务 {{ assessment.id }}{% if assessment.model %} · {{ assessment.model }}{% endif %}</div></div><a class="btn btn-outline-secondary ms-auto" href="/admin/contacts/{{ route_open_id }}?page={{ source_page }}">返回联系人</a></div>
-    <div class="alert alert-warning">这是影子结果：AI 只提供建议和可核验的消息引用，不会自动写入达人、经纪人或账号归属。只有下面的人工确认按钮会写入业务事实。</div>
+    <div class="d-flex align-items-center mb-3"><div><h2 class="page-title">{{ assessment.contact.display_name }} · AI 识别结果</h2><div class="text-secondary">任务 {{ assessment.id }}{% if assessment.model %} · {{ assessment.model }}{% endif %}</div></div><a class="btn btn-outline-secondary ms-auto" href="/admin/contacts/{{ route_open_id }}?page={{ source_page }}">返回联系人</a></div>
+    <div class="alert alert-info">AI 结果仅使用当前授权范围内的消息证据。高置信度结果可由系统自动建立事实；待人工确认的建议只有在你点击确认后才会写入达人、经纪人或账号归属。</div>
     {% if form_error %}<div class="alert alert-danger" role="alert">{{ form_error }}</div>{% endif %}
     <div class="row row-deck row-cards mb-4">
       <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">任务状态</div><div class="h3 mb-0"><span class="badge bg-{{ assessment.status_badge }}-lt">{{ assessment.status_label }}</span></div></div></div></div>
@@ -14,7 +14,8 @@
       <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">完成时间</div><div class="h3 mb-0">{{ assessment.finished_at_label }}</div></div></div></div>
     </div>
     {% if assessment.status == 'succeeded' %}
-    {% if not assessment.can_confirm %}<div class="alert alert-warning">本次证据已不完全处于当前授权范围内；可查看仍可读的内容，但不能确认任何业务事实。请重新发起判定。</div>{% endif %}
+    {% if not assessment.can_confirm %}<div class="alert alert-warning">本次证据已不完全处于当前授权范围内；可查看仍可读的内容，但不能确认任何业务事实。请等待新的有效消息后由系统重新评估。</div>{% endif %}
+    {% if assessment.review_status == 'pending' %}<div class="alert alert-warning d-flex flex-wrap align-items-center gap-2"><span>本次结果仍待人工处理。确认单项后，可在无需保留其余建议时将本次候选标记为已处理。</span><form action="/admin/ai-candidates/{{ assessment.id }}/dismiss" method="post" class="ms-auto"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-outline-secondary" type="submit">标记本次候选已处理</button></form></div>{% endif %}
     <div class="card mb-4">
       <div class="card-header"><div><h3 class="card-title mb-1">角色建议</h3><div class="text-secondary small">置信度不等于业务事实。请先核对下面的消息证据，再选择确认。</div></div></div>
       {% if assessment.role_suggestions %}
@@ -42,9 +43,9 @@
       {% if assessment.evidence %}<div class="list-group list-group-flush">{% for item in assessment.evidence %}<div class="list-group-item"><div class="d-flex flex-wrap gap-2 align-items-center mb-2"><span class="badge bg-secondary-lt">{{ item.label }}</span><span class="text-secondary small">{{ item.relation_label }} · {{ item.chat_name }} · {{ item.created_at_label }} · {{ item.sender_label }}</span></div>{% if item.available %}<div style="white-space: pre-wrap; overflow-wrap: anywhere;">{{ item.content }}</div>{% else %}<div class="text-secondary">原消息已不在当前有效授权范围内，不能显示正文。</div>{% endif %}</div>{% endfor %}</div>{% else %}<div class="card-body text-secondary">本次任务没有可展示的消息证据。</div>{% endif %}
     </div>
     {% elif assessment.status in ('queued', 'running') %}
-    <div class="card"><div class="card-body text-secondary">任务正在后台处理。刷新此页或返回联系人详情查看最新状态；不会自动写入任何达人或账号归属。</div></div>
+    <div class="card"><div class="card-body text-secondary">任务正在后台处理。刷新此页或返回联系人详情查看最新状态；满足阈值且建议不冲突时会自动确认，其余会进入待人工确认。</div></div>
     {% else %}
-    <div class="card"><div class="card-body text-secondary">本次任务未产生可用建议。{{ assessment.error_label or '可返回联系人详情后手动重新发起。' }}</div></div>
+    <div class="card"><div class="card-body text-secondary">本次任务未产生可用建议。{{ assessment.error_label or '请等待新增有效消息，或检查 AI 功能配置。' }}</div></div>
     {% endif %}
   </div></div></div>
 </div>

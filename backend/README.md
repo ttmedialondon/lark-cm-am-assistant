@@ -37,9 +37,9 @@ FastAPI + Jinja2 + HTMX + Tabler    ←→ PostgreSQL
 
 ### OpenAI 功能凭证
 
-仅 owner 可访问的 `/admin/ai` 当前只配置一个功能：`contact_assessment`（联系人/账号关系的影子判定）。owner 会在此一次性粘贴该功能所属 OpenAI Project 的 service-account key；服务端会立即以独立加密域保存密钥，页面和审计记录都不会保留或显示明文，只显示必要的遮罩尾号。
+仅 owner 可访问的 `/admin/ai` 当前只配置一个功能：`contact_assessment`（联系人/账号关系的自动识别）。owner 会在此一次性粘贴该功能所属 OpenAI Project 的 service-account key；服务端会立即以独立加密域保存密钥，页面和审计记录都不会保留或显示明文，只显示必要的遮罩尾号。
 
-页面会展示 Project ID、模型、启用状态、密钥轮换状态和最近测试时间/状态；空白密钥输入表示保留当前密钥，替换输入即轮换，关闭功能不必删除配置。浏览器不会直接请求 OpenAI，也不会保存 OpenAI Organization Admin Key。模型仅在 owner 从 `/admin/contacts/{open_id}` 明确点击“AI 影子判定”后由 worker 调用：任务只使用一个仍有效授权范围内的最多 60 条消息片段、约 32,000 个字符，使用 `store: false` 和严格 JSON Schema，保存角色/关系、置信度和消息引用而不保存 Prompt 或模型自由文本。现有 Lark 同步优先于判定任务；每一次人工确认都会重新校验证据授权仍有效。
+页面会展示 Project ID、模型、启用状态、自动确认阈值、密钥轮换状态和最近测试时间/状态；空白密钥输入表示保留当前密钥，替换输入即轮换，关闭功能不必删除配置。浏览器不会直接请求 OpenAI，也不会保存 OpenAI Organization Admin Key。联系人首次拥有一条仍有效授权范围内的消息正文时，worker 会在 Lark 同步空闲后自动入队；任务只使用最多 60 条消息片段、约 32,000 个字符，使用 `store: false` 和严格 JSON Schema，保存角色/关系、置信度和消息引用而不保存 Prompt 或模型自由文本。达到阈值且无冲突的事实自动确认；其余可确认建议进入 `/admin/ai-candidates` 由 owner 处理。已有任何已确认角色或账号归属的联系人会在入队、调用模型前和写入结果前被排除。完整运行口径见 [`contact-assessment-automatic-v0.2.md`](../docs/as-built/contact-assessment-automatic-v0.2.md)。
 
 成本归属以 OpenAI 的 Project 为单位：生产环境为每个成本中心/功能建立独立 Project，并为该 Project 建立独立 service account 与 key。例如本功能可使用 `TT Lark – Contact Assessment – Production` / `contact-assessment-worker`。这样 OpenAI 后台的 Project 用量、预算和告警可以直接对应功能；以后翻译、回复建议应各自使用新的 Project 和 key。
 
