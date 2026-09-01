@@ -29,31 +29,52 @@ LONDON_TIME_ZONE = ZoneInfo("Europe/London")
 LIST_PAGE_SIZE = 50
 MAX_PAGE = 10_000
 MESSAGE_PAGE_SIZE = 100
-MESSAGE_CONVERSATIONS_SQL = """
+MESSAGE_CONVERSATION_PAGE_SIZE = 5
+MAX_MESSAGE_CONVERSATION_QUERY_LENGTH = 120
+MESSAGE_CONVERSATION_TYPES = frozenset({"all", "group", "p2p"})
+MESSAGE_CONVERSATION_DIRECTORY_SQL = """
     SELECT
+        ac.authorization_id,
         ac.chat_id,
         c.name,
         c.external,
-        c.chat_mode,
+        COALESCE(c.chat_mode, 'group') AS chat_mode,
+        counterpart.display_name AS counterpart_display_name,
         ac.member_count,
         ac.member_count_status,
+        a.body_consent_at
+    FROM authorizations a
+    JOIN authorization_chats ac ON ac.authorization_id = a.id
+    JOIN chats c ON c.chat_id = ac.chat_id
+    LEFT JOIN lark_identities counterpart ON counterpart.open_id = ac.p2p_counterpart_open_id
+    WHERE a.id = %s
+      AND ac.is_visible
+      AND COALESCE(c.chat_status, 'normal') = 'normal'
+"""
+MESSAGE_CONVERSATION_COUNTS_SQL = """
+    SELECT
+        conversations.chat_id,
+        conversations.name,
+        conversations.external,
+        conversations.chat_mode,
+        conversations.counterpart_display_name,
+        conversations.member_count,
+        conversations.member_count_status,
         COUNT(o.message_id) FILTER (WHERE NOT m.is_deleted) AS message_count,
         COUNT(o.message_id) FILTER (
             WHERE NOT m.is_deleted
               AND m.body_ciphertext IS NOT NULL
-              AND a.body_consent_at IS NOT NULL
-              AND o.observed_at >= a.body_consent_at
+              AND conversations.body_consent_at IS NOT NULL
+              AND o.observed_at >= conversations.body_consent_at
         ) AS content_count
-    FROM authorizations a
-    JOIN authorization_chats ac ON ac.authorization_id = a.id
-    JOIN chats c ON c.chat_id = ac.chat_id
+    FROM conversations
     LEFT JOIN authorization_message_observations o
-      ON o.authorization_id = ac.authorization_id AND o.chat_id = ac.chat_id
+      ON o.authorization_id = conversations.authorization_id AND o.chat_id = conversations.chat_id
     LEFT JOIN chat_messages m ON m.chat_id = o.chat_id AND m.message_id = o.message_id
-    WHERE a.id = %s
-      AND ac.is_visible
-      AND COALESCE(c.chat_status, 'normal') = 'normal'
-    GROUP BY ac.chat_id, c.name, c.external, c.chat_mode, ac.member_count, ac.member_count_status
+    GROUP BY
+        conversations.authorization_id, conversations.chat_id, conversations.name, conversations.external,
+        conversations.chat_mode, conversations.counterpart_display_name, conversations.member_count,
+        conversations.member_count_status, conversations.body_consent_at
 """
 CONVERSATION_COUNTS_SQL = """
     SELECT
@@ -750,20 +771,65 @@ def creator_candidate_detail(candidate_id: UUID, evidence_page: int = 1) -> dict
     }
 
 
-def message_conversations(authorization_id: UUID, page: int = 1) -> dict[str, Any]:
-    """Return conversations that may be selected on the owner-only content page."""
+def normalize_message_conversation_query(value: str | None) -> str:
+    """Keep the owner-side conversation search bounded and predictable."""
 
-    page, limit, offset = _page_window(page)
+    return (value or "").strip()[:MAX_MESSAGE_CONVERSATION_QUERY_LENGTH]
+
+
+def normalize_message_conversation_type(value: str | None) -> str:
+    """Return a supported message-directory type filter."""
+
+    return value if value in MESSAGE_CONVERSATION_TYPES else "all"
+
+
+def message_conversations(
+    authorization_id: UUID,
+    page: int = 1,
+    query: str = "",
+    chat_type: str = "all",
+) -> dict[str, Any]:
+    """Return one filtered, five-conversation page for the owner-only content view."""
+
+    query = normalize_message_conversation_query(query)
+    chat_type = normalize_message_conversation_type(chat_type)
+    page, limit, offset = _page_window(page, MESSAGE_CONVERSATION_PAGE_SIZE)
     with connection() as conn:
         rows = conn.execute(
             f"""
-            {MESSAGE_CONVERSATIONS_SQL}
-            ORDER BY LOWER(COALESCE(c.name, '')), ac.chat_id
-            LIMIT %s OFFSET %s
+            WITH conversations AS (
+                {MESSAGE_CONVERSATION_DIRECTORY_SQL}
+                  AND (
+                    %s = ''
+                    OR POSITION(LOWER(%s) IN LOWER(COALESCE(c.name, ''))) > 0
+                    OR POSITION(LOWER(%s) IN LOWER(COALESCE(counterpart.display_name, ''))) > 0
+                  )
+                  AND (
+                    %s = 'all'
+                    OR (%s = 'p2p' AND COALESCE(c.chat_mode, 'group') = 'p2p')
+                    OR (%s = 'group' AND COALESCE(c.chat_mode, 'group') <> 'p2p')
+                  )
+                ORDER BY LOWER(COALESCE(c.name, counterpart.display_name, '')), ac.chat_id
+                LIMIT %s OFFSET %s
+            )
+            {MESSAGE_CONVERSATION_COUNTS_SQL}
+            ORDER BY LOWER(COALESCE(name, counterpart_display_name, '')), chat_id
             """,
-            (authorization_id, limit, offset),
+            (
+                authorization_id,
+                query,
+                query,
+                query,
+                chat_type,
+                chat_type,
+                chat_type,
+                limit,
+                offset,
+            ),
         ).fetchall()
-    return _page_result([_decorate_message_conversation(row) for row in rows], page)
+    return _page_result(
+        [_decorate_message_conversation(row) for row in rows], page, MESSAGE_CONVERSATION_PAGE_SIZE
+    )
 
 
 def message_conversation(authorization_id: UUID, chat_id: str) -> dict[str, Any] | None:
@@ -771,7 +837,13 @@ def message_conversation(authorization_id: UUID, chat_id: str) -> dict[str, Any]
 
     with connection() as conn:
         row = conn.execute(
-            f"SELECT * FROM ({MESSAGE_CONVERSATIONS_SQL}) AS conversations WHERE chat_id = %s",
+            f"""
+            WITH conversations AS (
+                {MESSAGE_CONVERSATION_DIRECTORY_SQL}
+                  AND ac.chat_id = %s
+            )
+            {MESSAGE_CONVERSATION_COUNTS_SQL}
+            """,
             (authorization_id, chat_id),
         ).fetchone()
     return _decorate_message_conversation(row) if row else None
@@ -940,7 +1012,8 @@ def _decorate_message_conversation(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     item["chat_mode"] = item.get("chat_mode") or "group"
     item["chat_mode_label"] = _chat_mode_label(item["chat_mode"])
-    item["name"] = _conversation_name(item.get("name"), item["chat_mode"], item.get("chat_id"))
+    name = item.get("name") or item.get("counterpart_display_name")
+    item["name"] = _conversation_name(name, item["chat_mode"], item.get("chat_id"))
     item["member_count_label"] = "—" if item["chat_mode"] == "p2p" else _member_count(
         item.get("member_count"), item.get("member_count_status")
     )

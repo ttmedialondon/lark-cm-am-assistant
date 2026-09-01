@@ -33,19 +33,39 @@
     <div class="alert alert-info">{{ selected_user.display_name }} 尚未完成新版授权。可查看其会话目录，但不会展示消息正文；请让该用户重新授权后开始回填。</div>
     {% endif %}
 
+    <div class="card mb-3"><div class="card-body">
+      <form action="/admin/messages" method="get" class="row g-3 align-items-end">
+        <input type="hidden" name="user_id" value="{{ selected_user.id }}">
+        <input type="hidden" name="user_page" value="{{ user_page.page }}">
+        <div class="col-md-6">
+          <label class="form-label" for="conversation-query">搜索当前人员的会话</label>
+          <input class="form-control" id="conversation-query" name="conversation_query" value="{{ conversation_query }}" maxlength="120" placeholder="会话名称或私聊对方名称">
+        </div>
+        <div class="col-md-3">
+          <label class="form-label" for="conversation-type">会话类型</label>
+          <select class="form-select" id="conversation-type" name="conversation_type">
+            <option value="all" {% if conversation_type == 'all' %}selected{% endif %}>全部会话</option>
+            <option value="group" {% if conversation_type == 'group' %}selected{% endif %}>仅群聊</option>
+            <option value="p2p" {% if conversation_type == 'p2p' %}selected{% endif %}>仅私聊</option>
+          </select>
+        </div>
+        <div class="col-md-3 d-flex gap-2"><button class="btn btn-primary flex-fill" type="submit">筛选</button><a class="btn btn-outline-secondary" href="/admin/messages?user_id={{ selected_user.id }}&amp;user_page={{ user_page.page }}">清空</a></div>
+      </form>
+    </div></div>
+
     <div class="card mb-4">
-      <div class="card-header"><div><h3 class="card-title mb-1">{{ selected_user.display_name }} 的可见会话</h3><div class="text-secondary small">点击“查看记录”才会读取该会话中已加密保存的消息正文。群成员信息以最近一次 Lark 快照为准。</div></div></div>
+      <div class="card-header"><div><h3 class="card-title mb-1">{{ selected_user.display_name }} 的可见会话</h3><div class="text-secondary small">每页 5 个会话；搜索仅覆盖该人员当前可见会话。点击“查看记录”才会读取消息正文并记入审计日志。</div></div></div>
       {% if conversations %}
       <div class="table-responsive"><table class="table table-vcenter card-table">
         <thead><tr><th>会话</th><th>类型</th><th>群成员</th><th>消息索引</th><th>可展示正文</th><th></th></tr></thead>
         <tbody>{% for chat in conversations %}<tr {% if selected_chat and chat.chat_id == selected_chat.chat_id %}class="table-active"{% endif %}>
           <td><div class="text-truncate group-name-cell" title="{{ chat.name }}">{{ chat.name }}</div>{% if chat.external %}<span class="badge bg-azure-lt mt-1">外部群</span>{% endif %}</td>
           <td>{{ chat.chat_mode_label }}</td><td>{{ chat.member_count_label }}</td><td>{{ chat.message_count }}</td><td>{{ chat.content_count }}</td>
-          <td class="text-end">{% if selected_chat and chat.chat_id == selected_chat.chat_id %}<span class="text-secondary small">正在查看</span>{% else %}<a class="btn btn-sm btn-outline-primary" href="/admin/messages?user_id={{ selected_user.id }}&amp;chat_id={{ chat.chat_id | urlencode }}&amp;user_page={{ user_page.page }}&amp;conversation_page={{ conversation_page.page }}">查看记录</a>{% endif %}</td>
+          <td class="text-end">{% if selected_chat and chat.chat_id == selected_chat.chat_id %}<span class="text-secondary small">正在查看</span>{% else %}<a class="btn btn-sm btn-outline-primary" href="/admin/messages?user_id={{ selected_user.id }}&amp;chat_id={{ chat.chat_id | urlencode }}&amp;user_page={{ user_page.page }}&amp;conversation_page={{ conversation_page.page }}&amp;conversation_query={{ conversation_query | urlencode }}&amp;conversation_type={{ conversation_type }}">查看记录</a>{% endif %}</td>
         </tr>{% endfor %}</tbody>
       </table></div>
       {% with pager=conversation_page %}{% include "admin/_pagination.html" %}{% endwith %}
-      {% else %}<div class="card-body text-secondary">该人员当前没有可展示的会话。</div>{% endif %}
+      {% else %}<div class="card-body text-secondary">没有匹配当前筛选的会话。<a href="/admin/messages?user_id={{ selected_user.id }}&amp;user_page={{ user_page.page }}">清空筛选</a></div>{% endif %}
     </div>
 
     {% if selected_chat and content_page %}

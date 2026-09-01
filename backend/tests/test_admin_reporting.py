@@ -9,6 +9,14 @@ def test_reporting_page_window_is_bounded_and_fetches_one_extra_row():
     assert admin_reporting._page_window(99_999) == (admin_reporting.MAX_PAGE, 51, 499_950)
 
 
+def test_message_conversation_filter_values_are_bounded_and_allowlisted():
+    assert admin_reporting._page_window(2, admin_reporting.MESSAGE_CONVERSATION_PAGE_SIZE) == (2, 6, 5)
+    assert admin_reporting.normalize_message_conversation_query("  Creator  ") == "Creator"
+    assert admin_reporting.normalize_message_conversation_query("x" * 121) == "x" * 120
+    assert admin_reporting.normalize_message_conversation_type("p2p") == "p2p"
+    assert admin_reporting.normalize_message_conversation_type("unknown") == "all"
+
+
 def test_member_count_labels_preserve_pending_and_unavailable_states():
     assert admin_reporting._member_count(7, "succeeded") == "7"
     assert admin_reporting._member_count(None, "pending") == "正在获取"

@@ -227,6 +227,8 @@ def create_admin_router(
         page: int = 1,
         user_page: int = 1,
         conversation_page: int = 1,
+        conversation_query: str = "",
+        conversation_type: str = "all",
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
@@ -247,12 +249,16 @@ def create_admin_router(
                 {"title": "未找到授权用户", "detail": "该用户不存在，或尚未完成 Lark 授权。"},
                 404,
             )
+        conversation_query = admin_reporting.normalize_message_conversation_query(conversation_query)
+        conversation_type = admin_reporting.normalize_message_conversation_type(conversation_type)
         conversation_page_data: dict[str, Any] | None = None
         conversations: list[dict[str, Any]] = []
         selected_chat: dict[str, Any] | None = None
         content_page: dict[str, Any] | None = None
         if selected_user:
-            conversation_page_data = admin_reporting.message_conversations(selected_user["id"], conversation_page)
+            conversation_page_data = admin_reporting.message_conversations(
+                selected_user["id"], conversation_page, conversation_query, conversation_type
+            )
             conversations = conversation_page_data["items"]
             selected_chat = (
                 admin_reporting.message_conversation(selected_user["id"], chat_id) if chat_id else None
@@ -278,10 +284,14 @@ def create_admin_router(
                     chat_id=chat_id,
                     conversation_page=conversation_page,
                     page=page,
+                    conversation_query=conversation_query,
+                    conversation_type=conversation_type,
                 ),
                 "selected_user": selected_user,
                 "selected_chat": selected_chat,
                 "conversations": conversations,
+                "conversation_query": conversation_query,
+                "conversation_type": conversation_type,
                 "conversation_page": (
                     pagination(
                         conversation_page_data,
@@ -291,6 +301,8 @@ def create_admin_router(
                         chat_id=chat_id,
                         user_page=user_page_data["page"],
                         page=page,
+                        conversation_query=conversation_query,
+                        conversation_type=conversation_type,
                     )
                     if conversation_page_data
                     else None
@@ -304,6 +316,8 @@ def create_admin_router(
                         chat_id=selected_chat["chat_id"],
                         user_page=user_page_data["page"],
                         conversation_page=conversation_page_data["page"] if conversation_page_data else None,
+                        conversation_query=conversation_query,
+                        conversation_type=conversation_type,
                     )
                     if content_page and selected_chat
                     else None

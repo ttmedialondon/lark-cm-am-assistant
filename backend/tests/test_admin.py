@@ -176,6 +176,38 @@ def test_selecting_a_user_lists_conversations_without_reading_message_content(mo
     assert audits == []
 
 
+def test_message_conversation_search_and_type_stay_with_the_selected_user(monkeypatch):
+    owner_id = uuid4()
+    selected_id = uuid4()
+    contexts = []
+    conversation_queries = []
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(
+        admin_reporting,
+        "users",
+        lambda *_args: _page([{"id": selected_id, "display_name": "CM", "body_consent_at": object()}]),
+    )
+    monkeypatch.setattr(
+        admin_reporting,
+        "message_conversations",
+        lambda *args: conversation_queries.append(args)
+        or _page([{"chat_id": "oc_visible", "chat_mode": "p2p"}], page=2, has_next=True),
+    )
+
+    response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get(
+        f"/admin/messages?user_id={selected_id}&conversation_page=2"
+        "&conversation_query=Creator&conversation_type=p2p"
+    )
+
+    assert response.status_code == 200
+    assert conversation_queries == [(selected_id, 2, "Creator", "p2p")]
+    context = contexts[-1][1]
+    assert context["conversation_query"] == "Creator"
+    assert context["conversation_type"] == "p2p"
+    assert "conversation_query=Creator" in context["conversation_page"]["next_url"]
+    assert "conversation_type=p2p" in context["conversation_page"]["next_url"]
+
+
 def test_owner_reads_only_an_explicit_visible_conversation(monkeypatch):
     owner_id = uuid4()
     selected_id = uuid4()
