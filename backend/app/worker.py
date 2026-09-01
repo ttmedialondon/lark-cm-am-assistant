@@ -77,6 +77,8 @@ def _recover_expired_leases() -> None:
             """
             UPDATE sync_jobs
             SET status = 'queued', scheduled_at = NOW(), lease_until = NULL,
+                attempts = attempts + 1,
+                last_error_code = NULL,
                 last_error = 'A worker lease expired; the job was safely resumed.', updated_at = NOW()
             WHERE status = 'running' AND lease_until < NOW()
             """
@@ -101,13 +103,12 @@ def _claim_job() -> SyncJob | None:
             """
             UPDATE sync_jobs
             SET status = 'running', started_at = COALESCE(started_at, NOW()),
-                attempts = attempts + 1,
                 lease_until = NOW() + INTERVAL '10 minutes', updated_at = NOW()
             WHERE id = %s
             """,
             (row["id"],),
         )
-        return SyncJob(row["id"], row["authorization_id"], row["mode"], int(row["attempts"]) + 1)
+        return SyncJob(row["id"], row["authorization_id"], row["mode"], int(row["attempts"]))
 
 
 def _execute_job(job: SyncJob, settings: Settings) -> None:
@@ -141,7 +142,7 @@ def _execute_job(job: SyncJob, settings: Settings) -> None:
         if complete:
             _finish_and_schedule_incremental(job)
         else:
-            _requeue(job.id, delay_seconds=0, detail="Continuing a paginated sync safely from its saved cursor.")
+            _requeue(job.id, delay_seconds=0, retry=False)
     except ReauthorizationRequired:
         _mark_attention(job, "Lark authorization must be renewed.")
     except LarkApiError as exc:
@@ -154,6 +155,7 @@ def _execute_job(job: SyncJob, settings: Settings) -> None:
                 delay_seconds=delay,
                 detail="Lark is temporarily unavailable; retry scheduled.",
                 code=exc.lark_code,
+                retry=True,
             )
         else:
             _finish_job(job.id, "failed", "A Lark API request could not be completed.", exc.lark_code)
@@ -162,6 +164,7 @@ def _execute_job(job: SyncJob, settings: Settings) -> None:
             job.id,
             delay_seconds=min(60 * (2 ** min(job.attempts, 4)), 900),
             detail="Temporary service issue; retry scheduled.",
+            retry=True,
         )
 
 
@@ -1221,16 +1224,29 @@ def _finish_and_schedule_incremental(job: SyncJob) -> None:
         )
 
 
-def _requeue(job_id: uuid.UUID, *, delay_seconds: int, detail: str, code: int | None = None) -> None:
+def _requeue(
+    job_id: uuid.UUID,
+    *,
+    delay_seconds: int,
+    retry: bool,
+    detail: str | None = None,
+    code: int | None = None,
+) -> None:
+    """Put a job back on the queue without treating normal pagination as an error."""
+
     with connection() as conn, conn.transaction():
         conn.execute(
             """
             UPDATE sync_jobs
             SET status = 'queued', scheduled_at = NOW() + (%s * INTERVAL '1 second'),
-                lease_until = NULL, last_error_code = %s, last_error = %s, updated_at = NOW()
+                lease_until = NULL,
+                attempts = attempts + CASE WHEN %s THEN 1 ELSE 0 END,
+                last_error_code = CASE WHEN %s THEN %s ELSE NULL END,
+                last_error = CASE WHEN %s THEN %s ELSE NULL END,
+                updated_at = NOW()
             WHERE id = %s
             """,
-            (delay_seconds, code, detail, job_id),
+            (delay_seconds, retry, retry, code, retry, detail, job_id),
         )
 
 

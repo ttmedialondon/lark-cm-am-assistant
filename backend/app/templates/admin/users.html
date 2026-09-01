@@ -5,17 +5,17 @@
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
     <div class="card">
-      <div class="card-header"><div><h3 class="card-title mb-1">已授权人员</h3><div class="text-secondary small">每一行是一个 Lark 用户授权；消息数按该用户实际可见的消息观察记录计算。</div></div></div>
+      <div class="card-header"><div><h3 class="card-title mb-1">已授权人员</h3><div class="text-secondary small">先看“接入状态”：它把发现、首次回填和定时更新收敛成一个阶段。私聊目录与成员人数是独立元数据，不代表消息正文已经同步。</div></div></div>
       {% if users %}
       <div class="table-responsive"><table class="table table-vcenter card-table">
-        <thead><tr><th>人员</th><th>授权状态</th><th>正文授权</th><th>管理角色</th><th>群聊</th><th>私聊</th><th>消息索引</th><th>本人消息</th><th>待处理</th><th>最新任务</th><th>最近同步</th></tr></thead>
+        <thead><tr><th>人员</th><th>授权</th><th>接入状态</th><th>会话范围</th><th>首次回填</th><th>消息索引</th><th>最近同步</th></tr></thead>
         <tbody>{% for user in users %}<tr>
           <td><a href="/admin/users/{{ user.id }}">{{ user.display_name }}</a></td>
           <td><span class="badge bg-{{ user.authorization_status_badge }}-lt">{{ user.authorization_status_label }}</span></td>
-          <td><span class="badge bg-{{ user.content_access_badge }}-lt">{{ user.content_access_label }}</span></td>
-          <td>{{ user.admin_role or "—" }}</td>
-          <td>{{ user.group_count }}</td><td>{{ user.p2p_count }}<div><span class="badge bg-{{ user.p2p_status_badge }}-lt mt-1">{{ user.p2p_status_label }}</span></div></td><td>{{ user.message_count }}</td><td>{{ user.own_message_count }}</td><td>{{ user.pending_conversation_count }}</td>
-          <td><span class="badge bg-{{ user.job_status_badge }}-lt">{{ user.job_status_label }}</span></td>
+          <td><span class="badge bg-{{ user.sync_state_badge }}-lt">{{ user.sync_state_label }}</span><div class="text-secondary small mt-1">{{ user.sync_state_detail }}</div></td>
+          <td>{{ user.group_count }} 个群聊 · {{ user.p2p_count }} 个私聊<div class="text-secondary small mt-1">{{ user.p2p_status_label }}{% if user.archived_conversation_count %} · {{ user.archived_conversation_count }} 个已归档/解散{% endif %}</div></td>
+          <td>{{ user.sync_progress_label }}<div class="text-secondary small mt-1">群聊 {{ user.group_content_progress_label }} · 私聊 {{ user.p2p_content_progress_label }}</div></td>
+          <td>{{ user.message_count }}<div class="text-secondary small mt-1">本人 {{ user.own_message_count }}</div></td>
           <td class="text-secondary text-nowrap">{{ user.last_synced_at_label }}</td>
         </tr>{% endfor %}</tbody>
       </table></div>

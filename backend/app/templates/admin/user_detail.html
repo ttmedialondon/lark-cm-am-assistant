@@ -8,19 +8,21 @@
     <div class="card mb-4"><div class="card-body">
       <div class="row g-3 align-items-center">
         <div class="col-md"><h3 class="mb-1">{{ user.display_name }}</h3><div class="text-secondary">授权于 {{ user.authorized_at_label }} · 最近更新 {{ user.updated_at_label }}</div></div>
-        <div class="col-md-auto"><span class="badge bg-{{ user.authorization_status_badge }}-lt">{{ user.authorization_status_label }}</span><span class="badge bg-{{ user.p2p_status_badge }}-lt ms-1">私聊：{{ user.p2p_status_label }}</span>{% if user.admin_role %}<span class="badge bg-azure-lt ms-1">{{ user.admin_role }}</span>{% endif %}</div>
+        <div class="col-md-auto"><span class="badge bg-{{ user.authorization_status_badge }}-lt">{{ user.authorization_status_label }}</span>{% if user.admin_role %}<span class="badge bg-azure-lt ms-1">{{ user.admin_role }}</span>{% endif %}</div>
       </div>
+      <div class="alert alert-{{ user.sync_state_badge }} mt-3 mb-0" role="status"><strong>{{ user.sync_state_label }}</strong><span class="ms-2">{{ user.sync_state_detail }}</span></div>
       <div class="row row-cards mt-2">
-        <div class="col-sm-3"><div class="subheader">当前群聊</div><div class="h2">{{ user.group_count }}</div></div>
-        <div class="col-sm-3"><div class="subheader">当前私聊</div><div class="h2">{{ user.p2p_count }}</div></div>
-        <div class="col-sm-3"><div class="subheader">可见消息索引</div><div class="h2">{{ user.message_count }}</div></div>
-        <div class="col-sm-3"><div class="subheader">本人消息</div><div class="h2">{{ user.own_message_count }}</div></div>
+        <div class="col-sm-6 col-lg-3"><div class="subheader">可同步会话</div><div class="h2">{{ user.syncable_conversation_count }}</div><div class="text-secondary small">群聊 {{ user.group_count }} · 私聊 {{ user.p2p_count }}</div></div>
+        <div class="col-sm-6 col-lg-3"><div class="subheader">首次回填</div><div class="h2">{{ user.sync_progress_label }}</div><div class="text-secondary small">群聊 {{ user.group_content_progress_label }} · 私聊 {{ user.p2p_content_progress_label }}</div></div>
+        <div class="col-sm-6 col-lg-3"><div class="subheader">可见消息索引</div><div class="h2">{{ user.message_count }}</div><div class="text-secondary small">本人 {{ user.own_message_count }}</div></div>
+        <div class="col-sm-6 col-lg-3"><div class="subheader">私聊目录</div><div class="h5 mb-1">{{ user.p2p_status_label }}</div><div class="text-secondary small">目录发现不等于私聊正文已回填</div></div>
       </div>
+      {% if user.archived_conversation_count %}<div class="text-secondary small mt-3">已发现 {{ user.discovered_conversation_count }} 个会话；其中 {{ user.archived_conversation_count }} 个被 Lark 标为已归档/解散，因此不计划回填。</div>{% endif %}
       {% if admin_role == 'owner' %}<a class="btn btn-sm btn-outline-primary mt-3" href="/admin/messages?user_id={{ user.id }}">查看此人的会话</a>{% endif %}
     </div></div>
 
     <div class="card mb-4">
-      <div class="card-header"><div><h3 class="card-title mb-1">当前可见会话</h3><div class="text-secondary small">群名称和成员人数来自共享的群目录；私聊没有成员人数。同步状态属于该人员的授权关系。</div></div></div>
+      <div class="card-header"><div><h3 class="card-title mb-1">当前可见会话</h3><div class="text-secondary small">同步状态属于该人员的授权关系。群成员人数是独立的目录元数据；私聊不适用成员快照，不影响正文回填。</div></div></div>
       {% if conversations %}
       <div class="table-responsive"><table class="table table-vcenter card-table">
         <thead><tr><th>会话</th><th>类型</th><th>成员人数</th><th>消息索引</th><th>同步状态</th><th>最近同步</th></tr></thead>
@@ -34,11 +36,11 @@
     </div>
 
     <div class="card">
-      <div class="card-header"><h3 class="card-title">最近 20 个同步任务</h3></div>
+      <div class="card-header"><div><h3 class="card-title mb-1">最近 20 个同步任务</h3><div class="text-secondary small">分页续跑属于同一个任务，不会标成错误重试。</div></div></div>
       {% if jobs %}
       <div class="table-responsive"><table class="table table-vcenter card-table">
-        <thead><tr><th>模式</th><th>状态</th><th>页数</th><th>发现群聊</th><th>新增消息</th><th>创建时间</th><th>结束时间</th></tr></thead>
-        <tbody>{% for job in jobs %}<tr><td>{{ job.mode }}</td><td><span class="badge bg-{{ job.status_badge }}-lt">{{ job.status_label }}</span></td><td>{{ job.pages_processed }}</td><td>{{ job.chats_discovered }}</td><td>{{ job.messages_indexed }}</td><td class="text-secondary text-nowrap">{{ job.created_at_label }}</td><td class="text-secondary text-nowrap">{{ job.finished_at_label }}</td></tr>{% endfor %}</tbody>
+        <thead><tr><th>模式</th><th>状态</th><th>页数</th><th>发现会话</th><th>新增消息</th><th>计划执行</th><th>结束时间</th></tr></thead>
+        <tbody>{% for job in jobs %}<tr><td>{{ job.mode_label }}</td><td><span class="badge bg-{{ job.status_badge }}-lt">{{ job.status_label }}</span></td><td>{{ job.pages_processed }}</td><td>{{ job.chats_discovered }}</td><td>{{ job.messages_indexed }}</td><td class="text-secondary text-nowrap">{{ job.scheduled_at_label }}</td><td class="text-secondary text-nowrap">{{ job.finished_at_label }}</td></tr>{% endfor %}</tbody>
       </table></div>
       {% else %}<div class="card-body text-secondary">尚未创建同步任务。</div>{% endif %}
     </div>

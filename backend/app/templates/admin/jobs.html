@@ -5,14 +5,14 @@
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
     <div class="card">
-      <div class="card-header"><div><h3 class="card-title mb-1">最近同步任务</h3><div class="text-secondary small">仅展示任务状态和统计，不显示 Lark 访问令牌、刷新令牌或应用密钥。</div></div></div>
+      <div class="card-header"><div><h3 class="card-title mb-1">最近同步任务</h3><div class="text-secondary small">首次回填会安全分页续跑；正常续跑不会被记为失败。定时更新在计划时间到达前显示“等待下一轮检查”。</div></div></div>
       {% if jobs %}
       <div class="table-responsive"><table class="table table-vcenter card-table">
-        <thead><tr><th>人员</th><th>模式</th><th>状态</th><th>页数</th><th>发现群聊</th><th>新增消息</th><th>本人消息</th><th>尝试</th><th>创建时间</th><th>完成时间</th></tr></thead>
+        <thead><tr><th>人员</th><th>模式</th><th>状态</th><th>页数</th><th>发现会话</th><th>新增消息</th><th>本人消息</th><th>计划执行</th><th>完成时间</th></tr></thead>
         <tbody>{% for job in jobs %}<tr>
-          <td>{{ job.display_name }}</td><td>{{ job.mode }}</td><td><span class="badge bg-{{ job.status_badge }}-lt">{{ job.status_label }}</span></td>
-          <td>{{ job.pages_processed }}</td><td>{{ job.chats_discovered }}</td><td>{{ job.messages_indexed }}</td><td>{{ job.own_messages_indexed }}</td><td>{{ job.attempts }}</td>
-          <td class="text-secondary text-nowrap">{{ job.created_at_label }}</td><td class="text-secondary text-nowrap">{{ job.finished_at_label }}</td>
+          <td>{{ job.display_name }}</td><td>{{ job.mode_label }}</td><td><span class="badge bg-{{ job.status_badge }}-lt">{{ job.status_label }}</span></td>
+          <td>{{ job.pages_processed }}</td><td>{{ job.chats_discovered }}</td><td>{{ job.messages_indexed }}</td><td>{{ job.own_messages_indexed }}</td>
+          <td class="text-secondary text-nowrap">{{ job.scheduled_at_label }}</td><td class="text-secondary text-nowrap">{{ job.finished_at_label }}</td>
         </tr>{% endfor %}</tbody>
       </table></div>
       {% else %}<div class="card-body text-secondary">尚未创建同步任务。</div>{% endif %}

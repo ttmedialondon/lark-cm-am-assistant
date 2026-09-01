@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 from app import admin_reporting
 
 
@@ -22,3 +24,46 @@ def test_seconds_label_prefers_human_readable_units():
 def test_message_body_renderer_extracts_text_without_showing_raw_json():
     assert admin_reporting._readable_body('{"text":"hello"}', "text") == "hello"
     assert admin_reporting._readable_body('{"zh_cn":{"content":[[{"text":"hello"}]]}}', "post") == "hello"
+
+
+def test_sync_summary_shows_initial_progress_instead_of_a_generic_running_job():
+    label, badge, detail = admin_reporting.sync_summary(
+        {
+            "authorization_status": "active",
+            "syncable_conversation_count": 295,
+            "backfill_complete_count": 37,
+            "syncing_conversation_count": 1,
+            "waiting_conversation_count": 257,
+            "not_readable_conversation_count": 0,
+            "archived_conversation_count": 9,
+            "job_mode": "backfill",
+            "job_status": "running",
+        }
+    )
+
+    assert (label, badge) == ("首次同步中", "primary")
+    assert "37/295" in detail
+    assert "1 个正在读取" in detail
+    assert "9 个 Lark 已归档/解散会话不计划回填" in detail
+
+
+def test_sync_summary_treats_future_incremental_work_as_a_schedule_not_a_queue():
+    now = datetime(2026, 9, 1, 12, tzinfo=UTC)
+    label, badge, detail = admin_reporting.sync_summary(
+        {
+            "authorization_status": "active",
+            "syncable_conversation_count": 13,
+            "backfill_complete_count": 13,
+            "syncing_conversation_count": 0,
+            "waiting_conversation_count": 0,
+            "not_readable_conversation_count": 0,
+            "archived_conversation_count": 0,
+            "job_mode": "incremental",
+            "job_status": "queued",
+            "job_scheduled_at": now + timedelta(minutes=5),
+        },
+        now=now,
+    )
+
+    assert (label, badge) == ("已接入 · 定时同步", "success")
+    assert "下一轮检查" in detail

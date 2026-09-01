@@ -14,7 +14,7 @@ conversation or message once per authorised user.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -28,6 +28,56 @@ from .db import connection
 LONDON_TIME_ZONE = ZoneInfo("Europe/London")
 MAX_LIST_LIMIT = 500
 MESSAGE_PAGE_SIZE = 100
+CONVERSATION_COUNTS_SQL = """
+    SELECT
+        ac.authorization_id,
+        COUNT(*) AS discovered_conversation_count,
+        COUNT(*) FILTER (
+            WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+        ) AS syncable_conversation_count,
+        COUNT(*) FILTER (
+            WHERE COALESCE(c.chat_status, 'normal') <> 'normal'
+        ) AS archived_conversation_count,
+        COUNT(*) FILTER (
+            WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND COALESCE(c.chat_mode, 'group') <> 'p2p'
+        ) AS group_count,
+        COUNT(*) FILTER (
+            WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND c.chat_mode = 'p2p'
+        ) AS p2p_count,
+        COUNT(*) FILTER (
+            WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND ac.backfill_complete
+        ) AS backfill_complete_count,
+        COUNT(*) FILTER (
+            WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND ac.sync_status = 'syncing'
+        ) AS syncing_conversation_count,
+        COUNT(*) FILTER (
+            WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND ac.sync_status IN ('pending', 'failed_retryable')
+        ) AS waiting_conversation_count,
+        COUNT(*) FILTER (
+            WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND ac.sync_status = 'not_readable'
+        ) AS not_readable_conversation_count,
+        COUNT(*) FILTER (
+            WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND c.chat_mode = 'p2p' AND ac.backfill_complete
+        ) AS p2p_backfill_complete_count,
+        COUNT(*) FILTER (
+            WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND COALESCE(c.chat_mode, 'group') <> 'p2p' AND ac.backfill_complete
+        ) AS group_backfill_complete_count,
+        MAX(COALESCE(ac.last_incremental_at, ac.last_backfill_at)) FILTER (
+            WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+        ) AS last_synced_at
+    FROM authorization_chats ac
+    JOIN chats c ON c.chat_id = ac.chat_id
+    WHERE ac.is_visible
+    GROUP BY ac.authorization_id
+"""
 
 
 def admin_role_for(authorization_id: UUID) -> str | None:
@@ -55,7 +105,7 @@ def overview() -> dict[str, Any]:
                 (SELECT COUNT(*) FROM authorizations WHERE status = 'active') AS active_authorization_count,
                 (SELECT COUNT(*) FROM chats
                   WHERE COALESCE(chat_status, 'normal') = 'normal'
-                    AND COALESCE(chat_mode, 'group') = 'group') AS group_chat_count,
+                    AND COALESCE(chat_mode, 'group') <> 'p2p') AS group_chat_count,
                 (SELECT COUNT(*) FROM chats
                   WHERE COALESCE(chat_status, 'normal') = 'normal'
                     AND chat_mode = 'p2p') AS p2p_chat_count,
@@ -72,27 +122,18 @@ def overview() -> dict[str, Any]:
                   WHERE ac.is_visible
                     AND COALESCE(c.chat_status, 'normal') = 'normal'
                     AND ac.sync_status IN ('pending', 'syncing', 'failed_retryable')) AS pending_membership_count,
-                (SELECT COUNT(*) FROM sync_jobs WHERE status IN ('queued', 'running')) AS active_job_count
+                (SELECT COUNT(*) FROM sync_jobs
+                  WHERE status = 'running'
+                     OR (status = 'queued' AND scheduled_at <= NOW())) AS active_job_count
             """
         ).fetchone()
         attention = conn.execute(
-            """
+            f"""
             WITH conversation_counts AS (
-                SELECT
-                    ac.authorization_id,
-                    COUNT(*) FILTER (WHERE COALESCE(c.chat_mode, 'group') = 'group') AS group_count,
-                    COUNT(*) FILTER (WHERE c.chat_mode = 'p2p') AS p2p_count,
-                    COUNT(*) FILTER (
-                        WHERE ac.sync_status IN ('pending', 'syncing', 'failed_retryable')
-                    ) AS pending_conversation_count,
-                    MAX(COALESCE(ac.last_incremental_at, ac.last_backfill_at)) AS last_synced_at
-                FROM authorization_chats ac
-                JOIN chats c ON c.chat_id = ac.chat_id
-                WHERE ac.is_visible AND COALESCE(c.chat_status, 'normal') = 'normal'
-                GROUP BY ac.authorization_id
+                {CONVERSATION_COUNTS_SQL}
             ), latest_jobs AS (
                 SELECT DISTINCT ON (authorization_id)
-                    authorization_id, status, updated_at
+                    authorization_id, mode, status, scheduled_at, updated_at, pages_processed
                 FROM sync_jobs
                 ORDER BY authorization_id, created_at DESC
             )
@@ -100,17 +141,32 @@ def overview() -> dict[str, Any]:
                 a.id,
                 a.display_name,
                 a.status AS authorization_status,
+                a.body_consent_at,
+                a.p2p_discovery_status,
                 COALESCE(g.group_count, 0) AS group_count,
                 COALESCE(g.p2p_count, 0) AS p2p_count,
-                COALESCE(g.pending_conversation_count, 0) AS pending_conversation_count,
+                COALESCE(g.discovered_conversation_count, 0) AS discovered_conversation_count,
+                COALESCE(g.syncable_conversation_count, 0) AS syncable_conversation_count,
+                COALESCE(g.archived_conversation_count, 0) AS archived_conversation_count,
+                COALESCE(g.backfill_complete_count, 0) AS backfill_complete_count,
+                COALESCE(g.syncing_conversation_count, 0) AS syncing_conversation_count,
+                COALESCE(g.waiting_conversation_count, 0) AS waiting_conversation_count,
+                COALESCE(g.not_readable_conversation_count, 0) AS not_readable_conversation_count,
+                COALESCE(g.p2p_backfill_complete_count, 0) AS p2p_backfill_complete_count,
+                COALESCE(g.group_backfill_complete_count, 0) AS group_backfill_complete_count,
                 g.last_synced_at,
+                j.mode AS job_mode,
                 j.status AS job_status,
-                j.updated_at AS job_updated_at
+                j.scheduled_at AS job_scheduled_at,
+                j.updated_at AS job_updated_at,
+                j.pages_processed AS job_pages_processed
             FROM authorizations a
             LEFT JOIN conversation_counts g ON g.authorization_id = a.id
             LEFT JOIN latest_jobs j ON j.authorization_id = a.id
             WHERE a.status <> 'active'
-               OR COALESCE(g.pending_conversation_count, 0) > 0
+               OR COALESCE(g.backfill_complete_count, 0) < COALESCE(g.syncable_conversation_count, 0)
+               OR j.status = 'running'
+               OR (j.status = 'queued' AND (j.mode = 'backfill' OR j.scheduled_at <= NOW()))
                OR j.status IN ('failed', 'attention_required')
             ORDER BY
                 CASE WHEN a.status <> 'active' THEN 0 ELSE 1 END,
@@ -131,6 +187,8 @@ def overview() -> dict[str, Any]:
                 j.created_at,
                 j.started_at,
                 j.finished_at,
+                j.scheduled_at,
+                j.updated_at,
                 a.display_name
             FROM sync_jobs j
             JOIN authorizations a ON a.id = j.authorization_id
@@ -171,14 +229,14 @@ def overview() -> dict[str, Any]:
             "hint": "仅来自完成新版授权后的同步",
         },
         {
-            "label": "待处理会话关系",
+            "label": "首次同步未完成会话",
             "value": int(counts["pending_membership_count"] or 0),
-            "hint": "等待首次回填、同步中或等待重试",
+            "hint": "不含 Lark 已归档/解散的会话",
         },
         {
             "label": "活动同步任务",
             "value": int(counts["active_job_count"] or 0),
-            "hint": "当前排队或运行中的 worker 任务",
+            "hint": "正在运行或已到执行时间；不含下一轮定时检查",
         },
     )
     return {
@@ -208,20 +266,9 @@ def users(limit: int = 200) -> list[dict[str, Any]]:
 
     with connection() as conn:
         rows = conn.execute(
-            """
+            f"""
             WITH conversation_counts AS (
-                SELECT
-                    ac.authorization_id,
-                    COUNT(*) FILTER (WHERE COALESCE(c.chat_mode, 'group') = 'group') AS group_count,
-                    COUNT(*) FILTER (WHERE c.chat_mode = 'p2p') AS p2p_count,
-                    COUNT(*) FILTER (
-                        WHERE ac.sync_status IN ('pending', 'syncing', 'failed_retryable')
-                    ) AS pending_conversation_count,
-                    MAX(COALESCE(ac.last_incremental_at, ac.last_backfill_at)) AS last_synced_at
-                FROM authorization_chats ac
-                JOIN chats c ON c.chat_id = ac.chat_id
-                WHERE ac.is_visible AND COALESCE(c.chat_status, 'normal') = 'normal'
-                GROUP BY ac.authorization_id
+                {CONVERSATION_COUNTS_SQL}
             ), message_counts AS (
                 SELECT
                     o.authorization_id,
@@ -237,7 +284,7 @@ def users(limit: int = 200) -> list[dict[str, Any]]:
                 GROUP BY o.authorization_id
             ), latest_jobs AS (
                 SELECT DISTINCT ON (authorization_id)
-                    authorization_id, mode, status, updated_at
+                    authorization_id, mode, status, scheduled_at, updated_at, pages_processed
                 FROM sync_jobs
                 ORDER BY authorization_id, created_at DESC
             )
@@ -252,13 +299,23 @@ def users(limit: int = 200) -> list[dict[str, Any]]:
                 r.role AS admin_role,
                 COALESCE(g.group_count, 0) AS group_count,
                 COALESCE(g.p2p_count, 0) AS p2p_count,
-                COALESCE(g.pending_conversation_count, 0) AS pending_conversation_count,
+                COALESCE(g.discovered_conversation_count, 0) AS discovered_conversation_count,
+                COALESCE(g.syncable_conversation_count, 0) AS syncable_conversation_count,
+                COALESCE(g.archived_conversation_count, 0) AS archived_conversation_count,
+                COALESCE(g.backfill_complete_count, 0) AS backfill_complete_count,
+                COALESCE(g.syncing_conversation_count, 0) AS syncing_conversation_count,
+                COALESCE(g.waiting_conversation_count, 0) AS waiting_conversation_count,
+                COALESCE(g.not_readable_conversation_count, 0) AS not_readable_conversation_count,
+                COALESCE(g.p2p_backfill_complete_count, 0) AS p2p_backfill_complete_count,
+                COALESCE(g.group_backfill_complete_count, 0) AS group_backfill_complete_count,
                 g.last_synced_at,
                 COALESCE(m.message_count, 0) AS message_count,
                 COALESCE(m.own_message_count, 0) AS own_message_count,
                 j.mode AS job_mode,
                 j.status AS job_status,
-                j.updated_at AS job_updated_at
+                j.scheduled_at AS job_scheduled_at,
+                j.updated_at AS job_updated_at,
+                j.pages_processed AS job_pages_processed
             FROM authorizations a
             LEFT JOIN admin_roles r ON r.authorization_id = a.id AND r.is_active
             LEFT JOIN conversation_counts g ON g.authorization_id = a.id
@@ -277,22 +334,9 @@ def user_detail(authorization_id: UUID) -> dict[str, Any] | None:
 
     with connection() as conn:
         user = conn.execute(
-            """
+            f"""
             WITH conversation_counts AS (
-                SELECT
-                    ac.authorization_id,
-                    COUNT(*) FILTER (WHERE COALESCE(c.chat_mode, 'group') = 'group') AS group_count,
-                    COUNT(*) FILTER (WHERE c.chat_mode = 'p2p') AS p2p_count,
-                    COUNT(*) FILTER (
-                        WHERE ac.sync_status IN ('pending', 'syncing', 'failed_retryable')
-                    ) AS pending_conversation_count,
-                    MAX(COALESCE(ac.last_incremental_at, ac.last_backfill_at)) AS last_synced_at
-                FROM authorization_chats ac
-                JOIN chats c ON c.chat_id = ac.chat_id
-                WHERE ac.authorization_id = %s
-                  AND ac.is_visible
-                  AND COALESCE(c.chat_status, 'normal') = 'normal'
-                GROUP BY ac.authorization_id
+                {CONVERSATION_COUNTS_SQL}
             ), message_counts AS (
                 SELECT
                     o.authorization_id,
@@ -310,7 +354,7 @@ def user_detail(authorization_id: UUID) -> dict[str, Any] | None:
                 GROUP BY o.authorization_id
             ), latest_jobs AS (
                 SELECT DISTINCT ON (authorization_id)
-                    authorization_id, mode, status, updated_at
+                    authorization_id, mode, status, scheduled_at, updated_at, pages_processed
                 FROM sync_jobs
                 WHERE authorization_id = %s
                 ORDER BY authorization_id, created_at DESC
@@ -326,13 +370,23 @@ def user_detail(authorization_id: UUID) -> dict[str, Any] | None:
                 r.role AS admin_role,
                 COALESCE(g.group_count, 0) AS group_count,
                 COALESCE(g.p2p_count, 0) AS p2p_count,
-                COALESCE(g.pending_conversation_count, 0) AS pending_conversation_count,
+                COALESCE(g.discovered_conversation_count, 0) AS discovered_conversation_count,
+                COALESCE(g.syncable_conversation_count, 0) AS syncable_conversation_count,
+                COALESCE(g.archived_conversation_count, 0) AS archived_conversation_count,
+                COALESCE(g.backfill_complete_count, 0) AS backfill_complete_count,
+                COALESCE(g.syncing_conversation_count, 0) AS syncing_conversation_count,
+                COALESCE(g.waiting_conversation_count, 0) AS waiting_conversation_count,
+                COALESCE(g.not_readable_conversation_count, 0) AS not_readable_conversation_count,
+                COALESCE(g.p2p_backfill_complete_count, 0) AS p2p_backfill_complete_count,
+                COALESCE(g.group_backfill_complete_count, 0) AS group_backfill_complete_count,
                 g.last_synced_at,
                 COALESCE(m.message_count, 0) AS message_count,
                 COALESCE(m.own_message_count, 0) AS own_message_count,
                 j.mode AS job_mode,
                 j.status AS job_status,
-                j.updated_at AS job_updated_at
+                j.scheduled_at AS job_scheduled_at,
+                j.updated_at AS job_updated_at,
+                j.pages_processed AS job_pages_processed
             FROM authorizations a
             LEFT JOIN admin_roles r ON r.authorization_id = a.id AND r.is_active
             LEFT JOIN conversation_counts g ON g.authorization_id = a.id
@@ -340,7 +394,7 @@ def user_detail(authorization_id: UUID) -> dict[str, Any] | None:
             LEFT JOIN latest_jobs j ON j.authorization_id = a.id
             WHERE a.id = %s
             """,
-            (authorization_id, authorization_id, authorization_id, authorization_id),
+            (authorization_id, authorization_id, authorization_id),
         ).fetchone()
         if not user:
             return None
@@ -379,7 +433,8 @@ def user_detail(authorization_id: UUID) -> dict[str, Any] | None:
             """
             SELECT
                 id, mode, status, pages_processed, chats_discovered, messages_indexed,
-                own_messages_indexed, attempts, created_at, started_at, finished_at
+                own_messages_indexed, attempts, created_at, started_at, finished_at,
+                scheduled_at, updated_at
             FROM sync_jobs
             WHERE authorization_id = %s
             ORDER BY created_at DESC
@@ -413,7 +468,7 @@ def chats(limit: int = 500) -> list[dict[str, Any]]:
                 JOIN chats c ON c.chat_id = ac.chat_id
                 WHERE ac.is_visible
                   AND COALESCE(c.chat_status, 'normal') = 'normal'
-                  AND COALESCE(c.chat_mode, 'group') = 'group'
+                  AND COALESCE(c.chat_mode, 'group') <> 'p2p'
                 GROUP BY ac.chat_id
             ), member_counts AS (
                 SELECT DISTINCT ON (ac.chat_id)
@@ -426,7 +481,7 @@ def chats(limit: int = 500) -> list[dict[str, Any]]:
                 WHERE ac.is_visible
                   AND ac.sync_enabled
                   AND COALESCE(c.chat_status, 'normal') = 'normal'
-                  AND COALESCE(c.chat_mode, 'group') = 'group'
+                  AND COALESCE(c.chat_mode, 'group') <> 'p2p'
                 ORDER BY
                     ac.chat_id,
                     CASE WHEN ac.member_count_status = 'succeeded' THEN 0 ELSE 1 END,
@@ -441,6 +496,7 @@ def chats(limit: int = 500) -> list[dict[str, Any]]:
                 c.chat_id,
                 c.name,
                 c.external,
+                c.chat_mode,
                 mc.member_count,
                 mc.member_count_status,
                 mc.member_count_checked_at,
@@ -455,7 +511,7 @@ def chats(limit: int = 500) -> list[dict[str, Any]]:
             LEFT JOIN member_counts mc ON mc.chat_id = c.chat_id
             LEFT JOIN messages msg ON msg.chat_id = c.chat_id
             WHERE COALESCE(c.chat_status, 'normal') = 'normal'
-              AND COALESCE(c.chat_mode, 'group') = 'group'
+              AND COALESCE(c.chat_mode, 'group') <> 'p2p'
             ORDER BY LOWER(COALESCE(c.name, '')), c.chat_id
             LIMIT %s
             """,
@@ -482,6 +538,7 @@ def jobs(limit: int = 200) -> list[dict[str, Any]]:
                 j.created_at,
                 j.started_at,
                 j.finished_at,
+                j.scheduled_at,
                 j.updated_at,
                 a.display_name
             FROM sync_jobs j
@@ -803,22 +860,28 @@ def _list_limit(value: int) -> int:
 def _decorate_user(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     item["display_name"] = item.get("display_name") or "未命名用户"
-    for field in ("authorized_at", "updated_at", "last_synced_at", "job_updated_at"):
+    for field in ("authorized_at", "updated_at", "last_synced_at", "job_scheduled_at", "job_updated_at"):
         item[f"{field}_label"] = _format_time(item.get(field))
     item["authorization_status_label"], item["authorization_status_badge"] = _authorization_status(
         item.get("authorization_status")
     )
-    item["job_status_label"], item["job_status_badge"] = _job_status(item.get("job_status"))
+    item["job_status_label"], item["job_status_badge"] = _job_status(
+        item.get("job_status"), item.get("job_mode"), item.get("job_scheduled_at")
+    )
     item["content_access_label"] = "已完成新版授权" if item.get("body_consent_at") else "需新版授权"
     item["content_access_badge"] = "success" if item.get("body_consent_at") else "warning"
     item["p2p_status_label"], item["p2p_status_badge"] = _p2p_status(item.get("p2p_discovery_status"))
+    item["sync_state_label"], item["sync_state_badge"], item["sync_state_detail"] = sync_summary(item)
+    item["sync_progress_label"] = _sync_progress_label(item)
+    item["p2p_content_progress_label"] = _mode_progress_label(item, "p2p")
+    item["group_content_progress_label"] = _mode_progress_label(item, "group")
     return item
 
 
 def _decorate_conversation_membership(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     item["chat_mode"] = item.get("chat_mode") or "group"
-    item["chat_mode_label"] = "私聊" if item["chat_mode"] == "p2p" else "群聊"
+    item["chat_mode_label"] = _chat_mode_label(item["chat_mode"])
     item["name"] = _conversation_name(item.get("name"), item["chat_mode"], item.get("chat_id"))
     item["member_count_label"] = "—" if item["chat_mode"] == "p2p" else _member_count(
         item.get("member_count"), item.get("member_count_status")
@@ -831,6 +894,7 @@ def _decorate_conversation_membership(row: dict[str, Any]) -> dict[str, Any]:
 def _decorate_chat(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     item["name"] = item.get("name") or "未命名群聊"
+    item["chat_mode_label"] = _chat_mode_label(item.get("chat_mode"))
     item["member_count_label"] = _member_count(item.get("member_count"), item.get("member_count_status"))
     for field in ("last_seen_at", "last_synced_at"):
         item[f"{field}_label"] = _format_time(item.get(field))
@@ -840,7 +904,7 @@ def _decorate_chat(row: dict[str, Any]) -> dict[str, Any]:
 def _decorate_message_conversation(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     item["chat_mode"] = item.get("chat_mode") or "group"
-    item["chat_mode_label"] = "私聊" if item["chat_mode"] == "p2p" else "群聊"
+    item["chat_mode_label"] = _chat_mode_label(item["chat_mode"])
     item["name"] = _conversation_name(item.get("name"), item["chat_mode"], item.get("chat_id"))
     item["member_count_label"] = "—" if item["chat_mode"] == "p2p" else _member_count(
         item.get("member_count"), item.get("member_count_status")
@@ -851,7 +915,7 @@ def _decorate_message_conversation(row: dict[str, Any]) -> dict[str, Any]:
 def _decorate_message(row: dict[str, Any], cipher: TokenCipher) -> dict[str, Any]:
     item = dict(row)
     item["chat_mode"] = item.get("chat_mode") or "group"
-    item["chat_mode_label"] = "私聊" if item["chat_mode"] == "p2p" else "群聊"
+    item["chat_mode_label"] = _chat_mode_label(item["chat_mode"])
     item["chat_name"] = _conversation_name(item.get("name"), item["chat_mode"], item.get("chat_id"))
     item["sender_label"] = (
         "本人"
@@ -913,9 +977,12 @@ def _body_text_values(value: Any) -> list[str]:
 def _decorate_job(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     item["display_name"] = item.get("display_name") or "未命名用户"
-    for field in ("created_at", "started_at", "finished_at", "updated_at"):
+    for field in ("created_at", "started_at", "finished_at", "scheduled_at", "updated_at"):
         item[f"{field}_label"] = _format_time(item.get(field))
-    item["status_label"], item["status_badge"] = _job_status(item.get("status"))
+    item["mode_label"] = "首次回填" if item.get("mode") == "backfill" else "定时更新"
+    item["status_label"], item["status_badge"] = _job_status(
+        item.get("status"), item.get("mode"), item.get("scheduled_at")
+    )
     return item
 
 
@@ -993,6 +1060,77 @@ def _message_time(value: datetime | None) -> str:
     return value.astimezone(LONDON_TIME_ZONE).strftime("%Y-%m-%d %H:%M %Z")
 
 
+def sync_summary(facts: dict[str, Any], *, now: datetime | None = None) -> tuple[str, str, str]:
+    """Collapse queue, discovery, and per-conversation facts into one user-facing state."""
+
+    if facts.get("authorization_status") != "active":
+        return "需要重新授权", "warning", "Lark 授权状态需要处理后才能继续同步。"
+
+    job_status = facts.get("job_status")
+    if job_status == "attention_required":
+        return "需要重新授权", "warning", "Lark 要求重新确认授权；现有数据保持不变。"
+    if job_status == "failed":
+        return "同步需要处理", "danger", "最近一次同步未完成；请查看同步任务中的安全错误摘要。"
+
+    total = int(facts.get("syncable_conversation_count") or 0)
+    completed = int(facts.get("backfill_complete_count") or 0)
+    syncing = int(facts.get("syncing_conversation_count") or 0)
+    waiting = int(facts.get("waiting_conversation_count") or 0)
+    unreadable = int(facts.get("not_readable_conversation_count") or 0)
+    archived = int(facts.get("archived_conversation_count") or 0)
+    job_mode = facts.get("job_mode")
+    scheduled_at = facts.get("job_scheduled_at")
+    current = now or datetime.now(UTC)
+
+    if total == 0:
+        if job_status in {"queued", "running"}:
+            return "正在发现会话", "primary", "正在从 Lark 建立可同步会话目录。"
+        return "暂无可同步会话", "secondary", "Lark 尚未返回可同步的群聊或私聊。"
+
+    if completed < total:
+        label = "首次同步中" if job_status == "running" else "等待首次同步"
+        parts = [f"已完成 {completed}/{total} 个可同步会话"]
+        if syncing:
+            parts.append(f"{syncing} 个正在读取")
+        if waiting:
+            parts.append(f"{waiting} 个等待处理")
+        if unreadable:
+            parts.append(f"{unreadable} 个 Lark 未允许读取")
+        if archived:
+            parts.append(f"另有 {archived} 个 Lark 已归档/解散会话不计划回填")
+        return label, "primary", "；".join(parts) + "。"
+
+    if unreadable:
+        detail = f"首次同步已完成；{unreadable} 个会话未获 Lark 读取许可。"
+        if archived:
+            detail += f"另有 {archived} 个已归档/解散会话不计划回填。"
+        return "已接入（部分不可读）", "warning", detail
+
+    if job_mode == "incremental" and job_status == "running":
+        return "定时更新中", "primary", "首次同步已完成，正在执行本轮增量检查。"
+    if job_mode == "incremental" and job_status == "queued":
+        if isinstance(scheduled_at, datetime) and scheduled_at > current:
+            return "已接入 · 定时同步", "success", f"首次同步已完成；下一轮检查将在 {_format_time(scheduled_at)}。"
+        return "准备定时更新", "primary", "首次同步已完成，worker 正在等待本轮增量检查执行。"
+
+    detail = "首次同步已完成，系统会每 5 分钟检查一次新增消息。"
+    if archived:
+        detail += f"另有 {archived} 个 Lark 已归档/解散会话不计划回填。"
+    return "已接入 · 定时同步", "success", detail
+
+
+def _sync_progress_label(facts: dict[str, Any]) -> str:
+    total = int(facts.get("syncable_conversation_count") or 0)
+    completed = int(facts.get("backfill_complete_count") or 0)
+    return f"{completed} / {total}" if total else "—"
+
+
+def _mode_progress_label(facts: dict[str, Any], mode: str) -> str:
+    total_field = "p2p_count" if mode == "p2p" else "group_count"
+    completed_field = "p2p_backfill_complete_count" if mode == "p2p" else "group_backfill_complete_count"
+    return f"{int(facts.get(completed_field) or 0)} / {int(facts.get(total_field) or 0)}"
+
+
 def _seconds_label(seconds: int) -> str:
     if seconds % 3600 == 0:
         return f"{seconds // 3600} 小时"
@@ -1010,9 +1148,15 @@ def _authorization_status(value: str | None) -> tuple[str, str]:
     return mapping.get(value or "", ("状态未知", "secondary"))
 
 
-def _job_status(value: str | None) -> tuple[str, str]:
+def _job_status(
+    value: str | None,
+    mode: str | None = None,
+    scheduled_at: datetime | None = None,
+) -> tuple[str, str]:
+    if value == "queued" and mode == "incremental" and scheduled_at and scheduled_at > datetime.now(UTC):
+        return "等待下一轮检查", "secondary"
     mapping = {
-        "queued": ("排队中", "secondary"),
+        "queued": ("等待执行", "secondary"),
         "running": ("运行中", "primary"),
         "succeeded": ("已完成", "success"),
         "failed": ("失败", "danger"),
@@ -1035,12 +1179,20 @@ def _sync_status(value: str | None) -> tuple[str, str]:
 
 def _p2p_status(value: str | None) -> tuple[str, str]:
     mapping = {
-        "pending": ("等待新版授权", "secondary"),
-        "succeeded": ("已发现", "success"),
-        "unavailable": ("Lark 未返回", "warning"),
+        "pending": ("等待私聊目录", "secondary"),
+        "succeeded": ("私聊目录已发现", "success"),
+        "unavailable": ("私聊目录未返回", "warning"),
         "attention_required": ("需要重新授权", "warning"),
     }
     return mapping.get(value or "", ("尚未检查", "secondary"))
+
+
+def _chat_mode_label(value: str | None) -> str:
+    if value == "p2p":
+        return "私聊"
+    if value == "topic":
+        return "专题群"
+    return "群聊"
 
 
 def _candidate_status(value: str | None) -> tuple[str, str]:

@@ -1,5 +1,8 @@
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
+from app import worker
 from app.worker import (
     _body_content,
     _is_author_message,
@@ -81,3 +84,21 @@ def test_member_snapshot_follows_lark_pagination_and_keeps_member_facts() -> Non
     assert snapshot.count == 2
     assert snapshot.snapshot_status == "succeeded"
     assert {member["open_id"] for member in snapshot.members} == {"ou_one", "ou_two"}
+
+
+def test_normal_pagination_requeue_does_not_increment_retry_count(monkeypatch) -> None:
+    calls = []
+
+    class Connection:
+        def transaction(self):
+            return nullcontext()
+
+        def execute(self, query, params):
+            calls.append((query, params))
+
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(Connection()))
+
+    worker._requeue(uuid4(), delay_seconds=0, retry=False)
+
+    assert calls[0][1][1:6] == (False, False, None, False, None)
+    assert "attempts = attempts + CASE WHEN %s THEN 1 ELSE 0 END" in calls[0][0]

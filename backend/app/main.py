@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .admin import create_admin_router
-from .admin_reporting import admin_role_for
+from .admin_reporting import admin_role_for, sync_summary
 from .config import get_settings
 from .crypto import TokenCipher
 from .db import connection, database_is_ready
@@ -287,47 +287,93 @@ def _current_authorization(request: Request) -> dict[str, Any] | None:
 
 def _dashboard_stats(authorization_id: uuid.UUID) -> dict[str, Any]:
     with connection() as conn:
-        last_sync = conn.execute(
+        row = conn.execute(
             """
+            WITH conversation_counts AS (
+                SELECT
+                    access.authorization_id,
+                    COUNT(*) FILTER (
+                        WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+                    ) AS syncable_conversation_count,
+                    COUNT(*) FILTER (
+                        WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+                          AND access.backfill_complete
+                    ) AS backfill_complete_count,
+                    COUNT(*) FILTER (
+                        WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+                          AND access.sync_status = 'syncing'
+                    ) AS syncing_conversation_count,
+                    COUNT(*) FILTER (
+                        WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+                          AND access.sync_status IN ('pending', 'failed_retryable')
+                    ) AS waiting_conversation_count,
+                    COUNT(*) FILTER (
+                        WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+                          AND access.sync_status = 'not_readable'
+                    ) AS not_readable_conversation_count,
+                    COUNT(*) FILTER (
+                        WHERE COALESCE(c.chat_status, 'normal') <> 'normal'
+                    ) AS archived_conversation_count,
+                    MAX(COALESCE(access.last_incremental_at, access.last_backfill_at)) FILTER (
+                        WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+                    ) AS last_synced_at
+                FROM authorization_chats AS access
+                JOIN chats AS c ON c.chat_id = access.chat_id
+                WHERE access.authorization_id = %s AND access.is_visible
+                GROUP BY access.authorization_id
+            ), latest_job AS (
+                SELECT mode, status, scheduled_at, pages_processed, chats_discovered,
+                       messages_indexed, own_messages_indexed, last_error, updated_at
+                FROM sync_jobs
+                WHERE authorization_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+            )
             SELECT
-                MAX(COALESCE(access.last_incremental_at, access.last_backfill_at)) AS last_synced_at
-            FROM authorization_chats AS access
-            JOIN chats AS c ON c.chat_id = access.chat_id
-            WHERE access.authorization_id = %s AND access.is_visible
-              AND COALESCE(c.chat_status, 'normal') = 'normal'
+                a.status AS authorization_status,
+                COALESCE(c.syncable_conversation_count, 0) AS syncable_conversation_count,
+                COALESCE(c.backfill_complete_count, 0) AS backfill_complete_count,
+                COALESCE(c.syncing_conversation_count, 0) AS syncing_conversation_count,
+                COALESCE(c.waiting_conversation_count, 0) AS waiting_conversation_count,
+                COALESCE(c.not_readable_conversation_count, 0) AS not_readable_conversation_count,
+                COALESCE(c.archived_conversation_count, 0) AS archived_conversation_count,
+                c.last_synced_at,
+                j.mode AS job_mode,
+                j.status AS job_status,
+                j.scheduled_at AS job_scheduled_at,
+                j.pages_processed,
+                j.chats_discovered,
+                j.messages_indexed,
+                j.own_messages_indexed,
+                j.last_error,
+                j.updated_at
+            FROM authorizations a
+            LEFT JOIN conversation_counts c ON c.authorization_id = a.id
+            LEFT JOIN latest_job j ON TRUE
+            WHERE a.id = %s
             """,
-            (authorization_id,),
-        ).fetchone()
-        job = conn.execute(
-            """
-            SELECT mode, status, pages_processed, chats_discovered, messages_indexed,
-                   own_messages_indexed, last_error, updated_at
-            FROM sync_jobs WHERE authorization_id = %s
-            ORDER BY created_at DESC LIMIT 1
-            """,
-            (authorization_id,),
+            (authorization_id, authorization_id, authorization_id),
         ).fetchone()
 
-    status, detail, badge = _job_status(job)
+    facts = dict(row) if row else {"authorization_status": "attention_required"}
+    status, badge, detail = sync_summary(facts)
+    job = {
+        "mode": facts.get("job_mode"),
+        "status": facts.get("job_status"),
+        "pages_processed": facts.get("pages_processed"),
+        "chats_discovered": facts.get("chats_discovered"),
+        "messages_indexed": facts.get("messages_indexed"),
+        "own_messages_indexed": facts.get("own_messages_indexed"),
+        "last_error": facts.get("last_error"),
+        "updated_at": facts.get("updated_at"),
+    }
     return {
-        "last_synced_at": _format_time(last_sync["last_synced_at"]),
+        "last_synced_at": _format_time(facts.get("last_synced_at")),
         "status": status,
         "detail": detail,
         "badge": badge,
         "job": job,
     }
-
-
-def _job_status(job: dict[str, Any] | None) -> tuple[str, str, str]:
-    if not job:
-        return "准备接入", "授权完成后，系统会开始建立提醒所需的连接。", "secondary"
-    if job["status"] in {"queued", "running"}:
-        return "正在接入", "正在建立提醒所需的连接。", "primary"
-    if job["status"] == "succeeded":
-        return "接入完成", "提醒规则正在测试中；当前不会自动发送消息。", "success"
-    if job["status"] == "attention_required":
-        return "需要重新授权", "提醒所需的授权需要重新确认。", "warning"
-    return "接入遇到问题", "系统会安全重试；若持续失败，请联系管理员。", "danger"
 
 
 def _queue_job(conn: psycopg.Connection, authorization_id: uuid.UUID, mode: str) -> bool:
