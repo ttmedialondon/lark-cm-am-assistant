@@ -1149,15 +1149,15 @@ def account_detail(account_id: UUID, evidence_page: int = 1) -> dict[str, Any] |
                 source.contact_id AS source_contact_id,
                 source.display_name AS source_display_name,
                 source.tenant_classification AS source_tenant_classification,
-                authorization.display_name AS observed_by_display_name,
+                auth.display_name AS observed_by_display_name,
                 message.message_type,
                 message.message_create_time,
                 message.is_deleted,
                 CASE
-                    WHEN authorization.status = 'active'
+                    WHEN auth.status = 'active'
                      AND authorization_chat.is_visible
-                     AND authorization.body_consent_at IS NOT NULL
-                     AND scope.observed_at >= authorization.body_consent_at
+                     AND auth.body_consent_at IS NOT NULL
+                     AND scope.observed_at >= auth.body_consent_at
                      AND NOT message.is_deleted
                     THEN message.body_ciphertext
                 END AS body_ciphertext
@@ -1165,7 +1165,7 @@ def account_detail(account_id: UUID, evidence_page: int = 1) -> dict[str, Any] |
             JOIN chat_messages message
               ON message.chat_id = observation.chat_id AND message.message_id = observation.message_id
             JOIN chats chat ON chat.chat_id = observation.chat_id
-            JOIN authorizations authorization ON authorization.id = observation.observed_by_authorization_id
+            JOIN authorizations auth ON auth.id = observation.observed_by_authorization_id
             LEFT JOIN authorization_chats authorization_chat
               ON authorization_chat.authorization_id = observation.observed_by_authorization_id
              AND authorization_chat.chat_id = observation.chat_id

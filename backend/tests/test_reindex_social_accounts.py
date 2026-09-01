@@ -66,8 +66,8 @@ def test_reindex_rows_records_a_raw_account_observation_without_ownership() -> N
 def test_reindex_query_requires_active_consent_valid_visible_message_scope() -> None:
     query = reindex.READABLE_MESSAGES_SQL
 
-    assert "authorization.status = 'active'" in query
-    assert "authorization.body_consent_at IS NOT NULL" in query
-    assert "observation.observed_at >= authorization.body_consent_at" in query
+    assert "auth.status = 'active'" in query
+    assert "auth.body_consent_at IS NOT NULL" in query
+    assert "observation.observed_at >= auth.body_consent_at" in query
     assert "chat_scope.is_visible" in query
     assert "chat_scope.sync_enabled" in query

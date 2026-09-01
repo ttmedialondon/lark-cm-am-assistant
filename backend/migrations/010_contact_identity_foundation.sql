@@ -162,13 +162,13 @@ WITH internal_tenants AS (
     SELECT DISTINCT tenant_key
     FROM (
         SELECT identity.tenant_key
-        FROM authorizations authorization
-        JOIN lark_identities identity ON identity.open_id = authorization.open_id
+        FROM authorizations auth
+        JOIN lark_identities identity ON identity.open_id = auth.open_id
         WHERE identity.tenant_key IS NOT NULL
         UNION
         SELECT message.sender_tenant_key
-        FROM authorizations authorization
-        JOIN chat_messages message ON message.sender_open_id = authorization.open_id
+        FROM authorizations auth
+        JOIN chat_messages message ON message.sender_open_id = auth.open_id
         WHERE message.sender_tenant_key IS NOT NULL
     ) tenant_facts
 )

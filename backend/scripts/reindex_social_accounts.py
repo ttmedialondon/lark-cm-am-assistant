@@ -43,15 +43,15 @@ FROM chat_messages message
 JOIN authorization_message_observations observation
   ON observation.chat_id = message.chat_id
  AND observation.message_id = message.message_id
-JOIN authorizations authorization ON authorization.id = observation.authorization_id
+JOIN authorizations auth ON auth.id = observation.authorization_id
 JOIN authorization_chats chat_scope
   ON chat_scope.authorization_id = observation.authorization_id
  AND chat_scope.chat_id = message.chat_id
 WHERE message.body_ciphertext IS NOT NULL
   AND NOT message.is_deleted
-  AND authorization.status = 'active'
-  AND authorization.body_consent_at IS NOT NULL
-  AND observation.observed_at >= authorization.body_consent_at
+  AND auth.status = 'active'
+  AND auth.body_consent_at IS NOT NULL
+  AND observation.observed_at >= auth.body_consent_at
   AND chat_scope.is_visible
   AND chat_scope.sync_enabled
   AND (
