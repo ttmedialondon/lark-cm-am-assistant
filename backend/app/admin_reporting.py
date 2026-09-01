@@ -1228,7 +1228,7 @@ def _decorate_creator_identifier(row: dict[str, Any]) -> dict[str, Any]:
 
 def _decorate_creator_candidate(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
-    item["subject_label"] = item.get("subject_display_name") or "未知 Lark 参与者"
+    item["subject_label"] = item.get("subject_display_name") or "Lark 外部参与者（姓名未返回）"
     item["creator_label"] = item.get("creator_display_name") or "尚未匹配达人库"
     item["identifier_label"] = (
         " · ".join(value for value in (item.get("platform"), item.get("display_value")) if value) or "未命名标识"

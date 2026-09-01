@@ -45,6 +45,12 @@ def test_member_count_labels_preserve_pending_and_unavailable_states():
     assert admin_reporting._member_count(None, "unavailable") == "Lark 未返回"
 
 
+def test_creator_candidate_label_distinguishes_missing_name_from_unknown_identity():
+    assert admin_reporting._decorate_creator_candidate({"subject_display_name": "Ada"})["subject_label"] == "Ada"
+    candidate = admin_reporting._decorate_creator_candidate({"subject_display_name": None})
+    assert candidate["subject_label"] == "Lark 外部参与者（姓名未返回）"
+
+
 def test_seconds_label_prefers_human_readable_units():
     assert admin_reporting._seconds_label(300) == "5 分钟"
     assert admin_reporting._seconds_label(3600) == "1 小时"

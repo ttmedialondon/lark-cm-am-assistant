@@ -6,7 +6,7 @@
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl admin-directory__container">
     <div class="alert alert-warning">仅所有者可查看。候选只由高精度规则生成，不会自动确认达人归属；打开详情才会读取对应的已加密消息正文并记入审计日志。</div>
     <div class="card admin-directory__card">
-      <div class="card-header"><div><h3 class="card-title mb-1">达人识别候选</h3><div class="text-secondary small">每条候选均保留其来源规则与证据数，便于先核验准确率。</div></div></div>
+      <div class="card-header"><div><h3 class="card-title mb-1">达人识别候选</h3><div class="text-secondary small">每条候选均保留其来源规则与证据数，便于先核验准确率。“姓名未返回”表示已有稳定 Lark 身份、可跨会话聚合，但 Lark 未返回显示名称，不等于已识别为达人。</div></div></div>
       {% if candidates %}
       <div class="table-responsive admin-directory__table"><table class="table table-vcenter card-table">
         <thead><tr><th>Lark 参与者</th><th>发现的账号</th><th>达人库匹配</th><th>状态</th><th>证据</th><th>最后发现</th><th></th></tr></thead>
