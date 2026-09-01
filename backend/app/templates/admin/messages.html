@@ -43,18 +43,18 @@
             <input type="hidden" name="user_id" value="{{ selected_user.id }}">
             <input type="hidden" name="user_page" value="{{ user_page.page }}">
             <div class="col-12">
-              <label class="form-label mb-1" for="conversation-query">搜索会话</label>
-              <input class="form-control" id="conversation-query" name="conversation_query" value="{{ conversation_query }}" maxlength="120" placeholder="名称或私聊对方">
+              <label class="visually-hidden" for="conversation-query">搜索会话</label>
+              <input class="form-control" id="conversation-query" name="conversation_query" value="{{ conversation_query }}" maxlength="120" placeholder="搜索名称或私聊对方">
             </div>
-            <div class="col-7">
-              <label class="form-label mb-1" for="conversation-type">类型</label>
+            <div class="col-12 d-flex gap-2">
+              <label class="visually-hidden" for="conversation-type">会话类型</label>
               <select class="form-select" id="conversation-type" name="conversation_type">
                 <option value="all" {% if conversation_type == 'all' %}selected{% endif %}>全部</option>
                 <option value="group" {% if conversation_type == 'group' %}selected{% endif %}>群聊</option>
                 <option value="p2p" {% if conversation_type == 'p2p' %}selected{% endif %}>私聊</option>
               </select>
+              <button class="btn btn-primary" type="submit">筛选</button><a class="btn btn-outline-secondary" href="/admin/messages?user_id={{ selected_user.id }}&amp;user_page={{ user_page.page }}" aria-label="清空筛选">清空</a>
             </div>
-            <div class="col-5 d-flex gap-2"><button class="btn btn-primary flex-fill" type="submit">筛选</button><a class="btn btn-outline-secondary" href="/admin/messages?user_id={{ selected_user.id }}&amp;user_page={{ user_page.page }}" aria-label="清空筛选">清空</a></div>
           </form>
         </div>
 
