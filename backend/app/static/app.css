@@ -13,3 +13,47 @@ body { min-height: 100vh; }
   letter-spacing: .04em;
 }
 .group-name-cell { max-width: 26rem; }
+
+.message-console { background: var(--tblr-bg-surface-secondary, #f5f7fb); }
+.message-console__container { max-width: none; }
+.message-console__notice { flex: 1 1 18rem; }
+.message-console__user-form { flex: 1 1 24rem; max-width: 34rem; }
+.message-console__workspace { display: grid; gap: 1rem; grid-template-columns: minmax(19rem, 23rem) minmax(0, 1fr); }
+.message-console__directory, .message-console__detail { display: flex; flex-direction: column; min-width: 0; }
+.message-console__directory-header, .message-console__detail-header { flex: 0 0 auto; }
+.message-console__directory-header > .min-width-0, .message-console__detail-header .min-width-0 { min-width: 0; }
+.message-console__filter-panel { flex: 0 0 auto; padding: .75rem 1rem; border-bottom: 1px solid var(--tblr-border-color); }
+.message-console__access-note { padding: .5rem 1rem; color: var(--tblr-yellow); background: var(--tblr-yellow-lt); font-size: .8125rem; }
+.message-console__directory-list { flex: 1 1 auto; }
+.message-console__conversation { min-height: 4.15rem; padding: .65rem 1rem; border-left: 3px solid transparent; }
+.message-console__conversation:hover { background: var(--tblr-bg-surface-secondary, #f5f7fb); }
+.message-console__conversation.is-current { color: var(--tblr-primary); border-left-color: currentColor; background: var(--tblr-primary-lt); }
+.message-console__conversation-meta { display: flex; flex-wrap: wrap; gap: .25rem .65rem; margin-top: .3rem; color: var(--tblr-secondary); font-size: .75rem; }
+.message-console__directory-empty { display: grid; flex: 1 1 auto; place-items: center; padding: 2rem; text-align: center; }
+.message-console__metrics { display: flex; flex-wrap: wrap; gap: .25rem 1.25rem; padding: .55rem 1rem; color: var(--tblr-secondary); border-bottom: 1px solid var(--tblr-border-color); font-size: .8125rem; }
+.message-console__metrics strong { color: var(--tblr-body-color); font-size: .9375rem; }
+.message-console__messages { display: flex; flex: 1 1 auto; flex-direction: column; gap: .65rem; padding: 1rem; background: var(--tblr-bg-surface-secondary, #f5f7fb); }
+.message-console__message { align-self: flex-start; max-width: min(88%, 54rem); padding: .65rem .8rem; border: 1px solid var(--tblr-border-color); border-radius: .6rem; background: var(--tblr-bg-surface); box-shadow: 0 .125rem .25rem rgb(0 0 0 / 3%); }
+.message-console__message--own { align-self: flex-end; border-color: var(--tblr-primary-lt); background: var(--tblr-primary-lt); }
+.message-console__message-meta { margin-bottom: .35rem; color: var(--tblr-secondary); font-size: .75rem; }
+.message-console__message-body { white-space: pre-wrap; overflow-wrap: anywhere; }
+.message-console__detail-empty, .message-console__empty { display: grid; flex: 1 1 auto; min-height: 18rem; place-items: center; align-content: center; padding: 2rem; text-align: center; }
+.message-console__detail-empty h3, .message-console__empty h3 { margin-bottom: .5rem; font-size: 1rem; }
+.message-console__detail-empty p { max-width: 26rem; margin: 0; color: var(--tblr-secondary); }
+
+@media (min-width: 992px) and (min-height: 50rem) {
+  .message-console { display: flex; flex-direction: column; height: 100dvh; overflow: hidden; }
+  .message-console > .navbar, .message-console > .page-header { flex: 0 0 auto; }
+  .message-console > .page-wrapper, .message-console .page-body, .message-console__container { display: flex; flex: 1 1 auto; min-height: 0; }
+  .message-console .page-body { overflow: hidden; }
+  .message-console__container { flex-direction: column; padding-top: .75rem; padding-bottom: .75rem; }
+  .message-console__workspace { flex: 1 1 auto; grid-template-rows: minmax(0, 1fr); min-height: 0; }
+  .message-console__directory, .message-console__detail { min-height: 0; overflow: hidden; }
+  .message-console__messages { min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+}
+
+@media (max-width: 991.98px), (max-height: 49.99rem) {
+  .message-console__workspace { grid-template-columns: minmax(0, 1fr); }
+  .message-console__user-form { max-width: none; }
+  .message-console__messages { max-height: 36rem; overflow-y: auto; }
+}
