@@ -8,15 +8,18 @@ avoids importing ``main`` back into an admin module.
 from __future__ import annotations
 
 import hmac
+import json
 from collections.abc import Callable
 from typing import Any, Protocol
 from urllib.parse import parse_qs, urlencode
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse, Response
 
-from . import admin_reporting, creator_registry
+from . import admin_reporting, ai_feature_config, creator_registry
+from .config import get_settings
+from .db import connection
 
 
 class TemplateRenderer(Protocol):
@@ -160,6 +163,30 @@ def create_admin_router(
             },
             status_code,
         )
+
+    def render_ai_config(
+        request: Request,
+        access_context: dict[str, Any],
+        *,
+        error: str | None = None,
+        status_code: int = 200,
+    ) -> Response:
+        with connection() as conn:
+            config = ai_feature_config.display_config(
+                ai_feature_config.get_feature_config(conn, "contact_assessment")
+            )
+        response = render_template(
+            request,
+            "admin/ai.html",
+            {
+                **page_context(access_context, "ai"),
+                "config": config,
+                "form_error": error,
+            },
+            status_code,
+        )
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
 
     @router.get("/admin")
     def admin_overview(request: Request) -> Response:
@@ -369,6 +396,14 @@ def create_admin_router(
         assert access_context is not None
         return render_creators(request, access_context, page=page)
 
+    @router.get("/admin/ai")
+    def admin_ai_config(request: Request) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        return render_ai_config(request, access_context)
+
     @router.get("/admin/contacts")
     def admin_contacts(request: Request, page: int = 1) -> Response:
         access_context, denied = owner_access(request)
@@ -508,6 +543,61 @@ def create_admin_router(
         except creator_registry.CreatorInputError as exc:
             return render_creators(request, access_context, error=str(exc), status_code=400)
         return RedirectResponse(url=f"/admin/creators/{creator_id}", status_code=303)
+
+    @router.post("/admin/ai")
+    async def admin_save_ai_config(request: Request) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        form = await _form_fields(request)
+        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
+            response = render_template(
+                request,
+                "error.html",
+                {"title": "请求校验失败", "detail": "请返回 AI 功能配置页面后重试。"},
+                400,
+            )
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
+        try:
+            with connection() as conn, conn.transaction():
+                key_rotated = bool(form.get("api_key", "").strip())
+                ai_feature_config.save_feature_config(
+                    conn,
+                    ai_feature_config.api_key_cipher(get_settings().token_encryption_key),
+                    "contact_assessment",
+                    provider="openai",
+                    project_id=form.get("project_id", ""),
+                    model=form.get("model", ""),
+                    enabled=form.get("enabled") == "1",
+                    api_key=form.get("api_key", ""),
+                    updated_by_authorization_id=access_context["authorization"]["id"],
+                )
+                conn.execute(
+                    "INSERT INTO audit_events (id, authorization_id, action, metadata) "
+                    "VALUES (%s, %s, %s, %s::jsonb)",
+                    (
+                        uuid4(),
+                        access_context["authorization"]["id"],
+                        "ai_feature_config_updated",
+                        json.dumps(
+                            {
+                                "feature": "contact_assessment",
+                                "provider": "openai",
+                                "project_id": form.get("project_id", "").strip(),
+                                "model": form.get("model", "").strip(),
+                                "enabled": form.get("enabled") == "1",
+                                "key_rotated": key_rotated,
+                            }
+                        ),
+                    ),
+                )
+        except ai_feature_config.FeatureConfigInputError as exc:
+            return render_ai_config(request, access_context, error=str(exc), status_code=400)
+        response = RedirectResponse(url="/admin/ai", status_code=303)
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
 
     @router.get("/admin/creators/{creator_id}")
     def admin_creator_detail(request: Request, creator_id: UUID, identifier_page: int = 1) -> Response:
