@@ -35,6 +35,14 @@ FastAPI + Jinja2 + HTMX + Tabler    ←→ PostgreSQL
 
 `/admin` 是独立的内部管理台，展示公司范围的授权、唯一群、去重消息与同步任务。它由数据库的 `admin_roles` 强制控制；无角色用户即使直接输入 URL 也会得到 403。当前部署只写入一个 `owner`，不自动授予其他 CM/AM。`/admin/messages`、`/admin/contacts`、`/admin/accounts` 和 `/admin/creators` 仅 owner 可访问；联系人页展示稳定 Lark 身份，账号页展示原始出现记录。每次查看正文或账号证据均审计但不记录正文。
 
+### OpenAI 功能凭证
+
+当前安装尚未配置 OpenAI API Key，也没有模型调用。仅 owner 可访问的 `/admin/ai` 当前只配置一个功能：`contact_assessment`（联系人/账号关系的影子判定）。owner 会在此一次性粘贴该功能所属 OpenAI Project 的 service-account key；服务端会立即以独立加密域保存密钥，页面和审计记录都不会保留或显示明文，只显示必要的遮罩尾号。
+
+页面会展示 Project ID、模型、启用状态、密钥轮换状态和最近测试时间/状态；空白密钥输入表示保留当前密钥，替换输入即轮换，关闭功能不必删除配置。浏览器不会直接请求 OpenAI，也不会保存 OpenAI Organization Admin Key；实际模型调用仍由服务器 worker 在后续版本实现。
+
+成本归属以 OpenAI 的 Project 为单位：生产环境为每个成本中心/功能建立独立 Project，并为该 Project 建立独立 service account 与 key。例如本功能可使用 `TT Lark – Contact Assessment – Production` / `contact-assessment-worker`。这样 OpenAI 后台的 Project 用量、预算和告警可以直接对应功能；以后翻译、回复建议应各自使用新的 Project 和 key。
+
 数据模型与页面口径见 [`docs/as-built/admin-console-v0.3.md`](../docs/as-built/admin-console-v0.3.md)。
 
 ## 本地开发

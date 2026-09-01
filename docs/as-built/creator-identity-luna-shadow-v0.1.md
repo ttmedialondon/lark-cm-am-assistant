@@ -128,6 +128,14 @@ Builder 每次只构造一个固定大小的证据包：
 
 ## OpenAI 调用契约
 
+### Project 与密钥配置边界
+
+OpenAI 的成本归属应以 **Project** 为单位，而不是让所有功能共用一个组织级 key：生产环境每个成本中心/功能一个 Project，并在该 Project 下创建专用 service account 与 key。当前功能建议命名为 `TT Lark – Contact Assessment – Production` 和 `contact-assessment-worker`；翻译、回复建议等后续功能各自建立 Project 和 key。这样 Project 用量、预算和告警能直接对应功能，必要时也可按 key 进一步核对。
+
+本阶段尚未存储任何 OpenAI 凭证。配置功能合入后，只有 owner 可访问 `/admin/ai`，并且当前只会出现 `contact_assessment` 这一项。owner 粘贴 Project 的 service-account key 一次后，服务端将以独立加密域保存；页面只显示遮罩尾号，审计事件只记录“已配置/已轮换/已启停”等动作和非敏感配置，不记录 key。本页同时显示 Project ID、模型、启用状态、最近测试时间/状态，并允许轮换密钥或停用功能；留空密钥字段表示保留已存密钥。
+
+这里不使用 OpenAI Organization Admin Key，也不允许浏览器直接调用 OpenAI。即使完成配置，在 Context Builder、评估任务和 worker 接入完成前，也不会产生实际模型调用或费用。
+
 使用一次性 Responses 请求：`model: gpt-5.6-luna`、`reasoning.effort: low`、`store: false`、无工具、严格 JSON Schema Structured Outputs。先以 `low` 作为延迟/成本基线；只在人工标注集上比较 `medium`。Luna 支持 Responses API 和 Structured Outputs，适合高频、固定证据包的分类任务。[GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
 
 服务端必须验证：
