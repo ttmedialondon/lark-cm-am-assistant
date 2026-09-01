@@ -1,4 +1,9 @@
-"""Small write path for the owner-maintained creator identity library."""
+"""Small write path for the owner-maintained creator identity library.
+
+Creators are contacts with one confirmed ``creator`` role.  A social account is
+kept separate from the contact so a message mentioning an account never implies
+who owns it; only this explicit owner action creates that relationship.
+"""
 
 from __future__ import annotations
 
@@ -23,8 +28,16 @@ def create_creator(actor_id: UUID, display_name: str) -> UUID:
     creator_id = uuid4()
     with connection() as conn, conn.transaction():
         conn.execute(
-            "INSERT INTO creators (id, display_name) VALUES (%s, %s)",
+            "INSERT INTO contacts (id, display_name) VALUES (%s, %s)",
             (creator_id, name),
+        )
+        conn.execute(
+            """
+            INSERT INTO contact_roles (
+                contact_id, role, status, source, reviewed_by_authorization_id, reviewed_at
+            ) VALUES (%s, 'creator', 'confirmed', 'manual', %s, NOW())
+            """,
+            (creator_id, actor_id),
         )
         _audit(conn, actor_id, "creator_created", {"creator_id": str(creator_id)})
     return creator_id
@@ -46,16 +59,33 @@ def add_identifier(
     identifier_id = uuid4()
     try:
         with connection() as conn, conn.transaction():
-            if not conn.execute("SELECT 1 FROM creators WHERE id = %s", (creator_id,)).fetchone():
-                raise CreatorInputError("未找到该达人。")
-            conn.execute(
+            if not conn.execute(
                 """
-                INSERT INTO creator_identifiers (
-                    id, creator_id, kind, platform, normalized_value, display_value
-                ) VALUES (%s, %s, %s, %s, %s, %s)
+                SELECT 1
+                FROM contact_roles
+                WHERE contact_id = %s AND role = 'creator' AND status = 'confirmed'
                 """,
-                (identifier_id, creator_id, kind, platform, normalized_value, display_value),
-            )
+                (creator_id,),
+            ).fetchone():
+                raise CreatorInputError("未找到该达人。")
+            if kind == "handle":
+                identifier_id = _add_confirmed_social_account(
+                    conn,
+                    actor_id=actor_id,
+                    creator_id=creator_id,
+                    platform=platform,
+                    normalized_value=normalized_value,
+                    display_value=display_value,
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO contact_identifiers (
+                        id, contact_id, kind, platform, normalized_value, display_value
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (identifier_id, creator_id, kind, platform, normalized_value, display_value),
+                )
             _audit(
                 conn,
                 actor_id,
@@ -65,6 +95,46 @@ def add_identifier(
     except UniqueViolation as exc:
         raise CreatorInputError("该身份标识已存在，不能重复归属。") from exc
     return identifier_id
+
+
+def _add_confirmed_social_account(
+    conn: psycopg.Connection,
+    *,
+    actor_id: UUID,
+    creator_id: UUID,
+    platform: str,
+    normalized_value: str,
+    display_value: str,
+) -> UUID:
+    account = conn.execute(
+        """
+        INSERT INTO social_accounts (id, platform, normalized_handle, display_handle)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (platform, normalized_handle) DO UPDATE SET
+            display_handle = EXCLUDED.display_handle,
+            updated_at = NOW()
+        RETURNING id
+        """,
+        (uuid4(), platform, normalized_value, display_value),
+    ).fetchone()
+    assert account is not None
+    account_id = account["id"]
+    conn.execute(
+        """
+        INSERT INTO contact_social_accounts (
+            contact_id, social_account_id, relationship, status, source,
+            reviewed_by_authorization_id, reviewed_at
+        ) VALUES (%s, %s, 'owner', 'confirmed', 'manual', %s, NOW())
+        ON CONFLICT (contact_id, social_account_id, relationship) DO UPDATE SET
+            status = 'confirmed',
+            source = 'manual',
+            reviewed_by_authorization_id = EXCLUDED.reviewed_by_authorization_id,
+            reviewed_at = EXCLUDED.reviewed_at,
+            updated_at = NOW()
+        """,
+        (creator_id, account_id, actor_id),
+    )
+    return account_id
 
 
 def _normalize_identifier(kind: str, platform: str, value: str) -> tuple[str, str]:
