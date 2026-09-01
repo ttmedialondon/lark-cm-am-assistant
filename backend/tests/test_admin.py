@@ -110,37 +110,59 @@ def test_creator_library_is_owner_only_and_uses_the_owner_context(monkeypatch):
     assert response.status_code == 200
 
 
-def test_creator_candidates_are_owner_only(monkeypatch):
+def test_contact_directory_is_owner_only(monkeypatch):
     monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "operator")
 
-    response = _client(lambda _request: {"id": uuid4(), "status": "active"}).get("/admin/candidates")
+    response = _client(lambda _request: {"id": uuid4(), "status": "active"}).get("/admin/contacts")
 
     assert response.status_code == 403
 
 
-def test_owner_candidate_detail_reads_only_that_candidate_and_audits(monkeypatch):
+def test_owner_contact_detail_reads_only_that_contact_without_message_content(monkeypatch):
     owner_id = uuid4()
-    candidate_id = uuid4()
+    contexts = []
+    reads = []
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(
+        admin_reporting,
+        "contact_detail",
+        lambda *args: reads.append(args)
+        or {"contact": {}, "identities": [], "conversations": _page([]), "accounts": _page([])},
+    )
+
+    response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get(
+        "/admin/contacts/ou_contact?conversations_page=2&accounts_page=3"
+    )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert reads == [("ou_contact", 2, 3)]
+    assert contexts[-1][0] == "admin/contact_detail.html"
+
+
+def test_owner_account_detail_reads_only_that_account_and_audits(monkeypatch):
+    owner_id = uuid4()
+    account_id = uuid4()
     contexts = []
     reads = []
     audits = []
     monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
     monkeypatch.setattr(
         admin_reporting,
-        "creator_candidate_detail",
-        lambda *args: reads.append(args) or {"candidate": {}, "evidence": _page([])},
+        "account_detail",
+        lambda *args: reads.append(args) or {"account": {}, "evidence": _page([])},
     )
-    monkeypatch.setattr(admin_reporting, "record_candidate_view", lambda *args: audits.append(args))
+    monkeypatch.setattr(admin_reporting, "record_account_view", lambda *args: audits.append(args))
 
     response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get(
-        f"/admin/candidates/{candidate_id}"
+        f"/admin/accounts/{account_id}"
     )
 
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store, max-age=0"
-    assert reads == [(candidate_id, 1)]
-    assert audits == [(owner_id, candidate_id)]
-    assert contexts[-1][0] == "admin/candidate_detail.html"
+    assert reads == [(account_id, 1)]
+    assert audits == [(owner_id, account_id)]
+    assert contexts[-1][0] == "admin/account_detail.html"
 
 
 def test_creator_write_requires_csrf_and_redirects_after_a_valid_post(monkeypatch):

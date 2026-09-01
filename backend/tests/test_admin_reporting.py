@@ -45,10 +45,18 @@ def test_member_count_labels_preserve_pending_and_unavailable_states():
     assert admin_reporting._member_count(None, "unavailable") == "Lark 未返回"
 
 
-def test_creator_candidate_label_distinguishes_missing_name_from_unknown_identity():
-    assert admin_reporting._decorate_creator_candidate({"subject_display_name": "Ada"})["subject_label"] == "Ada"
-    candidate = admin_reporting._decorate_creator_candidate({"subject_display_name": None})
-    assert candidate["subject_label"] == "Lark 外部参与者（姓名未返回）"
+def test_contact_and_account_labels_do_not_imply_identity_or_ownership():
+    contact = admin_reporting._decorate_contact({"display_name": "Ada", "tenant_classification": "known_external"})
+    assert contact["display_name"] == "Ada"
+    assert contact["tenant_classification_label"] == "外部成员"
+
+    unnamed = admin_reporting._decorate_contact({"display_name": None, "tenant_classification": "unresolved"})
+    assert unnamed["display_name"] == "Lark 参与者（姓名未返回）"
+    assert unnamed["tenant_classification_label"] == "租户未返回"
+
+    account = admin_reporting._decorate_social_account({"platform": "instagram", "display_handle": "@example"})
+    assert account["identifier_label"] == "instagram · @example"
+    assert account["owner_label"] == "尚未人工确认"
 
 
 def test_seconds_label_prefers_human_readable_units():

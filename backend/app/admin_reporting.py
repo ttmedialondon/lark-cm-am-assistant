@@ -668,7 +668,16 @@ def creators(page: int = 1) -> dict[str, Any]:
     """Return the compact owner-maintained creator identity library."""
 
     with connection() as conn:
-        total_count = int(conn.execute("SELECT COUNT(*) AS total_count FROM creators").fetchone()["total_count"] or 0)
+        total_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS total_count
+                FROM contact_roles
+                WHERE role = 'creator' AND status = 'confirmed'
+                """
+            ).fetchone()["total_count"]
+            or 0
+        )
         page, limit, offset = _page_window(page, total_count=total_count)
         rows = conn.execute(
             """
@@ -677,12 +686,14 @@ def creators(page: int = 1) -> dict[str, Any]:
                 c.display_name,
                 c.created_at,
                 c.updated_at,
-                COUNT(DISTINCT i.id) AS identifier_count,
-                COUNT(DISTINCT candidate.id) AS candidate_count,
-                COUNT(DISTINCT candidate.id) FILTER (WHERE candidate.status = 'pending') AS pending_candidate_count
-            FROM creators c
-            LEFT JOIN creator_identifiers i ON i.creator_id = c.id
-            LEFT JOIN creator_identity_candidates candidate ON candidate.creator_id = c.id
+                COUNT(DISTINCT identifier.id) + COUNT(DISTINCT account.social_account_id) AS identifier_count,
+                COUNT(DISTINCT account.social_account_id) AS social_account_count
+            FROM contacts c
+            JOIN contact_roles role
+              ON role.contact_id = c.id AND role.role = 'creator' AND role.status = 'confirmed'
+            LEFT JOIN contact_identifiers identifier ON identifier.contact_id = c.id
+            LEFT JOIN contact_social_accounts account
+              ON account.contact_id = c.id AND account.status = 'confirmed'
             GROUP BY c.id, c.display_name, c.created_at, c.updated_at
             ORDER BY LOWER(c.display_name), c.id
             LIMIT %s OFFSET %s
@@ -701,10 +712,14 @@ def creator_detail(creator_id: UUID, identifier_page: int = 1) -> dict[str, Any]
                 c.display_name,
                 c.created_at,
                 c.updated_at,
-                COUNT(DISTINCT candidate.id) AS candidate_count,
-                COUNT(DISTINCT candidate.id) FILTER (WHERE candidate.status = 'pending') AS pending_candidate_count
-            FROM creators c
-            LEFT JOIN creator_identity_candidates candidate ON candidate.creator_id = c.id
+                COUNT(DISTINCT identifier.id) + COUNT(DISTINCT account.social_account_id) AS identifier_count,
+                COUNT(DISTINCT account.social_account_id) AS social_account_count
+            FROM contacts c
+            JOIN contact_roles role
+              ON role.contact_id = c.id AND role.role = 'creator' AND role.status = 'confirmed'
+            LEFT JOIN contact_identifiers identifier ON identifier.contact_id = c.id
+            LEFT JOIN contact_social_accounts account
+              ON account.contact_id = c.id AND account.status = 'confirmed'
             WHERE c.id = %s
             GROUP BY c.id, c.display_name, c.created_at, c.updated_at
             """,
@@ -714,8 +729,20 @@ def creator_detail(creator_id: UUID, identifier_page: int = 1) -> dict[str, Any]
             return None
         identifier_total_count = int(
             conn.execute(
-                "SELECT COUNT(*) AS total_count FROM creator_identifiers WHERE creator_id = %s",
-                (creator_id,),
+                """
+                SELECT COUNT(*) AS total_count
+                FROM (
+                    SELECT id
+                    FROM contact_identifiers
+                    WHERE contact_id = %s
+                    UNION ALL
+                    SELECT account.id
+                    FROM contact_social_accounts relation
+                    JOIN social_accounts account ON account.id = relation.social_account_id
+                    WHERE relation.contact_id = %s AND relation.status = 'confirmed'
+                ) AS identifiers
+                """,
+                (creator_id, creator_id),
             ).fetchone()["total_count"]
             or 0
         )
@@ -724,13 +751,23 @@ def creator_detail(creator_id: UUID, identifier_page: int = 1) -> dict[str, Any]
         )
         identifiers = conn.execute(
             """
+            WITH identifiers AS (
+                SELECT id, kind, platform, display_value, created_at, updated_at
+                FROM contact_identifiers
+                WHERE contact_id = %s
+                UNION ALL
+                SELECT account.id, 'handle' AS kind, account.platform, account.display_handle AS display_value,
+                       relation.created_at, relation.updated_at
+                FROM contact_social_accounts relation
+                JOIN social_accounts account ON account.id = relation.social_account_id
+                WHERE relation.contact_id = %s AND relation.status = 'confirmed'
+            )
             SELECT id, kind, platform, display_value, created_at, updated_at
-            FROM creator_identifiers
-            WHERE creator_id = %s
-            ORDER BY kind, platform, normalized_value
+            FROM identifiers
+            ORDER BY kind, platform, LOWER(display_value), id
             LIMIT %s OFFSET %s
             """,
-            (creator_id, identifier_limit, identifier_offset),
+            (creator_id, creator_id, identifier_limit, identifier_offset),
         ).fetchall()
     return {
         "creator": _decorate_creator(creator),
@@ -743,80 +780,344 @@ def creator_detail(creator_id: UUID, identifier_page: int = 1) -> dict[str, Any]
     }
 
 
-def creator_candidates(page: int = 1) -> dict[str, Any]:
-    """Return rule-generated creator candidates without reading message bodies."""
+def contacts(page: int = 1) -> dict[str, Any]:
+    """Return discovered non-internal Lark contacts; no role is inferred here."""
 
     with connection() as conn:
         total_count = int(
-            conn.execute("SELECT COUNT(*) AS total_count FROM creator_identity_candidates").fetchone()["total_count"]
+            conn.execute(
+                """
+                SELECT COUNT(DISTINCT contact.id) AS total_count
+                FROM contacts contact
+                JOIN lark_identities identity ON identity.contact_id = contact.id
+                WHERE identity.identity_type = 'user' AND identity.tenant_classification <> 'internal'
+                """
+            ).fetchone()["total_count"]
             or 0
         )
         page, limit, offset = _page_window(page, total_count=total_count)
         rows = conn.execute(
             """
             SELECT
-                candidate.id,
-                candidate.identifier_kind,
-                candidate.platform,
-                candidate.display_value,
-                candidate.status,
-                candidate.source,
-                candidate.created_at,
-                candidate.updated_at,
-                subject.display_name AS subject_display_name,
-                creator.display_name AS creator_display_name,
-                COUNT(evidence.id) AS evidence_count,
-                MAX(evidence.created_at) AS last_evidence_at
-            FROM creator_identity_candidates candidate
-            LEFT JOIN lark_identities subject ON subject.open_id = candidate.subject_open_id
-            LEFT JOIN creators creator ON creator.id = candidate.creator_id
-            LEFT JOIN creator_candidate_evidence evidence ON evidence.candidate_id = candidate.id
-            GROUP BY
-                candidate.id, candidate.identifier_kind, candidate.platform, candidate.display_value,
-                candidate.status, candidate.source, candidate.created_at, candidate.updated_at,
-                subject.display_name, creator.display_name
-            ORDER BY
-                CASE candidate.status WHEN 'pending' THEN 0 ELSE 1 END,
-                MAX(evidence.created_at) DESC NULLS LAST,
-                candidate.updated_at DESC
+                contact.id AS contact_id,
+                COALESCE(contact.display_name, primary_identity.display_name) AS display_name,
+                primary_identity.open_id,
+                primary_identity.tenant_key,
+                primary_identity.tenant_classification,
+                identity_counts.lark_identity_count,
+                identity_counts.last_seen_at,
+                conversations.conversation_count,
+                messages.message_count,
+                accounts.account_count
+            FROM contacts contact
+            JOIN LATERAL (
+                SELECT identity.open_id, identity.display_name, identity.tenant_key, identity.tenant_classification
+                FROM lark_identities identity
+                WHERE identity.contact_id = contact.id
+                  AND identity.identity_type = 'user'
+                  AND identity.tenant_classification <> 'internal'
+                ORDER BY identity.last_seen_at DESC, identity.open_id
+                LIMIT 1
+            ) AS primary_identity ON TRUE
+            JOIN LATERAL (
+                SELECT COUNT(*) AS lark_identity_count, MAX(identity.last_seen_at) AS last_seen_at
+                FROM lark_identities identity
+                WHERE identity.contact_id = contact.id AND identity.identity_type = 'user'
+            ) AS identity_counts ON TRUE
+            JOIN LATERAL (
+                SELECT COUNT(*) AS conversation_count
+                FROM (
+                    SELECT member.chat_id
+                    FROM chat_members member
+                    JOIN lark_identities identity ON identity.open_id = member.open_id
+                    WHERE identity.contact_id = contact.id
+                    UNION
+                    SELECT message.chat_id
+                    FROM chat_messages message
+                    JOIN lark_identities identity ON identity.open_id = message.sender_open_id
+                    WHERE identity.contact_id = contact.id
+                    UNION
+                    SELECT association.chat_id
+                    FROM authorization_chats association
+                    JOIN lark_identities identity ON identity.open_id = association.p2p_counterpart_open_id
+                    WHERE association.is_visible AND identity.contact_id = contact.id
+                ) AS contact_conversations
+            ) AS conversations ON TRUE
+            JOIN LATERAL (
+                SELECT COUNT(*) AS message_count
+                FROM chat_messages message
+                JOIN lark_identities identity ON identity.open_id = message.sender_open_id
+                WHERE identity.contact_id = contact.id AND NOT message.is_deleted
+            ) AS messages ON TRUE
+            JOIN LATERAL (
+                SELECT COUNT(DISTINCT observation.social_account_id) AS account_count
+                FROM social_account_observations observation
+                JOIN lark_identities identity ON identity.open_id = observation.source_open_id
+                WHERE identity.contact_id = contact.id
+            ) AS accounts ON TRUE
+            ORDER BY identity_counts.last_seen_at DESC NULLS LAST,
+                     LOWER(COALESCE(contact.display_name, primary_identity.display_name)), contact.id
             LIMIT %s OFFSET %s
             """,
             (limit, offset),
         ).fetchall()
-    return _page_result([_decorate_creator_candidate(row) for row in rows], page, total_count=total_count)
+    return _page_result([_decorate_contact(row) for row in rows], page, total_count=total_count)
 
 
-def creator_candidate_detail(candidate_id: UUID, evidence_page: int = 1) -> dict[str, Any] | None:
-    """Return one owner-reviewable candidate and only its linked evidence."""
+def contact_detail(
+    open_id: str,
+    conversation_page: int = 1,
+    account_page: int = 1,
+) -> dict[str, Any] | None:
+    """Return one stable Lark contact, its visible conversation facts, and raw account appearances."""
 
     with connection() as conn:
-        candidate = conn.execute(
+        contact = conn.execute(
             """
             SELECT
-                candidate.id,
-                candidate.identifier_kind,
-                candidate.platform,
-                candidate.display_value,
-                candidate.status,
-                candidate.source,
-                candidate.created_at,
-                candidate.updated_at,
-                subject.display_name AS subject_display_name,
-                creator.id AS creator_id,
-                creator.display_name AS creator_display_name
-            FROM creator_identity_candidates candidate
-            LEFT JOIN lark_identities subject ON subject.open_id = candidate.subject_open_id
-            LEFT JOIN creators creator ON creator.id = candidate.creator_id
-            WHERE candidate.id = %s
+                contact.id AS contact_id,
+                COALESCE(contact.display_name, identity.display_name) AS display_name,
+                identity.open_id,
+                identity.tenant_key,
+                identity.tenant_classification,
+                contact.created_at,
+                contact.updated_at
+            FROM lark_identities identity
+            JOIN contacts contact ON contact.id = identity.contact_id
+            WHERE identity.open_id = %s
+              AND identity.identity_type = 'user'
+              AND identity.tenant_classification <> 'internal'
             """,
-            (candidate_id,),
+            (open_id,),
         ).fetchone()
-        if not candidate:
+        if not contact:
+            return None
+
+        contact_id = contact["contact_id"]
+        identities = conn.execute(
+            """
+            SELECT open_id, display_name, tenant_key, tenant_classification, first_seen_at, last_seen_at
+            FROM lark_identities
+            WHERE contact_id = %s AND identity_type = 'user'
+            ORDER BY last_seen_at DESC, open_id
+            """,
+            (contact_id,),
+        ).fetchall()
+
+        conversation_total_count = int(
+            conn.execute(
+                """
+                WITH contact_identities AS (
+                    SELECT open_id FROM lark_identities WHERE contact_id = %s
+                ), conversation_ids AS (
+                    SELECT member.chat_id FROM chat_members member
+                    JOIN contact_identities identity USING (open_id)
+                    UNION
+                    SELECT message.chat_id FROM chat_messages message
+                    JOIN contact_identities identity ON identity.open_id = message.sender_open_id
+                    UNION
+                    SELECT association.chat_id FROM authorization_chats association
+                    JOIN contact_identities identity ON identity.open_id = association.p2p_counterpart_open_id
+                    WHERE association.is_visible
+                )
+                SELECT COUNT(*) AS total_count
+                FROM conversation_ids ids
+                JOIN chats chat ON chat.chat_id = ids.chat_id
+                WHERE COALESCE(chat.chat_status, 'normal') = 'normal'
+                """,
+                (contact_id,),
+            ).fetchone()["total_count"]
+            or 0
+        )
+        conversation_page, conversation_limit, conversation_offset = _page_window(
+            conversation_page, DETAIL_PAGE_SIZE, total_count=conversation_total_count
+        )
+        conversations = conn.execute(
+            """
+            WITH contact_identities AS (
+                SELECT open_id FROM lark_identities WHERE contact_id = %s
+            ), conversation_ids AS (
+                SELECT member.chat_id FROM chat_members member
+                JOIN contact_identities identity USING (open_id)
+                UNION
+                SELECT message.chat_id FROM chat_messages message
+                JOIN contact_identities identity ON identity.open_id = message.sender_open_id
+                UNION
+                SELECT association.chat_id FROM authorization_chats association
+                JOIN contact_identities identity ON identity.open_id = association.p2p_counterpart_open_id
+                WHERE association.is_visible
+            )
+            SELECT
+                chat.chat_id,
+                chat.name,
+                COALESCE(chat.chat_mode, 'group') AS chat_mode,
+                chat.external,
+                member_counts.member_count,
+                message_counts.message_count,
+                message_counts.contact_message_count,
+                message_counts.last_message_at
+            FROM conversation_ids ids
+            JOIN chats chat ON chat.chat_id = ids.chat_id
+            JOIN LATERAL (
+                SELECT COUNT(*) AS member_count FROM chat_members member WHERE member.chat_id = chat.chat_id
+            ) AS member_counts ON TRUE
+            JOIN LATERAL (
+                SELECT
+                    COUNT(*) FILTER (WHERE NOT message.is_deleted) AS message_count,
+                    COUNT(*) FILTER (
+                        WHERE NOT message.is_deleted
+                          AND message.sender_open_id IN (SELECT open_id FROM contact_identities)
+                    ) AS contact_message_count,
+                    MAX(message.message_create_time) FILTER (WHERE NOT message.is_deleted) AS last_message_at
+                FROM chat_messages message
+                WHERE message.chat_id = chat.chat_id
+            ) AS message_counts ON TRUE
+            WHERE COALESCE(chat.chat_status, 'normal') = 'normal'
+            ORDER BY message_counts.last_message_at DESC NULLS LAST, LOWER(COALESCE(chat.name, '')), chat.chat_id
+            LIMIT %s OFFSET %s
+            """,
+            (contact_id, conversation_limit, conversation_offset),
+        ).fetchall()
+
+        account_total_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(DISTINCT observation.social_account_id) AS total_count
+                FROM social_account_observations observation
+                JOIN lark_identities identity ON identity.open_id = observation.source_open_id
+                WHERE identity.contact_id = %s
+                """,
+                (contact_id,),
+            ).fetchone()["total_count"]
+            or 0
+        )
+        account_page, account_limit, account_offset = _page_window(
+            account_page, DETAIL_PAGE_SIZE, total_count=account_total_count
+        )
+        accounts = conn.execute(
+            """
+            SELECT
+                account.id,
+                account.platform,
+                account.display_handle,
+                COUNT(observation.id) AS observation_count,
+                MAX(observation.last_observed_at) AS last_observed_at
+            FROM social_account_observations observation
+            JOIN lark_identities identity ON identity.open_id = observation.source_open_id
+            JOIN social_accounts account ON account.id = observation.social_account_id
+            WHERE identity.contact_id = %s
+            GROUP BY account.id, account.platform, account.display_handle
+            ORDER BY MAX(observation.last_observed_at) DESC, account.platform, account.normalized_handle
+            LIMIT %s OFFSET %s
+            """,
+            (contact_id, account_limit, account_offset),
+        ).fetchall()
+
+    return {
+        "contact": _decorate_contact(contact),
+        "identities": [_decorate_lark_identity(row) for row in identities],
+        "conversations": _page_result(
+            [_decorate_contact_conversation(row) for row in conversations],
+            conversation_page,
+            DETAIL_PAGE_SIZE,
+            total_count=conversation_total_count,
+        ),
+        "accounts": _page_result(
+            [_decorate_social_account(row) for row in accounts],
+            account_page,
+            DETAIL_PAGE_SIZE,
+            total_count=account_total_count,
+        ),
+    }
+
+
+def accounts(page: int = 1) -> dict[str, Any]:
+    """Return independent social accounts and their raw message appearances."""
+
+    with connection() as conn:
+        total_count = int(
+            conn.execute("SELECT COUNT(*) AS total_count FROM social_accounts").fetchone()["total_count"] or 0
+        )
+        page, limit, offset = _page_window(page, total_count=total_count)
+        rows = conn.execute(
+            """
+            SELECT
+                account.id,
+                account.platform,
+                account.display_handle,
+                account.created_at,
+                account.updated_at,
+                owner.display_name AS owner_display_name,
+                observations.observation_count,
+                observations.source_count,
+                observations.last_observed_at
+            FROM social_accounts account
+            LEFT JOIN contact_social_accounts owner_relation
+              ON owner_relation.social_account_id = account.id
+             AND owner_relation.relationship = 'owner'
+             AND owner_relation.status = 'confirmed'
+            LEFT JOIN contacts owner ON owner.id = owner_relation.contact_id
+            JOIN LATERAL (
+                SELECT
+                    COUNT(*) AS observation_count,
+                    COUNT(DISTINCT source_open_id) AS source_count,
+                    MAX(last_observed_at) AS last_observed_at
+                FROM social_account_observations observation
+                WHERE observation.social_account_id = account.id
+            ) AS observations ON TRUE
+            ORDER BY observations.last_observed_at DESC NULLS LAST, account.platform, account.normalized_handle
+            LIMIT %s OFFSET %s
+            """,
+            (limit, offset),
+        ).fetchall()
+    return _page_result([_decorate_social_account(row) for row in rows], page, total_count=total_count)
+
+
+def account_detail(account_id: UUID, evidence_page: int = 1) -> dict[str, Any] | None:
+    """Return a social account with only its authorized, auditable message evidence."""
+
+    with connection() as conn:
+        account = conn.execute(
+            """
+            SELECT
+                account.id,
+                account.platform,
+                account.display_handle,
+                account.created_at,
+                account.updated_at,
+                owner.id AS owner_contact_id,
+                owner.display_name AS owner_display_name,
+                observations.observation_count,
+                observations.source_count,
+                observations.last_observed_at
+            FROM social_accounts account
+            LEFT JOIN contact_social_accounts owner_relation
+              ON owner_relation.social_account_id = account.id
+             AND owner_relation.relationship = 'owner'
+             AND owner_relation.status = 'confirmed'
+            LEFT JOIN contacts owner ON owner.id = owner_relation.contact_id
+            JOIN LATERAL (
+                SELECT
+                    COUNT(*) AS observation_count,
+                    COUNT(DISTINCT source_open_id) AS source_count,
+                    MAX(last_observed_at) AS last_observed_at
+                FROM social_account_observations observation
+                WHERE observation.social_account_id = account.id
+            ) AS observations ON TRUE
+            WHERE account.id = %s
+            """,
+            (account_id,),
+        ).fetchone()
+        if not account:
             return None
         evidence_total_count = int(
             conn.execute(
-                "SELECT COUNT(*) AS total_count FROM creator_candidate_evidence WHERE candidate_id = %s",
-                (candidate_id,),
+                """
+                SELECT COUNT(*) AS total_count
+                FROM social_account_observations
+                WHERE social_account_id = %s
+                """,
+                (account_id,),
             ).fetchone()["total_count"]
             or 0
         )
@@ -826,34 +1127,54 @@ def creator_candidate_detail(candidate_id: UUID, evidence_page: int = 1) -> dict
         evidence = conn.execute(
             """
             SELECT
-                evidence.id,
-                evidence.evidence_type,
-                evidence.created_at,
-                evidence.chat_id,
+                observation.id,
+                observation.extractor,
+                observation.created_at,
+                observation.last_observed_at,
+                observation.chat_id,
+                observation.message_id,
                 chat.name AS chat_name,
                 COALESCE(chat.chat_mode, 'group') AS chat_mode,
+                source.open_id AS source_open_id,
+                source.contact_id AS source_contact_id,
                 source.display_name AS source_display_name,
-                message.body_ciphertext,
+                source.tenant_classification AS source_tenant_classification,
+                authorization.display_name AS observed_by_display_name,
                 message.message_type,
                 message.message_create_time,
-                message.is_deleted
-            FROM creator_candidate_evidence evidence
-            LEFT JOIN chats chat ON chat.chat_id = evidence.chat_id
-            LEFT JOIN lark_identities source ON source.open_id = evidence.source_open_id
-            LEFT JOIN chat_messages message
-              ON message.chat_id = evidence.chat_id AND message.message_id = evidence.message_id
-            WHERE evidence.candidate_id = %s
-            ORDER BY evidence.created_at DESC, evidence.id DESC
+                message.is_deleted,
+                CASE
+                    WHEN authorization_chat.is_visible
+                     AND authorization.body_consent_at IS NOT NULL
+                     AND scope.observed_at >= authorization.body_consent_at
+                     AND NOT message.is_deleted
+                    THEN message.body_ciphertext
+                END AS body_ciphertext
+            FROM social_account_observations observation
+            JOIN chat_messages message
+              ON message.chat_id = observation.chat_id AND message.message_id = observation.message_id
+            JOIN chats chat ON chat.chat_id = observation.chat_id
+            JOIN authorizations authorization ON authorization.id = observation.observed_by_authorization_id
+            LEFT JOIN authorization_chats authorization_chat
+              ON authorization_chat.authorization_id = observation.observed_by_authorization_id
+             AND authorization_chat.chat_id = observation.chat_id
+            LEFT JOIN authorization_message_observations scope
+              ON scope.authorization_id = observation.observed_by_authorization_id
+             AND scope.chat_id = observation.chat_id
+             AND scope.message_id = observation.message_id
+            LEFT JOIN lark_identities source ON source.open_id = observation.source_open_id
+            WHERE observation.social_account_id = %s
+            ORDER BY observation.last_observed_at DESC, observation.id DESC
             LIMIT %s OFFSET %s
             """,
-            (candidate_id, evidence_limit, evidence_offset),
+            (account_id, evidence_limit, evidence_offset),
         ).fetchall()
 
     cipher = message_body_cipher(get_settings().token_encryption_key)
     return {
-        "candidate": _decorate_creator_candidate(candidate),
+        "account": _decorate_social_account(account),
         "evidence": _page_result(
-            [_decorate_candidate_evidence(row, cipher) for row in evidence],
+            [_decorate_account_observation(row, cipher) for row in evidence],
             evidence_page,
             DETAIL_PAGE_SIZE,
             total_count=evidence_total_count,
@@ -1029,16 +1350,16 @@ def record_message_view(viewer_id: UUID, target_authorization_id: UUID, chat_id:
         )
 
 
-def record_candidate_view(viewer_id: UUID, candidate_id: UUID) -> None:
-    """Audit a candidate evidence view without putting message text in the log."""
+def record_account_view(viewer_id: UUID, account_id: UUID) -> None:
+    """Audit a raw account-evidence view without putting message text in the log."""
 
     with connection() as conn, conn.transaction():
         conn.execute(
             """
             INSERT INTO audit_events (id, authorization_id, action, metadata)
-            VALUES (%s, %s, 'admin_creator_candidate_viewed', %s::jsonb)
+            VALUES (%s, %s, 'admin_social_account_viewed', %s::jsonb)
             """,
-            (uuid4(), viewer_id, json.dumps({"candidate_id": str(candidate_id)})),
+            (uuid4(), viewer_id, json.dumps({"social_account_id": str(account_id)})),
         )
 
 
@@ -1207,6 +1528,9 @@ def _decorate_job(row: dict[str, Any]) -> dict[str, Any]:
 
 def _decorate_creator(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
+    item["display_name"] = item.get("display_name") or "未命名达人"
+    item["identifier_count"] = int(item.get("identifier_count") or 0)
+    item["social_account_count"] = int(item.get("social_account_count") or 0)
     for field in ("created_at", "updated_at"):
         item[f"{field}_label"] = _format_time(item.get(field))
     return item
@@ -1226,37 +1550,70 @@ def _decorate_creator_identifier(row: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def _decorate_creator_candidate(row: dict[str, Any]) -> dict[str, Any]:
+def _decorate_contact(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
-    item["subject_label"] = item.get("subject_display_name") or "Lark 外部参与者（姓名未返回）"
-    item["creator_label"] = item.get("creator_display_name") or "尚未匹配达人库"
-    item["identifier_label"] = (
-        " · ".join(value for value in (item.get("platform"), item.get("display_value")) if value) or "未命名标识"
+    item["display_name"] = item.get("display_name") or "Lark 参与者（姓名未返回）"
+    item["tenant_classification_label"], item["tenant_classification_badge"] = _tenant_classification(
+        item.get("tenant_classification")
     )
-    item["status_label"], item["status_badge"] = _candidate_status(item.get("status"))
-    item["created_at_label"] = _format_time(item.get("created_at"))
-    item["updated_at_label"] = _format_time(item.get("updated_at"))
-    item["last_evidence_at_label"] = _format_time(item.get("last_evidence_at"))
+    for field in ("lark_identity_count", "conversation_count", "message_count", "account_count"):
+        item[field] = int(item.get(field) or 0)
+    for field in ("created_at", "updated_at", "last_seen_at"):
+        item[f"{field}_label"] = _format_time(item.get(field))
     return item
 
 
-def _decorate_candidate_evidence(row: dict[str, Any], cipher: TokenCipher) -> dict[str, Any]:
+def _decorate_lark_identity(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    item["display_name"] = item.get("display_name") or "姓名未返回"
+    item["tenant_classification_label"], item["tenant_classification_badge"] = _tenant_classification(
+        item.get("tenant_classification")
+    )
+    for field in ("first_seen_at", "last_seen_at"):
+        item[f"{field}_label"] = _format_time(item.get(field))
+    return item
+
+
+def _decorate_contact_conversation(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    item["chat_mode"] = item.get("chat_mode") or "group"
+    item["chat_mode_label"] = _chat_mode_label(item["chat_mode"])
+    item["name"] = _conversation_name(item.get("name"), item["chat_mode"], item.get("chat_id"))
+    item["member_count_label"] = "—" if item["chat_mode"] == "p2p" else str(int(item.get("member_count") or 0))
+    item["message_count"] = int(item.get("message_count") or 0)
+    item["contact_message_count"] = int(item.get("contact_message_count") or 0)
+    item["last_message_at_label"] = _format_time(item.get("last_message_at"))
+    return item
+
+
+def _decorate_social_account(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    item["identifier_label"] = " · ".join(
+        value for value in (item.get("platform"), item.get("display_handle")) if value
+    ) or "未命名账号"
+    item["owner_label"] = item.get("owner_display_name") or "尚未人工确认"
+    for field in ("observation_count", "source_count"):
+        item[field] = int(item.get(field) or 0)
+    for field in ("created_at", "updated_at", "last_observed_at"):
+        item[f"{field}_label"] = _format_time(item.get(field))
+    return item
+
+
+def _decorate_account_observation(row: dict[str, Any], cipher: TokenCipher) -> dict[str, Any]:
     item = dict(row)
     item["chat_mode"] = item.get("chat_mode") or "group"
     item["chat_name"] = _conversation_name(item.get("chat_name"), item["chat_mode"], item.get("chat_id"))
-    item["source_label"] = item.get("source_display_name") or "会话参与者"
-    item["evidence_type_label"] = {
-        "message": "消息规则",
-        "member": "群成员快照",
-        "p2p": "私聊对端",
-        "crm": "CRM",
-        "manual": "人工录入",
-    }.get(item.get("evidence_type"), "识别证据")
+    item["source_label"] = item.get("source_display_name") or "Lark 参与者（姓名未返回）"
+    item["source_tenant_label"], item["source_tenant_badge"] = _tenant_classification(
+        item.get("source_tenant_classification")
+    )
+    item["extractor_label"] = item.get("extractor") or "消息规则"
     item["created_at_label"] = _message_time(item.get("message_create_time") or item.get("created_at"))
+    item["last_observed_at_label"] = _format_time(item.get("last_observed_at"))
     if item.get("is_deleted"):
         item["content"] = "（该消息已删除）"
     elif not item.get("body_ciphertext"):
-        item["content"] = "（消息正文未保存）"
+        item["content"] = "（消息正文不在当前可读取范围）"
     else:
         try:
             body = cipher.decrypt(item["body_ciphertext"])
@@ -1414,14 +1771,13 @@ def _chat_mode_label(value: str | None) -> str:
     return "群聊"
 
 
-def _candidate_status(value: str | None) -> tuple[str, str]:
+def _tenant_classification(value: str | None) -> tuple[str, str]:
     mapping = {
-        "pending": ("待核验", "warning"),
-        "confirmed": ("已确认", "success"),
-        "rejected": ("已排除", "secondary"),
-        "conflict": ("存在冲突", "danger"),
+        "internal": ("公司成员", "primary"),
+        "known_external": ("外部成员", "success"),
+        "unresolved": ("租户未返回", "secondary"),
     }
-    return mapping.get(value or "", ("状态未知", "secondary"))
+    return mapping.get(value or "", ("租户状态未知", "secondary"))
 
 
 def _member_count(count: int | None, status: str | None) -> str:

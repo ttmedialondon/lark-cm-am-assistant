@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}{{ contact.display_name }} · 外部联系人{% endblock %}
+{% block body %}
+<div class="page">
+  {% include "admin/_nav.html" %}
+  <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
+    <div class="d-flex align-items-center mb-3"><div><h2 class="page-title">{{ contact.display_name }}</h2><div class="text-secondary">稳定 Lark 身份 · {{ contact.open_id }}</div></div><a class="btn btn-outline-secondary ms-auto" href="/admin/contacts?page={{ source_page }}">返回外部联系人</a></div>
+    <div class="alert alert-info">以下是此 Lark 联系人的会话事实和账号出现记录。账号出现不等于该联系人拥有、运营或代表该账号。</div>
+    <div class="card mb-4">
+      <div class="card-header"><h3 class="card-title">稳定身份</h3></div>
+      <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>名称</th><th>Lark Open ID</th><th>租户</th><th>首次发现</th><th>最近活动</th></tr></thead>
+        <tbody>{% for identity in identities %}<tr><td>{{ identity.display_name }}</td><td><code>{{ identity.open_id }}</code></td><td><span class="badge bg-{{ identity.tenant_classification_badge }}-lt">{{ identity.tenant_classification_label }}</span></td><td>{{ identity.first_seen_at_label }}</td><td>{{ identity.last_seen_at_label }}</td></tr>{% endfor %}</tbody>
+      </table></div>
+    </div>
+    <div class="card mb-4">
+      <div class="card-header"><div><h3 class="card-title mb-1">相关会话</h3><div class="text-secondary small">仅展示会话元数据和统计，不在此页读取消息正文。</div></div></div>
+      {% if conversations %}
+      <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>会话</th><th>类型</th><th>群成员</th><th>会话消息</th><th>该联系人发送</th><th>最近消息</th></tr></thead>
+        <tbody>{% for conversation in conversations %}<tr><td>{{ conversation.name }}</td><td>{{ conversation.chat_mode_label }}</td><td>{{ conversation.member_count_label }}</td><td>{{ conversation.message_count }}</td><td>{{ conversation.contact_message_count }}</td><td class="text-secondary">{{ conversation.last_message_at_label }}</td></tr>{% endfor %}</tbody>
+      </table></div>
+      {% with pager=conversation_page %}{% include "admin/_pagination.html" %}{% endwith %}
+      {% else %}<div class="card-body text-secondary">暂未在同步数据中找到相关会话。</div>{% endif %}
+    </div>
+    <div class="card">
+      <div class="card-header"><div><h3 class="card-title mb-1">由此联系人发出的账号出现记录</h3><div class="text-secondary small">用于后续人工核验；不建立账号归属关系。</div></div></div>
+      {% if accounts %}
+      <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>账号</th><th>出现次数</th><th>最近出现</th><th></th></tr></thead>
+        <tbody>{% for account in accounts %}<tr><td>{{ account.identifier_label }}</td><td>{{ account.observation_count }}</td><td class="text-secondary">{{ account.last_observed_at_label }}</td><td class="text-end"><a class="btn btn-sm btn-outline-primary" href="/admin/accounts/{{ account.id }}">查看证据</a></td></tr>{% endfor %}</tbody>
+      </table></div>
+      {% with pager=account_page %}{% include "admin/_pagination.html" %}{% endwith %}
+      {% else %}<div class="card-body text-secondary">该联系人尚未发出被规则记录的平台账号。</div>{% endif %}
+    </div>
+  </div></div></div>
+</div>
+{% endblock %}

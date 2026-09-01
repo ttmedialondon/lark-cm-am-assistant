@@ -369,49 +369,119 @@ def create_admin_router(
         assert access_context is not None
         return render_creators(request, access_context, page=page)
 
-    @router.get("/admin/candidates")
-    def admin_creator_candidates(request: Request, page: int = 1) -> Response:
+    @router.get("/admin/contacts")
+    def admin_contacts(request: Request, page: int = 1) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        candidate_page = admin_reporting.creator_candidates(page)
+        contact_page = admin_reporting.contacts(page)
         response = render_template(
             request,
-            "admin/candidates.html",
+            "admin/contacts.html",
             {
-                **page_context(access_context, "candidates"),
-                "candidates": candidate_page["items"],
-                "candidate_page": pagination(candidate_page, "/admin/candidates"),
+                **page_context(access_context, "contacts"),
+                "contacts": contact_page["items"],
+                "contact_page": pagination(contact_page, "/admin/contacts"),
             },
         )
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 
-    @router.get("/admin/candidates/{candidate_id}")
-    def admin_creator_candidate_detail(request: Request, candidate_id: UUID, evidence_page: int = 1) -> Response:
+    @router.get("/admin/contacts/{open_id}")
+    def admin_contact_detail(
+        request: Request,
+        open_id: str,
+        page: int = 1,
+        conversations_page: int = 1,
+        accounts_page: int = 1,
+    ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        detail = admin_reporting.creator_candidate_detail(candidate_id, evidence_page)
+        detail = admin_reporting.contact_detail(open_id, conversations_page, accounts_page)
         if not detail:
             return render_template(
                 request,
                 "error.html",
-                {"title": "未找到识别候选", "detail": "该候选可能尚未生成，或已被删除。"},
+                {"title": "未找到 Lark 参与者", "detail": "该参与者尚未被同步，或不在外部联系人目录中。"},
                 404,
             )
-        admin_reporting.record_candidate_view(access_context["authorization"]["id"], candidate_id)
+        conversations = detail["conversations"]
+        accounts = detail["accounts"]
+        response = render_template(
+            request,
+            "admin/contact_detail.html",
+            {
+                **page_context(access_context, "contacts"),
+                "contact": detail["contact"],
+                "identities": detail["identities"],
+                "source_page": page,
+                "conversations": conversations["items"],
+                "conversation_page": pagination(
+                    conversations,
+                    f"/admin/contacts/{open_id}",
+                    page_name="conversations_page",
+                    page=page,
+                    accounts_page=accounts["page"],
+                ),
+                "accounts": accounts["items"],
+                "account_page": pagination(
+                    accounts,
+                    f"/admin/contacts/{open_id}",
+                    page_name="accounts_page",
+                    page=page,
+                    conversations_page=conversations["page"],
+                ),
+            },
+        )
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
+    @router.get("/admin/accounts")
+    def admin_accounts(request: Request, page: int = 1) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        account_page = admin_reporting.accounts(page)
+        response = render_template(
+            request,
+            "admin/accounts.html",
+            {
+                **page_context(access_context, "accounts"),
+                "accounts": account_page["items"],
+                "account_page": pagination(account_page, "/admin/accounts"),
+            },
+        )
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
+    @router.get("/admin/accounts/{account_id}")
+    def admin_account_detail(request: Request, account_id: UUID, evidence_page: int = 1) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        detail = admin_reporting.account_detail(account_id, evidence_page)
+        if not detail:
+            return render_template(
+                request,
+                "error.html",
+                {"title": "未找到账号记录", "detail": "该账号尚未被规则记录，或已被删除。"},
+                404,
+            )
+        admin_reporting.record_account_view(access_context["authorization"]["id"], account_id)
         evidence = detail["evidence"]
         response = render_template(
             request,
-            "admin/candidate_detail.html",
+            "admin/account_detail.html",
             {
-                **page_context(access_context, "candidates"),
-                "candidate": detail["candidate"],
+                **page_context(access_context, "accounts"),
+                "account": detail["account"],
                 "evidence": evidence["items"],
-                "evidence_page": pagination(evidence, f"/admin/candidates/{candidate_id}", page_name="evidence_page"),
+                "evidence_page": pagination(evidence, f"/admin/accounts/{account_id}", page_name="evidence_page"),
             },
         )
         response.headers["Cache-Control"] = "no-store, max-age=0"

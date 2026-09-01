@@ -4,7 +4,7 @@
 <div class="page admin-directory">
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl admin-directory__container">
-    <div class="alert alert-info">这是人工维护的达人身份库。规则生成的账号候选不会自动确认；请在<a class="alert-link" href="/admin/candidates">识别候选</a>中先核验其消息证据。</div>
+    <div class="alert alert-info">这是人工确认的达人主档。账号出现记录只表示消息中出现过该账号，不会自动确认任何人或账号的归属。</div>
     {% if form_error %}<div class="alert alert-danger" role="alert">{{ form_error }}</div>{% endif %}
     <div class="card mb-4"><div class="card-body">
       <form action="/admin/creators" method="post" class="row g-3 align-items-end">
@@ -14,12 +14,12 @@
       </form>
     </div></div>
     <div class="card admin-directory__card">
-      <div class="card-header"><h3 class="card-title">达人身份库</h3></div>
+      <div class="card-header"><h3 class="card-title">达人主档</h3></div>
       {% if creators %}
       <div class="table-responsive admin-directory__table"><table class="table table-vcenter card-table">
-        <thead><tr><th>达人</th><th>身份标识</th><th>候选</th><th>最后更新</th><th></th></tr></thead>
+        <thead><tr><th>达人</th><th>已确认标识</th><th>其中平台账号</th><th>最后更新</th><th></th></tr></thead>
         <tbody>{% for creator in creators %}<tr>
-          <td>{{ creator.display_name }}</td><td>{{ creator.identifier_count }}</td><td>{{ creator.pending_candidate_count }} 待处理 / {{ creator.candidate_count }} 总计</td><td>{{ creator.updated_at_label }}</td>
+          <td>{{ creator.display_name }}</td><td>{{ creator.identifier_count }}</td><td>{{ creator.social_account_count }}</td><td>{{ creator.updated_at_label }}</td>
           <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="/admin/creators/{{ creator.id }}">查看</a></td>
         </tr>{% endfor %}</tbody>
       </table></div>

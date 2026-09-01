@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}外部联系人 · 管理台{% endblock %}
+{% block body %}
+<div class="page admin-directory">
+  {% include "admin/_nav.html" %}
+  <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl admin-directory__container">
+    <div class="alert alert-info">此目录按稳定 Lark 身份聚合已同步到的非公司成员。它只展示可验证的会话、消息和账号出现事实；不会推定对方是达人、经纪人或账号所有者。</div>
+    <div class="card admin-directory__card">
+      <div class="card-header"><div><h3 class="card-title mb-1">外部联系人</h3><div class="text-secondary small">“租户未返回”表示 Lark 只返回了稳定用户 ID，尚不能判断其所属企业。</div></div></div>
+      {% if contacts %}
+      <div class="table-responsive admin-directory__table"><table class="table table-vcenter card-table">
+        <thead><tr><th>参与者</th><th>租户</th><th>会话</th><th>发送消息</th><th>账号出现</th><th>最近活动</th><th></th></tr></thead>
+        <tbody>{% for contact in contacts %}<tr>
+          <td><div>{{ contact.display_name }}</div>{% if contact.lark_identity_count > 1 %}<div class="text-secondary small">{{ contact.lark_identity_count }} 个稳定 Lark 身份</div>{% endif %}</td>
+          <td><span class="badge bg-{{ contact.tenant_classification_badge }}-lt">{{ contact.tenant_classification_label }}</span></td>
+          <td>{{ contact.conversation_count }}</td><td>{{ contact.message_count }}</td><td>{{ contact.account_count }}</td>
+          <td class="text-secondary text-nowrap">{{ contact.last_seen_at_label }}</td>
+          <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="/admin/contacts/{{ contact.open_id }}?page={{ contact_page.page }}">查看</a></td>
+        </tr>{% endfor %}</tbody>
+      </table></div>
+      {% with pager=contact_page %}{% include "admin/_pagination.html" %}{% endwith %}
+      {% else %}<div class="card-body text-secondary">尚未同步到外部联系人。首次回填或成员快照完成后会显示在这里。</div>{% endif %}
+    </div>
+  </div></div></div>
+</div>
+{% endblock %}
