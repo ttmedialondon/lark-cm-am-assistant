@@ -63,7 +63,7 @@ class LarkChatMemberTotal:
 
 
 class LarkClient:
-    """Uses user tokens only for group discovery and group message listing."""
+    """Uses user tokens only for the authorised user's conversation discovery and history."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -116,7 +116,9 @@ class LarkClient:
             avatar_url=_string(data.get("avatar_url")),
         )
 
-    def list_group_chats(self, access_token: str, page_token: str | None = None) -> dict[str, Any]:
+    def list_chats(
+        self, access_token: str, page_token: str | None = None, *, types: str | None = None
+    ) -> dict[str, Any]:
         params: dict[str, str | int] = {
             "user_id_type": "open_id",
             # Create-time ordering is stable while new messages change active time.
@@ -125,7 +127,8 @@ class LarkClient:
         }
         if page_token:
             params["page_token"] = page_token
-        # `types` is intentionally omitted. Lark defaults to group chats; P2P is out of scope.
+        if types:
+            params["types"] = types
         return self._request(
             "GET",
             f"{self.settings.lark_api_base_url}/open-apis/im/v1/chats",

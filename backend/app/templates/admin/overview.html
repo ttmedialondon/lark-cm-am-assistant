@@ -1,12 +1,12 @@
 {% extends "base.html" %}
-{% block title %}管理台概览 · Lark Message Stats{% endblock %}
+{% block title %}管理台概览 · Lark CM/AM Assistant{% endblock %}
 {% block body %}
 <div class="page">
   {% include "admin/_nav.html" %}
   <div class="page-wrapper">
     <div class="page-body pt-0">
       <div class="container-xl">
-        <div class="alert alert-info" role="status">管理台当前为只读：展示公司范围内的授权、群聊关系和同步状态；不展示 OAuth 令牌、应用密钥或消息正文。</div>
+        <div class="alert alert-info" role="status">管理台展示公司范围内的授权、会话关系和同步状态；OAuth 令牌与应用密钥始终不展示。消息正文仅限所有者在“消息内容”页面按人员授权范围查看。</div>
         <div class="row row-deck row-cards">
           {% for metric in metrics %}
           <div class="col-sm-6 col-lg-4">
@@ -25,12 +25,12 @@
               <div class="card-header"><h3 class="card-title">需要关注的授权或同步</h3></div>
               {% if attention %}
               <div class="table-responsive"><table class="table table-vcenter card-table">
-                <thead><tr><th>人员</th><th>授权</th><th>群聊</th><th>待处理</th><th>最近同步</th></tr></thead>
+                <thead><tr><th>人员</th><th>授权</th><th>群聊</th><th>私聊</th><th>待处理</th><th>最近同步</th></tr></thead>
                 <tbody>{% for item in attention %}<tr>
                   <td><a href="/admin/users/{{ item.id }}">{{ item.display_name }}</a></td>
                   <td><span class="badge bg-{{ item.authorization_status_badge }}-lt">{{ item.authorization_status_label }}</span></td>
-                  <td>{{ item.group_count }}</td>
-                  <td>{{ item.pending_group_count }}</td>
+                  <td>{{ item.group_count }}</td><td>{{ item.p2p_count }}</td>
+                  <td>{{ item.pending_conversation_count }}</td>
                   <td class="text-secondary text-nowrap">{{ item.last_synced_at_label }}</td>
                 </tr>{% endfor %}</tbody>
               </table></div>

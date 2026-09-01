@@ -4,7 +4,7 @@ Internal system for managing CM/AM night-time Lark messages, generating auditabl
 
 ## Current status
 
-- `backend/` contains the deployed v0.1 message-statistics prototype as the migration baseline.
+- `backend/` contains the deployed FastAPI service for authorised CM/AM conversation sync and the owner-only content console.
 - `docs/architecture/TDD_v2.0.md` defines the approved target architecture; it remains a technical-review draft until its P0 governance decisions are closed.
 - No customer-facing or automatic message sending is included.
 
@@ -19,7 +19,7 @@ Internal system for managing CM/AM night-time Lark messages, generating auditabl
 
 1. GitHub is the sole source of truth; production servers deploy a reviewed release and are never edited directly.
 2. Secrets, tokens, customer messages, production exports, and backups must never be committed.
-3. The production message-body and AI features stay disabled until the required consent, data-governance, and security decisions are implemented.
+3. Message bodies are collected only after the revised OAuth agreement, encrypted at rest, excluded from logs, and visible only to the designated owner through the audited admin page. AI remains disabled.
 
 ## Getting started
 

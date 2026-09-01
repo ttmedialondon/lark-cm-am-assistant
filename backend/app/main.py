@@ -148,8 +148,9 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 id, open_id, union_id, display_name, avatar_url,
                 access_token_ciphertext, refresh_token_ciphertext,
                 access_token_expires_at, refresh_token_expires_at, scopes,
-                status, last_error, authorized_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', NULL, NOW(), NOW())
+                status, last_error, body_consent_at, p2p_discovery_status,
+                authorized_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', NULL, NOW(), 'pending', NOW(), NOW())
             ON CONFLICT (open_id) DO UPDATE SET
                 union_id = EXCLUDED.union_id,
                 display_name = EXCLUDED.display_name,
@@ -161,6 +162,10 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 scopes = EXCLUDED.scopes,
                 status = 'active',
                 last_error = NULL,
+                body_consent_at = NOW(),
+                p2p_discovery_status = 'pending',
+                p2p_last_checked_at = NULL,
+                p2p_last_error = NULL,
                 updated_at = NOW()
             RETURNING id
             """,
@@ -178,7 +183,8 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
             ),
         ).fetchone()
         authorization_id = row["id"]
-        # A re-authorization is the explicit opportunity to retry any group that was previously unreadable.
+        # A re-authorization is the explicit opportunity to retry unreadable
+        # conversations and collect content under the revised agreement.
         conn.execute(
             """
             UPDATE authorization_chats
@@ -235,6 +241,7 @@ def dashboard(request: Request):
             "admin_role": admin_role_for(authorization["id"]),
             "stats": stats,
             "chats": chats,
+            "body_consent": bool(authorization["body_consent_at"]),
             "csrf_token": _csrf_token(request),
         },
     )
@@ -256,13 +263,17 @@ def dashboard_chats(request: Request):
     return _template(
         request,
         "partials/chats.html",
-        {"chats": _dashboard_chats(authorization["id"]), "csrf_token": _csrf_token(request)},
+        {
+            "chats": _dashboard_chats(authorization["id"]),
+            "body_consent": bool(authorization["body_consent_at"]),
+            "csrf_token": _csrf_token(request),
+        },
     )
 
 
 @app.post("/dashboard/chats/{chat_id}/sync-all")
-def request_group_full_sync(request: Request, chat_id: str):
-    """Queue a safe, idempotent full-history rescan for one visible group."""
+def request_conversation_full_sync(request: Request, chat_id: str):
+    """Queue a safe, idempotent full-history rescan for one visible conversation."""
 
     authorization = _current_authorization(request)
     if not authorization:
@@ -285,11 +296,11 @@ def request_group_full_sync(request: Request, chat_id: str):
             (authorization["id"], chat_id),
         ).fetchone()
         if not chat:
-            raise HTTPException(status_code=404, detail="group not found")
+            raise HTTPException(status_code=404, detail="conversation not found")
 
-        group_name = chat["name"] or "该群聊"
+        chat_name = chat["name"] or "该会话"
         if chat["manual_backfill_requested_at"]:
-            notice = f"{group_name} 已在全量同步队列中。"
+            notice = f"{chat_name} 已在全量同步队列中。"
         else:
             conn.execute(
                 """
@@ -301,8 +312,8 @@ def request_group_full_sync(request: Request, chat_id: str):
                 """,
                 (authorization["id"], chat_id),
             )
-            _audit(conn, authorization["id"], "manual_group_backfill_requested")
-            notice = f"已请求重新同步 {group_name} 的全部可读取历史。已有消息会按消息 ID 去重，不会重复计数。"
+            _audit(conn, authorization["id"], "manual_conversation_backfill_requested")
+            notice = f"已请求重新同步 {chat_name} 的全部可读取历史。已有消息会按消息 ID 去重，不会重复计数。"
 
         _queue_or_wake_backfill(conn, authorization["id"])
 
@@ -311,6 +322,7 @@ def request_group_full_sync(request: Request, chat_id: str):
         "partials/chats.html",
         {
             "chats": _dashboard_chats(authorization["id"]),
+            "body_consent": bool(authorization["body_consent_at"]),
             "csrf_token": _csrf_token(request),
             "sync_notice": notice,
         },
@@ -324,7 +336,8 @@ def _current_authorization(request: Request) -> dict[str, Any] | None:
     with connection() as conn, conn.transaction():
         row = conn.execute(
             """
-            SELECT a.id, a.open_id, a.display_name, a.status, a.last_error
+            SELECT a.id, a.open_id, a.display_name, a.status, a.last_error,
+                   a.body_consent_at, a.p2p_discovery_status, a.p2p_last_error
             FROM web_sessions s
             JOIN authorizations a ON a.id = s.authorization_id
             WHERE s.session_hash = %s AND s.expires_at > NOW()
@@ -362,7 +375,14 @@ def _dashboard_stats(authorization_id: uuid.UUID) -> dict[str, Any]:
                    FROM authorization_chats AS access
                    JOIN chats AS c ON c.chat_id = access.chat_id
                   WHERE access.authorization_id = %s AND access.is_visible
-                        AND COALESCE(c.chat_status, 'normal') = 'normal') AS group_count,
+                        AND COALESCE(c.chat_status, 'normal') = 'normal'
+                        AND COALESCE(c.chat_mode, 'group') = 'group') AS group_count,
+                (SELECT COUNT(*)
+                   FROM authorization_chats AS access
+                   JOIN chats AS c ON c.chat_id = access.chat_id
+                  WHERE access.authorization_id = %s AND access.is_visible
+                        AND COALESCE(c.chat_status, 'normal') = 'normal'
+                        AND c.chat_mode = 'p2p') AS p2p_count,
                 (SELECT COUNT(*)
                    FROM authorization_message_observations AS observation
                    JOIN authorization_chats AS access
@@ -386,9 +406,12 @@ def _dashboard_stats(authorization_id: uuid.UUID) -> dict[str, Any]:
                         AND COALESCE(c.chat_status, 'normal') = 'normal'
                         AND observation.sent_by_author AND NOT message.is_deleted) AS own_message_count,
                 (SELECT MAX(COALESCE(access.last_incremental_at, access.last_backfill_at))
-                   FROM authorization_chats AS access WHERE access.authorization_id = %s) AS last_synced_at
+                   FROM authorization_chats AS access
+                   JOIN chats AS c ON c.chat_id = access.chat_id
+                  WHERE access.authorization_id = %s AND access.is_visible
+                    AND COALESCE(c.chat_status, 'normal') = 'normal') AS last_synced_at
             """,
-            (authorization_id, authorization_id, authorization_id, authorization_id),
+            (authorization_id, authorization_id, authorization_id, authorization_id, authorization_id),
         ).fetchone()
         job = conn.execute(
             """
@@ -403,6 +426,7 @@ def _dashboard_stats(authorization_id: uuid.UUID) -> dict[str, Any]:
     status, detail, badge = _job_status(job)
     return {
         "group_count": int(counts["group_count"] or 0),
+        "p2p_count": int(counts["p2p_count"] or 0),
         "message_count": int(counts["message_count"] or 0),
         "own_message_count": int(counts["own_message_count"] or 0),
         "last_synced_at": _format_time(counts["last_synced_at"]),
@@ -421,6 +445,7 @@ def _dashboard_chats(authorization_id: uuid.UUID) -> list[dict[str, Any]]:
                 access.chat_id,
                 c.name,
                 c.external,
+                c.chat_mode,
                 access.member_count,
                 access.member_count_status,
                 access.sync_status,
@@ -440,7 +465,7 @@ def _dashboard_chats(authorization_id: uuid.UUID) -> list[dict[str, Any]]:
               AND access.is_visible
               AND COALESCE(c.chat_status, 'normal') = 'normal'
             GROUP BY
-                access.authorization_id, access.chat_id, c.name, c.external, access.member_count,
+                access.authorization_id, access.chat_id, c.name, c.external, c.chat_mode, access.member_count,
                 access.member_count_status, access.sync_status, access.last_error,
                 access.last_backfill_at, access.last_incremental_at,
                 access.manual_backfill_requested_at, access.manual_backfill_started_at
@@ -455,9 +480,14 @@ def _dashboard_chats(authorization_id: uuid.UUID) -> list[dict[str, Any]]:
         chats.append(
             {
                 "chat_id": row["chat_id"],
-                "name": row["name"] or "未命名群聊",
+                "name": row["name"]
+                or (f"未命名私聊 · {row['chat_id'][-8:]}" if row["chat_mode"] == "p2p" else "未命名群聊"),
                 "external": bool(row["external"]),
-                "member_count": _member_count_label(row["member_count"], row["member_count_status"]),
+                "chat_mode": row["chat_mode"] or "group",
+                "chat_mode_label": "私聊" if row["chat_mode"] == "p2p" else "群聊",
+                "member_count": "—"
+                if row["chat_mode"] == "p2p"
+                else _member_count_label(row["member_count"], row["member_count_status"]),
                 "message_count": int(row["message_count"] or 0),
                 "sync_label": sync_label,
                 "sync_badge": sync_badge,
@@ -472,9 +502,9 @@ def _dashboard_chats(authorization_id: uuid.UUID) -> list[dict[str, Any]]:
 
 def _job_status(job: dict[str, Any] | None) -> tuple[str, str, str]:
     if not job:
-        return "等待首次同步", "授权完成后，后台服务会自动枚举你当前可见的群聊。", "secondary"
+        return "等待首次同步", "授权完成后，后台服务会自动枚举你当前可见的会话。", "secondary"
     if job["status"] in {"queued", "running"}:
-        return "正在同步", "正在枚举群聊并按页统计消息；刷新页面不会重复计数。", "primary"
+        return "正在同步", "正在枚举会话并按页同步消息；刷新页面不会重复计数。", "primary"
     if job["status"] == "succeeded":
         return "同步完成", "后台会按固定间隔继续增量统计新消息。", "success"
     if job["status"] == "attention_required":

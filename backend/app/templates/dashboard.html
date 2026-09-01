@@ -1,10 +1,10 @@
 {% extends "base.html" %}
-{% block title %}我的统计 · Lark Message Stats{% endblock %}
+{% block title %}我的会话 · Lark CM/AM Assistant{% endblock %}
 {% block body %}
 <div class="page">
   <header class="navbar navbar-expand-md d-print-none">
     <div class="container-xl">
-      <a class="navbar-brand" href="/">Lark Message Stats</a>
+      <a class="navbar-brand" href="/">Lark CM/AM Assistant</a>
       <div class="navbar-nav flex-row order-md-last">
         {% if admin_role %}<div class="nav-item"><a class="nav-link" href="/admin">管理台</a></div>{% endif %}
         <div class="nav-item"><span class="nav-link text-secondary">{{ authorization.display_name or "CM / AM" }}</span></div>
@@ -16,8 +16,8 @@
       <div class="container-xl">
         <div class="row g-2 align-items-center">
           <div class="col">
-            <h2 class="page-title">我的群聊消息统计</h2>
-            <div class="text-secondary mt-1">只展示你授权范围内、当前可见的群聊统计。页面每 5 秒更新一次。</div>
+            <h2 class="page-title">我的会话同步</h2>
+            <div class="text-secondary mt-1">只展示你授权范围内、当前可见的群聊与私聊。页面每 5 秒更新一次。</div>
           </div>
         </div>
       </div>
@@ -26,10 +26,17 @@
       <div class="container-xl">
         {% include "partials/stats.html" %}
         {% include "partials/chats.html" %}
+        {% if not body_consent %}
+        <div class="alert alert-info mt-4">你此前的授权仅用于统计。若要启用群聊/私聊正文同步，请 <a href="/auth/lark/start" class="alert-link">重新使用 Lark 授权</a>。</div>
+        {% elif authorization.p2p_discovery_status == 'unavailable' %}
+        <div class="alert alert-warning mt-4">Lark 当前未返回你的私聊列表；群聊仍会继续同步。</div>
+        {% elif authorization.p2p_discovery_status == 'attention_required' %}
+        <div class="alert alert-warning mt-4">私聊读取需要重新授权后再试；群聊仍会继续同步。</div>
+        {% endif %}
         <div class="card mt-4">
           <div class="card-body">
             <h3 class="card-title">数据说明</h3>
-            <p class="text-secondary mb-0">“已同步消息总数”仅统计 Lark API 可返回且未撤回的群消息记录。“我发送的消息数”仅在 Lark 返回的发送者 Open ID 与当前授权用户一致时计入。成员人数只保留 Lark 返回的总数。测试版不保存消息正文、附件或成员名单。</p>
+            <p class="text-secondary mb-0">“已同步消息总数”仅统计 Lark API 可返回且未撤回的会话消息。“我发送的消息数”仅在 Lark 返回的发送者 Open ID 与当前授权用户一致时计入。群聊成员人数只保留 Lark 返回的总数；私聊没有成员人数。完成新版授权后，服务会加密保存消息正文，不保存附件二进制或成员名单。</p>
           </div>
         </div>
       </div>

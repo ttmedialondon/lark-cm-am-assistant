@@ -1,18 +1,18 @@
-# Message Stats MVP 部署手册
+# Lark CM/AM Assistant 部署手册
 
-本手册部署的是群聊统计 MVP：Lark OAuth、可见群列表、群内人类成员总数和已同步消息记录数。它不保存消息正文、成员名单或附件。
+本手册部署 Lark OAuth、授权用户可见的群聊/私聊、加密消息正文和 owner 专用消息管理台。不保存附件二进制或成员名单。
 
 ## 先决条件
 
 - Hetzner 主机已有 PostgreSQL、Caddy、`larkstats` 系统用户、`/etc/lark-message-stats/app.env` 和 Python 虚拟环境。
 - 仓库位于 `/opt/lark-message-stats`，虚拟环境位于 `/opt/lark-message-stats/venv`。
 - `app.env` 不进入 Git，且权限保持为 `root:larkstats` / `0640`。
-- Lark 应用已启用消息统计所需的用户权限：`offline_access`、`im:chat:read`、`im:message:readonly`。`im:chat.members:read` 仅在需要展示成员总数时额外启用。
+- Lark 应用已启用消息同步所需的用户权限：`offline_access`、`im:chat:read`、`im:message:readonly`。`im:chat.members:read` 仅在需要展示成员总数时额外启用。
 - Lark OAuth 回调地址为 `https://larkbot.ttapp.help/auth/lark/callback`；服务器公网出口 IP 已在应用白名单中。
 
 ## 发布步骤
 
-在服务器上执行。命令不会打印 App Secret 或 OAuth Token。`004_normalize_chats_and_admin.sql` 会规范化群和消息表，因此发布该版本前必须短暂停止 Web/Worker 并完成数据库备份。
+在服务器上执行。命令不会打印 App Secret、OAuth Token 或消息正文。`005_message_bodies_and_p2p.sql` 为现有规范化表增加正文加密与 P2P 状态字段，因此发布前必须短暂停止 Web/Worker 并完成数据库备份。
 
 ```bash
 cd /opt/lark-message-stats
@@ -36,7 +36,7 @@ sudo systemctl --no-pager --full status lark-message-stats-web.service lark-mess
 curl --fail --silent --show-error https://larkbot.ttapp.help/healthz
 ```
 
-在第一次启用成员人数功能时，`app.env` 的 `LARK_OAUTH_SCOPES` 还必须包含 `im:chat.members:read`；保留既有 scope，不要覆盖 App Secret 或加密密钥。
+在第一次启用成员人数功能时，`app.env` 的 `LARK_OAUTH_SCOPES` 还必须包含 `im:chat.members:read`；保留既有 scope，不要覆盖 App Secret 或加密密钥。正文与 P2P 已用当前 `im:message:readonly` 完成真实 user-token 预检，不需要为了本版本替换为更宽泛的 scope。
 
 预期健康检查返回 `{"status":"ok","database":"ok",...}`。若服务未启动，先查看不含消息正文的 systemd 日志：
 
@@ -46,11 +46,12 @@ sudo journalctl -u lark-message-stats-web.service -u lark-message-stats-worker.s
 
 ## Lark 权限与验收
 
-1. 测试 CM/AM 打开 `https://larkbot.ttapp.help/` 并完成 OAuth。
-2. 回到仪表盘。群列表通常会先出现，随后每群的“已同步消息记录”和同步状态持续更新。
-3. 需要重新核对一个群的历史时，点击该行的“同步全部历史”。页面会显示“已请求同步”或“正在主动同步”；Worker 串行重新扫描 Lark API 可返回的历史，已有消息 ID 自动去重。
+1. 已有 CM/AM 必须打开 `https://larkbot.ttapp.help/` 并重新完成 OAuth；这是正文和 P2P 采集的明确授权边界。
+2. 回到仪表盘。会话列表通常会先出现，随后每个会话的“已同步消息记录”和同步状态持续更新。
+3. 需要重新核对一个会话的历史时，点击该行的“同步全部历史”。页面会显示“已请求同步”或“正在主动同步”；Worker 串行重新扫描 Lark API 可返回的历史，已有消息 ID 自动去重。
 4. 若管理员启用成员人数功能，需在 Lark 开发者后台发布 `im:chat.members:read`，并让测试用户重新 OAuth；成员人数来自 Lark 的 `user_total`。未启用时显示“Lark 未返回”，但不会阻塞消息统计。
+5. owner 重新登录后进入 `https://larkbot.ttapp.help/admin/messages`，选择 CM/AM 和会话，确认仅在新版授权后的回填完成后出现正文。不要在终端、日志或 Git 中输出正文。
 
 ## 回退原则
 
-先停止发布并保留数据库。不得通过删除数据库或令牌来“回退”。`004_normalize_chats_and_admin.sql` 会替换旧的 `message_ledger`，因此不能在已迁移数据库上直接启动旧版代码。若新版本异常，停止服务、恢复发布前的 PostgreSQL 备份，再恢复上一个已验证的 Git 提交和对应 systemd 单元。
+先停止发布并保留数据库。不得通过删除数据库或令牌来“回退”。本版本的迁移是 additive；若新版本异常，停止服务、恢复发布前的 PostgreSQL 备份，再恢复上一个已验证的 Git 提交和对应 systemd 单元。

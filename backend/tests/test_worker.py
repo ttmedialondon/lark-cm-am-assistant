@@ -1,6 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
-from app.worker import _is_author_message, _lark_time, _member_count_refresh_due
+from app.worker import _body_content, _is_author_message, _lark_time, _member_count_refresh_due
 
 
 def test_author_message_requires_open_id_semantics() -> None:
@@ -21,3 +21,8 @@ def test_member_count_refresh_is_due_only_when_missing_or_stale() -> None:
     assert _member_count_refresh_due(None, now, 86400)
     assert not _member_count_refresh_due(now - timedelta(hours=23), now, 86400)
     assert _member_count_refresh_due(now - timedelta(hours=24), now, 86400)
+
+
+def test_message_body_content_is_kept_as_the_lark_payload() -> None:
+    assert _body_content({"body": {"content": '{"text":"hello"}'}}) == '{"text":"hello"}'
+    assert _body_content({"body": {}}) is None

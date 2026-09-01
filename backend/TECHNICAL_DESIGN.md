@@ -1,94 +1,70 @@
-# Lark Message Stats：测试版技术说明
+# Lark CM/AM Assistant：当前实现说明
 
-状态：已部署；Lark App Secret 已完成服务器端安全配置，等待真实 CM/AM 对当前 Python 版本完成 OAuth 与消息统计端到端验收。  
 入口：`https://larkbot.ttapp.help/`
 
-## 范围
+## 当前范围
 
-- 仅群聊；不包含 P2P 单聊。
-- 每个 CM/AM 通过 Lark OAuth 授权后，只统计该用户当前可见的群。
-- 默认历史范围为 Lark API 可返回的全部历史（`SYNC_LOOKBACK_DAYS=0`）；可改为正整数限制最近天数。
-- 不发送 Lark 消息，不运行 AI。
-- 不保存消息正文、附件、提及、完整发送者资料。
+- 每位 CM/AM 以自己的 Lark OAuth user access token 授权；系统只读取该用户原本可见、且 Lark API 实际返回的会话与历史消息。
+- 群聊和私聊使用同一套 `chats`、`authorization_chats`、`chat_messages` 与同步队列。群聊成员人数仅保存 Lark 返回的总数；私聊显示为无成员数。
+- OAuth 成功后回填 Lark API 可返回的历史，并每 5 分钟增量同步、回看 10 分钟以避免边界漏记。
+- 不发送 Lark 消息，不运行 AI，不保存附件二进制或成员名单。
 
-## 展示口径
+`GET /im/v1/chats?types=p2p` 的用户身份支持在当前租户已做 metadata-only 预检；因公开网页文档仍有滞后描述，Worker 将 P2P 发现状态单独记为 `succeeded`、`unavailable` 或 `attention_required`。P2P 不可用不会阻塞群聊同步。
 
-| 卡片 | 口径 |
+## 授权与正文边界
+
+旧版本 OAuth 明确承诺只做统计，因此旧授权不会被静默升级：
+
+1. `body_consent_at` 为空的既有用户继续同步原有群聊统计，不读取私聊，也不保存正文。
+2. 用户在更新后的授权页重新 OAuth 后，服务设置 `body_consent_at`、重新开始会话回填，并收集正文。
+3. 只有在新版授权时间之后重新观察到的消息，才会在该 CM/AM 的管理台筛选范围内显示正文。
+
+消息正文存入公司级去重表 `chat_messages.body_ciphertext`，使用从服务器主密钥派生的独立 AES-256-GCM 加密域。共享群的正文只存一份；`authorization_message_observations` 决定某一 CM/AM 是否可在自己的授权范围中看到该消息。令牌、密钥、正文都不写入普通日志。
+
+## 页面口径
+
+个人仪表盘展示：
+
+| 项目 | 口径 |
 |---|---|
-| 已加入群聊 | 当前可见且 `chat_status=normal` 的群数量。 |
-| 已同步消息总数 | Lark API 返回、未撤回、且属于当前可见群的唯一消息 ID 数。 |
-| 我发送的消息数 | 发送者为 `user`、`id_type=open_id` 且 ID 与 OAuth 用户 `open_id` 一致的未撤回消息。 |
-| 最近一次同步 | 某个可读群最后完成回填或增量同步的时间。 |
+| 已加入群聊 / 私聊 | 当前可见、`chat_status=normal` 的会话数。 |
+| 已同步消息总数 | 当前可见会话中 Lark 返回、未撤回的唯一消息 ID。 |
+| 我发送的消息数 | 发送者的 `open_id` 与当前 OAuth 用户一致。 |
+| 最近一次同步 | 某个当前可见会话最后完成回填或增量同步的时间。 |
 
-`chat_messages` 是公司级唯一消息索引，仅保存：`chat_id`、`message_id`、创建时间与撤回布尔值；`authorization_message_observations` 仅保存某授权用户是否见过该消息、以及是否为本人发送。两者用于分页断点后的去重和可重复统计，绝不保存 `content`。`authorization_chats` 保存用户—群可见性与同步游标，`chats` 保存唯一群元数据。
-
-## 服务组件
-
-```text
-浏览器 / Lark Web App
-       │ OAuth + HTTPS
-       ▼
-Caddy → FastAPI Web（127.0.0.1:8100）
-       │               │
-       │               └─ Jinja2 + HTMX + Tabler 仪表盘
-       ▼
-PostgreSQL ← 独立 Python worker（systemd） ← Lark User Access Token
-```
-
-| 部件 | 名称 |
-|---|---|
-| 系统账户 | `larkstats` |
-| 数据库 | `lark_message_stats` |
-| Web 服务 | `lark-message-stats-web.service` |
-| 同步服务 | `lark-message-stats-worker.service` |
-| Web 本机端口 | `127.0.0.1:8100` |
-| 运行配置 | `/etc/lark-message-stats/app.env`，权限 `640 root:larkstats` |
-| App Secret 安全录入器 | `/usr/local/sbin/lark-message-stats-set-secret` |
-
-PostgreSQL、FastAPI 均不监听公网；仅 Caddy 暴露 80/443。Uvicorn 已关闭 access log，避免 OAuth 授权码出现在日志中。
-
-## OAuth 与令牌
-
-授权页使用 Lark OAuth v2 与 PKCE：
-
-1. 生成一次性 `state` 与 PKCE `code_verifier`。
-2. 浏览器用 Secure + HttpOnly `__Host-` Cookie 保存 `state`；数据库只保存其 SHA-256 与加密后的 verifier，10 分钟过期。
-3. 回调校验 Cookie 和一次性数据库状态，再用 code 换取令牌。
-4. `access_token`、`refresh_token` 使用服务器独有的 AES-256-GCM 密钥加密后写入 PostgreSQL。
-5. Worker 在 access token 临近过期时，对授权行加锁并原子替换 Lark 单次使用的 refresh token。
-
-实际调用的最小用户权限：
-
-```text
-im:chat:read
-im:message:readonly
-offline_access
-```
-
-参考：
-
-- [Lark 获取 OAuth 授权码](https://open.larksuite.com/document/common-capabilities/sso/api/obtain-oauth-code)
-- [Lark 获取 user_access_token](https://open.larksuite.com/document/uAjLw4CM/ukTMukTMukTM/authentication-management/access-token/get-user-access-token)
-- [Lark 刷新 user_access_token](https://open.larksuite.com/document/uAjLw4CM/ukTMukTMukTM/authentication-management/access-token/refresh-user-access-token)
-- [Lark 群列表](https://open.larksuite.com/document/server-docs/group/chat/list)
-- [Lark 会话历史消息](https://open.larksuite.com/document/server-docs/im-v1/message/list)
+`/admin` 展示公司级统计、人员、群聊和同步任务。`/admin/messages` 仅数据库 `admin_roles` 中的 `owner` 可访问：可用 CM/AM、会话类型和会话下拉筛选，展示最近 100 条已加密存储的正文。每次内容页查看写入 `audit_events`，但审计记录不含消息正文。
 
 ## 同步模型
 
-- OAuth 成功后创建 `backfill` job。
-- Worker 以用户 token 用稳定的创建时间排序分页获取群（每页最多 100）。
-- 每群消息以创建时间顺序分页（每页最多 50），固定首次回填的时间窗口，避免新消息改变分页边界。
-- 每页把 ledger 去重、游标和状态写在同一 PostgreSQL 事务；服务重启后安全继续。
-- 首次回填完成后，每 300 秒创建一次增量 job；增量窗口包含 10 分钟重叠，以防边界漏记，重复消息不会重复计数。
-- 若单个群不可读，标记为 `not_readable`，不把它误计为“零消息”；重新 OAuth 后会重新尝试。
-- 仪表盘可对一个当前可见群请求“同步全部历史”。Web 端只写入群级请求标记；同一授权用户仍只允许一个活动 job。Worker 在当前分页边界优先接手请求、原子重置该群游标并回填 Lark API 可返回的全部历史。每次请求递增群的同步代次，过期 worker 不能覆盖新游标或清除新请求。既有 `message_id` 会去重，消息正文不会写入数据库。
-- `/admin` 使用 `admin_roles` 强制授权，初始只分配一个 `owner`；全局群/消息指标读取 `chats` 与 `chat_messages`，个人指标读取授权观察关系，因此多人共享一个群不会造成重复计数。
+1. OAuth 成功后创建一个 `backfill` job。
+2. Worker 使用稳定创建时间顺序分页发现会话（每页 100）并读取消息（每页 50）。
+3. 一页中的 canonical 消息、用户观察关系与游标在同一 PostgreSQL 事务写入，重启可安全续跑。
+4. 首次回填完成后，每 300 秒创建增量 job；每次重叠 600 秒，重复消息按 `(chat_id, message_id)` 去重。
+5. “同步全部历史”只为当前用户—会话关系写入请求标记；同一用户仍只有一个活动 job，旧 worker 不能覆盖新游标。
 
-## 验证结果
+## 运行组件
 
-- 2026-08-27 本机复核：Ruff 通过。
-- 2026-08-27 单元测试复核：4/4 通过（AES-GCM、OAuth URL/PKCE、本人发送判定、毫秒时间解析）。
-- Hetzner：Python、PostgreSQL、Caddy、Web、Worker 已启用且开机自启。
-- 2026-08-27 公网 `GET /healthz` 返回 200，数据库为 `ok`，Secret 状态为 `configured`；首页授权按钮已启用。
+```text
+浏览器
+  │ OAuth + HTTPS
+  ▼
+Caddy → FastAPI + Jinja2/HTMX/Tabler → PostgreSQL
+                       ▲
+                systemd Python worker → Lark Open API
+```
 
-早期 Spike 已验证用户身份可读取测试外部群及其历史消息；当前 Python 版本的完整 OAuth、历史回填、增量同步和看板数字，仍需由应用可用范围内的真实 CM/AM 完成一次授权后验收。
+| 部件 | 值 |
+|---|---|
+| Web 服务 | `lark-message-stats-web.service` |
+| Worker | `lark-message-stats-worker.service` |
+| Web 本机端口 | `127.0.0.1:8100` |
+| 运行配置 | `/etc/lark-message-stats/app.env`，`root:larkstats` / `0640` |
+
+实际 OAuth scopes 保持当前已验证的最小运行集：`offline_access`、`im:chat:read`、`im:message:readonly`。群成员总数需要时可额外加入 `im:chat.members:read`。
+
+参考：
+
+- [Lark OAuth 授权](https://open.larksuite.com/document/common-capabilities/sso/api/obtain-oauth-code)
+- [Lark user access token](https://open.larksuite.com/document/uAjLw4CM/ukTMukTMukTM/authentication-management/access-token/get-user-access-token)
+- [Lark 会话历史消息](https://open.larksuite.com/document/server-docs/im-v1/message/list)
+- [Lark IM CLI 的 chat list 参数说明](https://github.com/larksuite/cli/blob/main/skills/lark-im/references/lark-im-chat-list.md)

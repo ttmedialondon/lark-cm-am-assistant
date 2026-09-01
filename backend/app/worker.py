@@ -12,7 +12,7 @@ from typing import Any
 import psycopg
 
 from .config import Settings, get_settings
-from .crypto import TokenCipher
+from .crypto import TokenCipher, message_body_cipher
 from .db import connection
 from .lark_api import LarkApiError, LarkClient, TokenBundle
 
@@ -115,10 +115,18 @@ def _execute_job(job: SyncJob, settings: Settings) -> None:
 
         client = LarkClient(settings)
         access_token = _usable_access_token(job.authorization_id, authorization, client, settings)
-        discovered = _discover_groups(job, authorization, access_token, client, settings)
+        discovered = _discover_chats(job, authorization, access_token, client, settings, chat_type="group")
+        # P2P discovery and content collection are part of the revised OAuth
+        # agreement. Existing statistics-only authorizations continue to sync
+        # their group metadata until the person explicitly reauthorizes.
+        if authorization.get("body_consent_at") and authorization.get("p2p_discovery_status") not in {
+            "unavailable",
+            "attention_required",
+        }:
+            discovered += _discover_p2p(job, authorization, access_token, client, settings)
         _set_job_discovered(job.id, discovered)
 
-        # A newly discovered group can appear while an incremental job is
+        # A newly discovered conversation can appear while an incremental job is
         # running. Always drain pending full-history backfills first so those
         # rows never remain at "waiting" indefinitely.
         if job.mode == "backfill" or _has_pending_backfill(job.authorization_id):
@@ -158,7 +166,8 @@ def _authorization(authorization_id: uuid.UUID) -> dict[str, Any] | None:
         return conn.execute(
             """
             SELECT id, open_id, status, access_token_ciphertext, refresh_token_ciphertext,
-                   access_token_expires_at, refresh_token_expires_at
+                   access_token_expires_at, refresh_token_expires_at,
+                   body_consent_at, p2p_discovery_status
             FROM authorizations WHERE id = %s
             """,
             (authorization_id,),
@@ -219,18 +228,19 @@ def _store_refreshed_tokens(
     )
 
 
-def _discover_groups(
+def _discover_chats(
     job: SyncJob,
     authorization: dict[str, Any],
     access_token: str,
     client: LarkClient,
     settings: Settings,
+    *,
+    chat_type: str,
 ) -> int:
-    """Discover visible groups and periodically refresh only their member totals.
+    """Discover one conversation type and retain its user-specific visibility.
 
-    Group discovery and message ingestion must stay independent: an unavailable
-    member-total API must never make an otherwise readable group look empty or
-    prevent its message history from being indexed.
+    Member totals are group-only secondary metadata: a failure there must never
+    make an otherwise readable conversation look empty or block message sync.
     """
 
     page_token: str | None = None
@@ -239,14 +249,16 @@ def _discover_groups(
     last_member_count_checks = _member_count_check_times(authorization["id"])
     while True:
         _renew_lease(job.id)
-        data = client.list_group_chats(access_token, page_token)
+        data = client.list_chats(access_token, page_token, types="p2p" if chat_type == "p2p" else None)
         rows: list[tuple[str, str | None, bool, str, str, MemberCountMeasurement | None]] = []
         for chat in _items(data):
             chat_id = _text(chat.get("chat_id"))
             if not chat_id:
                 continue
             measurement: MemberCountMeasurement | None = None
-            if _member_count_refresh_due(
+            if chat_type == "p2p":
+                measurement = MemberCountMeasurement(count=None, status="unavailable", checked_at=seen_at)
+            elif _member_count_refresh_due(
                 last_member_count_checks.get(chat_id), seen_at, settings.member_count_refresh_seconds
             ):
                 if "im:chat.members:read" in settings.oauth_scopes:
@@ -264,7 +276,7 @@ def _discover_groups(
                     _text(chat.get("name")),
                     _bool(chat.get("external")),
                     _text(chat.get("chat_status")) or "normal",
-                    _text(chat.get("chat_mode")) or "group",
+                    _text(chat.get("chat_mode")) or chat_type,
                     measurement,
                 )
             )
@@ -330,16 +342,59 @@ def _discover_groups(
     with connection() as conn, conn.transaction():
         conn.execute(
             """
-            UPDATE authorization_chats
+            UPDATE authorization_chats AS access
             SET is_visible = FALSE,
                 manual_backfill_requested_at = NULL,
                 manual_backfill_started_at = NULL,
                 sync_generation = sync_generation + 1
-            WHERE authorization_id = %s AND last_seen_at < %s
+            FROM chats AS c
+            WHERE access.authorization_id = %s
+              AND access.chat_id = c.chat_id
+              AND COALESCE(c.chat_mode, 'group') = %s
+              AND access.last_seen_at < %s
             """,
-            (authorization["id"], seen_at),
+            (authorization["id"], chat_type, seen_at),
         )
     return discovered
+
+
+def _discover_p2p(
+    job: SyncJob,
+    authorization: dict[str, Any],
+    access_token: str,
+    client: LarkClient,
+    settings: Settings,
+) -> int:
+    """Treat Lark's evolving P2P-list support as an explicit per-user capability."""
+
+    try:
+        discovered = _discover_chats(job, authorization, access_token, client, settings, chat_type="p2p")
+    except LarkApiError as exc:
+        if exc.retryable:
+            raise
+        status = "attention_required" if exc.likely_auth_problem else "unavailable"
+        detail = (
+            "Lark authorization or P2P permission must be renewed."
+            if status == "attention_required"
+            else "Lark does not currently return this user's P2P conversation list."
+        )
+        _set_p2p_discovery(authorization["id"], status, detail)
+        return 0
+    _set_p2p_discovery(authorization["id"], "succeeded", None)
+    return discovered
+
+
+def _set_p2p_discovery(authorization_id: uuid.UUID, status: str, detail: str | None) -> None:
+    with connection() as conn, conn.transaction():
+        conn.execute(
+            """
+            UPDATE authorizations
+            SET p2p_discovery_status = %s, p2p_last_checked_at = NOW(),
+                p2p_last_error = %s, updated_at = NOW()
+            WHERE id = %s
+            """,
+            (status, detail, authorization_id),
+        )
 
 
 def _member_count_check_times(authorization_id: uuid.UUID) -> dict[str, datetime | None]:
@@ -366,7 +421,7 @@ def _read_member_count(client: LarkClient, access_token: str, chat_id: str) -> M
     try:
         total = client.chat_member_total(access_token, chat_id).user_total
     except LarkApiError as exc:
-        # This is secondary metadata. Preserve the group and primary message
+        # This is secondary metadata. Preserve the conversation and primary message
         # sync even when a tenant policy or a missing scope denies this call.
         status = "pending" if exc.retryable else "unavailable"
         LOGGER.info("member-count metadata unavailable: status=%s code=%s", exc.status_code, exc.lark_code)
@@ -381,6 +436,9 @@ def _run_backfill(
     job: SyncJob, authorization: dict[str, Any], access_token: str, client: LarkClient, settings: Settings
 ) -> bool:
     pages = 0
+    content_cipher = (
+        message_body_cipher(settings.token_encryption_key) if authorization.get("body_consent_at") else None
+    )
     while pages < settings.max_pages_per_job:
         chat = _next_backfill_chat(authorization["id"])
         if not chat:
@@ -427,6 +485,7 @@ def _run_backfill(
             next_page_token=next_page_token,
             backfill=True,
             generation=generation,
+            content_cipher=content_cipher,
         )
         pages += 1
         _add_job_progress(job.id, pages=1, messages=inserted, own_messages=own_inserted)
@@ -437,6 +496,9 @@ def _run_incremental(
     job: SyncJob, authorization: dict[str, Any], access_token: str, client: LarkClient, settings: Settings
 ) -> bool:
     pages = 0
+    content_cipher = (
+        message_body_cipher(settings.token_encryption_key) if authorization.get("body_consent_at") else None
+    )
     while pages < settings.max_pages_per_job:
         # Finish the current page before yielding to a requested full rescan.
         # The requeued job will claim that request before reading another
@@ -484,6 +546,7 @@ def _run_incremental(
             next_page_token=next_page_token,
             backfill=False,
             generation=generation,
+            content_cipher=content_cipher,
         )
         pages += 1
         _add_job_progress(job.id, pages=1, messages=inserted, own_messages=own_inserted)
@@ -491,7 +554,7 @@ def _run_incremental(
 
 
 def _next_backfill_chat(authorization_id: uuid.UUID) -> dict[str, Any] | None:
-    """Return the next full-history group, honoring requested rescans first."""
+    """Return the next full-history conversation, honoring requested rescans first."""
 
     with connection() as conn:
         manual_in_progress = conn.execute(
@@ -689,6 +752,7 @@ def _record_page(
     next_page_token: str | None,
     backfill: bool,
     generation: int,
+    content_cipher: TokenCipher | None,
 ) -> tuple[int, int]:
     inserted = 0
     own_inserted = 0
@@ -699,13 +763,26 @@ def _record_page(
                 continue
             is_own = _is_author_message(message, authorization["open_id"])
             is_deleted = _bool(message.get("deleted"))
+            body_content = _body_content(message)
+            body_ciphertext = (
+                content_cipher.encrypt(body_content) if content_cipher and body_content and not is_deleted else None
+            )
             conn.execute(
                 """
                 INSERT INTO chat_messages (
-                    chat_id, message_id, message_create_time, is_deleted, first_indexed_at, last_observed_at
-                ) VALUES (%s, %s, %s, %s, NOW(), NOW())
+                    chat_id, message_id, message_create_time, message_update_time,
+                    message_type, body_ciphertext,
+                    is_deleted, first_indexed_at, last_observed_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
                 ON CONFLICT (chat_id, message_id) DO UPDATE SET
                     message_create_time = COALESCE(chat_messages.message_create_time, EXCLUDED.message_create_time),
+                    message_update_time = COALESCE(EXCLUDED.message_update_time, chat_messages.message_update_time),
+                    message_type = COALESCE(EXCLUDED.message_type, chat_messages.message_type),
+                    body_ciphertext = CASE
+                        WHEN EXCLUDED.is_deleted THEN NULL
+                        WHEN EXCLUDED.body_ciphertext IS NULL THEN chat_messages.body_ciphertext
+                        ELSE EXCLUDED.body_ciphertext
+                    END,
                     is_deleted = chat_messages.is_deleted OR EXCLUDED.is_deleted,
                     last_observed_at = NOW()
                 """,
@@ -713,6 +790,9 @@ def _record_page(
                     chat_id,
                     message_id,
                     _lark_time(message.get("create_time")),
+                    _lark_time(message.get("update_time")),
+                    _text(message.get("msg_type")),
+                    body_ciphertext,
                     is_deleted,
                 ),
             )
@@ -794,7 +874,7 @@ def _mark_chat_not_readable(authorization_id: uuid.UUID, chat_id: str, generatio
                 incremental_page_token = NULL,
                 manual_backfill_requested_at = NULL,
                 manual_backfill_started_at = NULL,
-                last_error = 'This group is not readable with the current authorization.'
+                last_error = 'This conversation is not readable with the current authorization.'
             WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
             """,
             (authorization_id, chat_id, generation),
@@ -927,6 +1007,11 @@ def _text(value: object) -> str | None:
 
 def _bool(value: object) -> bool:
     return value is True or value == 1 or value == "true"
+
+
+def _body_content(message: dict[str, Any]) -> str | None:
+    body = message.get("body")
+    return _text(body.get("content")) if isinstance(body, dict) else None
 
 
 def _is_author_message(message: dict[str, Any], open_id: str) -> bool:

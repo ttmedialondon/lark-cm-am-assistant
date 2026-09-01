@@ -1,24 +1,30 @@
 <div id="dashboard-stats" hx-get="/dashboard/stats" hx-trigger="load, every 5s" hx-swap="outerHTML">
   <div class="row row-deck row-cards">
-    <div class="col-sm-6 col-lg-3">
+    <div class="col-sm-6 col-lg-2">
       <div class="card"><div class="card-body">
         <div class="subheader">已加入群聊</div>
         <div class="h1 mb-0">{{ stats.group_count }}</div>
       </div></div>
     </div>
-    <div class="col-sm-6 col-lg-3">
+    <div class="col-sm-6 col-lg-2">
+      <div class="card"><div class="card-body">
+        <div class="subheader">已加入私聊</div>
+        <div class="h1 mb-0">{{ stats.p2p_count }}</div>
+      </div></div>
+    </div>
+    <div class="col-sm-6 col-lg-2">
       <div class="card"><div class="card-body">
         <div class="subheader">已同步消息总数</div>
         <div class="h1 mb-0">{{ stats.message_count }}</div>
       </div></div>
     </div>
-    <div class="col-sm-6 col-lg-3">
+    <div class="col-sm-6 col-lg-2">
       <div class="card"><div class="card-body">
         <div class="subheader">我发送的消息数</div>
         <div class="h1 mb-0">{{ stats.own_message_count }}</div>
       </div></div>
     </div>
-    <div class="col-sm-6 col-lg-3">
+    <div class="col-sm-6 col-lg-4">
       <div class="card"><div class="card-body">
         <div class="subheader">最近一次同步</div>
         <div class="h4 mb-0">{{ stats.last_synced_at }}</div>
@@ -34,7 +40,7 @@
         <a class="btn btn-sm btn-warning mt-2" href="/auth/lark/start">重新授权</a>
         {% endif %}
         {% if stats.job and stats.job.status in ["queued", "running"] %}
-        <div class="text-secondary small mt-1">已处理 {{ stats.job.pages_processed }} 页，发现 {{ stats.job.chats_discovered }} 个群，新增 {{ stats.job.messages_indexed }} 条消息索引。</div>
+        <div class="text-secondary small mt-1">已处理 {{ stats.job.pages_processed }} 页，发现 {{ stats.job.chats_discovered }} 个会话，新增 {{ stats.job.messages_indexed }} 条消息索引。</div>
         {% endif %}
       </div>
     </div>

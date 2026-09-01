@@ -68,6 +68,20 @@ def create_admin_router(
             "admin_role_label": _role_label(access_context["admin_role"]),
         }
 
+    def owner_access(request: Request) -> tuple[dict[str, Any] | None, Response | None]:
+        access_context, denied = access(request)
+        if denied is not None:
+            return None, denied
+        assert access_context is not None
+        if access_context["admin_role"] != "owner":
+            return None, render_template(
+                request,
+                "error.html",
+                {"title": "消息内容仅限所有者", "detail": "当前管理角色不能查看 CM / AM 的具体消息内容。"},
+                403,
+            )
+        return access_context, None
+
     @router.get("/admin")
     def admin_overview(request: Request) -> Response:
         access_context, denied = access(request)
@@ -123,6 +137,59 @@ def create_admin_router(
             "admin/chats.html",
             {**page_context(access_context, "chats"), "chats": admin_reporting.chats()},
         )
+
+    @router.get("/admin/messages")
+    def admin_messages(
+        request: Request,
+        user_id: UUID | None = None,
+        chat_id: str | None = None,
+        chat_mode: str | None = None,
+        page: int = 1,
+    ) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+
+        if chat_mode not in {"group", "p2p"}:
+            chat_mode = None
+        page = max(1, min(page, 10_000))
+        users = admin_reporting.users()
+        selected_user = next((item for item in users if item["id"] == user_id), None)
+        if user_id is not None and not selected_user:
+            return render_template(
+                request,
+                "error.html",
+                {"title": "未找到授权用户", "detail": "该用户不存在，或尚未完成 Lark 授权。"},
+                404,
+            )
+        if selected_user is None and users:
+            selected_user = users[0]
+
+        conversations: list[dict[str, Any]] = []
+        content_page = {"metrics": {}, "items": [], "page": page, "has_next": False}
+        if selected_user:
+            conversations = admin_reporting.message_conversations(selected_user["id"], chat_mode)
+            if chat_id not in {item["chat_id"] for item in conversations}:
+                chat_id = None
+            content_page = admin_reporting.message_page(selected_user["id"], chat_mode, chat_id, page)
+            admin_reporting.record_message_view(access_context["authorization"]["id"], selected_user["id"], chat_id)
+
+        response = render_template(
+            request,
+            "admin/messages.html",
+            {
+                **page_context(access_context, "messages"),
+                "users": users,
+                "selected_user": selected_user,
+                "selected_chat_id": chat_id,
+                "selected_chat_mode": chat_mode,
+                "conversations": conversations,
+                "content_page": content_page,
+            },
+        )
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
 
     @router.get("/admin/jobs")
     def admin_jobs(request: Request) -> Response:

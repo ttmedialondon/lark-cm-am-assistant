@@ -17,3 +17,8 @@ def test_seconds_label_prefers_human_readable_units():
     assert admin_reporting._seconds_label(300) == "5 分钟"
     assert admin_reporting._seconds_label(3600) == "1 小时"
     assert admin_reporting._seconds_label(45) == "45 秒"
+
+
+def test_message_body_renderer_extracts_text_without_showing_raw_json():
+    assert admin_reporting._readable_body('{"text":"hello"}', "text") == "hello"
+    assert admin_reporting._readable_body('{"zh_cn":{"content":[[{"text":"hello"}]]}}', "post") == "hello"

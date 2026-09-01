@@ -2,8 +2,8 @@
   <div class="card mt-4">
     <div class="card-header">
       <div>
-        <h3 class="card-title mb-1">当前可见群聊</h3>
-        <div class="text-secondary small">成员人数是 Lark 返回的用户总数；服务不保存成员名单或消息正文。点击“同步全部历史”会重新扫描 Lark API 可返回的历史，已有消息自动去重。</div>
+        <h3 class="card-title mb-1">当前可见会话</h3>
+        <div class="text-secondary small">群聊成员人数是 Lark 返回的用户总数；私聊没有成员人数。{% if body_consent %}消息正文会在服务器端加密保存。{% else %}重新授权后才会开始保存消息正文和同步私聊。{% endif %} 点击“同步全部历史”会重新扫描 Lark API 可返回的历史，已有消息自动去重。</div>
       </div>
     </div>
     {% if sync_notice %}
@@ -14,7 +14,8 @@
       <table class="table table-vcenter card-table">
         <thead>
           <tr>
-            <th>群聊</th>
+            <th>会话</th>
+            <th>类型</th>
             <th>成员人数</th>
             <th>已同步消息记录</th>
             <th>同步状态</th>
@@ -29,6 +30,7 @@
               <div class="text-truncate" title="{{ chat.name }}">{{ chat.name }}</div>
               {% if chat.external %}<span class="badge bg-azure-lt mt-1">外部群</span>{% endif %}
             </td>
+            <td>{{ chat.chat_mode_label }}</td>
             <td>{{ chat.member_count }}</td>
             <td>{{ chat.message_count }}</td>
             <td><span class="badge bg-{{ chat.sync_badge }}-lt">{{ chat.sync_label }}</span></td>
@@ -55,7 +57,7 @@
       </table>
     </div>
     {% else %}
-    <div class="card-body text-secondary">暂未发现群聊。授权后的首次同步正在后台执行时，请稍候刷新。</div>
+    <div class="card-body text-secondary">暂未发现会话。授权后的首次同步正在后台执行时，请稍候刷新。</div>
     {% endif %}
   </div>
 </div>

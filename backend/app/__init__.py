@@ -1,1 +1,1 @@
-"""Lark Message Stats test application."""
+"""Lark CM/AM Assistant test application."""

@@ -8,27 +8,29 @@
     <div class="card mb-4"><div class="card-body">
       <div class="row g-3 align-items-center">
         <div class="col-md"><h3 class="mb-1">{{ user.display_name }}</h3><div class="text-secondary">授权于 {{ user.authorized_at_label }} · 最近更新 {{ user.updated_at_label }}</div></div>
-        <div class="col-md-auto"><span class="badge bg-{{ user.authorization_status_badge }}-lt">{{ user.authorization_status_label }}</span>{% if user.admin_role %}<span class="badge bg-azure-lt ms-1">{{ user.admin_role }}</span>{% endif %}</div>
+        <div class="col-md-auto"><span class="badge bg-{{ user.authorization_status_badge }}-lt">{{ user.authorization_status_label }}</span><span class="badge bg-{{ user.p2p_status_badge }}-lt ms-1">私聊：{{ user.p2p_status_label }}</span>{% if user.admin_role %}<span class="badge bg-azure-lt ms-1">{{ user.admin_role }}</span>{% endif %}</div>
       </div>
       <div class="row row-cards mt-2">
-        <div class="col-sm-4"><div class="subheader">当前群聊</div><div class="h2">{{ user.group_count }}</div></div>
-        <div class="col-sm-4"><div class="subheader">可见消息索引</div><div class="h2">{{ user.message_count }}</div></div>
-        <div class="col-sm-4"><div class="subheader">本人消息</div><div class="h2">{{ user.own_message_count }}</div></div>
+        <div class="col-sm-3"><div class="subheader">当前群聊</div><div class="h2">{{ user.group_count }}</div></div>
+        <div class="col-sm-3"><div class="subheader">当前私聊</div><div class="h2">{{ user.p2p_count }}</div></div>
+        <div class="col-sm-3"><div class="subheader">可见消息索引</div><div class="h2">{{ user.message_count }}</div></div>
+        <div class="col-sm-3"><div class="subheader">本人消息</div><div class="h2">{{ user.own_message_count }}</div></div>
       </div>
+      {% if admin_role == 'owner' %}<a class="btn btn-sm btn-outline-primary mt-3" href="/admin/messages?user_id={{ user.id }}">查看此人的消息内容</a>{% endif %}
     </div></div>
 
     <div class="card mb-4">
-      <div class="card-header"><div><h3 class="card-title mb-1">当前可见群聊</h3><div class="text-secondary small">群名称和成员人数来自共享的群目录；同步状态属于该人员的授权关系。</div></div></div>
-      {% if groups %}
+      <div class="card-header"><div><h3 class="card-title mb-1">当前可见会话</h3><div class="text-secondary small">群名称和成员人数来自共享的群目录；私聊没有成员人数。同步状态属于该人员的授权关系。</div></div></div>
+      {% if conversations %}
       <div class="table-responsive"><table class="table table-vcenter card-table">
-        <thead><tr><th>群聊</th><th>成员人数</th><th>消息索引</th><th>同步状态</th><th>最近同步</th></tr></thead>
-        <tbody>{% for group in groups %}<tr>
-          <td><div class="text-truncate group-name-cell" title="{{ group.name }}">{{ group.name }}</div>{% if group.external %}<span class="badge bg-azure-lt mt-1">外部群</span>{% endif %}</td>
-          <td>{{ group.member_count_label }}</td><td>{{ group.message_count }}</td>
-          <td><span class="badge bg-{{ group.sync_status_badge }}-lt">{{ group.sync_status_label }}</span></td><td class="text-secondary text-nowrap">{{ group.last_synced_at_label }}</td>
+        <thead><tr><th>会话</th><th>类型</th><th>成员人数</th><th>消息索引</th><th>同步状态</th><th>最近同步</th></tr></thead>
+        <tbody>{% for conversation in conversations %}<tr>
+          <td><div class="text-truncate group-name-cell" title="{{ conversation.name }}">{{ conversation.name }}</div>{% if conversation.external %}<span class="badge bg-azure-lt mt-1">外部群</span>{% endif %}</td>
+          <td>{{ conversation.chat_mode_label }}</td><td>{{ conversation.member_count_label }}</td><td>{{ conversation.message_count }}</td>
+          <td><span class="badge bg-{{ conversation.sync_status_badge }}-lt">{{ conversation.sync_status_label }}</span></td><td class="text-secondary text-nowrap">{{ conversation.last_synced_at_label }}</td>
         </tr>{% endfor %}</tbody>
       </table></div>
-      {% else %}<div class="card-body text-secondary">该用户目前没有可展示的群聊。</div>{% endif %}
+      {% else %}<div class="card-body text-secondary">该用户目前没有可展示的会话。</div>{% endif %}
     </div>
 
     <div class="card">

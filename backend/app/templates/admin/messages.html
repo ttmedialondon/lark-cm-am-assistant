@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}消息内容 · 管理台{% endblock %}
+{% block body %}
+<div class="page">
+  {% include "admin/_nav.html" %}
+  <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
+    <div class="alert alert-warning" role="status">仅所有者可查看。这里按所选 CM / AM 的授权范围展示消息正文；每次查看会记入审计日志，日志不保存消息内容。</div>
+
+    <div class="card mb-4"><div class="card-body">
+      <form method="get" class="row g-3 align-items-end">
+        <div class="col-md-4">
+          <label class="form-label" for="message-user">CM / AM</label>
+          <select class="form-select" id="message-user" name="user_id">
+            {% for user in users %}<option value="{{ user.id }}" {% if selected_user and user.id == selected_user.id %}selected{% endif %}>{{ user.display_name }} · {{ user.content_access_label }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="col-md-2">
+          <label class="form-label" for="message-type">会话类型</label>
+          <select class="form-select" id="message-type" name="chat_mode">
+            <option value="" {% if not selected_chat_mode %}selected{% endif %}>全部</option>
+            <option value="group" {% if selected_chat_mode == 'group' %}selected{% endif %}>群聊</option>
+            <option value="p2p" {% if selected_chat_mode == 'p2p' %}selected{% endif %}>私聊</option>
+          </select>
+        </div>
+        <div class="col-md-4">
+          <label class="form-label" for="message-chat">会话</label>
+          <select class="form-select" id="message-chat" name="chat_id">
+            <option value="">全部会话</option>
+            {% for chat in conversations %}<option value="{{ chat.chat_id }}" {% if chat.chat_id == selected_chat_id %}selected{% endif %}>{{ chat.chat_mode_label }} · {{ chat.name }}（{{ chat.content_count }} 条正文）</option>{% endfor %}
+          </select>
+        </div>
+        <div class="col-md-2"><button class="btn btn-primary w-100" type="submit">筛选</button></div>
+      </form>
+    </div></div>
+
+    {% if selected_user %}
+      {% if not selected_user.body_consent_at %}
+      <div class="alert alert-info">{{ selected_user.display_name }} 尚未完成新版授权。其原有统计仍在，但不会采集群聊或私聊正文；请让该用户从首页重新授权后开始回填。</div>
+      {% endif %}
+      <div class="row row-deck row-cards mb-4">
+        <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">筛选范围消息</div><div class="h1 mb-0">{{ content_page.metrics.get('message_count', 0) }}</div></div></div></div>
+        <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">可展示正文</div><div class="h1 mb-0">{{ content_page.metrics.get('content_count', 0) }}</div></div></div></div>
+        <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">本人发送</div><div class="h1 mb-0">{{ content_page.metrics.get('own_message_count', 0) }}</div></div></div></div>
+        <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">私聊消息</div><div class="h1 mb-0">{{ content_page.metrics.get('p2p_message_count', 0) }}</div></div></div></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><div><h3 class="card-title mb-1">最近消息正文</h3><div class="text-secondary small">按 Lark 消息创建时间倒序；每页最多 {{ content_page["items"] | length }} 条。文本和富文本会展示可读内容，其它消息类型会标明不可读。</div></div></div>
+        {% if content_page["items"] %}
+        <div class="list-group list-group-flush">
+          {% for message in content_page["items"] %}
+          <div class="list-group-item">
+            <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+              <span class="badge bg-{{ 'azure' if message.chat_mode == 'p2p' else 'secondary' }}-lt">{{ message.chat_mode_label }}</span>
+              <strong>{{ message.chat_name }}</strong>
+              <span class="text-secondary small">{{ message.sender_label }} · {{ message.message_type or '未知类型' }} · {{ message.created_at_label }}</span>
+            </div>
+            <div style="white-space: pre-wrap; overflow-wrap: anywhere;">{{ message.content }}</div>
+          </div>
+          {% endfor %}
+        </div>
+        {% if content_page.page > 1 or content_page.has_next %}
+        <div class="card-footer d-flex justify-content-between">
+          {% if content_page.page > 1 %}<a class="btn btn-sm btn-outline-secondary" href="/admin/messages?user_id={{ selected_user.id }}{% if selected_chat_mode %}&amp;chat_mode={{ selected_chat_mode }}{% endif %}{% if selected_chat_id %}&amp;chat_id={{ selected_chat_id | urlencode }}{% endif %}&amp;page={{ content_page.page - 1 }}">上一页</a>{% else %}<span></span>{% endif %}
+          {% if content_page.has_next %}<a class="btn btn-sm btn-outline-secondary" href="/admin/messages?user_id={{ selected_user.id }}{% if selected_chat_mode %}&amp;chat_mode={{ selected_chat_mode }}{% endif %}{% if selected_chat_id %}&amp;chat_id={{ selected_chat_id | urlencode }}{% endif %}&amp;page={{ content_page.page + 1 }}">下一页</a>{% endif %}
+        </div>
+        {% endif %}
+        {% else %}
+        <div class="card-body text-secondary">当前筛选范围内没有已加密保存且可展示的消息正文。新版授权后的首次回填完成后会出现在这里。</div>
+        {% endif %}
+      </div>
+    {% else %}
+    <div class="card"><div class="card-body text-secondary">尚未有 CM / AM 完成 Lark 授权。</div></div>
+    {% endif %}
+  </div></div></div>
+</div>
+{% endblock %}

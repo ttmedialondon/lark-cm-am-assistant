@@ -50,3 +50,19 @@ def test_chat_member_total_requests_only_the_aggregate_user_bucket(monkeypatch) 
     assert captured["url"].endswith("/open-apis/im/v1/chats/oc_test/members/list")
     assert captured["access_token"] == "user-token"
     assert captured["params"] == {"member_id_type": "open_id", "member_types": "user", "page_size": 1}
+
+
+def test_p2p_discovery_uses_the_user_chat_type_filter(monkeypatch) -> None:
+    client = LarkClient(settings())
+    captured = {}
+
+    def fake_request(method, url, **kwargs):
+        captured.update(method=method, url=url, **kwargs)
+        return {"items": []}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    client.list_chats("user-token", types="p2p")
+
+    assert captured["params"]["types"] == "p2p"
+    assert captured["params"]["user_id_type"] == "open_id"
