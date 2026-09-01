@@ -102,6 +102,7 @@ def save_feature_config(
                 WHEN EXCLUDED.api_key_ciphertext IS NULL THEN ai_feature_configs.key_updated_by_authorization_id
                 ELSE EXCLUDED.key_updated_by_authorization_id
             END,
+            automatic_queue_checked_at = '-infinity'::timestamptz,
             last_tested_at = NULL,
             last_test_status = 'never',
             updated_at = NOW()
@@ -170,13 +171,13 @@ def _normalize_auto_confirm_threshold(value: Decimal | float | str) -> Decimal:
     try:
         threshold = Decimal(str(value))
     except (InvalidOperation, ValueError) as exc:
-        raise FeatureConfigInputError("自动确认阈值必须是 0.50 到 1.00 之间的数字。") from exc
+        raise FeatureConfigInputError("自动确认阈值必须是 0.90 到 1.00 之间的数字。") from exc
     if (
         not threshold.is_finite()
         or threshold.as_tuple().exponent < -3
-        or not Decimal("0.500") <= threshold <= Decimal("1.000")
+        or not Decimal("0.900") <= threshold <= Decimal("1.000")
     ):
-        raise FeatureConfigInputError("自动确认阈值必须在 0.50 到 1.00 之间。")
+        raise FeatureConfigInputError("自动确认阈值必须在 0.90 到 1.00 之间。")
     return threshold.quantize(Decimal("0.001"))
 
 

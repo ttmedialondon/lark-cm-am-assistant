@@ -33,6 +33,14 @@ MESSAGE_PAGE_SIZE = 100
 MESSAGE_CONVERSATION_PAGE_SIZE = 5
 MAX_MESSAGE_CONVERSATION_QUERY_LENGTH = 120
 MESSAGE_CONVERSATION_TYPES = frozenset({"all", "group", "p2p"})
+CONFIRMED_CONTACT_ROLE_LABELS = {
+    "creator": "已确认达人 / 创作者",
+    "agent_or_agency": "已确认经纪人 / 机构",
+    "brand": "已确认品牌方",
+    "merchant": "已确认商家",
+    "supplier": "已确认供应商",
+    "other": "已确认其他业务角色",
+}
 MESSAGE_CONVERSATION_DIRECTORY_SQL = """
     SELECT
         ac.authorization_id,
@@ -808,7 +816,16 @@ def contacts(page: int = 1) -> dict[str, Any]:
                 identity_counts.last_seen_at,
                 conversations.conversation_count,
                 messages.message_count,
-                accounts.account_count
+                accounts.account_count,
+                ARRAY(
+                    SELECT confirmed_role.role
+                    FROM contact_roles confirmed_role
+                    WHERE confirmed_role.contact_id = contact.id AND confirmed_role.status = 'confirmed'
+                    ORDER BY CASE confirmed_role.role
+                        WHEN 'creator' THEN 1 WHEN 'agent_or_agency' THEN 2 WHEN 'brand' THEN 3
+                        WHEN 'merchant' THEN 4 WHEN 'supplier' THEN 5 ELSE 6
+                    END
+                ) AS confirmed_roles
             FROM contacts contact
             JOIN LATERAL (
                 SELECT identity.open_id, identity.display_name, identity.tenant_key, identity.tenant_classification
@@ -881,7 +898,16 @@ def contact_detail(
                 identity.tenant_key,
                 identity.tenant_classification,
                 contact.created_at,
-                contact.updated_at
+                contact.updated_at,
+                ARRAY(
+                    SELECT confirmed_role.role
+                    FROM contact_roles confirmed_role
+                    WHERE confirmed_role.contact_id = contact.id AND confirmed_role.status = 'confirmed'
+                    ORDER BY CASE confirmed_role.role
+                        WHEN 'creator' THEN 1 WHEN 'agent_or_agency' THEN 2 WHEN 'brand' THEN 3
+                        WHEN 'merchant' THEN 4 WHEN 'supplier' THEN 5 ELSE 6
+                    END
+                ) AS confirmed_roles
             FROM lark_identities identity
             JOIN contacts contact ON contact.id = identity.contact_id
             WHERE identity.open_id = %s
@@ -1564,6 +1590,13 @@ def _decorate_creator_identifier(row: dict[str, Any]) -> dict[str, Any]:
 def _decorate_contact(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     item["display_name"] = item.get("display_name") or "Lark 参与者（姓名未返回）"
+    roles = item.get("confirmed_roles")
+    roles = roles if isinstance(roles, list | tuple) else ()
+    item["confirmed_role_labels"] = [
+        CONFIRMED_CONTACT_ROLE_LABELS[role]
+        for role in roles
+        if role in CONFIRMED_CONTACT_ROLE_LABELS
+    ]
     item["tenant_classification_label"], item["tenant_classification_badge"] = _tenant_classification(
         item.get("tenant_classification")
     )

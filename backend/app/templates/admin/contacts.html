@@ -11,7 +11,7 @@
       <div class="table-responsive admin-directory__table"><table class="table table-vcenter card-table">
         <thead><tr><th>参与者</th><th>租户</th><th>会话</th><th>发送消息</th><th>账号出现</th><th>最近活动</th><th></th></tr></thead>
         <tbody>{% for contact in contacts %}<tr>
-          <td><div>{{ contact.display_name }}</div>{% if contact.lark_identity_count > 1 %}<div class="text-secondary small">{{ contact.lark_identity_count }} 个稳定 Lark 身份</div>{% endif %}</td>
+          <td><div class="d-flex flex-wrap align-items-center gap-1"><span>{{ contact.display_name }}</span>{% for label in contact.confirmed_role_labels %}<span class="badge bg-success-lt">{{ label }}</span>{% endfor %}</div>{% if contact.lark_identity_count > 1 %}<div class="text-secondary small">{{ contact.lark_identity_count }} 个稳定 Lark 身份</div>{% endif %}</td>
           <td><span class="badge bg-{{ contact.tenant_classification_badge }}-lt">{{ contact.tenant_classification_label }}</span></td>
           <td>{{ contact.conversation_count }}</td><td>{{ contact.message_count }}</td><td>{{ contact.account_count }}</td>
           <td class="text-secondary text-nowrap">{{ contact.last_seen_at_label }}</td>

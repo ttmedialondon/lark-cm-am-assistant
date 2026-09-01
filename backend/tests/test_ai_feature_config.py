@@ -127,6 +127,22 @@ def test_first_time_enable_requires_a_key() -> None:
         )
 
 
+def test_auto_confirmation_never_allows_a_threshold_below_ninety_percent() -> None:
+    with pytest.raises(FeatureConfigInputError, match="0.90"):
+        save_feature_config(
+            _Connection(),
+            api_key_cipher(b"a" * 32),
+            "contact_assessment",
+            provider="openai",
+            project_id="proj_contact_assessment",
+            model="gpt-5.6-luna",
+            enabled=True,
+            api_key="sk-test-value-1234",
+            updated_by_authorization_id=uuid4(),
+            auto_confirm_threshold="0.899",
+        )
+
+
 def test_get_and_display_never_expose_ciphertext() -> None:
     when = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
     row = {

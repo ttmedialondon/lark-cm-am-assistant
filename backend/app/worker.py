@@ -20,6 +20,7 @@ from .db import connection
 from .lark_api import LarkApiError, LarkClient, TokenBundle
 
 LOGGER = logging.getLogger("lark_message_stats.worker")
+MAX_CONSECUTIVE_SYNC_JOBS = 3
 LEASE_MINUTES = 10
 
 
@@ -54,17 +55,24 @@ def run_forever() -> None:
     if not settings.app_secret_configured:
         LOGGER.warning("Lark App Secret is not configured; worker is waiting for administrator input")
 
+    sync_streak = 0
     while True:
         try:
             _recover_expired_leases()
-            # Synchronisation always wins: an assessment only uses already
-            # stored, authorised content and must never delay a Lark sync.
+            # Keep a backfill from starving the durable AI queue forever. The
+            # assessment path remains globally rate-limited in PostgreSQL.
+            if sync_streak >= MAX_CONSECUTIVE_SYNC_JOBS and _run_contact_assessment(settings):
+                sync_streak = 0
+                continue
             job = _claim_job() if settings.app_secret_configured else None
             if job:
                 _execute_job(job, settings)
+                sync_streak += 1
                 continue
             if _run_contact_assessment(settings):
+                sync_streak = 0
                 continue
+            sync_streak = 0
             time.sleep(settings.worker_idle_seconds)
         except KeyboardInterrupt:
             raise

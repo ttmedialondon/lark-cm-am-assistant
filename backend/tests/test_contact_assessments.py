@@ -289,6 +289,24 @@ def test_auto_decision_confirms_only_one_unambiguous_high_confidence_role(monkey
     assert confirmed == ["creator"]
 
 
+def test_auto_decision_keeps_a_role_below_ninety_percent_for_review(monkeypatch) -> None:
+    monkeypatch.setattr(
+        contact_assessments,
+        "_auto_confirm_role",
+        lambda *_args: pytest.fail("a role below 90% must not be automatically written"),
+    )
+
+    outcome, review_status, roles, relations = contact_assessments._apply_automatic_decision(
+        object(),
+        uuid4(),
+        uuid4(),
+        {"roles": [{"role": "creator", "confidence": 0.899}], "account_relations": []},
+        0.9,
+    )
+
+    assert (outcome, review_status, roles, relations) == ("review_required", "pending", [], [])
+
+
 def test_auto_decision_sends_low_or_ambiguous_roles_to_review(monkeypatch) -> None:
     monkeypatch.setattr(
         contact_assessments,

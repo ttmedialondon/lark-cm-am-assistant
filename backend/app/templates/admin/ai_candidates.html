@@ -4,7 +4,7 @@
 <div class="page admin-directory">
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl admin-directory__container">
-    <div class="alert alert-info">系统会在联系人具备可读的授权消息后自动识别。只有低于自动确认阈值或建议相互冲突的可执行结果会出现在这里；此页不展示消息正文。</div>
+    <div class="alert alert-info">系统会在联系人具备可读的授权消息后自动识别。只有低于 90% 或建议相互冲突的可执行结果会出现在这里；此页不展示消息正文。</div>
     {% if form_error %}<div class="alert alert-danger" role="alert">{{ form_error }}</div>{% endif %}
     <div class="card admin-directory__card">
       <div class="card-header"><div><h3 class="card-title mb-1">待人工确认</h3><div class="text-secondary small">先打开结果核对证据，再确认单项；“标记已处理”只移出本次候选，不会撤销已确认的业务事实。</div></div></div>

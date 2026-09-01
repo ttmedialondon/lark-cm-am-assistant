@@ -33,7 +33,9 @@ CANDIDATE_PAGE_SIZE = 20
 MAX_PAGE = 10_000
 MAX_AUTOMATIC_ATTEMPTS_PER_WATERMARK = 3
 AUTOMATIC_RETRY_COOLDOWN_MINUTES = 15
-AUTOMATIC_FAILURE_COOLDOWN_MINUTES = 15
+AUTOMATIC_QUEUE_REFRESH_SECONDS = 60
+AUTOMATIC_START_INTERVAL_SECONDS = 3
+AUTOMATIC_CLAIM_LOCK = 541_195_271
 MODEL_ROLES = {"creator", "agent_or_agency", "brand", "merchant", "supplier", "other", "insufficient"}
 FACT_ROLES = MODEL_ROLES - {"insufficient"}
 ACCOUNT_RELATIONSHIPS = {"owner", "representative", "mentioned_other", "unrelated", "insufficient"}
@@ -120,36 +122,8 @@ def assessment_available() -> bool:
     return bool(row and row["enabled"] and row["provider"].casefold() == "openai" and row["api_key_ciphertext"])
 
 
-def _automatic_execution_allowed() -> bool:
-    """Pause the whole automatic queue briefly after a feature-level failure."""
-
-    with connection() as conn:
-        row = conn.execute(
-            """
-            SELECT enabled, provider, api_key_ciphertext,
-                CASE
-                    WHEN last_test_status = 'failed'
-                     AND last_tested_at > NOW() - (%s * INTERVAL '1 minute')
-                    THEN FALSE
-                    ELSE TRUE
-                END AS retry_allowed
-            FROM ai_feature_configs
-            WHERE feature = %s
-            """,
-            (AUTOMATIC_FAILURE_COOLDOWN_MINUTES, FEATURE),
-        ).fetchone()
-        if (
-            not row
-            or not row["enabled"]
-            or row["provider"].casefold() != "openai"
-            or not row["api_key_ciphertext"]
-        ):
-            return False
-    return bool(row["retry_allowed"])
-
-
-def queue_eligible_contact_assessments(limit: int = 5) -> int:
-    """Keep at most five automatic reviews queued for contacts with new messages.
+def queue_eligible_contact_assessments() -> int:
+    """Materialize every eligible contact into the durable PostgreSQL queue.
 
     ``first_observed_at`` is immutable, so ordinary incremental re-reads do
     not make a contact eligible again.  Any completed outcome consumes the
@@ -158,26 +132,25 @@ def queue_eligible_contact_assessments(limit: int = 5) -> int:
     retrying. Transient task failures retry at most three times per watermark.
     """
 
-    limit = min(max(int(limit), 1), 5)
     with connection() as conn, conn.transaction():
-        config = conn.execute(
-            "SELECT enabled, provider, api_key_ciphertext FROM ai_feature_configs WHERE feature = %s",
-            (FEATURE,),
+        refreshed = conn.execute(
+            """
+            UPDATE ai_feature_configs
+            SET automatic_queue_checked_at = NOW(), updated_at = NOW()
+            WHERE feature = %s
+              AND enabled
+              AND provider = 'openai'
+              AND api_key_ciphertext IS NOT NULL
+              AND automatic_queue_checked_at <= NOW() - (%s * INTERVAL '1 second')
+            RETURNING feature
+            """,
+            (FEATURE, AUTOMATIC_QUEUE_REFRESH_SECONDS),
         ).fetchone()
-        if (
-            not config
-            or not config["enabled"]
-            or config["provider"].casefold() != "openai"
-            or not config["api_key_ciphertext"]
-        ):
+        if not refreshed:
             return 0
         rows = conn.execute(
             """
-            WITH queue_slots AS (
-                SELECT GREATEST(0, %s - COUNT(*))::integer AS queue_limit
-                FROM contact_assessments
-                WHERE status IN ('queued', 'running')
-            ), eligible_messages AS (
+            WITH eligible_messages AS (
                 SELECT
                     identity.contact_id,
                     observation.first_observed_at,
@@ -266,7 +239,6 @@ def queue_eligible_contact_assessments(limit: int = 5) -> int:
                       AND active.status IN ('queued', 'running')
                 )
                 ORDER BY eligible.source_message_seen_at, eligible.contact_id
-                LIMIT (SELECT queue_limit FROM queue_slots)
             )
             INSERT INTO contact_assessments (
                 id, contact_id, trigger, source_message_seen_at
@@ -276,7 +248,7 @@ def queue_eligible_contact_assessments(limit: int = 5) -> int:
             ON CONFLICT (contact_id) WHERE status IN ('queued', 'running') DO NOTHING
             RETURNING id
             """,
-            (limit, MAX_AUTOMATIC_ATTEMPTS_PER_WATERMARK, AUTOMATIC_RETRY_COOLDOWN_MINUTES),
+            (MAX_AUTOMATIC_ATTEMPTS_PER_WATERMARK, AUTOMATIC_RETRY_COOLDOWN_MINUTES),
         ).fetchall()
     return len(rows)
 
@@ -640,17 +612,13 @@ def confirm_assessment_account_relation(
 
 
 def run_next_contact_assessment(settings: Settings) -> bool:
-    """Queue eligible contacts and run one review while the Lark worker is idle."""
+    """Keep the durable queue current and run one rate-limited assessment."""
 
     _expire_leases()
-    if not _automatic_execution_allowed():
+    if not assessment_available():
         return False
+    queue_eligible_contact_assessments()
     job = _claim_next()
-    if not job:
-        # ponytail: five-task batches trade promptness for a bounded, cheap
-        # scan; add a durable pending-contact queue only if this becomes slow.
-        queue_eligible_contact_assessments()
-        job = _claim_next()
     if not job:
         return False
     _run(job, settings)
@@ -659,14 +627,14 @@ def run_next_contact_assessment(settings: Settings) -> bool:
 
 def _expire_leases() -> None:
     with connection() as conn, conn.transaction():
-        # Avoid a surprise duplicate paid request after a worker crash.  An owner
-        # can explicitly press the button again once the reason is visible.
+        # Do not repeat an uncertain paid request immediately after a crash.
+        # The ordinary per-contact retry policy will safely requeue it later.
         conn.execute(
             """
             UPDATE contact_assessments
             SET status = 'failed', finished_at = NOW(), lease_until = NULL,
                 outcome = 'no_action', review_status = 'not_required',
-                error_message = '工作进程中断；请重新发起判定。', updated_at = NOW()
+                error_message = '工作进程中断；将在稍后自动重试。', updated_at = NOW()
             WHERE status = 'running' AND lease_until < NOW()
             """
         )
@@ -674,15 +642,32 @@ def _expire_leases() -> None:
 
 def _claim_next() -> dict[str, Any] | None:
     with connection() as conn, conn.transaction():
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (AUTOMATIC_CLAIM_LOCK,))
+        automatic_ready = conn.execute(
+            """
+            SELECT NOT EXISTS (
+                SELECT 1 FROM contact_assessments
+                WHERE trigger = 'automatic' AND status = 'running'
+            ) AND NOT EXISTS (
+                SELECT 1 FROM contact_assessments
+                WHERE trigger = 'automatic'
+                  AND started_at > NOW() - (%s * INTERVAL '1 second')
+            ) AS ready
+            """,
+            (AUTOMATIC_START_INTERVAL_SECONDS,),
+        ).fetchone()
         row = conn.execute(
             """
             SELECT id, contact_id, trigger, attempts
             FROM contact_assessments
-            WHERE status = 'queued' AND scheduled_at <= NOW()
+            WHERE status = 'queued'
+              AND scheduled_at <= NOW()
+              AND (trigger <> 'automatic' OR %s)
             ORDER BY scheduled_at, created_at
             FOR UPDATE SKIP LOCKED
             LIMIT 1
-            """
+            """,
+            (bool(automatic_ready and automatic_ready["ready"]),),
         ).fetchone()
         if not row:
             return None
@@ -756,16 +741,16 @@ def _run(job: Mapping[str, Any], settings: Settings) -> None:
         _finish(
             assessment_id,
             "invalid",
-            "模型未返回可核验的建议；未写入任何联系人事实。",
+            "模型未返回可核验的建议；未写入任何联系人事实，稍后会自动重试。",
             outcome="no_action",
         )
         _mark_feature_test("failed")
     except ContactAssessmentInputError as exc:
-        _finish(assessment_id, "failed", str(exc), outcome="no_action")
+        _finish(assessment_id, "failed", f"{exc} 系统会稍后自动重试。", outcome="no_action")
         _mark_feature_test("failed")
     except Exception:
         LOGGER.exception("contact assessment failed without logging user content")
-        _finish(assessment_id, "failed", "AI 服务暂时不可用；请稍后重新发起。", outcome="no_action")
+        _finish(assessment_id, "failed", "AI 服务暂时不可用；系统会稍后自动重试。", outcome="no_action")
         _mark_feature_test("failed")
 
 
@@ -1560,7 +1545,7 @@ def _auto_confirm_threshold(config: Mapping[str, Any]) -> float:
         threshold = float(config.get("auto_confirm_threshold", DEFAULT_AUTO_CONFIRM_THRESHOLD))
     except (TypeError, ValueError) as exc:
         raise ContactAssessmentInputError("自动确认阈值无效；请在 AI 功能配置中重新保存。") from exc
-    if not 0.5 <= threshold <= 1:
+    if not 0.9 <= threshold <= 1:
         raise ContactAssessmentInputError("自动确认阈值无效；请在 AI 功能配置中重新保存。")
     return threshold
 

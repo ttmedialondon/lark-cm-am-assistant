@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import uuid4
 
 from app import worker
@@ -227,3 +228,29 @@ def test_contact_assessment_runner_keeps_worker_alive_on_unexpected_failure(monk
     )
 
     assert worker._run_contact_assessment(object()) is False
+
+
+def test_worker_gives_the_durable_ai_queue_a_turn_during_continuous_sync(monkeypatch) -> None:
+    calls: list[str] = []
+    jobs = iter((object(), object(), object()))
+
+    def recover() -> None:
+        if "assessment" in calls:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        worker,
+        "get_settings",
+        lambda: SimpleNamespace(app_secret_configured=True, worker_idle_seconds=1),
+    )
+    monkeypatch.setattr(worker, "_recover_expired_leases", recover)
+    monkeypatch.setattr(worker, "_claim_job", lambda: next(jobs))
+    monkeypatch.setattr(worker, "_execute_job", lambda _job, _settings: calls.append("sync"))
+    monkeypatch.setattr(worker, "_run_contact_assessment", lambda _settings: calls.append("assessment") or True)
+
+    try:
+        worker.run_forever()
+    except KeyboardInterrupt:
+        pass
+
+    assert calls == ["sync", "sync", "sync", "assessment"]
