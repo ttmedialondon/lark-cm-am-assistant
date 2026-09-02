@@ -50,6 +50,9 @@ def test_automatic_queue_materializes_all_eligible_contacts_from_immutable_water
     assert "active.status IN ('queued', 'running')" in query
     assert "contact_roles role" in query
     assert "identity.tenant_classification <> 'internal'" in query
+    assert "FROM contact_organization_links link" in query
+    assert "link.contact_id = identity.contact_id" in query
+    assert "organization_sync_state" not in query
     assert "queue_slots" not in query
     assert "LIMIT (SELECT queue_limit FROM queue_slots)" not in query
     assert "ON CONFLICT (contact_id) WHERE status IN ('queued', 'running')" in query
@@ -110,4 +113,7 @@ def test_claim_uses_a_database_lock_and_rate_limits_automatic_work(monkeypatch) 
     assert lock_params == (contact_assessments.AUTOMATIC_CLAIM_LOCK,)
     claim_query, claim_params = calls[-1]
     assert "trigger <> 'automatic' OR %s" in claim_query
+    assert "FROM contact_organization_links link" in claim_query
+    assert "link.contact_id = contact_assessments.contact_id" in claim_query
+    assert "organization_sync_state" not in claim_query
     assert claim_params == (False,)

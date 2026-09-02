@@ -9,33 +9,34 @@
       <div class="card-header"><div><h3 class="card-title mb-1">人员目录</h3><div class="text-secondary small">按稳定 Lark 身份聚合。TT Media London 同事由内部租户事实确定；其他类别仅由已确认事实或证据充分的 AI 建议确定。</div></div></div>
       <div class="card-body border-bottom">
         <div class="subheader mb-2">主类别</div><div class="btn-list">
-          <a class="btn btn-sm {% if category == 'all' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=all&amp;organization_status={{ organization_status }}">全部</a>
-          <a class="btn btn-sm {% if category == 'unclassified' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=unclassified&amp;organization_status={{ organization_status }}">待识别</a>
-          <a class="btn btn-sm {% if category == 'creator' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=creator&amp;organization_status={{ organization_status }}">达人 / 内容创作者</a>
-          <a class="btn btn-sm {% if category == 'partner_contact' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=partner_contact&amp;organization_status={{ organization_status }}">合作机构对接人</a>
-          <a class="btn btn-sm {% if category == 'merchant_contact' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=merchant_contact&amp;organization_status={{ organization_status }}">商家 / 品牌方</a>
-          <a class="btn btn-sm {% if category == 'platform_contact' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=platform_contact&amp;organization_status={{ organization_status }}">字节系平台官方</a>
-          <a class="btn btn-sm {% if category == 'internal_colleague' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=internal_colleague&amp;organization_status={{ organization_status }}">TT Media 同事</a>
-          <a class="btn btn-sm {% if category == 'other_external_contact' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=other_external_contact&amp;organization_status={{ organization_status }}">其他已确认外部联系人</a>
+          <a class="btn btn-sm {% if category == 'all' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=all&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">全部</a>
+          <a class="btn btn-sm {% if category == 'unclassified' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=unclassified&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">待识别</a>
+          <a class="btn btn-sm {% if category == 'creator' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=creator&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">达人 / 内容创作者</a>
+          <a class="btn btn-sm {% if category == 'partner_contact' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=partner_contact&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">合作机构对接人</a>
+          <a class="btn btn-sm {% if category == 'merchant_contact' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=merchant_contact&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">商家 / 品牌方</a>
+          <a class="btn btn-sm {% if category == 'platform_contact' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=platform_contact&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">字节系平台官方</a>
+          <a class="btn btn-sm {% if category == 'internal_colleague' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=internal_colleague&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">TT Media 同事</a>
+          <a class="btn btn-sm {% if category == 'other_external_contact' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=other_external_contact&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">其他已确认外部联系人</a>
         </div>
         <div class="subheader mt-3 mb-2">组织状态</div><div class="btn-list">
-          <a class="btn btn-sm {% if organization_status == 'all' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category={{ category }}&amp;organization_status=all">全部</a>
-          <a class="btn btn-sm {% if organization_status == 'verified' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category={{ category }}&amp;organization_status=verified">已验证</a>
-          <a class="btn btn-sm {% if organization_status == 'candidate' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category={{ category }}&amp;organization_status=candidate">待核验</a>
-          <a class="btn btn-sm {% if organization_status == 'unresolved' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category={{ category }}&amp;organization_status=unresolved">未解析</a>
+          <a class="btn btn-sm {% if organization_status == 'all' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category={{ category }}&amp;organization_status=all{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">全部</a>
+          <a class="btn btn-sm {% if organization_status == 'verified' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category={{ category }}&amp;organization_status=verified{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">已验证</a>
+          <a class="btn btn-sm {% if organization_status == 'candidate' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category={{ category }}&amp;organization_status=candidate{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">待核验</a>
+          <a class="btn btn-sm {% if organization_status == 'unresolved' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category={{ category }}&amp;organization_status=unresolved{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">未解析</a>
         </div>
+        <form action="/admin/contacts" method="get" class="row g-2 align-items-end mt-3"><input type="hidden" name="category" value="{{ category }}"><input type="hidden" name="organization_status" value="{{ organization_status }}"><div class="col-sm-6 col-lg-4"><label class="form-label">按组织筛选</label><input class="form-control" type="search" name="organization_query" value="{{ organization_query }}" maxlength="120" placeholder="例如 TT MEDIA ITALY"></div><div class="col-auto"><button class="btn btn-outline-primary" type="submit">筛选</button>{% if organization_query %}<a class="btn btn-link" href="/admin/contacts?category={{ category }}&amp;organization_status={{ organization_status }}">清除</a>{% endif %}</div></form>
       </div>
       {% if contacts %}
       <div class="table-responsive admin-directory__table"><table class="table table-vcenter card-table">
-        <thead><tr><th>人员</th><th>主类别</th><th>所属组织</th><th>Lark 身份</th><th>会话</th><th>发送消息</th><th>最近活动</th><th></th></tr></thead>
+        <thead><tr><th>人员</th><th>主类别</th><th>所属组织</th><th>租户属性</th><th>会话</th><th>发送消息</th><th>最近活动</th><th></th></tr></thead>
         <tbody>{% for contact in contacts %}<tr>
           <td><div class="fw-medium">{{ contact.display_name }}</div>{% if contact.lark_identity_count > 1 %}<div class="text-secondary small">{{ contact.lark_identity_count }} 个稳定 Lark 身份</div>{% endif %}</td>
-          <td><span class="badge bg-{{ contact.category_badge }}-lt">{{ contact.category_label }}</span>{% for label in contact.confirmed_role_labels[1:] %}<div class="text-secondary small mt-1">{{ label }}</div>{% endfor %}</td>
+          <td><span class="badge bg-{{ contact.category_badge }}-lt">{{ contact.category_label }}</span>{% for label in contact.confirmed_role_labels[1:] %}<div class="text-secondary small mt-1">辅助：{{ label }}</div>{% endfor %}</td>
           <td><div>{{ contact.organization_name }}</div><span class="badge bg-{{ contact.organization_status_badge }}-lt mt-1">{{ contact.organization_status_label }}</span></td>
           <td><span class="badge bg-{{ contact.tenant_classification_badge }}-lt">{{ contact.tenant_classification_label }}</span></td>
           <td>{{ contact.conversation_count }}</td><td>{{ contact.message_count }}</td>
           <td class="text-secondary text-nowrap">{{ contact.last_seen_at_label }}</td>
-          <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="/admin/contacts/{{ contact.open_id }}?page={{ contact_page.page }}&amp;category={{ category }}&amp;organization_status={{ organization_status }}">查看</a></td>
+          <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="/admin/contacts/{{ contact.open_id }}?page={{ contact_page.page }}&amp;category={{ category }}&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">查看</a></td>
         </tr>{% endfor %}</tbody>
       </table></div>
       {% with pager=contact_page %}{% include "admin/_pagination.html" %}{% endwith %}

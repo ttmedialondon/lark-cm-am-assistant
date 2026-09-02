@@ -17,7 +17,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse, Response
 
-from . import admin_reporting, ai_feature_config, contact_assessments, contact_assignments
+from . import admin_reporting, ai_feature_config, contact_assessments, contact_assignments, organization_sync
 from .config import get_settings
 from .db import connection
 
@@ -141,6 +141,22 @@ def create_admin_router(
             "next_url": url(page + 1) if has_next else None,
         }
 
+    def contact_query(
+        *,
+        page: int,
+        category: str,
+        organization_status: str,
+        organization_query: str,
+    ) -> str:
+        query: dict[str, object] = {
+            "page": page,
+            "category": category,
+            "organization_status": organization_status,
+        }
+        if organization_query:
+            query["organization_query"] = organization_query
+        return urlencode(query)
+
     def owner_access(request: Request) -> tuple[dict[str, Any] | None, Response | None]:
         access_context, denied = access(request)
         if denied is not None:
@@ -217,6 +233,7 @@ def create_admin_router(
         source_page: int = 1,
         source_category: str = "all",
         source_organization_status: str = "all",
+        source_organization_query: str = "",
         error: str | None = None,
         status_code: int = 200,
     ) -> Response:
@@ -243,6 +260,13 @@ def create_admin_router(
                     "source_page": source_page,
                     "source_category": source_category,
                     "source_organization_status": source_organization_status,
+                    "source_organization_query": source_organization_query,
+                    "source_query": contact_query(
+                        page=source_page,
+                        category=source_category,
+                        organization_status=source_organization_status,
+                        organization_query=source_organization_query,
+                    ),
                     "form_error": error,
                 },
                 status_code,
@@ -526,6 +550,7 @@ def create_admin_router(
         page: int = 1,
         category: str = "all",
         organization_status: str = "all",
+        organization_query: str = "",
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
@@ -533,7 +558,8 @@ def create_admin_router(
         assert access_context is not None
         category = admin_reporting.normalize_contact_category(category)
         organization_status = admin_reporting.normalize_organization_status(organization_status)
-        contact_page = admin_reporting.contacts(page, category, organization_status)
+        organization_query = admin_reporting.normalize_organization_query(organization_query)
+        contact_page = admin_reporting.contacts(page, category, organization_status, organization_query)
         response = render_template(
             request,
             "admin/contacts.html",
@@ -545,9 +571,14 @@ def create_admin_router(
                     "/admin/contacts",
                     category=category,
                     organization_status=organization_status,
+                    organization_query=organization_query or None,
                 ),
                 "category": category,
                 "organization_status": organization_status,
+                "organization_query": organization_query,
+                "organization_query_param": urlencode({"organization_query": organization_query})
+                if organization_query
+                else "",
                 "organization_sync": admin_reporting.organization_sync_status(),
             },
         )
@@ -561,6 +592,7 @@ def create_admin_router(
         page: int = 1,
         category: str = "all",
         organization_status: str = "all",
+        organization_query: str = "",
         conversations_page: int = 1,
     ) -> Response:
         access_context, denied = owner_access(request)
@@ -569,6 +601,7 @@ def create_admin_router(
         assert access_context is not None
         category = admin_reporting.normalize_contact_category(category)
         organization_status = admin_reporting.normalize_organization_status(organization_status)
+        organization_query = admin_reporting.normalize_organization_query(organization_query)
         detail = admin_reporting.contact_detail(open_id, conversations_page)
         if not detail:
             return render_template(
@@ -599,9 +632,19 @@ def create_admin_router(
                 **page_context(access_context, "contacts"),
                 "contact": detail["contact"],
                 "identities": detail["identities"],
+                "organizations": detail["organizations"],
+                "organization_context_ready": any(item.get("status") == "verified" for item in detail["organizations"]),
+                "tenant_population": detail.get("tenant_population", 0),
                 "source_page": page,
                 "source_category": category,
                 "source_organization_status": organization_status,
+                "source_organization_query": organization_query,
+                "source_query": contact_query(
+                    page=page,
+                    category=category,
+                    organization_status=organization_status,
+                    organization_query=organization_query,
+                ),
                 "assessment": latest_assessment,
                 "assessment_available": contact_assessments.assessment_available(),
                 "is_creator": is_creator,
@@ -618,6 +661,7 @@ def create_admin_router(
                     page=page,
                     category=category,
                     organization_status=organization_status,
+                    organization_query=organization_query or None,
                 ),
             },
         )
@@ -632,6 +676,7 @@ def create_admin_router(
         page: int = 1,
         category: str = "all",
         organization_status: str = "all",
+        organization_query: str = "",
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
@@ -639,6 +684,7 @@ def create_admin_router(
         assert access_context is not None
         category = admin_reporting.normalize_contact_category(category)
         organization_status = admin_reporting.normalize_organization_status(organization_status)
+        organization_query = admin_reporting.normalize_organization_query(organization_query)
         form = await _form_fields(request)
         if not _csrf_matches(form, csrf_token(access_context["authorization"])):
             response = render_template(
@@ -681,7 +727,83 @@ def create_admin_router(
             )
             response.headers["Cache-Control"] = "no-store, max-age=0"
             return response
-        query = urlencode({"page": page, "category": category, "organization_status": organization_status})
+        query = contact_query(
+            page=page,
+            category=category,
+            organization_status=organization_status,
+            organization_query=organization_query,
+        )
+        response = RedirectResponse(url=f"/admin/contacts/{open_id}?{query}", status_code=303)
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
+    @router.post("/admin/contacts/{open_id}/organization")
+    async def admin_confirm_contact_organization(
+        request: Request,
+        open_id: str,
+        page: int = 1,
+        category: str = "all",
+        organization_status: str = "all",
+        organization_query: str = "",
+    ) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        category = admin_reporting.normalize_contact_category(category)
+        organization_status = admin_reporting.normalize_organization_status(organization_status)
+        organization_query = admin_reporting.normalize_organization_query(organization_query)
+        form = await _form_fields(request)
+        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
+            response = render_template(
+                request,
+                "error.html",
+                {"title": "请求校验失败", "detail": "请返回联系人详情页后重试。"},
+                400,
+            )
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
+        with connection() as conn:
+            contact = conn.execute(
+                """
+                SELECT contact_id FROM lark_identities
+                WHERE open_id = %s AND identity_type = 'user'
+                """,
+                (open_id,),
+            ).fetchone()
+        if not contact:
+            response = render_template(
+                request,
+                "error.html",
+                {"title": "未找到联系人", "detail": "该 Lark 参与者尚未被同步。"},
+                404,
+            )
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
+        try:
+            organization_sync.manually_confirm_contact_organization(
+                access_context["authorization"]["id"],
+                contact["contact_id"],
+                open_id,
+                form.get("canonical_name", ""),
+                form.get("organization_kind", ""),
+                map_current_tenant=form.get("map_current_tenant") == "1",
+            )
+        except organization_sync.OrganizationInputError as exc:
+            response = render_template(
+                request,
+                "error.html",
+                {"title": "无法确认组织", "detail": str(exc)},
+                400,
+            )
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
+        query = contact_query(
+            page=page,
+            category=category,
+            organization_status=organization_status,
+            organization_query=organization_query,
+        )
         response = RedirectResponse(url=f"/admin/contacts/{open_id}?{query}", status_code=303)
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
@@ -694,6 +816,7 @@ def create_admin_router(
         page: int = 1,
         category: str = "all",
         organization_status: str = "all",
+        organization_query: str = "",
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
@@ -701,6 +824,7 @@ def create_admin_router(
         assert access_context is not None
         category = admin_reporting.normalize_contact_category(category)
         organization_status = admin_reporting.normalize_organization_status(organization_status)
+        organization_query = admin_reporting.normalize_organization_query(organization_query)
         return render_contact_assessment(
             request,
             access_context,
@@ -709,6 +833,7 @@ def create_admin_router(
             source_page=page,
             source_category=category,
             source_organization_status=organization_status,
+            source_organization_query=organization_query,
         )
 
     @router.post("/admin/contacts/{open_id}/assessments/{assessment_id}/roles")
@@ -719,6 +844,7 @@ def create_admin_router(
         page: int = 1,
         category: str = "all",
         organization_status: str = "all",
+        organization_query: str = "",
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
@@ -726,6 +852,7 @@ def create_admin_router(
         assert access_context is not None
         category = admin_reporting.normalize_contact_category(category)
         organization_status = admin_reporting.normalize_organization_status(organization_status)
+        organization_query = admin_reporting.normalize_organization_query(organization_query)
         if not contact_assessments.assessment_matches_contact(assessment_id, open_id):
             response = render_template(
                 request,
@@ -745,6 +872,7 @@ def create_admin_router(
                 source_page=page,
                 source_category=category,
                 source_organization_status=organization_status,
+                source_organization_query=organization_query,
                 error="请求校验失败，请返回此页面后重试。",
                 status_code=400,
             )
@@ -761,27 +889,31 @@ def create_admin_router(
                 source_page=page,
                 source_category=category,
                 source_organization_status=organization_status,
+                source_organization_query=organization_query,
                 error=str(exc),
                 status_code=400,
             )
+        query = contact_query(
+            page=page,
+            category=category,
+            organization_status=organization_status,
+            organization_query=organization_query,
+        )
         response = RedirectResponse(
-            url=(
-                f"/admin/contacts/{open_id}/assessments/{assessment_id}?"
-                f"{urlencode({'page': page, 'category': category, 'organization_status': organization_status})}"
-            ),
-            status_code=303,
+            url=f"/admin/contacts/{open_id}/assessments/{assessment_id}?{query}", status_code=303
         )
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 
-    @router.post("/admin/contacts/{open_id}/assessments/{assessment_id}/dismiss")
-    async def admin_dismiss_contact_assessment(
+    @router.post("/admin/contacts/{open_id}/assessments/{assessment_id}/organizations")
+    async def admin_confirm_assessment_organization(
         request: Request,
         open_id: str,
         assessment_id: UUID,
         page: int = 1,
         category: str = "all",
         organization_status: str = "all",
+        organization_query: str = "",
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
@@ -789,6 +921,7 @@ def create_admin_router(
         assert access_context is not None
         category = admin_reporting.normalize_contact_category(category)
         organization_status = admin_reporting.normalize_organization_status(organization_status)
+        organization_query = admin_reporting.normalize_organization_query(organization_query)
         if not contact_assessments.assessment_matches_contact(assessment_id, open_id):
             response = render_template(
                 request,
@@ -808,6 +941,82 @@ def create_admin_router(
                 source_page=page,
                 source_category=category,
                 source_organization_status=organization_status,
+                source_organization_query=organization_query,
+                error="请求校验失败，请返回此页面后重试。",
+                status_code=400,
+            )
+        try:
+            candidate = contact_assessments.organization_candidate_for_assessment(
+                assessment_id, form.get("organization_name", "")
+            )
+            organization_sync.manually_confirm_contact_organization(
+                access_context["authorization"]["id"],
+                candidate["contact_id"],
+                open_id,
+                candidate["name"],
+                candidate["kind"],
+                map_current_tenant=form.get("map_current_tenant") == "1",
+            )
+        except (contact_assessments.ContactAssessmentInputError, organization_sync.OrganizationInputError) as exc:
+            return render_contact_assessment(
+                request,
+                access_context,
+                open_id=open_id,
+                assessment_id=assessment_id,
+                source_page=page,
+                source_category=category,
+                source_organization_status=organization_status,
+                source_organization_query=organization_query,
+                error=str(exc),
+                status_code=400,
+            )
+        query = contact_query(
+            page=page,
+            category=category,
+            organization_status=organization_status,
+            organization_query=organization_query,
+        )
+        response = RedirectResponse(url=f"/admin/contacts/{open_id}?{query}", status_code=303)
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
+    @router.post("/admin/contacts/{open_id}/assessments/{assessment_id}/dismiss")
+    async def admin_dismiss_contact_assessment(
+        request: Request,
+        open_id: str,
+        assessment_id: UUID,
+        page: int = 1,
+        category: str = "all",
+        organization_status: str = "all",
+        organization_query: str = "",
+    ) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        category = admin_reporting.normalize_contact_category(category)
+        organization_status = admin_reporting.normalize_organization_status(organization_status)
+        organization_query = admin_reporting.normalize_organization_query(organization_query)
+        if not contact_assessments.assessment_matches_contact(assessment_id, open_id):
+            response = render_template(
+                request,
+                "error.html",
+                {"title": "未找到 AI 判定", "detail": "该判定不存在，或不属于当前联系人。"},
+                404,
+            )
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
+        form = await _form_fields(request)
+        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
+            return render_contact_assessment(
+                request,
+                access_context,
+                open_id=open_id,
+                assessment_id=assessment_id,
+                source_page=page,
+                source_category=category,
+                source_organization_status=organization_status,
+                source_organization_query=organization_query,
                 error="请求校验失败，请返回此页面后重试。",
                 status_code=400,
             )
@@ -822,10 +1031,16 @@ def create_admin_router(
                 source_page=page,
                 source_category=category,
                 source_organization_status=organization_status,
+                source_organization_query=organization_query,
                 error=str(exc),
                 status_code=400,
             )
-        query = urlencode({"page": page, "category": category, "organization_status": organization_status})
+        query = contact_query(
+            page=page,
+            category=category,
+            organization_status=organization_status,
+            organization_query=organization_query,
+        )
         response = RedirectResponse(url=f"/admin/contacts/{open_id}?{query}", status_code=303)
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response

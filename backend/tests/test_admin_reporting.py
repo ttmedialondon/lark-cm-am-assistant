@@ -42,6 +42,8 @@ def test_message_conversation_filter_values_are_bounded_and_allowlisted():
     assert admin_reporting.normalize_contact_category("unexpected") == "all"
     assert admin_reporting.normalize_organization_status("verified") == "verified"
     assert admin_reporting.normalize_organization_status("unexpected") == "all"
+    assert admin_reporting.normalize_organization_query("  TT   MEDIA ITALY  ") == "TT MEDIA ITALY"
+    assert admin_reporting.normalize_organization_query("x" * 121) == "x" * 120
     assert admin_reporting.normalize_creator_assignment_filter("pending") == "pending"
     assert admin_reporting.normalize_creator_assignment_filter("unexpected") == "all"
 

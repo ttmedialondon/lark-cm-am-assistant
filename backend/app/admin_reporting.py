@@ -23,7 +23,7 @@ from cryptography.exceptions import InvalidTag
 
 from .config import get_settings
 from .contact_assignments import MANUAL_REVIEW_CONFIDENCE_FLOOR, POLICY_VERSION
-from .contact_taxonomy import CONTACT_ROLE_CODES, ROLE_LABELS, role_label
+from .contact_taxonomy import CONTACT_ROLE_CODES, ORGANIZATION_KIND_LABELS, ROLE_LABELS, role_label
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
 
@@ -34,6 +34,7 @@ MAX_PAGE = 10_000
 MESSAGE_PAGE_SIZE = 100
 MESSAGE_CONVERSATION_PAGE_SIZE = 5
 MAX_MESSAGE_CONVERSATION_QUERY_LENGTH = 120
+MAX_ORGANIZATION_QUERY_LENGTH = 120
 MESSAGE_CONVERSATION_TYPES = frozenset({"all", "group", "p2p"})
 CONTACT_CATEGORIES = frozenset({"all", "unclassified", *CONTACT_ROLE_CODES})
 ORGANIZATION_STATUSES = frozenset({"all", "verified", "candidate", "unresolved"})
@@ -855,12 +856,14 @@ def contacts(
     page: int = 1,
     category: str = "all",
     organization_status: str = "all",
+    organization_query: str = "",
 ) -> dict[str, Any]:
-    """Return all human contacts, filtered by main category and organization state."""
+    """Return people filtered by category, organization state, and organization name."""
 
     category = normalize_contact_category(category)
     organization_status = normalize_organization_status(organization_status)
-    filters = (category, category, organization_status, organization_status)
+    organization_query = normalize_organization_query(organization_query)
+    filters = (category, category, organization_status, organization_status, organization_query, organization_query)
     with connection() as conn:
         total_count = int(
             conn.execute(
@@ -869,6 +872,17 @@ def contacts(
                 SELECT COUNT(*) AS total_count FROM directory
                 WHERE (%s = 'all' OR category = %s)
                   AND (%s = 'all' OR organization_status = %s)
+                  AND (
+                      %s = '' OR EXISTS (
+                          SELECT 1
+                          FROM contact_organization_links organization_link
+                          JOIN organizations organization_filter
+                            ON organization_filter.id = organization_link.organization_id
+                          WHERE organization_link.contact_id = directory.contact_id
+                            AND organization_link.status <> 'rejected'
+                            AND POSITION(LOWER(%s) IN LOWER(organization_filter.canonical_name)) > 0
+                      )
+                  )
                 """,
                 filters,
             ).fetchone()["total_count"]
@@ -881,6 +895,17 @@ def contacts(
             SELECT * FROM directory
             WHERE (%s = 'all' OR category = %s)
               AND (%s = 'all' OR organization_status = %s)
+              AND (
+                  %s = '' OR EXISTS (
+                      SELECT 1
+                      FROM contact_organization_links organization_link
+                      JOIN organizations organization_filter
+                        ON organization_filter.id = organization_link.organization_id
+                      WHERE organization_link.contact_id = directory.contact_id
+                        AND organization_link.status <> 'rejected'
+                        AND POSITION(LOWER(%s) IN LOWER(organization_filter.canonical_name)) > 0
+                  )
+              )
             ORDER BY last_seen_at DESC NULLS LAST, LOWER(display_name), contact_id
             LIMIT %s OFFSET %s
             """,
@@ -956,6 +981,19 @@ def contact_detail(open_id: str, conversation_page: int = 1) -> dict[str, Any] |
             return None
 
         contact_id = contact["contact_id"]
+        tenant_population = 0
+        if contact["tenant_key"]:
+            tenant_population = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT contact_id) AS total_count
+                    FROM lark_identities
+                    WHERE tenant_key = %s AND identity_type = 'user' AND contact_id IS NOT NULL
+                    """,
+                    (contact["tenant_key"],),
+                ).fetchone()["total_count"]
+                or 0
+            )
         identities = conn.execute(
             """
             SELECT open_id, display_name, tenant_key, tenant_classification, first_seen_at, last_seen_at
@@ -1066,6 +1104,7 @@ def contact_detail(open_id: str, conversation_page: int = 1) -> dict[str, Any] |
 
     return {
         "contact": _decorate_contact(contact),
+        "tenant_population": tenant_population,
         "identities": [_decorate_lark_identity(row) for row in identities],
         "organizations": [_decorate_contact_organization(row) for row in organizations],
         "conversations": _page_result(
@@ -1099,6 +1138,12 @@ def normalize_organization_status(value: str | None) -> str:
     """Return one supported organization-verification filter."""
 
     return value if value in ORGANIZATION_STATUSES else "all"
+
+
+def normalize_organization_query(value: str | None) -> str:
+    """Keep the organization-name filter bounded without inventing a search index."""
+
+    return " ".join((value or "").split())[:MAX_ORGANIZATION_QUERY_LENGTH]
 
 
 def normalize_creator_assignment_filter(value: str | None) -> str:
@@ -1497,15 +1542,7 @@ def _decorate_contact_organization(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     item["canonical_name"] = item.get("canonical_name") or "未命名组织"
     item["status_label"], item["status_badge"] = _organization_status(item.get("status"))
-    kinds = {
-        "mcn_or_agency": "MCN / 代理机构",
-        "merchant_or_brand": "商家 / 品牌",
-        "platform": "平台",
-        "partner_service": "合作服务商",
-        "other": "其他组织",
-        "unknown": "类型未标注",
-    }
-    item["organization_kind_label"] = kinds.get(item.get("organization_kind"), "类型未标注")
+    item["organization_kind_label"] = ORGANIZATION_KIND_LABELS.get(item.get("organization_kind"), "类型未标注")
     relationships = {
         "tenant_affiliation": "Lark 租户关联",
         "employee": "成员关系",

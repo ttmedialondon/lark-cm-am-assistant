@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from fastapi.testclient import TestClient
 
-from app import admin, admin_reporting, contact_assessments, contact_assignments
+from app import admin, admin_reporting, contact_assessments, contact_assignments, organization_sync
 
 
 def _page(items, page=1, has_next=False, **metadata):
@@ -186,7 +186,9 @@ def test_people_directory_filters_category_and_keeps_it_in_pagination(monkeypatc
     monkeypatch.setattr(
         admin_reporting,
         "contacts",
-        lambda page, category, organization_status: calls.append((page, category, organization_status))
+        lambda page, category, organization_status, organization_query: calls.append(
+            (page, category, organization_status, organization_query)
+        )
         or _page([], page=page, total_count=50, total_pages=2, page_size=25),
     )
     monkeypatch.setattr(
@@ -196,15 +198,15 @@ def test_people_directory_filters_category_and_keeps_it_in_pagination(monkeypatc
     )
 
     response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get(
-        "/admin/contacts?page=2&category=creator&organization_status=verified"
+        "/admin/contacts?page=2&category=creator&organization_status=verified&organization_query=TT+MEDIA+ITALY"
     )
 
     assert response.status_code == 200
-    assert calls == [(2, "creator", "verified")]
+    assert calls == [(2, "creator", "verified", "TT MEDIA ITALY")]
     assert contexts[-1][1]["category"] == "creator"
     assert contexts[-1][1]["organization_status"] == "verified"
     assert contexts[-1][1]["contact_page"]["previous_url"] == (
-        "/admin/contacts?category=creator&organization_status=verified&page=1"
+        "/admin/contacts?category=creator&organization_status=verified&organization_query=TT+MEDIA+ITALY&page=1"
     )
 
 
@@ -224,6 +226,7 @@ def test_owner_contact_detail_reads_only_that_contact_without_message_content(mo
         or {
             "contact": {"contact_id": uuid4()},
             "identities": [],
+            "organizations": [],
             "conversations": _page([]),
         },
     )
@@ -240,6 +243,52 @@ def test_owner_contact_detail_reads_only_that_contact_without_message_content(mo
     assert contexts[-1][0] == "admin/contact_detail.html"
     assert contexts[-1][1]["assessment"] is None
     assert contexts[-1][1]["assessment_available"] is True
+
+
+def test_owner_can_confirm_one_persons_organization(monkeypatch):
+    owner_id = uuid4()
+    contact_id = uuid4()
+    confirmed = []
+
+    class Result:
+        @staticmethod
+        def fetchone():
+            return {"contact_id": contact_id}
+
+    class Connection:
+        @staticmethod
+        def execute(_query, _params):
+            return Result()
+
+    @contextmanager
+    def connection():
+        yield Connection()
+
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(admin, "connection", connection)
+    monkeypatch.setattr(
+        organization_sync,
+        "manually_confirm_contact_organization",
+        lambda *args, **kwargs: confirmed.append((args, kwargs)),
+    )
+
+    response = _client(lambda _request: {"id": owner_id, "status": "active"}).post(
+        "/admin/contacts/ou_contact/organization?page=2&category=unclassified&organization_query=TT+MEDIA",
+        data={
+            "csrf_token": "csrf",
+            "canonical_name": "TT MEDIA ITALY",
+            "organization_kind": "mcn_or_agency",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == (
+        "/admin/contacts/ou_contact?page=2&category=unclassified&organization_status=all&organization_query=TT+MEDIA"
+    )
+    assert confirmed == [
+        ((owner_id, contact_id, "ou_contact", "TT MEDIA ITALY", "mcn_or_agency"), {"map_current_tenant": False})
+    ]
 
 
 def test_owner_can_manually_set_or_hand_over_a_creator_assignment(monkeypatch):
@@ -351,6 +400,40 @@ def test_owner_confirmation_uses_only_suggested_form_values(monkeypatch):
         == f"/admin/contacts/ou_contact/assessments/{assessment_id}?page=4&category=all&organization_status=all"
     )
     assert confirmed == [(owner_id, assessment_id, "creator")]
+
+
+def test_owner_can_confirm_an_evidence_bound_organization_candidate(monkeypatch):
+    owner_id = uuid4()
+    assessment_id = uuid4()
+    contact_id = uuid4()
+    candidate_calls = []
+    confirmed = []
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(contact_assessments, "assessment_matches_contact", lambda *_args: True)
+    monkeypatch.setattr(
+        contact_assessments,
+        "organization_candidate_for_assessment",
+        lambda *args: candidate_calls.append(args)
+        or {"contact_id": contact_id, "name": "Trutonic Media", "kind": "mcn_or_agency"},
+    )
+    monkeypatch.setattr(
+        organization_sync,
+        "manually_confirm_contact_organization",
+        lambda *args, **kwargs: confirmed.append((args, kwargs)),
+    )
+
+    response = _client(lambda _request: {"id": owner_id, "status": "active"}).post(
+        f"/admin/contacts/ou_contact/assessments/{assessment_id}/organizations?page=4",
+        data={"csrf_token": "csrf", "organization_name": "Trutonic Media"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/contacts/ou_contact?page=4&category=all&organization_status=all"
+    assert candidate_calls == [(assessment_id, "Trutonic Media")]
+    assert confirmed == [
+        ((owner_id, contact_id, "ou_contact", "Trutonic Media", "mcn_or_agency"), {"map_current_tenant": False})
+    ]
 
 
 def test_owner_cannot_confirm_an_assessment_through_another_contact_path(monkeypatch):

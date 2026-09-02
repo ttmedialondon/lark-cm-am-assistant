@@ -5,14 +5,20 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import UUID
 
 import psycopg
 
 from .config import Settings
+from .contact_taxonomy import ORGANIZATION_KINDS
 from .db import connection
 from .lark_api import LarkApiError, LarkClient
 
 LOGGER = logging.getLogger("lark_message_stats.organization_sync")
+
+
+class OrganizationInputError(ValueError):
+    """An owner supplied an invalid organization fact."""
 
 
 def sync_if_due(settings: Settings, client: LarkClient) -> bool:
@@ -56,15 +62,15 @@ def verified_subject_organizations(conn: psycopg.Connection, contact_id: object)
 
     rows = conn.execute(
         """
-        SELECT DISTINCT organization.canonical_name, organization.organization_kind,
-               'tenant_affiliation' AS relationship
-        FROM lark_identities identity
-        JOIN organization_tenants mapping
-          ON mapping.tenant_key = identity.tenant_key AND mapping.status = 'verified'
+        SELECT DISTINCT ON (organization.id)
+               organization.canonical_name, organization.organization_kind, link.relationship
+        FROM contact_organization_links link
         JOIN organizations organization
-          ON organization.id = mapping.organization_id AND organization.verification_status = 'verified'
-        WHERE identity.contact_id = %s AND identity.identity_type = 'user'
-        ORDER BY organization.canonical_name
+          ON organization.id = link.organization_id AND organization.verification_status = 'verified'
+        WHERE link.contact_id = %s AND link.status = 'verified'
+        ORDER BY organization.id,
+                 CASE link.relationship WHEN 'tenant_affiliation' THEN 0 ELSE 1 END,
+                 link.last_seen_at DESC, organization.canonical_name
         LIMIT 3
         """,
         (contact_id,),
@@ -78,6 +84,146 @@ def verified_subject_organizations(conn: psycopg.Connection, contact_id: object)
         }
         for row in rows
     ]
+
+
+def assessment_context_ready(conn: psycopg.Connection, contact_id: object) -> bool:
+    """Require a verified organization fact for this particular person.
+
+    The model must receive both TT Media London and S1's organization. A global
+    Trust Party pass is not enough: the pass may not map this external person.
+    """
+
+    row = conn.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM contact_organization_links link
+            JOIN organizations organization
+              ON organization.id = link.organization_id AND organization.verification_status = 'verified'
+            WHERE link.contact_id = %s AND link.status = 'verified'
+        ) AS ready
+        """,
+        (contact_id,),
+    ).fetchone()
+    return bool(row and row["ready"])
+
+
+def manually_confirm_contact_organization(
+    actor_id: UUID,
+    contact_id: UUID,
+    open_id: str,
+    canonical_name: str,
+    organization_kind: str,
+    *,
+    map_current_tenant: bool,
+) -> None:
+    """Store one owner-confirmed organization fact and optionally its tenant map."""
+
+    name = " ".join(canonical_name.split())
+    if not 1 <= len(name) <= 320:
+        raise OrganizationInputError("组织名称需要为 1–320 个字符。")
+    if organization_kind not in ORGANIZATION_KINDS:
+        raise OrganizationInputError("组织类型无效。")
+
+    now = datetime.now(UTC)
+    with connection() as conn, conn.transaction():
+        identity = conn.execute(
+            """
+            SELECT tenant_key
+            FROM lark_identities
+            WHERE contact_id = %s AND open_id = %s AND identity_type = 'user'
+            """,
+            (contact_id, open_id),
+        ).fetchone()
+        if not identity:
+            raise OrganizationInputError("未找到该联系人的稳定 Lark 身份。")
+        organization = conn.execute(
+            """
+            INSERT INTO organizations (
+                canonical_name, organization_kind, verification_status, source, updated_at
+            ) VALUES (%s, %s, 'verified', 'manual', %s)
+            ON CONFLICT ((LOWER(canonical_name))) DO UPDATE SET
+                organization_kind = CASE
+                    WHEN organizations.organization_kind = 'unknown' THEN EXCLUDED.organization_kind
+                    ELSE organizations.organization_kind
+                END,
+                verification_status = 'verified',
+                source = CASE
+                    WHEN organizations.source IN ('lark_trust_party', 'crm') THEN organizations.source
+                    ELSE 'manual'
+                END,
+                updated_at = EXCLUDED.updated_at
+            RETURNING id
+            """,
+            (name, organization_kind, now),
+        ).fetchone()
+        assert organization
+        organization_id = organization["id"]
+        tenant_key = identity.get("tenant_key")
+        if map_current_tenant and not tenant_key:
+            raise OrganizationInputError("此联系人没有可映射的 Lark 租户标识；请仅确认该联系人。")
+        if map_current_tenant:
+            existing = conn.execute(
+                """
+                SELECT organization_id, source, status
+                FROM organization_tenants
+                WHERE tenant_key = %s
+                FOR UPDATE
+                """,
+                (tenant_key,),
+            ).fetchone()
+            if (
+                existing
+                and existing["organization_id"] != organization_id
+                and existing["status"] == 'verified'
+                and existing["source"] in ('lark_trust_party', 'crm')
+            ):
+                raise OrganizationInputError("此 Lark 租户已有 CRM 或 Lark 验证的不同组织，不能人工覆盖。")
+            if existing and existing["organization_id"] != organization_id:
+                conn.execute(
+                    """
+                    UPDATE contact_organization_links link
+                    SET status = 'rejected', last_seen_at = %s
+                    WHERE link.organization_id = %s
+                      AND link.relationship = 'tenant_affiliation'
+                      AND link.source = 'manual'
+                      AND link.status = 'verified'
+                      AND EXISTS (
+                          SELECT 1
+                          FROM lark_identities identity
+                          WHERE identity.contact_id = link.contact_id
+                            AND identity.identity_type = 'user'
+                            AND identity.tenant_key = %s
+                      )
+                    """,
+                    (now, existing["organization_id"], tenant_key),
+                )
+            conn.execute(
+                """
+                INSERT INTO organization_tenants (
+                    tenant_key, organization_id, source, status, verified_at, last_synced_at, updated_at
+                ) VALUES (%s, %s, 'manual', 'verified', %s, %s, %s)
+                ON CONFLICT (tenant_key) DO UPDATE SET
+                    organization_id = EXCLUDED.organization_id, source = 'manual', status = 'verified',
+                    verified_at = EXCLUDED.verified_at, last_synced_at = EXCLUDED.last_synced_at,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (tenant_key, organization_id, now, now, now),
+            )
+            _link_tenant_identities(conn, tenant_key, organization_id, "manual", now)
+            relationship = "tenant_affiliation"
+        else:
+            relationship = "unknown"
+            _upsert_contact_link(conn, contact_id, organization_id, relationship, "manual", now)
+        conn.execute(
+            """
+            INSERT INTO audit_events (id, authorization_id, action, metadata)
+            VALUES (gen_random_uuid(), %s, 'contact_organization_manually_confirmed',
+                    jsonb_build_object('contact_id', %s::text, 'organization_id', %s::text,
+                                       'tenant_mapped', %s, 'relationship', %s))
+            """,
+            (actor_id, contact_id, organization_id, bool(map_current_tenant and tenant_key), relationship),
+        )
 
 
 def _fetch_all(client: LarkClient, tenant_access_token: str) -> tuple[list[dict[str, str]], set[str]]:
@@ -242,6 +388,66 @@ def _link_known_identities(conn: psycopg.Connection, now: datetime, *, refresh_e
         ON CONFLICT (contact_id, organization_id, relationship) {conflict}
         """,
         (now, now),
+    )
+
+
+def _link_tenant_identities(
+    conn: psycopg.Connection,
+    tenant_key: str,
+    organization_id: UUID,
+    source: str,
+    now: datetime,
+) -> None:
+    """Attach every known human from one manually verified Lark tenant."""
+
+    conn.execute(
+        """
+        INSERT INTO contact_organization_links (
+            contact_id, organization_id, relationship, status, source, confidence, first_seen_at, last_seen_at
+        )
+        SELECT DISTINCT identity.contact_id, %s, 'tenant_affiliation', 'verified', %s, 1.000, %s, %s
+        FROM lark_identities identity
+        WHERE identity.tenant_key = %s
+          AND identity.identity_type = 'user'
+          AND identity.contact_id IS NOT NULL
+        ON CONFLICT (contact_id, organization_id, relationship) DO UPDATE SET
+            status = 'verified',
+            source = CASE
+                WHEN contact_organization_links.source IN ('lark_trust_party', 'crm')
+                THEN contact_organization_links.source
+                ELSE EXCLUDED.source
+            END,
+            confidence = GREATEST(contact_organization_links.confidence, EXCLUDED.confidence),
+            last_seen_at = EXCLUDED.last_seen_at
+        """,
+        (organization_id, source, now, now, tenant_key),
+    )
+
+
+def _upsert_contact_link(
+    conn: psycopg.Connection,
+    contact_id: UUID,
+    organization_id: UUID,
+    relationship: str,
+    source: str,
+    now: datetime,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO contact_organization_links (
+            contact_id, organization_id, relationship, status, source, confidence, first_seen_at, last_seen_at
+        ) VALUES (%s, %s, %s, 'verified', %s, 1.000, %s, %s)
+        ON CONFLICT (contact_id, organization_id, relationship) DO UPDATE SET
+            status = 'verified',
+            source = CASE
+                WHEN contact_organization_links.source IN ('lark_trust_party', 'crm')
+                THEN contact_organization_links.source
+                ELSE EXCLUDED.source
+            END,
+            confidence = GREATEST(contact_organization_links.confidence, EXCLUDED.confidence),
+            last_seen_at = EXCLUDED.last_seen_at
+        """,
+        (contact_id, organization_id, relationship, source, now, now),
     )
 
 
