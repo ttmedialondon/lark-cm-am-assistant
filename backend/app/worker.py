@@ -14,7 +14,6 @@ import psycopg
 
 from . import contact_assessments
 from .config import Settings, get_settings
-from .creator_rules import extract_creator_claims
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
 from .lark_api import LarkApiError, LarkClient, TokenBundle
@@ -1255,15 +1254,6 @@ def _record_page(
                 """,
                 (authorization["id"], chat_id, message_id, is_own),
             ).fetchone()
-            if content_cipher and body_content and not is_deleted:
-                _record_social_account_observations(
-                    conn,
-                    source_open_id=sender_open_id,
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    observed_by_authorization_id=authorization["id"],
-                    body_content=body_content,
-                )
             if observation["is_new"]:
                 inserted += 1
                 own_inserted += int(bool(observation["sent_by_author"]))
@@ -1321,61 +1311,6 @@ def _record_page(
                 ),
             )
     return inserted, own_inserted
-
-
-def _record_social_account_observations(
-    conn: psycopg.Connection,
-    *,
-    source_open_id: str | None,
-    chat_id: str,
-    message_id: str,
-    observed_by_authorization_id: uuid.UUID,
-    body_content: str,
-) -> None:
-    """Store high-precision social-account occurrences without assigning ownership."""
-
-    for claim in extract_creator_claims(body_content):
-        account = conn.execute(
-            """
-            INSERT INTO social_accounts (
-                id, platform, normalized_handle, display_handle
-            ) VALUES (%s, %s, %s, %s)
-            ON CONFLICT (platform, normalized_handle) DO UPDATE SET
-                display_handle = EXCLUDED.display_handle,
-                updated_at = NOW()
-            RETURNING id
-            """,
-            (
-                uuid.uuid4(),
-                claim.platform,
-                claim.normalized_value,
-                claim.display_value,
-            ),
-        ).fetchone()
-        conn.execute(
-            """
-            INSERT INTO social_account_observations (
-                id, social_account_id, source_open_id, chat_id, message_id,
-                observed_by_authorization_id, extractor, metadata
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
-            ON CONFLICT (social_account_id, observed_by_authorization_id, chat_id, message_id)
-            DO UPDATE SET
-                source_open_id = COALESCE(EXCLUDED.source_open_id, social_account_observations.source_open_id),
-                extractor = EXCLUDED.extractor,
-                metadata = EXCLUDED.metadata,
-                last_observed_at = NOW()
-            """,
-            (
-                uuid.uuid4(),
-                account["id"],
-                source_open_id,
-                chat_id,
-                message_id,
-                observed_by_authorization_id,
-                f"rule:{claim.source}",
-                json.dumps({"extractor": "social-account-rules-v1", "rule": claim.source}),
-            ),
-        )
 
 
 def _mark_chat_not_readable(authorization_id: uuid.UUID, chat_id: str, generation: int) -> None:

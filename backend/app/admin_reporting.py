@@ -701,9 +701,7 @@ def creators(page: int = 1) -> dict[str, Any]:
                 c.display_name,
                 c.created_at,
                 c.updated_at,
-                primary_identity.open_id,
-                COUNT(DISTINCT identifier.id) + COUNT(DISTINCT account.social_account_id) AS identifier_count,
-                COUNT(DISTINCT account.social_account_id) AS social_account_count
+                primary_identity.open_id
             FROM contacts c
             JOIN contact_roles role
               ON role.contact_id = c.id AND role.role = 'creator' AND role.status = 'confirmed'
@@ -716,9 +714,6 @@ def creators(page: int = 1) -> dict[str, Any]:
                 ORDER BY identity.last_seen_at DESC, identity.open_id
                 LIMIT 1
             ) AS primary_identity ON TRUE
-            LEFT JOIN contact_identifiers identifier ON identifier.contact_id = c.id
-            LEFT JOIN contact_social_accounts account
-              ON account.contact_id = c.id AND account.status = 'confirmed'
             GROUP BY c.id, c.display_name, c.created_at, c.updated_at, primary_identity.open_id
             ORDER BY LOWER(c.display_name), c.id
             LIMIT %s OFFSET %s
@@ -747,16 +742,10 @@ def contacts(page: int = 1, confirmation: str = "all") -> dict[str, Any]:
                 )
                   AND (
                       %s = 'all'
-                      OR (
-                          EXISTS (
+                          OR EXISTS (
                               SELECT 1 FROM contact_roles role
                               WHERE role.contact_id = contact.id AND role.status = 'confirmed'
-                          )
-                          OR EXISTS (
-                              SELECT 1 FROM contact_social_accounts account
-                              WHERE account.contact_id = contact.id AND account.status = 'confirmed'
-                          )
-                      ) = (%s = 'confirmed')
+                          ) = (%s = 'confirmed')
                   )
                 """,
                 (confirmation, confirmation),
@@ -776,7 +765,6 @@ def contacts(page: int = 1, confirmation: str = "all") -> dict[str, Any]:
                 identity_counts.last_seen_at,
                 conversations.conversation_count,
                 messages.message_count,
-                accounts.account_count,
                 confirmed_facts.is_confirmed,
                 ARRAY(
                     SELECT confirmed_role.role
@@ -802,10 +790,6 @@ def contacts(page: int = 1, confirmation: str = "all") -> dict[str, Any]:
                     EXISTS (
                         SELECT 1 FROM contact_roles role
                         WHERE role.contact_id = contact.id AND role.status = 'confirmed'
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM contact_social_accounts account
-                        WHERE account.contact_id = contact.id AND account.status = 'confirmed'
                     ) AS is_confirmed
             ) AS confirmed_facts ON TRUE
             JOIN LATERAL (
@@ -838,12 +822,6 @@ def contacts(page: int = 1, confirmation: str = "all") -> dict[str, Any]:
                 JOIN lark_identities identity ON identity.open_id = message.sender_open_id
                 WHERE identity.contact_id = contact.id AND NOT message.is_deleted
             ) AS messages ON TRUE
-            JOIN LATERAL (
-                SELECT COUNT(DISTINCT observation.social_account_id) AS account_count
-                FROM social_account_observations observation
-                JOIN lark_identities identity ON identity.open_id = observation.source_open_id
-                WHERE identity.contact_id = contact.id
-            ) AS accounts ON TRUE
             WHERE %s = 'all' OR confirmed_facts.is_confirmed = (%s = 'confirmed')
             ORDER BY identity_counts.last_seen_at DESC NULLS LAST,
                      LOWER(COALESCE(contact.display_name, primary_identity.display_name)), contact.id
@@ -854,12 +832,8 @@ def contacts(page: int = 1, confirmation: str = "all") -> dict[str, Any]:
     return _page_result([_decorate_contact(row) for row in rows], page, total_count=total_count)
 
 
-def contact_detail(
-    open_id: str,
-    conversation_page: int = 1,
-    account_page: int = 1,
-) -> dict[str, Any] | None:
-    """Return one stable Lark contact, its visible conversation facts, and raw account appearances."""
+def contact_detail(open_id: str, conversation_page: int = 1) -> dict[str, Any] | None:
+    """Return one stable Lark contact and its visible conversation facts."""
 
     with connection() as conn:
         contact = conn.execute(
@@ -988,40 +962,6 @@ def contact_detail(
             (contact_id, conversation_limit, conversation_offset),
         ).fetchall()
 
-        account_total_count = int(
-            conn.execute(
-                """
-                SELECT COUNT(DISTINCT observation.social_account_id) AS total_count
-                FROM social_account_observations observation
-                JOIN lark_identities identity ON identity.open_id = observation.source_open_id
-                WHERE identity.contact_id = %s
-                """,
-                (contact_id,),
-            ).fetchone()["total_count"]
-            or 0
-        )
-        account_page, account_limit, account_offset = _page_window(
-            account_page, DETAIL_PAGE_SIZE, total_count=account_total_count
-        )
-        accounts = conn.execute(
-            """
-            SELECT
-                account.id,
-                account.platform,
-                account.display_handle,
-                COUNT(observation.id) AS observation_count,
-                MAX(observation.last_observed_at) AS last_observed_at
-            FROM social_account_observations observation
-            JOIN lark_identities identity ON identity.open_id = observation.source_open_id
-            JOIN social_accounts account ON account.id = observation.social_account_id
-            WHERE identity.contact_id = %s
-            GROUP BY account.id, account.platform, account.display_handle
-            ORDER BY MAX(observation.last_observed_at) DESC, account.platform, account.normalized_handle
-            LIMIT %s OFFSET %s
-            """,
-            (contact_id, account_limit, account_offset),
-        ).fetchall()
-
     return {
         "contact": _decorate_contact(contact),
         "identities": [_decorate_lark_identity(row) for row in identities],
@@ -1030,164 +970,6 @@ def contact_detail(
             conversation_page,
             DETAIL_PAGE_SIZE,
             total_count=conversation_total_count,
-        ),
-        "accounts": _page_result(
-            [_decorate_social_account(row) for row in accounts],
-            account_page,
-            DETAIL_PAGE_SIZE,
-            total_count=account_total_count,
-        ),
-    }
-
-
-def accounts(page: int = 1) -> dict[str, Any]:
-    """Return independent social accounts and their raw message appearances."""
-
-    with connection() as conn:
-        total_count = int(
-            conn.execute("SELECT COUNT(*) AS total_count FROM social_accounts").fetchone()["total_count"] or 0
-        )
-        page, limit, offset = _page_window(page, total_count=total_count)
-        rows = conn.execute(
-            """
-            SELECT
-                account.id,
-                account.platform,
-                account.display_handle,
-                account.created_at,
-                account.updated_at,
-                owner.display_name AS owner_display_name,
-                observations.observation_count,
-                observations.source_count,
-                observations.last_observed_at
-            FROM social_accounts account
-            LEFT JOIN contact_social_accounts owner_relation
-              ON owner_relation.social_account_id = account.id
-             AND owner_relation.relationship = 'owner'
-             AND owner_relation.status = 'confirmed'
-            LEFT JOIN contacts owner ON owner.id = owner_relation.contact_id
-            JOIN LATERAL (
-                SELECT
-                    COUNT(*) AS observation_count,
-                    COUNT(DISTINCT source_open_id) AS source_count,
-                    MAX(last_observed_at) AS last_observed_at
-                FROM social_account_observations observation
-                WHERE observation.social_account_id = account.id
-            ) AS observations ON TRUE
-            ORDER BY observations.last_observed_at DESC NULLS LAST, account.platform, account.normalized_handle
-            LIMIT %s OFFSET %s
-            """,
-            (limit, offset),
-        ).fetchall()
-    return _page_result([_decorate_social_account(row) for row in rows], page, total_count=total_count)
-
-
-def account_detail(account_id: UUID, evidence_page: int = 1) -> dict[str, Any] | None:
-    """Return a social account with only its authorized, auditable message evidence."""
-
-    with connection() as conn:
-        account = conn.execute(
-            """
-            SELECT
-                account.id,
-                account.platform,
-                account.display_handle,
-                account.created_at,
-                account.updated_at,
-                owner.id AS owner_contact_id,
-                owner.display_name AS owner_display_name,
-                observations.observation_count,
-                observations.source_count,
-                observations.last_observed_at
-            FROM social_accounts account
-            LEFT JOIN contact_social_accounts owner_relation
-              ON owner_relation.social_account_id = account.id
-             AND owner_relation.relationship = 'owner'
-             AND owner_relation.status = 'confirmed'
-            LEFT JOIN contacts owner ON owner.id = owner_relation.contact_id
-            JOIN LATERAL (
-                SELECT
-                    COUNT(*) AS observation_count,
-                    COUNT(DISTINCT source_open_id) AS source_count,
-                    MAX(last_observed_at) AS last_observed_at
-                FROM social_account_observations observation
-                WHERE observation.social_account_id = account.id
-            ) AS observations ON TRUE
-            WHERE account.id = %s
-            """,
-            (account_id,),
-        ).fetchone()
-        if not account:
-            return None
-        evidence_total_count = int(
-            conn.execute(
-                """
-                SELECT COUNT(*) AS total_count
-                FROM social_account_observations
-                WHERE social_account_id = %s
-                """,
-                (account_id,),
-            ).fetchone()["total_count"]
-            or 0
-        )
-        evidence_page, evidence_limit, evidence_offset = _page_window(
-            evidence_page, DETAIL_PAGE_SIZE, total_count=evidence_total_count
-        )
-        evidence = conn.execute(
-            """
-            SELECT
-                observation.id,
-                observation.extractor,
-                observation.created_at,
-                observation.last_observed_at,
-                observation.chat_id,
-                observation.message_id,
-                chat.name AS chat_name,
-                COALESCE(chat.chat_mode, 'group') AS chat_mode,
-                source.open_id AS source_open_id,
-                source.contact_id AS source_contact_id,
-                source.display_name AS source_display_name,
-                source.tenant_classification AS source_tenant_classification,
-                auth.display_name AS observed_by_display_name,
-                message.message_type,
-                message.message_create_time,
-                message.is_deleted,
-                CASE
-                    WHEN auth.status = 'active'
-                     AND authorization_chat.is_visible
-                     AND auth.body_consent_at IS NOT NULL
-                     AND scope.observed_at >= auth.body_consent_at
-                     AND NOT message.is_deleted
-                    THEN message.body_ciphertext
-                END AS body_ciphertext
-            FROM social_account_observations observation
-            JOIN chat_messages message
-              ON message.chat_id = observation.chat_id AND message.message_id = observation.message_id
-            JOIN chats chat ON chat.chat_id = observation.chat_id
-            JOIN authorizations auth ON auth.id = observation.observed_by_authorization_id
-            LEFT JOIN authorization_chats authorization_chat
-              ON authorization_chat.authorization_id = observation.observed_by_authorization_id
-             AND authorization_chat.chat_id = observation.chat_id
-            LEFT JOIN authorization_message_observations scope
-              ON scope.authorization_id = observation.observed_by_authorization_id
-             AND scope.chat_id = observation.chat_id
-             AND scope.message_id = observation.message_id
-            LEFT JOIN lark_identities source ON source.open_id = observation.source_open_id
-            WHERE observation.social_account_id = %s
-            ORDER BY observation.last_observed_at DESC, observation.id DESC
-            LIMIT %s OFFSET %s
-            """,
-            (account_id, evidence_limit, evidence_offset),
-        ).fetchall()
-
-    cipher = message_body_cipher(get_settings().token_encryption_key)
-    return {
-        "account": _decorate_social_account(account),
-        "evidence": _page_result(
-            [_decorate_account_observation(row, cipher) for row in evidence],
-            evidence_page,
-            DETAIL_PAGE_SIZE,
-            total_count=evidence_total_count,
         ),
     }
 
@@ -1366,19 +1148,6 @@ def record_message_view(viewer_id: UUID, target_authorization_id: UUID, chat_id:
         )
 
 
-def record_account_view(viewer_id: UUID, account_id: UUID) -> None:
-    """Audit a raw account-evidence view without putting message text in the log."""
-
-    with connection() as conn, conn.transaction():
-        conn.execute(
-            """
-            INSERT INTO audit_events (id, authorization_id, action, metadata)
-            VALUES (%s, %s, 'admin_social_account_viewed', %s::jsonb)
-            """,
-            (uuid4(), viewer_id, json.dumps({"social_account_id": str(account_id)})),
-        )
-
-
 def _page_window(page: int, page_size: int = LIST_PAGE_SIZE, *, total_count: int | None = None) -> tuple[int, int, int]:
     page = max(1, min(page, MAX_PAGE))
     if total_count is not None:
@@ -1545,8 +1314,6 @@ def _decorate_job(row: dict[str, Any]) -> dict[str, Any]:
 def _decorate_creator(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     item["display_name"] = item.get("display_name") or "未命名达人"
-    item["identifier_count"] = int(item.get("identifier_count") or 0)
-    item["social_account_count"] = int(item.get("social_account_count") or 0)
     for field in ("created_at", "updated_at"):
         item[f"{field}_label"] = _format_time(item.get(field))
     return item
@@ -1564,7 +1331,7 @@ def _decorate_contact(row: dict[str, Any]) -> dict[str, Any]:
     item["tenant_classification_label"], item["tenant_classification_badge"] = _tenant_classification(
         item.get("tenant_classification")
     )
-    for field in ("lark_identity_count", "conversation_count", "message_count", "account_count"):
+    for field in ("lark_identity_count", "conversation_count", "message_count"):
         item[field] = int(item.get(field) or 0)
     for field in ("created_at", "updated_at", "last_seen_at"):
         item[f"{field}_label"] = _format_time(item.get(field))
@@ -1593,44 +1360,6 @@ def _decorate_contact_conversation(row: dict[str, Any]) -> dict[str, Any]:
     item["message_count"] = int(item.get("message_count") or 0)
     item["contact_message_count"] = int(item.get("contact_message_count") or 0)
     item["last_message_at_label"] = _format_time(item.get("last_message_at"))
-    return item
-
-
-def _decorate_social_account(row: dict[str, Any]) -> dict[str, Any]:
-    item = dict(row)
-    item["identifier_label"] = (
-        " · ".join(value for value in (item.get("platform"), item.get("display_handle")) if value) or "未命名账号"
-    )
-    item["owner_label"] = item.get("owner_display_name") or "尚未人工确认"
-    for field in ("observation_count", "source_count"):
-        item[field] = int(item.get(field) or 0)
-    for field in ("created_at", "updated_at", "last_observed_at"):
-        item[f"{field}_label"] = _format_time(item.get(field))
-    return item
-
-
-def _decorate_account_observation(row: dict[str, Any], cipher: TokenCipher) -> dict[str, Any]:
-    item = dict(row)
-    item["chat_mode"] = item.get("chat_mode") or "group"
-    item["chat_name"] = _conversation_name(item.get("chat_name"), item["chat_mode"], item.get("chat_id"))
-    item["source_label"] = item.get("source_display_name") or "Lark 参与者（姓名未返回）"
-    item["source_tenant_label"], item["source_tenant_badge"] = _tenant_classification(
-        item.get("source_tenant_classification")
-    )
-    item["extractor_label"] = item.get("extractor") or "消息规则"
-    item["created_at_label"] = _message_time(item.get("message_create_time") or item.get("created_at"))
-    item["last_observed_at_label"] = _format_time(item.get("last_observed_at"))
-    if item.get("is_deleted"):
-        item["content"] = "（该消息已删除）"
-    elif not item.get("body_ciphertext"):
-        item["content"] = "（消息正文不在当前可读取范围）"
-    else:
-        try:
-            body = cipher.decrypt(item["body_ciphertext"])
-        except (InvalidTag, UnicodeDecodeError, ValueError):
-            item["content"] = "（正文无法读取）"
-        else:
-            item["content"] = _readable_body(body, item.get("message_type"))
     return item
 
 

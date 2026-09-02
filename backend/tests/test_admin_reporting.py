@@ -47,7 +47,7 @@ def test_member_count_labels_preserve_pending_and_unavailable_states():
     assert admin_reporting._member_count(None, "unavailable") == "Lark 未返回"
 
 
-def test_contact_and_account_labels_do_not_imply_identity_or_ownership():
+def test_contact_labels_do_not_imply_identity_or_ownership():
     contact = admin_reporting._decorate_contact(
         {
             "display_name": "Ada",
@@ -66,10 +66,6 @@ def test_contact_and_account_labels_do_not_imply_identity_or_ownership():
     assert unnamed["tenant_classification_label"] == "租户未返回"
     assert unnamed["confirmed_role_labels"] == []
     assert unnamed["is_confirmed"] is False
-
-    account = admin_reporting._decorate_social_account({"platform": "instagram", "display_handle": "@example"})
-    assert account["identifier_label"] == "instagram · @example"
-    assert account["owner_label"] == "尚未人工确认"
 
 
 def test_seconds_label_prefers_human_readable_units():

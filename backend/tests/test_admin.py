@@ -157,19 +157,18 @@ def test_owner_contact_detail_reads_only_that_contact_without_message_content(mo
             "contact": {"contact_id": uuid4()},
             "identities": [],
             "conversations": _page([]),
-            "accounts": _page([]),
         },
     )
     monkeypatch.setattr(contact_assessments, "latest_contact_assessment", lambda _contact_id: None)
     monkeypatch.setattr(contact_assessments, "assessment_available", lambda: True)
 
     response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get(
-        "/admin/contacts/ou_contact?conversations_page=2&accounts_page=3"
+        "/admin/contacts/ou_contact?conversations_page=2"
     )
 
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store, max-age=0"
-    assert reads == [("ou_contact", 2, 3)]
+    assert reads == [("ou_contact", 2)]
     assert contexts[-1][0] == "admin/contact_detail.html"
     assert contexts[-1][1]["assessment"] is None
     assert contexts[-1][1]["assessment_available"] is True
@@ -205,7 +204,6 @@ def test_owner_can_view_assessment_evidence_and_it_is_audited(monkeypatch):
         "contact": {"open_id": "ou_contact", "display_name": "Contact"},
         "status": "succeeded",
         "role_suggestions": [],
-        "account_suggestions": [],
         "evidence": [{"label": "M1", "content": "Scoped evidence", "available": True}],
     }
     monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
@@ -250,28 +248,6 @@ def test_owner_confirmation_uses_only_suggested_form_values(monkeypatch):
     assert confirmed == [(owner_id, assessment_id, "creator")]
 
 
-def test_owner_can_confirm_one_suggested_account_relation(monkeypatch):
-    owner_id = uuid4()
-    assessment_id = uuid4()
-    confirmed = []
-    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
-    monkeypatch.setattr(contact_assessments, "assessment_matches_contact", lambda *_args: True)
-    monkeypatch.setattr(
-        contact_assessments,
-        "confirm_assessment_account_relation",
-        lambda *args: confirmed.append(args),
-    )
-
-    response = _client(lambda _request: {"id": owner_id, "status": "active"}).post(
-        f"/admin/contacts/ou_contact/assessments/{assessment_id}/account-relations",
-        data={"csrf_token": "csrf", "account_ref": "A1", "relationship": "owner"},
-        follow_redirects=False,
-    )
-
-    assert response.status_code == 303
-    assert confirmed == [(owner_id, assessment_id, "A1", "owner")]
-
-
 def test_owner_cannot_confirm_an_assessment_through_another_contact_path(monkeypatch):
     owner_id = uuid4()
     assessment_id = uuid4()
@@ -287,31 +263,6 @@ def test_owner_cannot_confirm_an_assessment_through_another_contact_path(monkeyp
 
     assert response.status_code == 404
     assert confirmed == []
-
-
-def test_owner_account_detail_reads_only_that_account_and_audits(monkeypatch):
-    owner_id = uuid4()
-    account_id = uuid4()
-    contexts = []
-    reads = []
-    audits = []
-    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
-    monkeypatch.setattr(
-        admin_reporting,
-        "account_detail",
-        lambda *args: reads.append(args) or {"account": {}, "evidence": _page([])},
-    )
-    monkeypatch.setattr(admin_reporting, "record_account_view", lambda *args: audits.append(args))
-
-    response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get(
-        f"/admin/accounts/{account_id}"
-    )
-
-    assert response.status_code == 200
-    assert response.headers["cache-control"] == "no-store, max-age=0"
-    assert reads == [(account_id, 1)]
-    assert audits == [(owner_id, account_id)]
-    assert contexts[-1][0] == "admin/account_detail.html"
 
 
 def test_selecting_a_user_lists_conversations_without_reading_message_content(monkeypatch):

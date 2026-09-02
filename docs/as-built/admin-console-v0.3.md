@@ -6,7 +6,7 @@
 
 每个请求都会把 Secure + HttpOnly Web Session 映射回 Lark 授权记录，再查询 `admin_roles`：
 
-- `owner`：查看运营统计、人员/群目录、同步任务、`/admin/messages` 的正文、`/admin/contacts` 的外部联系人目录、`/admin/accounts` 的账号出现记录和 `/admin/creators` 的人工达人主档；
+- `owner`：查看运营统计、人员/群目录、同步任务、`/admin/messages` 的正文、`/admin/contacts` 的外部联系人目录和 `/admin/creators` 的已确认达人；
 - `operator` / `viewer`：查看管理台统计，但不能进入正文页；
 - 无活动角色：403。
 
@@ -27,11 +27,10 @@ chats (公司级唯一群聊或私聊)     authorization_message_observations
        ▼
 chat_messages (公司级唯一消息 ID；加密正文与必要元数据)
        │
-       ├── lark_identities（发送者 / 成员 / @ 提及的稳定 Lark 身份）──> contacts
-       └── social_account_observations（账号出现在该消息中的授权范围事实）──> social_accounts
+       └── lark_identities（发送者 / 成员 / @ 提及的稳定 Lark 身份）──> contacts
 
 chats ──< chat_members（最新群成员快照）
-contacts ──< contact_roles / contact_identifiers / contact_social_accounts（人工确认事实）
+contacts ──< contact_roles（人工确认或自动确认的角色事实）
 ```
 
 同一个 Lark 群被多位 CM/AM 授权时，群元数据和正文只保留一份；每位 CM/AM 的可见性、游标、同步状态和“本人发送”判断仍独立保存。因此，公司级计数不会重复，人员视图也不会误显示未重新授权的正文。
@@ -45,9 +44,8 @@ contacts ──< contact_roles / contact_identifiers / contact_social_accounts�
 | `/admin/users/{authorization_id}` | 某一授权用户的发现/可同步/已完成/等待进度、群/私聊分别的回填比例、当前可见会话与近期任务。 |
 | `/admin/chats` | 公司级唯一群和专题群、已授权可见人数、去重消息数、同步覆盖与成员人数状态。 |
 | `/admin/messages` | **仅 owner**：按 CM/AM、群/私聊、具体会话筛选，最近 100 条正文分页展示。 |
-| `/admin/contacts` | **仅 owner**：按稳定 Lark 身份查看外部联系人、会话统计及其发出的账号出现记录；不推断角色或账号归属。 |
-| `/admin/accounts` | **仅 owner**：查看平台账号的原始消息出现证据和人工确认归属；不把出现记录当作达人候选。 |
-| `/admin/creators` | **仅 owner**：人工维护已确认达人及稳定身份标识。 |
+| `/admin/contacts` | **仅 owner**：按稳定 Lark 身份查看外部联系人、会话统计、角色状态与可核验的 AI 消息证据。 |
+| `/admin/creators` | **仅 owner**：查看已确认拥有 `creator` 角色的联系人及其稳定 Lark 身份。 |
 | `/admin/jobs` | 最近同步任务及不含敏感内容的运行统计。 |
 
 ## 当前同步参数
@@ -62,4 +60,4 @@ contacts ──< contact_roles / contact_identifiers / contact_social_accounts�
 - 首次历史回填：安全分页续跑属于同一个 job，不记为错误重试；`attempts` 只在临时错误、租约过期或退避重试时增加。
 - 已归档/解散会话：保留发现事实但不计划回填，并从“可同步会话”分母中排除。
 - 专题群：计入群聊总数，在目录与人员页单独标为“专题群”。
-- 账号规则 V1：从所有已同意正文同步的消息中提取明确的 TikTok、Instagram、YouTube、Twitch 主页链接或带平台标签的账号。记录只表示账号出现在某条消息中，不因发言人、昵称、群名、普通 @ 提及或模型猜测自动确认达人、经纪人或账号归属。
+- 联系人角色：仅基于稳定 Lark 身份及当前授权范围内、可核验的消息证据生成或确认；群名只是弱证据，不会单独确认角色。

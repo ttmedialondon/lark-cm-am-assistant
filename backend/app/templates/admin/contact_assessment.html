@@ -5,7 +5,7 @@
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
     <div class="d-flex align-items-center mb-3"><div><h2 class="page-title">{{ assessment.contact.display_name }} · AI 识别结果</h2><div class="text-secondary">任务 {{ assessment.id }}{% if assessment.model %} · {{ assessment.model }}{% endif %}</div></div><a class="btn btn-outline-secondary ms-auto" href="/admin/contacts/{{ route_open_id }}?page={{ source_page }}&amp;confirmation={{ source_confirmation }}">返回联系人</a></div>
-    <div class="alert alert-info">AI 结果仅使用当前授权范围内的消息证据。高置信度结果可由系统自动建立事实；需要人工核对的建议只有在你点击确认后才会写入达人、经纪人或账号归属。</div>
+    <div class="alert alert-info">AI 结果仅使用当前授权范围内的消息证据。高置信度结果可由系统自动建立角色事实；需要人工核对的建议只有在你点击确认后才会写入达人、经纪人等角色。</div>
     {% if form_error %}<div class="alert alert-danger" role="alert">{{ form_error }}</div>{% endif %}
     <div class="row row-deck row-cards mb-4">
       <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">任务状态</div><div class="h3 mb-0"><span class="badge bg-{{ assessment.status_badge }}-lt">{{ assessment.status_label }}</span></div></div></div></div>
@@ -26,17 +26,6 @@
         </tr>{% endfor %}
       </tbody></table></div>
       {% else %}<div class="card-body text-secondary">AI 没有给出可人工确认的角色建议。</div>{% endif %}
-    </div>
-    <div class="card mb-4">
-      <div class="card-header"><div><h3 class="card-title mb-1">账号归属建议</h3><div class="text-secondary small">只可确认“本人账号”或“代表/管理账号”；“提到他人”等结论不写入归属。</div></div></div>
-      {% if assessment.account_suggestions %}
-      <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>账号</th><th>建议</th><th>置信度</th><th>依据</th><th></th></tr></thead><tbody>
-        {% for suggestion in assessment.account_suggestions %}<tr>
-          <td>{{ suggestion.account_label }}</td><td>{{ suggestion.relationship_label }}</td><td>{{ suggestion.confidence_label }}</td><td class="text-secondary">{% if suggestion.evidence_refs %}引用：{{ suggestion.evidence_refs | join(', ') }}{% else %}—{% endif %}</td>
-          <td class="text-end">{% if suggestion.confirmed %}<span class="badge bg-success-lt">已确认</span>{% elif assessment.can_confirm and suggestion.relationship in ('owner', 'representative') %}<form action="/admin/contacts/{{ route_open_id }}/assessments/{{ assessment.id }}/account-relations?page={{ source_page }}&amp;confirmation={{ source_confirmation }}" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="account_ref" value="{{ suggestion.account_ref }}"><input type="hidden" name="relationship" value="{{ suggestion.relationship }}"><button class="btn btn-sm btn-primary" type="submit">确认{{ suggestion.relationship_label }}</button></form>{% endif %}</td>
-        </tr>{% endfor %}
-      </tbody></table></div>
-      {% else %}<div class="card-body text-secondary">没有可确认的账号归属建议。</div>{% endif %}
     </div>
     <div class="card">
       <div class="card-header"><div><h3 class="card-title mb-1">模型引用的消息证据</h3><div class="text-secondary small">仅显示本次任务构造时仍属于有效授权范围的消息。打开此页会记录到审计日志。</div></div></div>

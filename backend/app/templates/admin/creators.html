@@ -9,9 +9,9 @@
       <div class="card-header"><h3 class="card-title">达人主档</h3></div>
       {% if creators %}
       <div class="table-responsive admin-directory__table"><table class="table table-vcenter card-table">
-        <thead><tr><th>达人</th><th>已确认标识</th><th>其中平台账号</th><th>最后更新</th><th></th></tr></thead>
+        <thead><tr><th>达人</th><th>最后更新</th><th></th></tr></thead>
         <tbody>{% for creator in creators %}<tr>
-          <td>{{ creator.display_name }}</td><td>{{ creator.identifier_count }}</td><td>{{ creator.social_account_count }}</td><td>{{ creator.updated_at_label }}</td>
+          <td>{{ creator.display_name }}</td><td>{{ creator.updated_at_label }}</td>
           <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="/admin/contacts/{{ creator.open_id }}?confirmation=confirmed">查看联系人</a></td>
         </tr>{% endfor %}</tbody>
       </table></div>

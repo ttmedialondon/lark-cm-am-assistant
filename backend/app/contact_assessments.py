@@ -14,7 +14,6 @@ from zoneinfo import ZoneInfo
 import httpx
 import psycopg
 from cryptography.exceptions import InvalidTag
-from psycopg.errors import UniqueViolation
 
 from .ai_feature_config import DEFAULT_AUTO_CONFIRM_THRESHOLD, api_key_cipher
 from .config import Settings, get_settings
@@ -27,7 +26,6 @@ MAX_FRAGMENTS = 60
 MAX_BODY_CHARS = 800
 MAX_INPUT_BODY_CHARS = 32_000
 MAX_ROLE_SUGGESTIONS = 3
-MAX_ACCOUNT_SUGGESTIONS = 3
 MAX_EVIDENCE_REFS = 12
 MAX_AUTOMATIC_ATTEMPTS_PER_WATERMARK = 3
 AUTOMATIC_RETRY_COOLDOWN_MINUTES = 15
@@ -36,8 +34,6 @@ AUTOMATIC_START_INTERVAL_SECONDS = 3
 AUTOMATIC_CLAIM_LOCK = 541_195_271
 MODEL_ROLES = {"creator", "agent_or_agency", "brand", "merchant", "supplier", "other", "insufficient"}
 FACT_ROLES = MODEL_ROLES - {"insufficient"}
-ACCOUNT_RELATIONSHIPS = {"owner", "representative", "mentioned_other", "unrelated", "insufficient"}
-CONFIRMABLE_RELATIONSHIPS = {"owner", "representative"}
 ROLE_LABELS = {
     "creator": "达人 / 创作者",
     "agent_or_agency": "经纪人 / 机构",
@@ -45,13 +41,6 @@ ROLE_LABELS = {
     "merchant": "商家",
     "supplier": "供应商",
     "other": "其他业务角色",
-    "insufficient": "信息不足",
-}
-RELATIONSHIP_LABELS = {
-    "owner": "本人账号",
-    "representative": "代运营 / 代表账号",
-    "mentioned_other": "提到他人账号",
-    "unrelated": "无关账号",
     "insufficient": "信息不足",
 }
 STATUS_LABELS = {
@@ -167,11 +156,6 @@ def queue_eligible_contact_assessments() -> int:
                   AND NOT EXISTS (
                       SELECT 1 FROM contact_roles role
                       WHERE role.contact_id = identity.contact_id AND role.status = 'confirmed'
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM contact_social_accounts account_relation
-                      WHERE account_relation.contact_id = identity.contact_id
-                        AND account_relation.status = 'confirmed'
                   )
                   AND auth.status = 'active'
                   AND auth.body_consent_at IS NOT NULL
@@ -334,17 +318,6 @@ def assessment_detail(assessment_id: UUID | str) -> dict[str, Any] | None:
                 (row["contact_id"],),
             ).fetchall()
         }
-        confirmed_account_relations = {
-            (str(item["social_account_id"]), item["relationship"])
-            for item in conn.execute(
-                """
-                SELECT social_account_id, relationship FROM contact_social_accounts
-                WHERE contact_id = %s AND status = 'confirmed'
-                """,
-                (row["contact_id"],),
-            ).fetchall()
-        }
-
     cipher = message_body_cipher(get_settings().token_encryption_key)
     evidence: dict[str, dict[str, Any]] = {}
     for item in refs:
@@ -362,10 +335,6 @@ def assessment_detail(assessment_id: UUID | str) -> dict[str, Any] | None:
     result = _json_object(row.get("result"))
     summary = _summary(row)
     roles = [_detail_role(item, confirmed_roles) for item in _json_list(result.get("roles"))]
-    account_relations = [
-        _detail_account_relation(item, confirmed_account_relations)
-        for item in _json_list(result.get("account_relations"))
-    ]
     return {
         "contact": {
             "id": str(row["contact_id"]),
@@ -378,7 +347,6 @@ def assessment_detail(assessment_id: UUID | str) -> dict[str, Any] | None:
         and bool(evidence)
         and all(item["available"] for item in evidence.values()),
         "role_suggestions": roles,
-        "account_suggestions": account_relations,
         "evidence": [evidence[label] for label in sorted(evidence, key=lambda label: int(label[1:]))],
     }
 
@@ -483,67 +451,6 @@ def confirm_assessment_role(actor_id: UUID | str, assessment_id: UUID | str, rol
             {"assessment_id": str(assessment_id), "contact_id": str(assessment["contact_id"]), "role": role},
         )
     return {"contact_id": str(assessment["contact_id"]), "role": role}
-
-
-def confirm_assessment_account_relation(
-    actor_id: UUID | str,
-    assessment_id: UUID | str,
-    account_ref: str,
-    relationship: str,
-) -> dict[str, str]:
-    """Promote one suggested account relation into a reviewed, durable fact."""
-
-    actor_id = _as_uuid(actor_id, "管理员")
-    assessment_id = _as_uuid(assessment_id, "判定")
-    account_ref = account_ref.strip()
-    relationship = relationship.strip()
-    if relationship not in CONFIRMABLE_RELATIONSHIPS:
-        raise ContactAssessmentInputError("不是可确认的账号关系建议。")
-    try:
-        with connection() as conn, conn.transaction():
-            assessment = _successful_assessment(conn, assessment_id)
-            if not _refs_are_still_authorized_in(conn, assessment_id):
-                raise ContactAssessmentInputError("判定证据已不在当前授权范围内；请重新发起判定。")
-            _lock_contact(conn, assessment["contact_id"])
-            suggestions = _json_list(_json_object(assessment["result"]).get("account_relations"))
-            suggestion = next(
-                (
-                    item
-                    for item in suggestions
-                    if item.get("account_ref") == account_ref and item.get("relationship") == relationship
-                ),
-                None,
-            )
-            if not suggestion or not suggestion.get("account_id"):
-                raise ContactAssessmentInputError("该账号关系不在此判定建议中。")
-            account_id = _as_uuid(suggestion["account_id"], "账号")
-            conn.execute(
-                """
-                INSERT INTO contact_social_accounts (
-                    contact_id, social_account_id, relationship, status, source,
-                    reviewed_by_authorization_id, reviewed_at
-                ) VALUES (%s, %s, %s, 'confirmed', 'ai_manual_confirmed', %s, NOW())
-                ON CONFLICT (contact_id, social_account_id, relationship) DO UPDATE SET
-                    status = 'confirmed', source = 'ai_manual_confirmed',
-                    reviewed_by_authorization_id = EXCLUDED.reviewed_by_authorization_id,
-                    reviewed_at = EXCLUDED.reviewed_at, updated_at = NOW()
-                """,
-                (assessment["contact_id"], account_id, relationship, actor_id),
-            )
-            _audit(
-                conn,
-                actor_id,
-                "contact_assessment_account_relation_manually_confirmed",
-                {
-                    "assessment_id": str(assessment_id),
-                    "contact_id": str(assessment["contact_id"]),
-                    "account_ref": account_ref,
-                    "relationship": relationship,
-                },
-            )
-    except UniqueViolation as exc:
-        raise ContactAssessmentInputError("该账号已确认归属另一位联系人，不能重复确认为本人账号。") from exc
-    return {"contact_id": str(assessment["contact_id"]), "account_ref": account_ref, "relationship": relationship}
 
 
 def run_next_contact_assessment(settings: Settings) -> bool:
@@ -660,7 +567,7 @@ def _run(job: Mapping[str, Any], settings: Settings) -> None:
             )
             return
         response = _call_openai(config, api_key, evidence["pack"], job["contact_id"])
-        result = _validate_model_result(response["text"], evidence["labels"], evidence["accounts"])
+        result = _validate_model_result(response["text"], evidence["labels"])
         completed = _finish_with_decision(
             assessment_id,
             job["contact_id"],
@@ -726,7 +633,7 @@ def _build_evidence(contact_id: UUID, settings: Settings) -> dict[str, Any]:
         target_ids = {row["open_id"] for row in identities}
         anchor = _anchor_row(conn, contact_id)
         if not anchor:
-            return {"fragments": [], "refs": [], "labels": set(), "accounts": {}, "char_count": 0, "pack": {}}
+            return {"fragments": [], "refs": [], "labels": set(), "char_count": 0, "pack": {}}
         rows: list[tuple[Mapping[str, Any], str]] = [(anchor, "anchor")]
         before, after = _conversation_context(conn, anchor)
         rows.extend((row, "context") for row in reversed(before))
@@ -754,9 +661,8 @@ def _build_evidence(contact_id: UUID, settings: Settings) -> dict[str, Any]:
             fragments.append({"row": row, "relation": relation, "text": body})
 
         if not fragments:
-            return {"fragments": [], "refs": [], "labels": set(), "accounts": {}, "char_count": 0, "pack": {}}
+            return {"fragments": [], "refs": [], "labels": set(), "char_count": 0, "pack": {}}
         _label_fragments(fragments, target_ids)
-        accounts = _accounts_in_fragments(conn, contact_id, fragments)
         refs = [
             {
                 "label": fragment["label"],
@@ -770,22 +676,12 @@ def _build_evidence(contact_id: UUID, settings: Settings) -> dict[str, Any]:
         pack = {
             "subject": {"alias": "S1", "tenant_classification": _subject_tenant(identities)},
             "confirmed_facts": facts,
-            "account_candidates": [
-                {
-                    "ref": ref,
-                    "platform": data["platform"],
-                    "handle": data["display_handle"],
-                    "evidence_refs": data["evidence_refs"],
-                }
-                for ref, data in accounts.items()
-            ],
             "messages": [_model_fragment(fragment, target_ids) for fragment in fragments],
         }
     return {
         "fragments": fragments,
         "refs": refs,
         "labels": {fragment["label"] for fragment in fragments},
-        "accounts": accounts,
         "char_count": char_count,
         "pack": pack,
         "source_authorization_id": anchor["authorization_id"],
@@ -819,16 +715,7 @@ def _anchor_row(conn: psycopg.Connection, contact_id: UUID) -> Mapping[str, Any]
           AND access.is_visible AND access.sync_enabled
           AND NOT message.is_deleted AND message.body_ciphertext IS NOT NULL
           AND message.message_create_time IS NOT NULL
-        ORDER BY
-            EXISTS (
-                SELECT 1
-                FROM social_account_observations social_observation
-                WHERE social_observation.observed_by_authorization_id = observation.authorization_id
-                  AND social_observation.chat_id = message.chat_id
-                  AND social_observation.message_id = message.message_id
-                  AND social_observation.source_open_id = subject.open_id
-            ) DESC,
-            message.message_create_time DESC,
+        ORDER BY message.message_create_time DESC,
             observation.observed_at DESC,
             observation.authorization_id DESC,
             message.message_id DESC
@@ -945,20 +832,7 @@ def _known_facts(conn: psycopg.Connection, contact_id: UUID) -> list[str]:
         """,
         (contact_id,),
     ).fetchall()
-    accounts = conn.execute(
-        """
-        SELECT account.platform, account.display_handle, relation.relationship
-        FROM contact_social_accounts relation
-        JOIN social_accounts account ON account.id = relation.social_account_id
-        WHERE relation.contact_id = %s AND relation.status = 'confirmed'
-        ORDER BY account.platform, account.normalized_handle
-        """,
-        (contact_id,),
-    ).fetchall()
-    return [
-        *[f"confirmed role: {row['role']}" for row in roles],
-        *[f"confirmed {row['relationship']} account: {row['platform']} @{row['display_handle']}" for row in accounts],
-    ]
+    return [f"confirmed role: {row['role']}" for row in roles]
 
 
 def _label_fragments(fragments: list[dict[str, Any]], target_ids: set[str]) -> None:
@@ -969,43 +843,6 @@ def _label_fragments(fragments: list[dict[str, Any]], target_ids: set[str]) -> N
             aliases[sender] = f"S{len(aliases) + 1}"
         fragment["label"] = f"M{index}"
         fragment["speaker"] = aliases[sender]
-
-
-def _accounts_in_fragments(
-    conn: psycopg.Connection, contact_id: UUID, fragments: list[dict[str, Any]]
-) -> dict[str, dict[str, Any]]:
-    values = ", ".join("(%s, %s, %s, %s)" for _ in fragments)
-    params: list[Any] = []
-    for fragment in fragments:
-        row = fragment["row"]
-        params.extend((row["authorization_id"], row["chat_id"], row["message_id"], fragment["label"]))
-    rows = conn.execute(
-        f"""
-        WITH selected(authorization_id, chat_id, message_id, label) AS (VALUES {values})
-        SELECT DISTINCT ON (account.id)
-            account.id, account.platform, account.display_handle, selected.label
-        FROM selected
-        JOIN social_account_observations observation
-          ON observation.observed_by_authorization_id = selected.authorization_id
-         AND observation.chat_id = selected.chat_id AND observation.message_id = selected.message_id
-        JOIN lark_identities source ON source.open_id = observation.source_open_id
-        JOIN social_accounts account ON account.id = observation.social_account_id
-        WHERE source.contact_id = %s
-        ORDER BY account.id, selected.label
-        """,
-        (*params, contact_id),
-    ).fetchall()
-    accounts: dict[str, dict[str, Any]] = {}
-    for row in rows[:3]:
-        ref = f"A{len(accounts) + 1}"
-        accounts[ref] = {
-            "id": str(row["id"]),
-            "platform": row["platform"],
-            "display_handle": row["display_handle"],
-            "label": f"{row['platform']} @{row['display_handle']}",
-            "evidence_refs": [row["label"]],
-        }
-    return accounts
 
 
 def _model_fragment(fragment: Mapping[str, Any], target_ids: set[str]) -> dict[str, Any]:
@@ -1165,22 +1002,6 @@ def _structured_output_format() -> dict[str, Any]:
             },
         },
     }
-    account_item = {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["account_ref", "relationship", "confidence", "evidence_refs"],
-        "properties": {
-            "account_ref": {"type": "string"},
-            "relationship": {"type": "string", "enum": sorted(ACCOUNT_RELATIONSHIPS)},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "evidence_refs": {
-                "type": "array",
-                "items": {"type": "string"},
-                "minItems": 1,
-                "maxItems": MAX_EVIDENCE_REFS,
-            },
-        },
-    }
     return {
         "type": "json_schema",
         "name": "contact_assessment",
@@ -1188,18 +1009,13 @@ def _structured_output_format() -> dict[str, Any]:
         "schema": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["roles", "account_relations"],
+            "required": ["roles"],
             "properties": {
                 "roles": {
                     "type": "array",
                     "items": evidence_item,
                     "minItems": 1,
                     "maxItems": MAX_ROLE_SUGGESTIONS,
-                },
-                "account_relations": {
-                    "type": "array",
-                    "items": account_item,
-                    "maxItems": MAX_ACCOUNT_SUGGESTIONS,
                 },
             },
         },
@@ -1216,13 +1032,8 @@ Return one to three role items. Use `creator` only when S1 is likely the
 creator/influencer themselves; use `agent_or_agency` when S1 represents
 creators or an agency. Use `insufficient` as the only role when the evidence
 cannot support a business role.
-An account candidate can strengthen a conclusion, but is never required for a
-`creator` role: if the supplied message evidence supports it, classify S1 as a
-creator even when `account_candidates` is empty. Account relations are a
-separate optional judgment; return an empty list when none can be supported.
-For an account candidate, use `owner` only when S1 likely identifies it as
-their own account; `representative` means S1 likely represents it. Do not
-invent account references, message references, identities, facts, or quotes.
+Do not infer a role from a social-media handle or account mention. Do not
+invent message references, identities, facts, or quotes.
 Every suggestion must cite one to twelve supplied M references. Do not produce a
 summary, rationale, quotation, or any other free text. The response is
 used for automatic confirmation only at a strict configured confidence
@@ -1240,7 +1051,7 @@ def _response_text(data: Mapping[str, Any]) -> str:
     raise KeyError("output_text")
 
 
-def _validate_model_result(raw: str, labels: set[str], accounts: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+def _validate_model_result(raw: str, labels: set[str]) -> dict[str, Any]:
     try:
         payload = json.loads(raw)
     except (TypeError, json.JSONDecodeError) as exc:
@@ -1268,32 +1079,7 @@ def _validate_model_result(raw: str, labels: set[str], accounts: Mapping[str, Ma
         )
     if "insufficient" in seen_roles and len(roles) != 1:
         raise _ModelOutputError("insufficient role")
-    relations: list[dict[str, Any]] = []
-    seen_accounts: set[str] = set()
-    for raw_relation in _json_list(payload.get("account_relations")):
-        if not isinstance(raw_relation, Mapping) or len(relations) >= MAX_ACCOUNT_SUGGESTIONS:
-            continue
-        account_ref = raw_relation.get("account_ref")
-        relationship = raw_relation.get("relationship")
-        if account_ref not in accounts or account_ref in seen_accounts or relationship not in ACCOUNT_RELATIONSHIPS:
-            continue
-        try:
-            confidence = _confidence(raw_relation.get("confidence"))
-            evidence_refs = _evidence_refs(raw_relation.get("evidence_refs"), labels)
-        except _ModelOutputError:
-            continue
-        seen_accounts.add(account_ref)
-        relations.append(
-            {
-                "account_ref": account_ref,
-                "account_id": accounts[account_ref]["id"],
-                "account_label": accounts[account_ref]["label"],
-                "relationship": relationship,
-                "confidence": confidence,
-                "evidence_refs": evidence_refs,
-            }
-        )
-    return {"roles": roles, "account_relations": relations}
+    return {"roles": roles}
 
 
 def _finish_with_decision(
@@ -1340,9 +1126,8 @@ def _finish_with_decision(
             )
             return False
 
-        outcome, review_status, confirmed_roles, confirmed_relations = _apply_automatic_decision(
+        outcome, review_status, confirmed_roles = _apply_automatic_decision(
             conn,
-            assessment_id,
             contact_id,
             result,
             _auto_confirm_threshold(config),
@@ -1364,9 +1149,8 @@ def _finish_with_decision(
             "contact_id": str(contact_id),
             "threshold": f"{_auto_confirm_threshold(config):.3f}",
             "role_count": str(len(confirmed_roles)),
-            "account_relation_count": str(len(confirmed_relations)),
         }
-        if confirmed_roles or confirmed_relations:
+        if confirmed_roles:
             _audit(conn, None, "contact_assessment_auto_confirmed", metadata)
         if outcome == "review_required":
             _audit(conn, None, "contact_assessment_review_required", metadata)
@@ -1375,16 +1159,14 @@ def _finish_with_decision(
 
 def _apply_automatic_decision(
     conn: psycopg.Connection,
-    assessment_id: UUID,
     contact_id: UUID,
     result: Mapping[str, Any],
     threshold: float,
-) -> tuple[str, str, list[str], list[tuple[str, str]]]:
+) -> tuple[str, str, list[str]]:
     """Write only independent high-confidence facts; preserve all ambiguity for review."""
 
     review_required = False
     confirmed_roles: list[str] = []
-    confirmed_relations: list[tuple[str, str]] = []
     factual_roles = [
         suggestion
         for suggestion in _json_list(result.get("roles"))
@@ -1407,35 +1189,11 @@ def _apply_automatic_decision(
         # More than one high-confidence business role is not a safe automatic classification.
         review_required = True
 
-    for suggestion in _json_list(result.get("account_relations")):
-        if not isinstance(suggestion, Mapping):
-            continue
-        relationship = suggestion.get("relationship")
-        if relationship not in CONFIRMABLE_RELATIONSHIPS:
-            continue
-        if float(suggestion.get("confidence", 0)) < threshold:
-            review_required = True
-            continue
-        account_id = suggestion.get("account_id")
-        if not account_id:
-            review_required = True
-            continue
-        state = _auto_confirm_account_relation(
-            conn,
-            contact_id,
-            _as_uuid(account_id, "账号"),
-            relationship,
-        )
-        if state == "confirmed":
-            confirmed_relations.append((str(account_id), relationship))
-        else:
-            review_required = True
-
     if review_required:
-        return "review_required", "pending", confirmed_roles, confirmed_relations
-    if confirmed_roles or confirmed_relations:
-        return "auto_confirmed", "not_required", confirmed_roles, confirmed_relations
-    return "no_action", "not_required", confirmed_roles, confirmed_relations
+        return "review_required", "pending", confirmed_roles
+    if confirmed_roles:
+        return "auto_confirmed", "not_required", confirmed_roles
+    return "no_action", "not_required", confirmed_roles
 
 
 def _auto_confirm_role(conn: psycopg.Connection, contact_id: UUID, role: str) -> str:
@@ -1457,35 +1215,6 @@ def _auto_confirm_role(conn: psycopg.Connection, contact_id: UUID, role: str) ->
     return "confirmed" if existing and existing["status"] == "confirmed" else "conflict"
 
 
-def _auto_confirm_account_relation(
-    conn: psycopg.Connection,
-    contact_id: UUID,
-    account_id: UUID,
-    relationship: str,
-) -> str:
-    inserted = conn.execute(
-        """
-        INSERT INTO contact_social_accounts (
-            contact_id, social_account_id, relationship, status, source, reviewed_at
-        ) VALUES (%s, %s, %s, 'confirmed', 'ai_auto_confirmed', NOW())
-        ON CONFLICT DO NOTHING
-        RETURNING contact_id
-        """,
-        (contact_id, account_id, relationship),
-    ).fetchone()
-    if inserted:
-        return "confirmed"
-    existing = conn.execute(
-        """
-        SELECT contact_id, status
-        FROM contact_social_accounts
-        WHERE contact_id = %s AND social_account_id = %s AND relationship = %s
-        """,
-        (contact_id, account_id, relationship),
-    ).fetchone()
-    return "confirmed" if existing and existing["status"] == "confirmed" else "conflict"
-
-
 def _auto_confirm_threshold(config: Mapping[str, Any]) -> float:
     try:
         threshold = float(config.get("auto_confirm_threshold", DEFAULT_AUTO_CONFIRM_THRESHOLD))
@@ -1501,11 +1230,9 @@ def _contact_has_confirmed_facts(conn: psycopg.Connection, contact_id: UUID) -> 
         """
         SELECT EXISTS (
             SELECT 1 FROM contact_roles WHERE contact_id = %s AND status = 'confirmed'
-        ) OR EXISTS (
-            SELECT 1 FROM contact_social_accounts WHERE contact_id = %s AND status = 'confirmed'
         ) AS has_facts
         """,
-        (contact_id, contact_id),
+        (contact_id,),
     ).fetchone()
     return bool(row and row["has_facts"])
 
@@ -1630,7 +1357,6 @@ def _summary(row: Mapping[str, Any]) -> dict[str, Any]:
         "review_status_label": REVIEW_STATUS_LABELS.get(review_status, review_status),
         "review_status_badge": REVIEW_STATUS_BADGES.get(review_status, "secondary"),
         "role_count": len(_json_list(result.get("roles"))),
-        "account_relation_count": len(_json_list(result.get("account_relations"))),
     }
 
 
@@ -1644,24 +1370,6 @@ def _detail_role(item: Any, confirmed_roles: set[str]) -> dict[str, Any]:
         "confidence_label": _confidence_label(value.get("confidence")),
         "evidence_refs": _json_list(value.get("evidence_refs")),
         "confirmed": role in confirmed_roles,
-    }
-
-
-def _detail_account_relation(
-    item: Any,
-    confirmed_account_relations: set[tuple[str, str]],
-) -> dict[str, Any]:
-    value = item if isinstance(item, Mapping) else {}
-    relationship = value.get("relationship") or "insufficient"
-    return {
-        "account_ref": value.get("account_ref") or "",
-        "account_label": value.get("account_label") or "",
-        "relationship": relationship,
-        "relationship_label": RELATIONSHIP_LABELS.get(relationship, relationship),
-        "confirmable": relationship in CONFIRMABLE_RELATIONSHIPS,
-        "confidence_label": _confidence_label(value.get("confidence")),
-        "evidence_refs": _json_list(value.get("evidence_refs")),
-        "confirmed": (str(value.get("account_id") or ""), relationship) in confirmed_account_relations,
     }
 
 

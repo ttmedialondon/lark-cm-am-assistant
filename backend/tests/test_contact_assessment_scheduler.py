@@ -49,7 +49,6 @@ def test_automatic_queue_materializes_all_eligible_contacts_from_immutable_water
     assert "COALESCE(retry.attempt_count, 0) < %s" in query
     assert "active.status IN ('queued', 'running')" in query
     assert "contact_roles role" in query
-    assert "contact_social_accounts account_relation" in query
     assert "queue_slots" not in query
     assert "LIMIT (SELECT queue_limit FROM queue_slots)" not in query
     assert "ON CONFLICT (contact_id) WHERE status IN ('queued', 'running')" in query

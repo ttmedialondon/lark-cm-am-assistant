@@ -466,14 +466,13 @@ def create_admin_router(
         page: int = 1,
         confirmation: str = "all",
         conversations_page: int = 1,
-        accounts_page: int = 1,
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
         confirmation = admin_reporting.normalize_contact_confirmation(confirmation)
-        detail = admin_reporting.contact_detail(open_id, conversations_page, accounts_page)
+        detail = admin_reporting.contact_detail(open_id, conversations_page)
         if not detail:
             return render_template(
                 request,
@@ -482,7 +481,6 @@ def create_admin_router(
                 404,
             )
         conversations = detail["conversations"]
-        accounts = detail["accounts"]
         latest_assessment = contact_assessments.latest_contact_assessment(detail["contact"]["contact_id"])
         response = render_template(
             request,
@@ -502,16 +500,6 @@ def create_admin_router(
                     page_name="conversations_page",
                     page=page,
                     confirmation=confirmation,
-                    accounts_page=accounts["page"],
-                ),
-                "accounts": accounts["items"],
-                "account_page": pagination(
-                    accounts,
-                    f"/admin/contacts/{open_id}",
-                    page_name="accounts_page",
-                    page=page,
-                    confirmation=confirmation,
-                    conversations_page=conversations["page"],
                 ),
             },
         )
@@ -599,68 +587,6 @@ def create_admin_router(
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 
-    @router.post("/admin/contacts/{open_id}/assessments/{assessment_id}/account-relations")
-    async def admin_confirm_assessment_account_relation(
-        request: Request,
-        open_id: str,
-        assessment_id: UUID,
-        page: int = 1,
-        confirmation: str = "all",
-    ) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        confirmation = admin_reporting.normalize_contact_confirmation(confirmation)
-        if not contact_assessments.assessment_matches_contact(assessment_id, open_id):
-            response = render_template(
-                request,
-                "error.html",
-                {"title": "未找到 AI 判定", "detail": "该判定不存在，或不属于当前联系人。"},
-                404,
-            )
-            response.headers["Cache-Control"] = "no-store, max-age=0"
-            return response
-        form = await _form_fields(request)
-        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
-            return render_contact_assessment(
-                request,
-                access_context,
-                open_id=open_id,
-                assessment_id=assessment_id,
-                source_page=page,
-                source_confirmation=confirmation,
-                error="请求校验失败，请返回此页面后重试。",
-                status_code=400,
-            )
-        try:
-            contact_assessments.confirm_assessment_account_relation(
-                access_context["authorization"]["id"],
-                assessment_id,
-                form.get("account_ref", ""),
-                form.get("relationship", ""),
-            )
-        except contact_assessments.ContactAssessmentInputError as exc:
-            return render_contact_assessment(
-                request,
-                access_context,
-                open_id=open_id,
-                assessment_id=assessment_id,
-                source_page=page,
-                source_confirmation=confirmation,
-                error=str(exc),
-                status_code=400,
-            )
-        response = RedirectResponse(
-            url=(
-                f"/admin/contacts/{open_id}/assessments/{assessment_id}?"
-                f"{urlencode({'page': page, 'confirmation': confirmation})}"
-            ),
-            status_code=303,
-        )
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-        return response
-
     @router.post("/admin/contacts/{open_id}/assessments/{assessment_id}/dismiss")
     async def admin_dismiss_contact_assessment(
         request: Request,
@@ -711,54 +637,6 @@ def create_admin_router(
         response = RedirectResponse(
             url=f"/admin/contacts/{open_id}?{urlencode({'page': page, 'confirmation': confirmation})}",
             status_code=303,
-        )
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-        return response
-
-    @router.get("/admin/accounts")
-    def admin_accounts(request: Request, page: int = 1) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        account_page = admin_reporting.accounts(page)
-        response = render_template(
-            request,
-            "admin/accounts.html",
-            {
-                **page_context(access_context, "accounts"),
-                "accounts": account_page["items"],
-                "account_page": pagination(account_page, "/admin/accounts"),
-            },
-        )
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-        return response
-
-    @router.get("/admin/accounts/{account_id}")
-    def admin_account_detail(request: Request, account_id: UUID, evidence_page: int = 1) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        detail = admin_reporting.account_detail(account_id, evidence_page)
-        if not detail:
-            return render_template(
-                request,
-                "error.html",
-                {"title": "未找到账号记录", "detail": "该账号尚未被规则记录，或已被删除。"},
-                404,
-            )
-        admin_reporting.record_account_view(access_context["authorization"]["id"], account_id)
-        evidence = detail["evidence"]
-        response = render_template(
-            request,
-            "admin/account_detail.html",
-            {
-                **page_context(access_context, "accounts"),
-                "account": detail["account"],
-                "evidence": evidence["items"],
-                "evidence_page": pagination(evidence, f"/admin/accounts/{account_id}", page_name="evidence_page"),
-            },
         )
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
