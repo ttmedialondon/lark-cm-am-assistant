@@ -127,7 +127,9 @@ def test_owner_can_mark_an_onboarded_user_as_assignment_eligible(monkeypatch):
     assert response.status_code == 303
     assert response.headers["location"] == f"/admin/users/{target_id}?page=2"
     assert calls[0][1] == (True, target_id)
-    assert calls[1][1][2] == "contact_assignment_eligibility_updated"
+    assert calls[1][1] == ("contact_assignment",)
+    assert "automatic_queue_checked_at = '-infinity'::timestamptz" in calls[1][0]
+    assert calls[2][1][2] == "contact_assignment_eligibility_updated"
 
 
 def test_message_content_page_is_owner_only(monkeypatch):

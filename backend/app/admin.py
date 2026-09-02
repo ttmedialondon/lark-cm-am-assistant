@@ -355,6 +355,15 @@ def create_admin_router(
                     {"title": "未找到授权用户", "detail": "该用户可能已经被删除。"},
                     404,
                 )
+            if enabled:
+                conn.execute(
+                    """
+                    UPDATE ai_feature_configs
+                    SET automatic_queue_checked_at = '-infinity'::timestamptz, updated_at = NOW()
+                    WHERE feature = %s
+                    """,
+                    (contact_assignments.FEATURE,),
+                )
             conn.execute(
                 "INSERT INTO audit_events (id, authorization_id, action, metadata) VALUES (%s, %s, %s, %s::jsonb)",
                 (
