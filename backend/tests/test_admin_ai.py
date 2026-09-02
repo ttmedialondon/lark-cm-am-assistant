@@ -113,6 +113,7 @@ def test_owner_post_passes_key_to_encrypted_store_without_rendering_it(monkeypat
         "/admin/ai",
         data={
             "csrf_token": "csrf",
+            "feature": "contact_assessment",
             "project_id": "proj_contact_assessment",
             "model": "gpt-5.6-luna",
             "enabled": "1",

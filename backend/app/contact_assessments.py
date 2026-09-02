@@ -941,15 +941,26 @@ def _refs_are_still_authorized_in(conn: psycopg.Connection, assessment_id: UUID)
     return bool(counts and counts["all_count"] and counts["all_count"] == counts["allowed_count"])
 
 
-def _call_openai(config: Mapping[str, Any], api_key: str, pack: Mapping[str, Any], contact_id: UUID) -> dict[str, Any]:
+def call_openai(
+    config: Mapping[str, Any],
+    api_key: str,
+    pack: Mapping[str, Any],
+    contact_id: UUID,
+    *,
+    instructions: str,
+    output_format: Mapping[str, Any],
+    max_output_tokens: int = 500,
+) -> dict[str, Any]:
+    """Call Responses once for an evidence-bound internal AI feature."""
+
     payload = {
         "model": config["model"],
         "store": False,
         "reasoning": {"effort": "low"},
-        "max_output_tokens": 500,
-        "instructions": _MODEL_INSTRUCTIONS,
+        "max_output_tokens": max_output_tokens,
+        "instructions": instructions,
         "input": json.dumps(pack, ensure_ascii=False, separators=(",", ":")),
-        "text": {"format": _structured_output_format()},
+        "text": {"format": output_format},
         "safety_identifier": hashlib.sha256(str(contact_id).encode("ascii")).hexdigest(),
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -977,6 +988,19 @@ def _call_openai(config: Mapping[str, Any], api_key: str, pack: Mapping[str, Any
             "output_tokens": _nonnegative_int(usage.get("output_tokens")),
         },
     }
+
+
+def _call_openai(config: Mapping[str, Any], api_key: str, pack: Mapping[str, Any], contact_id: UUID) -> dict[str, Any]:
+    """Keep the contact-role feature's existing call boundary stable."""
+
+    return call_openai(
+        config,
+        api_key,
+        pack,
+        contact_id,
+        instructions=_MODEL_INSTRUCTIONS,
+        output_format=_structured_output_format(),
+    )
 
 
 def _structured_output_format() -> dict[str, Any]:

@@ -369,6 +369,7 @@ def users(page: int = 1) -> dict[str, Any]:
                 a.authorized_at,
                 a.updated_at,
                 a.body_consent_at,
+                a.assignment_eligible,
                 a.p2p_discovery_status,
                 r.role AS admin_role,
                 COALESCE(g.group_count, 0) AS group_count,
@@ -440,6 +441,7 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
                 a.authorized_at,
                 a.updated_at,
                 a.body_consent_at,
+                a.assignment_eligible,
                 a.p2p_discovery_status,
                 r.role AS admin_role,
                 COALESCE(g.group_count, 0) AS group_count,
@@ -1194,6 +1196,9 @@ def _decorate_user(row: dict[str, Any]) -> dict[str, Any]:
     )
     item["content_access_label"] = "已完成新版授权" if item.get("body_consent_at") else "需新版授权"
     item["content_access_badge"] = "success" if item.get("body_consent_at") else "warning"
+    item["assignment_eligible"] = bool(item.get("assignment_eligible"))
+    item["assignment_eligible_label"] = "可担任负责人" if item["assignment_eligible"] else "不参与负责人匹配"
+    item["assignment_eligible_badge"] = "success" if item["assignment_eligible"] else "secondary"
     item["p2p_status_label"], item["p2p_status_badge"] = _p2p_status(item.get("p2p_discovery_status"))
     item["sync_state_label"], item["sync_state_badge"], item["sync_state_detail"] = sync_summary(item)
     item["sync_progress_label"] = _sync_progress_label(item)

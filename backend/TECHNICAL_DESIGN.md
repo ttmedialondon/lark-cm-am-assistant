@@ -7,7 +7,7 @@
 - 每位 CM/AM 以自己的 Lark OAuth user access token 授权；系统只读取该用户原本可见、且 Lark API 实际返回的会话与历史消息。
 - 群聊和私聊使用同一套 `chats`、`authorization_chats`、`chat_messages` 与同步队列。每条消息保存 Lark 返回的发送者 ID、ID 类型、`open_id`（适用时）、`tenant_key`、发送者类型、回复链/话题/`@` 关系及可用的 Lark 跳转定位字段。
 - 群聊在成员数刷新时分页保存最新成员快照：`open_id`、名称、`tenant_key` 与成员类型；不把 API 未返回的人误判为已离群，也不保存成员历史版本。私聊的对端稳定 ID 保存在该授权用户的 `authorization_chats` 关系上。
-- 联系人以稳定 Lark 身份聚合，`creator`、经纪/机构、品牌/商家等都是联系人角色。独立的联系人自动识别任务只使用当前授权范围内的消息、会话上下文、群名和 Lark 身份元数据构造受限证据包调用 Luna；仅达到 owner 配置阈值、引用可核验且无事实冲突的角色建议才能自动确认，其他建议进入人工队列。
+- 联系人以稳定 Lark 身份聚合，`creator`、经纪/机构、品牌/商家等都是联系人角色。独立的联系人自动识别任务只使用当前授权范围内的消息、会话上下文、群名和 Lark 身份元数据构造受限证据包调用 Luna；仅达到 owner 配置阈值、引用可核验且无事实冲突的角色建议才能自动确认，其他建议进入人工队列。已确认达人可另由独立负责人队列在尚未分配时匹配一位 CM/AM；owner 必须先把该授权账号标记为可担任负责人。该队列只比较双方实际消息，群聊与私聊同权，绝不自动交接。具体口径见 [`contact-assignment-automatic-v0.1.md`](../docs/as-built/contact-assignment-automatic-v0.1.md)。
 - OAuth 成功后回填 Lark API 可返回的历史，并每 5 分钟增量同步、回看 10 分钟以避免边界漏记。
 - 不发送 Lark 消息，不保存附件二进制；成员快照和消息发送者身份仅用于公司内部的后续归属与提醒链路。Luna 仅用于联系人自动识别，使用 `store: false`、严格 JSON Schema 和消息引用校验；具体口径见 [`contact-assessment-automatic-v0.2.md`](../docs/as-built/contact-assessment-automatic-v0.2.md)。
 

@@ -1,10 +1,11 @@
+from contextlib import contextmanager, nullcontext
 from uuid import uuid4
 
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from fastapi.testclient import TestClient
 
-from app import admin, admin_reporting, contact_assessments
+from app import admin, admin_reporting, contact_assessments, contact_assignments
 
 
 def _page(items, page=1, has_next=False, **metadata):
@@ -94,6 +95,41 @@ def test_admin_users_numbered_pagination_keeps_edge_pages(monkeypatch):
     assert middle["pages"][-1]["url"] == "/admin/users?page=17"
 
 
+def test_owner_can_mark_an_onboarded_user_as_assignment_eligible(monkeypatch):
+    owner_id = uuid4()
+    target_id = uuid4()
+    calls = []
+
+    class Result:
+        def fetchone(self):
+            return {"id": target_id}
+
+    class Connection:
+        def transaction(self):
+            return nullcontext()
+
+        def execute(self, query, params):
+            calls.append((query, params))
+            return Result()
+
+    @contextmanager
+    def connection():
+        yield Connection()
+
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(admin, "connection", connection)
+    response = _client(lambda _request: {"id": owner_id, "status": "active"}).post(
+        f"/admin/users/{target_id}/assignment-eligibility?page=2",
+        data={"csrf_token": "csrf", "enabled": "1"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/admin/users/{target_id}?page=2"
+    assert calls[0][1] == (True, target_id)
+    assert calls[1][1][2] == "contact_assignment_eligibility_updated"
+
+
 def test_message_content_page_is_owner_only(monkeypatch):
     monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "operator")
 
@@ -172,6 +208,39 @@ def test_owner_contact_detail_reads_only_that_contact_without_message_content(mo
     assert contexts[-1][0] == "admin/contact_detail.html"
     assert contexts[-1][1]["assessment"] is None
     assert contexts[-1][1]["assessment_available"] is True
+
+
+def test_owner_can_manually_set_or_hand_over_a_creator_assignment(monkeypatch):
+    owner_id = uuid4()
+    contact_id = uuid4()
+    assignee_id = uuid4()
+    assigned = []
+
+    class Result:
+        def fetchone(self):
+            return {"contact_id": contact_id}
+
+    class Connection:
+        def execute(self, _query, _params):
+            return Result()
+
+    @contextmanager
+    def connection():
+        yield Connection()
+
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(admin, "connection", connection)
+    monkeypatch.setattr(contact_assignments, "manually_assign", lambda *args: assigned.append(args))
+
+    response = _client(lambda _request: {"id": owner_id, "status": "active"}).post(
+        "/admin/contacts/ou_creator/assignment/handoff?page=3&confirmation=confirmed",
+        data={"csrf_token": "csrf", "responsible_authorization_id": str(assignee_id)},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/contacts/ou_creator?page=3&confirmation=confirmed"
+    assert assigned == [(owner_id, contact_id, str(assignee_id))]
 
 
 def test_owner_can_dismiss_one_ai_suggestion_from_its_contact(monkeypatch):

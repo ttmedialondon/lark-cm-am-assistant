@@ -12,7 +12,7 @@ from typing import Any
 
 import psycopg
 
-from . import contact_assessments
+from . import contact_assessments, contact_assignments
 from .config import Settings, get_settings
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
@@ -55,20 +55,24 @@ def run_forever() -> None:
         LOGGER.warning("Lark App Secret is not configured; worker is waiting for administrator input")
 
     sync_streak = 0
+    prefer_assignment = False
     while True:
         try:
             _recover_expired_leases()
             # Keep a backfill from starving the durable AI queue forever. The
             # assessment path remains globally rate-limited in PostgreSQL.
-            if sync_streak >= MAX_CONSECUTIVE_SYNC_JOBS and _run_contact_assessment(settings):
-                sync_streak = 0
-                continue
+            if sync_streak >= MAX_CONSECUTIVE_SYNC_JOBS:
+                ran_ai, prefer_assignment = _run_ai_turn(settings, prefer_assignment)
+                if ran_ai:
+                    sync_streak = 0
+                    continue
             job = _claim_job() if settings.app_secret_configured else None
             if job:
                 _execute_job(job, settings)
                 sync_streak += 1
                 continue
-            if _run_contact_assessment(settings):
+            ran_ai, prefer_assignment = _run_ai_turn(settings, prefer_assignment)
+            if ran_ai:
                 sync_streak = 0
                 continue
             sync_streak = 0
@@ -88,6 +92,32 @@ def _run_contact_assessment(settings: Settings) -> bool:
     except Exception:
         LOGGER.exception("contact assessment worker failed without exposing user data")
         return False
+
+
+def _run_contact_assignment(settings: Settings) -> bool:
+    """Run one assignment task without allowing an AI failure to stop sync work."""
+
+    try:
+        return contact_assignments.run_next_contact_assignment(settings)
+    except Exception:
+        LOGGER.exception("contact assignment worker failed without exposing user data")
+        return False
+
+
+def _run_ai_turn(settings: Settings, prefer_assignment: bool) -> tuple[bool, bool]:
+    """Give both durable AI queues a fair turn without delaying sync work."""
+
+    if prefer_assignment:
+        if _run_contact_assignment(settings):
+            return True, False
+        if _run_contact_assessment(settings):
+            return True, True
+    else:
+        if _run_contact_assessment(settings):
+            return True, True
+        if _run_contact_assignment(settings):
+            return True, False
+    return False, prefer_assignment
 
 
 def _recover_expired_leases() -> None:

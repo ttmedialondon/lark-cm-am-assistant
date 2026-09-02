@@ -10,7 +10,7 @@
       <div class="table-responsive admin-directory__table"><table class="table table-vcenter card-table">
         <thead><tr><th>人员</th><th>授权</th><th>接入状态</th><th>会话范围</th><th>首次回填</th><th>消息索引</th><th>最近同步</th></tr></thead>
         <tbody>{% for user in users %}<tr>
-          <td><a href="/admin/users/{{ user.id }}?page={{ user_page.page }}">{{ user.display_name }}</a></td>
+          <td><a href="/admin/users/{{ user.id }}?page={{ user_page.page }}">{{ user.display_name }}</a><div class="text-secondary small mt-1">{{ user.assignment_eligible_label }}</div></td>
           <td><span class="badge bg-{{ user.authorization_status_badge }}-lt">{{ user.authorization_status_label }}</span></td>
           <td><span class="badge bg-{{ user.sync_state_badge }}-lt">{{ user.sync_state_label }}</span><div class="text-secondary small mt-1">{{ user.sync_state_detail }}</div></td>
           <td>{{ user.group_count }} 个群聊 · {{ user.p2p_count }} 个私聊<div class="text-secondary small mt-1">{{ user.p2p_status_label }}{% if user.archived_conversation_count %} · {{ user.archived_conversation_count }} 个已归档/解散{% endif %}</div></td>

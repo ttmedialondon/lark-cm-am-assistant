@@ -3,6 +3,8 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
+import pytest
+
 from app import worker
 from app.worker import (
     _body_content,
@@ -236,3 +238,28 @@ def test_worker_gives_the_durable_ai_queue_a_turn_during_continuous_sync(monkeyp
         pass
 
     assert calls == ["sync", "sync", "sync", "assessment"]
+
+
+def test_worker_alternates_assignment_and_identity_ai_queues(monkeypatch) -> None:
+    calls: list[str] = []
+    jobs = iter((object(), object(), object(), object(), object(), object()))
+
+    def recover() -> None:
+        if calls == ["sync", "sync", "sync", "assessment", "sync", "sync", "sync", "assignment"]:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        worker,
+        "get_settings",
+        lambda: SimpleNamespace(app_secret_configured=True, worker_idle_seconds=1),
+    )
+    monkeypatch.setattr(worker, "_recover_expired_leases", recover)
+    monkeypatch.setattr(worker, "_claim_job", lambda: next(jobs))
+    monkeypatch.setattr(worker, "_execute_job", lambda _job, _settings: calls.append("sync"))
+    monkeypatch.setattr(worker, "_run_contact_assessment", lambda _settings: calls.append("assessment") or True)
+    monkeypatch.setattr(worker, "_run_contact_assignment", lambda _settings: calls.append("assignment") or True)
+
+    with pytest.raises(KeyboardInterrupt):
+        worker.run_forever()
+
+    assert calls == ["sync", "sync", "sync", "assessment", "sync", "sync", "sync", "assignment"]

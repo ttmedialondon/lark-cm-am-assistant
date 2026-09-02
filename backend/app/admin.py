@@ -17,7 +17,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse, Response
 
-from . import admin_reporting, ai_feature_config, contact_assessments
+from . import admin_reporting, ai_feature_config, contact_assessments, contact_assignments
 from .config import get_settings
 from .db import connection
 
@@ -34,6 +34,18 @@ class TemplateRenderer(Protocol):
 
 CurrentAuthorization = Callable[[Request], dict[str, Any] | None]
 CsrfToken = Callable[[dict[str, Any]], str]
+AI_FEATURES = {
+    "contact_assessment": {
+        "title": "联系人身份识别",
+        "description": "自动判断外部联系人的业务身份；高置信度结果才会确认身份。",
+        "enabled_label": "启用联系人判定",
+    },
+    "contact_assignment": {
+        "title": "达人负责人匹配",
+        "description": "只在达人尚无负责人时，以真实双向互动匹配一位 CM/AM；不会自动交接。",
+        "enabled_label": "启用负责人匹配",
+    },
+}
 
 
 def create_admin_router(
@@ -168,13 +180,23 @@ def create_admin_router(
         status_code: int = 200,
     ) -> Response:
         with connection() as conn:
-            config = ai_feature_config.display_config(ai_feature_config.get_feature_config(conn, "contact_assessment"))
+            configs = [
+                {
+                    **AI_FEATURES[feature],
+                    "id_suffix": feature.replace("_", "-"),
+                    "config": ai_feature_config.display_config(ai_feature_config.get_feature_config(conn, feature)),
+                    "feature": feature,
+                }
+                for feature in AI_FEATURES
+            ]
         response = render_template(
             request,
             "admin/ai.html",
             {
                 **page_context(access_context, "ai"),
-                "config": config,
+                "configs": configs,
+                # Retain this template-safe alias while external callers migrate to ``configs``.
+                "config": configs[0]["config"],
                 "form_error": error,
             },
             status_code,
@@ -298,6 +320,51 @@ def create_admin_router(
                 ),
             },
         )
+
+    @router.post("/admin/users/{authorization_id}/assignment-eligibility")
+    async def admin_set_assignment_eligibility(
+        request: Request, authorization_id: UUID, page: int = 1
+    ) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        form = await _form_fields(request)
+        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
+            return render_template(
+                request,
+                "error.html",
+                {"title": "请求校验失败", "detail": "请返回人员页面后重试。"},
+                400,
+            )
+        enabled = form.get("enabled") == "1"
+        with connection() as conn, conn.transaction():
+            user = conn.execute(
+                """
+                UPDATE authorizations
+                SET assignment_eligible = %s, updated_at = NOW()
+                WHERE id = %s
+                RETURNING id
+                """,
+                (enabled, authorization_id),
+            ).fetchone()
+            if not user:
+                return render_template(
+                    request,
+                    "error.html",
+                    {"title": "未找到授权用户", "detail": "该用户可能已经被删除。"},
+                    404,
+                )
+            conn.execute(
+                "INSERT INTO audit_events (id, authorization_id, action, metadata) VALUES (%s, %s, %s, %s::jsonb)",
+                (
+                    uuid4(),
+                    access_context["authorization"]["id"],
+                    "contact_assignment_eligibility_updated",
+                    json.dumps({"target_authorization_id": str(authorization_id), "enabled": enabled}),
+                ),
+            )
+        return RedirectResponse(url=f"/admin/users/{authorization_id}?{urlencode({'page': page})}", status_code=303)
 
     @router.get("/admin/chats")
     def admin_chats(request: Request, page: int = 1) -> Response:
@@ -481,7 +548,20 @@ def create_admin_router(
                 404,
             )
         conversations = detail["conversations"]
+        is_creator = "creator" in detail["contact"].get("confirmed_roles", ())
         latest_assessment = contact_assessments.latest_contact_assessment(detail["contact"]["contact_id"])
+        assignment = contact_assignments.active_assignment(detail["contact"]["contact_id"]) if is_creator else None
+        assignment_assessment = (
+            contact_assignments.latest_contact_assignment_assessment(detail["contact"]["contact_id"])
+            if is_creator
+            else None
+        )
+        assignees = contact_assignments.assignable_authorizations(detail["contact"]["contact_id"]) if is_creator else []
+        assignment_choices = [
+            item
+            for item in assignees
+            if not assignment or item["id"] != assignment["responsible_authorization_id"]
+        ]
         response = render_template(
             request,
             "admin/contact_detail.html",
@@ -493,6 +573,12 @@ def create_admin_router(
                 "source_confirmation": confirmation,
                 "assessment": latest_assessment,
                 "assessment_available": contact_assessments.assessment_available(),
+                "is_creator": is_creator,
+                "assignment": assignment,
+                "assignment_assessment": assignment_assessment,
+                "assignment_available": contact_assignments.assignment_available() if is_creator else False,
+                "assignees": assignees,
+                "assignment_choices": assignment_choices,
                 "conversations": conversations["items"],
                 "conversation_page": pagination(
                     conversations,
@@ -502,6 +588,68 @@ def create_admin_router(
                     confirmation=confirmation,
                 ),
             },
+        )
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
+    @router.post("/admin/contacts/{open_id}/assignment")
+    @router.post("/admin/contacts/{open_id}/assignment/handoff")
+    async def admin_set_contact_assignment(
+        request: Request,
+        open_id: str,
+        page: int = 1,
+        confirmation: str = "all",
+    ) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        confirmation = admin_reporting.normalize_contact_confirmation(confirmation)
+        form = await _form_fields(request)
+        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
+            response = render_template(
+                request,
+                "error.html",
+                {"title": "请求校验失败", "detail": "请返回达人详情页后重试。"},
+                400,
+            )
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
+        with connection() as conn:
+            contact = conn.execute(
+                """
+                SELECT contact_id FROM lark_identities
+                WHERE open_id = %s AND identity_type = 'user'
+                """,
+                (open_id,),
+            ).fetchone()
+        if not contact:
+            response = render_template(
+                request,
+                "error.html",
+                {"title": "未找到达人", "detail": "该外部联系人尚未被同步。"},
+                404,
+            )
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
+        try:
+            contact_assignments.manually_assign(
+                access_context["authorization"]["id"],
+                contact["contact_id"],
+                form.get("responsible_authorization_id", ""),
+            )
+        except contact_assignments.ContactAssignmentInputError as exc:
+            response = render_template(
+                request,
+                "error.html",
+                {"title": "无法更新负责人", "detail": str(exc)},
+                400,
+            )
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
+        response = RedirectResponse(
+            url=f"/admin/contacts/{open_id}?{urlencode({'page': page, 'confirmation': confirmation})}",
+            status_code=303,
         )
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
@@ -657,13 +805,16 @@ def create_admin_router(
             )
             response.headers["Cache-Control"] = "no-store, max-age=0"
             return response
+        feature = form.get("feature", "")
+        if feature not in AI_FEATURES:
+            return render_ai_config(request, access_context, error="未知的 AI 功能配置。", status_code=400)
         try:
             with connection() as conn, conn.transaction():
                 key_rotated = bool(form.get("api_key", "").strip())
                 ai_feature_config.save_feature_config(
                     conn,
                     ai_feature_config.api_key_cipher(get_settings().token_encryption_key),
-                    "contact_assessment",
+                    feature,
                     provider="openai",
                     project_id=form.get("project_id", ""),
                     model=form.get("model", ""),
@@ -682,7 +833,7 @@ def create_admin_router(
                         "ai_feature_config_updated",
                         json.dumps(
                             {
-                                "feature": "contact_assessment",
+                                "feature": feature,
                                 "provider": "openai",
                                 "project_id": form.get("project_id", "").strip(),
                                 "model": form.get("model", "").strip(),
