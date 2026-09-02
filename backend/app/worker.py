@@ -64,6 +64,10 @@ def run_forever() -> None:
         while True:
             try:
                 _reap_ai_futures(futures)
+                _recover_expired_leases()
+                # Fill paid-call slots before any potentially long Lark work.
+                # The claims are quick; the main thread still owns all sync IO.
+                prefer_assignment = _fill_ai_slots(settings, executor, futures, prefer_assignment)
                 if settings.app_secret_configured and time.monotonic() >= next_organization_check:
                     _run_organization_sync(settings)
                     # The database keeps the real daily cadence. This local bound
@@ -71,10 +75,6 @@ def run_forever() -> None:
                     next_organization_check = time.monotonic() + min(
                         getattr(settings, "organization_sync_interval_seconds", 21_600), 300
                     )
-                _recover_expired_leases()
-                # Fill paid-call slots before a potentially long Lark backfill.
-                # The claims are quick; the main thread still owns all sync IO.
-                prefer_assignment = _fill_ai_slots(settings, executor, futures, prefer_assignment)
                 job = _claim_job() if settings.app_secret_configured else None
                 if job:
                     _execute_job(job, settings)
