@@ -215,7 +215,8 @@ def create_admin_router(
         open_id: str,
         assessment_id: UUID,
         source_page: int = 1,
-        source_confirmation: str = "all",
+        source_category: str = "all",
+        source_organization_status: str = "all",
         error: str | None = None,
         status_code: int = 200,
     ) -> Response:
@@ -240,7 +241,8 @@ def create_admin_router(
                     "assessment": detail,
                     "route_open_id": open_id,
                     "source_page": source_page,
-                    "source_confirmation": source_confirmation,
+                    "source_category": source_category,
+                    "source_organization_status": source_organization_status,
                     "form_error": error,
                 },
                 status_code,
@@ -519,21 +521,34 @@ def create_admin_router(
         return render_ai_config(request, access_context)
 
     @router.get("/admin/contacts")
-    def admin_contacts(request: Request, page: int = 1, confirmation: str = "all") -> Response:
+    def admin_contacts(
+        request: Request,
+        page: int = 1,
+        category: str = "all",
+        organization_status: str = "all",
+    ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        confirmation = admin_reporting.normalize_contact_confirmation(confirmation)
-        contact_page = admin_reporting.contacts(page, confirmation)
+        category = admin_reporting.normalize_contact_category(category)
+        organization_status = admin_reporting.normalize_organization_status(organization_status)
+        contact_page = admin_reporting.contacts(page, category, organization_status)
         response = render_template(
             request,
             "admin/contacts.html",
             {
                 **page_context(access_context, "contacts"),
                 "contacts": contact_page["items"],
-                "contact_page": pagination(contact_page, "/admin/contacts", confirmation=confirmation),
-                "confirmation": confirmation,
+                "contact_page": pagination(
+                    contact_page,
+                    "/admin/contacts",
+                    category=category,
+                    organization_status=organization_status,
+                ),
+                "category": category,
+                "organization_status": organization_status,
+                "organization_sync": admin_reporting.organization_sync_status(),
             },
         )
         response.headers["Cache-Control"] = "no-store, max-age=0"
@@ -544,24 +559,26 @@ def create_admin_router(
         request: Request,
         open_id: str,
         page: int = 1,
-        confirmation: str = "all",
+        category: str = "all",
+        organization_status: str = "all",
         conversations_page: int = 1,
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        confirmation = admin_reporting.normalize_contact_confirmation(confirmation)
+        category = admin_reporting.normalize_contact_category(category)
+        organization_status = admin_reporting.normalize_organization_status(organization_status)
         detail = admin_reporting.contact_detail(open_id, conversations_page)
         if not detail:
             return render_template(
                 request,
                 "error.html",
-                {"title": "未找到 Lark 参与者", "detail": "该参与者尚未被同步，或不在外部联系人目录中。"},
+                {"title": "未找到 Lark 参与者", "detail": "该参与者尚未被同步，或不在人员目录中。"},
                 404,
             )
         conversations = detail["conversations"]
-        is_creator = "creator" in detail["contact"].get("confirmed_roles", ())
+        is_creator = detail["contact"].get("primary_role") == "creator"
         latest_assessment = contact_assessments.latest_contact_assessment(detail["contact"]["contact_id"])
         assignment = contact_assignments.active_assignment(detail["contact"]["contact_id"]) if is_creator else None
         assignment_assessment = (
@@ -583,7 +600,8 @@ def create_admin_router(
                 "contact": detail["contact"],
                 "identities": detail["identities"],
                 "source_page": page,
-                "source_confirmation": confirmation,
+                "source_category": category,
+                "source_organization_status": organization_status,
                 "assessment": latest_assessment,
                 "assessment_available": contact_assessments.assessment_available(),
                 "is_creator": is_creator,
@@ -598,7 +616,8 @@ def create_admin_router(
                     f"/admin/contacts/{open_id}",
                     page_name="conversations_page",
                     page=page,
-                    confirmation=confirmation,
+                    category=category,
+                    organization_status=organization_status,
                 ),
             },
         )
@@ -611,13 +630,15 @@ def create_admin_router(
         request: Request,
         open_id: str,
         page: int = 1,
-        confirmation: str = "all",
+        category: str = "all",
+        organization_status: str = "all",
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        confirmation = admin_reporting.normalize_contact_confirmation(confirmation)
+        category = admin_reporting.normalize_contact_category(category)
+        organization_status = admin_reporting.normalize_organization_status(organization_status)
         form = await _form_fields(request)
         if not _csrf_matches(form, csrf_token(access_context["authorization"])):
             response = render_template(
@@ -660,10 +681,8 @@ def create_admin_router(
             )
             response.headers["Cache-Control"] = "no-store, max-age=0"
             return response
-        response = RedirectResponse(
-            url=f"/admin/contacts/{open_id}?{urlencode({'page': page, 'confirmation': confirmation})}",
-            status_code=303,
-        )
+        query = urlencode({"page": page, "category": category, "organization_status": organization_status})
+        response = RedirectResponse(url=f"/admin/contacts/{open_id}?{query}", status_code=303)
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 
@@ -673,20 +692,23 @@ def create_admin_router(
         open_id: str,
         assessment_id: UUID,
         page: int = 1,
-        confirmation: str = "all",
+        category: str = "all",
+        organization_status: str = "all",
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        confirmation = admin_reporting.normalize_contact_confirmation(confirmation)
+        category = admin_reporting.normalize_contact_category(category)
+        organization_status = admin_reporting.normalize_organization_status(organization_status)
         return render_contact_assessment(
             request,
             access_context,
             open_id=open_id,
             assessment_id=assessment_id,
             source_page=page,
-            source_confirmation=confirmation,
+            source_category=category,
+            source_organization_status=organization_status,
         )
 
     @router.post("/admin/contacts/{open_id}/assessments/{assessment_id}/roles")
@@ -695,13 +717,15 @@ def create_admin_router(
         open_id: str,
         assessment_id: UUID,
         page: int = 1,
-        confirmation: str = "all",
+        category: str = "all",
+        organization_status: str = "all",
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        confirmation = admin_reporting.normalize_contact_confirmation(confirmation)
+        category = admin_reporting.normalize_contact_category(category)
+        organization_status = admin_reporting.normalize_organization_status(organization_status)
         if not contact_assessments.assessment_matches_contact(assessment_id, open_id):
             response = render_template(
                 request,
@@ -719,7 +743,8 @@ def create_admin_router(
                 open_id=open_id,
                 assessment_id=assessment_id,
                 source_page=page,
-                source_confirmation=confirmation,
+                source_category=category,
+                source_organization_status=organization_status,
                 error="请求校验失败，请返回此页面后重试。",
                 status_code=400,
             )
@@ -734,14 +759,15 @@ def create_admin_router(
                 open_id=open_id,
                 assessment_id=assessment_id,
                 source_page=page,
-                source_confirmation=confirmation,
+                source_category=category,
+                source_organization_status=organization_status,
                 error=str(exc),
                 status_code=400,
             )
         response = RedirectResponse(
             url=(
                 f"/admin/contacts/{open_id}/assessments/{assessment_id}?"
-                f"{urlencode({'page': page, 'confirmation': confirmation})}"
+                f"{urlencode({'page': page, 'category': category, 'organization_status': organization_status})}"
             ),
             status_code=303,
         )
@@ -754,13 +780,15 @@ def create_admin_router(
         open_id: str,
         assessment_id: UUID,
         page: int = 1,
-        confirmation: str = "all",
+        category: str = "all",
+        organization_status: str = "all",
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        confirmation = admin_reporting.normalize_contact_confirmation(confirmation)
+        category = admin_reporting.normalize_contact_category(category)
+        organization_status = admin_reporting.normalize_organization_status(organization_status)
         if not contact_assessments.assessment_matches_contact(assessment_id, open_id):
             response = render_template(
                 request,
@@ -778,7 +806,8 @@ def create_admin_router(
                 open_id=open_id,
                 assessment_id=assessment_id,
                 source_page=page,
-                source_confirmation=confirmation,
+                source_category=category,
+                source_organization_status=organization_status,
                 error="请求校验失败，请返回此页面后重试。",
                 status_code=400,
             )
@@ -791,14 +820,13 @@ def create_admin_router(
                 open_id=open_id,
                 assessment_id=assessment_id,
                 source_page=page,
-                source_confirmation=confirmation,
+                source_category=category,
+                source_organization_status=organization_status,
                 error=str(exc),
                 status_code=400,
             )
-        response = RedirectResponse(
-            url=f"/admin/contacts/{open_id}?{urlencode({'page': page, 'confirmation': confirmation})}",
-            status_code=303,
-        )
+        query = urlencode({"page": page, "category": category, "organization_status": organization_status})
+        response = RedirectResponse(url=f"/admin/contacts/{open_id}?{query}", status_code=303)
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 

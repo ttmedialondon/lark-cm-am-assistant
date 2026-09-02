@@ -19,7 +19,7 @@
           <td>{{ creator.display_name }}</td>
           <td><span class="badge bg-{{ creator.assignment_status_badge }}-lt">{{ creator.assignment_status_label }}</span>{% if creator.responsible_name %}<div class="text-secondary small mt-1">{{ creator.responsible_name }}{% if creator.assignment_confidence_label %} · {{ creator.assignment_confidence_label }}{% endif %}</div>{% elif creator.suggested_name %}<div class="text-secondary small mt-1">建议：{{ creator.suggested_name }}{% if creator.assignment_confidence_label %} · {{ creator.assignment_confidence_label }}{% endif %}</div>{% endif %}</td>
           <td>{{ creator.updated_at_label }}</td>
-          <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="/admin/contacts/{{ creator.open_id }}?confirmation=confirmed">查看联系人</a></td>
+          <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="/admin/contacts/{{ creator.open_id }}?category=creator">查看联系人</a></td>
         </tr>{% endfor %}</tbody>
       </table></div>
       {% with pager=creator_page %}{% include "admin/_pagination.html" %}{% endwith %}

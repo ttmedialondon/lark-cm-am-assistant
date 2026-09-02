@@ -12,7 +12,7 @@ from typing import Any
 
 import psycopg
 
-from . import contact_assessments, contact_assignments
+from . import contact_assessments, contact_assignments, organization_sync
 from .config import Settings, get_settings
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
@@ -56,8 +56,16 @@ def run_forever() -> None:
 
     sync_streak = 0
     prefer_assignment = False
+    next_organization_check = 0.0
     while True:
         try:
+            if settings.app_secret_configured and time.monotonic() >= next_organization_check:
+                _run_organization_sync(settings)
+                # The database keeps the real daily cadence. This local bound
+                # avoids a query on every three-second idle worker loop.
+                next_organization_check = time.monotonic() + min(
+                    getattr(settings, "organization_sync_interval_seconds", 21_600), 300
+                )
             _recover_expired_leases()
             # Keep a backfill from starving the durable AI queue forever. The
             # assessment path remains globally rate-limited in PostgreSQL.
@@ -82,6 +90,15 @@ def run_forever() -> None:
         except Exception:  # Unexpected failures must not terminate the systemd worker loop.
             LOGGER.exception("worker loop failed without exposing user data")
             time.sleep(settings.worker_idle_seconds)
+
+
+def _run_organization_sync(settings: Settings) -> None:
+    """Keep an optional Trust Party failure separate from message collection."""
+
+    try:
+        organization_sync.sync_if_due(settings, LarkClient(settings))
+    except Exception:
+        LOGGER.exception("organization sync failed without exposing organization data")
 
 
 def _run_contact_assessment(settings: Settings) -> bool:
@@ -381,7 +398,16 @@ def _discover_chats(
                         last_seen_at = EXCLUDED.last_seen_at,
                         metadata_updated_at = EXCLUDED.metadata_updated_at
                     """,
-                    (chat_id, name, external, chat_status, chat_mode, seen_at, seen_at, seen_at),
+                    (
+                        chat_id,
+                        name,
+                        external,
+                        chat_status,
+                        chat_mode,
+                        seen_at,
+                        seen_at,
+                        seen_at,
+                    ),
                 )
                 counterpart_open_id = _p2p_counterpart_open_id(counterpart_id, counterpart_type)
                 if counterpart_open_id:
@@ -463,6 +489,7 @@ def _discover_chats(
                         internal_tenant_keys,
                     )
                 discovered += 1
+            _ensure_internal_contact_roles(conn)
         if not _has_more(data):
             break
         page_token = _text(data.get("page_token"))
@@ -738,6 +765,42 @@ def _refresh_tenant_classifications(conn: psycopg.Connection, internal_tenant_ke
         END
         """,
         (list(internal_tenant_keys),),
+    )
+    _ensure_internal_contact_roles(conn)
+
+
+def _ensure_internal_contact_roles(conn: psycopg.Connection) -> None:
+    """Make verified company membership deterministic, never a model decision."""
+
+    conn.execute(
+        """
+        WITH internal_contacts AS (
+            SELECT DISTINCT contact_id
+            FROM lark_identities
+            WHERE identity_type = 'user'
+              AND tenant_classification = 'internal'
+              AND contact_id IS NOT NULL
+        )
+        UPDATE contact_roles role
+        SET is_primary = FALSE, updated_at = NOW()
+        WHERE role.is_primary AND role.status = 'confirmed'
+          AND role.contact_id IN (SELECT contact_id FROM internal_contacts)
+          AND role.role <> 'internal_colleague'
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO contact_roles (contact_id, role, status, source, is_primary, reviewed_at)
+        SELECT DISTINCT identity.contact_id, 'internal_colleague', 'confirmed',
+               'lark_internal_tenant', TRUE, NOW()
+        FROM lark_identities identity
+        WHERE identity.identity_type = 'user'
+          AND identity.tenant_classification = 'internal'
+          AND identity.contact_id IS NOT NULL
+        ON CONFLICT (contact_id, role) DO UPDATE SET
+            status = 'confirmed', source = 'lark_internal_tenant', is_primary = TRUE,
+            reviewed_at = EXCLUDED.reviewed_at, updated_at = NOW()
+        """
     )
 
 

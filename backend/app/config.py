@@ -66,6 +66,8 @@ class Settings:
     member_count_refresh_seconds: int
     max_pages_per_job: int
     worker_idle_seconds: int
+    our_organization_name: str = "TT Media London"
+    organization_sync_interval_seconds: int = 21_600
 
     @property
     def app_secret_configured(self) -> bool:
@@ -103,4 +105,7 @@ def get_settings() -> Settings:
         member_count_refresh_seconds=_positive_int("MEMBER_COUNT_REFRESH_SECONDS", 86400, 300),
         max_pages_per_job=_positive_int("MAX_PAGES_PER_JOB", 30, 1),
         worker_idle_seconds=_positive_int("WORKER_IDLE_SECONDS", 3, 1),
+        our_organization_name=os.environ.get("OUR_ORGANIZATION_NAME", "TT Media London").strip()
+        or "TT Media London",
+        organization_sync_interval_seconds=_positive_int("ORGANIZATION_SYNC_INTERVAL_SECONDS", 21_600, 300),
     )

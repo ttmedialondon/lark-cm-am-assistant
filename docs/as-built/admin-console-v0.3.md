@@ -30,8 +30,9 @@ chat_messages (公司级唯一消息 ID；加密正文与必要元数据)
        └── lark_identities（发送者 / 成员 / @ 提及的稳定 Lark 身份）──> contacts
 
 chats ──< chat_members（最新群成员快照）
-contacts ──< contact_roles（人工确认或自动确认的角色事实）
-contacts ──< contact_assignments（单一当前负责人 + 人工交接历史）
+contacts ──< contact_roles（唯一主类别：人工确认或自动确认）
+contacts ──< contact_organization_links >── organizations <── organization_tenants
+contacts ──< contact_assignments（仅达人：单一当前负责人 + 人工交接历史）
 ```
 
 同一个 Lark 群被多位 CM/AM 授权时，群元数据和正文只保留一份；每位 CM/AM 的可见性、游标、同步状态和“本人发送”判断仍独立保存。因此，公司级计数不会重复，人员视图也不会误显示未重新授权的正文。
@@ -45,7 +46,7 @@ contacts ──< contact_assignments（单一当前负责人 + 人工交接历�
 | `/admin/users/{authorization_id}` | 某一授权用户的发现/可同步/已完成/等待进度、群/私聊分别的回填比例、当前可见会话与近期任务；owner 可明确标记该账号是否可担任达人负责人。 |
 | `/admin/chats` | 公司级唯一群和专题群、已授权可见人数、去重消息数、同步覆盖与成员人数状态。 |
 | `/admin/messages` | **仅 owner**：按 CM/AM、群/私聊、具体会话筛选，最近 100 条正文分页展示。 |
-| `/admin/contacts` | **仅 owner**：按稳定 Lark 身份查看外部联系人、会话统计、角色状态与可核验的 AI 消息证据。 |
+| `/admin/contacts` | **仅 owner**：按稳定 Lark 身份查看所有人员；可按主类别和组织验证状态筛选，查看会话统计、组织关系与可核验的 AI 消息证据。 |
 | `/admin/creators` | **仅 owner**：查看已确认拥有 `creator` 角色的联系人及其稳定 Lark 身份。 |
 | `/admin/contacts/{open_id}`（达人） | **仅 owner**：显示唯一当前负责人、最近的 AI 匹配状态与建议；会明确展示候选覆盖、直接互动证据或校准样本造成的自动确认拦截；可人工确认或交接给另一位已接入 CM/AM。 |
 | `/admin/ai` | **仅 owner**：分别配置“联系人身份识别”和“达人负责人匹配”的 OpenAI Project / service-account key，并显示负责人匹配的人工校准样本进度。 |
@@ -63,4 +64,4 @@ contacts ──< contact_assignments（单一当前负责人 + 人工交接历�
 - 首次历史回填：安全分页续跑属于同一个 job，不记为错误重试；`attempts` 只在临时错误、租约过期或退避重试时增加。
 - 已归档/解散会话：保留发现事实但不计划回填，并从“可同步会话”分母中排除。
 - 专题群：计入群聊总数，在目录与人员页单独标为“专题群”。
-- 联系人角色：仅基于稳定 Lark 身份及当前授权范围内、可核验的消息证据生成或确认；群名只是弱证据，不会单独确认角色。
+- 人员主类别、组织归属、达人负责人相互独立。待识别不等于“其他外部联系人”；群名只是弱证据，不能单独确认类别或组织。Lark 关联租户只能验证 `tenant_key → 组织`，不自动证明该人是该机构员工或负责人。

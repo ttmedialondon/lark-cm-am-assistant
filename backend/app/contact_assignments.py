@@ -192,7 +192,7 @@ def queue_eligible_contact_assignments() -> int:
                 JOIN lark_identities identity ON identity.open_id = changed.sender_open_id
                 JOIN contact_roles role ON role.contact_id = identity.contact_id
                 WHERE identity.identity_type = 'user'
-                  AND role.role = 'creator' AND role.status = 'confirmed'
+                  AND role.role = 'creator' AND role.status = 'confirmed' AND role.is_primary
                 UNION
                 SELECT DISTINCT identity.contact_id
                 FROM changed_messages changed
@@ -205,7 +205,7 @@ def queue_eligible_contact_assignments() -> int:
                 JOIN contact_roles role ON role.contact_id = identity.contact_id
                 WHERE changed.sent_by_author
                   AND identity.identity_type = 'user'
-                  AND role.role = 'creator' AND role.status = 'confirmed'
+                  AND role.role = 'creator' AND role.status = 'confirmed' AND role.is_primary
                 UNION
                 SELECT contact_id
                 FROM retry_attempts
@@ -216,7 +216,7 @@ def queue_eligible_contact_assignments() -> int:
                 FROM contacts contact
                 JOIN contact_roles role ON role.contact_id = contact.id
                 JOIN seeded_contacts seed ON seed.contact_id = contact.id
-                WHERE role.role = 'creator' AND role.status = 'confirmed'
+                WHERE role.role = 'creator' AND role.status = 'confirmed' AND role.is_primary
                   AND NOT EXISTS (
                       SELECT 1 FROM contact_assignments assignment
                       WHERE assignment.contact_id = contact.id AND assignment.ended_at IS NULL
@@ -1430,7 +1430,7 @@ def _confirmed_creator_in(conn: psycopg.Connection, contact_id: UUID) -> bool:
         """
         SELECT EXISTS (
             SELECT 1 FROM contact_roles
-            WHERE contact_id = %s AND role = 'creator' AND status = 'confirmed'
+            WHERE contact_id = %s AND role = 'creator' AND status = 'confirmed' AND is_primary
         ) AS is_creator
         """,
         (contact_id,),

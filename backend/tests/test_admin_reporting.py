@@ -38,8 +38,10 @@ def test_message_conversation_filter_values_are_bounded_and_allowlisted():
     assert admin_reporting.normalize_message_conversation_query("x" * 121) == "x" * 120
     assert admin_reporting.normalize_message_conversation_type("p2p") == "p2p"
     assert admin_reporting.normalize_message_conversation_type("unknown") == "all"
-    assert admin_reporting.normalize_contact_confirmation("confirmed") == "confirmed"
-    assert admin_reporting.normalize_contact_confirmation("unexpected") == "all"
+    assert admin_reporting.normalize_contact_category("creator") == "creator"
+    assert admin_reporting.normalize_contact_category("unexpected") == "all"
+    assert admin_reporting.normalize_organization_status("verified") == "verified"
+    assert admin_reporting.normalize_organization_status("unexpected") == "all"
     assert admin_reporting.normalize_creator_assignment_filter("pending") == "pending"
     assert admin_reporting.normalize_creator_assignment_filter("unexpected") == "all"
 
@@ -88,13 +90,18 @@ def test_contact_labels_do_not_imply_identity_or_ownership():
         {
             "display_name": "Ada",
             "tenant_classification": "known_external",
-            "confirmed_roles": ["agent_or_agency", "candidate", "supplier"],
-            "is_confirmed": True,
+            "primary_role": "partner_contact",
+            "category": "partner_contact",
+            "confirmed_roles": ["partner_contact"],
+            "organization_name": "TT MEDIA ITALY",
+            "organization_status": "verified",
         }
     )
     assert contact["display_name"] == "Ada"
     assert contact["tenant_classification_label"] == "外部成员"
-    assert contact["confirmed_role_labels"] == ["已确认经纪人 / 机构", "已确认供应商"]
+    assert contact["category_label"] == "合作机构对接人"
+    assert contact["confirmed_role_labels"] == ["合作机构对接人"]
+    assert contact["organization_status_label"] == "已验证"
     assert contact["is_confirmed"] is True
 
     unnamed = admin_reporting._decorate_contact({"display_name": None, "tenant_classification": "unresolved"})
@@ -102,6 +109,9 @@ def test_contact_labels_do_not_imply_identity_or_ownership():
     assert unnamed["tenant_classification_label"] == "租户未返回"
     assert unnamed["confirmed_role_labels"] == []
     assert unnamed["is_confirmed"] is False
+    assert unnamed["category"] == "unclassified"
+    assert unnamed["category_label"] == "待识别"
+    assert unnamed["organization_status_label"] == "未解析"
 
 
 def test_seconds_label_prefers_human_readable_units():

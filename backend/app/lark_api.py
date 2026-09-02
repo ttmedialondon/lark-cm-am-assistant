@@ -56,7 +56,7 @@ class LarkProfile:
 
 
 class LarkClient:
-    """Uses user tokens only for the authorised user's conversation discovery and history."""
+    """Small wrapper for user-scoped IM data and tenant-scoped organization mapping."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -175,6 +175,35 @@ class LarkClient:
             "GET",
             f"{self.settings.lark_api_base_url}/open-apis/im/v1/chats/{quote(chat_id, safe='')}/members/list",
             access_token=access_token,
+            params=params,
+        )
+
+    def tenant_access_token(self) -> str:
+        """Get a short-lived app tenant token; never persist it."""
+
+        self._require_secret()
+        data = self._request(
+            "POST",
+            f"{self.settings.lark_api_base_url}/open-apis/auth/v3/tenant_access_token/internal",
+            json={"app_id": self.settings.lark_app_id, "app_secret": self.settings.lark_app_secret},
+        )
+        token = _string(data.get("tenant_access_token"))
+        if not token:
+            raise LarkApiError(502, None, "Lark tenant-token response did not contain tenant_access_token")
+        return token
+
+    def list_collaboration_tenants(
+        self, tenant_access_token: str, page_token: str | None = None
+    ) -> dict[str, Any]:
+        """List only organizations associated with this Lark tenant."""
+
+        params: dict[str, str | int] = {"page_size": 100}
+        if page_token:
+            params["page_token"] = page_token
+        return self._request(
+            "GET",
+            f"{self.settings.lark_api_base_url}/open-apis/directory/v1/collaboration_tenants",
+            access_token=tenant_access_token,
             params=params,
         )
 

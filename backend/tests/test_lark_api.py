@@ -96,3 +96,30 @@ def test_p2p_discovery_uses_the_user_chat_type_filter(monkeypatch) -> None:
 
     assert captured["params"]["types"] == "p2p"
     assert captured["params"]["user_id_type"] == "open_id"
+
+
+def test_trust_party_mapping_uses_a_short_lived_tenant_token(monkeypatch) -> None:
+    client = LarkClient(settings())
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        if method == "POST":
+            return {"tenant_access_token": "tenant-token"}
+        return {"items": []}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    token = client.tenant_access_token()
+    client.list_collaboration_tenants(token, "next-page")
+
+    assert token == "tenant-token"
+    assert calls[0] == (
+        "POST",
+        "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal",
+        {"json": {"app_id": "cli_test", "app_secret": "secret"}},
+    )
+    assert calls[1][0] == "GET"
+    assert calls[1][1].endswith("/open-apis/directory/v1/collaboration_tenants")
+    assert calls[1][2]["access_token"] == "tenant-token"
+    assert calls[1][2]["params"] == {"page_size": 100, "page_token": "next-page"}

@@ -178,7 +178,7 @@ def test_contact_directory_is_owner_only(monkeypatch):
     assert response.status_code == 403
 
 
-def test_contact_directory_filters_confirmation_and_keeps_it_in_pagination(monkeypatch):
+def test_people_directory_filters_category_and_keeps_it_in_pagination(monkeypatch):
     owner_id = uuid4()
     contexts = []
     calls = []
@@ -186,18 +186,26 @@ def test_contact_directory_filters_confirmation_and_keeps_it_in_pagination(monke
     monkeypatch.setattr(
         admin_reporting,
         "contacts",
-        lambda page, confirmation: calls.append((page, confirmation))
+        lambda page, category, organization_status: calls.append((page, category, organization_status))
         or _page([], page=page, total_count=50, total_pages=2, page_size=25),
+    )
+    monkeypatch.setattr(
+        admin_reporting,
+        "organization_sync_status",
+        lambda: {"status": "pending", "status_label": "等待", "status_badge": "secondary", "detail": "等待"},
     )
 
     response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get(
-        "/admin/contacts?page=2&confirmation=confirmed"
+        "/admin/contacts?page=2&category=creator&organization_status=verified"
     )
 
     assert response.status_code == 200
-    assert calls == [(2, "confirmed")]
-    assert contexts[-1][1]["confirmation"] == "confirmed"
-    assert contexts[-1][1]["contact_page"]["previous_url"] == "/admin/contacts?confirmation=confirmed&page=1"
+    assert calls == [(2, "creator", "verified")]
+    assert contexts[-1][1]["category"] == "creator"
+    assert contexts[-1][1]["organization_status"] == "verified"
+    assert contexts[-1][1]["contact_page"]["previous_url"] == (
+        "/admin/contacts?category=creator&organization_status=verified&page=1"
+    )
 
 
 def test_removed_ai_candidate_queue_is_not_routable():
@@ -257,13 +265,15 @@ def test_owner_can_manually_set_or_hand_over_a_creator_assignment(monkeypatch):
     monkeypatch.setattr(contact_assignments, "manually_assign", lambda *args: assigned.append(args))
 
     response = _client(lambda _request: {"id": owner_id, "status": "active"}).post(
-        "/admin/contacts/ou_creator/assignment/handoff?page=3&confirmation=confirmed",
+        "/admin/contacts/ou_creator/assignment/handoff?page=3&category=creator&organization_status=verified",
         data={"csrf_token": "csrf", "responsible_authorization_id": str(assignee_id)},
         follow_redirects=False,
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/admin/contacts/ou_creator?page=3&confirmation=confirmed"
+    assert response.headers["location"] == (
+        "/admin/contacts/ou_creator?page=3&category=creator&organization_status=verified"
+    )
     assert assigned == [(owner_id, contact_id, str(assignee_id))]
 
 
@@ -276,13 +286,15 @@ def test_owner_can_dismiss_one_ai_suggestion_from_its_contact(monkeypatch):
     monkeypatch.setattr(contact_assessments, "dismiss_assessment", lambda *args: dismissed.append(args))
 
     response = _client(lambda _request: {"id": owner_id, "status": "active"}).post(
-        f"/admin/contacts/ou_contact/assessments/{assessment_id}/dismiss?page=3&confirmation=unconfirmed",
+        f"/admin/contacts/ou_contact/assessments/{assessment_id}/dismiss?page=3&category=unclassified",
         data={"csrf_token": "csrf"},
         follow_redirects=False,
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/admin/contacts/ou_contact?page=3&confirmation=unconfirmed"
+    assert response.headers["location"] == (
+        "/admin/contacts/ou_contact?page=3&category=unclassified&organization_status=all"
+    )
     assert response.headers["cache-control"] == "no-store, max-age=0"
     assert dismissed == [(owner_id, assessment_id)]
 
@@ -336,7 +348,7 @@ def test_owner_confirmation_uses_only_suggested_form_values(monkeypatch):
     assert response.status_code == 303
     assert (
         response.headers["location"]
-        == f"/admin/contacts/ou_contact/assessments/{assessment_id}?page=4&confirmation=all"
+        == f"/admin/contacts/ou_contact/assessments/{assessment_id}?page=4&category=all&organization_status=all"
     )
     assert confirmed == [(owner_id, assessment_id, "creator")]
 

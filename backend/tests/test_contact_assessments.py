@@ -16,6 +16,7 @@ def _valid_result(*, evidence_ref: str = "M1") -> str:
                 {
                     "role": "creator",
                     "confidence": 0.86,
+                    "basis": "direct_interaction",
                     "evidence_refs": [evidence_ref],
                 }
             ],
@@ -35,18 +36,31 @@ def test_model_result_keeps_a_valid_role() -> None:
     result = contact_assessments._validate_model_result(
         json.dumps(
             {
-                "roles": [{"role": "creator", "confidence": 0.95, "evidence_refs": ["M1"]}],
+                "roles": [
+                    {
+                        "role": "creator",
+                        "confidence": 0.95,
+                        "basis": "self_declaration",
+                        "evidence_refs": ["M1"],
+                    }
+                ],
             }
         ),
         {"M1"},
     )
 
-    assert result == {"roles": [{"role": "creator", "confidence": 0.95, "evidence_refs": ["M1"]}]}
+    assert result == {
+        "roles": [
+            {"role": "creator", "confidence": 0.95, "basis": "self_declaration", "evidence_refs": ["M1"]}
+        ]
+    }
 
 
 def test_model_result_rejects_insufficient_mixed_with_a_business_role() -> None:
     payload = json.loads(_valid_result())
-    payload["roles"].append({"role": "insufficient", "confidence": 0.2, "evidence_refs": ["M1"]})
+    payload["roles"].append(
+        {"role": "insufficient", "confidence": 0.2, "basis": "weak_context", "evidence_refs": ["M1"]}
+    )
     with pytest.raises(ValueError):
         contact_assessments._validate_model_result(
             json.dumps(payload),
@@ -331,8 +345,9 @@ def test_auto_decision_confirms_creator(monkeypatch) -> None:
     outcome, review_status, roles = contact_assessments._apply_automatic_decision(
         object(),
         uuid4(),
-        {"roles": [{"role": "creator", "confidence": 0.9}]},
+        {"roles": [{"role": "creator", "confidence": 0.9, "basis": "direct_interaction", "evidence_refs": ["M1"]}]},
         0.9,
+        {"M1": {"direct_relation": True, "subject_speaker": True}},
     )
 
     assert (outcome, review_status, roles) == ("auto_confirmed", "not_required", ["creator"])
@@ -352,11 +367,12 @@ def test_auto_decision_confirms_a_high_confidence_creator_and_keeps_a_low_role_f
         uuid4(),
         {
             "roles": [
-                {"role": "creator", "confidence": 0.95},
-                {"role": "agent_or_agency", "confidence": 0.20},
+                {"role": "creator", "confidence": 0.95, "basis": "direct_interaction", "evidence_refs": ["M1"]},
+                {"role": "partner_contact", "confidence": 0.20, "basis": "weak_context", "evidence_refs": ["M1"]},
             ],
         },
         0.9,
+        {"M1": {"direct_relation": True, "subject_speaker": True}},
     )
 
     assert (outcome, review_status, roles) == ("review_required", "pending", ["creator"])
@@ -373,8 +389,27 @@ def test_auto_decision_keeps_a_role_below_ninety_percent_for_review(monkeypatch)
     outcome, review_status, roles = contact_assessments._apply_automatic_decision(
         object(),
         uuid4(),
-        {"roles": [{"role": "creator", "confidence": 0.899}]},
+        {"roles": [{"role": "creator", "confidence": 0.899, "basis": "direct_interaction", "evidence_refs": ["M1"]}]},
         0.9,
+        {"M1": {"direct_relation": True, "subject_speaker": True}},
+    )
+
+    assert (outcome, review_status, roles) == ("review_required", "pending", [])
+
+
+def test_auto_decision_never_confirms_from_weak_group_context(monkeypatch) -> None:
+    monkeypatch.setattr(
+        contact_assessments,
+        "_auto_confirm_role",
+        lambda *_args: pytest.fail("weak context must not automatically write a category"),
+    )
+
+    outcome, review_status, roles = contact_assessments._apply_automatic_decision(
+        object(),
+        uuid4(),
+        {"roles": [{"role": "creator", "confidence": 0.99, "basis": "weak_context", "evidence_refs": ["M1"]}]},
+        0.9,
+        {"M1": {"direct_relation": False, "subject_speaker": False}},
     )
 
     assert (outcome, review_status, roles) == ("review_required", "pending", [])
@@ -392,11 +427,12 @@ def test_auto_decision_sends_low_or_ambiguous_roles_to_review(monkeypatch) -> No
         uuid4(),
         {
             "roles": [
-                {"role": "creator", "confidence": 0.99},
-                {"role": "agent_or_agency", "confidence": 0.91},
+                {"role": "creator", "confidence": 0.99, "basis": "direct_interaction", "evidence_refs": ["M1"]},
+                {"role": "partner_contact", "confidence": 0.91, "basis": "direct_interaction", "evidence_refs": ["M1"]},
             ],
         },
         0.9,
+        {"M1": {"direct_relation": True, "subject_speaker": True}},
     )
 
     assert (outcome, review_status, roles) == ("review_required", "pending", [])

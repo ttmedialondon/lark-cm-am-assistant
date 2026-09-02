@@ -14,6 +14,7 @@
 - 不发送 Lark 消息。私聊会话发现使用 `types=p2p`，若 Lark 租户未返回该能力，会记录为不可用且不影响群聊同步。
 - 旧的“仅统计”授权不会被静默升级：只有新版 OAuth 成功后才会读取私聊和保存正文。
 - 正文使用独立 AES-GCM 加密域保存；不保存附件二进制，正文不进入日志。消息发送者 `open_id` / `tenant_key` / 类型与群成员快照会被保存，用于按稳定 Lark 身份聚合联系人、构建角色判断证据和后续提醒。
+- 人员主类别、组织归属、达人负责人是三组独立事实。主类别只有：达人 / 内容创作者、合作机构对接人、TT Media London 同事、商家 / 品牌方对接人、字节系平台官方对接人、其他已确认外部联系人；没有充分证据时保持“待识别”，不写成“其他”。
 - 为了分页断点、去重和权限过滤，数据库将公司级 `chat_messages` 与授权用户级 observation 分开保存。共享群的正文只保存一份，但管理台只会按所选授权用户在新版授权后重新观察到的记录展示。
 
 ## 架构
@@ -33,13 +34,17 @@ FastAPI + Jinja2 + HTMX + Tabler    ←→ PostgreSQL
 
 ## 内部管理台
 
-`/admin` 是独立的内部管理台，展示公司范围的授权、唯一群、去重消息与同步任务。它由数据库的 `admin_roles` 强制控制；无角色用户即使直接输入 URL 也会得到 403。当前部署只写入一个 `owner`，不自动授予其他 CM/AM。`/admin/messages`、`/admin/contacts` 和 `/admin/creators` 仅 owner 可访问；联系人页展示稳定 Lark 身份、会话统计与角色判断。每次查看正文或 AI 证据均审计但不记录正文。
+`/admin` 是独立的内部管理台，展示公司范围的授权、唯一群、去重消息与同步任务。它由数据库的 `admin_roles` 强制控制；无角色用户即使直接输入 URL 也会得到 403。当前部署只写入一个 `owner`，不自动授予其他 CM/AM。`/admin/messages`、`/admin/contacts` 和 `/admin/creators` 仅 owner 可访问；人员目录可按主类别和组织验证状态筛选，联系人页展示稳定 Lark 身份、会话统计、组织关系和角色判断。每次查看正文或 AI 证据均审计但不记录正文。
 
 ### OpenAI 功能凭证
 
 仅 owner 可访问的 `/admin/ai` 当前只配置一个功能：`contact_assessment`（基于消息和 Lark 身份的联系人角色自动识别）。owner 会在此一次性粘贴该功能所属 OpenAI Project 的 service-account key；服务端会立即以独立加密域保存密钥，页面和审计记录都不会保留或显示明文，只显示必要的遮罩尾号。
 
-页面会展示 Project ID、模型、启用状态、自动确认阈值、密钥轮换状态和最近 AI 调用状态；空白密钥输入表示保留当前密钥，替换输入即轮换，关闭功能不必删除配置。浏览器不会直接请求 OpenAI，也不会保存 OpenAI Organization Admin Key。联系人首次拥有一条仍有效授权范围内的消息正文时，会进入持久化 PostgreSQL 队列；任务全局串行且两次启动至少相隔 3 秒，使用最多 17 条消息片段、约 8,000 个正文字符，群名仅随命中消息发送一次，使用 `store: false` 和严格 JSON Schema，保存角色建议、置信度和消息引用而不保存 Prompt 或模型自由文本。90% 及以上、单一且无冲突的角色建议会自动确认；其余可确认建议保留在对应外部联系人的详情中，由 owner 核对后逐项处理。已有已确认角色的联系人会在入队、调用模型前和写入结果前被排除。完整运行口径见 [`contact-assessment-automatic-v0.2.md`](../docs/as-built/contact-assessment-automatic-v0.2.md)。
+页面会展示 Project ID、模型、启用状态、自动确认阈值、密钥轮换状态和最近 AI 调用状态；空白密钥输入表示保留当前密钥，替换输入即轮换，关闭功能不必删除配置。浏览器不会直接请求 OpenAI，也不会保存 OpenAI Organization Admin Key。联系人首次拥有一条仍有效授权范围内的消息正文时，会进入持久化 PostgreSQL 队列；任务全局串行且两次启动至少相隔 3 秒，使用最多 17 条消息片段、约 8,000 个正文字符，群名仅随命中消息发送一次，使用 `store: false` 和严格 JSON Schema，保存角色建议、置信度和消息引用而不保存 Prompt 或模型自由文本。证据包始终包含 `TT Media London`，并仅附带该联系人的已验证 Lark 关联组织；它不会把群名或组织名当成角色事实。90% 及以上、单一、无冲突且有直接互动或本人自述依据的建议才会自动确认；其余建议保留在对应外部联系人的详情中，由 owner 核对后逐项处理。已有已确认主类别的联系人会在入队、调用模型前和写入结果前被排除。完整运行口径见 [`contact-assessment-automatic-v0.2.md`](../docs/as-built/contact-assessment-automatic-v0.2.md)。
+
+### Lark 关联组织（可选增强）
+
+关联组织走应用 tenant access token，不扩展 CM/AM 的 OAuth scope，也不会要求所有人重新授权。需在开发者后台为应用申请并获批 `trust_party:collaboration_rule:read` 与 `trust_party:collaboration.tenant:readonly`。worker 每 6 小时拉取可见关联租户，并每 5 分钟把新发现的 `tenant_key` 关联到已有的验证组织映射；权限或可见性不可用时只在人员目录显示状态，不会阻塞消息同步或 AI 判定。
 
 成本归属以 OpenAI 的 Project 为单位：生产环境为每个成本中心/功能建立独立 Project，并为该 Project 建立独立 service account 与 key。例如本功能可使用 `TT Lark – Contact Assessment – Production` / `contact-assessment-worker`。这样 OpenAI 后台的 Project 用量、预算和告警可以直接对应功能；以后翻译、回复建议应各自使用新的 Project 和 key。
 

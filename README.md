@@ -19,7 +19,7 @@ Internal system for managing CM/AM night-time Lark messages, generating auditabl
 
 1. GitHub is the sole source of truth; production servers deploy a reviewed release and are never edited directly.
 2. Secrets, tokens, customer messages, production exports, and backups must never be committed.
-3. Message bodies are collected only after the revised OAuth agreement, encrypted at rest, excluded from logs, and visible only to the designated owner through the audited admin page. AI remains disabled.
+3. Message bodies are collected only after the revised OAuth agreement, encrypted at rest, excluded from logs, and visible only to the designated owner through the audited admin page. AI never sends Lark messages; contact classification is an owner-configured, evidence-bound feature.
 
 ## Getting started
 

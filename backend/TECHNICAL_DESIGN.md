@@ -7,7 +7,8 @@
 - 每位 CM/AM 以自己的 Lark OAuth user access token 授权；系统只读取该用户原本可见、且 Lark API 实际返回的会话与历史消息。
 - 群聊和私聊使用同一套 `chats`、`authorization_chats`、`chat_messages` 与同步队列。每条消息保存 Lark 返回的发送者 ID、ID 类型、`open_id`（适用时）、`tenant_key`、发送者类型、回复链/话题/`@` 关系及可用的 Lark 跳转定位字段。
 - 群聊在成员数刷新时分页保存最新成员快照：`open_id`、名称、`tenant_key` 与成员类型；不把 API 未返回的人误判为已离群，也不保存成员历史版本。私聊的对端稳定 ID 保存在该授权用户的 `authorization_chats` 关系上。
-- 联系人以稳定 Lark 身份聚合，`creator`、经纪/机构、品牌/商家等都是联系人角色。独立的联系人自动识别任务只使用当前授权范围内的消息、会话上下文、群名和 Lark 身份元数据构造受限证据包调用 Luna；仅达到 owner 配置阈值、引用可核验且无事实冲突的角色建议才能自动确认，其他建议进入人工队列。已确认达人可另由独立负责人队列在尚未分配时匹配一位 CM/AM；owner 必须先把该授权账号标记为可担任负责人。该队列只比较双方实际消息，群聊与私聊同权，绝不自动交接。具体口径见 [`contact-assignment-automatic-v0.1.md`](../docs/as-built/contact-assignment-automatic-v0.1.md)。
+- 联系人以稳定 Lark 身份聚合。**人员主类别**、**所属组织**、**达人负责人**必须分开存储：主类别为 `creator`（达人 / 内容创作者）、`partner_contact`（合作机构对接人）、`internal_colleague`（TT Media London 同事）、`merchant_contact`（商家 / 品牌方对接人）、`platform_contact`（字节系平台官方对接人）、`other_external_contact`（其他已确认外部联系人）；没有充分事实时是 `NULL` / 待识别，不是“其他”。组织采用 `organizations`、`organization_tenants` 与 `contact_organization_links`；`tenant_key → 组织`仅是可验证的 Lark 租户关联，不等于员工或业务角色。负责人只适用于主类别为 `creator` 的联系人，且每位达人只有一位当前 CM/AM。
+- 独立的联系人自动识别任务只使用当前授权范围内的消息、结构化直接互动、群名（弱背景）、Lark 身份元数据、固定的 `TT Media London` 背景与该联系人的**已验证**组织构造受限证据包调用 Luna。内部同事由内部租户事实确定，绝不交给模型猜测。仅达到 owner 配置阈值、唯一、引用可核验、无事实冲突且有 P2P / 回复 / @ / 本人自述等直接依据的角色建议才能自动确认，其他建议留在该联系人详情中人工确认。已确认达人可另由独立负责人队列在尚未分配时匹配一位 CM/AM；owner 必须先把该授权账号标记为可担任负责人。该队列只比较双方实际消息，群聊与私聊同权，绝不自动交接。具体口径见 [`contact-assignment-automatic-v0.1.md`](../docs/as-built/contact-assignment-automatic-v0.1.md)。
 - OAuth 成功后回填 Lark API 可返回的历史，并每 5 分钟增量同步、回看 10 分钟以避免边界漏记。
 - 不发送 Lark 消息，不保存附件二进制；成员快照和消息发送者身份仅用于公司内部的后续归属与提醒链路。Luna 仅用于联系人自动识别，使用 `store: false`、严格 JSON Schema 和消息引用校验；具体口径见 [`contact-assessment-automatic-v0.2.md`](../docs/as-built/contact-assessment-automatic-v0.2.md)。
 
@@ -27,7 +28,7 @@
 
 CM/AM 的个人页面是“消息提醒中心”：仅展示接入状态和最近检查时间，不展示会话名称、成员人数、消息数量或消息正文，也不提供手动历史回填。页面保留可折叠、明确的“权限与数据使用”说明：系统会在用户授权范围内读取群聊和私聊内容用于分析，正文会加密保存并由内部 owner 按该用户授权范围查看。
 
-`/admin` 展示公司级统计、人员、群聊和同步任务。`/admin/messages` 仅数据库 `admin_roles` 中的 `owner` 可访问：可用 CM/AM、会话类型和会话下拉筛选，展示最近 100 条已加密存储的正文。发送者名称优先使用消息返回的名称和最近成员快照。`/admin/contacts` 可按已确认或未确认筛选；每次人工核对都从该联系人详情进入。`/admin/creators` 只展示已确认拥有 `creator` 角色的联系人，并链接到同一位外部联系人的详情。每次正文或 AI 证据页查看均写入 `audit_events`，但审计记录不含消息正文。
+`/admin` 展示公司级统计、人员、群聊和同步任务。`/admin/messages` 仅数据库 `admin_roles` 中的 `owner` 可访问：可用 CM/AM、会话类型和会话下拉筛选，展示最近 100 条已加密存储的正文。发送者名称优先使用消息返回的名称和最近成员快照。`/admin/contacts` 可按主类别及组织验证状态筛选；每次人工核对都从该联系人详情进入。`/admin/creators` 只展示已确认主类别为 `creator` 的联系人，并链接到同一位外部联系人的详情。每次正文或 AI 证据页查看均写入 `audit_events`，但审计记录不含消息正文。
 
 管理台的人员状态以一个主阶段展示：`正在发现会话`、`首次同步中`、`已接入 · 定时同步`、`定时更新中` 或需要处理。该主阶段由授权状态、可同步会话数、首次回填完成数、当前 job 和下一次计划时间派生，不会把“已发现私聊目录”“群成员快照”或“下一轮定时 job 已排程”误显示成消息同步失败。页面另列出群聊/私聊的正文回填进度；P2P 的目录发现与 P2P 正文回填始终分开。
 
@@ -64,7 +65,7 @@ Caddy → FastAPI + Jinja2/HTMX/Tabler → PostgreSQL
 | Web 本机端口 | `127.0.0.1:8100` |
 | 运行配置 | `/etc/lark-message-stats/app.env`，`root:larkstats` / `0640` |
 
-实际 OAuth scopes 为：`offline_access`、`im:chat:read`、`im:message:readonly`、`im:chat.members:read`。最后一项用于群成员快照；消息的回复链、线程、`@` 提及随消息对象保存，本版本不需要为它们新增 Lark 权限。群详情仅在实际需要时用真实 user token 预检，明确缺 scope 后再申请。
+实际 CM/AM OAuth scopes 为：`offline_access`、`im:chat:read`、`im:message:readonly`、`im:chat.members:read`。最后一项用于群成员快照；消息的回复链、线程、`@` 提及随消息对象保存，本版本不需要为它们新增 Lark 权限。组织映射单独使用应用 tenant token，需要 Lark 应用权限 `trust_party:collaboration_rule:read` 与 `trust_party:collaboration.tenant:readonly`；它们不加入 OAuth 授权页。没有这两个应用权限时，关联组织状态会显示不可用，但消息同步、身份判定和管理台不会受阻。
 
 参考：
 
