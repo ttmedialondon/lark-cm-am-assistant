@@ -160,15 +160,18 @@ def create_admin_router(
         access_context: dict[str, Any],
         *,
         page: int = 1,
+        assignment: str = "all",
     ) -> Response:
-        creator_page = admin_reporting.creators(page)
+        assignment = admin_reporting.normalize_creator_assignment_filter(assignment)
+        creator_page = admin_reporting.creators(page, assignment)
         return render_template(
             request,
             "admin/creators.html",
             {
                 **page_context(access_context, "creators"),
                 "creators": creator_page["items"],
-                "creator_page": pagination(creator_page, "/admin/creators"),
+                "assignment": assignment,
+                "creator_page": pagination(creator_page, "/admin/creators", assignment=assignment),
             },
         )
 
@@ -499,12 +502,12 @@ def create_admin_router(
         return response
 
     @router.get("/admin/creators")
-    def admin_creators(request: Request, page: int = 1) -> Response:
+    def admin_creators(request: Request, page: int = 1, assignment: str = "all") -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        return render_creators(request, access_context, page=page)
+        return render_creators(request, access_context, page=page, assignment=assignment)
 
     @router.get("/admin/ai")
     def admin_ai_config(request: Request) -> Response:

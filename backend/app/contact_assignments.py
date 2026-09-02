@@ -34,6 +34,8 @@ AUTOMATIC_START_INTERVAL_SECONDS = 3
 AUTOMATIC_CLAIM_LOCK = 541_195_272
 MAX_AUTOMATIC_ATTEMPTS_PER_WATERMARK = 3
 AUTOMATIC_RETRY_COOLDOWN_MINUTES = 15
+# Below this, a model suggestion is not useful manual-review work.
+MANUAL_REVIEW_CONFIDENCE_FLOOR = 0.70
 MODEL_DECISIONS = {"assign", "needs_review", "unassigned"}
 
 STATUS_LABELS = {
@@ -1020,7 +1022,7 @@ def _finish_with_decision(
                 (uuid4(), contact_id, candidate_id, result["confidence"], assessment_id),
             )
             outcome = "auto_assigned"
-        elif result["decision"] != "unassigned" and candidate_id:
+        elif _requires_manual_review(result, candidate_id):
             outcome = "review_required"
         else:
             outcome = "no_action"
@@ -1248,6 +1250,14 @@ def _candidate_id(result: Mapping[str, Any]) -> UUID | None:
         return UUID(str(value))
     except (TypeError, ValueError, AttributeError):
         return None
+
+
+def _requires_manual_review(result: Mapping[str, Any], candidate_id: UUID | None) -> bool:
+    return bool(
+        result["decision"] != "unassigned"
+        and candidate_id is not None
+        and float(result["confidence"]) >= MANUAL_REVIEW_CONFIDENCE_FLOOR
+    )
 
 
 def _audit(conn: psycopg.Connection, actor_id: UUID | None, action: str, metadata: Mapping[str, str]) -> None:

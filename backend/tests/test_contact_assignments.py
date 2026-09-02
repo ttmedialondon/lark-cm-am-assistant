@@ -56,6 +56,19 @@ def test_assignment_result_accepts_only_known_candidate_and_evidence() -> None:
         )
 
 
+def test_assignment_review_requires_meaningful_confidence() -> None:
+    candidate_id = uuid4()
+    assert not contact_assignments._requires_manual_review(
+        {"decision": "needs_review", "confidence": 0.69}, candidate_id
+    )
+    assert contact_assignments._requires_manual_review(
+        {"decision": "needs_review", "confidence": 0.70}, candidate_id
+    )
+    assert not contact_assignments._requires_manual_review(
+        {"decision": "unassigned", "confidence": 1.0}, candidate_id
+    )
+
+
 def test_assignment_queue_requires_real_bidirectional_interaction_without_chat_type_bias(monkeypatch) -> None:
     calls: list[tuple[str, tuple[object, ...] | None]] = []
 

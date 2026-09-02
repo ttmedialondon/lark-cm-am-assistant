@@ -21,7 +21,9 @@ from zoneinfo import ZoneInfo
 
 from cryptography.exceptions import InvalidTag
 
+from .ai_feature_config import DEFAULT_AUTO_CONFIRM_THRESHOLD
 from .config import get_settings
+from .contact_assignments import MANUAL_REVIEW_CONFIDENCE_FLOOR
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
 
@@ -34,6 +36,7 @@ MESSAGE_CONVERSATION_PAGE_SIZE = 5
 MAX_MESSAGE_CONVERSATION_QUERY_LENGTH = 120
 MESSAGE_CONVERSATION_TYPES = frozenset({"all", "group", "p2p"})
 CONTACT_CONFIRMATIONS = frozenset({"all", "confirmed", "unconfirmed"})
+CREATOR_ASSIGNMENT_FILTERS = frozenset({"all", "confirmed", "pending"})
 CONFIRMED_CONTACT_ROLE_LABELS = {
     "creator": "已确认达人 / 创作者",
     "agent_or_agency": "已确认经纪人 / 机构",
@@ -97,6 +100,65 @@ MESSAGE_CONVERSATION_COUNTS_SQL = """
         conversations.authorization_id, conversations.chat_id, conversations.name, conversations.external,
         conversations.chat_mode, conversations.counterpart_display_name, conversations.member_count,
         conversations.member_count_status, conversations.body_consent_at
+"""
+CREATOR_DIRECTORY_SQL = """
+    WITH creator_directory AS (
+        SELECT
+            contact.id,
+            contact.display_name,
+            contact.created_at,
+            contact.updated_at,
+            primary_identity.open_id,
+            COALESCE(NULLIF(responsible.display_name, ''), responsible.open_id) AS responsible_name,
+            COALESCE(NULLIF(suggested.display_name, ''), suggested.open_id) AS suggested_name,
+            assignment.confidence AS assignment_confidence,
+            latest_assessment.confidence AS assessment_confidence,
+            CASE
+                WHEN assignment.id IS NOT NULL THEN 'confirmed'
+                WHEN latest_assessment.outcome = 'review_required'
+                  AND latest_assessment.decision IN ('assign', 'needs_review')
+                  AND latest_assessment.candidate <> 'none'
+                  AND latest_assessment.confidence >= %s::numeric
+                  AND latest_assessment.confidence < config.automatic_threshold
+                THEN 'pending'
+                ELSE 'unmatched'
+            END AS assignment_status
+        FROM contacts contact
+        JOIN contact_roles role
+          ON role.contact_id = contact.id AND role.role = 'creator' AND role.status = 'confirmed'
+        CROSS JOIN (
+            SELECT COALESCE(
+                (SELECT auto_confirm_threshold FROM ai_feature_configs WHERE feature = 'contact_assignment'),
+                %s::numeric
+            ) AS automatic_threshold
+        ) AS config
+        JOIN LATERAL (
+            SELECT identity.open_id
+            FROM lark_identities identity
+            WHERE identity.contact_id = contact.id
+              AND identity.identity_type = 'user'
+              AND identity.tenant_classification <> 'internal'
+            ORDER BY identity.last_seen_at DESC, identity.open_id
+            LIMIT 1
+        ) AS primary_identity ON TRUE
+        LEFT JOIN contact_assignments assignment
+          ON assignment.contact_id = contact.id AND assignment.ended_at IS NULL
+        LEFT JOIN authorizations responsible ON responsible.id = assignment.responsible_authorization_id
+        LEFT JOIN LATERAL (
+            SELECT
+                assessment.outcome,
+                assessment.result ->> 'decision' AS decision,
+                assessment.result ->> 'candidate' AS candidate,
+                assessment.result -> 'candidate_aliases'
+                    ->> (assessment.result ->> 'candidate') AS candidate_authorization_id,
+                NULLIF(assessment.result ->> 'confidence', '')::numeric AS confidence
+            FROM contact_assignment_assessments assessment
+            WHERE assessment.contact_id = contact.id AND assessment.status = 'succeeded'
+            ORDER BY assessment.finished_at DESC NULLS LAST, assessment.created_at DESC, assessment.id DESC
+            LIMIT 1
+        ) AS latest_assessment ON TRUE
+        LEFT JOIN authorizations suggested ON suggested.id::text = latest_assessment.candidate_authorization_id
+    )
 """
 CONVERSATION_COUNTS_SQL = """
     SELECT
@@ -675,52 +737,38 @@ def jobs(page: int = 1) -> dict[str, Any]:
     return _page_result([_decorate_job(row) for row in rows], page, total_count=total_count)
 
 
-def creators(page: int = 1) -> dict[str, Any]:
-    """Return confirmed creators that can open their external-contact detail."""
+def creators(page: int = 1, assignment: str = "all") -> dict[str, Any]:
+    """Return confirmed creators filtered by their current owner-match state."""
 
+    assignment = normalize_creator_assignment_filter(assignment)
+    filters = (MANUAL_REVIEW_CONFIDENCE_FLOOR, float(DEFAULT_AUTO_CONFIRM_THRESHOLD), assignment, assignment)
     with connection() as conn:
         total_count = int(
             conn.execute(
-                """
+                f"""
+                {CREATOR_DIRECTORY_SQL}
                 SELECT COUNT(*) AS total_count
-                FROM contact_roles role
-                WHERE role.role = 'creator' AND role.status = 'confirmed'
-                  AND EXISTS (
-                      SELECT 1 FROM lark_identities identity
-                      WHERE identity.contact_id = role.contact_id
-                        AND identity.identity_type = 'user'
-                        AND identity.tenant_classification <> 'internal'
-                  )
-                """
+                FROM creator_directory
+                WHERE %s = 'all' OR assignment_status = %s
+                """,
+                filters,
             ).fetchone()["total_count"]
             or 0
         )
         page, limit, offset = _page_window(page, total_count=total_count)
         rows = conn.execute(
-            """
+            f"""
+            {CREATOR_DIRECTORY_SQL}
             SELECT
-                c.id,
-                c.display_name,
-                c.created_at,
-                c.updated_at,
-                primary_identity.open_id
-            FROM contacts c
-            JOIN contact_roles role
-              ON role.contact_id = c.id AND role.role = 'creator' AND role.status = 'confirmed'
-            JOIN LATERAL (
-                SELECT identity.open_id
-                FROM lark_identities identity
-                WHERE identity.contact_id = c.id
-                  AND identity.identity_type = 'user'
-                  AND identity.tenant_classification <> 'internal'
-                ORDER BY identity.last_seen_at DESC, identity.open_id
-                LIMIT 1
-            ) AS primary_identity ON TRUE
-            GROUP BY c.id, c.display_name, c.created_at, c.updated_at, primary_identity.open_id
-            ORDER BY LOWER(c.display_name), c.id
+                id, display_name, created_at, updated_at, open_id,
+                responsible_name, suggested_name, assignment_confidence,
+                assessment_confidence, assignment_status
+            FROM creator_directory
+            WHERE %s = 'all' OR assignment_status = %s
+            ORDER BY LOWER(display_name), id
             LIMIT %s OFFSET %s
             """,
-            (limit, offset),
+            (*filters, limit, offset),
         ).fetchall()
     return _page_result([_decorate_creator(row) for row in rows], page, total_count=total_count)
 
@@ -992,6 +1040,12 @@ def normalize_contact_confirmation(value: str | None) -> str:
     """Return a supported external-contact confirmation filter."""
 
     return value if value in CONTACT_CONFIRMATIONS else "all"
+
+
+def normalize_creator_assignment_filter(value: str | None) -> str:
+    """Return a supported owner-match filter for the creator directory."""
+
+    return value if value in CREATOR_ASSIGNMENT_FILTERS else "all"
 
 
 def message_conversations(
@@ -1319,6 +1373,17 @@ def _decorate_job(row: dict[str, Any]) -> dict[str, Any]:
 def _decorate_creator(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     item["display_name"] = item.get("display_name") or "未命名达人"
+    labels = {
+        "confirmed": ("负责人已确认", "success", item.get("assignment_confidence")),
+        "pending": ("负责人待确认", "warning", item.get("assessment_confidence")),
+    }
+    label, badge, confidence = labels.get(item.get("assignment_status"), ("尚无可靠匹配", "secondary", None))
+    item["assignment_status_label"] = label
+    item["assignment_status_badge"] = badge
+    try:
+        item["assignment_confidence_label"] = f"{float(confidence):.0%}" if confidence is not None else ""
+    except (TypeError, ValueError):
+        item["assignment_confidence_label"] = ""
     for field in ("created_at", "updated_at"):
         item[f"{field}_label"] = _format_time(item.get(field))
     return item

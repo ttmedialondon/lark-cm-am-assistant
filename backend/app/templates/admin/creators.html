@@ -4,14 +4,21 @@
 <div class="page admin-directory">
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl admin-directory__container">
-    <div class="alert alert-info">这里只展示已确认的达人 / 创作者。打开后会进入同一位外部联系人的详情、会话事实和 AI 证据。</div>
+    <div class="alert alert-info">这里只展示已确认的达人 / 创作者。筛选的是负责人状态：待确认仅表示已有可核验的 AI 建议，置信度在 70% 至自动确认阈值之间；较低分数会显示为“尚无可靠匹配”。</div>
+    <div class="btn-list mb-3" aria-label="负责人筛选">
+      <a class="btn btn-sm {% if assignment == 'all' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/creators?assignment=all">全部</a>
+      <a class="btn btn-sm {% if assignment == 'confirmed' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/creators?assignment=confirmed">负责人已确认</a>
+      <a class="btn btn-sm {% if assignment == 'pending' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/creators?assignment=pending">负责人待确认</a>
+    </div>
     <div class="card admin-directory__card">
       <div class="card-header"><h3 class="card-title">达人主档</h3></div>
       {% if creators %}
       <div class="table-responsive admin-directory__table"><table class="table table-vcenter card-table">
-        <thead><tr><th>达人</th><th>最后更新</th><th></th></tr></thead>
+        <thead><tr><th>达人</th><th>负责人匹配</th><th>最后更新</th><th></th></tr></thead>
         <tbody>{% for creator in creators %}<tr>
-          <td>{{ creator.display_name }}</td><td>{{ creator.updated_at_label }}</td>
+          <td>{{ creator.display_name }}</td>
+          <td><span class="badge bg-{{ creator.assignment_status_badge }}-lt">{{ creator.assignment_status_label }}</span>{% if creator.responsible_name %}<div class="text-secondary small mt-1">{{ creator.responsible_name }}{% if creator.assignment_confidence_label %} · {{ creator.assignment_confidence_label }}{% endif %}</div>{% elif creator.suggested_name %}<div class="text-secondary small mt-1">建议：{{ creator.suggested_name }}{% if creator.assignment_confidence_label %} · {{ creator.assignment_confidence_label }}{% endif %}</div>{% endif %}</td>
+          <td>{{ creator.updated_at_label }}</td>
           <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="/admin/contacts/{{ creator.open_id }}?confirmation=confirmed">查看联系人</a></td>
         </tr>{% endfor %}</tbody>
       </table></div>

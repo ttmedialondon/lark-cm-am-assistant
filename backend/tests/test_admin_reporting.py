@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 
 from app import admin_reporting
@@ -39,6 +40,40 @@ def test_message_conversation_filter_values_are_bounded_and_allowlisted():
     assert admin_reporting.normalize_message_conversation_type("unknown") == "all"
     assert admin_reporting.normalize_contact_confirmation("confirmed") == "confirmed"
     assert admin_reporting.normalize_contact_confirmation("unexpected") == "all"
+    assert admin_reporting.normalize_creator_assignment_filter("pending") == "pending"
+    assert admin_reporting.normalize_creator_assignment_filter("unexpected") == "all"
+
+
+def test_creator_pending_filter_requires_the_latest_actionable_assignment_suggestion(monkeypatch):
+    calls = []
+
+    class Result:
+        def __init__(self, *, row=None, rows=None):
+            self.row = row
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.row
+
+        def fetchall(self):
+            return self.rows
+
+    class Connection:
+        def execute(self, query, params=None):
+            calls.append((query, params))
+            return Result(row={"total_count": 0}) if len(calls) == 1 else Result()
+
+    monkeypatch.setattr(admin_reporting, "connection", lambda: nullcontext(Connection()))
+
+    page = admin_reporting.creators(assignment="pending")
+
+    assert page["items"] == []
+    query, params = calls[0]
+    assert params == (0.7, 0.9, "pending", "pending")
+    assert "assessment.outcome = 'review_required'" in query
+    assert "latest_assessment.decision IN ('assign', 'needs_review')" in query
+    assert "latest_assessment.confidence >= %s::numeric" in query
+    assert "latest_assessment.confidence < config.automatic_threshold" in query
 
 
 def test_member_count_labels_preserve_pending_and_unavailable_states():

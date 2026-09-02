@@ -148,6 +148,28 @@ def test_creator_library_is_owner_only_and_uses_the_owner_context(monkeypatch):
     assert response.status_code == 200
 
 
+def test_creator_directory_filters_owner_match_state_and_keeps_it_in_pagination(monkeypatch):
+    owner_id = uuid4()
+    contexts = []
+    calls = []
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(
+        admin_reporting,
+        "creators",
+        lambda page, assignment: calls.append((page, assignment))
+        or _page([], page=page, total_count=50, total_pages=2, page_size=25),
+    )
+
+    response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get(
+        "/admin/creators?page=2&assignment=pending"
+    )
+
+    assert response.status_code == 200
+    assert calls == [(2, "pending")]
+    assert contexts[-1][1]["assignment"] == "pending"
+    assert contexts[-1][1]["creator_page"]["previous_url"] == "/admin/creators?assignment=pending&page=1"
+
+
 def test_contact_directory_is_owner_only(monkeypatch):
     monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "operator")
 
