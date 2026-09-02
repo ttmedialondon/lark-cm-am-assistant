@@ -57,57 +57,6 @@ def sync_if_due(settings: Settings, client: LarkClient) -> bool:
     return True
 
 
-def verified_subject_organizations(conn: psycopg.Connection, contact_id: object) -> list[dict[str, str]]:
-    """Return only compact, source-verified affiliation context for one person."""
-
-    rows = conn.execute(
-        """
-        SELECT DISTINCT ON (organization.id)
-               organization.canonical_name, organization.organization_kind, link.relationship
-        FROM contact_organization_links link
-        JOIN organizations organization
-          ON organization.id = link.organization_id AND organization.verification_status = 'verified'
-        WHERE link.contact_id = %s AND link.status = 'verified'
-        ORDER BY organization.id,
-                 CASE link.relationship WHEN 'tenant_affiliation' THEN 0 ELSE 1 END,
-                 link.last_seen_at DESC, organization.canonical_name
-        LIMIT 3
-        """,
-        (contact_id,),
-    ).fetchall()
-    return [
-        {
-            "name": row["canonical_name"],
-            "kind": row["organization_kind"],
-            "relationship": row["relationship"],
-            "verification": "verified",
-        }
-        for row in rows
-    ]
-
-
-def assessment_context_ready(conn: psycopg.Connection, contact_id: object) -> bool:
-    """Require a verified organization fact for this particular person.
-
-    The model must receive both TT Media London and S1's organization. A global
-    Trust Party pass is not enough: the pass may not map this external person.
-    """
-
-    row = conn.execute(
-        """
-        SELECT EXISTS (
-            SELECT 1
-            FROM contact_organization_links link
-            JOIN organizations organization
-              ON organization.id = link.organization_id AND organization.verification_status = 'verified'
-            WHERE link.contact_id = %s AND link.status = 'verified'
-        ) AS ready
-        """,
-        (contact_id,),
-    ).fetchone()
-    return bool(row and row["ready"])
-
-
 def manually_confirm_contact_organization(
     actor_id: UUID,
     contact_id: UUID,

@@ -51,61 +51,6 @@ def test_associated_organization_keys_remain_visible_when_lark_omits_a_name() ->
     ) == {"known", "also-known"}
 
 
-def test_verified_subject_organizations_reads_direct_verified_links() -> None:
-    calls = []
-
-    class Result:
-        @staticmethod
-        def fetchall():
-            return [
-                {
-                    "canonical_name": "TT MEDIA ITALY",
-                    "organization_kind": "mcn_or_agency",
-                    "relationship": "unknown",
-                }
-            ]
-
-    class Connection:
-        @staticmethod
-        def execute(query, params):
-            calls.append((query, params))
-            return Result()
-
-    contact_id = uuid4()
-    organizations = organization_sync.verified_subject_organizations(Connection(), contact_id)
-
-    assert organizations == [
-        {
-            "name": "TT MEDIA ITALY",
-            "kind": "mcn_or_agency",
-            "relationship": "unknown",
-            "verification": "verified",
-        }
-    ]
-    assert "FROM contact_organization_links link" in calls[0][0]
-    assert calls[0][1] == (contact_id,)
-
-
-def test_assessment_context_requires_a_verified_link_for_this_contact() -> None:
-    calls = []
-
-    class Result:
-        @staticmethod
-        def fetchone():
-            return {"ready": True}
-
-    class Connection:
-        @staticmethod
-        def execute(query, params):
-            calls.append((query, params))
-            return Result()
-
-    contact_id = uuid4()
-    assert organization_sync.assessment_context_ready(Connection(), contact_id) is True
-    assert "organization_sync_state" not in calls[0][0]
-    assert calls[0][1] == (contact_id,)
-
-
 def test_manual_tenant_mapping_uses_the_identity_opened_in_the_admin_page(monkeypatch) -> None:
     calls = []
     contact_id = uuid4()

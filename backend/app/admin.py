@@ -633,7 +633,6 @@ def create_admin_router(
                 "contact": detail["contact"],
                 "identities": detail["identities"],
                 "organizations": detail["organizations"],
-                "organization_context_ready": any(item.get("status") == "verified" for item in detail["organizations"]),
                 "tenant_population": detail.get("tenant_population", 0),
                 "source_page": page,
                 "source_category": category,
@@ -902,81 +901,6 @@ def create_admin_router(
         response = RedirectResponse(
             url=f"/admin/contacts/{open_id}/assessments/{assessment_id}?{query}", status_code=303
         )
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-        return response
-
-    @router.post("/admin/contacts/{open_id}/assessments/{assessment_id}/organizations")
-    async def admin_confirm_assessment_organization(
-        request: Request,
-        open_id: str,
-        assessment_id: UUID,
-        page: int = 1,
-        category: str = "all",
-        organization_status: str = "all",
-        organization_query: str = "",
-    ) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        category = admin_reporting.normalize_contact_category(category)
-        organization_status = admin_reporting.normalize_organization_status(organization_status)
-        organization_query = admin_reporting.normalize_organization_query(organization_query)
-        if not contact_assessments.assessment_matches_contact(assessment_id, open_id):
-            response = render_template(
-                request,
-                "error.html",
-                {"title": "未找到 AI 判定", "detail": "该判定不存在，或不属于当前联系人。"},
-                404,
-            )
-            response.headers["Cache-Control"] = "no-store, max-age=0"
-            return response
-        form = await _form_fields(request)
-        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
-            return render_contact_assessment(
-                request,
-                access_context,
-                open_id=open_id,
-                assessment_id=assessment_id,
-                source_page=page,
-                source_category=category,
-                source_organization_status=organization_status,
-                source_organization_query=organization_query,
-                error="请求校验失败，请返回此页面后重试。",
-                status_code=400,
-            )
-        try:
-            candidate = contact_assessments.organization_candidate_for_assessment(
-                assessment_id, form.get("organization_name", "")
-            )
-            organization_sync.manually_confirm_contact_organization(
-                access_context["authorization"]["id"],
-                candidate["contact_id"],
-                open_id,
-                candidate["name"],
-                candidate["kind"],
-                map_current_tenant=form.get("map_current_tenant") == "1",
-            )
-        except (contact_assessments.ContactAssessmentInputError, organization_sync.OrganizationInputError) as exc:
-            return render_contact_assessment(
-                request,
-                access_context,
-                open_id=open_id,
-                assessment_id=assessment_id,
-                source_page=page,
-                source_category=category,
-                source_organization_status=organization_status,
-                source_organization_query=organization_query,
-                error=str(exc),
-                status_code=400,
-            )
-        query = contact_query(
-            page=page,
-            category=category,
-            organization_status=organization_status,
-            organization_query=organization_query,
-        )
-        response = RedirectResponse(url=f"/admin/contacts/{open_id}?{query}", status_code=303)
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 

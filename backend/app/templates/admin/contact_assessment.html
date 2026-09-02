@@ -5,7 +5,7 @@
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
     <div class="d-flex align-items-center mb-3"><div><h2 class="page-title">{{ assessment.contact.display_name }} · AI 识别结果</h2><div class="text-secondary">任务 {{ assessment.id }}{% if assessment.model %} · {{ assessment.model }}{% endif %}</div></div><a class="btn btn-outline-secondary ms-auto" href="/admin/contacts/{{ route_open_id }}?{{ source_query }}">返回人员</a></div>
-    <div class="alert alert-info">AI 仅使用当前授权范围内的消息证据、TT Media London 与已验证组织背景。达到阈值且具有直接互动或本人自述依据的唯一建议才会自动建立主类别；其他建议只能由你确认。</div>
+    <div class="alert alert-info">AI 仅使用当前授权范围内的消息证据与结构化互动关系，不读取或使用组织资料。达到阈值且具有直接互动或本人自述依据的唯一建议才会自动建立主类别；其他建议只能由你确认。</div>
     {% if form_error %}<div class="alert alert-danger" role="alert">{{ form_error }}</div>{% endif %}
     <div class="row row-deck row-cards mb-4">
       <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">任务状态</div><div class="h3 mb-0"><span class="badge bg-{{ assessment.status_badge }}-lt">{{ assessment.status_label }}</span></div></div></div></div>
@@ -27,14 +27,6 @@
       </tbody></table></div>
       {% else %}<div class="card-body text-secondary">AI 没有给出可人工确认的角色建议。</div>{% endif %}
     </div>
-    {% if assessment.organization_candidates %}
-    <div class="card mb-4">
-      <div class="card-header"><div><h3 class="card-title mb-1">组织候选</h3><div class="text-secondary small">仅是模型从消息中发现的候选，不会自动写入。确认后只关联此人；需要映射整个 Lark 租户时，请在联系人详情页另行确认。</div></div></div>
-      <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>组织</th><th>类型</th><th>置信度</th><th>引用</th><th></th></tr></thead><tbody>
-        {% for candidate in assessment.organization_candidates %}<tr><td>{{ candidate.name }}</td><td>{{ candidate.kind_label }}</td><td>{{ candidate.confidence_label }}</td><td class="text-secondary">{{ candidate.evidence_refs | join(', ') }}</td><td class="text-end">{% if assessment.can_confirm and candidate.confirmable %}<form action="/admin/contacts/{{ route_open_id }}/assessments/{{ assessment.id }}/organizations?{{ source_query }}" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="organization_name" value="{{ candidate.name }}"><button class="btn btn-sm btn-outline-primary" type="submit">确认组织</button></form>{% else %}<span class="text-secondary small">低于人工确认下限</span>{% endif %}</td></tr>{% endfor %}
-      </tbody></table></div>
-    </div>
-    {% endif %}
     <div class="card">
       <div class="card-header"><div><h3 class="card-title mb-1">模型引用的消息证据</h3><div class="text-secondary small">仅显示本次任务构造时仍属于有效授权范围的消息。打开此页会记录到审计日志。</div></div></div>
       {% if assessment.evidence %}<div class="list-group list-group-flush">{% for item in assessment.evidence %}<div class="list-group-item"><div class="d-flex flex-wrap gap-2 align-items-center mb-2"><span class="badge bg-secondary-lt">{{ item.label }}</span><span class="text-secondary small">{{ item.relation_label }} · {{ item.chat_name }} · {{ item.created_at_label }} · {{ item.sender_label }}</span></div>{% if item.available %}<div style="white-space: pre-wrap; overflow-wrap: anywhere;">{{ item.content }}</div>{% else %}<div class="text-secondary">原消息已不在当前有效授权范围内，不能显示正文。</div>{% endif %}</div>{% endfor %}</div>{% else %}<div class="card-body text-secondary">本次任务没有可展示的消息证据。</div>{% endif %}

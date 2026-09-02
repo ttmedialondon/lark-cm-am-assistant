@@ -402,40 +402,6 @@ def test_owner_confirmation_uses_only_suggested_form_values(monkeypatch):
     assert confirmed == [(owner_id, assessment_id, "creator")]
 
 
-def test_owner_can_confirm_an_evidence_bound_organization_candidate(monkeypatch):
-    owner_id = uuid4()
-    assessment_id = uuid4()
-    contact_id = uuid4()
-    candidate_calls = []
-    confirmed = []
-    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
-    monkeypatch.setattr(contact_assessments, "assessment_matches_contact", lambda *_args: True)
-    monkeypatch.setattr(
-        contact_assessments,
-        "organization_candidate_for_assessment",
-        lambda *args: candidate_calls.append(args)
-        or {"contact_id": contact_id, "name": "Trutonic Media", "kind": "mcn_or_agency"},
-    )
-    monkeypatch.setattr(
-        organization_sync,
-        "manually_confirm_contact_organization",
-        lambda *args, **kwargs: confirmed.append((args, kwargs)),
-    )
-
-    response = _client(lambda _request: {"id": owner_id, "status": "active"}).post(
-        f"/admin/contacts/ou_contact/assessments/{assessment_id}/organizations?page=4",
-        data={"csrf_token": "csrf", "organization_name": "Trutonic Media"},
-        follow_redirects=False,
-    )
-
-    assert response.status_code == 303
-    assert response.headers["location"] == "/admin/contacts/ou_contact?page=4&category=all&organization_status=all"
-    assert candidate_calls == [(assessment_id, "Trutonic Media")]
-    assert confirmed == [
-        ((owner_id, contact_id, "ou_contact", "Trutonic Media", "mcn_or_agency"), {"map_current_tenant": False})
-    ]
-
-
 def test_owner_cannot_confirm_an_assessment_through_another_contact_path(monkeypatch):
     owner_id = uuid4()
     assessment_id = uuid4()

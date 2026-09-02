@@ -40,7 +40,7 @@ FastAPI + Jinja2 + HTMX + Tabler    ←→ PostgreSQL
 
 仅 owner 可访问的 `/admin/ai` 当前只配置一个功能：`contact_assessment`（基于消息和 Lark 身份的联系人角色自动识别）。owner 会在此一次性粘贴该功能所属 OpenAI Project 的 service-account key；服务端会立即以独立加密域保存密钥，页面和审计记录都不会保留或显示明文，只显示必要的遮罩尾号。
 
-页面会展示 Project ID、模型、启用状态、自动确认阈值、密钥轮换状态和最近 AI 调用状态；空白密钥输入表示保留当前密钥，替换输入即轮换，关闭功能不必删除配置。浏览器不会直接请求 OpenAI，也不会保存 OpenAI Organization Admin Key。联系人首次拥有一条仍有效授权范围内的消息正文时，会进入持久化 PostgreSQL 队列；任务全局串行且两次启动至少相隔 3 秒，使用最多 17 条消息片段、约 8,000 个正文字符，群名仅随命中消息发送一次，使用 `store: false` 和严格 JSON Schema，保存角色建议、置信度和消息引用而不保存 Prompt 或模型自由文本。证据包始终包含 `TT Media London`，并仅附带该联系人的已验证 Lark 关联组织；它不会把群名或组织名当成角色事实。90% 及以上、单一、无冲突且有直接互动或本人自述依据的建议才会自动确认；其余建议保留在对应外部联系人的详情中，由 owner 核对后逐项处理。已有已确认主类别的联系人会在入队、调用模型前和写入结果前被排除。完整运行口径见 [`contact-assessment-automatic-v0.2.md`](../docs/as-built/contact-assessment-automatic-v0.2.md)。
+页面会展示 Project ID、模型、启用状态、自动确认阈值、密钥轮换状态和最近 AI 调用状态；空白密钥输入表示保留当前密钥，替换输入即轮换，关闭功能不必删除配置。浏览器不会直接请求 OpenAI，也不会保存 OpenAI Organization Admin Key。联系人首次拥有一条仍有效授权范围内的消息正文时，会进入持久化 PostgreSQL 队列；任务全局串行且两次启动至少相隔 3 秒，使用最多 17 条消息片段、约 8,000 个正文字符，群名仅随命中消息发送一次，使用 `store: false` 和严格 JSON Schema，保存角色建议、置信度和消息引用而不保存 Prompt 或模型自由文本。证据包不带组织名称、组织映射或组织候选；群名不能成为角色事实。90% 及以上、单一、无冲突且有直接互动或本人自述依据的建议才会自动确认；其余建议保留在对应外部联系人的详情中，由 owner 核对后逐项处理。已有已确认主类别的联系人会在入队、调用模型前和写入结果前被排除。完整运行口径见 [`contact-assessment-automatic-v0.2.md`](../docs/as-built/contact-assessment-automatic-v0.2.md)。
 
 ### Lark 关联组织（可选增强）
 

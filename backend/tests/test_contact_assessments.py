@@ -19,8 +19,7 @@ def _valid_result(*, evidence_ref: str = "M1") -> str:
                     "basis": "direct_interaction",
                     "evidence_refs": [evidence_ref],
                 }
-            ],
-            "organization_candidates": [],
+            ]
         }
     )
 
@@ -29,25 +28,6 @@ def test_model_result_rejects_an_invented_message_reference() -> None:
     with pytest.raises(ValueError):
         contact_assessments._validate_model_result(
             _valid_result(evidence_ref="M999"),
-            {"M1"},
-        )
-
-
-def test_model_result_requires_the_organization_candidate_field() -> None:
-    with pytest.raises(ValueError):
-        contact_assessments._validate_model_result(
-            json.dumps(
-                {
-                    "roles": [
-                        {
-                            "role": "creator",
-                            "confidence": 0.8,
-                            "basis": "direct_interaction",
-                            "evidence_refs": ["M1"],
-                        }
-                    ]
-                }
-            ),
             {"M1"},
         )
 
@@ -63,8 +43,7 @@ def test_model_result_keeps_a_valid_role() -> None:
                         "basis": "self_declaration",
                         "evidence_refs": ["M1"],
                     }
-                ],
-                "organization_candidates": [],
+                ]
             }
         ),
         {"M1"},
@@ -73,44 +52,8 @@ def test_model_result_keeps_a_valid_role() -> None:
     assert result == {
         "roles": [
             {"role": "creator", "confidence": 0.95, "basis": "self_declaration", "evidence_refs": ["M1"]}
-        ],
-        "organization_candidates": [],
+        ]
     }
-
-
-def test_model_result_keeps_an_evidence_bound_organization_candidate() -> None:
-    result = contact_assessments._validate_model_result(
-        json.dumps(
-            {
-                "roles": [
-                    {
-                        "role": "partner_contact",
-                        "confidence": 0.8,
-                        "basis": "direct_interaction",
-                        "evidence_refs": ["M1"],
-                    }
-                ],
-                "organization_candidates": [
-                    {
-                        "name": "TT MEDIA ITALY",
-                        "kind": "mcn_or_agency",
-                        "confidence": 0.8,
-                        "evidence_refs": ["M1"],
-                    }
-                ],
-            }
-        ),
-        {"M1"},
-    )
-
-    assert result["organization_candidates"] == [
-        {
-            "name": "TT MEDIA ITALY",
-            "kind": "mcn_or_agency",
-            "confidence": 0.8,
-            "evidence_refs": ["M1"],
-        }
-    ]
 
 
 def test_model_result_rejects_insufficient_mixed_with_a_business_role() -> None:
@@ -277,8 +220,7 @@ def test_responses_request_is_nonpersistent_and_uses_configured_model(monkeypatc
     assert evidence_refs["minItems"] == 1
     assert evidence_refs["maxItems"] == 12
     assert schema["properties"]["roles"]["maxItems"] == 3
-    assert "organization_candidates" in schema["required"]
-    assert schema["properties"]["organization_candidates"]["maxItems"] == 2
+    assert "organization_candidates" not in schema["properties"]
     assert "account_relations" not in schema["properties"]
     assert result["usage"] == {"input_tokens": 12, "output_tokens": 8}
 
@@ -351,7 +293,7 @@ def test_context_limits_are_balanced_and_group_name_is_not_repeated() -> None:
     anchor_payload = contact_assessments._model_fragment({**base_fragment, "relation": "anchor"}, set())
     context_payload = contact_assessments._model_fragment({**base_fragment, "relation": "context"}, set())
     assert anchor_payload["conversation"]["name"] == "Creator campaign"
-    assert anchor_payload["speaker_party"] == "external_or_unknown"
+    assert "speaker_party" not in anchor_payload
     assert "name" not in context_payload["conversation"]
 
 
@@ -552,24 +494,41 @@ def test_run_skips_every_confirmed_contact_before_loading_ai_or_sending_content(
     ]
 
 
-def test_run_defers_when_the_subject_organization_is_not_verified(monkeypatch) -> None:
+def test_run_without_an_organization_reaches_ai(monkeypatch) -> None:
     assessment_id = uuid4()
     contact_id = uuid4()
-    deferred: list[object] = []
+    called: list[object] = []
 
     monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(object()))
     monkeypatch.setattr(contact_assessments, "_contact_has_confirmed_facts", lambda *_args: False)
-    monkeypatch.setattr(contact_assessments.organization_sync, "assessment_context_ready", lambda *_args: False)
-    monkeypatch.setattr(contact_assessments, "_defer_for_organization_context", deferred.append)
+    monkeypatch.setattr(contact_assessments, "_configured_openai", lambda *_args: ({"model": "luna"}, "sk-test"))
     monkeypatch.setattr(
         contact_assessments,
-        "_configured_openai",
-        lambda *_args: pytest.fail("missing organization must not load or call AI"),
+        "_build_evidence",
+        lambda *_args: {
+            "fragments": [{}],
+            "refs": [],
+            "char_count": 0,
+            "source_authorization_id": uuid4(),
+            "pack": {"subject": {"alias": "S1"}, "messages": []},
+            "labels": {"M1"},
+            "evidence_strength": {},
+        },
     )
+    monkeypatch.setattr(contact_assessments, "_save_refs", lambda *_args: None)
+    monkeypatch.setattr(contact_assessments, "_refs_are_still_authorized", lambda *_args: True)
+    monkeypatch.setattr(contact_assessments, "_call_openai", lambda *_args: {"text": "{}", "usage": {}})
+    monkeypatch.setattr(contact_assessments, "_validate_model_result", lambda *_args: {"roles": []})
+    monkeypatch.setattr(
+        contact_assessments,
+        "_finish_with_decision",
+        lambda *_args, **_kwargs: called.append("decision") or True,
+    )
+    monkeypatch.setattr(contact_assessments, "_mark_feature_test", lambda result: called.append(result))
 
     contact_assessments._run({"id": assessment_id, "contact_id": contact_id}, object())
 
-    assert deferred == [assessment_id]
+    assert called == ["decision", "succeeded"]
 
 
 def test_run_rechecks_confirmation_immediately_before_the_model_call(monkeypatch) -> None:
@@ -580,7 +539,6 @@ def test_run_rechecks_confirmation_immediately_before_the_model_call(monkeypatch
 
     monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(object()))
     monkeypatch.setattr(contact_assessments, "_contact_has_confirmed_facts", lambda *_args: next(checks))
-    monkeypatch.setattr(contact_assessments.organization_sync, "assessment_context_ready", lambda *_args: True)
     monkeypatch.setattr(
         contact_assessments,
         "_configured_openai",

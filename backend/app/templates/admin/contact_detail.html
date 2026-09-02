@@ -5,9 +5,9 @@
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
     <div class="d-flex align-items-center mb-3"><div><div class="d-flex flex-wrap align-items-center gap-2"><h2 class="page-title mb-0">{{ contact.display_name }}</h2><span class="badge bg-{{ contact.category_badge }}-lt">{{ contact.category_label }}</span>{% for label in contact.confirmed_role_labels[1:] %}<span class="badge bg-secondary-lt">辅助：{{ label }}</span>{% endfor %}</div><div class="text-secondary">稳定 Lark 身份 · {{ contact.open_id }}</div></div><a class="btn btn-outline-secondary ms-auto" href="/admin/contacts?{{ source_query }}">返回人员目录</a></div>
-    <div class="alert alert-info">以下是此 Lark 联系人的可验证会话事实。AI 只使用当前授权范围内的消息、结构化互动关系，以及 TT Media London 与已验证的所属组织背景。</div>
+    <div class="alert alert-info">以下是此 Lark 联系人的可验证会话事实。AI 只使用当前授权范围内的消息与结构化互动关系，不读取或使用组织资料。</div>
     <div class="card mb-4">
-      <div class="card-header"><div><h3 class="card-title mb-1">AI 自动识别</h3><div class="text-secondary small">联系人具备可读的授权消息且已确认所属组织后，后台会自动识别。只有 90% 及以上、唯一且具备强证据的身份会自动确认；其余建议保留在此联系人详情中，供你核对后确认。</div></div></div>
+      <div class="card-header"><div><h3 class="card-title mb-1">AI 自动识别</h3><div class="text-secondary small">联系人具备可读的授权消息后，后台会自动识别。只有 90% 及以上、唯一且具备强证据的身份会自动确认；其余建议保留在此联系人详情中，供你核对后确认。</div></div></div>
       <div class="card-body d-flex flex-wrap align-items-center gap-3">
         {% if contact.primary_role == 'internal_colleague' %}
         <div class="text-secondary small">此人由内部 Lark 租户事实确定为 TT Media London 同事，不进入 AI 外部联系人判定队列。</div>
@@ -15,7 +15,7 @@
         <div><span class="badge bg-{{ assessment.status_badge }}-lt">{{ assessment.status_label }}</span>{% if assessment.outcome_label %}<span class="text-secondary small ms-2">{{ assessment.outcome_label }}</span>{% endif %}<span class="text-secondary small ms-2">{{ assessment.created_at_label }}{% if assessment.model %} · {{ assessment.model }}{% endif %}</span>{% if assessment.error_label %}<div class="text-danger small mt-1">{{ assessment.error_label }}</div>{% endif %}</div>
         {% if assessment.status == 'succeeded' %}<a class="btn btn-outline-primary ms-auto" href="/admin/contacts/{{ contact.open_id }}/assessments/{{ assessment.id }}?{{ source_query }}">查看建议与证据</a>{% endif %}
         {% elif assessment_available %}
-        {% if organization_context_ready %}<div class="text-secondary small">尚无任务。系统会在下次同步发现可用消息后自动安排识别。</div>{% else %}<div class="text-secondary small">尚未确认此人的所属组织。为避免在缺少对方组织背景时误判，系统暂不调用 AI；可在下方补充已验证组织。</div>{% endif %}
+        <div class="text-secondary small">尚无任务。系统会在下次同步发现可用消息后自动安排识别。</div>
         {% else %}
         <div class="text-secondary">AI 功能尚未启用。请先在 <a href="/admin/ai">AI 功能配置</a> 中保存有效的 OpenAI 配置。</div>
         {% endif %}
