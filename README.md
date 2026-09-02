@@ -6,6 +6,7 @@ Internal system for managing CM/AM night-time Lark messages, generating auditabl
 
 - `backend/` contains the deployed FastAPI service for authorised CM/AM conversation sync and the owner-only content console.
 - `docs/architecture/TDD_v2.0.md` defines the approved target architecture; it remains a technical-review draft until its P0 governance decisions are closed.
+- `docs/architecture/contact-identity-organization-model-v0.4.md` documents the deployed person, organization, role, and creator-owner model.
 - No customer-facing or automatic message sending is included.
 
 ## Repository layout
