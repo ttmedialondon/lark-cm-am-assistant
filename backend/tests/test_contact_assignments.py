@@ -77,7 +77,7 @@ def test_assignment_queue_requires_real_bidirectional_interaction_without_chat_t
         def execute(self, query, params=None):
             calls.append((query, params))
             if "SELECT automatic_queue_checked_at" in query:
-                return Result(row={"automatic_queue_checked_at": "watermark"})
+                return Result(row={"watermark": "-infinity"})
             if "UPDATE ai_feature_configs" in query:
                 return Result()
             return Result(rows=[{"id": "queued"}])
@@ -90,8 +90,10 @@ def test_assignment_queue_requires_real_bidirectional_interaction_without_chat_t
     assert calls[0][1] == ("contact_assignment", 60)
     assert "FOR UPDATE" in calls[0][0]
     assert calls[1][1] == ("contact_assignment",)
-    assert params == ("watermark", 89, 3, 15, 89, 3, 15)
+    assert params == ("-infinity", 89, 3, 15, 89, 3, 15)
     assert query.count("%s") == len(params)
+    assert "automatic_queue_checked_at::text AS watermark" in calls[0][0]
+    assert "observation.first_observed_at > %s::timestamptz" in query
     assert "role.role = 'creator' AND role.status = 'confirmed'" in query
     assert "auth.status = 'active'" in query
     assert "auth.assignment_eligible" in query

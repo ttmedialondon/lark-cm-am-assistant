@@ -97,7 +97,10 @@ def queue_eligible_contact_assignments() -> int:
     with connection() as conn, conn.transaction():
         config = conn.execute(
             """
-            SELECT automatic_queue_checked_at
+            -- Keep PostgreSQL's initial '-infinity' as text. Psycopg cannot
+            -- deserialize that sentinel into Python datetime, but PostgreSQL
+            -- can safely cast the bound value back below.
+            SELECT automatic_queue_checked_at::text AS watermark
             FROM ai_feature_configs
             WHERE feature = %s
               AND enabled
@@ -110,7 +113,7 @@ def queue_eligible_contact_assignments() -> int:
         ).fetchone()
         if not config:
             return 0
-        watermark = config["automatic_queue_checked_at"]
+        watermark = config["watermark"]
         conn.execute(
             """
             UPDATE ai_feature_configs
@@ -147,7 +150,7 @@ def queue_eligible_contact_assignments() -> int:
                 WHERE auth.status = 'active'
                   AND auth.body_consent_at IS NOT NULL
                   AND auth.assignment_eligible
-                  AND observation.first_observed_at > %s
+                  AND observation.first_observed_at > %s::timestamptz
                   AND observation.observed_at >= auth.body_consent_at
                   AND access.is_visible AND access.sync_enabled
                   AND NOT message.is_deleted AND message.body_ciphertext IS NOT NULL
