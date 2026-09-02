@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import psycopg
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -85,6 +87,29 @@ def _message_page(
     raise RuntimeError("unreachable")
 
 
+def _store_sender_identities(authorization: dict[str, Any], messages: list[dict[str, Any]]) -> tuple[int, int]:
+    for attempt in range(3):
+        try:
+            sender_names_returned = 0
+            with connection() as conn, conn.transaction():
+                internal_tenant_keys = _internal_tenant_keys(conn)
+                for message in messages:
+                    metadata = _record_message_sender_identity(
+                        conn,
+                        message,
+                        is_own=_is_author_message(message, authorization["open_id"]),
+                        internal_tenant_keys=internal_tenant_keys,
+                    )
+                    sender_names_returned += int(bool(metadata[-1]))
+                _refresh_tenant_classifications(conn, internal_tenant_keys)
+            return len(messages), sender_names_returned
+        except psycopg.errors.DeadlockDetected:
+            if attempt == 2:
+                raise
+            time.sleep(2**attempt)
+    raise RuntimeError("unreachable")
+
+
 def _sync_chat(
     client: LarkClient, authorization: dict[str, Any], access_token: str, chat_id: str, stats: Stats
 ) -> None:
@@ -92,18 +117,9 @@ def _sync_chat(
     while True:
         data = _message_page(client, access_token, chat_id, page_token)
         messages = _items(data)
-        with connection() as conn, conn.transaction():
-            internal_tenant_keys = _internal_tenant_keys(conn)
-            for message in messages:
-                metadata = _record_message_sender_identity(
-                    conn,
-                    message,
-                    is_own=_is_author_message(message, authorization["open_id"]),
-                    internal_tenant_keys=internal_tenant_keys,
-                )
-                stats.messages_seen += 1
-                stats.sender_names_returned += int(bool(metadata[-1]))
-            _refresh_tenant_classifications(conn, internal_tenant_keys)
+        messages_seen, sender_names_returned = _store_sender_identities(authorization, messages)
+        stats.messages_seen += messages_seen
+        stats.sender_names_returned += sender_names_returned
         stats.pages_scanned += 1
         if not _has_more(data):
             return
