@@ -35,24 +35,24 @@ from app.worker import (  # noqa: E402
 
 
 TARGET_CHATS_SQL = """
-SELECT DISTINCT access.authorization_id, access.chat_id
-FROM authorization_chats access
-JOIN authorizations authorization ON authorization.id = access.authorization_id
-JOIN chats chat ON chat.chat_id = access.chat_id
+SELECT DISTINCT ac.authorization_id, ac.chat_id
+FROM authorization_chats ac
+JOIN authorizations auth ON auth.id = ac.authorization_id
+JOIN chats chat ON chat.chat_id = ac.chat_id
 JOIN authorization_message_observations observation
-  ON observation.authorization_id = access.authorization_id
- AND observation.chat_id = access.chat_id
+  ON observation.authorization_id = ac.authorization_id
+ AND observation.chat_id = ac.chat_id
 JOIN chat_messages message
   ON message.chat_id = observation.chat_id AND message.message_id = observation.message_id
 JOIN lark_identities identity ON identity.open_id = message.sender_open_id
-WHERE authorization.status = 'active'
-  AND access.is_visible
-  AND access.sync_enabled
+WHERE auth.status = 'active'
+  AND ac.is_visible
+  AND ac.sync_enabled
   AND COALESCE(chat.chat_status, 'normal') = 'normal'
   AND identity.identity_type = 'user'
   AND COALESCE(BTRIM(identity.display_name), '') = ''
   AND NOT message.is_deleted
-ORDER BY access.authorization_id, access.chat_id
+ORDER BY ac.authorization_id, ac.chat_id
 """
 
 
