@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import random
 import time
 from collections.abc import Mapping
@@ -657,8 +658,12 @@ def _run(job: Mapping[str, Any], settings: Settings) -> None:
 def _retry_delay(retry_after_seconds: float | None, attempts: object) -> float:
     """Respect a provider retry deadline; only use a small fallback if absent."""
 
-    if retry_after_seconds is not None:
-        base = retry_after_seconds
+    try:
+        provider_delay = float(retry_after_seconds) if retry_after_seconds is not None else None
+    except (TypeError, ValueError):
+        provider_delay = None
+    if provider_delay is not None and math.isfinite(provider_delay):
+        base = provider_delay
     else:
         try:
             base = min(60.0, 2.0 ** min(max(int(attempts or 0), 0), 5))
@@ -1172,6 +1177,8 @@ def _retry_after_header(response: httpx.Response) -> float | None:
             seconds = parsedate_to_datetime(str(raw)).timestamp() - time.time()
         except (TypeError, ValueError, IndexError, OverflowError):
             return None
+    if not math.isfinite(seconds):
+        return None
     return min(max(seconds, 0.0), 3_600.0)
 
 
@@ -1186,7 +1193,17 @@ def _is_quota_response(response: httpx.Response) -> bool:
     if not isinstance(error, Mapping):
         return False
     signals = " ".join(str(error.get(field) or "").casefold() for field in ("code", "type", "message"))
-    return any(token in signals for token in ("insufficient_quota", "billing", "credit balance", "payment required"))
+    return any(
+        token in signals
+        for token in (
+            "insufficient_quota",
+            "billing",
+            "credit balance",
+            "payment required",
+            "hard_limit",
+            "quota exceeded",
+        )
+    )
 
 
 def _call_openai(config: Mapping[str, Any], api_key: str, pack: Mapping[str, Any], contact_id: UUID) -> dict[str, Any]:

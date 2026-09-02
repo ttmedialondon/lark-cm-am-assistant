@@ -295,6 +295,13 @@ def test_retry_after_accepts_an_http_date(monkeypatch) -> None:
     assert contact_assessments._retry_after_header(Response()) == 7
 
 
+def test_retry_after_rejects_a_non_finite_provider_value() -> None:
+    class Response:
+        headers = {"retry-after": "NaN"}
+
+    assert contact_assessments._retry_after_header(Response()) is None
+
+
 def test_non_429_http_error_keeps_safe_telemetry_without_a_blind_retry(monkeypatch) -> None:
     class Response:
         status_code = 500

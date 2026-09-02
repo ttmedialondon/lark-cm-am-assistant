@@ -6,6 +6,7 @@ the small number of paid OpenAI requests it may hand to worker threads.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import psycopg
@@ -50,7 +51,13 @@ def can_claim(conn: psycopg.Connection) -> bool:
 def throttle(delay_seconds: float) -> None:
     """Temporarily hold both queues after a recoverable provider 429."""
 
-    delay = min(max(float(delay_seconds), 0.0), 3_600.0)
+    try:
+        delay = float(delay_seconds)
+    except (TypeError, ValueError):
+        return
+    if not math.isfinite(delay):
+        return
+    delay = min(max(delay, 0.0), 3_600.0)
     with connection() as conn, conn.transaction():
         conn.execute("SELECT pg_advisory_xact_lock(%s)", (_ADMISSION_LOCK,))
         conn.execute(
