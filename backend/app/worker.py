@@ -20,7 +20,6 @@ from .db import connection
 from .lark_api import LarkApiError, LarkClient, TokenBundle
 
 LOGGER = logging.getLogger("lark_message_stats.worker")
-MAX_CONSECUTIVE_SYNC_JOBS = 3
 LEASE_MINUTES = 10
 
 
@@ -55,7 +54,6 @@ def run_forever() -> None:
     if not settings.app_secret_configured:
         LOGGER.warning("Lark App Secret is not configured; worker is waiting for administrator input")
 
-    sync_streak = 0
     prefer_assignment = False
     next_organization_check = 0.0
     # ponytail: only paid OpenAI calls need parallel slots; Lark sync remains in
@@ -74,25 +72,13 @@ def run_forever() -> None:
                         getattr(settings, "organization_sync_interval_seconds", 21_600), 300
                     )
                 _recover_expired_leases()
-                # Keep a backfill from starving the durable AI queue forever,
-                # but never wait for an AI result here.
-                if sync_streak >= MAX_CONSECUTIVE_SYNC_JOBS:
-                    submitted, prefer_assignment = _dispatch_ai_turn(
-                        settings, executor, futures, prefer_assignment
-                    )
-                    if submitted:
-                        sync_streak = 0
-                        continue
+                # Fill paid-call slots before a potentially long Lark backfill.
+                # The claims are quick; the main thread still owns all sync IO.
+                prefer_assignment = _fill_ai_slots(settings, executor, futures, prefer_assignment)
                 job = _claim_job() if settings.app_secret_configured else None
                 if job:
                     _execute_job(job, settings)
-                    sync_streak += 1
                     continue
-                submitted, prefer_assignment = _dispatch_ai_turn(settings, executor, futures, prefer_assignment)
-                if submitted:
-                    sync_streak = 0
-                    continue
-                sync_streak = 0
                 time.sleep(settings.worker_idle_seconds)
             except KeyboardInterrupt:
                 raise
@@ -157,6 +143,21 @@ def _dispatch_ai_turn(
         futures.add(executor.submit(runner, job, settings))
         return True, next_preference
     return False, prefer_assignment
+
+
+def _fill_ai_slots(
+    settings: Settings,
+    executor: ThreadPoolExecutor,
+    futures: set[Future[Any]],
+    prefer_assignment: bool,
+) -> bool:
+    """Fill up to three AI slots before returning immediately to Lark sync."""
+
+    while len(futures) < ai_dispatch.MAX_CONCURRENT_REQUESTS:
+        submitted, prefer_assignment = _dispatch_ai_turn(settings, executor, futures, prefer_assignment)
+        if not submitted:
+            break
+    return prefer_assignment
 
 
 def _reap_ai_futures(futures: set[Future[Any]]) -> None:

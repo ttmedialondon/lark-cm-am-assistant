@@ -190,12 +190,12 @@ def test_normal_pagination_requeue_does_not_increment_retry_count(monkeypatch) -
     assert "last_error_code = %s" in calls[0][0]
 
 
-def test_worker_gives_the_durable_ai_queue_a_turn_during_continuous_sync(monkeypatch) -> None:
+def test_worker_fills_ai_slots_before_a_lark_sync_job(monkeypatch) -> None:
     calls: list[str] = []
-    jobs = iter((object(), object(), object()))
+    jobs = iter((object(),))
 
     def recover() -> None:
-        if "assessment" in calls:
+        if calls == ["assessment", "sync"]:
             raise KeyboardInterrupt
 
     monkeypatch.setattr(
@@ -206,46 +206,27 @@ def test_worker_gives_the_durable_ai_queue_a_turn_during_continuous_sync(monkeyp
     monkeypatch.setattr(worker, "_recover_expired_leases", recover)
     monkeypatch.setattr(worker, "_claim_job", lambda: next(jobs))
     monkeypatch.setattr(worker, "_execute_job", lambda _job, _settings: calls.append("sync"))
-    monkeypatch.setattr(
-        worker,
-        "_dispatch_ai_turn",
-        lambda _settings, _executor, _futures, _prefer: (calls.append("assessment") or True, True),
-    )
+    monkeypatch.setattr(worker, "_fill_ai_slots", lambda *_args: calls.append("assessment") or True)
 
     try:
         worker.run_forever()
     except KeyboardInterrupt:
         pass
 
-    assert calls == ["sync", "sync", "sync", "assessment"]
+    assert calls == ["assessment", "sync"]
 
 
-def test_full_ai_slots_do_not_prevent_the_next_lark_sync_job(monkeypatch) -> None:
-    calls: list[str] = []
-    jobs = iter((object(), object(), object(), object()))
+def test_full_ai_slots_do_not_attempt_another_claim(monkeypatch) -> None:
+    class Future:
+        pass
 
-    def recover() -> None:
-        if calls == ["sync", "sync", "sync", "ai_full", "sync"]:
-            raise KeyboardInterrupt
-
-    monkeypatch.setattr(
-        worker,
-        "get_settings",
-        lambda: SimpleNamespace(app_secret_configured=True, worker_idle_seconds=1),
-    )
-    monkeypatch.setattr(worker, "_recover_expired_leases", recover)
-    monkeypatch.setattr(worker, "_claim_job", lambda: next(jobs))
-    monkeypatch.setattr(worker, "_execute_job", lambda _job, _settings: calls.append("sync"))
     monkeypatch.setattr(
         worker,
         "_dispatch_ai_turn",
-        lambda _settings, _executor, _futures, _prefer: (calls.append("ai_full") or False, _prefer),
+        lambda *_args: pytest.fail("a full AI pool must not claim another task"),
     )
 
-    with pytest.raises(KeyboardInterrupt):
-        worker.run_forever()
-
-    assert calls == ["sync", "sync", "sync", "ai_full", "sync"]
+    assert worker._fill_ai_slots(object(), object(), {Future(), Future(), Future()}, False) is False
 
 
 def test_dispatch_uses_at_most_three_slots_and_alternates_queues(monkeypatch) -> None:
