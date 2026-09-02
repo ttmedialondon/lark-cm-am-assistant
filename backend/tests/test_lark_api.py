@@ -57,6 +57,31 @@ def test_chat_member_list_requests_a_paginated_user_roster(monkeypatch) -> None:
     }
 
 
+def test_message_list_requests_sender_names(monkeypatch) -> None:
+    client = LarkClient(settings())
+    captured = {}
+
+    def fake_request(method, url, **kwargs):
+        captured.update(method=method, url=url, **kwargs)
+        return {"items": []}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    client.list_chat_messages("user-token", "oc_test", page_token="page-2", ascending=False)
+
+    assert captured["method"] == "GET"
+    assert captured["url"].endswith("/open-apis/im/v1/messages")
+    assert captured["access_token"] == "user-token"
+    assert captured["params"] == {
+        "container_id_type": "chat",
+        "container_id": "oc_test",
+        "with_sender_name": "true",
+        "page_size": 50,
+        "sort_type": "ByCreateTimeDesc",
+        "page_token": "page-2",
+    }
+
+
 def test_p2p_discovery_uses_the_user_chat_type_filter(monkeypatch) -> None:
     client = LarkClient(settings())
     captured = {}

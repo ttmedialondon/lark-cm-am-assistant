@@ -1083,6 +1083,42 @@ def _start_incremental_window(
         )
 
 
+def _record_message_sender_identity(
+    conn: psycopg.Connection,
+    message: dict[str, Any],
+    *,
+    is_own: bool,
+    internal_tenant_keys: set[str],
+) -> tuple[str | None, str | None, str | None, str | None, str | None, str | None]:
+    """Persist sender identity facts; display names never act as identity keys."""
+
+    metadata = _sender_metadata(message)
+    sender_id, sender_id_type, sender_open_id, sender_tenant_key, sender_type, sender_name = metadata
+    if is_own and sender_tenant_key:
+        internal_tenant_keys.add(sender_tenant_key)
+    if sender_open_id:
+        identity_type = sender_type or "user"
+        _upsert_lark_identity(
+            conn,
+            sender_open_id,
+            tenant_key=sender_tenant_key,
+            display_name=sender_name,
+            identity_type=identity_type,
+        )
+        _ensure_contact_for_identity(
+            conn,
+            sender_open_id,
+            tenant_classification=_tenant_classification(
+                tenant_key=sender_tenant_key,
+                identity_type=identity_type,
+                internal_tenant_keys=internal_tenant_keys,
+            ),
+            identity_type=identity_type,
+            display_name=sender_name,
+        )
+    return metadata
+
+
 def _record_page(
     job: SyncJob,
     authorization: dict[str, Any],
@@ -1102,6 +1138,7 @@ def _record_page(
             message_id = _text(message.get("message_id"))
             if not message_id:
                 continue
+            is_own = _is_author_message(message, authorization["open_id"])
             (
                 sender_id,
                 sender_id_type,
@@ -1109,30 +1146,12 @@ def _record_page(
                 sender_tenant_key,
                 sender_type,
                 sender_name,
-            ) = _sender_metadata(message)
-            is_own = _is_author_message(message, authorization["open_id"])
-            if is_own and sender_tenant_key:
-                internal_tenant_keys.add(sender_tenant_key)
-            if sender_open_id:
-                identity_type = sender_type or "user"
-                _upsert_lark_identity(
-                    conn,
-                    sender_open_id,
-                    tenant_key=sender_tenant_key,
-                    display_name=sender_name,
-                    identity_type=identity_type,
-                )
-                _ensure_contact_for_identity(
-                    conn,
-                    sender_open_id,
-                    tenant_classification=_tenant_classification(
-                        tenant_key=sender_tenant_key,
-                        identity_type=identity_type,
-                        internal_tenant_keys=internal_tenant_keys,
-                    ),
-                    identity_type=identity_type,
-                    display_name=sender_name,
-                )
+            ) = _record_message_sender_identity(
+                conn,
+                message,
+                is_own=is_own,
+                internal_tenant_keys=internal_tenant_keys,
+            )
             is_deleted = _bool(message.get("deleted"))
             body_content = _body_content(message)
             body_ciphertext = (

@@ -142,6 +142,7 @@ class LarkClient:
         params: dict[str, str | int] = {
             "container_id_type": "chat",
             "container_id": chat_id,
+            "with_sender_name": "true",
             "page_size": 50,
             "sort_type": "ByCreateTimeAsc" if ascending else "ByCreateTimeDesc",
         }

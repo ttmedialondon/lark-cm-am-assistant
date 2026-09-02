@@ -66,6 +66,18 @@ def test_sender_metadata_keeps_open_id_only_when_lark_marks_it_as_open_id() -> N
     assert _sender_metadata(app)[2] is None
 
 
+def test_same_sender_name_keeps_distinct_lark_identity_keys() -> None:
+    first = _sender_metadata(
+        {"sender": {"id": "ou_first", "id_type": "open_id", "tenant_key": "tenant_a", "sender_name": "Alex"}}
+    )
+    second = _sender_metadata(
+        {"sender": {"id": "ou_second", "id_type": "open_id", "tenant_key": "tenant_b", "sender_name": "Alex"}}
+    )
+
+    assert first[2:] == ("ou_first", "tenant_a", None, "Alex")
+    assert second[2:] == ("ou_second", "tenant_b", None, "Alex")
+
+
 def test_message_relationship_metadata_keeps_only_context_fields() -> None:
     relations = _message_relation_metadata(
         {
