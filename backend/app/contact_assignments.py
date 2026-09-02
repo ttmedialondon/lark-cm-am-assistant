@@ -117,7 +117,7 @@ def assignment_safety_status() -> dict[str, int | bool]:
 
 
 def queue_eligible_contact_assignments() -> int:
-    """Queue unassigned, confirmed creators that have real CM/AM interaction."""
+    """Queue unassigned creators after relevant messages or role confirmation."""
 
     with connection() as conn, conn.transaction():
         config = conn.execute(
@@ -184,6 +184,15 @@ def queue_eligible_contact_assignments() -> int:
                   AND message.message_create_time >= (
                       ((NOW() AT TIME ZONE 'Europe/London')::date - %s)::timestamp AT TIME ZONE 'Europe/London'
                   )
+            ), changed_creator_roles AS (
+                -- A person can become a confirmed creator after their messages
+                -- were already indexed. Seed one recent-history pass in that case.
+                SELECT role.contact_id
+                FROM contact_roles role
+                WHERE role.role = 'creator'
+                  AND role.status = 'confirmed'
+                  AND role.is_primary
+                  AND role.updated_at > %s::timestamptz
             ), seeded_contacts AS (
                 SELECT DISTINCT identity.contact_id
                 FROM changed_messages changed
@@ -204,6 +213,8 @@ def queue_eligible_contact_assignments() -> int:
                 WHERE changed.sent_by_author
                   AND identity.identity_type = 'user'
                   AND role.role = 'creator' AND role.status = 'confirmed' AND role.is_primary
+                UNION
+                SELECT contact_id FROM changed_creator_roles
                 UNION
                 SELECT contact_id
                 FROM retry_attempts
@@ -381,6 +392,7 @@ def queue_eligible_contact_assignments() -> int:
                 POLICY_VERSION,
                 watermark,
                 RECENT_INTERACTION_DAYS - 1,
+                watermark,
                 MAX_AUTOMATIC_ATTEMPTS_PER_WATERMARK,
                 AUTOMATIC_RETRY_COOLDOWN_MINUTES,
                 RECENT_INTERACTION_DAYS - 1,

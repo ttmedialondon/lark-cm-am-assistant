@@ -107,6 +107,7 @@ def test_assignment_queue_requires_direct_interaction_and_current_policy(monkeyp
         contact_assignments.POLICY_VERSION,
         "-infinity",
         89,
+        "-infinity",
         3,
         15,
         89,
@@ -119,6 +120,9 @@ def test_assignment_queue_requires_direct_interaction_and_current_policy(monkeyp
     assert query.count("%s") == len(params)
     assert "automatic_queue_checked_at::text AS watermark" in calls[0][0]
     assert "observation.first_observed_at > %s::timestamptz" in query
+    assert "changed_creator_roles AS" in query
+    assert "role.updated_at > %s::timestamptz" in query
+    assert "SELECT contact_id FROM changed_creator_roles" in query
     assert "role.role = 'creator' AND role.status = 'confirmed'" in query
     assert "auth.status = 'active'" in query
     assert "auth.assignment_eligible" in query
