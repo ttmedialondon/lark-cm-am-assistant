@@ -190,30 +190,6 @@ def test_normal_pagination_requeue_does_not_increment_retry_count(monkeypatch) -
     assert "last_error_code = %s" in calls[0][0]
 
 
-def test_contact_assessment_runner_isolated_from_sync_loop(monkeypatch) -> None:
-    settings = object()
-    calls = []
-
-    monkeypatch.setattr(
-        worker.contact_assessments,
-        "run_next_contact_assessment",
-        lambda received_settings: calls.append(received_settings) or True,
-    )
-
-    assert worker._run_contact_assessment(settings) is True
-    assert calls == [settings]
-
-
-def test_contact_assessment_runner_keeps_worker_alive_on_unexpected_failure(monkeypatch) -> None:
-    monkeypatch.setattr(
-        worker.contact_assessments,
-        "run_next_contact_assessment",
-        lambda _settings: (_ for _ in ()).throw(RuntimeError("untrusted details")),
-    )
-
-    assert worker._run_contact_assessment(object()) is False
-
-
 def test_worker_gives_the_durable_ai_queue_a_turn_during_continuous_sync(monkeypatch) -> None:
     calls: list[str] = []
     jobs = iter((object(), object(), object()))
@@ -230,7 +206,11 @@ def test_worker_gives_the_durable_ai_queue_a_turn_during_continuous_sync(monkeyp
     monkeypatch.setattr(worker, "_recover_expired_leases", recover)
     monkeypatch.setattr(worker, "_claim_job", lambda: next(jobs))
     monkeypatch.setattr(worker, "_execute_job", lambda _job, _settings: calls.append("sync"))
-    monkeypatch.setattr(worker, "_run_contact_assessment", lambda _settings: calls.append("assessment") or True)
+    monkeypatch.setattr(
+        worker,
+        "_dispatch_ai_turn",
+        lambda _settings, _executor, _futures, _prefer: (calls.append("assessment") or True, True),
+    )
 
     try:
         worker.run_forever()
@@ -240,12 +220,12 @@ def test_worker_gives_the_durable_ai_queue_a_turn_during_continuous_sync(monkeyp
     assert calls == ["sync", "sync", "sync", "assessment"]
 
 
-def test_worker_alternates_assignment_and_identity_ai_queues(monkeypatch) -> None:
+def test_full_ai_slots_do_not_prevent_the_next_lark_sync_job(monkeypatch) -> None:
     calls: list[str] = []
-    jobs = iter((object(), object(), object(), object(), object(), object()))
+    jobs = iter((object(), object(), object(), object()))
 
     def recover() -> None:
-        if calls == ["sync", "sync", "sync", "assessment", "sync", "sync", "sync", "assignment"]:
+        if calls == ["sync", "sync", "sync", "ai_full", "sync"]:
             raise KeyboardInterrupt
 
     monkeypatch.setattr(
@@ -256,10 +236,40 @@ def test_worker_alternates_assignment_and_identity_ai_queues(monkeypatch) -> Non
     monkeypatch.setattr(worker, "_recover_expired_leases", recover)
     monkeypatch.setattr(worker, "_claim_job", lambda: next(jobs))
     monkeypatch.setattr(worker, "_execute_job", lambda _job, _settings: calls.append("sync"))
-    monkeypatch.setattr(worker, "_run_contact_assessment", lambda _settings: calls.append("assessment") or True)
-    monkeypatch.setattr(worker, "_run_contact_assignment", lambda _settings: calls.append("assignment") or True)
+    monkeypatch.setattr(
+        worker,
+        "_dispatch_ai_turn",
+        lambda _settings, _executor, _futures, _prefer: (calls.append("ai_full") or False, _prefer),
+    )
 
     with pytest.raises(KeyboardInterrupt):
         worker.run_forever()
 
-    assert calls == ["sync", "sync", "sync", "assessment", "sync", "sync", "sync", "assignment"]
+    assert calls == ["sync", "sync", "sync", "ai_full", "sync"]
+
+
+def test_dispatch_uses_at_most_three_slots_and_alternates_queues(monkeypatch) -> None:
+    submitted: list[tuple[object, object]] = []
+
+    class Future:
+        def done(self):
+            return False
+
+    class Executor:
+        def submit(self, runner, job, settings):
+            submitted.append((runner, job))
+            return Future()
+
+    assessment_jobs = iter(({"id": "identity-1"}, {"id": "identity-2"}))
+    assignment_jobs = iter(({"id": "assignment-1"},))
+    monkeypatch.setattr(worker.contact_assessments, "claim_next_contact_assessment", lambda: next(assessment_jobs))
+    monkeypatch.setattr(worker.contact_assignments, "claim_next_contact_assignment", lambda: next(assignment_jobs))
+
+    futures = set()
+    submitted_one, preference = worker._dispatch_ai_turn(object(), Executor(), futures, False)
+    submitted_two, preference = worker._dispatch_ai_turn(object(), Executor(), futures, preference)
+    submitted_three, preference = worker._dispatch_ai_turn(object(), Executor(), futures, preference)
+    submitted_four, _ = worker._dispatch_ai_turn(object(), Executor(), futures, preference)
+
+    assert (submitted_one, submitted_two, submitted_three, submitted_four) == (True, True, True, False)
+    assert [job["id"] for _runner, job in submitted] == ["identity-1", "assignment-1", "identity-2"]

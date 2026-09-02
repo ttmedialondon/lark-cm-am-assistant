@@ -6,13 +6,14 @@ import json
 import logging
 import time
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import psycopg
 
-from . import contact_assessments, contact_assignments, organization_sync
+from . import ai_dispatch, contact_assessments, contact_assignments, organization_sync
 from .config import Settings, get_settings
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
@@ -57,39 +58,50 @@ def run_forever() -> None:
     sync_streak = 0
     prefer_assignment = False
     next_organization_check = 0.0
-    while True:
-        try:
-            if settings.app_secret_configured and time.monotonic() >= next_organization_check:
-                _run_organization_sync(settings)
-                # The database keeps the real daily cadence. This local bound
-                # avoids a query on every three-second idle worker loop.
-                next_organization_check = time.monotonic() + min(
-                    getattr(settings, "organization_sync_interval_seconds", 21_600), 300
-                )
-            _recover_expired_leases()
-            # Keep a backfill from starving the durable AI queue forever. The
-            # assessment path remains globally rate-limited in PostgreSQL.
-            if sync_streak >= MAX_CONSECUTIVE_SYNC_JOBS:
-                ran_ai, prefer_assignment = _run_ai_turn(settings, prefer_assignment)
-                if ran_ai:
+    # ponytail: only paid OpenAI calls need parallel slots; Lark sync remains in
+    # the main loop so a busy AI queue can never delay OAuth/message collection.
+    executor = ThreadPoolExecutor(max_workers=ai_dispatch.MAX_CONCURRENT_REQUESTS, thread_name_prefix="openai")
+    futures: set[Future[Any]] = set()
+    try:
+        while True:
+            try:
+                _reap_ai_futures(futures)
+                if settings.app_secret_configured and time.monotonic() >= next_organization_check:
+                    _run_organization_sync(settings)
+                    # The database keeps the real daily cadence. This local bound
+                    # avoids a query on every three-second idle worker loop.
+                    next_organization_check = time.monotonic() + min(
+                        getattr(settings, "organization_sync_interval_seconds", 21_600), 300
+                    )
+                _recover_expired_leases()
+                # Keep a backfill from starving the durable AI queue forever,
+                # but never wait for an AI result here.
+                if sync_streak >= MAX_CONSECUTIVE_SYNC_JOBS:
+                    submitted, prefer_assignment = _dispatch_ai_turn(
+                        settings, executor, futures, prefer_assignment
+                    )
+                    if submitted:
+                        sync_streak = 0
+                        continue
+                job = _claim_job() if settings.app_secret_configured else None
+                if job:
+                    _execute_job(job, settings)
+                    sync_streak += 1
+                    continue
+                submitted, prefer_assignment = _dispatch_ai_turn(settings, executor, futures, prefer_assignment)
+                if submitted:
                     sync_streak = 0
                     continue
-            job = _claim_job() if settings.app_secret_configured else None
-            if job:
-                _execute_job(job, settings)
-                sync_streak += 1
-                continue
-            ran_ai, prefer_assignment = _run_ai_turn(settings, prefer_assignment)
-            if ran_ai:
                 sync_streak = 0
-                continue
-            sync_streak = 0
-            time.sleep(settings.worker_idle_seconds)
-        except KeyboardInterrupt:
-            raise
-        except Exception:  # Unexpected failures must not terminate the systemd worker loop.
-            LOGGER.exception("worker loop failed without exposing user data")
-            time.sleep(settings.worker_idle_seconds)
+                time.sleep(settings.worker_idle_seconds)
+            except KeyboardInterrupt:
+                raise
+            except Exception:  # Unexpected failures must not terminate the systemd worker loop.
+                LOGGER.exception("worker loop failed without exposing user data")
+                time.sleep(settings.worker_idle_seconds)
+    finally:
+        # Leases preserve in-flight work if systemd terminates us during a call.
+        executor.shutdown(wait=False, cancel_futures=False)
 
 
 def _run_organization_sync(settings: Settings) -> None:
@@ -101,40 +113,63 @@ def _run_organization_sync(settings: Settings) -> None:
         LOGGER.exception("organization sync failed without exposing organization data")
 
 
-def _run_contact_assessment(settings: Settings) -> bool:
-    """Run one manually requested assessment without taking down sync processing."""
+def _dispatch_ai_turn(
+    settings: Settings,
+    executor: ThreadPoolExecutor,
+    futures: set[Future[Any]],
+    prefer_assignment: bool,
+) -> tuple[bool, bool]:
+    """Claim one fair AI task and submit it without blocking Lark sync."""
 
-    try:
-        return contact_assessments.run_next_contact_assessment(settings)
-    except Exception:
-        LOGGER.exception("contact assessment worker failed without exposing user data")
-        return False
-
-
-def _run_contact_assignment(settings: Settings) -> bool:
-    """Run one assignment task without allowing an AI failure to stop sync work."""
-
-    try:
-        return contact_assignments.run_next_contact_assignment(settings)
-    except Exception:
-        LOGGER.exception("contact assignment worker failed without exposing user data")
-        return False
-
-
-def _run_ai_turn(settings: Settings, prefer_assignment: bool) -> tuple[bool, bool]:
-    """Give both durable AI queues a fair turn without delaying sync work."""
-
-    if prefer_assignment:
-        if _run_contact_assignment(settings):
-            return True, False
-        if _run_contact_assessment(settings):
-            return True, True
-    else:
-        if _run_contact_assessment(settings):
-            return True, True
-        if _run_contact_assignment(settings):
-            return True, False
+    if len(futures) >= ai_dispatch.MAX_CONCURRENT_REQUESTS:
+        return False, prefer_assignment
+    queues = (
+        (
+            contact_assignments.claim_next_contact_assignment,
+            contact_assignments.run_claimed_contact_assignment,
+            False,
+        ),
+        (
+            contact_assessments.claim_next_contact_assessment,
+            contact_assessments.run_claimed_contact_assessment,
+            True,
+        ),
+    ) if prefer_assignment else (
+        (
+            contact_assessments.claim_next_contact_assessment,
+            contact_assessments.run_claimed_contact_assessment,
+            True,
+        ),
+        (
+            contact_assignments.claim_next_contact_assignment,
+            contact_assignments.run_claimed_contact_assignment,
+            False,
+        ),
+    )
+    for claim, runner, next_preference in queues:
+        try:
+            job = claim()
+        except Exception:
+            LOGGER.exception("AI queue claim failed without exposing user data")
+            continue
+        if not job:
+            continue
+        futures.add(executor.submit(runner, job, settings))
+        return True, next_preference
     return False, prefer_assignment
+
+
+def _reap_ai_futures(futures: set[Future[Any]]) -> None:
+    """Release finished slots and keep a worker-thread exception observable."""
+
+    for future in tuple(futures):
+        if not future.done():
+            continue
+        futures.remove(future)
+        try:
+            future.result()
+        except Exception:
+            LOGGER.exception("AI task runner failed without exposing user data")
 
 
 def _recover_expired_leases() -> None:

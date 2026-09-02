@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 import psycopg
 from cryptography.exceptions import InvalidTag
 
-from . import contact_assessments
+from . import ai_dispatch, contact_assessments
 from .ai_feature_config import DEFAULT_AUTO_CONFIRM_THRESHOLD, api_key_cipher
 from .config import Settings
 from .crypto import message_body_cipher
@@ -31,8 +31,6 @@ MAX_INPUT_BODY_CHARS = 8_000
 MAX_EVIDENCE_REFS = 12
 RECENT_INTERACTION_DAYS = 90
 AUTOMATIC_QUEUE_REFRESH_SECONDS = 60
-AUTOMATIC_START_INTERVAL_SECONDS = 3
-AUTOMATIC_CLAIM_LOCK = 541_195_272
 MAX_AUTOMATIC_ATTEMPTS_PER_WATERMARK = 3
 AUTOMATIC_RETRY_COOLDOWN_MINUTES = 15
 # Below this, a model suggestion is not useful manual-review work.
@@ -396,18 +394,20 @@ def queue_eligible_contact_assignments() -> int:
     return len(rows)
 
 
-def run_next_contact_assignment(settings: Settings) -> bool:
-    """Refresh one durable assignment queue and run one rate-limited item."""
+def claim_next_contact_assignment() -> dict[str, Any] | None:
+    """Refresh and claim one task; the worker may run it in an AI slot."""
 
     _expire_leases()
     if not assignment_available():
-        return False
+        return None
     queue_eligible_contact_assignments()
-    job = _claim_next()
-    if not job:
-        return False
+    return _claim_next()
+
+
+def run_claimed_contact_assignment(job: Mapping[str, Any], settings: Settings) -> None:
+    """Run an already claimed task without occupying the Lark sync thread."""
+
     _run(job, settings)
-    return True
 
 
 def latest_contact_assignment_assessment(contact_id: UUID | str) -> dict[str, Any] | None:
@@ -569,21 +569,7 @@ def _expire_leases() -> None:
 
 def _claim_next() -> dict[str, Any] | None:
     with connection() as conn, conn.transaction():
-        conn.execute("SELECT pg_advisory_xact_lock(%s)", (AUTOMATIC_CLAIM_LOCK,))
-        ready = conn.execute(
-            """
-            SELECT NOT EXISTS (
-                SELECT 1 FROM contact_assignment_assessments WHERE status = 'running'
-                  AND policy_version = %s
-            ) AND NOT EXISTS (
-                SELECT 1 FROM contact_assignment_assessments
-                WHERE policy_version = %s
-                  AND started_at > NOW() - (%s * INTERVAL '1 second')
-            ) AS ready
-            """,
-            (POLICY_VERSION, POLICY_VERSION, AUTOMATIC_START_INTERVAL_SECONDS),
-        ).fetchone()
-        if not ready or not ready["ready"]:
+        if not ai_dispatch.can_claim(conn):
             return None
         row = conn.execute(
             """
@@ -612,6 +598,7 @@ def _claim_next() -> dict[str, Any] | None:
 
 def _run(job: Mapping[str, Any], settings: Settings) -> None:
     assessment_id = job["id"]
+    response: Mapping[str, Any] | None = None
     try:
         with connection() as conn:
             if not _creator_needs_assignment_in(conn, job["contact_id"]):
@@ -665,10 +652,44 @@ def _run(job: Mapping[str, Any], settings: Settings) -> None:
             model=config["model"],
             response_id=response.get("response_id"),
             usage=response.get("usage"),
+            telemetry=response.get("telemetry"),
         ):
             _mark_feature_test("succeeded")
     except _ModelOutputError:
-        _finish(assessment_id, "invalid", "模型未返回可核验的负责人建议；稍后会自动重试。")
+        _finish(
+            assessment_id,
+            "invalid",
+            "模型未返回可核验的负责人建议；稍后会自动重试。",
+            response_id=response.get("response_id") if response else None,
+            usage=response.get("usage") if response else None,
+            telemetry=response.get("telemetry") if response else None,
+        )
+        _mark_feature_test("failed")
+    except contact_assessments.OpenAIRequestError as exc:
+        if exc.is_quota:
+            ai_dispatch.pause_for_quota()
+            _reschedule(
+                assessment_id,
+                0,
+                "OpenAI 项目因配额或账单问题已暂停；请由所有者处理后恢复队列。",
+                telemetry=exc.telemetry,
+            )
+        elif exc.retryable:
+            delay = contact_assessments._retry_delay(exc.retry_after_seconds, job.get("attempts"))
+            ai_dispatch.throttle(delay)
+            _reschedule(
+                assessment_id,
+                delay,
+                f"OpenAI 请求暂时限速；将在约 {round(delay)} 秒后自动重试。",
+                telemetry=exc.telemetry,
+            )
+        else:
+            _finish(
+                assessment_id,
+                "failed",
+                f"{exc} 系统会稍后自动重试。",
+                telemetry=exc.telemetry,
+            )
         _mark_feature_test("failed")
     except ContactAssignmentInputError as exc:
         _finish(assessment_id, "failed", f"{exc} 系统会稍后自动重试。")
@@ -677,6 +698,45 @@ def _run(job: Mapping[str, Any], settings: Settings) -> None:
         LOGGER.exception("contact assignment failed without logging user content")
         _finish(assessment_id, "failed", "AI 服务暂时不可用；系统会稍后自动重试。")
         _mark_feature_test("failed")
+
+
+def _reschedule(
+    assessment_id: UUID,
+    delay_seconds: float,
+    error_message: str,
+    *,
+    telemetry: Mapping[str, Any] | None = None,
+) -> None:
+    """Return a known-unprocessed 429 task to its durable queue exactly once."""
+
+    telemetry = telemetry or {}
+    with connection() as conn, conn.transaction():
+        conn.execute(
+            """
+            UPDATE contact_assignment_assessments
+            SET status = 'queued', scheduled_at = NOW() + (%s * INTERVAL '1 second'),
+                started_at = NULL, finished_at = NULL, lease_until = NULL,
+                openai_request_id = COALESCE(%s, openai_request_id),
+                response_latency_ms = COALESCE(%s, response_latency_ms),
+                rate_limit_remaining_requests = COALESCE(%s, rate_limit_remaining_requests),
+                rate_limit_remaining_tokens = COALESCE(%s, rate_limit_remaining_tokens),
+                rate_limit_reset_requests = COALESCE(%s, rate_limit_reset_requests),
+                rate_limit_reset_tokens = COALESCE(%s, rate_limit_reset_tokens),
+                error_message = %s, updated_at = NOW()
+            WHERE id = %s AND status = 'running'
+            """,
+            (
+                delay_seconds,
+                telemetry.get("openai_request_id"),
+                telemetry.get("response_latency_ms"),
+                telemetry.get("rate_limit_remaining_requests"),
+                telemetry.get("rate_limit_remaining_tokens"),
+                telemetry.get("rate_limit_reset_requests"),
+                telemetry.get("rate_limit_reset_tokens"),
+                _bounded_text(error_message, 400),
+                assessment_id,
+            ),
+        )
 
 
 def _configured_openai(settings: Settings) -> tuple[dict[str, Any], str]:
@@ -1133,6 +1193,8 @@ def _call_model(
         )
     except contact_assessments._ModelOutputError as exc:
         raise _ModelOutputError("invalid response") from exc
+    except contact_assessments.OpenAIRequestError:
+        raise
     except contact_assessments.ContactAssessmentInputError as exc:
         raise ContactAssignmentInputError(str(exc)) from exc
 
@@ -1241,6 +1303,7 @@ def _finish_with_decision(
     model: str,
     response_id: str | None,
     usage: Mapping[str, int | None] | None,
+    telemetry: Mapping[str, Any] | None = None,
 ) -> bool:
     with connection() as conn, conn.transaction():
         assessment = conn.execute(
@@ -1255,11 +1318,27 @@ def _finish_with_decision(
         if not assessment or assessment["status"] != "running":
             return False
         if not _refs_are_still_authorized_in(conn, assessment_id):
-            _finish_in(conn, assessment_id, "cancelled", "授权范围已变化；模型结果未写入负责人关系。")
+            _finish_in(
+                conn,
+                assessment_id,
+                "cancelled",
+                "授权范围已变化；模型结果未写入负责人关系。",
+                response_id=response_id,
+                usage=usage,
+                telemetry=telemetry,
+            )
             return False
         _lock_contact(conn, contact_id)
         if not _creator_needs_assignment_in(conn, contact_id):
-            _finish_in(conn, assessment_id, "cancelled", "达人已有负责人或不再是已确认达人；模型结果未写入。")
+            _finish_in(
+                conn,
+                assessment_id,
+                "cancelled",
+                "达人已有负责人或不再是已确认达人；模型结果未写入。",
+                response_id=response_id,
+                usage=usage,
+                telemetry=telemetry,
+            )
             return False
 
         stored_result = dict(result)
@@ -1297,6 +1376,7 @@ def _finish_with_decision(
             result=stored_result,
             response_id=response_id,
             usage=usage,
+            telemetry=telemetry,
             outcome=outcome,
         )
         _audit(
@@ -1361,6 +1441,7 @@ def _finish(
     result: Mapping[str, Any] | None = None,
     response_id: str | None = None,
     usage: Mapping[str, int | None] | None = None,
+    telemetry: Mapping[str, Any] | None = None,
     outcome: str | None = None,
 ) -> None:
     with connection() as conn, conn.transaction():
@@ -1373,6 +1454,7 @@ def _finish(
             result=result,
             response_id=response_id,
             usage=usage,
+            telemetry=telemetry,
             outcome=outcome,
         )
 
@@ -1387,6 +1469,7 @@ def _finish_in(
     result: Mapping[str, Any] | None = None,
     response_id: str | None = None,
     usage: Mapping[str, int | None] | None = None,
+    telemetry: Mapping[str, Any] | None = None,
     outcome: str | None = None,
 ) -> None:
     conn.execute(
@@ -1396,6 +1479,12 @@ def _finish_in(
             model = COALESCE(%s, model), result = COALESCE(%s::jsonb, result),
             response_id = COALESCE(%s, response_id),
             input_tokens = COALESCE(%s, input_tokens), output_tokens = COALESCE(%s, output_tokens),
+            openai_request_id = COALESCE(%s, openai_request_id),
+            response_latency_ms = COALESCE(%s, response_latency_ms),
+            rate_limit_remaining_requests = COALESCE(%s, rate_limit_remaining_requests),
+            rate_limit_remaining_tokens = COALESCE(%s, rate_limit_remaining_tokens),
+            rate_limit_reset_requests = COALESCE(%s, rate_limit_reset_requests),
+            rate_limit_reset_tokens = COALESCE(%s, rate_limit_reset_tokens),
             outcome = COALESCE(%s, outcome), error_message = %s, updated_at = NOW()
         WHERE id = %s AND status = 'running'
         """,
@@ -1406,6 +1495,12 @@ def _finish_in(
             response_id,
             usage.get("input_tokens") if usage else None,
             usage.get("output_tokens") if usage else None,
+            telemetry.get("openai_request_id") if telemetry else None,
+            telemetry.get("response_latency_ms") if telemetry else None,
+            telemetry.get("rate_limit_remaining_requests") if telemetry else None,
+            telemetry.get("rate_limit_remaining_tokens") if telemetry else None,
+            telemetry.get("rate_limit_reset_requests") if telemetry else None,
+            telemetry.get("rate_limit_reset_tokens") if telemetry else None,
             outcome,
             _bounded_text(error_message, 400) if error_message else None,
             assessment_id,

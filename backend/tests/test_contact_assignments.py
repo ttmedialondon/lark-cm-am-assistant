@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 
-from app import contact_assignments
+from app import contact_assessments, contact_assignments
 
 
 def test_assignment_result_accepts_only_known_candidate_and_evidence() -> None:
@@ -190,3 +190,21 @@ def test_assignment_ref_check_rejects_a_partially_deleted_evidence_set() -> None
 
     assert not contact_assignments._refs_are_still_authorized_in(Connection(), uuid4())
     assert "assessment.evidence_count AS expected_count" in calls[0][0]
+
+
+def test_assignment_model_boundary_preserves_shared_openai_retry_metadata(monkeypatch) -> None:
+    expected = contact_assessments.OpenAIRequestError(
+        "limited", retry_after_seconds=4, telemetry={"openai_request_id": "req_assignment"}
+    )
+    monkeypatch.setattr(
+        contact_assessments,
+        "call_openai",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(expected),
+    )
+
+    with pytest.raises(contact_assessments.OpenAIRequestError) as raised:
+        contact_assignments._call_model(
+            {"model": "gpt-5.6-luna"}, "sk-test", {}, uuid4(), {"A1": {}}
+        )
+
+    assert raised.value is expected

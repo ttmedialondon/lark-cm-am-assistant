@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 
-from app import contact_assessments
+import pytest
+
+from app import contact_assessments, contact_assignments
 
 
 def test_automatic_queue_materializes_all_eligible_contacts_from_immutable_watermarks(monkeypatch) -> None:
@@ -57,7 +59,7 @@ def test_automatic_queue_materializes_all_eligible_contacts_from_immutable_water
     assert "ON CONFLICT (contact_id) WHERE status IN ('queued', 'running')" in query
 
 
-def test_runner_refreshes_the_durable_queue_before_claiming(monkeypatch) -> None:
+def test_claim_refreshes_the_durable_queue_before_claiming(monkeypatch) -> None:
     calls: list[str] = []
 
     monkeypatch.setattr(contact_assessments, "_expire_leases", lambda: calls.append("expire"))
@@ -65,11 +67,11 @@ def test_runner_refreshes_the_durable_queue_before_claiming(monkeypatch) -> None
     monkeypatch.setattr(contact_assessments, "_claim_next", lambda: calls.append("claim") or None)
     monkeypatch.setattr(contact_assessments, "queue_eligible_contact_assessments", lambda: calls.append("queue") or 5)
 
-    assert contact_assessments.run_next_contact_assessment(object()) is False
+    assert contact_assessments.claim_next_contact_assessment() is None
     assert calls == ["expire", "available", "queue", "claim"]
 
 
-def test_runner_keeps_processing_after_an_individual_feature_failure(monkeypatch) -> None:
+def test_claim_returns_the_durable_job_for_an_ai_slot(monkeypatch) -> None:
     calls: list[str] = []
     job = {"id": "assessment", "contact_id": "contact"}
 
@@ -77,41 +79,20 @@ def test_runner_keeps_processing_after_an_individual_feature_failure(monkeypatch
     monkeypatch.setattr(contact_assessments, "assessment_available", lambda: calls.append("available") or True)
     monkeypatch.setattr(contact_assessments, "queue_eligible_contact_assessments", lambda: calls.append("queue") or 0)
     monkeypatch.setattr(contact_assessments, "_claim_next", lambda: calls.append("claim") or job)
-    monkeypatch.setattr(contact_assessments, "_run", lambda received, _settings: calls.append(f"run:{received['id']}"))
-
-    assert contact_assessments.run_next_contact_assessment(object()) is True
-    assert calls == ["expire", "available", "queue", "claim", "run:assessment"]
+    assert contact_assessments.claim_next_contact_assessment() == job
+    assert calls == ["expire", "available", "queue", "claim"]
 
 
-def test_claim_uses_a_database_lock_and_rate_limits_automatic_work(monkeypatch) -> None:
-    calls: list[tuple[str, tuple[object, ...] | None]] = []
-
-    class Result:
-        def __init__(self, row=None):
-            self.row = row
-
-        def fetchone(self):
-            return self.row
-
+@pytest.mark.parametrize("module", (contact_assessments, contact_assignments))
+def test_both_ai_queues_stop_before_claiming_when_the_shared_gate_is_full(monkeypatch, module) -> None:
     class Connection:
         def transaction(self):
             return nullcontext()
 
-        def execute(self, query, params=None):
-            calls.append((query, params))
-            if "AS ready" in query:
-                return Result({"ready": False})
-            return Result()
+        def execute(self, *_args, **_kwargs):
+            raise AssertionError("a full shared gate must prevent queue SQL")
 
-    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(Connection()))
+    monkeypatch.setattr(module, "connection", lambda: nullcontext(Connection()))
+    monkeypatch.setattr(module.ai_dispatch, "can_claim", lambda _conn: False)
 
-    assert contact_assessments._claim_next() is None
-
-    lock_query, lock_params = calls[0]
-    assert "pg_advisory_xact_lock" in lock_query
-    assert lock_params == (contact_assessments.AUTOMATIC_CLAIM_LOCK,)
-    claim_query, claim_params = calls[-1]
-    assert "trigger <> 'automatic' OR %s" in claim_query
-    assert "FROM contact_organization_links link" not in claim_query
-    assert "organization_sync_state" not in claim_query
-    assert claim_params == (False,)
+    assert module._claim_next() is None

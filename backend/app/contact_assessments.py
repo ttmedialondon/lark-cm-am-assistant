@@ -5,8 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import random
+import time
 from collections.abc import Mapping
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -15,6 +18,7 @@ import httpx
 import psycopg
 from cryptography.exceptions import InvalidTag
 
+from . import ai_dispatch
 from .ai_feature_config import DEFAULT_AUTO_CONFIRM_THRESHOLD, api_key_cipher
 from .config import Settings, get_settings
 from .contact_taxonomy import AI_ROLE_CODES, MODEL_ROLE_CODES, ROLE_LABELS
@@ -35,8 +39,6 @@ MANUAL_REVIEW_CONFIDENCE_FLOOR = 0.70
 MAX_AUTOMATIC_ATTEMPTS_PER_WATERMARK = 3
 AUTOMATIC_RETRY_COOLDOWN_MINUTES = 15
 AUTOMATIC_QUEUE_REFRESH_SECONDS = 60
-AUTOMATIC_START_INTERVAL_SECONDS = 3
-AUTOMATIC_CLAIM_LOCK = 541_195_271
 MODEL_ROLES = MODEL_ROLE_CODES
 FACT_ROLES = AI_ROLE_CODES
 MODEL_EVIDENCE_BASES = frozenset({"direct_interaction", "self_declaration", "weak_context"})
@@ -88,6 +90,25 @@ LONDON = ZoneInfo("Europe/London")
 
 class ContactAssessmentInputError(ValueError):
     """An assessment cannot safely be queued, used, or confirmed."""
+
+
+class OpenAIRequestError(ContactAssessmentInputError):
+    """A provider transport failure with only safe retry metadata."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float | None = None,
+        is_quota: bool = False,
+        retryable: bool = False,
+        telemetry: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+        self.is_quota = is_quota
+        self.retryable = retryable
+        self.telemetry = dict(telemetry or {})
 
 
 class _ModelOutputError(ValueError):
@@ -470,18 +491,20 @@ def confirm_assessment_role(actor_id: UUID | str, assessment_id: UUID | str, rol
     return {"contact_id": str(assessment["contact_id"]), "role": role}
 
 
-def run_next_contact_assessment(settings: Settings) -> bool:
-    """Keep the durable queue current and run one rate-limited assessment."""
+def claim_next_contact_assessment() -> dict[str, Any] | None:
+    """Refresh and claim one task; the worker may run it in an AI slot."""
 
     _expire_leases()
     if not assessment_available():
-        return False
+        return None
     queue_eligible_contact_assessments()
-    job = _claim_next()
-    if not job:
-        return False
+    return _claim_next()
+
+
+def run_claimed_contact_assessment(job: Mapping[str, Any], settings: Settings) -> None:
+    """Run an already claimed task.  Kept separate so sync never waits on it."""
+
     _run(job, settings)
-    return True
 
 
 def _expire_leases() -> None:
@@ -501,32 +524,17 @@ def _expire_leases() -> None:
 
 def _claim_next() -> dict[str, Any] | None:
     with connection() as conn, conn.transaction():
-        conn.execute("SELECT pg_advisory_xact_lock(%s)", (AUTOMATIC_CLAIM_LOCK,))
-        automatic_ready = conn.execute(
-            """
-            SELECT NOT EXISTS (
-                SELECT 1 FROM contact_assessments
-                WHERE trigger = 'automatic' AND status = 'running'
-            ) AND NOT EXISTS (
-                SELECT 1 FROM contact_assessments
-                WHERE trigger = 'automatic'
-                  AND started_at > NOW() - (%s * INTERVAL '1 second')
-            ) AS ready
-            """,
-            (AUTOMATIC_START_INTERVAL_SECONDS,),
-        ).fetchone()
+        if not ai_dispatch.can_claim(conn):
+            return None
         row = conn.execute(
             """
             SELECT id, contact_id, trigger, attempts
             FROM contact_assessments
-            WHERE status = 'queued'
-              AND scheduled_at <= NOW()
-              AND (trigger <> 'automatic' OR %s)
+            WHERE status = 'queued' AND scheduled_at <= NOW()
             ORDER BY scheduled_at, created_at
             FOR UPDATE SKIP LOCKED
             LIMIT 1
-            """,
-            (bool(automatic_ready and automatic_ready["ready"]),),
+            """
         ).fetchone()
         if not row:
             return None
@@ -544,6 +552,7 @@ def _claim_next() -> dict[str, Any] | None:
 
 def _run(job: Mapping[str, Any], settings: Settings) -> None:
     assessment_id = job["id"]
+    response: Mapping[str, Any] | None = None
     try:
         with connection() as conn:
             already_confirmed = _contact_has_confirmed_facts(conn, job["contact_id"])
@@ -594,6 +603,7 @@ def _run(job: Mapping[str, Any], settings: Settings) -> None:
             evidence_strength=evidence["evidence_strength"],
             response_id=response.get("response_id"),
             usage=response.get("usage"),
+            telemetry=response.get("telemetry"),
         )
         if completed:
             _mark_feature_test("succeeded")
@@ -602,8 +612,38 @@ def _run(job: Mapping[str, Any], settings: Settings) -> None:
             assessment_id,
             "invalid",
             "模型未返回可核验的建议；未写入任何联系人事实，稍后会自动重试。",
+            response_id=response.get("response_id") if response else None,
+            usage=response.get("usage") if response else None,
+            telemetry=response.get("telemetry") if response else None,
             outcome="no_action",
         )
+        _mark_feature_test("failed")
+    except OpenAIRequestError as exc:
+        if exc.is_quota:
+            ai_dispatch.pause_for_quota()
+            _reschedule(
+                assessment_id,
+                0,
+                "OpenAI 项目因配额或账单问题已暂停；请由所有者处理后恢复队列。",
+                telemetry=exc.telemetry,
+            )
+        elif exc.retryable:
+            delay = _retry_delay(exc.retry_after_seconds, job.get("attempts"))
+            ai_dispatch.throttle(delay)
+            _reschedule(
+                assessment_id,
+                delay,
+                f"OpenAI 请求暂时限速；将在约 {round(delay)} 秒后自动重试。",
+                telemetry=exc.telemetry,
+            )
+        else:
+            _finish(
+                assessment_id,
+                "failed",
+                f"{exc} 系统会稍后自动重试。",
+                telemetry=exc.telemetry,
+                outcome="no_action",
+            )
         _mark_feature_test("failed")
     except ContactAssessmentInputError as exc:
         _finish(assessment_id, "failed", f"{exc} 系统会稍后自动重试。", outcome="no_action")
@@ -612,6 +652,58 @@ def _run(job: Mapping[str, Any], settings: Settings) -> None:
         LOGGER.exception("contact assessment failed without logging user content")
         _finish(assessment_id, "failed", "AI 服务暂时不可用；系统会稍后自动重试。", outcome="no_action")
         _mark_feature_test("failed")
+
+
+def _retry_delay(retry_after_seconds: float | None, attempts: object) -> float:
+    """Respect a provider retry deadline; only use a small fallback if absent."""
+
+    if retry_after_seconds is not None:
+        base = retry_after_seconds
+    else:
+        try:
+            base = min(60.0, 2.0 ** min(max(int(attempts or 0), 0), 5))
+        except (TypeError, ValueError):
+            base = 2.0
+    return min(max(float(base), 0.0) + random.uniform(0.0, 1.0), 3_600.0)
+
+
+def _reschedule(
+    assessment_id: UUID,
+    delay_seconds: float,
+    error_message: str,
+    *,
+    telemetry: Mapping[str, Any] | None = None,
+) -> None:
+    """Return a known-unprocessed 429 task to its durable queue exactly once."""
+
+    telemetry = telemetry or {}
+    with connection() as conn, conn.transaction():
+        conn.execute(
+            """
+            UPDATE contact_assessments
+            SET status = 'queued', scheduled_at = NOW() + (%s * INTERVAL '1 second'),
+                started_at = NULL, finished_at = NULL, lease_until = NULL,
+                openai_request_id = COALESCE(%s, openai_request_id),
+                response_latency_ms = COALESCE(%s, response_latency_ms),
+                rate_limit_remaining_requests = COALESCE(%s, rate_limit_remaining_requests),
+                rate_limit_remaining_tokens = COALESCE(%s, rate_limit_remaining_tokens),
+                rate_limit_reset_requests = COALESCE(%s, rate_limit_reset_requests),
+                rate_limit_reset_tokens = COALESCE(%s, rate_limit_reset_tokens),
+                error_message = %s, updated_at = NOW()
+            WHERE id = %s AND status = 'running'
+            """,
+            (
+                delay_seconds,
+                telemetry.get("openai_request_id"),
+                telemetry.get("response_latency_ms"),
+                telemetry.get("rate_limit_remaining_requests"),
+                telemetry.get("rate_limit_remaining_tokens"),
+                telemetry.get("rate_limit_reset_requests"),
+                telemetry.get("rate_limit_reset_tokens"),
+                _bounded_text(error_message, 400),
+                assessment_id,
+            ),
+        )
 
 
 def _configured_openai(settings: Settings) -> tuple[dict[str, Any], str]:
@@ -1013,12 +1105,25 @@ def call_openai(
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     if config.get("project_id"):
         headers["OpenAI-Project"] = config["project_id"]
+    started = time.perf_counter()
     try:
         response = httpx.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=45.0)
     except httpx.HTTPError as exc:
         raise ContactAssessmentInputError("AI 服务暂时不可用；请稍后重新发起。") from exc
+    telemetry = _openai_telemetry(response, started)
     if response.status_code < 200 or response.status_code >= 300:
-        raise ContactAssessmentInputError(f"AI 服务请求未完成（HTTP {response.status_code}）。")
+        if response.status_code == 429:
+            raise OpenAIRequestError(
+                "AI 服务请求暂时受限。",
+                retry_after_seconds=_retry_after_header(response),
+                is_quota=_is_quota_response(response),
+                retryable=True,
+                telemetry=telemetry,
+            )
+        raise OpenAIRequestError(
+            f"AI 服务请求未完成（HTTP {response.status_code}）。",
+            telemetry=telemetry,
+        )
     try:
         data = response.json()
         text = _response_text(data)
@@ -1034,7 +1139,54 @@ def call_openai(
             "input_tokens": _nonnegative_int(usage.get("input_tokens")),
             "output_tokens": _nonnegative_int(usage.get("output_tokens")),
         },
+        "telemetry": telemetry,
     }
+
+
+def _openai_telemetry(response: httpx.Response, started: float) -> dict[str, Any]:
+    """Persist only stable operational headers, never a raw provider response."""
+
+    headers = getattr(response, "headers", {}) or {}
+
+    def header(name: str) -> str | None:
+        value = headers.get(name) or headers.get(name.lower())
+        return _bounded_text(value, 160) or None
+
+    return {
+        "openai_request_id": header("x-request-id"),
+        "response_latency_ms": max(0, round((time.perf_counter() - started) * 1_000)),
+        "rate_limit_remaining_requests": _header_nonnegative_int(header("x-ratelimit-remaining-requests")),
+        "rate_limit_remaining_tokens": _header_nonnegative_int(header("x-ratelimit-remaining-tokens")),
+        "rate_limit_reset_requests": header("x-ratelimit-reset-requests"),
+        "rate_limit_reset_tokens": header("x-ratelimit-reset-tokens"),
+    }
+
+
+def _retry_after_header(response: httpx.Response) -> float | None:
+    headers = getattr(response, "headers", {}) or {}
+    raw = headers.get("retry-after") or headers.get("Retry-After")
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        try:
+            seconds = parsedate_to_datetime(str(raw)).timestamp() - time.time()
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+    return min(max(seconds, 0.0), 3_600.0)
+
+
+def _is_quota_response(response: httpx.Response) -> bool:
+    """Recognize durable billing/quota failures without retaining raw error text."""
+
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return False
+    error = payload.get("error") if isinstance(payload, Mapping) else None
+    if not isinstance(error, Mapping):
+        return False
+    signals = " ".join(str(error.get(field) or "").casefold() for field in ("code", "type", "message"))
+    return any(token in signals for token in ("insufficient_quota", "billing", "credit balance", "payment required"))
 
 
 def _call_openai(config: Mapping[str, Any], api_key: str, pack: Mapping[str, Any], contact_id: UUID) -> dict[str, Any]:
@@ -1177,6 +1329,7 @@ def _finish_with_decision(
     evidence_strength: Mapping[str, Mapping[str, bool]],
     response_id: str | None,
     usage: Mapping[str, int | None] | None,
+    telemetry: Mapping[str, Any] | None = None,
 ) -> bool:
     """Persist a successful result and only its safe high-confidence facts."""
 
@@ -1198,6 +1351,9 @@ def _finish_with_decision(
                 assessment_id,
                 "cancelled",
                 "授权范围已变化；模型结果未写入联系人事实。",
+                response_id=response_id,
+                usage=usage,
+                telemetry=telemetry,
                 outcome="no_action",
             )
             return False
@@ -1208,6 +1364,9 @@ def _finish_with_decision(
                 assessment_id,
                 "cancelled",
                 "联系人已有已确认身份事实；判定结果未写入。",
+                response_id=response_id,
+                usage=usage,
+                telemetry=telemetry,
                 outcome="no_action",
             )
             return False
@@ -1228,6 +1387,7 @@ def _finish_with_decision(
             result=result,
             response_id=response_id,
             usage=usage,
+            telemetry=telemetry,
             outcome=outcome,
             review_status=review_status,
         )
@@ -1364,6 +1524,7 @@ def _finish(
     result: Mapping[str, Any] | None = None,
     response_id: str | None = None,
     usage: Mapping[str, int | None] | None = None,
+    telemetry: Mapping[str, Any] | None = None,
     outcome: str | None = None,
     review_status: str | None = None,
 ) -> None:
@@ -1377,6 +1538,7 @@ def _finish(
             result=result,
             response_id=response_id,
             usage=usage,
+            telemetry=telemetry,
             outcome=outcome,
             review_status=review_status,
         )
@@ -1392,6 +1554,7 @@ def _finish_in(
     result: Mapping[str, Any] | None = None,
     response_id: str | None = None,
     usage: Mapping[str, int | None] | None = None,
+    telemetry: Mapping[str, Any] | None = None,
     outcome: str | None = None,
     review_status: str | None = None,
 ) -> None:
@@ -1402,6 +1565,12 @@ def _finish_in(
             model = COALESCE(%s, model), result = COALESCE(%s::jsonb, result),
             response_id = COALESCE(%s, response_id),
             input_tokens = COALESCE(%s, input_tokens), output_tokens = COALESCE(%s, output_tokens),
+            openai_request_id = COALESCE(%s, openai_request_id),
+            response_latency_ms = COALESCE(%s, response_latency_ms),
+            rate_limit_remaining_requests = COALESCE(%s, rate_limit_remaining_requests),
+            rate_limit_remaining_tokens = COALESCE(%s, rate_limit_remaining_tokens),
+            rate_limit_reset_requests = COALESCE(%s, rate_limit_reset_requests),
+            rate_limit_reset_tokens = COALESCE(%s, rate_limit_reset_tokens),
             outcome = COALESCE(%s, outcome), review_status = COALESCE(%s, review_status),
             error_message = %s, updated_at = NOW()
         WHERE id = %s AND status = 'running'
@@ -1413,6 +1582,12 @@ def _finish_in(
             response_id,
             usage.get("input_tokens") if usage else None,
             usage.get("output_tokens") if usage else None,
+            telemetry.get("openai_request_id") if telemetry else None,
+            telemetry.get("response_latency_ms") if telemetry else None,
+            telemetry.get("rate_limit_remaining_requests") if telemetry else None,
+            telemetry.get("rate_limit_remaining_tokens") if telemetry else None,
+            telemetry.get("rate_limit_reset_requests") if telemetry else None,
+            telemetry.get("rate_limit_reset_tokens") if telemetry else None,
             outcome,
             review_status,
             _bounded_text(error_message, 400) if error_message else None,
@@ -1589,6 +1764,14 @@ def _json_object(value: object) -> dict[str, Any]:
 
 def _nonnegative_int(value: object) -> int | None:
     return int(value) if isinstance(value, int) and value >= 0 else None
+
+
+def _header_nonnegative_int(value: str | None) -> int | None:
+    try:
+        parsed = int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed is not None and parsed >= 0 else None
 
 
 def _time_label(value: datetime | None, fallback: str) -> str:

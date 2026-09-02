@@ -87,6 +87,11 @@ def test_owner_can_view_only_safe_ai_config_fields(monkeypatch):
         "assignment_safety_status",
         lambda: {"manual_label_count": 0, "minimum_manual_labels": 30, "calibration_ready": False},
     )
+    monkeypatch.setattr(
+        admin.ai_dispatch,
+        "status",
+        lambda _conn: {"state": "paused", "label": "AI 队列已暂停", "badge": "danger", "message": "safe"},
+    )
 
     response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get("/admin/ai")
 
@@ -95,6 +100,7 @@ def test_owner_can_view_only_safe_ai_config_fields(monkeypatch):
     assert contexts[-1][0] == "admin/ai.html"
     assert contexts[-1][1]["config"]["api_key_label"] == "已配置 · …abcd"
     assert "api_key_ciphertext" not in contexts[-1][1]["config"]
+    assert contexts[-1][1]["ai_dispatch"]["state"] == "paused"
 
 
 def test_owner_post_passes_key_to_encrypted_store_without_rendering_it(monkeypatch):
@@ -147,3 +153,30 @@ def test_owner_post_passes_key_to_encrypted_store_without_rendering_it(monkeypat
     assert audit[2] == "ai_feature_config_updated"
     assert "sk-secret-never-rendered" not in audit[3]
     assert '"key_rotated": true' in audit[3]
+
+
+def test_owner_can_resume_the_shared_ai_queue(monkeypatch):
+    owner_id = uuid4()
+    connections = []
+    resumed = []
+
+    @contextmanager
+    def connection():
+        conn = _Connection()
+        connections.append(conn)
+        yield conn
+
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(admin, "connection", connection)
+    monkeypatch.setattr(admin.ai_dispatch, "resume", lambda conn: resumed.append(conn))
+
+    response = _client(lambda _request: {"id": owner_id, "status": "active"}).post(
+        "/admin/ai/resume", data={"csrf_token": "csrf"}, follow_redirects=False
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/ai"
+    assert resumed == [connections[0]]
+    audit = connections[0].calls[-1][1]
+    assert audit[2] == "ai_queue_resumed"
+    assert audit[3] == '{"scope": "shared"}'

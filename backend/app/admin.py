@@ -17,7 +17,14 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse, Response
 
-from . import admin_reporting, ai_feature_config, contact_assessments, contact_assignments, organization_sync
+from . import (
+    admin_reporting,
+    ai_dispatch,
+    ai_feature_config,
+    contact_assessments,
+    contact_assignments,
+    organization_sync,
+)
 from .config import get_settings
 from .db import connection
 
@@ -208,6 +215,7 @@ def create_admin_router(
                 }
                 for feature in AI_FEATURES
             ]
+            dispatch_status = ai_dispatch.status(conn)
         response = render_template(
             request,
             "admin/ai.html",
@@ -215,6 +223,7 @@ def create_admin_router(
                 **page_context(access_context, "ai"),
                 "configs": configs,
                 "assignment_safety": contact_assignments.assignment_safety_status(),
+                "ai_dispatch": dispatch_status,
                 # Retain this template-safe alias while external callers migrate to ``configs``.
                 "config": configs[0]["config"],
                 "form_error": error,
@@ -1026,6 +1035,32 @@ def create_admin_router(
                 )
         except ai_feature_config.FeatureConfigInputError as exc:
             return render_ai_config(request, access_context, error=str(exc), status_code=400)
+        response = RedirectResponse(url="/admin/ai", status_code=303)
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
+    @router.post("/admin/ai/resume")
+    async def admin_resume_ai_queue(request: Request) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        form = await _form_fields(request)
+        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
+            response = render_template(
+                request,
+                "error.html",
+                {"title": "请求校验失败", "detail": "请返回 AI 功能配置页面后重试。"},
+                400,
+            )
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
+        with connection() as conn, conn.transaction():
+            ai_dispatch.resume(conn)
+            conn.execute(
+                "INSERT INTO audit_events (id, authorization_id, action, metadata) VALUES (%s, %s, %s, %s::jsonb)",
+                (uuid4(), access_context["authorization"]["id"], "ai_queue_resumed", json.dumps({"scope": "shared"})),
+            )
         response = RedirectResponse(url="/admin/ai", status_code=303)
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response

@@ -184,6 +184,13 @@ def test_responses_request_is_nonpersistent_and_uses_configured_model(monkeypatc
 
     class Response:
         status_code = 200
+        headers = {
+            "x-request-id": "req_test",
+            "x-ratelimit-remaining-requests": "497",
+            "x-ratelimit-remaining-tokens": "499000",
+            "x-ratelimit-reset-requests": "1s",
+            "x-ratelimit-reset-tokens": "6m",
+        }
 
         @staticmethod
         def json():
@@ -200,6 +207,8 @@ def test_responses_request_is_nonpersistent_and_uses_configured_model(monkeypatc
         return Response()
 
     monkeypatch.setattr(contact_assessments.httpx, "post", post)
+    clock = iter((1.0, 1.125))
+    monkeypatch.setattr(contact_assessments.time, "perf_counter", lambda: next(clock))
     result = contact_assessments._call_openai(
         {"model": "gpt-5.6-luna", "project_id": "proj_test"},
         "sk-test-only",
@@ -223,6 +232,87 @@ def test_responses_request_is_nonpersistent_and_uses_configured_model(monkeypatc
     assert "organization_candidates" not in schema["properties"]
     assert "account_relations" not in schema["properties"]
     assert result["usage"] == {"input_tokens": 12, "output_tokens": 8}
+    assert result["telemetry"] == {
+        "openai_request_id": "req_test",
+        "response_latency_ms": 125,
+        "rate_limit_remaining_requests": 497,
+        "rate_limit_remaining_tokens": 499000,
+        "rate_limit_reset_requests": "1s",
+        "rate_limit_reset_tokens": "6m",
+    }
+
+
+def test_responses_429_keeps_safe_retry_metadata(monkeypatch) -> None:
+    class Response:
+        status_code = 429
+        headers = {"retry-after": "7", "x-request-id": "req_limited", "x-ratelimit-reset-requests": "7s"}
+
+        @staticmethod
+        def json():
+            return {"error": {"code": "rate_limit_exceeded"}}
+
+    monkeypatch.setattr(contact_assessments.httpx, "post", lambda *_args, **_kwargs: Response())
+
+    with pytest.raises(contact_assessments.OpenAIRequestError) as raised:
+        contact_assessments._call_openai(
+            {"model": "gpt-5.6-luna", "project_id": "proj_test"},
+            "sk-test-only",
+            {"messages": []},
+            uuid4(),
+        )
+
+    assert raised.value.retry_after_seconds == 7
+    assert raised.value.retryable
+    assert not raised.value.is_quota
+    assert raised.value.telemetry["openai_request_id"] == "req_limited"
+
+
+def test_responses_quota_429_is_not_treated_as_a_temporary_limit(monkeypatch) -> None:
+    class Response:
+        status_code = 429
+        headers = {"x-request-id": "req_quota"}
+
+        @staticmethod
+        def json():
+            return {"error": {"code": "insufficient_quota"}}
+
+    monkeypatch.setattr(contact_assessments.httpx, "post", lambda *_args, **_kwargs: Response())
+
+    with pytest.raises(contact_assessments.OpenAIRequestError) as raised:
+        contact_assessments._call_openai(
+            {"model": "gpt-5.6-luna"}, "sk-test-only", {"messages": []}, uuid4()
+        )
+
+    assert raised.value.is_quota
+
+
+def test_retry_after_accepts_an_http_date(monkeypatch) -> None:
+    class Response:
+        headers = {"retry-after": "Thu, 01 Jan 1970 00:00:07 GMT"}
+
+    monkeypatch.setattr(contact_assessments.time, "time", lambda: 0.0)
+
+    assert contact_assessments._retry_after_header(Response()) == 7
+
+
+def test_non_429_http_error_keeps_safe_telemetry_without_a_blind_retry(monkeypatch) -> None:
+    class Response:
+        status_code = 500
+        headers = {"x-request-id": "req_server_error"}
+
+        @staticmethod
+        def json():
+            return {"error": {"message": "untrusted provider text"}}
+
+    monkeypatch.setattr(contact_assessments.httpx, "post", lambda *_args, **_kwargs: Response())
+
+    with pytest.raises(contact_assessments.OpenAIRequestError) as raised:
+        contact_assessments._call_openai(
+            {"model": "gpt-5.6-luna"}, "sk-test-only", {"messages": []}, uuid4()
+        )
+
+    assert not raised.value.retryable
+    assert raised.value.telemetry["openai_request_id"] == "req_server_error"
 
 
 def test_context_history_uses_the_anchor_authorization_only() -> None:
@@ -529,6 +619,90 @@ def test_run_without_an_organization_reaches_ai(monkeypatch) -> None:
     contact_assessments._run({"id": assessment_id, "contact_id": contact_id}, object())
 
     assert called == ["decision", "succeeded"]
+
+
+def test_run_reschedules_a_temporary_429_and_throttles_both_queues(monkeypatch) -> None:
+    assessment_id = uuid4()
+    contact_id = uuid4()
+    throttles: list[float] = []
+    rescheduled: list[tuple[object, ...]] = []
+
+    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(object()))
+    monkeypatch.setattr(contact_assessments, "_contact_has_confirmed_facts", lambda *_args: False)
+    monkeypatch.setattr(contact_assessments, "_configured_openai", lambda *_args: ({"model": "luna"}, "sk-test"))
+    monkeypatch.setattr(
+        contact_assessments,
+        "_build_evidence",
+        lambda *_args: {
+            "fragments": [{}], "refs": [], "char_count": 0, "source_authorization_id": uuid4(),
+            "pack": {}, "labels": {"M1"}, "evidence_strength": {},
+        },
+    )
+    monkeypatch.setattr(contact_assessments, "_save_refs", lambda *_args: None)
+    monkeypatch.setattr(contact_assessments, "_refs_are_still_authorized", lambda *_args: True)
+    monkeypatch.setattr(
+        contact_assessments,
+        "_call_openai",
+        lambda *_args: (_ for _ in ()).throw(
+                contact_assessments.OpenAIRequestError(
+                    "limited", retry_after_seconds=7, retryable=True, telemetry={"openai_request_id": "req_1"}
+                )
+        ),
+    )
+    monkeypatch.setattr(contact_assessments.ai_dispatch, "throttle", throttles.append)
+    monkeypatch.setattr(contact_assessments, "_reschedule", lambda *args, **kwargs: rescheduled.append((*args, kwargs)))
+    monkeypatch.setattr(contact_assessments, "_mark_feature_test", lambda *_args: None)
+    monkeypatch.setattr(contact_assessments.random, "uniform", lambda *_args: 0.5)
+
+    contact_assessments._run({"id": assessment_id, "contact_id": contact_id, "attempts": 1}, object())
+
+    assert throttles == [7.5]
+    assert rescheduled == [
+        (
+            assessment_id,
+            7.5,
+            "OpenAI 请求暂时限速；将在约 8 秒后自动重试。",
+            {"telemetry": {"openai_request_id": "req_1"}},
+        )
+    ]
+
+
+def test_run_pauses_the_shared_queue_for_a_quota_429(monkeypatch) -> None:
+    assessment_id = uuid4()
+    contact_id = uuid4()
+    paused: list[bool] = []
+    rescheduled: list[tuple[object, ...]] = []
+
+    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(object()))
+    monkeypatch.setattr(contact_assessments, "_contact_has_confirmed_facts", lambda *_args: False)
+    monkeypatch.setattr(contact_assessments, "_configured_openai", lambda *_args: ({"model": "luna"}, "sk-test"))
+    monkeypatch.setattr(
+        contact_assessments,
+        "_build_evidence",
+        lambda *_args: {
+            "fragments": [{}], "refs": [], "char_count": 0, "source_authorization_id": uuid4(),
+            "pack": {}, "labels": {"M1"}, "evidence_strength": {},
+        },
+    )
+    monkeypatch.setattr(contact_assessments, "_save_refs", lambda *_args: None)
+    monkeypatch.setattr(contact_assessments, "_refs_are_still_authorized", lambda *_args: True)
+    monkeypatch.setattr(
+        contact_assessments,
+        "_call_openai",
+        lambda *_args: (_ for _ in ()).throw(contact_assessments.OpenAIRequestError("quota", is_quota=True)),
+    )
+    monkeypatch.setattr(contact_assessments.ai_dispatch, "pause_for_quota", lambda: paused.append(True))
+    monkeypatch.setattr(contact_assessments, "_reschedule", lambda *args, **kwargs: rescheduled.append((*args, kwargs)))
+    monkeypatch.setattr(contact_assessments, "_mark_feature_test", lambda *_args: None)
+
+    contact_assessments._run({"id": assessment_id, "contact_id": contact_id}, object())
+
+    assert paused == [True]
+    assert rescheduled[0][:3] == (
+        assessment_id,
+        0,
+        "OpenAI 项目因配额或账单问题已暂停；请由所有者处理后恢复队列。",
+    )
 
 
 def test_run_rechecks_confirmation_immediately_before_the_model_call(monkeypatch) -> None:
