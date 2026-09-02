@@ -33,6 +33,7 @@ MESSAGE_PAGE_SIZE = 100
 MESSAGE_CONVERSATION_PAGE_SIZE = 5
 MAX_MESSAGE_CONVERSATION_QUERY_LENGTH = 120
 MESSAGE_CONVERSATION_TYPES = frozenset({"all", "group", "p2p"})
+CONTACT_CONFIRMATIONS = frozenset({"all", "confirmed", "unconfirmed"})
 CONFIRMED_CONTACT_ROLE_LABELS = {
     "creator": "已确认达人 / 创作者",
     "agent_or_agency": "已确认经纪人 / 机构",
@@ -673,15 +674,21 @@ def jobs(page: int = 1) -> dict[str, Any]:
 
 
 def creators(page: int = 1) -> dict[str, Any]:
-    """Return the compact owner-maintained creator identity library."""
+    """Return confirmed creators that can open their external-contact detail."""
 
     with connection() as conn:
         total_count = int(
             conn.execute(
                 """
                 SELECT COUNT(*) AS total_count
-                FROM contact_roles
-                WHERE role = 'creator' AND status = 'confirmed'
+                FROM contact_roles role
+                WHERE role.role = 'creator' AND role.status = 'confirmed'
+                  AND EXISTS (
+                      SELECT 1 FROM lark_identities identity
+                      WHERE identity.contact_id = role.contact_id
+                        AND identity.identity_type = 'user'
+                        AND identity.tenant_classification <> 'internal'
+                  )
                 """
             ).fetchone()["total_count"]
             or 0
@@ -694,15 +701,25 @@ def creators(page: int = 1) -> dict[str, Any]:
                 c.display_name,
                 c.created_at,
                 c.updated_at,
+                primary_identity.open_id,
                 COUNT(DISTINCT identifier.id) + COUNT(DISTINCT account.social_account_id) AS identifier_count,
                 COUNT(DISTINCT account.social_account_id) AS social_account_count
             FROM contacts c
             JOIN contact_roles role
               ON role.contact_id = c.id AND role.role = 'creator' AND role.status = 'confirmed'
+            JOIN LATERAL (
+                SELECT identity.open_id
+                FROM lark_identities identity
+                WHERE identity.contact_id = c.id
+                  AND identity.identity_type = 'user'
+                  AND identity.tenant_classification <> 'internal'
+                ORDER BY identity.last_seen_at DESC, identity.open_id
+                LIMIT 1
+            ) AS primary_identity ON TRUE
             LEFT JOIN contact_identifiers identifier ON identifier.contact_id = c.id
             LEFT JOIN contact_social_accounts account
               ON account.contact_id = c.id AND account.status = 'confirmed'
-            GROUP BY c.id, c.display_name, c.created_at, c.updated_at
+            GROUP BY c.id, c.display_name, c.created_at, c.updated_at, primary_identity.open_id
             ORDER BY LOWER(c.display_name), c.id
             LIMIT %s OFFSET %s
             """,
@@ -711,95 +728,38 @@ def creators(page: int = 1) -> dict[str, Any]:
     return _page_result([_decorate_creator(row) for row in rows], page, total_count=total_count)
 
 
-def creator_detail(creator_id: UUID, identifier_page: int = 1) -> dict[str, Any] | None:
-    with connection() as conn:
-        creator = conn.execute(
-            """
-            SELECT
-                c.id,
-                c.display_name,
-                c.created_at,
-                c.updated_at,
-                COUNT(DISTINCT identifier.id) + COUNT(DISTINCT account.social_account_id) AS identifier_count,
-                COUNT(DISTINCT account.social_account_id) AS social_account_count
-            FROM contacts c
-            JOIN contact_roles role
-              ON role.contact_id = c.id AND role.role = 'creator' AND role.status = 'confirmed'
-            LEFT JOIN contact_identifiers identifier ON identifier.contact_id = c.id
-            LEFT JOIN contact_social_accounts account
-              ON account.contact_id = c.id AND account.status = 'confirmed'
-            WHERE c.id = %s
-            GROUP BY c.id, c.display_name, c.created_at, c.updated_at
-            """,
-            (creator_id,),
-        ).fetchone()
-        if not creator:
-            return None
-        identifier_total_count = int(
-            conn.execute(
-                """
-                SELECT COUNT(*) AS total_count
-                FROM (
-                    SELECT id
-                    FROM contact_identifiers
-                    WHERE contact_id = %s
-                    UNION ALL
-                    SELECT account.id
-                    FROM contact_social_accounts relation
-                    JOIN social_accounts account ON account.id = relation.social_account_id
-                    WHERE relation.contact_id = %s AND relation.status = 'confirmed'
-                ) AS identifiers
-                """,
-                (creator_id, creator_id),
-            ).fetchone()["total_count"]
-            or 0
-        )
-        identifier_page, identifier_limit, identifier_offset = _page_window(
-            identifier_page, DETAIL_PAGE_SIZE, total_count=identifier_total_count
-        )
-        identifiers = conn.execute(
-            """
-            WITH identifiers AS (
-                SELECT id, kind, platform, display_value, created_at, updated_at
-                FROM contact_identifiers
-                WHERE contact_id = %s
-                UNION ALL
-                SELECT account.id, 'handle' AS kind, account.platform, account.display_handle AS display_value,
-                       relation.created_at, relation.updated_at
-                FROM contact_social_accounts relation
-                JOIN social_accounts account ON account.id = relation.social_account_id
-                WHERE relation.contact_id = %s AND relation.status = 'confirmed'
-            )
-            SELECT id, kind, platform, display_value, created_at, updated_at
-            FROM identifiers
-            ORDER BY kind, platform, LOWER(display_value), id
-            LIMIT %s OFFSET %s
-            """,
-            (creator_id, creator_id, identifier_limit, identifier_offset),
-        ).fetchall()
-    return {
-        "creator": _decorate_creator(creator),
-        "identifiers": _page_result(
-            [_decorate_creator_identifier(row) for row in identifiers],
-            identifier_page,
-            DETAIL_PAGE_SIZE,
-            total_count=identifier_total_count,
-        ),
-    }
-
-
-def contacts(page: int = 1) -> dict[str, Any]:
+def contacts(page: int = 1, confirmation: str = "all") -> dict[str, Any]:
     """Return discovered non-internal Lark contacts; no role is inferred here."""
 
+    confirmation = normalize_contact_confirmation(confirmation)
     with connection() as conn:
         total_count = int(
             conn.execute(
                 """
                 SELECT COUNT(DISTINCT contact.id) AS total_count
                 FROM contacts contact
-                JOIN lark_identities identity ON identity.contact_id = contact.id
-                WHERE identity.identity_type = 'user' AND identity.tenant_classification <> 'internal'
-                """
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM lark_identities identity
+                    WHERE identity.contact_id = contact.id
+                      AND identity.identity_type = 'user'
+                      AND identity.tenant_classification <> 'internal'
+                )
+                  AND (
+                      %s = 'all'
+                      OR (
+                          EXISTS (
+                              SELECT 1 FROM contact_roles role
+                              WHERE role.contact_id = contact.id AND role.status = 'confirmed'
+                          )
+                          OR EXISTS (
+                              SELECT 1 FROM contact_social_accounts account
+                              WHERE account.contact_id = contact.id AND account.status = 'confirmed'
+                          )
+                      ) = (%s = 'confirmed')
+                  )
+                """,
+                (confirmation, confirmation),
             ).fetchone()["total_count"]
             or 0
         )
@@ -817,6 +777,7 @@ def contacts(page: int = 1) -> dict[str, Any]:
                 conversations.conversation_count,
                 messages.message_count,
                 accounts.account_count,
+                confirmed_facts.is_confirmed,
                 ARRAY(
                     SELECT confirmed_role.role
                     FROM contact_roles confirmed_role
@@ -836,6 +797,17 @@ def contacts(page: int = 1) -> dict[str, Any]:
                 ORDER BY identity.last_seen_at DESC, identity.open_id
                 LIMIT 1
             ) AS primary_identity ON TRUE
+            JOIN LATERAL (
+                SELECT
+                    EXISTS (
+                        SELECT 1 FROM contact_roles role
+                        WHERE role.contact_id = contact.id AND role.status = 'confirmed'
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM contact_social_accounts account
+                        WHERE account.contact_id = contact.id AND account.status = 'confirmed'
+                    ) AS is_confirmed
+            ) AS confirmed_facts ON TRUE
             JOIN LATERAL (
                 SELECT COUNT(*) AS lark_identity_count, MAX(identity.last_seen_at) AS last_seen_at
                 FROM lark_identities identity
@@ -872,11 +844,12 @@ def contacts(page: int = 1) -> dict[str, Any]:
                 JOIN lark_identities identity ON identity.open_id = observation.source_open_id
                 WHERE identity.contact_id = contact.id
             ) AS accounts ON TRUE
+            WHERE %s = 'all' OR confirmed_facts.is_confirmed = (%s = 'confirmed')
             ORDER BY identity_counts.last_seen_at DESC NULLS LAST,
                      LOWER(COALESCE(contact.display_name, primary_identity.display_name)), contact.id
             LIMIT %s OFFSET %s
             """,
-            (limit, offset),
+            (confirmation, confirmation, limit, offset),
         ).fetchall()
     return _page_result([_decorate_contact(row) for row in rows], page, total_count=total_count)
 
@@ -1231,6 +1204,12 @@ def normalize_message_conversation_type(value: str | None) -> str:
     return value if value in MESSAGE_CONVERSATION_TYPES else "all"
 
 
+def normalize_contact_confirmation(value: str | None) -> str:
+    """Return a supported external-contact confirmation filter."""
+
+    return value if value in CONTACT_CONFIRMATIONS else "all"
+
+
 def message_conversations(
     authorization_id: UUID,
     page: int = 1,
@@ -1573,30 +1552,15 @@ def _decorate_creator(row: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def _decorate_creator_identifier(row: dict[str, Any]) -> dict[str, Any]:
-    item = dict(row)
-    item["kind_label"] = {
-        "handle": "平台账号",
-        "email": "邮箱",
-        "phone": "电话",
-        "crm_id": "CRM ID",
-        "alias": "别名",
-    }.get(item.get("kind"), "身份标识")
-    item["platform_label"] = item.get("platform") or "—"
-    item["created_at_label"] = _format_time(item.get("created_at"))
-    return item
-
-
 def _decorate_contact(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     item["display_name"] = item.get("display_name") or "Lark 参与者（姓名未返回）"
     roles = item.get("confirmed_roles")
     roles = roles if isinstance(roles, list | tuple) else ()
     item["confirmed_role_labels"] = [
-        CONFIRMED_CONTACT_ROLE_LABELS[role]
-        for role in roles
-        if role in CONFIRMED_CONTACT_ROLE_LABELS
+        CONFIRMED_CONTACT_ROLE_LABELS[role] for role in roles if role in CONFIRMED_CONTACT_ROLE_LABELS
     ]
+    item["is_confirmed"] = bool(item.get("is_confirmed"))
     item["tenant_classification_label"], item["tenant_classification_badge"] = _tenant_classification(
         item.get("tenant_classification")
     )
@@ -1634,9 +1598,9 @@ def _decorate_contact_conversation(row: dict[str, Any]) -> dict[str, Any]:
 
 def _decorate_social_account(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
-    item["identifier_label"] = " · ".join(
-        value for value in (item.get("platform"), item.get("display_handle")) if value
-    ) or "未命名账号"
+    item["identifier_label"] = (
+        " · ".join(value for value in (item.get("platform"), item.get("display_handle")) if value) or "未命名账号"
+    )
     item["owner_label"] = item.get("owner_display_name") or "尚未人工确认"
     for field in ("observation_count", "source_count"):
         item[field] = int(item.get(field) or 0)

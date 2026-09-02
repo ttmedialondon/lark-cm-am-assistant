@@ -37,6 +37,8 @@ def test_message_conversation_filter_values_are_bounded_and_allowlisted():
     assert admin_reporting.normalize_message_conversation_query("x" * 121) == "x" * 120
     assert admin_reporting.normalize_message_conversation_type("p2p") == "p2p"
     assert admin_reporting.normalize_message_conversation_type("unknown") == "all"
+    assert admin_reporting.normalize_contact_confirmation("confirmed") == "confirmed"
+    assert admin_reporting.normalize_contact_confirmation("unexpected") == "all"
 
 
 def test_member_count_labels_preserve_pending_and_unavailable_states():
@@ -51,16 +53,19 @@ def test_contact_and_account_labels_do_not_imply_identity_or_ownership():
             "display_name": "Ada",
             "tenant_classification": "known_external",
             "confirmed_roles": ["agent_or_agency", "candidate", "supplier"],
+            "is_confirmed": True,
         }
     )
     assert contact["display_name"] == "Ada"
     assert contact["tenant_classification_label"] == "外部成员"
     assert contact["confirmed_role_labels"] == ["已确认经纪人 / 机构", "已确认供应商"]
+    assert contact["is_confirmed"] is True
 
     unnamed = admin_reporting._decorate_contact({"display_name": None, "tenant_classification": "unresolved"})
     assert unnamed["display_name"] == "Lark 参与者（姓名未返回）"
     assert unnamed["tenant_classification_label"] == "租户未返回"
     assert unnamed["confirmed_role_labels"] == []
+    assert unnamed["is_confirmed"] is False
 
     account = admin_reporting._decorate_social_account({"platform": "instagram", "display_handle": "@example"})
     assert account["identifier_label"] == "instagram · @example"

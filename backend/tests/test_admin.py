@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from fastapi.testclient import TestClient
 
-from app import admin, admin_reporting, contact_assessments, creator_registry
+from app import admin, admin_reporting, contact_assessments
 
 
 def _page(items, page=1, has_next=False, **metadata):
@@ -118,6 +118,32 @@ def test_contact_directory_is_owner_only(monkeypatch):
     assert response.status_code == 403
 
 
+def test_contact_directory_filters_confirmation_and_keeps_it_in_pagination(monkeypatch):
+    owner_id = uuid4()
+    contexts = []
+    calls = []
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(
+        admin_reporting,
+        "contacts",
+        lambda page, confirmation: calls.append((page, confirmation))
+        or _page([], page=page, total_count=50, total_pages=2, page_size=25),
+    )
+
+    response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get(
+        "/admin/contacts?page=2&confirmation=confirmed"
+    )
+
+    assert response.status_code == 200
+    assert calls == [(2, "confirmed")]
+    assert contexts[-1][1]["confirmation"] == "confirmed"
+    assert contexts[-1][1]["contact_page"]["previous_url"] == "/admin/contacts?confirmation=confirmed&page=1"
+
+
+def test_removed_ai_candidate_queue_is_not_routable():
+    assert _client(lambda _request: {"id": uuid4(), "status": "active"}).get("/admin/ai-candidates").status_code == 404
+
+
 def test_owner_contact_detail_reads_only_that_contact_without_message_content(monkeypatch):
     owner_id = uuid4()
     contexts = []
@@ -149,41 +175,22 @@ def test_owner_contact_detail_reads_only_that_contact_without_message_content(mo
     assert contexts[-1][1]["assessment_available"] is True
 
 
-def test_owner_can_view_pending_ai_candidates(monkeypatch):
-    owner_id = uuid4()
-    contexts = []
-    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
-    monkeypatch.setattr(
-        contact_assessments,
-        "candidate_page",
-        lambda page: _page([], page=page, total_count=0, total_pages=0, page_size=25),
-    )
-
-    response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get(
-        "/admin/ai-candidates?page=2"
-    )
-
-    assert response.status_code == 200
-    assert response.headers["cache-control"] == "no-store, max-age=0"
-    assert contexts[-1][0] == "admin/ai_candidates.html"
-    assert contexts[-1][1]["candidate_page"]["page"] == 1
-
-
-def test_owner_can_mark_one_ai_candidate_processed(monkeypatch):
+def test_owner_can_dismiss_one_ai_suggestion_from_its_contact(monkeypatch):
     owner_id = uuid4()
     assessment_id = uuid4()
     dismissed = []
     monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
+    monkeypatch.setattr(contact_assessments, "assessment_matches_contact", lambda *_args: True)
     monkeypatch.setattr(contact_assessments, "dismiss_assessment", lambda *args: dismissed.append(args))
 
     response = _client(lambda _request: {"id": owner_id, "status": "active"}).post(
-        f"/admin/ai-candidates/{assessment_id}/dismiss?page=3",
+        f"/admin/contacts/ou_contact/assessments/{assessment_id}/dismiss?page=3&confirmation=unconfirmed",
         data={"csrf_token": "csrf"},
         follow_redirects=False,
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/admin/ai-candidates?page=3"
+    assert response.headers["location"] == "/admin/contacts/ou_contact?page=3&confirmation=unconfirmed"
     assert response.headers["cache-control"] == "no-store, max-age=0"
     assert dismissed == [(owner_id, assessment_id)]
 
@@ -236,7 +243,10 @@ def test_owner_confirmation_uses_only_suggested_form_values(monkeypatch):
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == f"/admin/contacts/ou_contact/assessments/{assessment_id}?page=4"
+    assert (
+        response.headers["location"]
+        == f"/admin/contacts/ou_contact/assessments/{assessment_id}?page=4&confirmation=all"
+    )
     assert confirmed == [(owner_id, assessment_id, "creator")]
 
 
@@ -302,24 +312,6 @@ def test_owner_account_detail_reads_only_that_account_and_audits(monkeypatch):
     assert reads == [(account_id, 1)]
     assert audits == [(owner_id, account_id)]
     assert contexts[-1][0] == "admin/account_detail.html"
-
-
-def test_creator_write_requires_csrf_and_redirects_after_a_valid_post(monkeypatch):
-    owner_id = uuid4()
-    creator_id = uuid4()
-    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _authorization_id: "owner")
-    monkeypatch.setattr(creator_registry, "create_creator", lambda *_args: creator_id)
-    client = _client(lambda _request: {"id": owner_id, "status": "active"})
-
-    assert client.post("/admin/creators", data={"display_name": "Creator"}).status_code == 400
-    response = client.post(
-        "/admin/creators",
-        data={"display_name": "Creator", "csrf_token": "csrf"},
-        follow_redirects=False,
-    )
-
-    assert response.status_code == 303
-    assert response.headers["location"] == f"/admin/creators/{creator_id}"
 
 
 def test_selecting_a_user_lists_conversations_without_reading_message_content(monkeypatch):

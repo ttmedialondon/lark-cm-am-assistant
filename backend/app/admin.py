@@ -1,4 +1,4 @@
-"""Small internal admin router with owner-only creator registry writes.
+"""Small internal admin router for the owner-only administration console.
 
 The router receives the session and rendering functions from ``main``.  That
 keeps it independent from the web application's module-level globals and
@@ -17,7 +17,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse, Response
 
-from . import admin_reporting, ai_feature_config, contact_assessments, creator_registry
+from . import admin_reporting, ai_feature_config, contact_assessments
 from .config import get_settings
 from .db import connection
 
@@ -148,8 +148,6 @@ def create_admin_router(
         access_context: dict[str, Any],
         *,
         page: int = 1,
-        error: str | None = None,
-        status_code: int = 200,
     ) -> Response:
         creator_page = admin_reporting.creators(page)
         return render_template(
@@ -159,9 +157,7 @@ def create_admin_router(
                 **page_context(access_context, "creators"),
                 "creators": creator_page["items"],
                 "creator_page": pagination(creator_page, "/admin/creators"),
-                "form_error": error,
             },
-            status_code,
         )
 
     def render_ai_config(
@@ -172,38 +168,13 @@ def create_admin_router(
         status_code: int = 200,
     ) -> Response:
         with connection() as conn:
-            config = ai_feature_config.display_config(
-                ai_feature_config.get_feature_config(conn, "contact_assessment")
-            )
+            config = ai_feature_config.display_config(ai_feature_config.get_feature_config(conn, "contact_assessment"))
         response = render_template(
             request,
             "admin/ai.html",
             {
                 **page_context(access_context, "ai"),
                 "config": config,
-                "form_error": error,
-            },
-            status_code,
-        )
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-        return response
-
-    def render_ai_candidates(
-        request: Request,
-        access_context: dict[str, Any],
-        *,
-        page: int = 1,
-        error: str | None = None,
-        status_code: int = 200,
-    ) -> Response:
-        candidate_page = contact_assessments.candidate_page(page)
-        response = render_template(
-            request,
-            "admin/ai_candidates.html",
-            {
-                **page_context(access_context, "ai_candidates"),
-                "candidates": candidate_page["items"],
-                "candidate_page": pagination(candidate_page, "/admin/ai-candidates"),
                 "form_error": error,
             },
             status_code,
@@ -218,6 +189,7 @@ def create_admin_router(
         open_id: str,
         assessment_id: UUID,
         source_page: int = 1,
+        source_confirmation: str = "all",
         error: str | None = None,
         status_code: int = 200,
     ) -> Response:
@@ -242,6 +214,7 @@ def create_admin_router(
                     "assessment": detail,
                     "route_open_id": open_id,
                     "source_page": source_page,
+                    "source_confirmation": source_confirmation,
                     "form_error": error,
                 },
                 status_code,
@@ -465,51 +438,22 @@ def create_admin_router(
         assert access_context is not None
         return render_ai_config(request, access_context)
 
-    @router.get("/admin/ai-candidates")
-    def admin_ai_candidates(request: Request, page: int = 1) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        return render_ai_candidates(request, access_context, page=page)
-
-    @router.post("/admin/ai-candidates/{assessment_id}/dismiss")
-    async def admin_dismiss_ai_candidate(request: Request, assessment_id: UUID, page: int = 1) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        form = await _form_fields(request)
-        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
-            return render_ai_candidates(
-                request,
-                access_context,
-                page=page,
-                error="请求校验失败，请返回候选队列后重试。",
-                status_code=400,
-            )
-        try:
-            contact_assessments.dismiss_assessment(access_context["authorization"]["id"], assessment_id)
-        except contact_assessments.ContactAssessmentInputError as exc:
-            return render_ai_candidates(request, access_context, page=page, error=str(exc), status_code=400)
-        response = RedirectResponse(url=f"/admin/ai-candidates?{urlencode({'page': page})}", status_code=303)
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-        return response
-
     @router.get("/admin/contacts")
-    def admin_contacts(request: Request, page: int = 1) -> Response:
+    def admin_contacts(request: Request, page: int = 1, confirmation: str = "all") -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        contact_page = admin_reporting.contacts(page)
+        confirmation = admin_reporting.normalize_contact_confirmation(confirmation)
+        contact_page = admin_reporting.contacts(page, confirmation)
         response = render_template(
             request,
             "admin/contacts.html",
             {
                 **page_context(access_context, "contacts"),
                 "contacts": contact_page["items"],
-                "contact_page": pagination(contact_page, "/admin/contacts"),
+                "contact_page": pagination(contact_page, "/admin/contacts", confirmation=confirmation),
+                "confirmation": confirmation,
             },
         )
         response.headers["Cache-Control"] = "no-store, max-age=0"
@@ -520,6 +464,7 @@ def create_admin_router(
         request: Request,
         open_id: str,
         page: int = 1,
+        confirmation: str = "all",
         conversations_page: int = 1,
         accounts_page: int = 1,
     ) -> Response:
@@ -527,6 +472,7 @@ def create_admin_router(
         if denied is not None:
             return denied
         assert access_context is not None
+        confirmation = admin_reporting.normalize_contact_confirmation(confirmation)
         detail = admin_reporting.contact_detail(open_id, conversations_page, accounts_page)
         if not detail:
             return render_template(
@@ -546,6 +492,7 @@ def create_admin_router(
                 "contact": detail["contact"],
                 "identities": detail["identities"],
                 "source_page": page,
+                "source_confirmation": confirmation,
                 "assessment": latest_assessment,
                 "assessment_available": contact_assessments.assessment_available(),
                 "conversations": conversations["items"],
@@ -554,6 +501,7 @@ def create_admin_router(
                     f"/admin/contacts/{open_id}",
                     page_name="conversations_page",
                     page=page,
+                    confirmation=confirmation,
                     accounts_page=accounts["page"],
                 ),
                 "accounts": accounts["items"],
@@ -562,6 +510,7 @@ def create_admin_router(
                     f"/admin/contacts/{open_id}",
                     page_name="accounts_page",
                     page=page,
+                    confirmation=confirmation,
                     conversations_page=conversations["page"],
                 ),
             },
@@ -575,17 +524,20 @@ def create_admin_router(
         open_id: str,
         assessment_id: UUID,
         page: int = 1,
+        confirmation: str = "all",
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
+        confirmation = admin_reporting.normalize_contact_confirmation(confirmation)
         return render_contact_assessment(
             request,
             access_context,
             open_id=open_id,
             assessment_id=assessment_id,
             source_page=page,
+            source_confirmation=confirmation,
         )
 
     @router.post("/admin/contacts/{open_id}/assessments/{assessment_id}/roles")
@@ -594,11 +546,13 @@ def create_admin_router(
         open_id: str,
         assessment_id: UUID,
         page: int = 1,
+        confirmation: str = "all",
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
+        confirmation = admin_reporting.normalize_contact_confirmation(confirmation)
         if not contact_assessments.assessment_matches_contact(assessment_id, open_id):
             response = render_template(
                 request,
@@ -616,6 +570,7 @@ def create_admin_router(
                 open_id=open_id,
                 assessment_id=assessment_id,
                 source_page=page,
+                source_confirmation=confirmation,
                 error="请求校验失败，请返回此页面后重试。",
                 status_code=400,
             )
@@ -630,11 +585,15 @@ def create_admin_router(
                 open_id=open_id,
                 assessment_id=assessment_id,
                 source_page=page,
+                source_confirmation=confirmation,
                 error=str(exc),
                 status_code=400,
             )
         response = RedirectResponse(
-            url=f"/admin/contacts/{open_id}/assessments/{assessment_id}?{urlencode({'page': page})}",
+            url=(
+                f"/admin/contacts/{open_id}/assessments/{assessment_id}?"
+                f"{urlencode({'page': page, 'confirmation': confirmation})}"
+            ),
             status_code=303,
         )
         response.headers["Cache-Control"] = "no-store, max-age=0"
@@ -646,11 +605,13 @@ def create_admin_router(
         open_id: str,
         assessment_id: UUID,
         page: int = 1,
+        confirmation: str = "all",
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
+        confirmation = admin_reporting.normalize_contact_confirmation(confirmation)
         if not contact_assessments.assessment_matches_contact(assessment_id, open_id):
             response = render_template(
                 request,
@@ -668,6 +629,7 @@ def create_admin_router(
                 open_id=open_id,
                 assessment_id=assessment_id,
                 source_page=page,
+                source_confirmation=confirmation,
                 error="请求校验失败，请返回此页面后重试。",
                 status_code=400,
             )
@@ -685,11 +647,69 @@ def create_admin_router(
                 open_id=open_id,
                 assessment_id=assessment_id,
                 source_page=page,
+                source_confirmation=confirmation,
                 error=str(exc),
                 status_code=400,
             )
         response = RedirectResponse(
-            url=f"/admin/contacts/{open_id}/assessments/{assessment_id}?{urlencode({'page': page})}",
+            url=(
+                f"/admin/contacts/{open_id}/assessments/{assessment_id}?"
+                f"{urlencode({'page': page, 'confirmation': confirmation})}"
+            ),
+            status_code=303,
+        )
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
+    @router.post("/admin/contacts/{open_id}/assessments/{assessment_id}/dismiss")
+    async def admin_dismiss_contact_assessment(
+        request: Request,
+        open_id: str,
+        assessment_id: UUID,
+        page: int = 1,
+        confirmation: str = "all",
+    ) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        confirmation = admin_reporting.normalize_contact_confirmation(confirmation)
+        if not contact_assessments.assessment_matches_contact(assessment_id, open_id):
+            response = render_template(
+                request,
+                "error.html",
+                {"title": "未找到 AI 判定", "detail": "该判定不存在，或不属于当前联系人。"},
+                404,
+            )
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            return response
+        form = await _form_fields(request)
+        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
+            return render_contact_assessment(
+                request,
+                access_context,
+                open_id=open_id,
+                assessment_id=assessment_id,
+                source_page=page,
+                source_confirmation=confirmation,
+                error="请求校验失败，请返回此页面后重试。",
+                status_code=400,
+            )
+        try:
+            contact_assessments.dismiss_assessment(access_context["authorization"]["id"], assessment_id)
+        except contact_assessments.ContactAssessmentInputError as exc:
+            return render_contact_assessment(
+                request,
+                access_context,
+                open_id=open_id,
+                assessment_id=assessment_id,
+                source_page=page,
+                source_confirmation=confirmation,
+                error=str(exc),
+                status_code=400,
+            )
+        response = RedirectResponse(
+            url=f"/admin/contacts/{open_id}?{urlencode({'page': page, 'confirmation': confirmation})}",
             status_code=303,
         )
         response.headers["Cache-Control"] = "no-store, max-age=0"
@@ -743,28 +763,6 @@ def create_admin_router(
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 
-    @router.post("/admin/creators")
-    async def admin_create_creator(request: Request) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        form = await _form_fields(request)
-        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
-            return render_template(
-                request,
-                "error.html",
-                {"title": "请求校验失败", "detail": "请返回达人库页面后重试。"},
-                400,
-            )
-        try:
-            creator_id = creator_registry.create_creator(
-                access_context["authorization"]["id"], form.get("display_name", "")
-            )
-        except creator_registry.CreatorInputError as exc:
-            return render_creators(request, access_context, error=str(exc), status_code=400)
-        return RedirectResponse(url=f"/admin/creators/{creator_id}", status_code=303)
-
     @router.post("/admin/ai")
     async def admin_save_ai_config(request: Request) -> Response:
         access_context, denied = owner_access(request)
@@ -799,8 +797,7 @@ def create_admin_router(
                     ),
                 )
                 conn.execute(
-                    "INSERT INTO audit_events (id, authorization_id, action, metadata) "
-                    "VALUES (%s, %s, %s, %s::jsonb)",
+                    "INSERT INTO audit_events (id, authorization_id, action, metadata) VALUES (%s, %s, %s, %s::jsonb)",
                     (
                         uuid4(),
                         access_context["authorization"]["id"],
@@ -823,82 +820,6 @@ def create_admin_router(
         response = RedirectResponse(url="/admin/ai", status_code=303)
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
-
-    @router.get("/admin/creators/{creator_id}")
-    def admin_creator_detail(request: Request, creator_id: UUID, identifier_page: int = 1) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        detail = admin_reporting.creator_detail(creator_id, identifier_page)
-        if not detail:
-            return render_template(
-                request,
-                "error.html",
-                {"title": "未找到达人", "detail": "该达人可能已被删除。"},
-                404,
-            )
-        identifiers = detail["identifiers"]
-        return render_template(
-            request,
-            "admin/creator_detail.html",
-            {
-                **page_context(access_context, "creators"),
-                "creator": detail["creator"],
-                "identifiers": identifiers["items"],
-                "identifier_page": pagination(
-                    identifiers, f"/admin/creators/{creator_id}", page_name="identifier_page"
-                ),
-            },
-        )
-
-    @router.post("/admin/creators/{creator_id}/identifiers")
-    async def admin_create_creator_identifier(request: Request, creator_id: UUID) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        form = await _form_fields(request)
-        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
-            return render_template(
-                request,
-                "error.html",
-                {"title": "请求校验失败", "detail": "请返回达人详情页面后重试。"},
-                400,
-            )
-        try:
-            creator_registry.add_identifier(
-                access_context["authorization"]["id"],
-                creator_id,
-                kind=form.get("kind", ""),
-                platform=form.get("platform", ""),
-                value=form.get("value", ""),
-            )
-        except creator_registry.CreatorInputError as exc:
-            detail = admin_reporting.creator_detail(creator_id)
-            if not detail:
-                return render_template(
-                    request,
-                    "error.html",
-                    {"title": "未找到达人", "detail": "该达人可能已被删除。"},
-                    404,
-                )
-            identifiers = detail["identifiers"]
-            return render_template(
-                request,
-                "admin/creator_detail.html",
-                {
-                    **page_context(access_context, "creators"),
-                    "creator": detail["creator"],
-                    "identifiers": identifiers["items"],
-                    "identifier_page": pagination(
-                        identifiers, f"/admin/creators/{creator_id}", page_name="identifier_page"
-                    ),
-                    "form_error": str(exc),
-                },
-                400,
-            )
-        return RedirectResponse(url=f"/admin/creators/{creator_id}", status_code=303)
 
     @router.get("/admin/jobs")
     def admin_jobs(request: Request, page: int = 1) -> Response:

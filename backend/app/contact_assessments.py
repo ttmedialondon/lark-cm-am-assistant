@@ -29,8 +29,6 @@ MAX_INPUT_BODY_CHARS = 32_000
 MAX_ROLE_SUGGESTIONS = 3
 MAX_ACCOUNT_SUGGESTIONS = 3
 MAX_EVIDENCE_REFS = 12
-CANDIDATE_PAGE_SIZE = 20
-MAX_PAGE = 10_000
 MAX_AUTOMATIC_ATTEMPTS_PER_WATERMARK = 3
 AUTOMATIC_RETRY_COOLDOWN_MINUTES = 15
 AUTOMATIC_QUEUE_REFRESH_SECONDS = 60
@@ -396,71 +394,8 @@ def record_assessment_view(viewer_id: UUID | str, assessment_id: UUID | str) -> 
         _audit(conn, viewer_id, "contact_assessment_viewed", {"assessment_id": str(assessment_id)})
 
 
-def candidate_page(page: int = 1, review: str = "pending") -> dict[str, Any]:
-    """Return an owner-safe page of assessments that still need a decision."""
-
-    if review not in {"pending", "ignored"}:
-        raise ContactAssessmentInputError("候选状态无效。")
-    page = min(max(int(page), 1), MAX_PAGE)
-    with connection() as conn:
-        total = int(
-            conn.execute(
-                """
-                SELECT COUNT(*) AS total_count
-                FROM contact_assessments assessment
-                WHERE assessment.status = 'succeeded'
-                  AND assessment.outcome = 'review_required'
-                  AND assessment.review_status = %s
-                  AND EXISTS (
-                      SELECT 1 FROM lark_identities identity
-                      WHERE identity.contact_id = assessment.contact_id
-                        AND identity.identity_type = 'user'
-                        AND identity.tenant_classification <> 'internal'
-                  )
-                """,
-                (review,),
-            ).fetchone()["total_count"]
-            or 0
-        )
-        total_pages = max(1, (total + CANDIDATE_PAGE_SIZE - 1) // CANDIDATE_PAGE_SIZE)
-        page = min(page, total_pages)
-        rows = conn.execute(
-            """
-            SELECT
-                assessment.id AS assessment_id, assessment.result, assessment.evidence_count,
-                assessment.created_at, assessment.status, assessment.outcome, assessment.review_status,
-                contact.display_name AS contact_display_name, identity.open_id AS contact_open_id
-            FROM contact_assessments assessment
-            JOIN contacts contact ON contact.id = assessment.contact_id
-            JOIN LATERAL (
-                SELECT open_id
-                FROM lark_identities identity
-                WHERE identity.contact_id = contact.id
-                  AND identity.identity_type = 'user'
-                  AND identity.tenant_classification <> 'internal'
-                ORDER BY identity.last_seen_at DESC, identity.open_id
-                LIMIT 1
-            ) identity ON TRUE
-            WHERE assessment.status = 'succeeded'
-              AND assessment.outcome = 'review_required'
-              AND assessment.review_status = %s
-            ORDER BY assessment.created_at DESC, assessment.id DESC
-            LIMIT %s OFFSET %s
-            """,
-            (review, CANDIDATE_PAGE_SIZE, (page - 1) * CANDIDATE_PAGE_SIZE),
-        ).fetchall()
-    return {
-        "items": [_candidate_item(row) for row in rows],
-        "page": page,
-        "page_size": CANDIDATE_PAGE_SIZE,
-        "total_count": total,
-        "total_pages": total_pages,
-        "has_next": page < total_pages,
-    }
-
-
 def dismiss_assessment(actor_id: UUID | str, assessment_id: UUID | str) -> dict[str, str]:
-    """Remove a reviewed candidate from the queue without changing any fact."""
+    """Mark one contact's review-required suggestion as not adopted."""
 
     actor_id = _as_uuid(actor_id, "管理员")
     assessment_id = _as_uuid(assessment_id, "判定")
@@ -473,11 +408,11 @@ def dismiss_assessment(actor_id: UUID | str, assessment_id: UUID | str) -> dict[
             (assessment_id,),
         ).fetchone()
         if not assessment or assessment["status"] != "succeeded" or assessment.get("outcome") != "review_required":
-            raise ContactAssessmentInputError("该判定不是可处理的候选。")
+            raise ContactAssessmentInputError("该判定不是可处理的建议。")
         if assessment.get("review_status") == "ignored":
             return {"assessment_id": str(assessment_id), "review_status": "ignored"}
         if assessment.get("review_status") != "pending":
-            raise ContactAssessmentInputError("该候选当前不能标记为已处理。")
+            raise ContactAssessmentInputError("该建议当前不能标记为不采纳。")
         conn.execute(
             """
             UPDATE contact_assessments
@@ -1697,49 +1632,6 @@ def _summary(row: Mapping[str, Any]) -> dict[str, Any]:
         "role_count": len(_json_list(result.get("roles"))),
         "account_relation_count": len(_json_list(result.get("account_relations"))),
     }
-
-
-def _candidate_item(row: Mapping[str, Any]) -> dict[str, Any]:
-    result = _json_object(row.get("result"))
-    suggestions: list[tuple[str, float | None]] = []
-    for suggestion in _json_list(result.get("roles")):
-        if isinstance(suggestion, Mapping) and suggestion.get("role") in FACT_ROLES:
-            suggestions.append((ROLE_LABELS[suggestion["role"]], _candidate_confidence(suggestion.get("confidence"))))
-    for suggestion in _json_list(result.get("account_relations")):
-        if isinstance(suggestion, Mapping) and suggestion.get("relationship") in CONFIRMABLE_RELATIONSHIPS:
-            suggestions.append(
-                (
-                    f"账号归属：{RELATIONSHIP_LABELS[suggestion['relationship']]}",
-                    _candidate_confidence(suggestion.get("confidence")),
-                )
-            )
-    label, confidence = max(
-        suggestions,
-        key=lambda item: item[1] if item[1] is not None else -1,
-        default=("待人工判断", None),
-    )
-    return {
-        "assessment_id": str(row["assessment_id"]),
-        "contact_open_id": row.get("contact_open_id") or "",
-        "contact_display_name": row.get("contact_display_name") or "未命名联系人",
-        "role_label": label,
-        "confidence_label": _confidence_label(confidence),
-        "evidence_count": int(row.get("evidence_count") or 0),
-        "created_at_label": _time_label(row.get("created_at"), "时间未知"),
-        "review_status": row.get("review_status") or "pending",
-        "review_status_label": REVIEW_STATUS_LABELS.get(
-            row.get("review_status"), row.get("review_status") or "pending"
-        ),
-        "status_label": STATUS_LABELS.get(row.get("status"), row.get("status") or "succeeded"),
-        "outcome": row.get("outcome") or "review_required",
-    }
-
-
-def _candidate_confidence(value: object) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _detail_role(item: Any, confirmed_roles: set[str]) -> dict[str, Any]:

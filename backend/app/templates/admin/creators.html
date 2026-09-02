@@ -4,15 +4,7 @@
 <div class="page admin-directory">
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl admin-directory__container">
-    <div class="alert alert-info">这是人工确认的达人主档。账号出现记录只表示消息中出现过该账号，不会自动确认任何人或账号的归属。</div>
-    {% if form_error %}<div class="alert alert-danger" role="alert">{{ form_error }}</div>{% endif %}
-    <div class="card mb-4"><div class="card-body">
-      <form action="/admin/creators" method="post" class="row g-3 align-items-end">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <div class="col-md-9"><label class="form-label" for="creator-name">达人名称</label><input class="form-control" id="creator-name" name="display_name" maxlength="160" required autofocus></div>
-        <div class="col-md-3"><button class="btn btn-primary w-100" type="submit">新建达人</button></div>
-      </form>
-    </div></div>
+    <div class="alert alert-info">这里只展示已确认的达人 / 创作者。打开后会进入同一位外部联系人的详情、会话事实和 AI 证据。</div>
     <div class="card admin-directory__card">
       <div class="card-header"><h3 class="card-title">达人主档</h3></div>
       {% if creators %}
@@ -20,7 +12,7 @@
         <thead><tr><th>达人</th><th>已确认标识</th><th>其中平台账号</th><th>最后更新</th><th></th></tr></thead>
         <tbody>{% for creator in creators %}<tr>
           <td>{{ creator.display_name }}</td><td>{{ creator.identifier_count }}</td><td>{{ creator.social_account_count }}</td><td>{{ creator.updated_at_label }}</td>
-          <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="/admin/creators/{{ creator.id }}">查看</a></td>
+          <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="/admin/contacts/{{ creator.open_id }}?confirmation=confirmed">查看联系人</a></td>
         </tr>{% endfor %}</tbody>
       </table></div>
       {% with pager=creator_page %}{% include "admin/_pagination.html" %}{% endwith %}
