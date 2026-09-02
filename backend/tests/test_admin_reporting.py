@@ -69,11 +69,12 @@ def test_creator_pending_filter_requires_the_latest_actionable_assignment_sugges
 
     assert page["items"] == []
     query, params = calls[0]
-    assert params == (0.7, 0.9, "pending", "pending")
+    assert params == (0.7, "direct_evidence_v2", "pending", "pending")
     assert "assessment.outcome = 'review_required'" in query
     assert "latest_assessment.decision IN ('assign', 'needs_review')" in query
     assert "latest_assessment.confidence >= %s::numeric" in query
-    assert "latest_assessment.confidence < config.automatic_threshold" in query
+    assert "assessment.policy_version = %s" in query
+    assert "automatic_threshold" not in query
 
 
 def test_member_count_labels_preserve_pending_and_unavailable_states():

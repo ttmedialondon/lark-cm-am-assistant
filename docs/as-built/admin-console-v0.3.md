@@ -47,8 +47,8 @@ contacts ──< contact_assignments（单一当前负责人 + 人工交接历�
 | `/admin/messages` | **仅 owner**：按 CM/AM、群/私聊、具体会话筛选，最近 100 条正文分页展示。 |
 | `/admin/contacts` | **仅 owner**：按稳定 Lark 身份查看外部联系人、会话统计、角色状态与可核验的 AI 消息证据。 |
 | `/admin/creators` | **仅 owner**：查看已确认拥有 `creator` 角色的联系人及其稳定 Lark 身份。 |
-| `/admin/contacts/{open_id}`（达人） | **仅 owner**：显示唯一当前负责人、最近的 AI 匹配状态与低置信建议；可人工确认或交接给另一位已接入 CM/AM。 |
-| `/admin/ai` | **仅 owner**：分别配置“联系人身份识别”和“达人负责人匹配”的 OpenAI Project / service-account key。 |
+| `/admin/contacts/{open_id}`（达人） | **仅 owner**：显示唯一当前负责人、最近的 AI 匹配状态与建议；会明确展示候选覆盖、直接互动证据或校准样本造成的自动确认拦截；可人工确认或交接给另一位已接入 CM/AM。 |
+| `/admin/ai` | **仅 owner**：分别配置“联系人身份识别”和“达人负责人匹配”的 OpenAI Project / service-account key，并显示负责人匹配的人工校准样本进度。 |
 | `/admin/jobs` | 最近同步任务及不含敏感内容的运行统计。 |
 
 ## 当前同步参数

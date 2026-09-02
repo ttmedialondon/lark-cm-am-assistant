@@ -21,9 +21,8 @@ from zoneinfo import ZoneInfo
 
 from cryptography.exceptions import InvalidTag
 
-from .ai_feature_config import DEFAULT_AUTO_CONFIRM_THRESHOLD
 from .config import get_settings
-from .contact_assignments import MANUAL_REVIEW_CONFIDENCE_FLOOR
+from .contact_assignments import MANUAL_REVIEW_CONFIDENCE_FLOOR, POLICY_VERSION
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
 
@@ -119,19 +118,12 @@ CREATOR_DIRECTORY_SQL = """
                   AND latest_assessment.decision IN ('assign', 'needs_review')
                   AND latest_assessment.candidate <> 'none'
                   AND latest_assessment.confidence >= %s::numeric
-                  AND latest_assessment.confidence < config.automatic_threshold
                 THEN 'pending'
                 ELSE 'unmatched'
             END AS assignment_status
         FROM contacts contact
         JOIN contact_roles role
           ON role.contact_id = contact.id AND role.role = 'creator' AND role.status = 'confirmed'
-        CROSS JOIN (
-            SELECT COALESCE(
-                (SELECT auto_confirm_threshold FROM ai_feature_configs WHERE feature = 'contact_assignment'),
-                %s::numeric
-            ) AS automatic_threshold
-        ) AS config
         JOIN LATERAL (
             SELECT identity.open_id
             FROM lark_identities identity
@@ -153,7 +145,9 @@ CREATOR_DIRECTORY_SQL = """
                     ->> (assessment.result ->> 'candidate') AS candidate_authorization_id,
                 NULLIF(assessment.result ->> 'confidence', '')::numeric AS confidence
             FROM contact_assignment_assessments assessment
-            WHERE assessment.contact_id = contact.id AND assessment.status = 'succeeded'
+            WHERE assessment.contact_id = contact.id
+              AND assessment.status = 'succeeded'
+              AND assessment.policy_version = %s
             ORDER BY assessment.finished_at DESC NULLS LAST, assessment.created_at DESC, assessment.id DESC
             LIMIT 1
         ) AS latest_assessment ON TRUE
@@ -741,7 +735,7 @@ def creators(page: int = 1, assignment: str = "all") -> dict[str, Any]:
     """Return confirmed creators filtered by their current owner-match state."""
 
     assignment = normalize_creator_assignment_filter(assignment)
-    filters = (MANUAL_REVIEW_CONFIDENCE_FLOOR, float(DEFAULT_AUTO_CONFIRM_THRESHOLD), assignment, assignment)
+    filters = (MANUAL_REVIEW_CONFIDENCE_FLOOR, POLICY_VERSION, assignment, assignment)
     with connection() as conn:
         total_count = int(
             conn.execute(

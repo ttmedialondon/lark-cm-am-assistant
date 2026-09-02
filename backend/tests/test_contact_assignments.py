@@ -69,7 +69,7 @@ def test_assignment_review_requires_meaningful_confidence() -> None:
     )
 
 
-def test_assignment_queue_requires_real_bidirectional_interaction_without_chat_type_bias(monkeypatch) -> None:
+def test_assignment_queue_requires_direct_interaction_and_current_policy(monkeypatch) -> None:
     calls: list[tuple[str, tuple[object, ...] | None]] = []
 
     class Result:
@@ -103,7 +103,19 @@ def test_assignment_queue_requires_real_bidirectional_interaction_without_chat_t
     assert calls[0][1] == ("contact_assignment", 60)
     assert "FOR UPDATE" in calls[0][0]
     assert calls[1][1] == ("contact_assignment",)
-    assert params == ("-infinity", 89, 3, 15, 89, 3, 15)
+    assert params == (
+        contact_assignments.POLICY_VERSION,
+        "-infinity",
+        89,
+        3,
+        15,
+        89,
+        contact_assignments.POLICY_VERSION,
+        3,
+        15,
+        contact_assignments.POLICY_VERSION,
+        contact_assignments.POLICY_VERSION,
+    )
     assert query.count("%s") == len(params)
     assert "automatic_queue_checked_at::text AS watermark" in calls[0][0]
     assert "observation.first_observed_at > %s::timestamptz" in query
@@ -113,8 +125,55 @@ def test_assignment_queue_requires_real_bidirectional_interaction_without_chat_t
     assert "observation.sent_by_author" in query
     assert "changed_messages" in query
     assert "HAVING BOOL_OR(speaker = 'cm_am') AND BOOL_OR(speaker = 'creator')" in query
-    assert "chat_mode" not in query
+    assert "strong_interaction_chats" in query
+    assert "p2p_counterpart_open_id" in query
+    assert "mentions_json" in query
+    assert "policy_version = %s" in query
     assert "contact_assignments assignment" in query
+
+
+def test_assignment_auto_confirmation_requires_coverage_direct_evidence_and_calibration(monkeypatch) -> None:
+    candidate_id = uuid4()
+    result = {
+        "candidate": "A1",
+        "evidence_policy": {
+            "candidate_pool_total": 2,
+            "candidate_pool_considered": 2,
+            "strong_cited": True,
+        },
+    }
+
+    monkeypatch.setattr(contact_assignments, "_manual_calibration_label_count_in", lambda _conn: 30)
+    assert contact_assignments._automatic_confirmation_policy(object(), result, candidate_id)["blockers"] == []
+
+    result["evidence_policy"]["candidate_pool_total"] = 1
+    assert contact_assignments._automatic_confirmation_policy(object(), result, candidate_id)["blockers"] == [
+        "candidate_pool_insufficient"
+    ]
+
+    result["evidence_policy"]["candidate_pool_total"] = 2
+    result["evidence_policy"]["strong_cited"] = False
+    assert contact_assignments._automatic_confirmation_policy(object(), result, candidate_id)["blockers"] == [
+        "no_strong_cited_evidence"
+    ]
+
+    result["evidence_policy"]["strong_cited"] = True
+    monkeypatch.setattr(contact_assignments, "_manual_calibration_label_count_in", lambda _conn: 29)
+    assert contact_assignments._automatic_confirmation_policy(object(), result, candidate_id)["blockers"] == [
+        "calibration_not_ready"
+    ]
+
+
+def test_assignment_strong_evidence_must_be_one_complete_cited_interaction() -> None:
+    result = {"candidate": "A1", "evidence_refs": ["M1", "M2"]}
+    evidence = {
+        "M1": {"candidate": "A1", "speaker": "creator", "interaction": "I1", "strength": "strong"},
+        "M2": {"candidate": "A1", "speaker": "cm_am", "interaction": "I2", "strength": "strong"},
+    }
+    assert not contact_assignments._has_strong_cited_interaction(result, evidence)
+
+    evidence["M2"]["interaction"] = "I1"
+    assert contact_assignments._has_strong_cited_interaction(result, evidence)
 
 
 def test_assignment_ref_check_rejects_a_partially_deleted_evidence_set() -> None:

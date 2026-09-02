@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from fastapi.testclient import TestClient
 
-from app import admin, admin_reporting, ai_feature_config
+from app import admin, admin_reporting, ai_feature_config, contact_assignments
 
 
 class _Connection:
@@ -82,6 +82,11 @@ def test_owner_can_view_only_safe_ai_config_fields(monkeypatch):
     monkeypatch.setattr(admin, "connection", _connection)
     monkeypatch.setattr(ai_feature_config, "get_feature_config", lambda *_args: {"api_key_ciphertext": "secret"})
     monkeypatch.setattr(ai_feature_config, "display_config", lambda _row: _config())
+    monkeypatch.setattr(
+        contact_assignments,
+        "assignment_safety_status",
+        lambda: {"manual_label_count": 0, "minimum_manual_labels": 30, "calibration_ready": False},
+    )
 
     response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get("/admin/ai")
 
