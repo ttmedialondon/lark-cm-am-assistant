@@ -33,6 +33,7 @@ RECENT_INTERACTION_DAYS = 90
 AUTOMATIC_QUEUE_REFRESH_SECONDS = 60
 MAX_AUTOMATIC_ATTEMPTS_PER_WATERMARK = 3
 AUTOMATIC_RETRY_COOLDOWN_MINUTES = 15
+ROLE_WATERMARK_OVERLAP_MINUTES = 5
 # Below this, a model suggestion is not useful manual-review work.
 MANUAL_REVIEW_CONFIDENCE_FLOOR = 0.70
 # A model score is not calibrated until the owner has supplied enough current,
@@ -192,7 +193,9 @@ def queue_eligible_contact_assignments() -> int:
                 WHERE role.role = 'creator'
                   AND role.status = 'confirmed'
                   AND role.is_primary
-                  AND role.updated_at > %s::timestamptz
+                  -- An overlap prevents a late-committing role change from
+                  -- falling exactly behind the moving queue watermark.
+                  AND role.updated_at >= %s::timestamptz - (%s * INTERVAL '1 minute')
             ), seeded_contacts AS (
                 SELECT DISTINCT identity.contact_id
                 FROM changed_messages changed
@@ -221,7 +224,7 @@ def queue_eligible_contact_assignments() -> int:
                 WHERE attempt_count < %s
                   AND (last_finished_at IS NULL OR last_finished_at <= NOW() - (%s * INTERVAL '1 minute'))
             ), creators AS (
-                SELECT DISTINCT contact.id AS contact_id
+                SELECT contact.id AS contact_id, role.updated_at AS role_updated_at
                 FROM contacts contact
                 JOIN contact_roles role ON role.contact_id = contact.id
                 JOIN seeded_contacts seed ON seed.contact_id = contact.id
@@ -231,7 +234,7 @@ def queue_eligible_contact_assignments() -> int:
                       WHERE assignment.contact_id = contact.id AND assignment.ended_at IS NULL
                   )
             ), target_ids AS (
-                SELECT creator.contact_id, identity.open_id
+                SELECT creator.contact_id, creator.role_updated_at, identity.open_id
                 FROM creators creator
                 JOIN lark_identities identity ON identity.contact_id = creator.contact_id
                 WHERE identity.identity_type = 'user'
@@ -242,6 +245,7 @@ def queue_eligible_contact_assignments() -> int:
                     auth.open_id AS candidate_open_id,
                     observation.chat_id,
                     observation.first_observed_at,
+                    target.role_updated_at,
                     message.message_id,
                     message.parent_id,
                     message.mentions_json,
@@ -340,7 +344,10 @@ def queue_eligible_contact_assignments() -> int:
             ), eligible AS (
                 SELECT
                     message.contact_id,
-                    MAX(message.first_observed_at) AS source_message_seen_at
+                    MAX(GREATEST(
+                        COALESCE(message.first_observed_at, '-infinity'::timestamptz),
+                        message.role_updated_at
+                    )) AS source_message_seen_at
                 FROM scoped_messages message
                 JOIN shared_chats shared
                   ON shared.contact_id = message.contact_id
@@ -393,6 +400,7 @@ def queue_eligible_contact_assignments() -> int:
                 watermark,
                 RECENT_INTERACTION_DAYS - 1,
                 watermark,
+                ROLE_WATERMARK_OVERLAP_MINUTES,
                 MAX_AUTOMATIC_ATTEMPTS_PER_WATERMARK,
                 AUTOMATIC_RETRY_COOLDOWN_MINUTES,
                 RECENT_INTERACTION_DAYS - 1,
