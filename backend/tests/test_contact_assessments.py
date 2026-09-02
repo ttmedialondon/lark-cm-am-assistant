@@ -197,6 +197,7 @@ def test_responses_request_is_nonpersistent_and_uses_configured_model(monkeypatc
     assert captured["json"]["model"] == "gpt-5.6-luna"
     assert captured["json"]["store"] is False
     assert captured["json"]["reasoning"] == {"effort": "low"}
+    assert captured["json"]["max_output_tokens"] == 500
     assert captured["headers"]["OpenAI-Project"] == "proj_test"
     schema = captured["json"]["text"]["format"]["schema"]
     assert "summary" not in schema["properties"]
@@ -230,8 +231,54 @@ def test_context_history_uses_the_anchor_authorization_only() -> None:
 
     query, params = conn.calls[0]
     assert "observation.authorization_id = %s" in query
-    assert params == (contact_id, authorization_id)
-    assert "LIMIT 12" in query
+    assert params == (contact_id, authorization_id, contact_assessments.MAX_SUBJECT_HISTORY_MESSAGES)
+    assert "LIMIT %s" in query
+
+
+def test_context_limits_are_balanced_and_group_name_is_not_repeated() -> None:
+    anchor = {
+        "authorization_id": uuid4(),
+        "chat_id": "oc_test",
+        "message_id": "om_anchor",
+        "message_create_time": "2026-09-02T10:00:00Z",
+        "chat_mode": "group",
+        "chat_name": "Creator campaign",
+        "external": True,
+        "p2p_counterpart_open_id": None,
+        "mentions_json": [],
+        "sender_tenant_classification": "known_external",
+        "message_type": "text",
+        "root_id": None,
+        "parent_id": None,
+        "thread_id": None,
+    }
+
+    class Result:
+        @staticmethod
+        def fetchall():
+            return []
+
+    class Connection:
+        calls = []
+
+        def execute(self, query, params):
+            self.calls.append((" ".join(query.split()), params))
+            return Result()
+
+    conn = Connection()
+    contact_assessments._conversation_context(conn, anchor)
+
+    before_query, before_params = conn.calls[0]
+    after_query, after_params = conn.calls[1]
+    assert "message.message_id < %s" in before_query
+    assert "message.message_id > %s" in after_query
+    assert before_params[-1] == after_params[-1] == contact_assessments.MAX_CONTEXT_MESSAGES_PER_SIDE
+
+    base_fragment = {"label": "M1", "speaker": "S1", "row": anchor, "text": "hello"}
+    anchor_payload = contact_assessments._model_fragment({**base_fragment, "relation": "anchor"}, set())
+    context_payload = contact_assessments._model_fragment({**base_fragment, "relation": "context"}, set())
+    assert anchor_payload["conversation"]["name"] == "Creator campaign"
+    assert "name" not in context_payload["conversation"]
 
 
 def test_saved_refs_record_the_single_source_authorization(monkeypatch) -> None:

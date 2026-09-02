@@ -22,9 +22,12 @@ from .db import connection
 
 LOGGER = logging.getLogger("lark_message_stats.contact_assessments")
 FEATURE = "contact_assessment"
-MAX_FRAGMENTS = 60
-MAX_BODY_CHARS = 800
-MAX_INPUT_BODY_CHARS = 32_000
+MAX_CONTEXT_MESSAGES_PER_SIDE = 6
+MAX_SUBJECT_HISTORY_MESSAGES = 4
+# ponytail: keep automatic review compact; add an explicit deep-review action only if audits need it.
+MAX_FRAGMENTS = 1 + 2 * MAX_CONTEXT_MESSAGES_PER_SIDE + MAX_SUBJECT_HISTORY_MESSAGES
+MAX_BODY_CHARS = 500
+MAX_INPUT_BODY_CHARS = 8_000
 MAX_ROLE_SUGGESTIONS = 3
 MAX_EVIDENCE_REFS = 12
 MAX_AUTOMATIC_ATTEMPTS_PER_WATERMARK = 3
@@ -639,7 +642,6 @@ def _build_evidence(contact_id: UUID, settings: Settings) -> dict[str, Any]:
         rows.extend((row, "context") for row in reversed(before))
         rows.extend((row, "context") for row in after)
         rows.extend((row, "history") for row in _recent_subject_history(conn, contact_id, anchor["authorization_id"]))
-        facts = _known_facts(conn, contact_id)
 
         fragments: list[dict[str, Any]] = []
         seen: set[tuple[Any, str, str]] = set()
@@ -675,7 +677,6 @@ def _build_evidence(contact_id: UUID, settings: Settings) -> dict[str, Any]:
         ]
         pack = {
             "subject": {"alias": "S1", "tenant_classification": _subject_tenant(identities)},
-            "confirmed_facts": facts,
             "messages": [_model_fragment(fragment, target_ids) for fragment in fragments],
         }
     return {
@@ -755,8 +756,8 @@ def _conversation_context(
     before = conn.execute(
         base
         + """
-          AND (message.message_create_time < %s OR (message.message_create_time = %s AND message.message_id <= %s))
-        ORDER BY message.message_create_time DESC, message.message_id DESC LIMIT 24
+          AND (message.message_create_time < %s OR (message.message_create_time = %s AND message.message_id < %s))
+        ORDER BY message.message_create_time DESC, message.message_id DESC LIMIT %s
         """,
         (
             anchor["authorization_id"],
@@ -764,13 +765,14 @@ def _conversation_context(
             anchor["message_create_time"],
             anchor["message_create_time"],
             anchor["message_id"],
+            MAX_CONTEXT_MESSAGES_PER_SIDE,
         ),
     ).fetchall()
     after = conn.execute(
         base
         + """
           AND (message.message_create_time > %s OR (message.message_create_time = %s AND message.message_id > %s))
-        ORDER BY message.message_create_time ASC, message.message_id ASC LIMIT 24
+        ORDER BY message.message_create_time ASC, message.message_id ASC LIMIT %s
         """,
         (
             anchor["authorization_id"],
@@ -778,6 +780,7 @@ def _conversation_context(
             anchor["message_create_time"],
             anchor["message_create_time"],
             anchor["message_id"],
+            MAX_CONTEXT_MESSAGES_PER_SIDE,
         ),
     ).fetchall()
     return before, after
@@ -817,22 +820,10 @@ def _recent_subject_history(
         )
         SELECT * FROM visible_subject_messages
         ORDER BY message_create_time DESC, message_id DESC
-        LIMIT 12
+        LIMIT %s
         """,
-        (contact_id, authorization_id),
+        (contact_id, authorization_id, MAX_SUBJECT_HISTORY_MESSAGES),
     ).fetchall()
-
-
-def _known_facts(conn: psycopg.Connection, contact_id: UUID) -> list[str]:
-    roles = conn.execute(
-        """
-        SELECT role FROM contact_roles
-        WHERE contact_id = %s AND status = 'confirmed'
-        ORDER BY role
-        """,
-        (contact_id,),
-    ).fetchall()
-    return [f"confirmed role: {row['role']}" for row in roles]
 
 
 def _label_fragments(fragments: list[dict[str, Any]], target_ids: set[str]) -> None:
@@ -848,17 +839,19 @@ def _label_fragments(fragments: list[dict[str, Any]], target_ids: set[str]) -> N
 def _model_fragment(fragment: Mapping[str, Any], target_ids: set[str]) -> dict[str, Any]:
     row = fragment["row"]
     mentions = _json_list(row.get("mentions_json"))
+    conversation = {
+        "type": row.get("chat_mode") or "group",
+        "external": bool(row.get("external")),
+        "subject_is_p2p_counterpart": row.get("p2p_counterpart_open_id") in target_ids,
+    }
+    if fragment["relation"] == "anchor":
+        conversation["name"] = _bounded_text(row.get("chat_name"), 160)
     return {
         "ref": fragment["label"],
         "kind": fragment["relation"],
         "speaker": fragment["speaker"],
         "speaker_tenant": row.get("sender_tenant_classification") or "unresolved",
-        "conversation": {
-            "type": row.get("chat_mode") or "group",
-            "name": _bounded_text(row.get("chat_name"), 160),
-            "external": bool(row.get("external")),
-            "subject_is_p2p_counterpart": row.get("p2p_counterpart_open_id") in target_ids,
-        },
+        "conversation": conversation,
         "message": {
             "type": row.get("message_type") or "unknown",
             "text": fragment["text"],
@@ -953,7 +946,7 @@ def _call_openai(config: Mapping[str, Any], api_key: str, pack: Mapping[str, Any
         "model": config["model"],
         "store": False,
         "reasoning": {"effort": "low"},
-        "max_output_tokens": 1000,
+        "max_output_tokens": 500,
         "instructions": _MODEL_INSTRUCTIONS,
         "input": json.dumps(pack, ensure_ascii=False, separators=(",", ":")),
         "text": {"format": _structured_output_format()},
