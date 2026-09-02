@@ -1,5 +1,5 @@
 from app.config import Settings
-from app.lark_api import LarkClient
+from app.lark_api import LarkApiError, LarkClient
 
 
 def settings() -> Settings:
@@ -123,3 +123,7 @@ def test_trust_party_mapping_uses_a_short_lived_tenant_token(monkeypatch) -> Non
     assert calls[1][1].endswith("/open-apis/directory/v1/collaboration_tenants")
     assert calls[1][2]["access_token"] == "tenant-token"
     assert calls[1][2]["params"] == {"page_size": 100, "page_token": "next-page"}
+
+
+def test_missing_app_scope_is_treated_as_an_authorization_problem() -> None:
+    assert LarkApiError(400, 99991672, "scope missing").likely_auth_problem
