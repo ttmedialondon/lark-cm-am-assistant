@@ -1026,15 +1026,6 @@ def _discover_chats(
                     ),
                 )
                 counterpart_open_id = _p2p_counterpart_open_id(counterpart_id, counterpart_type)
-                if counterpart_open_id:
-                    _upsert_lark_identity(conn, counterpart_open_id, seen_at=seen_at)
-                    _ensure_contact_for_identity(
-                        conn,
-                        counterpart_open_id,
-                        tenant_classification="unresolved",
-                        identity_type="user",
-                        seen_at=seen_at,
-                    )
                 conn.execute(
                     """
                     INSERT INTO authorization_chats (
@@ -1095,6 +1086,17 @@ def _discover_chats(
                         seen_at if counterpart_open_id else None,
                     ),
                 )
+                # Page commits lock access before identities/contacts. Keep
+                # discovery in the same order so confirmation can do likewise.
+                if counterpart_open_id:
+                    _upsert_lark_identity(conn, counterpart_open_id, seen_at=seen_at)
+                    _ensure_contact_for_identity(
+                        conn,
+                        counterpart_open_id,
+                        tenant_classification="unresolved",
+                        identity_type="user",
+                        seen_at=seen_at,
+                    )
                 if measurement:
                     _store_member_snapshot(
                         conn,

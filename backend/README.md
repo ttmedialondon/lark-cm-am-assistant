@@ -4,7 +4,7 @@
 
 它让 CM/AM 通过 Lark OAuth 授权后，同步自己当前可见的**群聊与私聊**：
 
-- 个人“消息提醒中心”只展示接入状态和最近检查时间；
+- 个人“消息提醒中心”展示接入状态、高置信度待确认达人候选和“我的达人（正式）”；
 - 个人页面不展示会话名称、成员人数或消息数量；
 - 完成新版授权后，加密保存消息正文，并由 owner 在内部管理台按 CM/AM 与会话筛选查看；同步时还会保存消息发送者的 Lark 身份元数据。
 
@@ -30,7 +30,7 @@ FastAPI + Jinja2 + HTMX + Tabler    ←→ PostgreSQL
 
 `app/main.py` 只处理网页和 OAuth；`app/worker.py` 作为独立进程领取 PostgreSQL 任务。历史回填不使用 FastAPI `BackgroundTasks`。
 
-个人页面不是会话管理台。首次回填和后续增量同步由独立 worker 自动完成：同一会话分页串行，不同会话和不同授权用户可在 PostgreSQL claim/租约保护下并发读取；公司级 `chat_messages` 以消息 ID 去重，因此多人看到同一群不会重复存储正文。
+个人页面不是会话管理台。它只向当前登录人展示推给自己的达人候选和已确认由自己负责的达人，不开放公司级目录或消息正文。首次回填和后续增量同步由独立 worker 自动完成：同一会话分页串行，不同会话和不同授权用户可在 PostgreSQL claim/租约保护下并发读取；公司级 `chat_messages` 以消息 ID 去重，因此多人看到同一群不会重复存储正文。
 
 ## 内部管理台
 
@@ -38,9 +38,11 @@ FastAPI + Jinja2 + HTMX + Tabler    ←→ PostgreSQL
 
 ### OpenAI 功能凭证
 
-仅 owner 可访问的 `/admin/ai` 当前只配置一个功能：`contact_assessment`（基于消息和 Lark 身份的联系人角色自动识别）。owner 会在此一次性粘贴该功能所属 OpenAI Project 的 service-account key；服务端会立即以独立加密域保存密钥，页面和审计记录都不会保留或显示明文，只显示必要的遮罩尾号。
+仅 owner 可访问的 `/admin/ai` 分别配置 `contact_assessment`（联系人角色识别）和 `contact_assignment`（达人负责人匹配）。owner 会为每个功能粘贴独立 OpenAI Project 的 service-account key；服务端会立即以独立加密域保存密钥，页面和审计记录都不会保留或显示明文，只显示必要的遮罩尾号。
 
-页面会展示 Project ID、模型、启用状态、自动确认阈值、密钥轮换状态和最近 AI 调用状态；空白密钥输入表示保留当前密钥，替换输入即轮换，关闭功能不必删除配置。浏览器不会直接请求 OpenAI，也不会保存 OpenAI Organization Admin Key。联系人首次拥有一条仍有效授权范围内的消息正文时，会进入持久化 PostgreSQL 队列；任务全局串行且两次启动至少相隔 3 秒，使用最多 17 条消息片段、约 8,000 个正文字符，群名仅随命中消息发送一次，使用 `store: false` 和严格 JSON Schema，保存角色建议、置信度和消息引用而不保存 Prompt 或模型自由文本。证据包不带组织名称、组织映射或组织候选；群名不能成为角色事实。90% 及以上、单一、无冲突且有直接互动或本人自述依据的建议才会自动确认；其余建议保留在对应外部联系人的详情中，由 owner 核对后逐项处理。已有已确认主类别的联系人会在入队、调用模型前和写入结果前被排除。完整运行口径见 [`contact-assessment-automatic-v0.2.md`](../docs/as-built/contact-assessment-automatic-v0.2.md)。
+页面会展示 Project ID、模型、启用状态、对应置信度阈值、密钥轮换状态和最近 AI 调用状态；空白密钥输入表示保留当前密钥，替换输入即轮换，关闭功能不必删除配置。浏览器不会直接请求 OpenAI，也不会保存 OpenAI Organization Admin Key。联系人首次拥有一条仍有效授权范围内的消息正文时，会进入持久化 PostgreSQL 队列；任务全局串行且两次启动至少相隔 3 秒，使用最多 17 条消息片段、约 8,000 个正文字符，群名仅随命中消息发送一次，使用 `store: false` 和严格 JSON Schema，保存角色建议、置信度和消息引用而不保存 Prompt 或模型自由文本。证据包不带组织名称、组织映射或组织候选；群名不能成为角色事实。90% 及以上、单一、无冲突且有直接互动或本人自述依据的建议才会自动确认；其余建议保留在对应外部联系人的详情中，由 owner 核对后逐项处理。已有已确认主类别的联系人会在入队、调用模型前和写入结果前被排除。完整运行口径见 [`contact-assessment-automatic-v0.2.md`](../docs/as-built/contact-assessment-automatic-v0.2.md)。
+
+负责人匹配只针对尚无负责人的已确认达人。AI 不直接写负责人关系：达到负责人“候选推送阈值”（默认 90%）的建议会显示在被建议 CM/AM 的个人首页，由本人确认后写入正式关系并进入“我的达人（正式）”。完整口径见 [`contact-assignment-automatic-v0.1.md`](../docs/as-built/contact-assignment-automatic-v0.1.md)。
 
 ### Lark 关联组织（可选增强）
 

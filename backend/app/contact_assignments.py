@@ -36,19 +36,7 @@ AUTOMATIC_RETRY_COOLDOWN_MINUTES = 15
 ROLE_WATERMARK_OVERLAP_MINUTES = 5
 # Below this, a model suggestion is not useful manual-review work.
 MANUAL_REVIEW_CONFIDENCE_FLOOR = 0.70
-# A model score is not calibrated until the owner has supplied enough current,
-# manually confirmed examples to evaluate it against. This is a safety gate,
-# not a claim that calibration has already happened.
-CALIBRATION_MINIMUM_LABELS = 30
-MINIMUM_AUTOMATIC_CANDIDATES = 2
 MODEL_DECISIONS = {"assign", "needs_review", "unassigned"}
-
-AUTOMATIC_BLOCKER_LABELS = {
-    "candidate_pool_insufficient": "候选负责人不足 2 人",
-    "candidate_pool_incomplete": "候选负责人未完整覆盖",
-    "no_strong_cited_evidence": "缺少 P2P 或明确回复 / @ 证据",
-    "calibration_not_ready": "人工负责人样本不足 30 条，尚未完成校准准备",
-}
 
 STATUS_LABELS = {
     "queued": "等待判定",
@@ -103,18 +91,6 @@ def assignment_available() -> bool:
     except psycopg.Error:
         return False
     return bool(row and row["enabled"] and row["provider"].casefold() == "openai" and row["api_key_ciphertext"])
-
-
-def assignment_safety_status() -> dict[str, int | bool]:
-    """Return the small, non-sensitive gate state shown to the owner."""
-
-    with connection() as conn:
-        manual_label_count = _manual_calibration_label_count_in(conn)
-    return {
-        "manual_label_count": manual_label_count,
-        "minimum_manual_labels": CALIBRATION_MINIMUM_LABELS,
-        "calibration_ready": manual_label_count >= CALIBRATION_MINIMUM_LABELS,
-    }
 
 
 def queue_eligible_contact_assignments() -> int:
@@ -471,8 +447,196 @@ def latest_contact_assignment_assessment(contact_id: UUID | str) -> dict[str, An
         "error_label": row.get("error_message") or "",
         "candidate_name": candidate["display_name"] if candidate else "",
         "confidence_label": _confidence_label(result.get("confidence")),
-        "automatic_blocker_labels": _automatic_blocker_labels(result),
     }
+
+
+def creator_workbench(authorization_id: UUID | str) -> dict[str, list[dict[str, str]]]:
+    """Return one CM/AM's actionable suggestions and confirmed creators."""
+
+    authorization_id = _as_uuid(authorization_id, "负责人")
+    with connection() as conn:
+        pending_rows = conn.execute(
+            """
+            WITH latest_assessment AS (
+                SELECT DISTINCT ON (assessment.contact_id)
+                    assessment.id, assessment.contact_id, assessment.status, assessment.outcome,
+                    assessment.result, assessment.created_at, assessment.finished_at
+                FROM contact_assignment_assessments assessment
+                WHERE assessment.policy_version = %s
+                ORDER BY assessment.contact_id, assessment.created_at DESC, assessment.id DESC
+            )
+            SELECT
+                latest.id AS assessment_id,
+                contact.display_name,
+                latest.result ->> 'confidence' AS confidence,
+                COALESCE(latest.finished_at, latest.created_at) AS suggested_at
+            FROM latest_assessment latest
+            JOIN contacts contact ON contact.id = latest.contact_id
+            JOIN contact_roles role
+              ON role.contact_id = contact.id
+             AND role.role = 'creator' AND role.status = 'confirmed' AND role.is_primary
+            JOIN authorizations actor
+              ON actor.id = %s AND actor.status = 'active'
+             AND actor.body_consent_at IS NOT NULL AND actor.assignment_eligible
+            JOIN ai_feature_configs config ON config.feature = %s
+            WHERE latest.status = 'succeeded'
+              AND latest.outcome = 'review_required'
+              AND latest.result ->> 'decision' IN ('assign', 'needs_review')
+              AND jsonb_typeof(latest.result -> 'confidence') = 'number'
+              AND (latest.result ->> 'confidence')::numeric >= config.auto_confirm_threshold
+              AND latest.result -> 'candidate_aliases'
+                    ->> (latest.result ->> 'candidate') = actor.id::text
+              AND NOT EXISTS (
+                  SELECT 1 FROM contact_assignments assignment
+                  WHERE assignment.contact_id = latest.contact_id AND assignment.ended_at IS NULL
+            )
+            ORDER BY COALESCE(latest.finished_at, latest.created_at) DESC, latest.id DESC
+            """,
+            (POLICY_VERSION, authorization_id, FEATURE),
+        ).fetchall()
+        creator_rows = conn.execute(
+            """
+            SELECT contact.display_name, assignment.started_at
+            FROM contact_assignments assignment
+            JOIN contacts contact ON contact.id = assignment.contact_id
+            JOIN contact_roles role
+              ON role.contact_id = contact.id
+             AND role.role = 'creator' AND role.status = 'confirmed' AND role.is_primary
+            WHERE assignment.responsible_authorization_id = %s
+              AND assignment.ended_at IS NULL
+            ORDER BY assignment.started_at DESC, assignment.id DESC
+            """,
+            (authorization_id,),
+        ).fetchall()
+    return {
+        "pending_candidates": [
+            {
+                "assessment_id": str(row["assessment_id"]),
+                "display_name": row.get("display_name") or "未命名达人",
+                "confidence_label": _confidence_label(row.get("confidence")),
+                "suggested_at_label": _time_label(row.get("suggested_at"), "时间未知"),
+            }
+            for row in pending_rows
+        ],
+        "confirmed_creators": [
+            {
+                "display_name": row.get("display_name") or "未命名达人",
+                "started_at_label": _time_label(row.get("started_at"), "时间未知"),
+            }
+            for row in creator_rows
+        ],
+    }
+
+
+def confirm_suggested_assignment(actor_id: UUID | str, assessment_id: UUID | str) -> dict[str, str]:
+    """Let the suggested CM/AM accept the latest owner match exactly once."""
+
+    actor_id = _as_uuid(actor_id, "负责人")
+    assessment_id = _as_uuid(assessment_id, "负责人建议")
+    for attempt in range(3):
+        try:
+            return _confirm_suggested_assignment_once(actor_id, assessment_id)
+        except psycopg.errors.DeadlockDetected as exc:
+            if attempt == 2:
+                raise ContactAssignmentInputError("达人数据正在同步，请稍后重新确认。") from exc
+    raise AssertionError("unreachable")
+
+
+def _confirm_suggested_assignment_once(actor_id: UUID, assessment_id: UUID) -> dict[str, str]:
+    with connection() as conn, conn.transaction():
+        assessment = conn.execute(
+            """
+            SELECT id, contact_id, status, outcome, policy_version, result
+            FROM contact_assignment_assessments
+            WHERE id = %s
+            FOR UPDATE
+            """,
+            (assessment_id,),
+        ).fetchone()
+        if (
+            not assessment
+            or assessment["policy_version"] != POLICY_VERSION
+            or assessment["status"] != "succeeded"
+            or assessment["outcome"] != "review_required"
+        ):
+            raise ContactAssignmentInputError("该负责人建议当前不能确认。")
+
+        result = _json_object(assessment.get("result"))
+        if result.get("decision") not in {"assign", "needs_review"} or _candidate_id(result) != actor_id:
+            raise ContactAssignmentInputError("该负责人建议不属于当前用户。")
+
+        contact_id = assessment["contact_id"]
+        # The queue takes this same row lock before inserting assessments. Holding
+        # it makes the latest-result check stable until this confirmation commits.
+        config = conn.execute(
+            "SELECT auto_confirm_threshold FROM ai_feature_configs WHERE feature = %s FOR UPDATE",
+            (FEATURE,),
+        ).fetchone()
+        if not config:
+            raise ContactAssignmentInputError("负责人匹配尚未配置。")
+        latest = conn.execute(
+            """
+            SELECT id
+            FROM contact_assignment_assessments
+            WHERE contact_id = %s AND policy_version = %s
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (contact_id, POLICY_VERSION),
+        ).fetchone()
+        if not latest or latest["id"] != assessment_id:
+            raise ContactAssignmentInputError("该负责人建议已不是最新结果。")
+
+        _lock_assignment_confirmation_rows_in(conn, contact_id, actor_id, assessment_id)
+        if not _is_assignable_in(conn, contact_id, actor_id):
+            raise ContactAssignmentInputError("当前用户不再是可分配的 CM/AM。")
+        if not _refs_are_still_authorized_in(conn, assessment_id):
+            raise ContactAssignmentInputError("建议证据已不在当前授权范围内。")
+
+        current = conn.execute(
+            """
+            SELECT responsible_authorization_id
+            FROM contact_assignments
+            WHERE contact_id = %s AND ended_at IS NULL
+            FOR UPDATE
+            """,
+            (contact_id,),
+        ).fetchone()
+        if current:
+            if current["responsible_authorization_id"] == actor_id:
+                return {"contact_id": str(contact_id), "status": "unchanged"}
+            raise ContactAssignmentInputError("该达人已有其他负责人。")
+
+        try:
+            confidence = _confidence(result.get("confidence"))
+        except _ModelOutputError as exc:
+            raise ContactAssignmentInputError("该负责人建议缺少有效置信度。") from exc
+        if confidence < _candidate_push_threshold(config):
+            raise ContactAssignmentInputError("该负责人建议置信度不足。")
+        if not _confirmed_creator_in(conn, contact_id):
+            raise ContactAssignmentInputError("该联系人已不是已确认达人。")
+
+        conn.execute(
+            """
+            INSERT INTO contact_assignments (
+                id, contact_id, responsible_authorization_id, source,
+                confidence, assessment_id, created_by_authorization_id
+            ) VALUES (%s, %s, %s, 'manual', %s, %s, %s)
+            """,
+            (uuid4(), contact_id, actor_id, confidence, assessment_id, actor_id),
+        )
+        _audit(
+            conn,
+            actor_id,
+            "contact_assignment_suggestion_confirmed",
+            {
+                "assessment_id": str(assessment_id),
+                "contact_id": str(contact_id),
+                "responsible_authorization_id": str(actor_id),
+                "confidence": f"{confidence:.3f}",
+            },
+        )
+    return {"contact_id": str(contact_id), "status": "assigned"}
 
 
 def active_assignment(contact_id: UUID | str) -> dict[str, Any] | None:
@@ -511,10 +675,7 @@ def assignable_authorizations(contact_id: UUID | str) -> list[dict[str, str]]:
     contact_id = _as_uuid(contact_id, "达人")
     with connection() as conn:
         rows = _assignable_authorizations_in(conn, contact_id)
-    return [
-        {"id": str(row["id"]), "display_name": row["display_name"]}
-        for row in rows
-    ]
+    return [{"id": str(row["id"]), "display_name": row["display_name"]} for row in rows]
 
 
 def manually_assign(
@@ -637,11 +798,6 @@ def _run(job: Mapping[str, Any], settings: Settings) -> None:
                     "confidence": 0.0,
                     "evidence_refs": [],
                     "candidate_aliases": {},
-                    "evidence_policy": {
-                        "candidate_pool_total": evidence["candidate_pool_total"],
-                        "candidate_pool_considered": 0,
-                        "strong_cited": False,
-                    },
                 },
                 outcome="no_action",
             )
@@ -655,19 +811,11 @@ def _run(job: Mapping[str, Any], settings: Settings) -> None:
                 _finish(assessment_id, "cancelled", "达人已有负责人或不再是已确认达人；未向模型发送消息内容。")
                 return
         response = _call_model(config, api_key, evidence["pack"], job["contact_id"], evidence["aliases"])
-        result = _validate_model_result(
-            response["text"], set(evidence["aliases"]), evidence["label_evidence"]
-        )
+        result = _validate_model_result(response["text"], set(evidence["aliases"]), evidence["label_evidence"])
         result["candidate_aliases"] = {alias: str(value["id"]) for alias, value in evidence["aliases"].items()}
-        result["evidence_policy"] = {
-            "candidate_pool_total": evidence["candidate_pool_total"],
-            "candidate_pool_considered": len(evidence["aliases"]),
-            "strong_cited": _has_strong_cited_interaction(result, evidence["label_evidence"]),
-        }
         if _finish_with_decision(
             assessment_id,
             job["contact_id"],
-            config,
             result=result,
             model=config["model"],
             response_id=response.get("response_id"),
@@ -1161,6 +1309,17 @@ def _message_text(cipher, ciphertext: str | None) -> str:
 
 def _save_refs(assessment_id: UUID, evidence: Mapping[str, Any]) -> None:
     with connection() as conn, conn.transaction():
+        current = conn.execute(
+            """
+            SELECT id
+            FROM contact_assignment_assessments
+            WHERE id = %s AND status = 'running'
+            FOR UPDATE
+            """,
+            (assessment_id,),
+        ).fetchone()
+        if not current:
+            return
         conn.execute("DELETE FROM contact_assignment_assessment_refs WHERE assessment_id = %s", (assessment_id,))
         for ref in evidence["refs"]:
             conn.execute(
@@ -1260,8 +1419,8 @@ best candidate is plausible but the evidence is not decisive. Use `unassigned`
 with candidate `none` when the evidence cannot support a responsible person.
 Never invent IDs, quotes, facts, or references. Every `assign` or `needs_review`
 decision must cite at least one creator M reference and one CM/AM M reference for
-that same candidate. Return no explanation or free text; the owner makes manual
-handover decisions separately."""
+that same candidate. Return no explanation or free text; the selected CM/AM must
+confirm a new assignment, and the owner manages later handovers separately."""
 
 
 def _validate_model_result(
@@ -1296,28 +1455,9 @@ def _validate_model_result(
     }
 
 
-def _has_strong_cited_interaction(
-    result: Mapping[str, Any], label_evidence: Mapping[str, Mapping[str, Any]]
-) -> bool:
-    """Require both sides of one cited interaction to be direct evidence."""
-
-    candidate = result.get("candidate")
-    strong_speakers: dict[str, set[str]] = {}
-    for ref in result.get("evidence_refs", []):
-        evidence = label_evidence.get(ref)
-        if not evidence or evidence.get("candidate") != candidate or evidence.get("strength") != "strong":
-            continue
-        interaction = evidence.get("interaction")
-        speaker = evidence.get("speaker")
-        if isinstance(interaction, str) and isinstance(speaker, str):
-            strong_speakers.setdefault(interaction, set()).add(speaker)
-    return any(speakers == {"creator", "cm_am"} for speakers in strong_speakers.values())
-
-
 def _finish_with_decision(
     assessment_id: UUID,
     contact_id: UUID,
-    config: Mapping[str, Any],
     *,
     result: Mapping[str, Any],
     model: str,
@@ -1363,30 +1503,7 @@ def _finish_with_decision(
 
         stored_result = dict(result)
         candidate_id = _candidate_id(stored_result)
-        threshold = _auto_confirm_threshold(config)
-        automatic_confirmation = _automatic_confirmation_policy(conn, stored_result, candidate_id)
-        stored_result["automatic_confirmation"] = automatic_confirmation
-        auto_assign = (
-            stored_result["decision"] == "assign"
-            and candidate_id is not None
-            and float(stored_result["confidence"]) >= threshold
-            and _is_assignable_in(conn, contact_id, candidate_id)
-            and not automatic_confirmation["blockers"]
-        )
-        if auto_assign:
-            conn.execute(
-                """
-                INSERT INTO contact_assignments (
-                    id, contact_id, responsible_authorization_id, source, confidence, assessment_id
-                ) VALUES (%s, %s, %s, 'ai', %s, %s)
-                """,
-                (uuid4(), contact_id, candidate_id, stored_result["confidence"], assessment_id),
-            )
-            outcome = "auto_assigned"
-        elif _requires_manual_review(stored_result, candidate_id):
-            outcome = "review_required"
-        else:
-            outcome = "no_action"
+        outcome = "review_required" if _requires_manual_review(stored_result, candidate_id) else "no_action"
         _finish_in(
             conn,
             assessment_id,
@@ -1402,13 +1519,11 @@ def _finish_with_decision(
         _audit(
             conn,
             None,
-            "contact_assignment_auto_assigned" if outcome == "auto_assigned" else "contact_assignment_review_ready",
+            "contact_assignment_review_ready" if outcome == "review_required" else "contact_assignment_no_action",
             {
                 "assessment_id": str(assessment_id),
                 "contact_id": str(contact_id),
                 "outcome": outcome,
-                "threshold": f"{threshold:.3f}",
-                "automatic_blockers": ",".join(automatic_confirmation["blockers"]),
             },
         )
     return True
@@ -1450,6 +1565,82 @@ def _refs_are_still_authorized_in(conn: psycopg.Connection, assessment_id: UUID)
         and row["all_count"] == row["expected_count"]
         and row["allowed_count"] == row["expected_count"]
     )
+
+
+def _lock_assignment_confirmation_rows_in(
+    conn: psycopg.Connection,
+    contact_id: UUID,
+    actor_id: UUID,
+    assessment_id: UUID,
+) -> None:
+    """Lock mutable confirmation inputs in the sync writer's order."""
+
+    conn.execute(
+        """
+        SELECT auth.id
+        FROM authorizations auth
+        WHERE auth.id = %s
+           OR EXISTS (
+               SELECT 1
+               FROM contact_assignment_assessment_refs reference
+               WHERE reference.assessment_id = %s
+                 AND auth.id IN (reference.authorization_id, reference.candidate_authorization_id)
+           )
+        ORDER BY auth.id
+        FOR UPDATE OF auth
+        """,
+        (actor_id, assessment_id),
+    ).fetchall()
+    conn.execute(
+        """
+        SELECT access.authorization_id, access.chat_id
+        FROM authorization_chats access
+        JOIN contact_assignment_assessment_refs reference
+          ON reference.authorization_id = access.authorization_id AND reference.chat_id = access.chat_id
+        WHERE reference.assessment_id = %s
+        ORDER BY access.authorization_id, access.chat_id, reference.label
+        FOR UPDATE OF access
+        """,
+        (assessment_id,),
+    ).fetchall()
+    _lock_contact(conn, contact_id)
+    conn.execute(
+        """
+        SELECT message.chat_id, message.message_id
+        FROM chat_messages message
+        JOIN contact_assignment_assessment_refs reference
+          ON reference.chat_id = message.chat_id AND reference.message_id = message.message_id
+        WHERE reference.assessment_id = %s
+        ORDER BY message.chat_id, message.message_id, reference.label
+        FOR UPDATE OF message
+        """,
+        (assessment_id,),
+    ).fetchall()
+    conn.execute(
+        """
+        SELECT observation.authorization_id, observation.chat_id, observation.message_id
+        FROM authorization_message_observations observation
+        JOIN contact_assignment_assessment_refs reference
+          ON reference.authorization_id = observation.authorization_id
+         AND reference.chat_id = observation.chat_id
+         AND reference.message_id = observation.message_id
+        WHERE reference.assessment_id = %s
+        ORDER BY observation.authorization_id, observation.chat_id,
+                 observation.message_id, reference.label
+        FOR UPDATE OF observation
+        """,
+        (assessment_id,),
+    ).fetchall()
+    conn.execute(
+        """
+        SELECT reference.label
+        FROM contact_assignment_assessment_refs reference
+        WHERE reference.assessment_id = %s
+        ORDER BY reference.label
+        FOR UPDATE OF reference
+        """,
+        (assessment_id,),
+    ).fetchall()
 
 
 def _finish(
@@ -1603,66 +1794,18 @@ def _is_assignable_in(conn: psycopg.Connection, contact_id: UUID, authorization_
     return bool(row and row["assignable"])
 
 
-def _manual_calibration_label_count_in(conn: psycopg.Connection) -> int:
-    row = conn.execute(
-        """
-        SELECT COUNT(DISTINCT contact_id)::integer AS manual_label_count
-        FROM contact_assignments
-        WHERE source = 'manual' AND ended_at IS NULL
-        """
-    ).fetchone()
-    return _nonnegative_int(row["manual_label_count"] if row else 0)
-
-
-def _automatic_confirmation_policy(
-    conn: psycopg.Connection, result: Mapping[str, Any], candidate_id: UUID | None
-) -> dict[str, Any]:
-    """Apply non-model safety gates before any AI result becomes a business fact."""
-
-    evidence_policy = _json_object(result.get("evidence_policy"))
-    candidate_pool_total = _nonnegative_int(evidence_policy.get("candidate_pool_total"))
-    candidate_pool_considered = _nonnegative_int(evidence_policy.get("candidate_pool_considered"))
-    manual_label_count = _manual_calibration_label_count_in(conn)
-    blockers: list[str] = []
-    if candidate_id is not None:
-        if candidate_pool_total < MINIMUM_AUTOMATIC_CANDIDATES:
-            blockers.append("candidate_pool_insufficient")
-        elif candidate_pool_considered < candidate_pool_total:
-            blockers.append("candidate_pool_incomplete")
-        if not evidence_policy.get("strong_cited"):
-            blockers.append("no_strong_cited_evidence")
-        if manual_label_count < CALIBRATION_MINIMUM_LABELS:
-            blockers.append("calibration_not_ready")
-    return {
-        "candidate_pool_total": candidate_pool_total,
-        "candidate_pool_considered": candidate_pool_considered,
-        "strong_cited": bool(evidence_policy.get("strong_cited")),
-        "manual_label_count": manual_label_count,
-        "minimum_manual_labels": CALIBRATION_MINIMUM_LABELS,
-        "blockers": blockers,
-    }
-
-
-def _automatic_blocker_labels(result: Mapping[str, Any]) -> list[str]:
-    policy = _json_object(result.get("automatic_confirmation"))
-    codes = policy.get("blockers")
-    if not isinstance(codes, list):
-        return []
-    return [AUTOMATIC_BLOCKER_LABELS[code] for code in codes if code in AUTOMATIC_BLOCKER_LABELS]
-
-
 def _lock_contact(conn: psycopg.Connection, contact_id: UUID) -> None:
     if not conn.execute("SELECT 1 FROM contacts WHERE id = %s FOR UPDATE", (contact_id,)).fetchone():
         raise ContactAssignmentInputError("未找到该达人。")
 
 
-def _auto_confirm_threshold(config: Mapping[str, Any]) -> float:
+def _candidate_push_threshold(config: Mapping[str, Any]) -> float:
     try:
         threshold = float(config.get("auto_confirm_threshold", DEFAULT_AUTO_CONFIRM_THRESHOLD))
     except (TypeError, ValueError) as exc:
-        raise ContactAssignmentInputError("自动确认阈值无效；请在 AI 功能配置中重新保存。") from exc
+        raise ContactAssignmentInputError("候选推送阈值无效；请在 AI 功能配置中重新保存。") from exc
     if not 0.9 <= threshold <= 1:
-        raise ContactAssignmentInputError("自动确认阈值无效；请在 AI 功能配置中重新保存。")
+        raise ContactAssignmentInputError("候选推送阈值无效；请在 AI 功能配置中重新保存。")
     return threshold
 
 

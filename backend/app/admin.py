@@ -49,7 +49,7 @@ AI_FEATURES = {
     },
     "contact_assignment": {
         "title": "达人负责人匹配",
-        "description": "只在达人尚无负责人时，根据直接互动生成一位 CM/AM 建议；不会自动交接。",
+        "description": "只在达人尚无负责人时，根据直接互动生成一位 CM/AM 建议；由被建议人确认后生效。",
         "enabled_label": "启用负责人匹配",
     },
 }
@@ -222,7 +222,6 @@ def create_admin_router(
             {
                 **page_context(access_context, "ai"),
                 "configs": configs,
-                "assignment_safety": contact_assignments.assignment_safety_status(),
                 "ai_dispatch": dispatch_status,
                 # Retain this template-safe alias while external callers migrate to ``configs``.
                 "config": configs[0]["config"],
@@ -378,6 +377,12 @@ def create_admin_router(
             )
         enabled = form.get("enabled") == "1"
         with connection() as conn, conn.transaction():
+            if enabled:
+                # Match candidate confirmation's config -> authorization lock order.
+                conn.execute(
+                    "SELECT feature FROM ai_feature_configs WHERE feature = %s FOR UPDATE",
+                    (contact_assignments.FEATURE,),
+                ).fetchone()
             user = conn.execute(
                 """
                 UPDATE authorizations

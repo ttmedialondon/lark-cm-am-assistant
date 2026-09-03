@@ -18,7 +18,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .admin import create_admin_router
+from . import admin, contact_assignments
 from .admin_reporting import admin_role_for, sync_summary
 from .config import get_settings
 from .crypto import TokenCipher
@@ -248,9 +248,16 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
 def dashboard(request: Request):
     authorization = _current_authorization(request)
     if not authorization:
-        return RedirectResponse(url="/", status_code=303)
+        response = RedirectResponse(url="/", status_code=303)
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
     stats = _dashboard_stats(authorization["id"])
-    return _template(
+    creator_workbench = (
+        contact_assignments.creator_workbench(authorization["id"])
+        if authorization["status"] == "active"
+        else {"pending_candidates": [], "confirmed_creators": []}
+    )
+    response = _template(
         request,
         "dashboard.html",
         {
@@ -258,8 +265,49 @@ def dashboard(request: Request):
             "admin_role": admin_role_for(authorization["id"]),
             "stats": stats,
             "body_consent": bool(authorization["body_consent_at"]),
+            "creator_workbench": creator_workbench,
+            "csrf_token": _admin_csrf_token(authorization),
         },
     )
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
+
+
+@app.post("/dashboard/creator-candidates/{assessment_id}/confirm")
+async def confirm_creator_candidate(request: Request, assessment_id: uuid.UUID):
+    authorization = _current_authorization(request)
+    if not authorization:
+        response = RedirectResponse(url="/", status_code=303)
+    elif authorization["status"] != "active":
+        response = _template(
+            request,
+            "error.html",
+            {"title": "当前授权不可用", "detail": "请重新完成 Lark 授权后再确认负责人关系。"},
+            403,
+        )
+    else:
+        form = await admin._form_fields(request)
+        if not admin._csrf_matches(form, _admin_csrf_token(authorization)):
+            response = _template(
+                request,
+                "error.html",
+                {"title": "请求校验失败", "detail": "请返回消息提醒中心后重试。"},
+                400,
+            )
+        else:
+            try:
+                contact_assignments.confirm_suggested_assignment(authorization["id"], assessment_id)
+            except contact_assignments.ContactAssignmentInputError as exc:
+                response = _template(
+                    request,
+                    "error.html",
+                    {"title": "无法确认达人", "detail": str(exc)},
+                    409,
+                )
+            else:
+                response = RedirectResponse(url="/dashboard", status_code=303)
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
 
 
 @app.get("/dashboard/stats")
@@ -449,7 +497,7 @@ def _admin_csrf_token(authorization: dict[str, Any]) -> str:
 
 
 app.include_router(
-    create_admin_router(
+    admin.create_admin_router(
         current_authorization=_current_authorization,
         render_template=_template,
         csrf_token=_admin_csrf_token,

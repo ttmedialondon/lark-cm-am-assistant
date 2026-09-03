@@ -12,6 +12,8 @@
 
 当前部署只写入一个 `owner`；其他已授权 CM/AM 不会自动获得管理台权限。Token、刷新 Token、App Secret 永不由管理台查询或展示。
 
+普通 CM/AM 不需要管理台角色即可在个人 `/dashboard` 查看 AI 高置信度推给自己的达人候选、确认由自己负责，并查看自己的正式达人列表。该入口不开放公司级人员目录或消息正文。
+
 `/admin/messages` 仅展示选定 CM/AM 在新版授权后重新观察到的会话消息。每次访问会写一条 `admin_message_content_viewed` 审计记录，记录查看者、目标授权用户和可选会话 ID，不保存正文。
 
 ## 数据模型
@@ -41,6 +43,7 @@ contacts ──< contact_assignments（仅达人：单一当前负责人 + 人�
 
 | 路径 | 内容 |
 |---|---|
+| `/dashboard` | 当前登录 CM/AM 的接入状态、高置信度待确认达人候选和“我的达人（正式）”；确认动作只允许接受推给当前用户的最新建议。 |
 | `/admin` | 有效授权人数、唯一群/私聊、去重消息、已加密正文，以及“接入进度与需要处理”。未来 5 分钟的定时 job 不计为活动任务。 |
 | `/admin/users` | 每位已授权 CM/AM 的单一接入阶段、群/私聊范围、首次回填进度和消息索引；不把私聊目录发现误当正文完成。 |
 | `/admin/users/{authorization_id}` | 某一授权用户的发现/可同步/已完成/等待进度、群/私聊分别的回填比例、当前可见会话与近期任务；owner 可明确标记该账号是否可担任达人负责人。 |
@@ -48,8 +51,8 @@ contacts ──< contact_assignments（仅达人：单一当前负责人 + 人�
 | `/admin/messages` | **仅 owner**：按 CM/AM、群/私聊、具体会话筛选，最近 100 条正文分页展示。 |
 | `/admin/contacts` | **仅 owner**：按稳定 Lark 身份查看所有人员；可按主类别和组织验证状态筛选，查看会话统计、组织关系与可核验的 AI 消息证据。 |
 | `/admin/creators` | **仅 owner**：查看已确认拥有 `creator` 角色的联系人及其稳定 Lark 身份。 |
-| `/admin/contacts/{open_id}`（达人） | **仅 owner**：显示唯一当前负责人、最近的 AI 匹配状态与建议；会明确展示候选覆盖、直接互动证据或校准样本造成的自动确认拦截；可人工确认或交接给另一位已接入 CM/AM。 |
-| `/admin/ai` | **仅 owner**：分别配置“联系人身份识别”和“达人负责人匹配”的 OpenAI Project / service-account key，并显示负责人匹配的人工校准样本进度。 |
+| `/admin/contacts/{open_id}`（达人） | **仅 owner**：显示唯一当前负责人和最近的 AI 匹配状态与建议；可人工确认或交接给另一位已接入 CM/AM。 |
+| `/admin/ai` | **仅 owner**：分别配置“联系人身份识别”和“达人负责人匹配”的 OpenAI Project / service-account key；负责人匹配阈值控制哪些建议会推送给对应 CM/AM。 |
 | `/admin/jobs` | 最近同步任务及不含敏感内容的运行统计。 |
 
 ## 当前同步参数
