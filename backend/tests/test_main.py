@@ -46,3 +46,27 @@ def test_dashboard_is_reminder_focused_and_transparent() -> None:
     assert "消息提醒中心" in rendered
     assert "权限与数据使用" in rendered
     assert "已同步消息总数" not in rendered
+
+
+def test_reauthorization_restarts_an_active_job_with_a_new_generation() -> None:
+    calls = []
+
+    class Result:
+        @staticmethod
+        def fetchone():
+            return {"id": "active-job"}
+
+    class Connection:
+        @staticmethod
+        def execute(query, params=None):
+            calls.append((query, params))
+            return Result()
+
+    assert main._queue_job(Connection(), "authorization-id", "backfill")
+
+    query, params = calls[0]
+    assert params == ("backfill", "authorization-id")
+    assert "mode = %s, status = 'queued'" in query
+    assert "discovery_status = 'pending'" in query
+    assert "discovery_generation = discovery_generation + 1" in query
+    assert "last_http_status = NULL" in query

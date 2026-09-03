@@ -1,3 +1,8 @@
+from contextlib import contextmanager
+
+import httpx
+import pytest
+
 from app.config import Settings
 from app.lark_api import LarkApiError, LarkClient
 
@@ -18,7 +23,6 @@ def settings() -> Settings:
         sync_interval_seconds=180,
         sync_overlap_seconds=600,
         member_count_refresh_seconds=86400,
-        max_pages_per_job=30,
         worker_idle_seconds=3,
     )
 
@@ -127,3 +131,44 @@ def test_trust_party_mapping_uses_a_short_lived_tenant_token(monkeypatch) -> Non
 
 def test_missing_app_scope_is_treated_as_an_authorization_problem() -> None:
     assert LarkApiError(400, 99991672, "scope missing").likely_auth_problem
+
+
+def test_rate_limit_pauses_shared_admission_gate() -> None:
+    events = []
+
+    class Admission:
+        @contextmanager
+        def request(self):
+            events.append("request")
+            try:
+                yield
+            finally:
+                events.append("release")
+
+        def pause(self, seconds):
+            events.append(("pause", seconds))
+
+    class HttpClient:
+        @staticmethod
+        def request(*_args, **_kwargs):
+            return httpx.Response(
+                429,
+                headers={"x-ogw-ratelimit-reset": "7"},
+                json={"code": 99991400, "msg": "rate limited"},
+            )
+
+    client = LarkClient(settings(), http_client=HttpClient(), admission=Admission())
+
+    with pytest.raises(LarkApiError) as raised:
+        client.list_chats("user-token")
+
+    assert raised.value.rate_limited
+    assert raised.value.retry_after == 7
+    assert events == ["request", ("pause", 7), "release"]
+
+
+def test_legacy_rate_limit_code_is_retryable_without_http_429() -> None:
+    error = LarkApiError(400, 99991400, "legacy rate limit")
+
+    assert error.rate_limited
+    assert error.retryable

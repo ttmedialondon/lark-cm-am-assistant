@@ -255,7 +255,8 @@ def overview() -> dict[str, Any]:
                 {CONVERSATION_COUNTS_SQL}
             ), latest_jobs AS (
                 SELECT DISTINCT ON (authorization_id)
-                    authorization_id, mode, status, scheduled_at, updated_at, pages_processed
+                    authorization_id, mode, status, scheduled_at, updated_at, pages_processed,
+                    chats_discovered, discovery_status, last_progress_at, last_http_status, last_error_code
                 FROM sync_jobs
                 ORDER BY authorization_id, created_at DESC
             )
@@ -281,7 +282,12 @@ def overview() -> dict[str, Any]:
                 j.status AS job_status,
                 j.scheduled_at AS job_scheduled_at,
                 j.updated_at AS job_updated_at,
-                j.pages_processed AS job_pages_processed
+                j.pages_processed AS job_pages_processed,
+                j.chats_discovered AS job_chats_discovered,
+                j.discovery_status AS job_discovery_status,
+                j.last_progress_at AS job_last_progress_at,
+                j.last_http_status AS job_last_http_status,
+                j.last_error_code AS job_last_error_code
             FROM authorizations a
             LEFT JOIN conversation_counts g ON g.authorization_id = a.id
             LEFT JOIN latest_jobs j ON j.authorization_id = a.id
@@ -306,6 +312,10 @@ def overview() -> dict[str, Any]:
                 j.pages_processed,
                 j.chats_discovered,
                 j.messages_indexed,
+                j.discovery_status,
+                j.last_progress_at,
+                j.last_http_status,
+                j.last_error_code,
                 j.created_at,
                 j.started_at,
                 j.finished_at,
@@ -318,6 +328,14 @@ def overview() -> dict[str, Any]:
             LIMIT 12
             """
         ).fetchall()
+        admission = conn.execute(
+            """
+            SELECT state.paused_until, state.last_rate_limited_at, state.rate_limited_count,
+                   (SELECT COUNT(*) FROM lark_sync_request_leases WHERE expires_at > NOW()) AS in_flight
+            FROM lark_sync_admission_state state
+            WHERE state.id
+            """
+        ).fetchone()
 
     metrics = (
         {
@@ -366,6 +384,7 @@ def overview() -> dict[str, Any]:
         "attention": [_decorate_user(row) for row in attention],
         "recent_jobs": [_decorate_job(row) for row in recent_jobs],
         "runtime": runtime_settings(),
+        "lark_admission": _decorate_lark_admission(admission),
     }
 
 
@@ -378,8 +397,14 @@ def runtime_settings() -> tuple[dict[str, str], ...]:
         {"label": "首次回填范围", "value": history},
         {"label": "增量同步周期", "value": _seconds_label(settings.sync_interval_seconds)},
         {"label": "增量重叠窗口", "value": _seconds_label(settings.sync_overlap_seconds)},
-        {"label": "每任务最大分页", "value": f"{settings.max_pages_per_job} 页"},
         {"label": "成员数刷新周期", "value": _seconds_label(settings.member_count_refresh_seconds)},
+        {"label": "Lark 全局并发", "value": f"{settings.lark_sync_max_inflight} 个请求"},
+        {
+            "label": "单人会话并发上限",
+            "value": f"{settings.lark_sync_per_authorization_max_inflight} 个（仅一人积压时可使用全部槽位）",
+        },
+        {"label": "Lark 全局请求速率", "value": f"{settings.lark_sync_requests_per_second} 请求 / 秒"},
+        {"label": "成员目录优先级", "value": "消息回填空闲后，以 1 个低优先级槽位刷新"},
     )
 
 
@@ -410,7 +435,8 @@ def users(page: int = 1) -> dict[str, Any]:
                 GROUP BY o.authorization_id
             ), latest_jobs AS (
                 SELECT DISTINCT ON (authorization_id)
-                    authorization_id, mode, status, scheduled_at, updated_at, pages_processed
+                    authorization_id, mode, status, scheduled_at, updated_at, pages_processed,
+                    chats_discovered, discovery_status, last_progress_at, last_http_status, last_error_code
                 FROM sync_jobs
                 ORDER BY authorization_id, created_at DESC
             )
@@ -442,7 +468,12 @@ def users(page: int = 1) -> dict[str, Any]:
                 j.status AS job_status,
                 j.scheduled_at AS job_scheduled_at,
                 j.updated_at AS job_updated_at,
-                j.pages_processed AS job_pages_processed
+                j.pages_processed AS job_pages_processed,
+                j.chats_discovered AS job_chats_discovered,
+                j.discovery_status AS job_discovery_status,
+                j.last_progress_at AS job_last_progress_at,
+                j.last_http_status AS job_last_http_status,
+                j.last_error_code AS job_last_error_code
             FROM authorizations a
             LEFT JOIN admin_roles r ON r.authorization_id = a.id AND r.is_active
             LEFT JOIN conversation_counts g ON g.authorization_id = a.id
@@ -481,7 +512,8 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
                 GROUP BY o.authorization_id
             ), latest_jobs AS (
                 SELECT DISTINCT ON (authorization_id)
-                    authorization_id, mode, status, scheduled_at, updated_at, pages_processed
+                    authorization_id, mode, status, scheduled_at, updated_at, pages_processed,
+                    chats_discovered, discovery_status, last_progress_at, last_http_status, last_error_code
                 FROM sync_jobs
                 WHERE authorization_id = %s
                 ORDER BY authorization_id, created_at DESC
@@ -514,7 +546,12 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
                 j.status AS job_status,
                 j.scheduled_at AS job_scheduled_at,
                 j.updated_at AS job_updated_at,
-                j.pages_processed AS job_pages_processed
+                j.pages_processed AS job_pages_processed,
+                j.chats_discovered AS job_chats_discovered,
+                j.discovery_status AS job_discovery_status,
+                j.last_progress_at AS job_last_progress_at,
+                j.last_http_status AS job_last_http_status,
+                j.last_error_code AS job_last_error_code
             FROM authorizations a
             LEFT JOIN admin_roles r ON r.authorization_id = a.id AND r.is_active
             LEFT JOIN conversation_counts g ON g.authorization_id = a.id
@@ -562,7 +599,17 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
                 c.chat_mode,
                 ac.member_count,
                 ac.member_count_status,
+                ac.member_snapshot_status,
+                ac.member_snapshot_checked_at,
+                ac.member_snapshot_retry_at,
+                (ac.member_snapshot_claim_id IS NOT NULL AND ac.member_snapshot_lease_until > NOW())
+                    AS member_snapshot_in_flight,
                 ac.sync_status,
+                ac.backfill_complete,
+                ac.backfill_started_at,
+                ac.page_retry_at,
+                (ac.backfill_page_token IS NOT NULL) AS backfill_has_next_page,
+                (ac.incremental_page_token IS NOT NULL) AS incremental_has_next_page,
                 ac.last_backfill_at,
                 ac.last_incremental_at,
                 COUNT(o.message_id) FILTER (WHERE NOT m.is_deleted) AS message_count
@@ -576,7 +623,11 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
               AND COALESCE(c.chat_status, 'normal') = 'normal'
             GROUP BY
                 ac.authorization_id, ac.chat_id, ac.member_count, ac.member_count_status,
-                ac.sync_status,
+                ac.member_snapshot_status, ac.member_snapshot_checked_at, ac.member_snapshot_retry_at,
+                ac.member_snapshot_claim_id, ac.member_snapshot_lease_until,
+                ac.sync_status, ac.backfill_complete, ac.backfill_started_at,
+                ac.page_retry_at,
+                ac.backfill_page_token, ac.incremental_page_token,
                 ac.last_backfill_at, ac.last_incremental_at,
                 c.name, c.external, c.chat_mode
             ORDER BY LOWER(COALESCE(c.name, '')), ac.chat_id
@@ -589,7 +640,7 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
             SELECT
                 id, mode, status, pages_processed, chats_discovered, messages_indexed,
                 own_messages_indexed, attempts, created_at, started_at, finished_at,
-                scheduled_at, updated_at
+                scheduled_at, updated_at, discovery_status, last_progress_at, last_http_status, last_error_code
             FROM sync_jobs
             WHERE authorization_id = %s
             ORDER BY created_at DESC
@@ -710,6 +761,10 @@ def jobs(page: int = 1) -> dict[str, Any]:
                 j.chats_discovered,
                 j.messages_indexed,
                 j.own_messages_indexed,
+                j.discovery_status,
+                j.last_progress_at,
+                j.last_http_status,
+                j.last_error_code,
                 j.attempts,
                 j.created_at,
                 j.started_at,
@@ -1344,13 +1399,24 @@ def _decorate_user(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     item["display_name"] = item.get("display_name") or "未命名用户"
     item["message_count_label"] = _message_count_label(item.get("message_count"))
-    for field in ("authorized_at", "updated_at", "last_synced_at", "job_scheduled_at", "job_updated_at"):
+    for field in (
+        "authorized_at",
+        "updated_at",
+        "last_synced_at",
+        "job_scheduled_at",
+        "job_updated_at",
+        "job_last_progress_at",
+    ):
         item[f"{field}_label"] = _format_time(item.get(field))
     item["authorization_status_label"], item["authorization_status_badge"] = _authorization_status(
         item.get("authorization_status")
     )
     item["job_status_label"], item["job_status_badge"] = _job_status(
-        item.get("job_status"), item.get("job_mode"), item.get("job_scheduled_at")
+        item.get("job_status"),
+        item.get("job_mode"),
+        item.get("job_scheduled_at"),
+        item.get("job_last_http_status"),
+        item.get("job_last_error_code"),
     )
     item["content_access_label"] = "已完成新版授权" if item.get("body_consent_at") else "需新版授权"
     item["content_access_badge"] = "success" if item.get("body_consent_at") else "warning"
@@ -1376,6 +1442,8 @@ def _decorate_conversation_membership(row: dict[str, Any]) -> dict[str, Any]:
     item["sync_status_label"], item["sync_status_badge"] = _sync_status(item.get("sync_status"))
     item["last_synced_at_label"] = _format_time(item.get("last_incremental_at") or item.get("last_backfill_at"))
     item["message_count_label"] = _message_count_label(item.get("message_count"))
+    item["message_page_label"] = _message_page_activity(item)
+    item["member_snapshot_label"] = _member_snapshot_activity(item)
     return item
 
 
@@ -1465,12 +1533,21 @@ def _body_text_values(value: Any) -> list[str]:
 def _decorate_job(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     item["display_name"] = item.get("display_name") or "未命名用户"
-    for field in ("created_at", "started_at", "finished_at", "scheduled_at", "updated_at"):
+    for field in ("created_at", "started_at", "finished_at", "scheduled_at", "updated_at", "last_progress_at"):
         item[f"{field}_label"] = _format_time(item.get(field))
     item["mode_label"] = "首次回填" if item.get("mode") == "backfill" else "定时更新"
     item["status_label"], item["status_badge"] = _job_status(
-        item.get("status"), item.get("mode"), item.get("scheduled_at")
+        item.get("status"),
+        item.get("mode"),
+        item.get("scheduled_at"),
+        item.get("last_http_status"),
+        item.get("last_error_code"),
     )
+    item["discovery_label"] = {
+        "pending": "等待枚举会话",
+        "running": "正在枚举会话",
+        "succeeded": "会话目录已就绪",
+    }.get(item.get("discovery_status"), "目录状态未知")
     return item
 
 
@@ -1610,13 +1687,22 @@ def sync_summary(facts: dict[str, Any], *, now: datetime | None = None) -> tuple
     scheduled_at = facts.get("job_scheduled_at")
     current = now or datetime.now(UTC)
 
+    if job_status in {"queued", "running"} and _is_lark_rate_limited(
+        facts.get("job_last_http_status"), facts.get("job_last_error_code")
+    ):
+        return "Lark 限流暂停", "warning", "Lark 暂时要求降低请求速率；恢复后会自动继续。"
+
+    if job_status == "running" and facts.get("job_discovery_status") in {"pending", "running"}:
+        return "正在发现会话", "primary", "正在建立当前可见会话目录；消息回填会在目录完成后并发开始。"
+
     if total == 0:
         if job_status in {"queued", "running"}:
             return "正在发现会话", "primary", "正在从 Lark 建立可同步会话目录。"
         return "暂无可同步会话", "secondary", "Lark 尚未返回可同步的群聊或私聊。"
 
     if completed < total:
-        label = "首次同步中" if job_status == "running" else "等待首次同步"
+        delayed = job_status == "queued" and isinstance(scheduled_at, datetime) and scheduled_at > current
+        label = "首次同步中" if job_status == "running" else "等待会话重试" if delayed else "等待首次同步"
         parts = [f"已完成 {completed}/{total} 个可同步会话"]
         if syncing:
             parts.append(f"{syncing} 个正在读取")
@@ -1626,6 +1712,8 @@ def sync_summary(facts: dict[str, Any], *, now: datetime | None = None) -> tuple
             parts.append(f"{unreadable} 个 Lark 未允许读取")
         if archived:
             parts.append(f"另有 {archived} 个 Lark 已归档/解散会话不计划回填")
+        if delayed:
+            parts.append(f"下一次会话重试于 {_format_time(scheduled_at)}")
         return label, "primary", "；".join(parts) + "。"
 
     if unreadable:
@@ -1680,7 +1768,11 @@ def _job_status(
     value: str | None,
     mode: str | None = None,
     scheduled_at: datetime | None = None,
+    last_http_status: int | None = None,
+    last_error_code: int | None = None,
 ) -> tuple[str, str]:
+    if value in {"queued", "running"} and _is_lark_rate_limited(last_http_status, last_error_code):
+        return "Lark 限流暂停", "warning"
     if value == "queued" and mode == "incremental" and scheduled_at and scheduled_at > datetime.now(UTC):
         return "等待下一轮检查", "secondary"
     mapping = {
@@ -1692,6 +1784,10 @@ def _job_status(
         "cancelled": ("已取消", "secondary"),
     }
     return mapping.get(value or "", ("尚无任务", "secondary"))
+
+
+def _is_lark_rate_limited(http_status: Any, error_code: Any) -> bool:
+    return http_status == 429 or error_code == 99991400
 
 
 def _sync_status(value: str | None) -> tuple[str, str]:
@@ -1747,6 +1843,56 @@ def _member_count(count: int | None, status: str | None) -> str:
     if status == "pending":
         return "正在获取"
     return "Lark 未返回"
+
+
+def _message_page_activity(item: dict[str, Any]) -> str:
+    if item.get("sync_status") == "failed_retryable" and item.get("page_retry_at"):
+        return f"等待重试于 {_format_time(item.get('page_retry_at'))}"
+    if not item.get("backfill_complete"):
+        if item.get("sync_status") == "syncing":
+            return "正在读取当前消息页"
+        if item.get("backfill_has_next_page"):
+            return "等待续读下一页"
+        return "回填排队"
+    if item.get("incremental_has_next_page"):
+        return "正在读取增量页" if item.get("sync_status") == "syncing" else "等待增量续读"
+    return "本轮消息已完成"
+
+
+def _member_snapshot_activity(item: dict[str, Any]) -> str:
+    if item.get("chat_mode") == "p2p":
+        return "私聊不读取群成员目录"
+    if item.get("member_snapshot_in_flight"):
+        return "正在低优先刷新"
+    status = item.get("member_snapshot_status")
+    if status == "pending" and item.get("member_snapshot_retry_at"):
+        return f"等待重试于 {_format_time(item.get('member_snapshot_retry_at'))}"
+    if status == "succeeded":
+        return f"已刷新于 {_format_time(item.get('member_snapshot_checked_at'))}"
+    if status == "partial":
+        return "Lark 仅返回部分成员资料"
+    if status == "unavailable":
+        return "Lark 未返回成员目录"
+    return "等待消息回填空闲后刷新"
+
+
+def _decorate_lark_admission(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not row:
+        return None
+    item = dict(row)
+    paused_until = item.get("paused_until")
+    in_flight = int(item.get("in_flight") or 0)
+    if isinstance(paused_until, datetime) and paused_until > datetime.now(UTC):
+        return {
+            "label": "Lark 限流暂停中",
+            "badge": "warning",
+            "detail": f"全局请求将在 {_format_time(paused_until)} 后自动恢复；当前在途请求 {in_flight} 个。",
+        }
+    return {
+        "label": "Lark 请求调度正常",
+        "badge": "success",
+        "detail": f"当前在途请求 {in_flight} 个；累计限流恢复 {int(item.get('rate_limited_count') or 0)} 次。",
+    }
 
 
 def _message_count_label(count: int | None) -> str:

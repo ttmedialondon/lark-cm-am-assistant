@@ -168,3 +168,45 @@ def test_sync_summary_treats_future_incremental_work_as_a_schedule_not_a_queue()
 
     assert (label, badge) == ("已接入 · 定时同步", "success")
     assert "下一轮检查" in detail
+
+
+def test_sync_status_shows_both_current_lark_rate_limit_variants():
+    assert admin_reporting._job_status("running", last_http_status=429) == ("Lark 限流暂停", "warning")
+    assert admin_reporting._job_status("queued", last_error_code=99991400) == ("Lark 限流暂停", "warning")
+
+
+def test_member_snapshot_retry_is_distinct_from_the_daily_refresh_state():
+    label = admin_reporting._member_snapshot_activity(
+        {
+            "chat_mode": "group",
+            "member_snapshot_status": "pending",
+            "member_snapshot_retry_at": datetime(2026, 9, 3, 12, tzinfo=UTC),
+        }
+    )
+
+    assert label.startswith("等待重试于")
+
+
+def test_message_retry_is_shown_as_a_specific_delayed_conversation():
+    now = datetime(2026, 9, 3, 12, tzinfo=UTC)
+    label, badge, detail = admin_reporting.sync_summary(
+        {
+            "authorization_status": "active",
+            "syncable_conversation_count": 4,
+            "backfill_complete_count": 3,
+            "syncing_conversation_count": 0,
+            "waiting_conversation_count": 1,
+            "not_readable_conversation_count": 0,
+            "archived_conversation_count": 0,
+            "job_mode": "backfill",
+            "job_status": "queued",
+            "job_scheduled_at": now + timedelta(minutes=2),
+        },
+        now=now,
+    )
+
+    assert (label, badge) == ("等待会话重试", "primary")
+    assert "下一次会话重试于" in detail
+    assert admin_reporting._message_page_activity(
+        {"sync_status": "failed_retryable", "page_retry_at": now + timedelta(minutes=2)}
+    ).startswith("等待重试于")

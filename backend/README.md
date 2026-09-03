@@ -30,7 +30,7 @@ FastAPI + Jinja2 + HTMX + Tabler    ←→ PostgreSQL
 
 `app/main.py` 只处理网页和 OAuth；`app/worker.py` 作为独立进程领取 PostgreSQL 任务。历史回填不使用 FastAPI `BackgroundTasks`。
 
-个人页面不是会话管理台。首次回填和后续增量同步均由串行 worker 自动完成；公司级 `chat_messages` 以消息 ID 去重，因此多人看到同一群不会重复存储正文。
+个人页面不是会话管理台。首次回填和后续增量同步由独立 worker 自动完成：同一会话分页串行，不同会话和不同授权用户可在 PostgreSQL claim/租约保护下并发读取；公司级 `chat_messages` 以消息 ID 去重，因此多人看到同一群不会重复存储正文。
 
 ## 内部管理台
 

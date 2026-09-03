@@ -182,6 +182,10 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
             ),
         ).fetchone()
         authorization_id = row["id"]
+        # Page commits lock sync_jobs before authorization_chats. Preserve
+        # that order here so OAuth reauthorization cannot deadlock with a
+        # late page response.
+        _queue_job(conn, authorization_id, "backfill")
         conn.execute(
             """
             INSERT INTO lark_identities (open_id, display_name, first_seen_at, last_seen_at)
@@ -201,9 +205,14 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 backfill_window_start_at = NULL, backfill_window_end_at = NULL,
                 incremental_page_token = NULL, incremental_job_id = NULL,
                 incremental_window_start_at = NULL, incremental_window_end_at = NULL,
+                page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
+                page_claimed_at = NULL, page_lease_until = NULL,
+                page_retry_at = NULL,
+                member_snapshot_claim_id = NULL, member_snapshot_claimed_at = NULL,
+                member_snapshot_lease_until = NULL,
+                member_snapshot_retry_at = NULL,
                 sync_generation = sync_generation + 1,
-                sync_status = CASE WHEN sync_status = 'not_readable' THEN 'pending' ELSE sync_status END,
-                last_error = CASE WHEN sync_status = 'not_readable' THEN NULL ELSE last_error END,
+                sync_status = 'pending', last_error = NULL,
                 member_count_status = 'pending', member_count_checked_at = NULL,
                 member_snapshot_status = 'pending', member_snapshot_checked_at = NULL
             WHERE authorization_id = %s
@@ -211,7 +220,6 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
             (authorization_id,),
         )
         _audit(conn, authorization_id, "oauth_authorized")
-        _queue_job(conn, authorization_id, "backfill")
 
         session_token = secrets.token_urlsafe(32)
         conn.execute(
@@ -377,6 +385,23 @@ def _dashboard_stats(authorization_id: uuid.UUID) -> dict[str, Any]:
 
 
 def _queue_job(conn: psycopg.Connection, authorization_id: uuid.UUID, mode: str) -> bool:
+    existing = conn.execute(
+        """
+        UPDATE sync_jobs
+        SET mode = %s, status = 'queued', scheduled_at = NOW(), started_at = NULL,
+            finished_at = NULL, lease_until = NULL, attempts = 0,
+            pages_processed = 0, chats_discovered = 0, messages_indexed = 0,
+            own_messages_indexed = 0, discovery_status = 'pending',
+            discovery_generation = discovery_generation + 1,
+            discovery_completed_at = NULL, last_progress_at = NULL,
+            last_error_code = NULL, last_http_status = NULL, last_error = NULL, updated_at = NOW()
+        WHERE authorization_id = %s AND status IN ('queued', 'running')
+        RETURNING id
+        """,
+        (mode, authorization_id),
+    ).fetchone()
+    if existing:
+        return True
     row = conn.execute(
         """
         INSERT INTO sync_jobs (id, authorization_id, mode, status, scheduled_at)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -10,6 +11,7 @@ from urllib.parse import quote, urlencode
 import httpx
 
 from .config import Settings
+from .lark_sync_admission import LarkSyncAdmission
 
 
 class LarkApiError(RuntimeError):
@@ -23,7 +25,13 @@ class LarkApiError(RuntimeError):
 
     @property
     def retryable(self) -> bool:
-        return self.status_code == 429 or self.status_code >= 500
+        return self.rate_limited or self.status_code >= 500
+
+    @property
+    def rate_limited(self) -> bool:
+        """Lark still returns its documented legacy rate error as HTTP 400."""
+
+        return self.status_code == 429 or self.lark_code == 99991400
 
     @property
     def likely_auth_problem(self) -> bool:
@@ -59,8 +67,16 @@ class LarkProfile:
 class LarkClient:
     """Small wrapper for user-scoped IM data and tenant-scoped organization mapping."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        http_client: httpx.Client | None = None,
+        admission: LarkSyncAdmission | None = None,
+    ) -> None:
         self.settings = settings
+        self._http_client = http_client
+        self._admission = admission
 
     def authorization_url(self, state: str, code_challenge: str) -> str:
         query = {
@@ -236,33 +252,47 @@ class LarkClient:
         if access_token:
             headers["Authorization"] = f"Bearer {access_token}"
 
-        try:
-            with httpx.Client(timeout=httpx.Timeout(20.0, connect=8.0)) as client:
-                response = client.request(method, url, headers=headers, params=params, json=json)
-        except httpx.HTTPError as exc:
-            raise LarkApiError(503, None, "network failure while calling Lark") from exc
+        gate = self._admission.request() if self._admission else nullcontext()
+        with gate:
+            try:
+                if self._http_client:
+                    response = self._http_client.request(method, url, headers=headers, params=params, json=json)
+                else:
+                    with httpx.Client(timeout=httpx.Timeout(20.0, connect=8.0)) as client:
+                        response = client.request(method, url, headers=headers, params=params, json=json)
+            except httpx.HTTPError as exc:
+                raise LarkApiError(503, None, "network failure while calling Lark") from exc
 
-        retry_after = _optional_int(response.headers.get("Retry-After"))
-        try:
-            raw: Any = response.json()
-        except ValueError as exc:
-            raise LarkApiError(response.status_code, None, "Lark returned a non-JSON response", retry_after) from exc
-        if not isinstance(raw, dict):
-            raise LarkApiError(response.status_code, None, "Lark returned an invalid JSON response", retry_after)
+            retry_after = _rate_limit_reset(response.headers)
+            try:
+                raw: Any = response.json()
+            except ValueError as exc:
+                self._pause_for_rate_limit(response.status_code, None, retry_after)
+                raise LarkApiError(
+                    response.status_code, None, "Lark returned a non-JSON response", retry_after
+                ) from exc
+            if not isinstance(raw, dict):
+                self._pause_for_rate_limit(response.status_code, None, retry_after)
+                raise LarkApiError(response.status_code, None, "Lark returned an invalid JSON response", retry_after)
 
-        code = _optional_int(raw.get("code"))
-        message = _string(raw.get("msg")) or _string(raw.get("message")) or "Lark API request failed"
-        if not response.is_success or (code is not None and code != 0):
-            raise LarkApiError(response.status_code, code, message, retry_after)
+            code = _optional_int(raw.get("code"))
+            message = _string(raw.get("msg")) or _string(raw.get("message")) or "Lark API request failed"
+            if not response.is_success or (code is not None and code != 0):
+                self._pause_for_rate_limit(response.status_code, code, retry_after)
+                raise LarkApiError(response.status_code, code, message, retry_after)
 
-        data = raw.get("data", raw)
-        if not isinstance(data, dict):
-            raise LarkApiError(502, code, "Lark response data was not an object")
-        return data
+            data = raw.get("data", raw)
+            if not isinstance(data, dict):
+                raise LarkApiError(502, code, "Lark response data was not an object")
+            return data
 
     def _require_secret(self) -> None:
         if not self.settings.app_secret_configured:
             raise RuntimeError("Lark App Secret is not configured")
+
+    def _pause_for_rate_limit(self, status_code: int, lark_code: int | None, retry_after: int | None) -> None:
+        if self._admission and (status_code == 429 or lark_code == 99991400):
+            self._admission.pause(retry_after)
 
 
 def _string(value: object) -> str | None:
@@ -279,3 +309,13 @@ def _optional_int(value: object) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _rate_limit_reset(headers: httpx.Headers) -> int | None:
+    """Lark's reset header takes precedence over the generic Retry-After."""
+
+    for name in ("x-ogw-ratelimit-reset", "Retry-After"):
+        value = _optional_int(headers.get(name))
+        if value is not None and value >= 0:
+            return value
+    return None

@@ -64,10 +64,13 @@ class Settings:
     sync_interval_seconds: int
     sync_overlap_seconds: int
     member_count_refresh_seconds: int
-    max_pages_per_job: int
     worker_idle_seconds: int
     our_organization_name: str = "TT Media London"
     organization_sync_interval_seconds: int = 21_600
+    lark_sync_max_inflight: int = 3
+    lark_sync_requests_per_second: int = 10
+    lark_sync_per_authorization_max_inflight: int = 2
+    lark_member_snapshot_max_inflight: int = 1
 
     @property
     def app_secret_configured(self) -> bool:
@@ -103,9 +106,14 @@ def get_settings() -> Settings:
         sync_interval_seconds=_positive_int("SYNC_INTERVAL_SECONDS", 300, 30),
         sync_overlap_seconds=_positive_int("SYNC_OVERLAP_SECONDS", 600, 60),
         member_count_refresh_seconds=_positive_int("MEMBER_COUNT_REFRESH_SECONDS", 86400, 300),
-        max_pages_per_job=_positive_int("MAX_PAGES_PER_JOB", 30, 1),
         worker_idle_seconds=_positive_int("WORKER_IDLE_SECONDS", 3, 1),
         our_organization_name=os.environ.get("OUR_ORGANIZATION_NAME", "TT Media London").strip()
         or "TT Media London",
         organization_sync_interval_seconds=_positive_int("ORGANIZATION_SYNC_INTERVAL_SECONDS", 21_600, 300),
+        lark_sync_max_inflight=_positive_int("LARK_SYNC_MAX_INFLIGHT", 3, 1),
+        lark_sync_requests_per_second=_positive_int("LARK_SYNC_REQUESTS_PER_SECOND", 10, 1),
+        lark_sync_per_authorization_max_inflight=_positive_int(
+            "LARK_SYNC_PER_AUTHORIZATION_MAX_INFLIGHT", 2, 1
+        ),
+        lark_member_snapshot_max_inflight=_positive_int("LARK_MEMBER_SNAPSHOT_MAX_INFLIGHT", 1, 1),
     )

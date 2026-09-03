@@ -1,7 +1,7 @@
+from collections import Counter
 from contextlib import nullcontext
-from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID
 
 import pytest
 
@@ -10,7 +10,6 @@ from app.worker import (
     _body_content,
     _is_author_message,
     _lark_time,
-    _member_count_refresh_due,
     _message_relation_metadata,
     _p2p_counterpart_open_id,
     _read_member_snapshot,
@@ -29,14 +28,6 @@ def test_lark_time_interprets_milliseconds() -> None:
     timestamp = _lark_time("1615380573411")
     assert timestamp is not None
     assert timestamp.year == 2021
-
-
-def test_member_count_refresh_is_due_only_when_missing_or_stale() -> None:
-    now = datetime(2026, 8, 29, tzinfo=UTC)
-
-    assert _member_count_refresh_due(None, now, 86400)
-    assert not _member_count_refresh_due(now - timedelta(hours=23), now, 86400)
-    assert _member_count_refresh_due(now - timedelta(hours=24), now, 86400)
 
 
 def test_message_body_content_is_kept_as_the_lark_payload() -> None:
@@ -171,51 +162,6 @@ def test_member_snapshot_follows_lark_pagination_and_keeps_member_facts() -> Non
     assert {member["open_id"] for member in snapshot.members} == {"ou_one", "ou_two"}
 
 
-def test_normal_pagination_requeue_does_not_increment_retry_count(monkeypatch) -> None:
-    calls = []
-
-    class Connection:
-        def transaction(self):
-            return nullcontext()
-
-        def execute(self, query, params):
-            calls.append((query, params))
-
-    monkeypatch.setattr(worker, "connection", lambda: nullcontext(Connection()))
-
-    worker._requeue(uuid4(), delay_seconds=0, retry=False)
-
-    assert calls[0][1][1:4] == (False, None, None)
-    assert "attempts = attempts + CASE WHEN %s THEN 1 ELSE 0 END" in calls[0][0]
-    assert "last_error_code = %s" in calls[0][0]
-
-
-def test_worker_fills_ai_slots_before_a_lark_sync_job(monkeypatch) -> None:
-    calls: list[str] = []
-    jobs = iter((object(),))
-
-    def recover() -> None:
-        if calls == ["assessment", "sync"]:
-            raise KeyboardInterrupt
-
-    monkeypatch.setattr(
-        worker,
-        "get_settings",
-        lambda: SimpleNamespace(app_secret_configured=True, worker_idle_seconds=1),
-    )
-    monkeypatch.setattr(worker, "_recover_expired_leases", recover)
-    monkeypatch.setattr(worker, "_claim_job", lambda: next(jobs))
-    monkeypatch.setattr(worker, "_execute_job", lambda _job, _settings: calls.append("sync"))
-    monkeypatch.setattr(worker, "_fill_ai_slots", lambda *_args: calls.append("assessment") or True)
-
-    try:
-        worker.run_forever()
-    except KeyboardInterrupt:
-        pass
-
-    assert calls == ["assessment", "sync"]
-
-
 def test_full_ai_slots_do_not_attempt_another_claim(monkeypatch) -> None:
     class Future:
         pass
@@ -254,3 +200,321 @@ def test_dispatch_uses_at_most_three_slots_and_alternates_queues(monkeypatch) ->
 
     assert (submitted_one, submitted_two, submitted_three, submitted_four) == (True, True, True, False)
     assert [job["id"] for _runner, job in submitted] == ["identity-1", "assignment-1", "identity-2"]
+
+
+def test_page_claim_uses_locked_conversation_cursor(monkeypatch) -> None:
+    calls = []
+
+    class Result:
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        def transaction(self):
+            return nullcontext()
+
+        def execute(self, query, params=None):
+            calls.append((query, params))
+            if "SELECT mode" in query:
+                return Result({"mode": "backfill"})
+            if "SELECT COUNT(*) AS count" in query:
+                return Result({"count": 0})
+            if "manual_backfill_started_at IS NULL" in query:
+                return Result()
+            if "SELECT access.*" in query:
+                return Result(
+                    {
+                        "chat_id": "oc_claim",
+                        "sync_generation": 4,
+                        "backfill_window_start_at": None,
+                        "backfill_window_end_at": None,
+                        "manual_backfill_requested_at": None,
+                        "backfill_page_token": "page-2",
+                    }
+                )
+            return Result()
+
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(Connection()))
+    job = worker.SyncJob(UUID(int=1), UUID(int=2), "backfill", 0, "succeeded", 3)
+
+    claim = worker._claim_next_page(
+        job,
+        {"open_id": "ou_cm", "body_consent_at": None},
+        SimpleNamespace(
+            sync_lookback_days=0,
+            sync_overlap_seconds=600,
+            lark_sync_per_authorization_max_inflight=2,
+        ),
+    )
+
+    assert claim is not None
+    assert claim.chat_id == "oc_claim"
+    assert claim.expected_page_token == "page-2"
+    sql = "\n".join(query for query, _params in calls)
+    assert "FOR UPDATE SKIP LOCKED" in sql
+    assert "page_claim_id = %s, page_claim_job_id = %s, page_claim_mode = %s" in sql
+
+
+def test_page_claim_respects_the_durable_per_authorization_limit(monkeypatch) -> None:
+    calls = []
+
+    class Result:
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        def transaction(self):
+            return nullcontext()
+
+        def execute(self, query, params=None):
+            calls.append((query, params))
+            if "SELECT mode" in query:
+                return Result({"mode": "backfill"})
+            if "SELECT COUNT(*) AS count" in query:
+                return Result({"count": 2})
+            return Result()
+
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(Connection()))
+    job = worker.SyncJob(UUID(int=1), UUID(int=2), "backfill", 0, "succeeded", 3)
+
+    claim = worker._claim_next_page(
+        job,
+        {"open_id": "ou_cm", "body_consent_at": None},
+        SimpleNamespace(sync_lookback_days=0, sync_overlap_seconds=600),
+        2,
+    )
+
+    assert claim is None
+    assert not any("SELECT access.*" in query for query, _params in calls)
+
+
+def test_stale_page_claim_does_not_write_messages_after_reauthorization(monkeypatch) -> None:
+    calls = []
+
+    class Result:
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        def transaction(self):
+            return nullcontext()
+
+        def execute(self, query, params=None):
+            calls.append((query, params))
+            if "FROM sync_jobs" in query:
+                return Result({"present": 1})
+            if "FROM authorization_chats" in query:
+                return Result()
+            return Result()
+
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(Connection()))
+    job = worker.SyncJob(UUID(int=1), UUID(int=2), "backfill", 0, "succeeded", 3)
+    claim = worker.PageClaim(
+        job=job,
+        chat_id="oc_stale",
+        mode="backfill",
+        generation=9,
+        claim_id=UUID(int=3),
+        expected_page_token="old-page",
+        start_at=None,
+        end_at=worker.datetime.now(worker.UTC),
+        author_open_id="ou_cm",
+        body_consent_at=None,
+    )
+
+    result = worker._record_claimed_page(claim, [{"message_id": "om_stale"}], None, None)
+
+    assert result.committed is False
+    assert not any("INSERT INTO chat_messages" in query for query, _params in calls)
+    assert any("page_lease_until > NOW()" in query for query, _params in calls)
+
+
+def test_expired_lease_releases_claims_without_resetting_cursors(monkeypatch) -> None:
+    calls = []
+
+    class Result:
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchall(self):
+            return self.rows
+
+    class Connection:
+        def transaction(self):
+            return nullcontext()
+
+        def execute(self, query, params=None):
+            calls.append((query, params))
+            if "UPDATE sync_jobs" in query:
+                return Result([{"id": UUID(int=1)}])
+            return Result()
+
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(Connection()))
+
+    worker._recover_expired_leases()
+
+    claim_updates = [query for query, _params in calls if "page_claim_id = NULL" in query]
+    assert claim_updates
+    assert all("backfill_page_token" not in query for query in claim_updates)
+    assert any("page_lease_until < NOW()" in query for query in claim_updates)
+
+
+def test_lark_dispatch_favors_users_then_claims_distinct_chats(monkeypatch) -> None:
+    submitted = []
+    authorization_a = UUID(int=10)
+    authorization_b = UUID(int=20)
+    job_a = worker.SyncJob(UUID(int=1), authorization_a, "backfill", 0, "succeeded", 0)
+    job_b = worker.SyncJob(UUID(int=2), authorization_b, "backfill", 0, "succeeded", 0)
+    remaining = {
+        authorization_a: iter(("oc_a_1", "oc_a_2")),
+        authorization_b: iter(("oc_b_1",)),
+    }
+
+    class Future:
+        pass
+
+    class Executor:
+        def submit(self, _runner, _client, claim, _token):
+            submitted.append(claim)
+            return Future()
+
+    def claim_next(job, *_args):
+        try:
+            chat_id = next(remaining[job.authorization_id])
+        except StopIteration:
+            return None
+        return SimpleNamespace(job=job, chat_id=chat_id)
+
+    monkeypatch.setattr(worker, "_authorization", lambda _id: {"status": "active", "open_id": "ou_cm"})
+    monkeypatch.setattr(worker, "_usable_access_token", lambda *_args: "token")
+    monkeypatch.setattr(worker, "_claim_next_page", claim_next)
+    monkeypatch.setattr(
+        worker,
+        "_active_page_claim_counts",
+        lambda _ids: Counter(claim.job.authorization_id for claim in submitted),
+    )
+    settings = SimpleNamespace(lark_sync_max_inflight=3, lark_sync_per_authorization_max_inflight=2)
+    futures = {}
+    cache = {}
+
+    for _ in range(3):
+        assert worker._dispatch_lark_turn(settings, object(), Executor(), futures, [job_a, job_b], cache)
+
+    assert [claim.job.authorization_id for claim in submitted] == [authorization_a, authorization_b, authorization_a]
+    chats_for_a = [claim.chat_id for claim in submitted if claim.job.authorization_id == authorization_a]
+    assert chats_for_a == ["oc_a_1", "oc_a_2"]
+
+
+def test_lark_dispatch_uses_idle_slot_when_other_user_has_no_backlog(monkeypatch) -> None:
+    submitted = []
+    authorization_a = UUID(int=10)
+    authorization_b = UUID(int=20)
+    job_a = worker.SyncJob(UUID(int=1), authorization_a, "backfill", 0, "succeeded", 0)
+    job_b = worker.SyncJob(UUID(int=2), authorization_b, "backfill", 0, "succeeded", 0)
+    remaining = iter(("oc_a_1", "oc_a_2", "oc_a_3"))
+
+    class Future:
+        pass
+
+    class Executor:
+        def submit(self, _runner, _client, claim, _token):
+            submitted.append(claim)
+            return Future()
+
+    def claim_next(job, *_args):
+        if job.authorization_id == authorization_b:
+            return None
+        return SimpleNamespace(job=job, chat_id=next(remaining))
+
+    monkeypatch.setattr(worker, "_authorization", lambda _id: {"status": "active", "open_id": "ou_cm"})
+    monkeypatch.setattr(worker, "_usable_access_token", lambda *_args: "token")
+    monkeypatch.setattr(worker, "_claim_next_page", claim_next)
+    monkeypatch.setattr(
+        worker,
+        "_active_page_claim_counts",
+        lambda _ids: Counter(claim.job.authorization_id for claim in submitted),
+    )
+    settings = SimpleNamespace(lark_sync_max_inflight=3, lark_sync_per_authorization_max_inflight=2)
+    futures = {}
+    cache = {}
+
+    for _ in range(3):
+        assert worker._dispatch_lark_turn(settings, object(), Executor(), futures, [job_a, job_b], cache)
+
+    assert [claim.chat_id for claim in submitted] == ["oc_a_1", "oc_a_2", "oc_a_3"]
+
+
+def test_completed_backfill_enqueues_a_separate_incremental_job(monkeypatch) -> None:
+    calls = []
+    job = worker.SyncJob(UUID(int=1), UUID(int=2), "backfill", 0, "succeeded", 3)
+
+    class Result:
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        def transaction(self):
+            return nullcontext()
+
+        def execute(self, query, params=None):
+            calls.append((query, params))
+            if "SELECT mode" in query:
+                return Result({"mode": "backfill"})
+            if "AS claimed" in query:
+                return Result({"claimed": False})
+            if "AS pending" in query:
+                return Result({"pending": False})
+            if "SET status = 'succeeded'" in query:
+                return Result({"id": job.id})
+            return Result()
+
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(Connection()))
+    monkeypatch.setattr(worker, "get_settings", lambda: SimpleNamespace(sync_interval_seconds=300))
+
+    worker._finish_and_schedule_incremental(job)
+
+    sql = "\n".join(query for query, _params in calls)
+    assert "SET status = 'succeeded'" in sql
+    assert "INSERT INTO sync_jobs" in sql
+    assert "incremental_job_id IS DISTINCT" not in sql
+
+
+def test_delayed_only_job_yields_its_coordinator_slot() -> None:
+    calls = []
+    job = worker.SyncJob(UUID(int=1), UUID(int=2), "backfill", 0, "succeeded", 3)
+
+    class Result:
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        def execute(self, query, params=None):
+            calls.append((query, params))
+            if "COUNT(*) AS count" in query:
+                return Result({"count": 0})
+            if "AS pending" in query:
+                return Result({"pending": False})
+            if "AS ready" in query:
+                return Result({"ready": False})
+            if "MIN(page_retry_at)" in query:
+                return Result({"retry_at": worker.datetime.now(worker.UTC)})
+            return Result()
+
+    assert worker._yield_job_to_retry_if_idle(Connection(), job)
+
+    assert any("SET status = 'queued', scheduled_at = %s" in query for query, _params in calls)

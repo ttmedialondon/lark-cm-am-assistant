@@ -7,6 +7,7 @@
     <div class="page-body pt-0">
       <div class="container-xl">
         <div class="alert alert-info" role="status">“首次同步中”表示历史会话正在安全分页回填，不是失败重试；“已接入 · 定时同步”表示首次回填已完成，下一轮会按 5 分钟周期检查。OAuth 令牌与应用密钥始终不展示。</div>
+        {% if lark_admission %}<div class="alert alert-{{ lark_admission.badge }}" role="status"><strong>{{ lark_admission.label }}</strong><span class="ms-2">{{ lark_admission.detail }}</span></div>{% endif %}
         <div class="row row-deck row-cards">
           {% for metric in metrics %}
           <div class="col-sm-6 col-lg-4">
@@ -44,11 +45,11 @@
               <div class="card-header"><h3 class="card-title">最近同步任务</h3><div class="card-actions"><a href="/admin/jobs" class="btn btn-sm btn-outline-secondary">查看全部</a></div></div>
               {% if recent_jobs %}
               <div class="table-responsive"><table class="table table-vcenter card-table">
-                <thead><tr><th>人员</th><th>模式</th><th>状态</th><th>新增消息</th><th>计划执行</th></tr></thead>
+                <thead><tr><th>人员</th><th>模式</th><th>状态</th><th>目录</th><th>新增消息</th><th>最近进度</th></tr></thead>
                 <tbody>{% for job in recent_jobs %}<tr>
                   <td>{{ job.display_name }}</td><td>{{ job.mode_label }}</td>
                   <td><span class="badge bg-{{ job.status_badge }}-lt">{{ job.status_label }}</span></td>
-                  <td>{{ job.messages_indexed }}</td><td class="text-secondary text-nowrap">{{ job.scheduled_at_label }}</td>
+                  <td>{{ job.discovery_label }}</td><td>{{ job.messages_indexed }}</td><td class="text-secondary text-nowrap">{{ job.last_progress_at_label }}</td>
                 </tr>{% endfor %}</tbody>
               </table></div>
               {% else %}

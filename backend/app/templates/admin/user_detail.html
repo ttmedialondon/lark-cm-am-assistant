@@ -28,8 +28,8 @@
         <thead><tr><th>会话</th><th>类型</th><th>成员人数</th><th>消息索引</th><th>同步状态</th><th>最近同步</th></tr></thead>
         <tbody>{% for conversation in conversations %}<tr>
           <td><div class="text-truncate group-name-cell" title="{{ conversation.name }}">{{ conversation.name }}</div>{% if conversation.external %}<span class="badge bg-azure-lt mt-1">外部群</span>{% endif %}</td>
-          <td>{{ conversation.chat_mode_label }}</td><td>{{ conversation.member_count_label }}</td><td>{{ conversation.message_count_label }}</td>
-          <td><span class="badge bg-{{ conversation.sync_status_badge }}-lt">{{ conversation.sync_status_label }}</span></td><td class="text-secondary text-nowrap">{{ conversation.last_synced_at_label }}</td>
+          <td>{{ conversation.chat_mode_label }}</td><td>{{ conversation.member_count_label }}<div class="text-secondary small mt-1">{{ conversation.member_snapshot_label }}</div></td><td>{{ conversation.message_count_label }}</td>
+          <td><span class="badge bg-{{ conversation.sync_status_badge }}-lt">{{ conversation.sync_status_label }}</span><div class="text-secondary small mt-1">{{ conversation.message_page_label }}</div></td><td class="text-secondary text-nowrap">{{ conversation.last_synced_at_label }}</td>
         </tr>{% endfor %}</tbody>
       </table></div>
       {% with pager=conversation_page %}{% include "admin/_pagination.html" %}{% endwith %}
@@ -40,8 +40,8 @@
       <div class="card-header"><div><h3 class="card-title mb-1">同步任务</h3><div class="text-secondary small">分页续跑属于同一个任务，不会标成错误重试。</div></div></div>
       {% if jobs %}
       <div class="table-responsive"><table class="table table-vcenter card-table">
-        <thead><tr><th>模式</th><th>状态</th><th>页数</th><th>发现会话</th><th>新增消息</th><th>计划执行</th><th>结束时间</th></tr></thead>
-        <tbody>{% for job in jobs %}<tr><td>{{ job.mode_label }}</td><td><span class="badge bg-{{ job.status_badge }}-lt">{{ job.status_label }}</span></td><td>{{ job.pages_processed }}</td><td>{{ job.chats_discovered }}</td><td>{{ job.messages_indexed }}</td><td class="text-secondary text-nowrap">{{ job.scheduled_at_label }}</td><td class="text-secondary text-nowrap">{{ job.finished_at_label }}</td></tr>{% endfor %}</tbody>
+        <thead><tr><th>模式</th><th>状态</th><th>目录</th><th>页数</th><th>发现会话</th><th>新增消息</th><th>最近进度</th><th>结束时间</th></tr></thead>
+        <tbody>{% for job in jobs %}<tr><td>{{ job.mode_label }}</td><td><span class="badge bg-{{ job.status_badge }}-lt">{{ job.status_label }}</span></td><td>{{ job.discovery_label }}</td><td>{{ job.pages_processed }}</td><td>{{ job.chats_discovered }}</td><td>{{ job.messages_indexed }}</td><td class="text-secondary text-nowrap">{{ job.last_progress_at_label }}</td><td class="text-secondary text-nowrap">{{ job.finished_at_label }}</td></tr>{% endfor %}</tbody>
       </table></div>
       {% with pager=job_page %}{% include "admin/_pagination.html" %}{% endwith %}
       {% else %}<div class="card-body text-secondary">尚未创建同步任务。</div>{% endif %}

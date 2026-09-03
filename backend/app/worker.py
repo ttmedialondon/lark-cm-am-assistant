@@ -6,11 +6,13 @@ import json
 import logging
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 import psycopg
 
 from . import ai_dispatch, contact_assessments, contact_assignments, organization_sync
@@ -18,6 +20,7 @@ from .config import Settings, get_settings
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
 from .lark_api import LarkApiError, LarkClient, TokenBundle
+from .lark_sync_admission import LarkSyncAdmission
 
 LOGGER = logging.getLogger("lark_message_stats.worker")
 LEASE_MINUTES = 10
@@ -27,12 +30,41 @@ class ReauthorizationRequired(RuntimeError):
     """The user must complete OAuth again before the worker can proceed."""
 
 
+class StaleSyncJob(RuntimeError):
+    """A reauthorization replaced this job's discovery or page generation."""
+
+
 @dataclass(frozen=True)
 class SyncJob:
     id: uuid.UUID
     authorization_id: uuid.UUID
     mode: str
     attempts: int
+    discovery_status: str
+    discovery_generation: int
+
+
+@dataclass(frozen=True)
+class PageClaim:
+    """One durable, user-scoped Lark message-page reservation."""
+
+    job: SyncJob
+    chat_id: str
+    mode: str
+    generation: int
+    claim_id: uuid.UUID
+    expected_page_token: str | None
+    start_at: datetime | None
+    end_at: datetime
+    author_open_id: str
+    body_consent_at: datetime | None
+
+
+@dataclass(frozen=True)
+class PageCommit:
+    committed: bool
+    messages: int = 0
+    own_messages: int = 0
 
 
 @dataclass(frozen=True)
@@ -44,6 +76,15 @@ class MemberSnapshotMeasurement:
     snapshot_status: str
     checked_at: datetime | None
     members: tuple[dict[str, str | None], ...] = ()
+    retry_after_seconds: int | None = None
+
+
+@dataclass(frozen=True)
+class MemberSnapshotClaim:
+    authorization_id: uuid.UUID
+    chat_id: str
+    generation: int
+    claim_id: uuid.UUID
 
 
 def run_forever() -> None:
@@ -56,30 +97,55 @@ def run_forever() -> None:
 
     prefer_assignment = False
     next_organization_check = 0.0
-    # ponytail: only paid OpenAI calls need parallel slots; Lark sync remains in
-    # the main loop so a busy AI queue can never delay OAuth/message collection.
-    executor = ThreadPoolExecutor(max_workers=ai_dispatch.MAX_CONCURRENT_REQUESTS, thread_name_prefix="openai")
-    futures: set[Future[Any]] = set()
+    ai_executor = ThreadPoolExecutor(max_workers=ai_dispatch.MAX_CONCURRENT_REQUESTS, thread_name_prefix="openai")
+    ai_futures: set[Future[Any]] = set()
+    # PostgreSQL owns the cross-process limit; this executor only provides the
+    # local page fetches.  Writes remain on the main thread below.
+    lark_executor = ThreadPoolExecutor(
+        max_workers=settings.lark_sync_max_inflight + settings.lark_member_snapshot_max_inflight,
+        thread_name_prefix="lark-sync",
+    )
+    page_futures: dict[Future[dict[str, Any]], PageClaim] = {}
+    member_futures: dict[Future[MemberSnapshotMeasurement], MemberSnapshotClaim] = {}
+    admission = LarkSyncAdmission(
+        max_inflight=settings.lark_sync_max_inflight,
+        requests_per_second=settings.lark_sync_requests_per_second,
+    )
+    http_client = httpx.Client(
+        timeout=httpx.Timeout(20.0, connect=8.0),
+        limits=httpx.Limits(
+            max_connections=settings.lark_sync_max_inflight + settings.lark_member_snapshot_max_inflight,
+            max_keepalive_connections=settings.lark_sync_max_inflight + settings.lark_member_snapshot_max_inflight,
+        ),
+    )
+    client = LarkClient(settings, http_client=http_client, admission=admission)
     try:
         while True:
             try:
-                _reap_ai_futures(futures)
+                _reap_ai_futures(ai_futures)
+                _reap_page_futures(page_futures, settings)
+                _reap_member_futures(member_futures)
                 _recover_expired_leases()
-                # Fill paid-call slots before any potentially long Lark work.
-                # The claims are quick; the main thread still owns all sync IO.
-                prefer_assignment = _fill_ai_slots(settings, executor, futures, prefer_assignment)
+                prefer_assignment = _fill_ai_slots(settings, ai_executor, ai_futures, prefer_assignment)
                 if settings.app_secret_configured and time.monotonic() >= next_organization_check:
-                    _run_organization_sync(settings)
+                    _run_organization_sync(settings, client)
                     # The database keeps the real daily cadence. This local bound
                     # avoids a query on every three-second idle worker loop.
                     next_organization_check = time.monotonic() + min(
                         getattr(settings, "organization_sync_interval_seconds", 21_600), 300
                     )
-                job = _claim_job() if settings.app_secret_configured else None
-                if job:
-                    _execute_job(job, settings)
-                    continue
-                time.sleep(settings.worker_idle_seconds)
+                if settings.app_secret_configured:
+                    # Existing message pages get a turn before synchronous
+                    # discovery for newly authorized users. Discovery remains
+                    # a per-user phase barrier, but it cannot starve active
+                    # backfills on this worker.
+                    _finish_completed_jobs(page_futures)
+                    _fill_lark_slots(settings, client, lark_executor, page_futures)
+                    _start_pending_jobs(settings, client)
+                    _finish_completed_jobs(page_futures)
+                    _fill_lark_slots(settings, client, lark_executor, page_futures)
+                    _schedule_member_snapshot(settings, client, lark_executor, page_futures, member_futures)
+                time.sleep(0.05 if page_futures or member_futures else settings.worker_idle_seconds)
             except KeyboardInterrupt:
                 raise
             except Exception:  # Unexpected failures must not terminate the systemd worker loop.
@@ -87,14 +153,16 @@ def run_forever() -> None:
                 time.sleep(settings.worker_idle_seconds)
     finally:
         # Leases preserve in-flight work if systemd terminates us during a call.
-        executor.shutdown(wait=False, cancel_futures=False)
+        ai_executor.shutdown(wait=False, cancel_futures=False)
+        lark_executor.shutdown(wait=False, cancel_futures=False)
+        http_client.close()
 
 
-def _run_organization_sync(settings: Settings) -> None:
+def _run_organization_sync(settings: Settings, client: LarkClient) -> None:
     """Keep an optional Trust Party failure separate from message collection."""
 
     try:
-        organization_sync.sync_if_due(settings, LarkClient(settings))
+        organization_sync.sync_if_due(settings, client)
     except Exception:
         LOGGER.exception("organization sync failed without exposing organization data")
 
@@ -175,14 +243,64 @@ def _reap_ai_futures(futures: set[Future[Any]]) -> None:
 
 def _recover_expired_leases() -> None:
     with connection() as conn, conn.transaction():
-        conn.execute(
+        expired_jobs = conn.execute(
             """
             UPDATE sync_jobs
             SET status = 'queued', scheduled_at = NOW(), lease_until = NULL,
                 attempts = attempts + 1,
+                discovery_status = CASE
+                    WHEN discovery_status = 'running' THEN 'pending'
+                    ELSE discovery_status
+                END,
+                discovery_generation = CASE
+                    WHEN discovery_status = 'running' THEN discovery_generation + 1
+                    ELSE discovery_generation
+                END,
+                discovery_completed_at = CASE
+                    WHEN discovery_status = 'running' THEN NULL
+                    ELSE discovery_completed_at
+                END,
                 last_error_code = NULL,
+                last_http_status = NULL,
                 last_error = 'A worker lease expired; the job was safely resumed.', updated_at = NOW()
             WHERE status = 'running' AND lease_until < NOW()
+            RETURNING id
+            """
+        ).fetchall()
+        if expired_jobs:
+            conn.execute(
+                """
+                UPDATE authorization_chats
+                SET page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
+                    page_claimed_at = NULL, page_lease_until = NULL,
+                    sync_status = CASE WHEN sync_status = 'syncing' AND backfill_complete
+                        THEN 'succeeded'
+                        WHEN sync_status = 'syncing' THEN 'pending'
+                        ELSE sync_status
+                    END
+                WHERE page_claim_job_id = ANY(%s)
+                """,
+                ([row["id"] for row in expired_jobs],),
+            )
+        conn.execute(
+            """
+            UPDATE authorization_chats
+            SET page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
+                page_claimed_at = NULL, page_lease_until = NULL,
+                sync_status = CASE WHEN sync_status = 'syncing' AND backfill_complete
+                    THEN 'succeeded'
+                    WHEN sync_status = 'syncing' THEN 'pending'
+                    ELSE sync_status
+                END
+            WHERE page_claim_id IS NOT NULL AND page_lease_until < NOW()
+            """
+        )
+        conn.execute(
+            """
+            UPDATE authorization_chats
+            SET member_snapshot_claim_id = NULL, member_snapshot_claimed_at = NULL,
+                member_snapshot_lease_until = NULL
+            WHERE member_snapshot_claim_id IS NOT NULL AND member_snapshot_lease_until < NOW()
             """
         )
 
@@ -191,7 +309,7 @@ def _claim_job() -> SyncJob | None:
     with connection() as conn, conn.transaction():
         row = conn.execute(
             """
-            SELECT id, authorization_id, mode, attempts
+            SELECT id, authorization_id, mode, attempts, discovery_status, discovery_generation
             FROM sync_jobs
             WHERE status = 'queued' AND scheduled_at <= NOW()
             ORDER BY scheduled_at, created_at
@@ -210,64 +328,541 @@ def _claim_job() -> SyncJob | None:
             """,
             (row["id"],),
         )
-        return SyncJob(row["id"], row["authorization_id"], row["mode"], int(row["attempts"]))
+        return SyncJob(
+            row["id"],
+            row["authorization_id"],
+            row["mode"],
+            int(row["attempts"]),
+            row["discovery_status"],
+            int(row["discovery_generation"]),
+        )
 
 
-def _execute_job(job: SyncJob, settings: Settings) -> None:
-    try:
-        authorization = _authorization(job.authorization_id)
-        if not authorization or authorization["status"] != "active":
-            _finish_job(job.id, "cancelled", "Authorization is no longer active.")
+def _running_jobs() -> list[SyncJob]:
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, authorization_id, mode, attempts, discovery_status, discovery_generation
+            FROM sync_jobs
+            WHERE status = 'running' AND lease_until > NOW()
+            ORDER BY COALESCE(last_progress_at, started_at, created_at), created_at
+            """
+        ).fetchall()
+    return [
+        SyncJob(
+            row["id"],
+            row["authorization_id"],
+            row["mode"],
+            int(row["attempts"]),
+            row["discovery_status"],
+            int(row["discovery_generation"]),
+        )
+        for row in rows
+    ]
+
+
+def _start_pending_jobs(settings: Settings, client: LarkClient) -> None:
+    """Claim a small fair set of user coordinators and discover each one once."""
+
+    for job in _running_jobs():
+        if job.discovery_status == "pending":
+            _prepare_job(job, settings, client)
+
+    while len(_running_jobs()) < settings.lark_sync_max_inflight:
+        job = _claim_job()
+        if not job:
             return
+        _prepare_job(job, settings, client)
 
-        client = LarkClient(settings)
-        access_token = _usable_access_token(job.authorization_id, authorization, client, settings)
-        discovered = _discover_chats(job, authorization, access_token, client, settings, chat_type="group")
-        # P2P discovery and content collection are part of the revised OAuth
-        # agreement. Existing statistics-only authorizations continue to sync
-        # their group metadata until the person explicitly reauthorizes.
+
+def _prepare_job(job: SyncJob, settings: Settings, client: LarkClient) -> None:
+    current = _begin_discovery(job)
+    if not current:
+        return
+    try:
+        authorization = _authorization(current.authorization_id)
+        if not authorization or authorization["status"] != "active":
+            _finish_job(current, "cancelled", "Authorization is no longer active.")
+            return
+        access_token = _usable_access_token(current.authorization_id, authorization, client, settings)
+        discovered = _discover_chats(current, authorization, access_token, client, settings, chat_type="group")
         if authorization.get("body_consent_at") and authorization.get("p2p_discovery_status") not in {
             "unavailable",
             "attention_required",
         }:
-            discovered += _discover_p2p(job, authorization, access_token, client, settings)
-        _set_job_discovered(job.id, discovered)
-
-        # A newly discovered conversation can appear while an incremental job is
-        # running. Always drain pending full-history backfills first so those
-        # rows never remain at "waiting" indefinitely.
-        if job.mode == "backfill" or _has_pending_backfill(job.authorization_id):
-            complete = _run_backfill(job, authorization, access_token, client, settings)
-        else:
-            complete = _run_incremental(job, authorization, access_token, client, settings)
-
-        if complete:
-            _finish_and_schedule_incremental(job)
-        else:
-            _requeue(job.id, delay_seconds=0, retry=False)
+            discovered += _discover_p2p(current, authorization, access_token, client, settings)
+        _complete_discovery(current, discovered)
+    except StaleSyncJob:
+        return
     except ReauthorizationRequired:
-        _mark_attention(job, "Lark authorization must be renewed.")
+        _mark_attention(current, "Lark authorization must be renewed.")
     except LarkApiError as exc:
-        if exc.likely_auth_problem:
-            _mark_attention(job, "Lark authorization or permission needs attention.")
-        elif exc.retryable:
-            delay = exc.retry_after or min(60 * (2 ** min(job.attempts, 4)), 900)
-            _requeue(
-                job.id,
-                delay_seconds=delay,
-                detail="Lark is temporarily unavailable; retry scheduled.",
-                code=exc.lark_code,
-                retry=True,
-            )
-        else:
-            _finish_job(job.id, "failed", "A Lark API request could not be completed.", exc.lark_code)
+        _handle_job_api_error(current, exc, discovery=True)
     except (psycopg.Error, ValueError):
         _requeue(
-            job.id,
-            delay_seconds=min(60 * (2 ** min(job.attempts, 4)), 900),
+            current,
+            delay_seconds=min(60 * (2 ** min(current.attempts, 4)), 900),
             detail="Temporary service issue; retry scheduled.",
-            retry=True,
+            reset_discovery=True,
         )
+
+
+def _begin_discovery(job: SyncJob) -> SyncJob | None:
+    with connection() as conn, conn.transaction():
+        row = conn.execute(
+            """
+            UPDATE sync_jobs
+            SET discovery_status = 'running', discovery_completed_at = NULL,
+                lease_until = NOW() + INTERVAL '10 minutes', updated_at = NOW()
+            WHERE id = %s AND status = 'running' AND discovery_status = 'pending'
+              AND discovery_generation = %s
+            RETURNING mode, attempts, discovery_generation
+            """,
+            (job.id, job.discovery_generation),
+        ).fetchone()
+    if not row:
+        return None
+    return SyncJob(
+        job.id,
+        job.authorization_id,
+        row["mode"],
+        int(row["attempts"]),
+        "running",
+        int(row["discovery_generation"]),
+    )
+
+
+def _complete_discovery(job: SyncJob, discovered: int) -> None:
+    with connection() as conn, conn.transaction():
+        conn.execute(
+            """
+            UPDATE sync_jobs
+            SET discovery_status = 'succeeded', discovery_completed_at = NOW(),
+                chats_discovered = %s, last_progress_at = NOW(),
+                lease_until = NOW() + INTERVAL '10 minutes', updated_at = NOW()
+            WHERE id = %s AND status = 'running'
+              AND discovery_status = 'running' AND discovery_generation = %s
+            """,
+            (discovered, job.id, job.discovery_generation),
+        )
+
+
+def _handle_job_api_error(job: SyncJob, exc: LarkApiError, *, discovery: bool) -> None:
+    if exc.likely_auth_problem:
+        _mark_attention(job, "Lark authorization or permission needs attention.")
+    elif exc.retryable:
+        _requeue(
+            job,
+            delay_seconds=exc.retry_after
+            if exc.retry_after is not None
+            else min(60 * (2 ** min(job.attempts, 4)), 900),
+            detail="Lark is temporarily unavailable; retry scheduled.",
+            code=exc.lark_code,
+            http_status=exc.status_code,
+            reset_discovery=discovery,
+        )
+    else:
+        _finish_job(job, "failed", "A Lark API request could not be completed.", exc.lark_code)
+
+
+def _fill_lark_slots(
+    settings: Settings,
+    client: LarkClient,
+    executor: ThreadPoolExecutor,
+    futures: dict[Future[dict[str, Any]], PageClaim],
+) -> None:
+    """Give distinct users the first slots, then use any spare capacity."""
+
+    jobs = [job for job in _running_jobs() if job.discovery_status == "succeeded"]
+    authorization_cache: dict[uuid.UUID, tuple[dict[str, Any], str] | None] = {}
+    while len(futures) < settings.lark_sync_max_inflight:
+        if not _dispatch_lark_turn(settings, client, executor, futures, jobs, authorization_cache):
+            return
+
+
+def _active_page_claim_counts(authorization_ids: set[uuid.UUID]) -> Counter[uuid.UUID]:
+    """Read durable claims so fairness survives an accidental second worker."""
+
+    if not authorization_ids:
+        return Counter()
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT authorization_id, COUNT(*) AS count
+            FROM authorization_chats
+            WHERE authorization_id = ANY(%s)
+              AND page_claim_id IS NOT NULL AND page_lease_until > NOW()
+            GROUP BY authorization_id
+            """,
+            (list(authorization_ids),),
+        ).fetchall()
+    return Counter({row["authorization_id"]: int(row["count"]) for row in rows})
+
+
+def _dispatch_lark_turn(
+    settings: Settings,
+    client: LarkClient,
+    executor: ThreadPoolExecutor,
+    futures: dict[Future[dict[str, Any]], PageClaim],
+    jobs: list[SyncJob],
+    authorization_cache: dict[uuid.UUID, tuple[dict[str, Any], str] | None],
+) -> bool:
+    active_authorizations = {job.authorization_id for job in jobs}
+    in_flight = _active_page_claim_counts(active_authorizations)
+    fair_limit = (
+        settings.lark_sync_max_inflight
+        if len(active_authorizations) <= 1
+        else min(settings.lark_sync_per_authorization_max_inflight, settings.lark_sync_max_inflight)
+    )
+
+    def dispatch(limit: int) -> bool:
+        for job in sorted(jobs, key=lambda item: (in_flight[item.authorization_id], item.id.hex)):
+            if in_flight[job.authorization_id] >= limit:
+                continue
+            cached = authorization_cache.get(job.authorization_id)
+            if cached is None and job.authorization_id not in authorization_cache:
+                authorization = _authorization(job.authorization_id)
+                if not authorization or authorization["status"] != "active":
+                    _finish_job(job, "cancelled", "Authorization is no longer active.")
+                    authorization_cache[job.authorization_id] = None
+                    continue
+                try:
+                    access_token = _usable_access_token(job.authorization_id, authorization, client, settings)
+                    cached = (authorization, access_token)
+                except ReauthorizationRequired:
+                    _mark_attention(job, "Lark authorization must be renewed.")
+                    authorization_cache[job.authorization_id] = None
+                    continue
+                except LarkApiError as exc:
+                    _handle_job_api_error(job, exc, discovery=False)
+                    authorization_cache[job.authorization_id] = None
+                    continue
+                except (psycopg.Error, ValueError):
+                    _requeue(
+                        job,
+                        delay_seconds=min(60 * (2 ** min(job.attempts, 4)), 900),
+                        detail="Temporary service issue; retry scheduled.",
+                    )
+                    authorization_cache[job.authorization_id] = None
+                    continue
+                authorization_cache[job.authorization_id] = cached
+            if not cached:
+                continue
+            authorization, access_token = cached
+            try:
+                claim = _claim_next_page(job, authorization, settings, limit)
+            except (psycopg.Error, ValueError):
+                _requeue(
+                    job,
+                    delay_seconds=min(60 * (2 ** min(job.attempts, 4)), 900),
+                    detail="Temporary service issue; retry scheduled.",
+                )
+                continue
+            if not claim:
+                continue
+            futures[executor.submit(_fetch_claim, client, claim, access_token)] = claim
+            return True
+        return False
+
+    # First give each authorized person up to the fair share.  If other active
+    # coordinators have no claimable conversation, do not leave a global slot
+    # idle: the remaining user can use it for another distinct chat.
+    if dispatch(fair_limit):
+        return True
+    if fair_limit < settings.lark_sync_max_inflight:
+        return dispatch(settings.lark_sync_max_inflight)
+    return False
+
+
+def _fetch_claim(client: LarkClient, claim: PageClaim, access_token: str) -> dict[str, Any]:
+    return client.list_chat_messages(
+        access_token,
+        claim.chat_id,
+        page_token=claim.expected_page_token,
+        start_at=claim.start_at,
+        end_at=claim.end_at,
+        ascending=True,
+    )
+
+
+def _reap_page_futures(futures: dict[Future[dict[str, Any]], PageClaim], settings: Settings) -> None:
+    for future, claim in tuple(futures.items()):
+        if not future.done():
+            continue
+        del futures[future]
+        try:
+            data = future.result()
+        except LarkApiError as exc:
+            _handle_claim_api_error(claim, exc)
+            continue
+        except Exception:
+            LOGGER.exception("Lark page task failed without exposing message content")
+            _release_retryable_page_claim(
+                claim,
+                delay_seconds=min(60 * (2 ** min(claim.job.attempts, 4)), 900),
+                detail="Temporary service issue; this conversation will retry.",
+            )
+            continue
+        content_cipher = message_body_cipher(settings.token_encryption_key) if claim.body_consent_at else None
+        try:
+            commit = _record_claimed_page(claim, _items(data), _continuation_token(data), content_cipher)
+        except StaleSyncJob:
+            continue
+        except LarkApiError as exc:
+            _handle_claim_api_error(claim, exc)
+            continue
+        except (psycopg.Error, ValueError):
+            LOGGER.exception("Lark page persistence failed without exposing message content")
+            _requeue(
+                claim.job,
+                delay_seconds=min(60 * (2 ** min(claim.job.attempts, 4)), 900),
+                detail="Temporary service issue; retry scheduled.",
+                claim=claim,
+            )
+            continue
+        if commit.committed:
+            _add_job_progress(claim.job, pages=1, messages=commit.messages, own_messages=commit.own_messages)
+
+
+def _schedule_member_snapshot(
+    settings: Settings,
+    client: LarkClient,
+    executor: ThreadPoolExecutor,
+    page_futures: dict[Future[dict[str, Any]], PageClaim],
+    member_futures: dict[Future[MemberSnapshotMeasurement], MemberSnapshotClaim],
+) -> None:
+    """Rosters are one low-priority slot and never start during message work."""
+
+    if page_futures or member_futures or _has_ready_message_work():
+        return
+    if "im:chat.members:read" not in settings.oauth_scopes:
+        _mark_one_member_snapshot_unavailable()
+        return
+    claim = _claim_member_snapshot(settings)
+    if not claim:
+        return
+    authorization = _authorization(claim.authorization_id)
+    if not authorization or authorization["status"] != "active":
+        _release_member_snapshot_claim(claim, "pending")
+        return
+    try:
+        access_token = _usable_access_token(claim.authorization_id, authorization, client, settings)
+    except ReauthorizationRequired:
+        _release_member_snapshot_claim(claim, "pending")
+        return
+    except LarkApiError:
+        _release_member_snapshot_claim(claim, "pending")
+        return
+    member_futures[executor.submit(_read_member_snapshot, client, access_token, claim.chat_id)] = claim
+
+
+def _has_ready_message_work() -> bool:
+    with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM sync_jobs
+                WHERE status = 'running' OR (status = 'queued' AND scheduled_at <= NOW())
+            ) AS ready
+            """
+        ).fetchone()
+    return bool(row["ready"])
+
+
+def _claim_member_snapshot(settings: Settings) -> MemberSnapshotClaim | None:
+    with connection() as conn, conn.transaction():
+        # Reuse the singleton admission row as a short global mutex so multiple
+        # worker processes cannot each start a roster read at the same time.
+        conn.execute("SELECT id FROM lark_sync_admission_state WHERE id FOR UPDATE")
+        chat = conn.execute(
+            """
+            SELECT access.authorization_id, access.chat_id, access.sync_generation
+            FROM authorization_chats access
+            JOIN chats c ON c.chat_id = access.chat_id
+            JOIN authorizations a ON a.id = access.authorization_id
+            WHERE a.status = 'active' AND access.sync_enabled AND access.is_visible
+              AND COALESCE(c.chat_status, 'normal') = 'normal'
+              AND COALESCE(c.chat_mode, 'group') <> 'p2p'
+              AND (access.member_snapshot_checked_at IS NULL
+                   OR access.member_snapshot_checked_at <= NOW() - (%s * INTERVAL '1 second'))
+              AND (access.member_snapshot_retry_at IS NULL OR access.member_snapshot_retry_at <= NOW())
+              AND (access.member_snapshot_claim_id IS NULL
+                   OR access.member_snapshot_lease_until < NOW())
+              AND NOT EXISTS (
+                  SELECT 1 FROM authorization_chats active_snapshot
+                  WHERE active_snapshot.member_snapshot_claim_id IS NOT NULL
+                    AND active_snapshot.member_snapshot_lease_until > NOW()
+              )
+            ORDER BY access.member_snapshot_checked_at NULLS FIRST, access.chat_id
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+            """,
+            (settings.member_count_refresh_seconds,),
+        ).fetchone()
+        if not chat:
+            return None
+        claim_id = uuid.uuid4()
+        conn.execute(
+            """
+            UPDATE authorization_chats
+            SET member_snapshot_claim_id = %s, member_snapshot_claimed_at = NOW(),
+                member_snapshot_lease_until = NOW() + INTERVAL '10 minutes'
+            WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
+            """,
+            (claim_id, chat["authorization_id"], chat["chat_id"], chat["sync_generation"]),
+        )
+    return MemberSnapshotClaim(
+        chat["authorization_id"], chat["chat_id"], int(chat["sync_generation"]), claim_id
+    )
+
+
+def _reap_member_futures(
+    futures: dict[Future[MemberSnapshotMeasurement], MemberSnapshotClaim],
+) -> None:
+    for future, claim in tuple(futures.items()):
+        if not future.done():
+            continue
+        del futures[future]
+        try:
+            measurement = future.result()
+        except Exception:
+            LOGGER.exception("member snapshot task failed without exposing roster data")
+            _release_member_snapshot_claim(claim, "pending")
+            continue
+        _store_claimed_member_snapshot(claim, measurement)
+
+
+def _store_claimed_member_snapshot(claim: MemberSnapshotClaim, measurement: MemberSnapshotMeasurement) -> None:
+    with connection() as conn, conn.transaction():
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM authorization_chats
+            WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
+              AND member_snapshot_claim_id = %s
+            FOR UPDATE
+            """,
+            (claim.authorization_id, claim.chat_id, claim.generation, claim.claim_id),
+        ).fetchone()
+        if not row:
+            return
+        if measurement.retry_after_seconds is not None:
+            conn.execute(
+                """
+                UPDATE authorization_chats
+                SET member_snapshot_status = 'pending',
+                    member_snapshot_retry_at = NOW() + (%s * INTERVAL '1 second'),
+                    member_snapshot_claim_id = NULL, member_snapshot_claimed_at = NULL,
+                    member_snapshot_lease_until = NULL
+                WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
+                  AND member_snapshot_claim_id = %s
+                """,
+                (
+                    measurement.retry_after_seconds,
+                    claim.authorization_id,
+                    claim.chat_id,
+                    claim.generation,
+                    claim.claim_id,
+                ),
+            )
+            return
+        seen_at = measurement.checked_at or datetime.now(UTC)
+        _store_member_snapshot(
+            conn,
+            claim.authorization_id,
+            claim.chat_id,
+            measurement,
+            seen_at,
+            _internal_tenant_keys(conn),
+        )
+        conn.execute(
+            """
+            UPDATE authorization_chats
+            SET member_count = %s, member_count_status = %s, member_count_checked_at = %s,
+                member_snapshot_status = %s, member_snapshot_checked_at = %s,
+                member_snapshot_claim_id = NULL, member_snapshot_claimed_at = NULL,
+                member_snapshot_lease_until = NULL, member_snapshot_retry_at = NULL
+            WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
+              AND member_snapshot_claim_id = %s
+            """,
+            (
+                measurement.count,
+                measurement.count_status,
+                measurement.checked_at,
+                measurement.snapshot_status,
+                measurement.checked_at,
+                claim.authorization_id,
+                claim.chat_id,
+                claim.generation,
+                claim.claim_id,
+            ),
+        )
+
+
+def _release_member_snapshot_claim(claim: MemberSnapshotClaim, status: str) -> None:
+    with connection() as conn, conn.transaction():
+        conn.execute(
+            """
+            UPDATE authorization_chats
+            SET member_snapshot_status = %s,
+                member_snapshot_checked_at = CASE WHEN %s = 'pending' THEN member_snapshot_checked_at ELSE NOW() END,
+                member_snapshot_retry_at = CASE
+                    WHEN %s = 'pending' THEN NOW() + INTERVAL '5 minutes'
+                    ELSE NULL
+                END,
+                member_snapshot_claim_id = NULL, member_snapshot_claimed_at = NULL,
+                member_snapshot_lease_until = NULL
+            WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
+              AND member_snapshot_claim_id = %s
+            """,
+            (status, status, status, claim.authorization_id, claim.chat_id, claim.generation, claim.claim_id),
+        )
+
+
+def _mark_one_member_snapshot_unavailable() -> None:
+    with connection() as conn, conn.transaction():
+        conn.execute(
+            """
+            UPDATE authorization_chats
+            SET member_count_status = 'unavailable', member_snapshot_status = 'unavailable',
+                member_count_checked_at = NOW(), member_snapshot_checked_at = NOW()
+            WHERE (authorization_id, chat_id) IN (
+                SELECT access.authorization_id, access.chat_id
+                FROM authorization_chats access
+                JOIN chats c ON c.chat_id = access.chat_id
+                WHERE COALESCE(c.chat_mode, 'group') <> 'p2p'
+                  AND access.member_snapshot_status = 'pending'
+                ORDER BY access.chat_id
+                LIMIT 1
+            )
+            """
+        )
+
+
+def _handle_claim_api_error(claim: PageClaim, exc: LarkApiError) -> None:
+    if exc.likely_auth_problem:
+        _mark_attention(claim.job, "Lark authorization or permission needs attention.", claim=claim)
+    elif exc.retryable:
+        _release_retryable_page_claim(
+            claim,
+            delay_seconds=exc.retry_after
+            if exc.retry_after is not None
+            else min(60 * (2 ** min(claim.job.attempts, 4)), 900),
+            detail="Lark is temporarily unavailable; this conversation will retry.",
+            code=exc.lark_code,
+            http_status=exc.status_code,
+        )
+    else:
+        _mark_chat_not_readable(claim)
+
+
+def _finish_completed_jobs(futures: dict[Future[dict[str, Any]], PageClaim]) -> None:
+    in_flight = {claim.job.id for claim in futures.values()}
+    for job in _running_jobs():
+        if job.discovery_status != "succeeded" or job.id in in_flight:
+            continue
+        _finish_and_schedule_incremental(job)
 
 
 def _authorization(authorization_id: uuid.UUID) -> dict[str, Any] | None:
@@ -351,9 +946,8 @@ def _discover_chats(
     page_token: str | None = None
     discovered = 0
     seen_at = datetime.now(UTC)
-    last_member_snapshot_checks = _member_snapshot_check_times(authorization["id"])
     while True:
-        _renew_lease(job.id)
+        _renew_lease(job)
         data = client.list_chats(access_token, page_token, types="p2p" if chat_type == "p2p" else None)
         rows: list[
             tuple[
@@ -375,21 +969,6 @@ def _discover_chats(
             if chat_type == "group" and chat_mode == "p2p":
                 continue
             measurement: MemberSnapshotMeasurement | None = None
-            if chat_type == "group" and _member_count_refresh_due(
-                last_member_snapshot_checks.get(chat_id), seen_at, settings.member_count_refresh_seconds
-            ):
-                if "im:chat.members:read" in settings.oauth_scopes:
-                    _renew_lease(job.id)
-                    measurement = _read_member_snapshot(client, access_token, chat_id)
-                else:
-                    measurement = MemberSnapshotMeasurement(
-                        count=None,
-                        count_status="unavailable",
-                        snapshot_status="unavailable",
-                        checked_at=seen_at,
-                    )
-                if measurement.checked_at:
-                    last_member_snapshot_checks[chat_id] = measurement.checked_at
             rows.append(
                 (
                     chat_id,
@@ -404,6 +983,7 @@ def _discover_chats(
             )
 
         with connection() as conn, conn.transaction():
+            _assert_discovery_current(conn, job)
             internal_tenant_keys = _internal_tenant_keys(conn)
             for (
                 chat_id,
@@ -533,6 +1113,7 @@ def _discover_chats(
             raise LarkApiError(502, None, "Lark chat pagination did not return a continuation token")
 
     with connection() as conn, conn.transaction():
+        _assert_discovery_current(conn, job)
         conn.execute(
             """
             UPDATE authorization_chats AS access
@@ -549,6 +1130,21 @@ def _discover_chats(
             (authorization["id"], chat_type, seen_at),
         )
     return discovered
+
+
+def _assert_discovery_current(conn: psycopg.Connection, job: SyncJob) -> None:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM sync_jobs
+        WHERE id = %s AND status = 'running' AND discovery_status = 'running'
+          AND discovery_generation = %s
+        FOR UPDATE
+        """,
+        (job.id, job.discovery_generation),
+    ).fetchone()
+    if not row:
+        raise StaleSyncJob
 
 
 def _discover_p2p(
@@ -571,13 +1167,13 @@ def _discover_p2p(
             if status == "attention_required"
             else "Lark does not currently return this user's P2P conversation list."
         )
-        _set_p2p_discovery(authorization["id"], status, detail)
+        _set_p2p_discovery(job, status, detail)
         return 0
-    _set_p2p_discovery(authorization["id"], "succeeded", None)
+    _set_p2p_discovery(job, "succeeded", None)
     return discovered
 
 
-def _set_p2p_discovery(authorization_id: uuid.UUID, status: str, detail: str | None) -> None:
+def _set_p2p_discovery(job: SyncJob, status: str, detail: str | None) -> None:
     with connection() as conn, conn.transaction():
         conn.execute(
             """
@@ -585,28 +1181,14 @@ def _set_p2p_discovery(authorization_id: uuid.UUID, status: str, detail: str | N
             SET p2p_discovery_status = %s, p2p_last_checked_at = NOW(),
                 p2p_last_error = %s, updated_at = NOW()
             WHERE id = %s
+              AND EXISTS (
+                  SELECT 1 FROM sync_jobs
+                  WHERE id = %s AND status = 'running' AND discovery_status = 'running'
+                    AND discovery_generation = %s
+              )
             """,
-            (status, detail, authorization_id),
+            (status, detail, job.authorization_id, job.id, job.discovery_generation),
         )
-
-
-def _member_snapshot_check_times(authorization_id: uuid.UUID) -> dict[str, datetime | None]:
-    with connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT chat_id, member_snapshot_checked_at
-            FROM authorization_chats
-            WHERE authorization_id = %s
-            """,
-            (authorization_id,),
-        ).fetchall()
-    return {row["chat_id"]: row["member_snapshot_checked_at"] for row in rows}
-
-
-def _member_count_refresh_due(
-    last_checked_at: datetime | None, now: datetime, refresh_seconds: int
-) -> bool:
-    return last_checked_at is None or last_checked_at <= now - timedelta(seconds=refresh_seconds)
 
 
 def _p2p_counterpart_open_id(counterpart_id: str | None, counterpart_type: str | None) -> str | None:
@@ -634,6 +1216,14 @@ def _read_member_snapshot(client: LarkClient, access_token: str, chat_id: str) -
     except LarkApiError as exc:
         status = "pending" if exc.retryable else "unavailable"
         LOGGER.info("member snapshot unavailable: status=%s code=%s", exc.status_code, exc.lark_code)
+        if exc.retryable:
+            return MemberSnapshotMeasurement(
+                count=None,
+                count_status="pending",
+                snapshot_status="pending",
+                checked_at=None,
+                retry_after_seconds=exc.retry_after if exc.retry_after is not None else 300,
+            )
         return MemberSnapshotMeasurement(None, status, status, checked_at)
 
     unique_members = {member["open_id"]: member for member in members}
@@ -900,212 +1490,216 @@ def _ensure_contact_for_identity(
         )
 
 
-def _run_backfill(
-    job: SyncJob, authorization: dict[str, Any], access_token: str, client: LarkClient, settings: Settings
-) -> bool:
-    pages = 0
-    content_cipher = (
-        message_body_cipher(settings.token_encryption_key) if authorization.get("body_consent_at") else None
-    )
-    while pages < settings.max_pages_per_job:
-        chat = _next_backfill_chat(authorization["id"])
-        if not chat:
-            return True
-        now = datetime.now(UTC)
-        generation = int(chat["sync_generation"])
-        start_at = chat["backfill_window_start_at"]
-        end_at = chat["backfill_window_end_at"]
-        if not end_at:
-            end_at = now
-            # A user-requested rescan intentionally ignores the optional
-            # default lookback: it means every message Lark can return.
-            start_at = (
-                None
-                if chat["manual_backfill_requested_at"]
-                else now - timedelta(days=settings.sync_lookback_days)
-                if settings.sync_lookback_days
-                else None
-            )
-            _start_backfill_window(authorization["id"], chat["chat_id"], start_at, end_at, generation)
-
-        try:
-            data = client.list_chat_messages(
-                access_token,
-                chat["chat_id"],
-                page_token=chat["backfill_page_token"],
-                start_at=start_at,
-                end_at=end_at,
-                ascending=True,
-            )
-        except LarkApiError as exc:
-            if exc.retryable or exc.likely_auth_problem:
-                raise
-            _mark_chat_not_readable(authorization["id"], chat["chat_id"], generation)
-            continue
-
-        next_page_token = _continuation_token(data)
-
-        inserted, own_inserted = _record_page(
-            job,
-            authorization,
-            chat["chat_id"],
-            _items(data),
-            next_page_token=next_page_token,
-            backfill=True,
-            generation=generation,
-            content_cipher=content_cipher,
-        )
-        pages += 1
-        _add_job_progress(job.id, pages=1, messages=inserted, own_messages=own_inserted)
-    return False
-
-
-def _run_incremental(
-    job: SyncJob, authorization: dict[str, Any], access_token: str, client: LarkClient, settings: Settings
-) -> bool:
-    pages = 0
-    content_cipher = (
-        message_body_cipher(settings.token_encryption_key) if authorization.get("body_consent_at") else None
-    )
-    while pages < settings.max_pages_per_job:
-        # Finish the current page before yielding to a requested full rescan.
-        # The requeued job will claim that request before reading another
-        # incremental page for this authorization.
-        if _has_manual_backfill_request(authorization["id"]):
-            return False
-        chat = _next_incremental_chat(authorization["id"], job.id)
-        if not chat:
-            return True
-        generation = int(chat["sync_generation"])
-        start_at = chat["incremental_window_start_at"]
-        end_at = chat["incremental_window_end_at"]
-        if not end_at:
-            end_at = datetime.now(UTC)
-            last_sync = chat["last_incremental_at"] or chat["last_backfill_at"]
-            if last_sync:
-                start_at = last_sync - timedelta(seconds=settings.sync_overlap_seconds)
-            else:
-                start_at = end_at - timedelta(days=settings.sync_lookback_days or 1)
-        if chat["incremental_job_id"] != job.id:
-            _start_incremental_window(authorization["id"], chat["chat_id"], job.id, start_at, end_at, generation)
-
-        try:
-            data = client.list_chat_messages(
-                access_token,
-                chat["chat_id"],
-                page_token=chat["incremental_page_token"],
-                start_at=start_at,
-                end_at=end_at,
-                ascending=True,
-            )
-        except LarkApiError as exc:
-            if exc.retryable or exc.likely_auth_problem:
-                raise
-            _mark_chat_not_readable(authorization["id"], chat["chat_id"], generation)
-            continue
-
-        next_page_token = _continuation_token(data)
-
-        inserted, own_inserted = _record_page(
-            job,
-            authorization,
-            chat["chat_id"],
-            _items(data),
-            next_page_token=next_page_token,
-            backfill=False,
-            generation=generation,
-            content_cipher=content_cipher,
-        )
-        pages += 1
-        _add_job_progress(job.id, pages=1, messages=inserted, own_messages=own_inserted)
-    return False
-
-
-def _next_backfill_chat(authorization_id: uuid.UUID) -> dict[str, Any] | None:
-    """Return the next full-history conversation, honoring requested rescans first."""
-
-    with connection() as conn:
-        manual_in_progress = conn.execute(
-            """
-            SELECT access.*
-            FROM authorization_chats AS access
-            JOIN chats AS c ON c.chat_id = access.chat_id
-            WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
-              AND COALESCE(c.chat_status, 'normal') = 'normal'
-              AND access.manual_backfill_requested_at IS NOT NULL
-              AND access.manual_backfill_started_at IS NOT NULL
-              AND NOT access.backfill_complete
-            ORDER BY access.manual_backfill_requested_at, access.chat_id
-            LIMIT 1
-            """,
-            (authorization_id,),
-        ).fetchone()
-        if manual_in_progress:
-            return manual_in_progress
-
-    claimed = _claim_requested_backfill(authorization_id)
-    if claimed:
-        return claimed
-
-    with connection() as conn:
-        return conn.execute(
-            """
-            SELECT access.*
-            FROM authorization_chats AS access
-            JOIN chats AS c ON c.chat_id = access.chat_id
-            WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
-              AND COALESCE(c.chat_status, 'normal') = 'normal' AND NOT access.backfill_complete
-              AND access.sync_status <> 'not_readable'
-            ORDER BY access.discovered_at, access.chat_id LIMIT 1
-            """,
-            (authorization_id,),
-        ).fetchone()
-
-
-def _claim_requested_backfill(authorization_id: uuid.UUID) -> dict[str, Any] | None:
-    """Atomically reset and claim one manual full-history rescan request."""
+def _claim_next_page(
+    job: SyncJob,
+    authorization: dict[str, Any],
+    settings: Settings,
+    claim_limit: int | None = None,
+) -> PageClaim | None:
+    """Lock one conversation cursor; another worker can only claim another chat."""
 
     with connection() as conn, conn.transaction():
-        return conn.execute(
+        current = conn.execute(
             """
-            WITH requested_chat AS (
-                SELECT access.authorization_id, access.chat_id
-                FROM authorization_chats AS access
-                JOIN chats AS c ON c.chat_id = access.chat_id
-                WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
-                  AND COALESCE(c.chat_status, 'normal') = 'normal'
-                  AND access.manual_backfill_requested_at IS NOT NULL
-                  AND access.manual_backfill_started_at IS NULL
-                ORDER BY access.manual_backfill_requested_at, access.chat_id
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            )
-            UPDATE authorization_chats AS access
-            SET backfill_page_token = NULL,
-                backfill_complete = FALSE,
-                backfill_started_at = NULL,
-                backfill_window_start_at = NULL,
-                backfill_window_end_at = NULL,
-                incremental_page_token = NULL,
-                incremental_job_id = NULL,
-                incremental_window_start_at = NULL,
-                incremental_window_end_at = NULL,
-                sync_status = 'pending',
-                last_error = NULL,
-                manual_backfill_started_at = NOW(),
-                sync_generation = access.sync_generation + 1
-            FROM requested_chat
-            WHERE access.authorization_id = requested_chat.authorization_id
-              AND access.chat_id = requested_chat.chat_id
-            RETURNING access.*
+            SELECT mode
+            FROM sync_jobs
+            WHERE id = %s AND status = 'running' AND discovery_status = 'succeeded'
+              AND discovery_generation = %s
+            FOR UPDATE
             """,
-            (authorization_id,),
+            (job.id, job.discovery_generation),
         ).fetchone()
+        if not current:
+            return None
+        claim_limit = claim_limit or settings.lark_sync_per_authorization_max_inflight
+        active_claims = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM authorization_chats
+            WHERE authorization_id = %s AND page_claim_id IS NOT NULL
+              AND page_lease_until > NOW()
+            """,
+            (job.authorization_id,),
+        ).fetchone()
+        if int(active_claims["count"]) >= claim_limit:
+            return None
+        mode = "backfill" if current["mode"] == "backfill" or _has_pending_backfill_in_connection(
+            conn, job.authorization_id
+        ) else "incremental"
+        if mode != current["mode"]:
+            conn.execute("UPDATE sync_jobs SET mode = %s, updated_at = NOW() WHERE id = %s", (mode, job.id))
+
+        if mode == "backfill":
+            _reset_one_requested_backfill(conn, job.authorization_id)
+            chat = _select_backfill_chat_for_claim(conn, job.authorization_id)
+        else:
+            chat = _select_incremental_chat_for_claim(conn, job.authorization_id, job.id)
+        if not chat:
+            return None
+
+        now = datetime.now(UTC)
+        generation = int(chat["sync_generation"])
+        if mode == "backfill":
+            start_at = chat["backfill_window_start_at"]
+            end_at = chat["backfill_window_end_at"]
+            if not end_at:
+                end_at = now
+                start_at = (
+                    None
+                    if chat["manual_backfill_requested_at"]
+                    else now - timedelta(days=settings.sync_lookback_days)
+                    if settings.sync_lookback_days
+                    else None
+                )
+            expected_page_token = chat["backfill_page_token"]
+        else:
+            same_job = chat["incremental_job_id"] == job.id
+            end_at = chat["incremental_window_end_at"] if same_job else None
+            start_at = chat["incremental_window_start_at"] if same_job else None
+            if not end_at:
+                end_at = now
+                last_sync = chat["last_incremental_at"] or chat["last_backfill_at"]
+                start_at = (
+                    last_sync - timedelta(seconds=settings.sync_overlap_seconds)
+                    if last_sync
+                    else end_at - timedelta(days=settings.sync_lookback_days or 1)
+                )
+            expected_page_token = chat["incremental_page_token"] if same_job else None
+
+        claim_id = uuid.uuid4()
+        conn.execute(
+            """
+            UPDATE authorization_chats
+            SET backfill_started_at = CASE WHEN %s = 'backfill' THEN COALESCE(backfill_started_at, NOW())
+                    ELSE backfill_started_at END,
+                backfill_window_start_at = CASE WHEN %s = 'backfill' THEN %s ELSE backfill_window_start_at END,
+                backfill_window_end_at = CASE WHEN %s = 'backfill' THEN %s ELSE backfill_window_end_at END,
+                incremental_job_id = CASE WHEN %s = 'incremental' THEN %s ELSE incremental_job_id END,
+                incremental_window_start_at = CASE WHEN %s = 'incremental' THEN %s ELSE incremental_window_start_at END,
+                incremental_window_end_at = CASE WHEN %s = 'incremental' THEN %s ELSE incremental_window_end_at END,
+                page_claim_id = %s, page_claim_job_id = %s, page_claim_mode = %s,
+                page_claimed_at = NOW(), page_lease_until = NOW() + INTERVAL '10 minutes',
+                page_retry_at = NULL, sync_status = 'syncing', last_error = NULL
+            WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
+            """,
+            (
+                mode,
+                mode,
+                start_at,
+                mode,
+                end_at,
+                mode,
+                job.id,
+                mode,
+                start_at,
+                mode,
+                end_at,
+                claim_id,
+                job.id,
+                mode,
+                job.authorization_id,
+                chat["chat_id"],
+                generation,
+            ),
+        )
+    assert end_at is not None
+    return PageClaim(
+        job=job,
+        chat_id=chat["chat_id"],
+        mode=mode,
+        generation=generation,
+        claim_id=claim_id,
+        expected_page_token=expected_page_token,
+        start_at=start_at,
+        end_at=end_at,
+        author_open_id=authorization["open_id"],
+        body_consent_at=authorization.get("body_consent_at"),
+    )
 
 
-def _has_pending_backfill(authorization_id: uuid.UUID) -> bool:
-    with connection() as conn:
-        return _has_pending_backfill_in_connection(conn, authorization_id)
+def _reset_one_requested_backfill(conn: psycopg.Connection, authorization_id: uuid.UUID) -> None:
+    row = conn.execute(
+        """
+        SELECT access.authorization_id, access.chat_id
+        FROM authorization_chats access
+        JOIN chats c ON c.chat_id = access.chat_id
+        WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
+          AND COALESCE(c.chat_status, 'normal') = 'normal'
+          AND access.manual_backfill_requested_at IS NOT NULL
+          AND access.manual_backfill_started_at IS NULL
+        ORDER BY access.manual_backfill_requested_at, access.chat_id
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+        """,
+        (authorization_id,),
+    ).fetchone()
+    if not row:
+        return
+    conn.execute(
+        """
+        UPDATE authorization_chats
+        SET backfill_page_token = NULL, backfill_complete = FALSE, backfill_started_at = NULL,
+            backfill_window_start_at = NULL, backfill_window_end_at = NULL,
+            incremental_page_token = NULL, incremental_job_id = NULL,
+            incremental_window_start_at = NULL, incremental_window_end_at = NULL,
+            page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
+            page_claimed_at = NULL, page_lease_until = NULL,
+            page_retry_at = NULL,
+            sync_status = 'pending', last_error = NULL, manual_backfill_started_at = NOW(),
+            sync_generation = sync_generation + 1
+        WHERE authorization_id = %s AND chat_id = %s
+        """,
+        (row["authorization_id"], row["chat_id"]),
+    )
+
+
+def _select_backfill_chat_for_claim(conn: psycopg.Connection, authorization_id: uuid.UUID) -> dict[str, Any] | None:
+    return conn.execute(
+        """
+        SELECT access.*
+        FROM authorization_chats access
+        JOIN chats c ON c.chat_id = access.chat_id
+        WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
+          AND COALESCE(c.chat_status, 'normal') = 'normal'
+          AND access.sync_status <> 'not_readable'
+          AND (access.page_claim_id IS NULL OR access.page_lease_until < NOW())
+          AND (access.page_retry_at IS NULL OR access.page_retry_at <= NOW())
+          AND (access.manual_backfill_requested_at IS NOT NULL OR NOT access.backfill_complete)
+        ORDER BY
+            CASE WHEN access.manual_backfill_requested_at IS NOT NULL THEN 0 ELSE 1 END,
+            access.manual_backfill_requested_at NULLS LAST, access.discovered_at, access.chat_id
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+        """,
+        (authorization_id,),
+    ).fetchone()
+
+
+def _select_incremental_chat_for_claim(
+    conn: psycopg.Connection, authorization_id: uuid.UUID, job_id: uuid.UUID
+) -> dict[str, Any] | None:
+    return conn.execute(
+        """
+        SELECT access.*
+        FROM authorization_chats access
+        JOIN chats c ON c.chat_id = access.chat_id
+        WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
+          AND COALESCE(c.chat_status, 'normal') = 'normal'
+          AND access.backfill_complete AND access.sync_status <> 'not_readable'
+          AND (access.page_claim_id IS NULL OR access.page_lease_until < NOW())
+          AND (access.page_retry_at IS NULL OR access.page_retry_at <= NOW())
+          AND (
+            (access.incremental_job_id = %s AND access.incremental_page_token IS NOT NULL)
+            OR access.incremental_job_id IS DISTINCT FROM %s
+          )
+        ORDER BY
+            CASE WHEN access.incremental_job_id = %s AND access.incremental_page_token IS NOT NULL THEN 0 ELSE 1 END,
+            COALESCE(access.last_incremental_at, access.last_backfill_at), access.chat_id
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+        """,
+        (authorization_id, job_id, job_id, job_id),
+    ).fetchone()
 
 
 def _has_pending_backfill_in_connection(conn: psycopg.Connection, authorization_id: uuid.UUID) -> bool:
@@ -1113,102 +1707,19 @@ def _has_pending_backfill_in_connection(conn: psycopg.Connection, authorization_
         """
         SELECT EXISTS (
             SELECT 1
-            FROM authorization_chats AS access
-            JOIN chats AS c ON c.chat_id = access.chat_id
+            FROM authorization_chats access
+            JOIN chats c ON c.chat_id = access.chat_id
             WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
               AND COALESCE(c.chat_status, 'normal') = 'normal'
               AND (
                     access.manual_backfill_requested_at IS NOT NULL
-                 OR (NOT access.backfill_complete AND access.sync_status <> 'not_readable')
+                    OR (NOT access.backfill_complete AND access.sync_status <> 'not_readable')
               )
         ) AS pending
         """,
         (authorization_id,),
     ).fetchone()
     return bool(row["pending"])
-
-
-def _has_manual_backfill_request(authorization_id: uuid.UUID) -> bool:
-    with connection() as conn:
-        row = conn.execute(
-            """
-            SELECT EXISTS (
-                SELECT 1
-                FROM authorization_chats AS access
-                JOIN chats AS c ON c.chat_id = access.chat_id
-                WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
-                  AND COALESCE(c.chat_status, 'normal') = 'normal'
-                  AND access.manual_backfill_requested_at IS NOT NULL
-            ) AS pending
-            """,
-            (authorization_id,),
-        ).fetchone()
-    return bool(row["pending"])
-
-
-def _next_incremental_chat(authorization_id: uuid.UUID, job_id: uuid.UUID) -> dict[str, Any] | None:
-    with connection() as conn:
-        return conn.execute(
-            """
-            SELECT access.*
-            FROM authorization_chats AS access
-            JOIN chats AS c ON c.chat_id = access.chat_id
-            WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
-              AND COALESCE(c.chat_status, 'normal') = 'normal' AND access.backfill_complete
-              AND access.sync_status <> 'not_readable'
-              AND (
-                    (access.incremental_job_id = %s AND access.incremental_page_token IS NOT NULL)
-                 OR access.incremental_job_id IS DISTINCT FROM %s
-              )
-            ORDER BY
-                CASE
-                    WHEN access.incremental_job_id = %s AND access.incremental_page_token IS NOT NULL THEN 0
-                    ELSE 1
-                END,
-                COALESCE(access.last_incremental_at, access.last_backfill_at), access.chat_id
-            LIMIT 1
-            """,
-            (authorization_id, job_id, job_id, job_id),
-        ).fetchone()
-
-
-def _start_backfill_window(
-    authorization_id: uuid.UUID, chat_id: str, start_at: datetime | None, end_at: datetime, generation: int
-) -> None:
-    with connection() as conn, conn.transaction():
-        conn.execute(
-            """
-            UPDATE authorization_chats
-            SET backfill_started_at = COALESCE(backfill_started_at, NOW()),
-                backfill_window_start_at = COALESCE(backfill_window_start_at, %s),
-                backfill_window_end_at = COALESCE(backfill_window_end_at, %s),
-                sync_status = 'syncing', last_error = NULL
-            WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
-            """,
-            (start_at, end_at, authorization_id, chat_id, generation),
-        )
-
-
-def _start_incremental_window(
-    authorization_id: uuid.UUID,
-    chat_id: str,
-    job_id: uuid.UUID,
-    start_at: datetime,
-    end_at: datetime,
-    generation: int,
-) -> None:
-    with connection() as conn, conn.transaction():
-        conn.execute(
-            """
-            UPDATE authorization_chats
-            SET incremental_job_id = %s,
-                incremental_window_start_at = COALESCE(incremental_window_start_at, %s),
-                incremental_window_end_at = COALESCE(incremental_window_end_at, %s),
-                sync_status = 'syncing', last_error = NULL
-            WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
-            """,
-            (job_id, start_at, end_at, authorization_id, chat_id, generation),
-        )
 
 
 def _record_message_sender_identity(
@@ -1247,26 +1758,68 @@ def _record_message_sender_identity(
     return metadata
 
 
-def _record_page(
-    job: SyncJob,
-    authorization: dict[str, Any],
-    chat_id: str,
+def _record_claimed_page(
+    claim: PageClaim,
     messages: list[dict[str, Any]],
-    *,
     next_page_token: str | None,
-    backfill: bool,
-    generation: int,
     content_cipher: TokenCipher | None,
-) -> tuple[int, int]:
+) -> PageCommit:
+    """Persist a fetched page only while its exact cursor claim is still current."""
+
     inserted = 0
     own_inserted = 0
     with connection() as conn, conn.transaction():
+        # Keep the same lock order as `_claim_next_page`: coordinator first,
+        # then its conversation row. This avoids a claim/commit deadlock when
+        # several page fetches return together.
+        current_job = conn.execute(
+            """
+            SELECT 1
+            FROM sync_jobs
+            WHERE id = %s AND status = 'running' AND discovery_status = 'succeeded'
+              AND discovery_generation = %s
+            FOR UPDATE
+            """,
+            (claim.job.id, claim.job.discovery_generation),
+        ).fetchone()
+        if not current_job:
+            return PageCommit(False)
+        current_claim = conn.execute(
+            """
+            SELECT 1
+            FROM authorization_chats access
+            WHERE access.authorization_id = %s AND access.chat_id = %s
+              AND access.sync_generation = %s
+              AND access.page_claim_id = %s AND access.page_claim_job_id = %s
+              AND access.page_claim_mode = %s
+              AND access.page_lease_until > NOW()
+              AND (
+                (%s = 'backfill' AND access.backfill_page_token IS NOT DISTINCT FROM %s)
+                OR (%s = 'incremental' AND access.incremental_page_token IS NOT DISTINCT FROM %s)
+              )
+            FOR UPDATE
+            """,
+            (
+                claim.job.authorization_id,
+                claim.chat_id,
+                claim.generation,
+                claim.claim_id,
+                claim.job.id,
+                claim.mode,
+                claim.mode,
+                claim.expected_page_token,
+                claim.mode,
+                claim.expected_page_token,
+            ),
+        ).fetchone()
+        if not current_claim:
+            return PageCommit(False)
         internal_tenant_keys = _internal_tenant_keys(conn)
         for message in messages:
             message_id = _text(message.get("message_id"))
             if not message_id:
                 continue
-            is_own = _is_author_message(message, authorization["open_id"])
+            is_own = _is_author_message(message, claim.author_open_id)
             (
                 sender_id,
                 sender_id_type,
@@ -1350,7 +1903,7 @@ def _record_page(
                     last_observed_at = NOW()
                 """,
                 (
-                    chat_id,
+                    claim.chat_id,
                     message_id,
                     _lark_time(message.get("create_time")),
                     _lark_time(message.get("update_time")),
@@ -1381,7 +1934,7 @@ def _record_page(
                     observed_at = NOW()
                 RETURNING sent_by_author, (xmax = 0) AS is_new
                 """,
-                (authorization["id"], chat_id, message_id, is_own),
+                (claim.job.authorization_id, claim.chat_id, message_id, is_own),
             ).fetchone()
             if observation["is_new"]:
                 inserted += 1
@@ -1389,8 +1942,8 @@ def _record_page(
 
         _refresh_tenant_classifications(conn, internal_tenant_keys)
 
-        if backfill:
-            conn.execute(
+        if claim.mode == "backfill":
+            updated = conn.execute(
                 """
                 UPDATE authorization_chats
                 SET backfill_page_token = %s,
@@ -1401,8 +1954,13 @@ def _record_page(
                         WHEN %s THEN NULL ELSE manual_backfill_requested_at
                     END,
                     manual_backfill_started_at = CASE WHEN %s THEN NULL ELSE manual_backfill_started_at END,
-                    last_error = NULL
+                    last_error = NULL,
+                    page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
+                    page_claimed_at = NULL, page_lease_until = NULL, page_retry_at = NULL
                 WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
+                  AND page_claim_id = %s AND page_claim_job_id = %s AND page_claim_mode = 'backfill'
+                  AND backfill_page_token IS NOT DISTINCT FROM %s
+                RETURNING 1
                 """,
                 (
                     next_page_token,
@@ -1411,13 +1969,16 @@ def _record_page(
                     next_page_token is None,
                     next_page_token is None,
                     next_page_token is None,
-                    authorization["id"],
-                    chat_id,
-                    generation,
+                    claim.job.authorization_id,
+                    claim.chat_id,
+                    claim.generation,
+                    claim.claim_id,
+                    claim.job.id,
+                    claim.expected_page_token,
                 ),
-            )
+            ).fetchone()
         else:
-            conn.execute(
+            updated = conn.execute(
                 """
                 UPDATE authorization_chats
                 SET incremental_page_token = %s,
@@ -1425,8 +1986,13 @@ def _record_page(
                     incremental_window_end_at = CASE WHEN %s THEN NULL ELSE incremental_window_end_at END,
                     last_incremental_at = CASE WHEN %s THEN NOW() ELSE last_incremental_at END,
                     sync_status = CASE WHEN %s THEN 'succeeded' ELSE 'syncing' END,
-                    last_error = NULL
+                    last_error = NULL,
+                    page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
+                    page_claimed_at = NULL, page_lease_until = NULL, page_retry_at = NULL
                 WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
+                  AND page_claim_id = %s AND page_claim_job_id = %s AND page_claim_mode = 'incremental'
+                  AND incremental_page_token IS NOT DISTINCT FROM %s
+                RETURNING 1
                 """,
                 (
                     next_page_token,
@@ -1434,15 +2000,20 @@ def _record_page(
                     next_page_token is None,
                     next_page_token is None,
                     next_page_token is None,
-                    authorization["id"],
-                    chat_id,
-                    generation,
+                    claim.job.authorization_id,
+                    claim.chat_id,
+                    claim.generation,
+                    claim.claim_id,
+                    claim.job.id,
+                    claim.expected_page_token,
                 ),
-            )
-    return inserted, own_inserted
+            ).fetchone()
+        if not updated:
+            raise StaleSyncJob
+    return PageCommit(True, inserted, own_inserted)
 
 
-def _mark_chat_not_readable(authorization_id: uuid.UUID, chat_id: str, generation: int) -> None:
+def _mark_chat_not_readable(claim: PageClaim) -> None:
     with connection() as conn, conn.transaction():
         conn.execute(
             """
@@ -1451,30 +2022,194 @@ def _mark_chat_not_readable(authorization_id: uuid.UUID, chat_id: str, generatio
                 incremental_page_token = NULL,
                 manual_backfill_requested_at = NULL,
                 manual_backfill_started_at = NULL,
-                last_error = 'This conversation is not readable with the current authorization.'
+                last_error = 'This conversation is not readable with the current authorization.',
+                page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
+                page_claimed_at = NULL, page_lease_until = NULL, page_retry_at = NULL
             WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
+              AND page_claim_id = %s AND page_claim_job_id = %s AND page_claim_mode = %s
+              AND page_lease_until > NOW()
             """,
-            (authorization_id, chat_id, generation),
+            (
+                claim.job.authorization_id,
+                claim.chat_id,
+                claim.generation,
+                claim.claim_id,
+                claim.job.id,
+                claim.mode,
+            ),
         )
 
 
-def _renew_lease(job_id: uuid.UUID) -> None:
+def _release_retryable_page_claim(
+    claim: PageClaim,
+    *,
+    delay_seconds: int,
+    detail: str,
+    code: int | None = None,
+    http_status: int | None = None,
+) -> None:
+    """Delay one failed page without interrupting sibling conversation reads."""
+
+    with connection() as conn, conn.transaction():
+        # Lock parent then page, matching claim/commit lock order.  The exact
+        # claim fence makes a late failure from an older retry a no-op.
+        job = conn.execute(
+            """
+            SELECT 1 FROM sync_jobs
+            WHERE id = %s AND status = 'running' AND discovery_generation = %s
+            FOR UPDATE
+            """,
+            (claim.job.id, claim.job.discovery_generation),
+        ).fetchone()
+        if not job:
+            return
+        released = conn.execute(
+            """
+            UPDATE authorization_chats
+            SET page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
+                page_claimed_at = NULL, page_lease_until = NULL,
+                page_retry_at = NOW() + (%s * INTERVAL '1 second'),
+                sync_status = 'failed_retryable', last_error = %s
+            WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
+              AND page_claim_id = %s AND page_claim_job_id = %s AND page_claim_mode = %s
+              AND page_lease_until > NOW()
+            RETURNING 1
+            """,
+            (
+                delay_seconds,
+                detail,
+                claim.job.authorization_id,
+                claim.chat_id,
+                claim.generation,
+                claim.claim_id,
+                claim.job.id,
+                claim.mode,
+            ),
+        ).fetchone()
+        if not released:
+            return
+        conn.execute(
+            """
+            UPDATE sync_jobs
+            SET last_error_code = %s, last_http_status = %s, last_error = %s,
+                last_progress_at = NOW(), updated_at = NOW()
+            WHERE id = %s AND discovery_generation = %s
+            """,
+            (code, http_status, detail, claim.job.id, claim.job.discovery_generation),
+        )
+        _yield_job_to_retry_if_idle(conn, claim.job)
+
+
+def _yield_job_to_retry_if_idle(conn: psycopg.Connection, job: SyncJob) -> bool:
+    """Free a coordinator slot when its only remaining work is delayed."""
+
+    active_claims = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM authorization_chats
+        WHERE authorization_id = %s AND page_claim_id IS NOT NULL
+          AND page_lease_until > NOW()
+        """,
+        (job.authorization_id,),
+    ).fetchone()
+    if int(active_claims["count"]):
+        return False
+    if _has_claimable_page_in_connection(conn, job):
+        return False
+    retry = conn.execute(
+        """
+        SELECT MIN(page_retry_at) AS retry_at
+        FROM authorization_chats
+        WHERE authorization_id = %s AND page_retry_at > NOW()
+        """,
+        (job.authorization_id,),
+    ).fetchone()
+    if not retry["retry_at"]:
+        return False
+    conn.execute(
+        """
+        UPDATE sync_jobs
+        SET status = 'queued', scheduled_at = %s, lease_until = NULL, updated_at = NOW()
+        WHERE id = %s AND status = 'running' AND discovery_generation = %s
+        """,
+        (retry["retry_at"], job.id, job.discovery_generation),
+    )
+    return True
+
+
+def _has_claimable_page_in_connection(conn: psycopg.Connection, job: SyncJob) -> bool:
+    """Whether this coordinator has a page it can run now, not after backoff."""
+
+    if _has_pending_backfill_in_connection(conn, job.authorization_id):
+        pending = """
+            (access.manual_backfill_requested_at IS NOT NULL OR NOT access.backfill_complete)
+        """
+        params: tuple[object, ...] = (job.authorization_id,)
+    else:
+        pending = """
+            access.backfill_complete
+            AND (
+                (access.incremental_job_id = %s AND access.incremental_page_token IS NOT NULL)
+                OR access.incremental_job_id IS DISTINCT FROM %s
+            )
+        """
+        params = (job.authorization_id, job.id, job.id)
+    row = conn.execute(
+        f"""
+        SELECT EXISTS (
+            SELECT 1
+            FROM authorization_chats access
+            JOIN chats c ON c.chat_id = access.chat_id
+            WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
+              AND COALESCE(c.chat_status, 'normal') = 'normal'
+              AND access.sync_status <> 'not_readable'
+              AND (access.page_claim_id IS NULL OR access.page_lease_until < NOW())
+              AND (access.page_retry_at IS NULL OR access.page_retry_at <= NOW())
+              AND {pending}
+        ) AS ready
+        """,
+        params,
+    ).fetchone()
+    return bool(row["ready"])
+
+
+def _locked_current_page_claim(conn: psycopg.Connection, claim: PageClaim) -> bool:
+    """Lock and verify a page claim after its coordinator row is already locked."""
+
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM authorization_chats
+        WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
+          AND page_claim_id = %s AND page_claim_job_id = %s AND page_claim_mode = %s
+          AND page_lease_until > NOW()
+        FOR UPDATE
+        """,
+        (
+            claim.job.authorization_id,
+            claim.chat_id,
+            claim.generation,
+            claim.claim_id,
+            claim.job.id,
+            claim.mode,
+        ),
+    ).fetchone()
+    return bool(row)
+
+
+def _renew_lease(job: SyncJob) -> None:
     with connection() as conn, conn.transaction():
         conn.execute(
-            "UPDATE sync_jobs SET lease_until = NOW() + INTERVAL '10 minutes', updated_at = NOW() WHERE id = %s",
-            (job_id,),
+            """
+            UPDATE sync_jobs
+            SET lease_until = NOW() + INTERVAL '10 minutes', updated_at = NOW()
+            WHERE id = %s AND status = 'running' AND discovery_generation = %s
+            """,
+            (job.id, job.discovery_generation),
         )
 
 
-def _set_job_discovered(job_id: uuid.UUID, discovered: int) -> None:
-    with connection() as conn, conn.transaction():
-        conn.execute(
-            "UPDATE sync_jobs SET chats_discovered = %s, updated_at = NOW() WHERE id = %s",
-            (discovered, job_id),
-        )
-
-
-def _add_job_progress(job_id: uuid.UUID, *, pages: int, messages: int, own_messages: int) -> None:
+def _add_job_progress(job: SyncJob, *, pages: int, messages: int, own_messages: int) -> None:
     with connection() as conn, conn.transaction():
         conn.execute(
             """
@@ -1482,25 +2217,94 @@ def _add_job_progress(job_id: uuid.UUID, *, pages: int, messages: int, own_messa
             SET pages_processed = pages_processed + %s,
                 messages_indexed = messages_indexed + %s,
                 own_messages_indexed = own_messages_indexed + %s,
-                lease_until = NOW() + INTERVAL '10 minutes', updated_at = NOW()
-            WHERE id = %s
+                lease_until = NOW() + INTERVAL '10 minutes',
+                last_progress_at = NOW(), last_error_code = NULL, last_http_status = NULL,
+                last_error = NULL, updated_at = NOW()
+            WHERE id = %s AND status = 'running' AND discovery_generation = %s
             """,
-            (pages, messages, own_messages, job_id),
+            (pages, messages, own_messages, job.id, job.discovery_generation),
         )
 
 
 def _finish_and_schedule_incremental(job: SyncJob) -> None:
     settings = get_settings()
     with connection() as conn, conn.transaction():
-        conn.execute(
+        current = conn.execute(
+            """
+            SELECT mode
+            FROM sync_jobs
+            WHERE id = %s AND status = 'running' AND discovery_generation = %s
+            FOR UPDATE
+            """,
+            (job.id, job.discovery_generation),
+        ).fetchone()
+        if not current:
+            return
+
+        claimed = conn.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM authorization_chats
+                WHERE page_claim_job_id = %s AND page_lease_until > NOW()
+            ) AS claimed
+            """,
+            (job.id,),
+        ).fetchone()
+        if claimed["claimed"] or _has_pending_backfill_in_connection(conn, job.authorization_id):
+            return
+
+        # A backfill job owns only backfill cursors.  Once those are complete,
+        # finish it and let the new incremental job establish its own windows.
+        # Otherwise every uninitialised incremental cursor would keep this
+        # backfill coordinator alive forever.
+        if current["mode"] == "incremental":
+            incremental_pending = conn.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM authorization_chats access
+                    JOIN chats c ON c.chat_id = access.chat_id
+                    WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
+                      AND COALESCE(c.chat_status, 'normal') = 'normal'
+                      AND access.backfill_complete AND access.sync_status <> 'not_readable'
+                      AND (
+                        (access.incremental_job_id = %s AND access.incremental_page_token IS NOT NULL)
+                        OR access.incremental_job_id IS DISTINCT FROM %s
+                      )
+                ) AS pending
+                """,
+                (job.authorization_id, job.id, job.id),
+            ).fetchone()
+            if incremental_pending["pending"]:
+                return
+
+        finished = conn.execute(
             """
             UPDATE sync_jobs
-            SET status = 'succeeded', finished_at = NOW(), lease_until = NULL, last_error = NULL, updated_at = NOW()
-            WHERE id = %s
+            SET status = 'succeeded', finished_at = NOW(), lease_until = NULL,
+                last_error = NULL, updated_at = NOW()
+            WHERE id = %s AND status = 'running' AND discovery_generation = %s
+            RETURNING id
+            """,
+            (job.id, job.discovery_generation),
+        ).fetchone()
+        if not finished:
+            return
+        conn.execute(
+            """
+            UPDATE authorization_chats
+            SET page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
+                page_claimed_at = NULL, page_lease_until = NULL,
+                sync_status = CASE WHEN sync_status = 'syncing' AND backfill_complete
+                    THEN 'succeeded'
+                    WHEN sync_status = 'syncing' THEN 'pending'
+                    ELSE sync_status
+                END
+            WHERE page_claim_job_id = %s
             """,
             (job.id,),
         )
-        mode = "backfill" if _has_pending_backfill_in_connection(conn, job.authorization_id) else "incremental"
+        mode = "incremental"
         conn.execute(
             """
             INSERT INTO sync_jobs (id, authorization_id, mode, status, scheduled_at)
@@ -1515,63 +2319,156 @@ def _finish_and_schedule_incremental(job: SyncJob) -> None:
 
 
 def _requeue(
-    job_id: uuid.UUID,
+    job: SyncJob,
     *,
     delay_seconds: int,
-    retry: bool,
     detail: str | None = None,
     code: int | None = None,
+    http_status: int | None = None,
+    reset_discovery: bool = False,
+    claim: PageClaim | None = None,
 ) -> None:
-    """Put a job back on the queue without treating normal pagination as an error."""
+    """Release all of a job's page claims and retry it from durable cursors."""
 
-    error_code = code if retry else None
-    error_detail = detail if retry else None
     with connection() as conn, conn.transaction():
-        conn.execute(
+        current_job = conn.execute(
+            """
+            SELECT 1 FROM sync_jobs
+            WHERE id = %s AND status = 'running' AND discovery_generation = %s
+            FOR UPDATE
+            """,
+            (job.id, job.discovery_generation),
+        ).fetchone()
+        if not current_job:
+            return
+        if claim and not _locked_current_page_claim(conn, claim):
+            return
+        row = conn.execute(
             """
             UPDATE sync_jobs
             SET status = 'queued', scheduled_at = NOW() + (%s * INTERVAL '1 second'),
                 lease_until = NULL,
-                attempts = attempts + CASE WHEN %s THEN 1 ELSE 0 END,
+                attempts = attempts + 1,
                 last_error_code = %s,
+                last_http_status = %s,
                 last_error = %s,
+                discovery_status = CASE WHEN %s THEN 'pending' ELSE discovery_status END,
+                discovery_generation = CASE
+                    WHEN %s THEN discovery_generation + 1
+                    ELSE discovery_generation
+                END,
+                discovery_completed_at = CASE WHEN %s THEN NULL ELSE discovery_completed_at END,
                 updated_at = NOW()
-            WHERE id = %s
+            WHERE id = %s AND status = 'running' AND discovery_generation = %s
+            RETURNING id
             """,
-            (delay_seconds, retry, error_code, error_detail, job_id),
-        )
+            (
+                delay_seconds,
+                code,
+                http_status,
+                detail,
+                reset_discovery,
+                reset_discovery,
+                reset_discovery,
+                job.id,
+                job.discovery_generation,
+            ),
+        ).fetchone()
+        if row:
+            conn.execute(
+                """
+                UPDATE authorization_chats
+                SET page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
+                    page_claimed_at = NULL, page_lease_until = NULL,
+                    sync_status = CASE WHEN sync_status = 'syncing' AND backfill_complete
+                        THEN 'succeeded'
+                        WHEN sync_status = 'syncing' THEN 'pending'
+                        ELSE sync_status
+                    END
+                WHERE page_claim_job_id = %s
+                """,
+                (job.id,),
+            )
 
 
-def _finish_job(job_id: uuid.UUID, status: str, detail: str, code: int | None = None) -> None:
+def _finish_job(job: SyncJob, status: str, detail: str, code: int | None = None) -> None:
     with connection() as conn, conn.transaction():
-        conn.execute(
+        row = conn.execute(
             """
             UPDATE sync_jobs
             SET status = %s, finished_at = NOW(), lease_until = NULL,
                 last_error_code = %s, last_error = %s, updated_at = NOW()
-            WHERE id = %s
+            WHERE id = %s AND status = 'running' AND discovery_generation = %s
+            RETURNING id
             """,
-            (status, code, detail, job_id),
-        )
+            (status, code, detail, job.id, job.discovery_generation),
+        ).fetchone()
+        if row:
+            conn.execute(
+                """
+                UPDATE authorization_chats
+                SET page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
+                    page_claimed_at = NULL, page_lease_until = NULL,
+                    sync_status = CASE WHEN sync_status = 'syncing' AND backfill_complete
+                        THEN 'succeeded'
+                        WHEN sync_status = 'syncing' THEN 'pending'
+                        ELSE sync_status
+                    END
+                WHERE page_claim_job_id = %s
+                """,
+                (job.id,),
+            )
 
 
-def _mark_attention(job: SyncJob, detail: str) -> None:
+def _mark_attention(job: SyncJob, detail: str, *, claim: PageClaim | None = None) -> None:
     with connection() as conn, conn.transaction():
-        conn.execute(
+        current_job = conn.execute(
             """
-            UPDATE authorizations
-            SET status = 'attention_required', last_error = %s, updated_at = NOW()
-            WHERE id = %s
+            SELECT 1 FROM sync_jobs
+            WHERE id = %s AND status = 'running' AND discovery_generation = %s
+            FOR UPDATE
             """,
-            (detail, job.authorization_id),
-        )
-        conn.execute(
+            (job.id, job.discovery_generation),
+        ).fetchone()
+        if not current_job:
+            return
+        if claim and not _locked_current_page_claim(conn, claim):
+            return
+        row = conn.execute(
             """
             UPDATE sync_jobs SET status = 'attention_required', finished_at = NOW(), lease_until = NULL,
-                last_error = %s, updated_at = NOW() WHERE id = %s
+                last_error = %s, updated_at = NOW()
+            WHERE id = %s AND status = 'running' AND discovery_generation = %s
+            RETURNING id
             """,
-            (detail, job.id),
-        )
+            (detail, job.id, job.discovery_generation),
+        ).fetchone()
+        if row:
+            # Do this only after the job fence succeeds.  A reauthorization
+            # increments the generation, so an old request can never turn the
+            # freshly authorized account back into an attention state.
+            conn.execute(
+                """
+                UPDATE authorizations
+                SET status = 'attention_required', last_error = %s, updated_at = NOW()
+                WHERE id = %s
+                """,
+                (detail, job.authorization_id),
+            )
+            conn.execute(
+                """
+                UPDATE authorization_chats
+                SET page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
+                    page_claimed_at = NULL, page_lease_until = NULL,
+                    sync_status = CASE WHEN sync_status = 'syncing' AND backfill_complete
+                        THEN 'succeeded'
+                        WHEN sync_status = 'syncing' THEN 'pending'
+                        ELSE sync_status
+                    END
+                WHERE page_claim_job_id = %s
+                """,
+                (job.id,),
+            )
 
 
 def _items(data: dict[str, Any]) -> list[dict[str, Any]]:
