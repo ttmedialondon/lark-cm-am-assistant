@@ -35,7 +35,6 @@ from app.worker import (  # noqa: E402
     _usable_access_token,
 )
 
-
 TARGET_CHATS_SQL = """
 SELECT DISTINCT ac.authorization_id, ac.chat_id
 FROM authorization_chats ac
