@@ -133,6 +133,14 @@ def assessment_available() -> bool:
     return bool(row and row["enabled"] and row["provider"].casefold() == "openai" and row["api_key_ciphertext"])
 
 
+def _feature_enabled_in(conn: psycopg.Connection) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM ai_feature_configs WHERE feature = %s AND enabled FOR UPDATE",
+        (FEATURE,),
+    ).fetchone()
+    return bool(row)
+
+
 def queue_eligible_contact_assessments() -> int:
     """Materialize every eligible contact into the durable PostgreSQL queue.
 
@@ -449,6 +457,8 @@ def confirm_assessment_role(actor_id: UUID | str, assessment_id: UUID | str, rol
     if role not in FACT_ROLES:
         raise ContactAssessmentInputError("不是可确认的角色建议。")
     with connection() as conn, conn.transaction():
+        if not _feature_enabled_in(conn):
+            raise ContactAssessmentInputError("达人 AI 识别当前未启用。")
         assessment = _successful_assessment(conn, assessment_id)
         if not _refs_are_still_authorized_in(conn, assessment_id):
             raise ContactAssessmentInputError("判定证据已不在当前授权范围内；请重新发起判定。")
@@ -1351,6 +1361,7 @@ def _finish_with_decision(
     """Persist a successful result and only its safe high-confidence facts."""
 
     with connection() as conn, conn.transaction():
+        feature_enabled = _feature_enabled_in(conn)
         assessment = conn.execute(
             """
             SELECT id, contact_id, trigger, status
@@ -1361,6 +1372,19 @@ def _finish_with_decision(
             (assessment_id, contact_id),
         ).fetchone()
         if not assessment or assessment["status"] != "running":
+            return False
+        if not feature_enabled:
+            _finish_in(
+                conn,
+                assessment_id,
+                "cancelled",
+                "达人 AI 识别已停用；模型结果未写入联系人事实。",
+                response_id=response_id,
+                usage=usage,
+                telemetry=telemetry,
+                outcome="no_action",
+                review_status="not_required",
+            )
             return False
         if not _refs_are_still_authorized_in(conn, assessment_id):
             _finish_in(

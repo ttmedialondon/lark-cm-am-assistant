@@ -37,6 +37,7 @@ def test_dashboard_is_reminder_focused_and_transparent() -> None:
         authorization={"display_name": "CM", "p2p_discovery_status": "succeeded"},
         admin_role=None,
         body_consent=True,
+        creator_features_enabled=False,
         creator_workbench={"pending_candidates": [], "confirmed_creators": []},
         csrf_token="csrf",
         stats={
@@ -51,6 +52,8 @@ def test_dashboard_is_reminder_focused_and_transparent() -> None:
     assert "消息提醒中心" in rendered
     assert "权限与数据使用" in rendered
     assert "已同步消息总数" not in rendered
+    assert "待我确认的达人候选" not in rendered
+    assert "我的达人（正式）" not in rendered
 
 
 def test_dashboard_shows_pending_candidates_and_confirmed_creators() -> None:
@@ -59,6 +62,7 @@ def test_dashboard_shows_pending_candidates_and_confirmed_creators() -> None:
         authorization={"display_name": "CM", "p2p_discovery_status": "succeeded"},
         admin_role=None,
         body_consent=True,
+        creator_features_enabled=True,
         csrf_token="csrf",
         creator_workbench={
             "pending_candidates": [

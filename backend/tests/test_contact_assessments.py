@@ -168,6 +168,7 @@ def test_confirmation_refuses_an_assessment_after_its_evidence_leaves_scope(monk
             raise AssertionError("no contact fact should be written")
 
     monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(Connection()))
+    monkeypatch.setattr(contact_assessments, "_feature_enabled_in", lambda _conn: True)
     monkeypatch.setattr(
         contact_assessments,
         "_successful_assessment",
@@ -177,6 +178,64 @@ def test_confirmation_refuses_an_assessment_after_its_evidence_leaves_scope(monk
 
     with pytest.raises(contact_assessments.ContactAssessmentInputError, match="当前授权范围"):
         contact_assessments.confirm_assessment_role(actor_id, assessment_id, "creator")
+
+
+def test_confirmation_refuses_ai_roles_while_identity_feature_is_disabled(monkeypatch) -> None:
+    class Connection:
+        def transaction(self):
+            return nullcontext()
+
+    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(Connection()))
+    monkeypatch.setattr(contact_assessments, "_feature_enabled_in", lambda _conn: False)
+
+    with pytest.raises(contact_assessments.ContactAssessmentInputError, match="当前未启用"):
+        contact_assessments.confirm_assessment_role(uuid4(), uuid4(), "creator")
+
+
+def test_disabled_identity_feature_discards_an_in_flight_model_result(monkeypatch) -> None:
+    assessment_id = uuid4()
+    contact_id = uuid4()
+    finished = []
+
+    class Result:
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        def transaction(self):
+            return nullcontext()
+
+        def execute(self, query, _params=None):
+            if "FROM ai_feature_configs" in query:
+                return Result()
+            if "FROM contact_assessments" in query:
+                return Result(
+                    {"id": assessment_id, "contact_id": contact_id, "trigger": "automatic", "status": "running"}
+                )
+            raise AssertionError(f"unexpected query: {query}")
+
+    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(Connection()))
+    monkeypatch.setattr(
+        contact_assessments,
+        "_finish_in",
+        lambda *args, **kwargs: finished.append((args, kwargs)),
+    )
+
+    assert not contact_assessments._finish_with_decision(
+        assessment_id,
+        contact_id,
+        {"auto_confirm_threshold": 0.9},
+        model="gpt-5.6-luna",
+        result={"roles": [{"role": "creator", "confidence": 0.99}]},
+        evidence_strength={},
+        response_id="resp_test",
+        usage={"input_tokens": 1, "output_tokens": 1},
+    )
+    assert finished[0][0][2:4] == ("cancelled", "达人 AI 识别已停用；模型结果未写入联系人事实。")
+    assert finished[0][1]["outcome"] == "no_action"
 
 
 def test_responses_request_is_nonpersistent_and_uses_configured_model(monkeypatch) -> None:

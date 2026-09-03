@@ -252,9 +252,12 @@ def dashboard(request: Request):
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
     stats = _dashboard_stats(authorization["id"])
+    creator_features_enabled = (
+        authorization["status"] == "active" and contact_assignments.assignment_available()
+    )
     creator_workbench = (
         contact_assignments.creator_workbench(authorization["id"])
-        if authorization["status"] == "active"
+        if creator_features_enabled
         else {"pending_candidates": [], "confirmed_creators": []}
     )
     response = _template(
@@ -265,6 +268,7 @@ def dashboard(request: Request):
             "admin_role": admin_role_for(authorization["id"]),
             "stats": stats,
             "body_consent": bool(authorization["body_consent_at"]),
+            "creator_features_enabled": creator_features_enabled,
             "creator_workbench": creator_workbench,
             "csrf_token": _admin_csrf_token(authorization),
         },

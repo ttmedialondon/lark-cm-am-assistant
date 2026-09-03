@@ -120,6 +120,7 @@ def test_creator_workbench_scopes_pending_and_confirmed_rows_to_one_authorizatio
     assert "WHERE assessment.policy_version = %s ORDER BY assessment.contact_id" in pending_query
     assert "ORDER BY assessment.contact_id, assessment.created_at DESC, assessment.id DESC" in pending_query
     assert "latest.status = 'succeeded'" in pending_query
+    assert "config.feature = %s AND config.enabled" in pending_query
     assert "config.auto_confirm_threshold" in pending_query
     assert "candidate_aliases" in pending_query
     assert "actor.id::text" in pending_query
@@ -250,6 +251,51 @@ def test_high_confidence_assignment_is_saved_for_review_without_an_ai_assignment
     assert finished[0][1]["outcome"] == "review_required"
     assert finished[0][1]["result"] == result
     assert all("INSERT INTO contact_assignments" not in query for query, _params in calls)
+
+
+def test_disabled_assignment_feature_discards_an_in_flight_model_result(monkeypatch) -> None:
+    assessment_id = uuid4()
+    contact_id = uuid4()
+    finished = []
+
+    class Result:
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        def transaction(self):
+            return nullcontext()
+
+        def execute(self, query, _params=None):
+            if "FROM ai_feature_configs" in query:
+                return Result()
+            if "FROM contact_assignment_assessments" in query:
+                return Result({"id": assessment_id, "status": "running"})
+            raise AssertionError(f"unexpected query: {query}")
+
+    monkeypatch.setattr(contact_assignments, "connection", lambda: nullcontext(Connection()))
+    monkeypatch.setattr(
+        contact_assignments,
+        "_finish_in",
+        lambda *args, **kwargs: finished.append((args, kwargs)),
+    )
+
+    assert not contact_assignments._finish_with_decision(
+        assessment_id,
+        contact_id,
+        result={"decision": "assign", "candidate": "A1", "confidence": 0.99},
+        model="gpt-5.6-luna",
+        response_id="resp_test",
+        usage={"input_tokens": 1, "output_tokens": 1},
+    )
+    assert finished[0][0][2:4] == (
+        "cancelled",
+        "达人负责人 AI 匹配已停用；模型结果未写入负责人建议。",
+    )
+    assert finished[0][1]["outcome"] == "no_action"
 
 
 @pytest.mark.parametrize("running", [True, False])
@@ -407,6 +453,7 @@ def test_suggested_owner_confirmation_writes_one_manual_assignment_with_provenan
     assert "'manual'" in insert_query
     assert insert_params[1:] == (contact_id, actor_id, 0.95, assessment_id, actor_id)
     config_query = next(query for query, _params in conn.calls if query.startswith("SELECT auto_confirm_threshold"))
+    assert "WHERE feature = %s AND enabled" in config_query
     assert config_query.endswith("FOR UPDATE")
     latest_query = next(
         query for query, _params in conn.calls if query.startswith("SELECT id FROM contact_assignment_assessments")
@@ -529,6 +576,33 @@ def test_confirmation_migration_reopens_active_ai_assignments() -> None:
     assert "WHERE source = 'ai' AND ended_at IS NULL" in sql
     assert "SET outcome = 'review_required'" in sql
     assert f"assessment.policy_version = '{contact_assignments.POLICY_VERSION}'" in sql
+
+
+def test_creator_shutdown_migration_is_scoped_and_preserves_queue_watermarks() -> None:
+    sql = (
+        Path(__file__).resolve().parents[1] / "migrations" / "026_disable_creator_ai_and_clear_derived_data.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "feature IN ('contact_assessment', 'contact_assignment')" in sql
+    assert "SET enabled = FALSE" in sql
+    assert "DELETE FROM contact_assignments;" in sql
+    assert "DELETE FROM contact_assignment_assessments;" in sql
+    assert (
+        "DELETE FROM contact_assessments assessment\n"
+        "USING creator_cleanup_contacts affected\n"
+        "WHERE assessment.contact_id = affected.contact_id;"
+    ) in sql
+    assert "DELETE FROM contact_assessments;" not in sql
+    assert "DELETE FROM contact_roles" in sql
+    assert "WHERE role = 'creator'" in sql
+    assert "creator_ai_features_disabled_and_data_cleared" in sql
+    assert "automatic_queue_checked_at" not in sql
+    assert "-infinity" not in sql
+    assert "TRUNCATE" not in sql.upper()
+    assert "DELETE FROM contacts" not in sql
+    assert "DELETE FROM lark_identities" not in sql
+    assert "DELETE FROM chat_messages" not in sql
+    assert "creator AI configuration is incomplete" not in sql
 
 
 def test_assignment_model_boundary_preserves_shared_openai_retry_metadata(monkeypatch) -> None:

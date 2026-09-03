@@ -93,6 +93,14 @@ def assignment_available() -> bool:
     return bool(row and row["enabled"] and row["provider"].casefold() == "openai" and row["api_key_ciphertext"])
 
 
+def _feature_enabled_in(conn: psycopg.Connection) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM ai_feature_configs WHERE feature = %s AND enabled FOR UPDATE",
+        (FEATURE,),
+    ).fetchone()
+    return bool(row)
+
+
 def queue_eligible_contact_assignments() -> int:
     """Queue unassigned creators after relevant messages or role confirmation."""
 
@@ -478,7 +486,7 @@ def creator_workbench(authorization_id: UUID | str) -> dict[str, list[dict[str, 
             JOIN authorizations actor
               ON actor.id = %s AND actor.status = 'active'
              AND actor.body_consent_at IS NOT NULL AND actor.assignment_eligible
-            JOIN ai_feature_configs config ON config.feature = %s
+            JOIN ai_feature_configs config ON config.feature = %s AND config.enabled
             WHERE latest.status = 'succeeded'
               AND latest.outcome = 'review_required'
               AND latest.result ->> 'decision' IN ('assign', 'needs_review')
@@ -569,11 +577,16 @@ def _confirm_suggested_assignment_once(actor_id: UUID, assessment_id: UUID) -> d
         # The queue takes this same row lock before inserting assessments. Holding
         # it makes the latest-result check stable until this confirmation commits.
         config = conn.execute(
-            "SELECT auto_confirm_threshold FROM ai_feature_configs WHERE feature = %s FOR UPDATE",
+            """
+            SELECT auto_confirm_threshold
+            FROM ai_feature_configs
+            WHERE feature = %s AND enabled
+            FOR UPDATE
+            """,
             (FEATURE,),
         ).fetchone()
         if not config:
-            raise ContactAssignmentInputError("负责人匹配尚未配置。")
+            raise ContactAssignmentInputError("负责人匹配当前未启用。")
         latest = conn.execute(
             """
             SELECT id
@@ -1466,6 +1479,7 @@ def _finish_with_decision(
     telemetry: Mapping[str, Any] | None = None,
 ) -> bool:
     with connection() as conn, conn.transaction():
+        feature_enabled = _feature_enabled_in(conn)
         assessment = conn.execute(
             """
             SELECT id, status
@@ -1476,6 +1490,18 @@ def _finish_with_decision(
             (assessment_id, contact_id, POLICY_VERSION),
         ).fetchone()
         if not assessment or assessment["status"] != "running":
+            return False
+        if not feature_enabled:
+            _finish_in(
+                conn,
+                assessment_id,
+                "cancelled",
+                "达人负责人 AI 匹配已停用；模型结果未写入负责人建议。",
+                response_id=response_id,
+                usage=usage,
+                telemetry=telemetry,
+                outcome="no_action",
+            )
             return False
         if not _refs_are_still_authorized_in(conn, assessment_id):
             _finish_in(

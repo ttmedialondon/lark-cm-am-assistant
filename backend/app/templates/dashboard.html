@@ -32,6 +32,7 @@
         {% elif authorization.p2p_discovery_status == 'attention_required' %}
         <div class="alert alert-warning mt-4">部分提醒所需的授权需要重新确认，请 <a href="/auth/lark/start" class="alert-link">重新使用 Lark 授权</a>。</div>
         {% endif %}
+        {% if creator_features_enabled %}
         <div class="card mt-4">
           <div class="card-header"><div><h3 class="card-title mb-1">待我确认的达人候选</h3><div class="text-secondary small">AI 根据你与达人的互动线索生成建议；确认后将加入“我的达人”。</div></div></div>
           {% if creator_workbench is defined and creator_workbench.pending_candidates %}
@@ -59,6 +60,7 @@
           </table></div>
           {% else %}<div class="card-body text-secondary">暂无正式负责的达人。</div>{% endif %}
         </div>
+        {% endif %}
         <div class="card mt-4">
           <div class="card-body">
             <details>

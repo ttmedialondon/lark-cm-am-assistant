@@ -20,17 +20,26 @@ sudo git pull --ff-only origin main
 sudo /opt/lark-message-stats/venv/bin/pip install -r backend/requirements.txt
 sudo install -m 0644 infra/systemd/lark-message-stats-web.service /etc/systemd/system/lark-message-stats-web.service
 sudo install -m 0644 infra/systemd/lark-message-stats-worker.service /etc/systemd/system/lark-message-stats-worker.service
-sudo install -m 0644 infra/caddy/Caddyfile /etc/caddy/Caddyfile
+# Caddy 配置由多项服务共享。普通应用发布只校验线上配置；不得用仓库
+# 中的单应用示例覆盖它。只有合并并复核全部现有路由后才单独更新/reload。
 sudo caddy validate --config /etc/caddy/Caddyfile
 sudo systemctl stop lark-message-stats-web.service lark-message-stats-worker.service
-sudo bash -c 'db_url=$(sed -n "s/^DATABASE_URL=//p" /etc/lark-message-stats/app.env | head -n1); pg_dump --dbname="$db_url" | gzip -9 > /var/backups/lark-message-stats/pre-release-$(date -u +%Y%m%dT%H%M%SZ).sql.gz'
+sudo bash -euo pipefail -c '
+  umask 077
+  backup_path="/var/backups/lark-message-stats/pre-release-$(date -u +%Y%m%dT%H%M%SZ).dump"
+  sudo -u postgres pg_dump --format=custom --dbname=lark_message_stats > "$backup_path"
+  test -s "$backup_path"
+  pg_restore --list "$backup_path" >/dev/null
+  sha256sum "$backup_path" > "$backup_path.sha256"
+  chmod 0600 "$backup_path" "$backup_path.sha256"
+  echo "Verified backup: $backup_path"
+'
 sudo systemd-run --quiet --wait --pipe --collect \
   --property=User=larkstats --property=Group=larkstats \
   --property=EnvironmentFile=/etc/lark-message-stats/app.env \
   --property=WorkingDirectory=/opt/lark-message-stats/backend \
   /opt/lark-message-stats/venv/bin/python scripts/migrate.py
 sudo systemctl daemon-reload
-sudo systemctl reload caddy
 sudo systemctl restart lark-message-stats-web.service lark-message-stats-worker.service
 sudo systemctl --no-pager --full status lark-message-stats-web.service lark-message-stats-worker.service
 curl --fail --silent --show-error https://larkbot.ttapp.help/healthz
@@ -53,4 +62,4 @@ sudo journalctl -u lark-message-stats-web.service -u lark-message-stats-worker.s
 
 ## 回退原则
 
-先停止发布并保留数据库。不得通过删除数据库或令牌来“回退”。本版本的迁移是 additive；若新版本异常，停止服务、恢复发布前的 PostgreSQL 备份，再恢复上一个已验证的 Git 提交和对应 systemd 单元。
+先停止发布并保留数据库。不得通过删除数据库或令牌来“回退”。部分迁移会删除派生数据，仅回滚代码不能恢复这些数据。若迁移提交后发现异常，保持 Web/Worker 停机，先把发布前的 custom dump 恢复到一个空白临时数据库并完成校验，再用已验证备份完整替换 live 数据库；不得把 full dump 直接叠加到非空 live 数据库。最后恢复上一个已验证的 Git 提交和对应 systemd 单元。备份包含清理前数据，权限必须保持 `0600`，并按内部保留策略安全删除。
