@@ -255,11 +255,7 @@ def dashboard(request: Request):
     creator_features_enabled = (
         authorization["status"] == "active" and contact_assignments.assignment_available()
     )
-    creator_workbench = (
-        contact_assignments.creator_workbench(authorization["id"])
-        if creator_features_enabled
-        else {"pending_candidates": [], "confirmed_creators": []}
-    )
+    creator_workbench = contact_assignments.creator_workbench(authorization["id"])
     response = _template(
         request,
         "dashboard.html",

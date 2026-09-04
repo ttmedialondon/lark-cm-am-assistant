@@ -53,7 +53,46 @@ def test_dashboard_is_reminder_focused_and_transparent() -> None:
     assert "权限与数据使用" in rendered
     assert "已同步消息总数" not in rendered
     assert "待我确认的达人候选" not in rendered
-    assert "我的达人（正式）" not in rendered
+    assert "我的达人（正式）" in rendered
+    assert "暂无正式负责的达人。" in rendered
+
+
+def test_dashboard_loads_confirmed_creators_when_ai_is_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    authorization_id = uuid4()
+    monkeypatch.setattr(
+        main,
+        "_current_authorization",
+        lambda _request: {
+            "id": authorization_id,
+            "status": "active",
+            "display_name": "Remi",
+            "body_consent_at": "authorized",
+            "p2p_discovery_status": "succeeded",
+        },
+    )
+    monkeypatch.setattr(main, "_dashboard_stats", lambda _authorization_id: {})
+    monkeypatch.setattr(main, "admin_role_for", lambda _authorization_id: None)
+    monkeypatch.setattr(main, "_admin_csrf_token", lambda _authorization: "csrf")
+    monkeypatch.setattr(contact_assignments, "assignment_available", lambda: False)
+    monkeypatch.setattr(
+        contact_assignments,
+        "creator_workbench",
+        lambda actual_id: {
+            "pending_candidates": [],
+            "confirmed_creators": [
+                {"display_name": "正式达人", "started_at_label": "2026-09-04 12:00 BST"}
+            ],
+        }
+        if actual_id == authorization_id
+        else pytest.fail("dashboard queried the wrong authorization"),
+    )
+
+    response = main.dashboard(_request_with_session("active-session"))
+    body = response.body.decode()
+
+    assert "待我确认的达人候选" not in body
+    assert "我的达人（正式）" in body
+    assert "正式达人" in body
 
 
 def test_dashboard_shows_pending_candidates_and_confirmed_creators() -> None:

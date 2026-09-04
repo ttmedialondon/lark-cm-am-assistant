@@ -47,6 +47,7 @@
           </table></div>
           {% else %}<div class="card-body text-secondary">暂无待确认达人。</div>{% endif %}
         </div>
+        {% endif %}
         <div class="card mt-4">
           <div class="card-header"><h3 class="card-title">我的达人（正式）</h3></div>
           {% if creator_workbench is defined and creator_workbench.confirmed_creators %}
@@ -60,7 +61,6 @@
           </table></div>
           {% else %}<div class="card-body text-secondary">暂无正式负责的达人。</div>{% endif %}
         </div>
-        {% endif %}
         <div class="card mt-4">
           <div class="card-body">
             <details>
