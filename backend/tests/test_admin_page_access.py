@@ -177,6 +177,17 @@ def test_creator_review_grant_allows_its_scoped_chat_not_global_messages(monkeyp
         assert browser.get(path).status_code == 403
 
 
+def _page_menu_targets(html):
+    menu = re.search(r'<nav\b[^>]*aria-label="页面导航"[^>]*>(.*?)</nav>', html, re.DOTALL)
+    assert menu is not None
+    return re.findall(r'href="([^"]+)"', menu.group(1))
+
+
+def _assert_no_navigation_role_labels(html):
+    for label in ("系统主人", "全部权限", "已授权查看", "当前为只读访问", "权限设置及业务修改"):
+        assert label not in html
+
+
 @pytest.mark.parametrize("granted", PAGES)
 def test_navigation_exposes_only_the_granted_page(granted):
     environment = Environment(loader=FileSystemLoader(Path(admin.__file__).parent / "templates"), autoescape=True)
@@ -192,6 +203,12 @@ def test_navigation_exposes_only_the_granted_page(granted):
     )
     backend_links = {link for link in re.findall(r'href="([^"]+)"', html) if link.startswith("/admin")}
     assert backend_links == {landing}
+    assert _page_menu_targets(html) == [landing]
+    _assert_no_navigation_role_labels(html)
+    if granted == "creator-review":
+        assert "Page viewer" not in html and "/dashboard" not in html
+    else:
+        assert "Page viewer" in html and "/dashboard" in html
 
 
 def test_owner_navigation_exposes_every_page():
@@ -207,6 +224,29 @@ def test_owner_navigation_exposes_every_page():
     )
     backend_links = {link for link in re.findall(r'href="([^"]+)"', html) if link.startswith("/admin")}
     assert backend_links == {page["path"] for page in admin_permissions.PAGES}
+    assert _page_menu_targets(html) == [page["path"] for page in admin_permissions.PAGES]
+    _assert_no_navigation_role_labels(html)
+
+
+@pytest.mark.parametrize("permissions", [
+    ("creator-review", "creators"),
+    ("creator-review", "overview", "users", "chats", "messages", "contacts", "ai", "jobs"),
+])
+def test_navigation_keeps_exact_grants_when_switching_between_pages(permissions):
+    environment = Environment(loader=FileSystemLoader(Path(admin.__file__).parent / "templates"), autoescape=True)
+    expected = [page["path"] for page in admin_permissions.PAGES if page["key"] in permissions]
+    for active_page in permissions:
+        html = environment.get_template("admin/_nav.html").render(
+            authorization={"display_name": "Page viewer"}, admin_role="member", admin_role_label="已授权查看",
+            admin_permissions=frozenset(permissions), permission_pages=admin_permissions.PAGES,
+            admin_landing_path=expected[0], active_page=active_page,
+        )
+        assert _page_menu_targets(html) == expected
+        _assert_no_navigation_role_labels(html)
+        if active_page == "creator-review":
+            assert "Page viewer" not in html and "/dashboard" not in html
+        else:
+            assert "Page viewer" in html and "/dashboard" in html
 
 
 @pytest.mark.parametrize(("permissions", "owner", "expected"), [

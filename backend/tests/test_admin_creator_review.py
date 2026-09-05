@@ -172,27 +172,47 @@ class _Navigation(HTMLParser):
     def __init__(self, html):
         super().__init__()
         self.targets = []
+        self.page_targets = []
+        self.page_navigation_count = 0
+        self._page_nav_depth = 0
         self.feed(html)
 
     def handle_starttag(self, tag, attrs):
         attr = dict(attrs)
+        if tag == "nav":
+            if attr.get("aria-label") == "页面导航":
+                self.page_navigation_count += 1
+                self._page_nav_depth = 1
+            elif self._page_nav_depth:
+                self._page_nav_depth += 1
         if tag == "a" and "href" in attr:
             self.targets.append(attr["href"])
+            if self._page_nav_depth:
+                self.page_targets.append(attr["href"])
         if tag == "form" and "action" in attr:
             self.targets.append(attr["action"])
 
+    def handle_endtag(self, tag):
+        if tag == "nav" and self._page_nav_depth:
+            self._page_nav_depth -= 1
 
-def _assert_standalone_review(html):
+
+def _assert_review_interface(html, permissions=()):
     for private_label in (
         "系统主人", "全部权限", "所有者", "只读预览", "只读查阅", "已获页面授权",
         "管理台", "我的统计", "后台", "PRIVATE_VIEWER_NAME",
     ):
         assert private_label not in html
-    targets = _Navigation(html).targets
+    navigation = _Navigation(html)
+    expected_menu = [page["path"] for page in admin_permissions.PAGES if page["key"] in permissions]
+    assert navigation.page_targets == expected_menu
+    assert navigation.page_navigation_count == bool(expected_menu)
+    targets = navigation.targets
     assert targets
     assert all(
         urlsplit(target).path == "/admin/creator-review"
         or urlsplit(target).path.startswith("/admin/creator-review/")
+        or target in expected_menu
         for target in targets
     )
     return targets
@@ -234,11 +254,17 @@ def rendered_review_data(monkeypatch):
     return contact_id, audit_calls
 
 
-@pytest.mark.parametrize("role", ["owner", "member"])
+@pytest.mark.parametrize(("role", "permissions"), [
+    ("member", ["creator-review"]),
+    ("member", ["creator-review", "creators"]),
+    ("member", ["creator-review", "overview", "users", "messages", "jobs"]),
+    ("member", ["creator-review", "chats", "contacts", "ai"]),
+    ("owner", []),
+])
 @pytest.mark.parametrize("view", ["list", "detail", "messages"])
-def test_review_pages_do_not_expose_other_admin_interfaces(monkeypatch, rendered_review_data, role, view):
+def test_review_navigation_exactly_matches_page_grants(monkeypatch, rendered_review_data, role, permissions, view):
     contact_id, audits = rendered_review_data
-    browser, actor = client(monkeypatch, role=role, permissions=["creator-review"], html=True)
+    browser, actor = client(monkeypatch, role=role, permissions=permissions, html=True)
     path = "/admin/creator-review" if view == "list" else f"/admin/creator-review/{contact_id}"
     params = {"page": 2, "q": "sample", "evidence": "documented"}
     if view == "messages":
@@ -246,7 +272,8 @@ def test_review_pages_do_not_expose_other_admin_interfaces(monkeypatch, rendered
     response = browser.get(path, params=params)
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store, max-age=0"
-    targets = _assert_standalone_review(response.text)
+    expected_permissions = admin_permissions.PAGE_KEYS if role == "owner" else permissions
+    targets = _assert_review_interface(response.text, expected_permissions)
     assert "Sample Creator" in response.text and "Remi" in response.text
     if view == "list":
         assert any(urlsplit(target).path == f"/admin/creator-review/{contact_id}" for target in targets)
@@ -277,7 +304,7 @@ def test_review_errors_stay_inside_the_review_interface(monkeypatch, rendered_re
         path, expected = f"/admin/creator-review/{contact_id}?chat_id=oc_unrelated", 404
     response = browser.get(path)
     assert response.status_code == expected
-    _assert_standalone_review(response.text)
+    _assert_review_interface(response.text)
     assert audits == []
 
 
@@ -297,7 +324,7 @@ def test_review_denials_are_neutral_and_do_not_load_private_data(monkeypatch, ro
     assert response.status_code == 403
     assert "暂时无法查看" in response.text
     assert "联系页面提供者" in response.text
-    _assert_standalone_review(response.text)
+    _assert_review_interface(response.text)
 
 
 def test_other_admin_denials_keep_the_existing_error_page(monkeypatch):

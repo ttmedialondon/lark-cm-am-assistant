@@ -1,9 +1,10 @@
 {% extends "base.html" %}
 {% block title %}{{ detail.creator.display_name }} · 达人归属复核{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-review.css?v=20260905-standalone">{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-review.css?v=20260905-nav">{% endblock %}
 {% block body %}
 {% set creator = detail.creator %}
 <div class="page creator-review">
+  {% include "admin/_nav.html" %}
   <div class="page-wrapper"><main class="page-body pt-0"><div class="container-xl creator-review__container">
     <div class="cr-detail-top"><a class="cr-back" href="{{ back_url }}"><span aria-hidden="true">← </span>返回达人归属复核</a></div>
     <header class="cr-profile">
