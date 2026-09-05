@@ -1,4 +1,4 @@
-"""Owner preview of creator assignments, with explicitly scoped text excerpts."""
+"""Owner preview of creator assignments and their authorized conversation history."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 from cryptography.exceptions import InvalidTag
 
-from .admin_reporting import _format_time, _message_time, _page_result, _page_window
+from .admin_reporting import _format_time, _message_time, _page_result, _page_window, _readable_body
 from .config import get_settings
 from .crypto import message_body_cipher
 from .db import connection
@@ -17,8 +17,9 @@ from .db import connection
 PAGE_SIZE = 20
 MESSAGE_PAGE_SIZE = 30
 CONVERSATION_NOTICE = (
-    "仅展示有留存主证据且当前负责人仍获授权的相关会话；单聊只作辅助材料。"
-    "聊天为局部视图，仅含该达人和当前负责人的文字消息，其他参与者、附件及转发内容不展示。"
+    "左侧汇总此达人身份关联、当前授权范围内的全部已同步会话，不限于导入证据或当前负责人。"
+    "打开会话可查看已同步的各方记录；归属证据是否完整不影响人工查阅，单聊仍只作辅助材料。"
+    "未同步或已删除的正文不可查看；图片、附件等保留消息类型提示，不提供原件或跳转读取其他会话。"
     "已遮盖常见邮箱和电话号码，但自由文本仍可能提及其他人或业务信息。"
 )
 
@@ -64,23 +65,17 @@ _CREATORS_SQL = """
       )
 """
 
-# Keep every conversation and message query bound to the same current business
-# assignment, current authorization, consent, and retained primary group IDs.
+# Scope is independent of import evidence/assignment. Exact identity links, not
+# handle/name similarity, bind every read to the creator and live source consent.
 _CONVERSATION_SCOPE_SQL = """
     FROM contacts target
     JOIN contact_roles role ON role.contact_id = target.id
       AND role.role = 'creator' AND role.status = 'confirmed' AND role.is_primary
-    JOIN contact_assignments assignment
-      ON assignment.contact_id = target.id AND assignment.ended_at IS NULL
-    JOIN authorizations responsible ON responsible.id = assignment.responsible_authorization_id
-    JOIN authorization_chats access ON access.authorization_id = responsible.id
+    JOIN authorizations source ON source.status = 'active' AND source.body_consent_at IS NOT NULL
+    JOIN authorization_chats access ON access.authorization_id = source.id
     JOIN chats chat ON chat.chat_id = access.chat_id
-    WHERE target.id = %s AND assignment.id = %s AND responsible.id = %s
-      AND role.source = 'manual_excel_and_identity_confirmed'
-      AND role.updated_at = %s
+    WHERE target.id = %s AND role.updated_at = %s
       AND target.entity_type = 'person'
-      AND responsible.status = 'active' AND responsible.assignment_eligible
-      AND responsible.body_consent_at IS NOT NULL
       AND access.is_visible AND access.sync_enabled
       AND COALESCE(chat.chat_status, 'normal') = 'normal'
       AND NOT EXISTS (
@@ -88,17 +83,29 @@ _CONVERSATION_SCOPE_SQL = """
           WHERE internal.contact_id = target.id AND internal.tenant_classification = 'internal'
       )
       AND (
-          (COALESCE(chat.chat_mode, 'group') <> 'p2p'
-           AND chat.external AND chat.chat_id = ANY(%s::text[])
-           AND access.member_snapshot_status = 'succeeded'
-           AND EXISTS (
+          (COALESCE(chat.chat_mode, 'group') <> 'p2p' AND (
+           EXISTS (
                SELECT 1 FROM chat_members member
                JOIN lark_identities identity ON identity.open_id = member.open_id
+               JOIN authorizations witness ON witness.id = member.last_observed_by_authorization_id
+               JOIN authorization_chats witnessed
+                 ON witnessed.authorization_id = witness.id AND witnessed.chat_id = member.chat_id
                WHERE member.chat_id = chat.chat_id AND identity.contact_id = target.id
                  AND member.member_type = 'user' AND identity.identity_type = 'user'
                  AND identity.tenant_classification = 'known_external'
-                 AND member.last_observed_by_authorization_id = responsible.id
-           ))
+                 AND witness.status = 'active' AND witness.body_consent_at IS NOT NULL
+                 AND witnessed.is_visible AND witnessed.sync_enabled
+           ) OR EXISTS (
+               SELECT 1 FROM chat_messages authored
+               JOIN lark_identities identity ON identity.open_id = authored.sender_open_id
+               JOIN authorization_message_observations seen
+                 ON seen.chat_id = authored.chat_id AND seen.message_id = authored.message_id
+                AND seen.authorization_id = source.id
+               WHERE authored.chat_id = chat.chat_id AND identity.contact_id = target.id
+                 AND authored.sender_type = 'user' AND NOT authored.is_deleted
+                 AND identity.identity_type = 'user' AND identity.tenant_classification = 'known_external'
+                 AND seen.observed_at >= source.body_consent_at
+           )))
           OR (chat.chat_mode = 'p2p' AND access.p2p_counterpart_type = 'user'
               AND EXISTS (
                   SELECT 1 FROM lark_identities counterpart
@@ -112,26 +119,53 @@ _CONVERSATION_SCOPE_SQL = """
 
 _VISIBLE_MESSAGES_SQL = """
     WITH scoped_chat AS (
-        SELECT chat.chat_id, responsible.id AS responsible_id, responsible.open_id AS responsible_open_id,
-               responsible.body_consent_at, target.id AS contact_id
+        SELECT chat.chat_id, source.id AS source_id, source.body_consent_at, target.id AS contact_id
 """ + _CONVERSATION_SCOPE_SQL + """
           AND chat.chat_id = %s
     )
     SELECT message.body_ciphertext, message.message_create_time, message.message_id,
-           message.sender_open_id = scope.responsible_open_id AS sent_by_author
-    FROM scoped_chat scope
-    JOIN authorization_message_observations observation
-      ON observation.authorization_id = scope.responsible_id AND observation.chat_id = scope.chat_id
-    JOIN chat_messages message
-      ON message.chat_id = observation.chat_id AND message.message_id = observation.message_id
-    WHERE observation.observed_at >= scope.body_consent_at AND NOT message.is_deleted
-      AND message.body_ciphertext IS NOT NULL AND message.message_type = 'text'
-      AND message.sender_type = 'user'
-      AND (message.sender_open_id = scope.responsible_open_id OR EXISTS (
-          SELECT 1 FROM lark_identities sender
-          WHERE sender.open_id = message.sender_open_id AND sender.contact_id = scope.contact_id
-            AND sender.identity_type = 'user' AND sender.tenant_classification = 'known_external'
-      ))
+           message.message_type, message.sender_type, sender.display_name AS sender_name,
+           sender.contact_id = (SELECT contact_id FROM scoped_chat LIMIT 1) AS sent_by_creator,
+           EXISTS (
+               SELECT 1 FROM contact_assignments assignment
+               JOIN authorizations responsible ON responsible.id = assignment.responsible_authorization_id
+               WHERE assignment.contact_id = (SELECT contact_id FROM scoped_chat LIMIT 1)
+                 AND assignment.ended_at IS NULL AND responsible.open_id = message.sender_open_id
+           ) AS sent_by_author
+    FROM chat_messages message
+    LEFT JOIN lark_identities sender ON sender.open_id = message.sender_open_id
+    WHERE NOT message.is_deleted AND EXISTS (
+        SELECT 1 FROM scoped_chat scope
+        JOIN authorization_message_observations observation
+          ON observation.authorization_id = scope.source_id AND observation.chat_id = scope.chat_id
+        WHERE observation.chat_id = message.chat_id AND observation.message_id = message.message_id
+          AND observation.observed_at >= scope.body_consent_at
+    )
+"""
+
+_CONVERSATIONS_SQL = """
+    WITH scoped_chats AS (
+        SELECT chat.chat_id, chat.name, COALESCE(chat.chat_mode, 'group') AS chat_mode,
+               source.id AS source_id, source.display_name AS source_name, source.body_consent_at
+""" + _CONVERSATION_SCOPE_SQL + """
+    ), conversation_list AS (
+        SELECT chat_id, name, chat_mode, array_agg(DISTINCT source_name ORDER BY source_name) AS source_names
+        FROM scoped_chats GROUP BY chat_id, name, chat_mode
+    )
+    SELECT conversation.*, counts.message_count, counts.last_message_at
+    FROM conversation_list conversation
+    JOIN LATERAL (
+        SELECT COUNT(*) AS message_count, MAX(message.message_create_time) AS last_message_at
+        FROM chat_messages message
+        WHERE message.chat_id = conversation.chat_id AND NOT message.is_deleted AND EXISTS (
+            SELECT 1 FROM scoped_chats scope
+            JOIN authorization_message_observations observation
+              ON observation.authorization_id = scope.source_id AND observation.chat_id = scope.chat_id
+            WHERE scope.chat_id = message.chat_id AND observation.message_id = message.message_id
+              AND observation.observed_at >= scope.body_consent_at
+        )
+    ) counts ON TRUE
+    ORDER BY counts.last_message_at DESC NULLS LAST, conversation.name NULLS LAST, conversation.chat_id
 """
 
 
@@ -252,8 +286,8 @@ def directory(page: int = 1, query: str = "", responsible_id: UUID | None = None
             "responsible_id": str(responsible_id) if responsible_id else ""}
 
 
-def _scope_params(row: dict[str, Any], facts: dict[str, Any]) -> tuple[Any, ...]:
-    return (row["id"], row["assignment_id"], row["responsible_id"], row["role_updated_at"], facts["group_ids"])
+def _scope_params(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (row["id"], row["role_updated_at"])
 
 
 def detail(contact_id: UUID) -> dict[str, Any] | None:
@@ -262,13 +296,7 @@ def detail(contact_id: UUID) -> dict[str, Any] | None:
         if not row:
             return None
         facts = _evidence(row)
-        conversations = []
-        if facts["documented"]:
-            conversations = conn.execute(
-                "SELECT chat.chat_id, chat.name, COALESCE(chat.chat_mode, 'group') AS chat_mode "
-                + _CONVERSATION_SCOPE_SQL + " ORDER BY chat.name NULLS LAST, chat.chat_id",
-                _scope_params(row, facts),
-            ).fetchall()
+        conversations = conn.execute(_CONVERSATIONS_SQL, _scope_params(row)).fetchall()
     item = _item(row, facts)
     source_rows = "、".join(map(str, facts["rows"])) or "未留存"
     return {
@@ -288,26 +316,35 @@ def detail(contact_id: UUID) -> dict[str, Any] | None:
         "conversations": [{"chat_id": chat["chat_id"],
                            "name": _label(chat["name"], "相关单聊" if chat["chat_mode"] == "p2p" else "相关合作群"),
                            "chat_mode_label": "单聊" if chat["chat_mode"] == "p2p" else "群聊",
-                           "context_label": "辅助材料" if chat["chat_mode"] == "p2p" else "主证据关联群 · 局部文字视图"}
+                           "context_label": "与达人单聊" if chat["chat_mode"] == "p2p" else "曾观察到达人账号参与",
+                           "message_count": int(chat["message_count"]),
+                           "last_message_at_label": _format_time(chat["last_message_at"]),
+                           "source_label": "、".join(_label(name, "姓名未返回") for name in chat["source_names"])}
                           for chat in conversations],
         "conversation_notice": CONVERSATION_NOTICE,
     }
 
 
-def _text_content(ciphertext: str, cipher: Any) -> str:
+def _text_content(ciphertext: str | None, cipher: Any, message_type: str | None = "text") -> str:
+    if ciphertext is None:
+        return "（正文尚未同步）"
     try:
-        body = json.loads(cipher.decrypt(ciphertext))
-        # Do not recursively traverse JSON: forwarded messages, attachment
-        # payloads, and nested quoted bodies are outside this text-only view.
-        text = body.get("text") if isinstance(body, dict) and set(body) == {"text"} else None
-        if not isinstance(text, str):
-            return "（此消息没有可展示的纯文本）"
+        # Reuse the existing plain-text renderer. It reads only the stored body;
+        # no attachment fetches or follow-up reads of referenced conversations.
+        text = _readable_body(cipher.decrypt(ciphertext), _message_type_label(message_type))
     except (InvalidTag, UnicodeDecodeError, ValueError, TypeError):
         return "（正文无法读取）"
     text = re.sub(r"[\w.+\-]+@[\w.\-]+\.[A-Za-z]{2,}", "[邮箱已隐藏]", text)
     text = re.sub(r"(?<!\w)\+?\d[\d ()\-]{6,}\d(?!\w)", "[电话号码已隐藏]", text)
     text = re.sub(r"\b(?:ou|on|cli)_[A-Za-z0-9]+\b", "[标识已隐藏]", text)
     return text
+
+
+def _message_type_label(message_type: str | None) -> str:
+    return {"text": "文字", "post": "富文本", "interactive": "卡片", "image": "图片",
+            "file": "文件", "audio": "语音", "media": "视频", "sticker": "表情",
+            "merge_forward": "合并转发", "share_chat": "分享群聊", "share_user": "分享联系人"
+            }.get(message_type, "其他消息")
 
 
 def messages(contact_id: UUID, chat_id: str, page: int = 1) -> dict[str, Any] | None:
@@ -317,10 +354,7 @@ def messages(contact_id: UUID, chat_id: str, page: int = 1) -> dict[str, Any] | 
         row = conn.execute(_CREATORS_SQL + " AND contact.id = %s", (contact_id,)).fetchone()
         if not row:
             return None
-        facts = _evidence(row)
-        if not facts["documented"]:
-            return None
-        params = (*_scope_params(row, facts), chat_id)
+        params = (*_scope_params(row), chat_id)
         if not conn.execute("SELECT chat.chat_id " + _CONVERSATION_SCOPE_SQL + " AND chat.chat_id = %s",
                             params).fetchone():
             return None
@@ -331,11 +365,14 @@ def messages(contact_id: UUID, chat_id: str, page: int = 1) -> dict[str, Any] | 
             ORDER BY message_create_time DESC NULLS LAST, message_id DESC LIMIT %s OFFSET %s
         """, (*params, limit, offset)).fetchall()
     cipher = message_body_cipher(get_settings().token_encryption_key)
-    items = [{"sender_label": _label(row["responsible_name"] if message["sent_by_author"]
-                                   else row["display_name"], "姓名未返回"),
-              "sender_role_label": "负责人" if message["sent_by_author"] else "达人",
+    items = [{"sender_label": _label(message["sender_name"] or (
+                  row["display_name"] if message["sent_by_creator"] else row["responsible_name"]
+                  if message["sent_by_author"] else None), "姓名未返回"),
+              "sender_role_label": "达人" if message["sent_by_creator"] else "当前负责人"
+              if message["sent_by_author"] else "其他参与者" if message["sender_type"] == "user" else "应用 / 系统",
               "created_at_label": _message_time(message["message_create_time"]),
-              "content": _text_content(message["body_ciphertext"], cipher),
+              "content": _text_content(message["body_ciphertext"], cipher, message["message_type"]),
+              "message_type_label": _message_type_label(message["message_type"]),
               "sent_by_author": message["sent_by_author"]} for message in rows[:MESSAGE_PAGE_SIZE]]
     return {**_page_result(items, page, MESSAGE_PAGE_SIZE, total_count=total), "notice": CONVERSATION_NOTICE}
 

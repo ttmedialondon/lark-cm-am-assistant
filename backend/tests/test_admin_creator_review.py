@@ -148,6 +148,8 @@ def test_scoped_chat_read_is_audited_and_keeps_creator_pagination(monkeypatch):
         assert "page=4" in url and "evidence=documented" in url and "q=sample" in url
     assert "message_page=3" in context["message_page"]["next_url"]
     assert "chat_id=approved-chat" in context["message_page"]["next_url"]
+    assert context["message_page"]["next_url"].endswith("#cr-chat-title")
+    assert context["detail"]["conversations"][0]["url"].endswith("#cr-chat-title")
 
 
 def test_review_has_no_mutation_endpoint(monkeypatch):

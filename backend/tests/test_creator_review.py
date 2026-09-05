@@ -121,68 +121,126 @@ def test_directory_filters_handle_owner_and_evidence_without_exposing_raw_audit(
     assert "internal.tenant_classification = 'internal'" in conn.calls[0][0]
 
 
-def test_detail_does_not_query_any_conversation_for_insufficient_evidence(monkeypatch):
+def conversation_row(**changes):
+    return {"chat_id": CHAT, "name": "Account x TT", "chat_mode": "group", "message_count": 42,
+            "last_message_at": NOW, "source_names": ["Another CM", "Owner Person"], **changes}
+
+
+@pytest.mark.parametrize("changes", [
+    {"role_source": "manual_p2p_confirmed"},
+    {"role_source": "manual_excel_import"},
+    {"assignment_id": None, "responsible_id": None, "responsible_name": None, "assignment_audit": {}},
+    {"assignment_id": UUID(int=99), "assignment_audit": {}},
+])
+def test_history_is_available_independent_of_evidence_or_current_assignment(monkeypatch, changes):
     row = {**documented_row(), "role_source": "manual_p2p_confirmed"}
-    conn = bind(monkeypatch, row)
+    row.update(changes)
+    conn = bind(monkeypatch, row, [conversation_row()])
     result = creator_review.detail(CONTACT)
-    assert result["conversations"] == []
-    assert len(conn.calls) == 1
-    assert "未留存" in result["creator"]["evidence_reason"]
+    assert len(result["conversations"]) == 1
+    assert result["creator"]["evidence_status"] == "review"
+    assert conn.calls[1][1] == (CONTACT, NOW)
 
 
-def test_detail_passes_only_explicit_primary_groups_and_never_raw_identity_ids(monkeypatch):
+def test_detail_lists_all_identity_related_sources_with_counts_and_times(monkeypatch):
     row = documented_row()
-    conn = bind(monkeypatch, row, [{"chat_id": CHAT, "name": "Account x TT", "chat_mode": "group"}])
+    conn = bind(monkeypatch, row, [conversation_row(), conversation_row(
+        chat_id=OTHER_CHAT, chat_mode="p2p", name=None, source_names=["Another CM"])])
     result = creator_review.detail(CONTACT)
-    assert conn.calls[1][1] == (CONTACT, ASSIGNMENT, OWNER, NOW, [CHAT])
-    assert result["conversations"][0]["context_label"] == "主证据关联群 · 局部文字视图"
+    assert conn.calls[1][1] == (CONTACT, NOW)
+    group, direct = result["conversations"]
+    assert group["context_label"] == "曾观察到达人账号参与"
+    assert group["source_label"] == "Another CM、Owner Person"
+    assert group["message_count"] == 42
+    assert group["last_message_at_label"] == "2026-09-05 01:00 BST"
+    assert direct["context_label"] == "与达人单聊"
+    assert direct["name"] == "相关单聊"
     assert "原 CM / TAP CM 字段未留存" in result["source_owner_label"]
 
 
-def test_messages_reject_noncreator_insufficient_evidence_and_unrelated_chat(monkeypatch):
+def test_messages_reject_noncreator_and_unrelated_chat(monkeypatch):
     bind(monkeypatch, None)
     assert creator_review.messages(CONTACT, CHAT) is None
-    conn = bind(monkeypatch, {**documented_row(), "role_source": "manual_p2p_confirmed"})
-    assert creator_review.messages(CONTACT, CHAT) is None
-    assert len(conn.calls) == 1
     conn = bind(monkeypatch, documented_row(), None)
     assert creator_review.messages(CONTACT, OTHER_CHAT) is None
     assert len(conn.calls) == 2
-    assert conn.calls[1][1][-2:] == ([CHAT], OTHER_CHAT)
+    assert conn.calls[1][1] == (CONTACT, NOW, OTHER_CHAT)
     assert creator_review.messages(CONTACT, "' OR 1=1 --") is None
 
 
-def test_each_message_read_rechecks_current_authorization_scope_and_limits_senders(monkeypatch):
+def test_each_message_read_rechecks_creator_and_all_current_authorized_sources(monkeypatch):
     cipher = message_body_cipher(b"r" * 32)
     conn = bind(monkeypatch, documented_row(), {"chat_id": CHAT}, {"total_count": 1}, [
         {"body_ciphertext": cipher.encrypt('{"text":"Hello creator"}'),
-         "message_create_time": NOW, "sent_by_author": True}])
+         "message_create_time": NOW, "sent_by_author": True, "sent_by_creator": False,
+         "sender_name": "Owner Person", "sender_type": "user", "message_type": "text"}])
     monkeypatch.setattr(creator_review, "get_settings", lambda: SimpleNamespace(token_encryption_key=b"r" * 32))
     result = creator_review.messages(CONTACT, CHAT)
-    assert result["items"] == [{"sender_label": "Owner Person", "sender_role_label": "负责人",
+    assert result["items"] == [{"sender_label": "Owner Person", "sender_role_label": "当前负责人",
                                 "created_at_label": "2026-09-05 01:00 BST", "content": "Hello creator",
-                                "sent_by_author": True}]
+                                "sent_by_author": True, "message_type_label": "文字"}]
     for sql, params in conn.calls[2:]:
-        assert params[:6] == (CONTACT, ASSIGNMENT, OWNER, NOW, [CHAT], CHAT)
-        for guard in ["assignment.ended_at IS NULL", "responsible.status = 'active'",
-                      "responsible.body_consent_at IS NOT NULL", "access.is_visible AND access.sync_enabled",
-                      "observation.observed_at >= scope.body_consent_at AND NOT message.is_deleted",
-                      "observation.authorization_id = scope.responsible_id", "message.message_type = 'text'",
-                      "sender.contact_id = scope.contact_id", "counterpart.contact_id = target.id",
-                      "message.sender_open_id = scope.responsible_open_id", "chat.chat_id = ANY(%s::text[])"]:
+        assert params[:3] == (CONTACT, NOW, CHAT)
+        for guard in ["role.role = 'creator' AND role.status = 'confirmed' AND role.is_primary",
+                      "source.status = 'active' AND source.body_consent_at IS NOT NULL",
+                      "access.is_visible AND access.sync_enabled", "role.updated_at = %s",
+                      "observation.observed_at >= scope.body_consent_at", "NOT message.is_deleted",
+                      "observation.authorization_id = scope.source_id", "counterpart.contact_id = target.id",
+                      "witness.status = 'active'", "seen.observed_at >= source.body_consent_at"]:
             assert guard in sql
+        for obsolete in ["role.source =", "assignment_eligible", "message.message_type = 'text'",
+                         "message.body_ciphertext IS NOT NULL", "chat.chat_id = ANY"]:
+            assert obsolete not in sql
 
 
-def test_text_renderer_does_not_expand_nested_content_and_masks_common_identifiers():
+def test_text_renderer_extracts_stored_body_only_and_masks_common_identifiers():
     cipher = message_body_cipher(b"r" * 32)
     def render(value):
         return creator_review._text_content(cipher.encrypt(value), cipher)
     text = render(json.dumps({"text": "email a+b@example.org tel +44 7700 900123 ou_secret0123"}))
     assert "example.org" not in text and "7700" not in text and "ou_secret" not in text
-    for value in ['{"forward":{"text":"secret"}}', '{"text":"safe","forward":{"text":"secret"}}',
-                  '{"file":{"name":"secret"}}', '"raw secret"', 'raw secret']:
+    assert render('{"forward":{"text":"stored context"}}') == "stored context"
+    for value in ['{"file":{"key":"secret"}}', '{"parent_id":"secret"}', '"raw secret"']:
         assert "secret" not in render(value)
+    assert creator_review._text_content(cipher.encrypt("stored forwarded text"), cipher, "merge_forward") == (
+        "stored forwarded text")
+    assert creator_review._text_content(None, cipher) == "（正文尚未同步）"
+    assert "图片" in creator_review._text_content(cipher.encrypt('{"image_key":"private"}'), cipher, "image")
     assert creator_review._text_content("invalid-ciphertext", cipher) == "（正文无法读取）"
+
+
+def test_other_participants_media_and_missing_bodies_are_not_silently_removed(monkeypatch):
+    cipher = message_body_cipher(b"r" * 32)
+    row = {**documented_row(), "role_source": "manual_p2p_confirmed", "assignment_audit": {}}
+    messages = [{"body_ciphertext": body, "message_create_time": NOW, "sent_by_author": False,
+                 "sent_by_creator": False, "sender_name": "Another participant", "sender_type": "user",
+                 "message_type": kind} for body, kind in [
+                     (cipher.encrypt('{"text":"Other speaker context"}'), "text"),
+                     (cipher.encrypt('{"image_key":"private-key"}'), "image"), (None, "post")]]
+    bind(monkeypatch, row, {"chat_id": CHAT}, {"total_count": 3}, messages)
+    monkeypatch.setattr(creator_review, "get_settings", lambda: SimpleNamespace(token_encryption_key=b"r" * 32))
+    result = creator_review.messages(CONTACT, CHAT)
+    assert result["total_count"] == 3
+    assert all(item["sender_role_label"] == "其他参与者" for item in result["items"])
+    assert result["items"][0]["content"] == "Other speaker context"
+    assert result["items"][1]["message_type_label"] == "图片"
+    assert "private-key" not in result["items"][1]["content"]
+    assert result["items"][2]["content"] == "（正文尚未同步）"
+
+
+def test_conversation_and_message_queries_deduplicate_by_canonical_keys():
+    assert "GROUP BY chat_id, name, chat_mode" in creator_review._CONVERSATIONS_SQL
+    assert "array_agg(DISTINCT source_name" in creator_review._CONVERSATIONS_SQL
+    for sql in [creator_review._CONVERSATIONS_SQL, creator_review._VISIBLE_MESSAGES_SQL]:
+        assert "FROM chat_messages message" in sql
+        assert "EXISTS (" in sql
+        assert "observation.message_id = message.message_id" in sql
+    scope = creator_review._CONVERSATION_SCOPE_SQL
+    assert "member.chat_id = chat.chat_id AND identity.contact_id = target.id" in scope
+    assert "counterpart.open_id = access.p2p_counterpart_open_id" in scope
+    assert "identity.tenant_classification = 'known_external'" in scope
+    assert "counterpart.identity_type = 'user'" in scope
+    assert "ILIKE" not in scope and "chat.name" not in scope
 
 
 def test_view_audit_records_only_target_identifiers(monkeypatch):

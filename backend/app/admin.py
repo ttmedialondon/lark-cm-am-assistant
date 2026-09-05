@@ -96,14 +96,15 @@ def create_admin_router(
             "csrf_token": csrf_token(access_context["authorization"]),
         }
 
-    def pagination(page_data: dict[str, Any], path: str, *, page_name: str = "page", **query: object) -> dict[str, Any]:
+    def pagination(page_data: dict[str, Any], path: str, *, page_name: str = "page",
+                   fragment: str = "", **query: object) -> dict[str, Any]:
         """Build compact, numbered navigation while retaining every query value."""
 
         page = int(page_data["page"])
         query = {key: value for key, value in query.items() if value is not None}
 
         def url(target_page: int) -> str:
-            return f"{path}?{urlencode({**query, page_name: target_page})}"
+            return f"{path}?{urlencode({**query, page_name: target_page})}" + (f"#{fragment}" if fragment else "")
 
         total_count = page_data.get("total_count")
         page_size = page_data.get("page_size")
@@ -624,7 +625,7 @@ def create_admin_router(
             filters["responsible_id"] = str(responsible_id)
         path = f"/admin/creator-review/{contact_id}"
         conversations = [
-            {**item, "url": f"{path}?{urlencode({**filters, 'chat_id': item['chat_id']})}"}
+            {**item, "url": f"{path}?{urlencode({**filters, 'chat_id': item['chat_id']})}#cr-chat-title"}
             for item in detail["conversations"]
         ]
         detail = {**detail, "conversations": conversations}
@@ -643,7 +644,7 @@ def create_admin_router(
                 )
             creator_review.record_view(access_context["authorization"]["id"], contact_id, chat_id)
             pager = pagination(
-                content_page, path, page_name="message_page", chat_id=chat_id, **filters,
+                content_page, path, page_name="message_page", fragment="cr-chat-title", chat_id=chat_id, **filters,
             )
         response = render_template(
             request,

@@ -1516,12 +1516,17 @@ def _body_text_values(value: Any) -> list[str]:
 
     def collect(current: Any) -> None:
         if isinstance(current, dict):
+            title = current.get("title")
+            if isinstance(title, str) and title and isinstance(current.get("content"), list):
+                texts.append(title)
             text = current.get("text")
             if isinstance(text, str) and text:
                 texts.append(text)
-            for key, child in current.items():
-                if key != "text":
-                    collect(child)
+            content = current.get("content")
+            if current.get("tag") in ("plain_text", "lark_md") and isinstance(content, str) and content:
+                texts.append(content)
+            for child in current.values():
+                collect(child)
         elif isinstance(current, list):
             for child in current:
                 collect(child)

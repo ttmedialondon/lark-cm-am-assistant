@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}{{ detail.creator.display_name }} · 达人归属复核{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-review.css?v=20260905">{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-review.css?v=20260905-conversations">{% endblock %}
 {% block body %}
 {% set creator = detail.creator %}
 <div class="page creator-review">
@@ -22,27 +22,33 @@
     </section>
 
     <section class="cr-chat-section" aria-labelledby="cr-chat-title">
-      <div class="cr-section-header cr-section-header--plain"><div><h2 id="cr-chat-title">相关聊天 <span class="cr-readonly">辅助复核</span></h2><p>聊天用于辅助理解账号、联系人及合作关系；单聊不单独决定归属。</p></div></div>
+      <div class="cr-section-header cr-section-header--plain"><div><h2 id="cr-chat-title">达人相关会话 <span class="cr-readonly">已同步授权范围</span></h2><p>左侧列出与这个达人账号相关的群聊和单聊，可逐个查看会话记录。归属依据待补充不影响人工查阅；单聊仍不能单独作为归属主证据。</p></div></div>
       {% if detail.conversation_notice %}<div class="cr-notice">{{ detail.conversation_notice }}</div>{% endif %}
       <div class="cr-chat-workspace">
-        <aside class="card cr-conversations" aria-label="可查看会话">
-          <div class="cr-conversations__header"><h3>可查看会话</h3><span>{{ detail.conversations|length }} 个</span></div>
+        <aside class="card cr-conversations" aria-label="达人相关会话列表">
+          <div class="cr-conversations__header"><h3>全部相关会话</h3><span>{{ detail.conversations|length }} 个</span></div>
           {% if detail.conversations %}
           <nav class="cr-conversations__list" aria-label="选择会话">{% for conversation in detail.conversations %}
-            <a class="cr-conversation {% if selected_chat and selected_chat.chat_id == conversation.chat_id %}is-current{% endif %}" href="{{ conversation.url }}" {% if selected_chat and selected_chat.chat_id == conversation.chat_id %}aria-current="true"{% endif %}><span class="cr-conversation__type">{{ conversation.chat_mode_label }}</span><strong>{{ conversation.name }}</strong><span class="cr-conversation__context">{{ conversation.context_label }}</span></a>
+            <a class="cr-conversation {% if selected_chat and selected_chat.chat_id == conversation.chat_id %}is-current{% endif %}" href="{{ conversation.url }}" {% if selected_chat and selected_chat.chat_id == conversation.chat_id %}aria-current="true"{% endif %}>
+              <span class="cr-conversation__summary"><span class="cr-conversation__type">{{ conversation.chat_mode_label }}</span><span>{{ conversation.message_count }} 条记录</span></span>
+              <strong>{{ conversation.name }}</strong>
+              <span class="cr-conversation__context">{{ conversation.context_label }}</span>
+              <span class="cr-conversation__context">最近记录：{{ conversation.last_message_at_label or '暂无已同步记录' }}</span>
+              <span class="cr-conversation__context">授权来源：{{ conversation.source_label or '未记录' }}</span>
+            </a>
           {% endfor %}</nav>
-          {% else %}<div class="cr-empty cr-empty--compact"><h3>暂无可查看会话</h3><p>当前没有符合此达人查阅范围的会话记录。</p></div>{% endif %}
+          {% else %}<div class="cr-empty cr-empty--compact"><h3>暂未找到相关会话</h3><p>当前授权范围内未找到与此达人账号相关的会话，不代表该账号没有聊天记录。</p></div>{% endif %}
         </aside>
         <section class="card cr-chat-content" aria-label="会话消息">
           {% if selected_chat %}
-          <div class="cr-chat-content__header"><span class="cr-conversation__type">{{ selected_chat.chat_mode_label }}</span><h3>{{ selected_chat.name }}</h3>{% if selected_chat.context_label %}<p>{{ selected_chat.context_label }}</p>{% endif %}</div>
+          <div class="cr-chat-content__header"><span class="cr-conversation__type">{{ selected_chat.chat_mode_label }}</span><h3>{{ selected_chat.name }}</h3><p>{{ selected_chat.context_label }} · {{ selected_chat.message_count }} 条已同步授权记录</p><p>授权来源：{{ selected_chat.source_label or '未记录' }}</p></div>
           <div class="cr-messages">
             {% if content_page and content_page['items'] %}
-            {% for message in content_page['items'] %}<article class="cr-message {% if message.sent_by_author %}cr-message--owner{% endif %}"><div class="cr-message__meta"><strong>{{ message.sender_label }}</strong>{% if message.sender_role_label %}<span class="cr-message__role">{{ message.sender_role_label }}</span>{% endif %}<span>{{ message.created_at_label }}</span></div><div class="cr-message__body">{{ message.content }}</div></article>{% endfor %}
-            {% else %}<div class="cr-empty"><h3>暂无可展示的消息正文</h3><p>此会话在当前查阅范围内没有可用正文。</p></div>{% endif %}
+            {% for message in content_page['items'] %}<article class="cr-message {% if message.sent_by_author %}cr-message--owner{% endif %}"><div class="cr-message__meta"><strong>{{ message.sender_label }}</strong>{% if message.sender_role_label %}<span class="cr-message__role">{{ message.sender_role_label }}</span>{% endif %}{% if message.message_type_label %}<span class="cr-message__role">{{ message.message_type_label }}</span>{% endif %}<span>{{ message.created_at_label }}</span></div><div class="cr-message__body">{{ message.content }}</div></article>{% endfor %}
+            {% else %}<div class="cr-empty"><h3>当前没有可展示的记录</h3><p>此会话在当前授权范围内暂未找到已同步记录，不代表原会话没有消息。</p></div>{% endif %}
           </div>
           {% if message_page %}{% with pager=message_page %}{% include "admin/_pagination.html" %}{% endwith %}{% endif %}
-          {% else %}<div class="cr-empty cr-chat-empty"><div class="cr-empty__mark" aria-hidden="true">···</div><h3>{% if detail.conversations %}选择一个会话，查看相关聊天{% else %}暂无相关聊天可展示{% endif %}</h3><p>{% if detail.conversations %}从会话列表打开记录，结合上方归属依据复核。{% else %}没有聊天记录不影响已有的 Excel 与身份定位依据。{% endif %}</p></div>{% endif %}
+          {% else %}<div class="cr-empty cr-chat-empty"><div class="cr-empty__mark" aria-hidden="true">···</div><h3>{% if detail.conversations %}选择一个会话，查看聊天记录{% else %}当前授权范围内未找到相关会话{% endif %}</h3><p>{% if detail.conversations %}从旁边的列表逐个打开会话，自行查看各参与者的已同步授权记录。{% else %}此处仅展示已同步且获授权的内容，不据此判断达人是否与某位负责人沟通过。{% endif %}</p></div>{% endif %}
         </section>
       </div>
     </section>
