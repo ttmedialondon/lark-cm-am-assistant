@@ -33,7 +33,7 @@ LIST_PAGE_SIZE = 25
 DETAIL_PAGE_SIZE = 10
 MAX_PAGE = 10_000
 MESSAGE_PAGE_SIZE = 100
-MESSAGE_CONVERSATION_PAGE_SIZE = 5
+MESSAGE_CONVERSATION_PAGE_SIZE = 20
 MAX_MESSAGE_CONVERSATION_QUERY_LENGTH = 120
 MAX_ORGANIZATION_QUERY_LENGTH = 120
 MESSAGE_CONVERSATION_TYPES = frozenset({"all", "group", "p2p"})
@@ -1198,7 +1198,7 @@ def contact_detail(open_id: str, conversation_page: int = 1, *,
 
 
 def normalize_message_conversation_query(value: str | None) -> str:
-    """Keep the owner-side conversation search bounded and predictable."""
+    """Keep the admin conversation search bounded and predictable."""
 
     return (value or "").strip()[:MAX_MESSAGE_CONVERSATION_QUERY_LENGTH]
 
@@ -1239,7 +1239,7 @@ def message_conversations(
     query: str = "",
     chat_type: str = "all",
 ) -> dict[str, Any]:
-    """Return one filtered, five-conversation page for the owner-only content view."""
+    """Return one filtered, twenty-conversation page for the authorized content view."""
 
     query = normalize_message_conversation_query(query)
     chat_type = normalize_message_conversation_type(chat_type)
@@ -1368,7 +1368,7 @@ def message_page(
         ).fetchall()
 
     cipher = message_body_cipher(get_settings().token_encryption_key)
-    items = [_decorate_message(row, cipher) for row in rows[:MESSAGE_PAGE_SIZE]]
+    items = [_decorate_message(row, cipher) for row in reversed(rows[:MESSAGE_PAGE_SIZE])]
     return {
         "metrics": {key: int(metrics[key] or 0) for key in metrics},
         **_page_result(items, page, MESSAGE_PAGE_SIZE, total_count=total_count),
@@ -1376,7 +1376,7 @@ def message_page(
 
 
 def record_message_view(viewer_id: UUID, target_authorization_id: UUID, chat_id: str | None) -> None:
-    """Audit an owner content-page view without ever placing message text in the log."""
+    """Audit an authorized content-page view without ever placing message text in the log."""
 
     metadata = {"target_authorization_id": str(target_authorization_id)}
     if chat_id:
@@ -1508,6 +1508,11 @@ def _decorate_message(row: dict[str, Any], cipher: TokenCipher) -> dict[str, Any
         "本人" if item.get("sent_by_author") else item.get("sender_display_name") or "会话对方 / 群成员"
     )
     item["created_at_label"] = _message_time(item.get("message_create_time"))
+    created_at = item.get("message_create_time")
+    item["created_date_label"] = (
+        created_at.astimezone(LONDON_TIME_ZONE).strftime("%Y-%m-%d") if created_at else "日期未知"
+    )
+    item["message_type_label"] = _message_type_label(item.get("message_type"))
     try:
         body = cipher.decrypt(item["body_ciphertext"])
     except (InvalidTag, UnicodeDecodeError, ValueError):
@@ -1515,6 +1520,13 @@ def _decorate_message(row: dict[str, Any], cipher: TokenCipher) -> dict[str, Any
     else:
         item["content"] = _readable_body(body, item.get("message_type"))
     return item
+
+
+def _message_type_label(message_type: str | None) -> str:
+    return {"text": "文字", "post": "富文本", "interactive": "卡片", "image": "图片",
+            "file": "文件", "audio": "语音", "media": "视频", "sticker": "表情",
+            "merge_forward": "合并转发", "share_chat": "分享群聊", "share_user": "分享联系人"
+            }.get(message_type, "其他消息")
 
 
 def _readable_body(raw: str, message_type: str | None) -> str:

@@ -3,6 +3,9 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
+import pytest
+from cryptography.exceptions import InvalidTag
+
 from app import admin_reporting
 
 
@@ -35,7 +38,7 @@ def test_reporting_pagination_uses_exact_totals_and_preserves_empty_results():
 
 
 def test_message_conversation_filter_values_are_bounded_and_allowlisted():
-    assert admin_reporting._page_window(2, admin_reporting.MESSAGE_CONVERSATION_PAGE_SIZE) == (2, 6, 5)
+    assert admin_reporting._page_window(2, admin_reporting.MESSAGE_CONVERSATION_PAGE_SIZE) == (2, 21, 20)
     assert admin_reporting.normalize_message_conversation_query("  Creator  ") == "Creator"
     assert admin_reporting.normalize_message_conversation_query("x" * 121) == "x" * 120
     assert admin_reporting.normalize_message_conversation_type("p2p") == "p2p"
@@ -264,3 +267,130 @@ def test_contact_detail_skips_ungranted_conversation_queries(monkeypatch):
     assert len(calls) == 3
     assert all("conversation_ids" not in query and "chat_messages" not in query for query, _ in calls)
     assert detail["conversations"]["items"] == []
+
+
+@pytest.mark.parametrize("requested_page,expected_page,offset", [(0, 1, 0), (2, 2, 20), (999_999, 3, 40)])
+def test_message_directory_twenty_item_pages_clamp_and_preserve_scope(
+    monkeypatch, requested_page, expected_page, offset
+):
+    authorization_id = uuid4()
+    calls = _empty_reporting_database(monkeypatch, {"total_count": 41})
+    page = admin_reporting.message_conversations(authorization_id, requested_page, "  synthetic  ", "p2p")
+    directory_params = (authorization_id, "synthetic", "synthetic", "synthetic", "p2p", "p2p", "p2p")
+    assert calls[0][1] == directory_params
+    assert calls[1][1] == (*directory_params, 21, offset)
+    assert page["page_size"] == 20
+    assert page["page"] == expected_page
+    assert page["total_count"] == 41
+    assert page["total_pages"] == 3
+    for query, _ in calls:
+        assert admin_reporting.MESSAGE_CONVERSATION_DIRECTORY_SQL in query
+        assert admin_reporting.MESSAGE_CONVERSATION_FILTER_SQL in query
+    assert "ORDER BY LOWER(COALESCE(c.name, counterpart.display_name, '')), ac.chat_id" in calls[1][0]
+    assert "ORDER BY LOWER(COALESCE(name, counterpart_display_name, '')), chat_id" in calls[1][0]
+
+
+@pytest.mark.parametrize("requested_page,expected_page,offset", [(0, 1, 0), (2, 2, 100), (999_999, 3, 200)])
+def test_message_page_decrypts_only_selected_hundred_then_displays_chronologically(
+    monkeypatch, requested_page, expected_page, offset
+):
+    calls = []
+    decrypted = []
+    authorization_id = uuid4()
+    start = datetime(2026, 9, 5, 12, tzinfo=UTC)
+    rows = [
+        {
+            "message_id": f"m_{index:03}", "message_create_time": start + timedelta(seconds=index // 2),
+            "message_type": "text", "body_ciphertext": f"cipher-{index}",
+        }
+        for index in range(201, 100, -1)
+    ]
+    metrics = {"message_count": 205, "content_count": 201, "own_message_count": 99, "p2p_message_count": 205}
+
+    def execute(query, params=()):
+        assert query.count("%s") == len(params)
+        calls.append((query, params))
+        return SimpleNamespace(fetchone=lambda: metrics, fetchall=lambda: rows)
+
+    def decrypt(ciphertext):
+        decrypted.append(ciphertext)
+        return '{"text":"synthetic test message"}'
+
+    monkeypatch.setattr(admin_reporting, "connection", lambda: nullcontext(SimpleNamespace(execute=execute)))
+    monkeypatch.setattr(admin_reporting, "get_settings", lambda: SimpleNamespace(token_encryption_key=b"test"))
+    monkeypatch.setattr(admin_reporting, "message_body_cipher", lambda key: SimpleNamespace(decrypt=decrypt))
+    page = admin_reporting.message_page(authorization_id, "oc_synthetic", requested_page)
+    assert page["page"] == expected_page
+    assert page["page_size"] == 100
+    assert len(page["items"]) == 100
+    assert page["metrics"] == metrics
+    assert page["total_count"] == 201
+    assert page["has_next"] is (expected_page < 3)
+    assert [item["message_id"] for item in page["items"]] == [f"m_{index:03}" for index in range(102, 202)]
+    assert decrypted == [f"cipher-{index}" for index in range(102, 202)]
+    assert "cipher-101" not in decrypted
+    assert calls[0][1] == (authorization_id, "oc_synthetic")
+    assert calls[1][1] == (authorization_id, "oc_synthetic", 101, offset)
+    for query, _ in calls:
+        for condition in (
+            "a.id = %s", "a.status = 'active'", "a.body_consent_at IS NOT NULL",
+            "o.observed_at >= a.body_consent_at", "ac.is_visible AND ac.sync_enabled",
+            "COALESCE(c.chat_status, 'normal') = 'normal'", "NOT m.is_deleted", "m.chat_id = %s",
+            "o.authorization_id = ac.authorization_id AND o.chat_id = ac.chat_id",
+            "m.chat_id = o.chat_id AND m.message_id = o.message_id",
+        ):
+            assert condition in query
+    assert "COUNT(*) FILTER (WHERE body_ciphertext IS NOT NULL) AS content_count" in calls[0][0]
+    assert "WHERE body_ciphertext IS NOT NULL" in calls[1][0]
+    assert "ORDER BY message_create_time DESC NULLS LAST, message_id DESC" in calls[1][0]
+    # Equal timestamps retain the inverse of the database's deterministic ID tie-breaker.
+    assert page["items"][0]["message_create_time"] == page["items"][1]["message_create_time"]
+    assert [item["message_id"] for item in page["items"][:2]] == ["m_102", "m_103"]
+
+
+@pytest.mark.parametrize(
+    "message_type,label",
+    [("text", "文字"), ("post", "富文本"), ("interactive", "卡片"), ("image", "图片"),
+     ("file", "文件"), ("audio", "语音"), ("media", "视频"), ("sticker", "表情"),
+     ("merge_forward", "合并转发"), ("share_chat", "分享群聊"), ("share_user", "分享联系人"),
+     (None, "其他消息"), ("unknown", "其他消息")],
+)
+def test_message_type_labels_share_the_existing_creator_mapping(message_type, label):
+    from app import creator_review
+
+    assert admin_reporting._message_type_label(message_type) == label
+    assert creator_review._message_type_label is admin_reporting._message_type_label
+    item = admin_reporting._decorate_message(
+        {"message_type": message_type, "body_ciphertext": "synthetic"},
+        SimpleNamespace(decrypt=lambda value: '{}'),
+    )
+    assert item["message_type_label"] == label
+    assert item["content"] == f"（{message_type or '未知类型'} 消息没有可展示的文本）"
+
+
+@pytest.mark.parametrize(
+    "created_at,date_label,time_label",
+    [(datetime(2026, 7, 4, 23, 30, tzinfo=UTC), "2026-07-05", "2026-07-05 00:30 BST"),
+     (datetime(2026, 1, 4, 23, 30, tzinfo=UTC), "2026-01-04", "2026-01-04 23:30 GMT"),
+     (None, "日期未知", "时间未知")],
+)
+def test_message_date_heading_uses_london_and_retains_existing_timestamp(created_at, date_label, time_label):
+    item = admin_reporting._decorate_message(
+        {"message_create_time": created_at, "message_type": "text", "body_ciphertext": "synthetic"},
+        SimpleNamespace(decrypt=lambda value: 'raw text fallback'),
+    )
+    assert item["created_date_label"] == date_label
+    assert item["created_at_label"] == time_label
+    assert item["content"] == "raw text fallback"
+
+
+def test_message_decryption_failure_still_has_safe_display_labels():
+    def decrypt(value):
+        raise InvalidTag
+
+    item = admin_reporting._decorate_message(
+        {"message_type": "image", "body_ciphertext": "synthetic"}, SimpleNamespace(decrypt=decrypt)
+    )
+    assert item["content"] == "（正文无法读取）"
+    assert item["message_type_label"] == "图片"
+    assert item["created_date_label"] == "日期未知"

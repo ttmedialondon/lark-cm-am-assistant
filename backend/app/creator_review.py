@@ -9,7 +9,14 @@ from uuid import UUID, uuid4
 
 from cryptography.exceptions import InvalidTag
 
-from .admin_reporting import _format_time, _message_time, _page_result, _page_window, _readable_body
+from .admin_reporting import (
+    _format_time,
+    _message_time,
+    _message_type_label,
+    _page_result,
+    _page_window,
+    _readable_body,
+)
 from .config import get_settings
 from .crypto import message_body_cipher
 from .db import connection
@@ -338,13 +345,6 @@ def _text_content(ciphertext: str | None, cipher: Any, message_type: str | None 
     text = re.sub(r"(?<!\w)\+?\d[\d ()\-]{6,}\d(?!\w)", "[电话号码已隐藏]", text)
     text = re.sub(r"\b(?:ou|on|cli)_[A-Za-z0-9]+\b", "[标识已隐藏]", text)
     return text
-
-
-def _message_type_label(message_type: str | None) -> str:
-    return {"text": "文字", "post": "富文本", "interactive": "卡片", "image": "图片",
-            "file": "文件", "audio": "语音", "media": "视频", "sticker": "表情",
-            "merge_forward": "合并转发", "share_chat": "分享群聊", "share_user": "分享联系人"
-            }.get(message_type, "其他消息")
 
 
 def messages(contact_id: UUID, chat_id: str, page: int = 1) -> dict[str, Any] | None:

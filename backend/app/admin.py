@@ -545,7 +545,7 @@ def create_admin_router(
         selected_user = next((item for item in users if item["id"] == user_id), None)
         selected_user_in_page = selected_user is not None
         if user_id is not None and selected_user is None:
-            selected = admin_reporting.user_detail(user_id)
+            selected = admin_reporting.user_detail(user_id, include_conversations=False, include_jobs=False)
             selected_user = selected["user"] if selected else None
         if user_id is not None and not selected_user:
             return render_template(
@@ -560,7 +560,13 @@ def create_admin_router(
         conversations: list[dict[str, Any]] = []
         selected_chat: dict[str, Any] | None = None
         content_page: dict[str, Any] | None = None
+        source_unavailable_reason = None
         if selected_user:
+            if selected_user.get("authorization_status", "active") != "active":
+                source_unavailable_reason = "该人员的 Lark 授权当前不可用，暂时无法查看其会话和记录。"
+            elif not selected_user.get("body_consent_at"):
+                source_unavailable_reason = "该人员尚未完成消息正文授权，暂时无法查看其会话和记录。"
+        if selected_user and not source_unavailable_reason:
             conversation_page_data = admin_reporting.message_conversations(
                 selected_user["id"], conversation_page, conversation_query, conversation_type
             )
@@ -572,21 +578,47 @@ def create_admin_router(
                     access_context["authorization"]["id"], selected_user["id"], selected_chat["chat_id"]
                 )
 
+        selected_chat_in_page = bool(selected_chat and any(
+            item["chat_id"] == selected_chat["chat_id"] for item in conversations
+        ))
+        source_params = (
+            {"user_id": str(selected_user["id"]), "user_page": user_page_data["page"]} if selected_user else {}
+        )
+        conversation_params = {
+            **source_params, "conversation_page": conversation_page_data["page"] if conversation_page_data else 1,
+            "conversation_query": conversation_query, "conversation_type": conversation_type,
+        }
+        conversations = [
+            {**item, "url": "/admin/messages?" + urlencode({**conversation_params, "chat_id": item["chat_id"]})
+             + "#message-panel"}
+            for item in conversations
+        ]
+        latest_messages_url = (
+            "/admin/messages?" + urlencode({**conversation_params, "chat_id": selected_chat["chat_id"], "page": 1})
+            + "#message-latest"
+            if selected_chat else None
+        )
         response = render_template(
             request,
             "admin/messages.html",
             {
                 **page_context(access_context, "messages"),
                 "users": users,
+                "source_unavailable_reason": source_unavailable_reason,
+                "requested_chat_unavailable": bool(selected_user and chat_id and not selected_chat
+                                                    and not source_unavailable_reason),
+                "selected_chat_in_page": selected_chat_in_page,
+                "clear_conversation_filters_url": f"/admin/messages?{urlencode(source_params)}",
+                "latest_messages_url": latest_messages_url,
                 "selected_user_in_page": selected_user_in_page,
                 "user_page": pagination(
                     user_page_data,
                     "/admin/messages",
                     page_name="user_page",
                     user_id=user_id,
-                    chat_id=chat_id,
-                    conversation_page=conversation_page,
-                    page=page,
+                    chat_id=selected_chat["chat_id"] if selected_chat else None,
+                    conversation_page=conversation_page_data["page"] if conversation_page_data else 1,
+                    page=content_page["page"] if content_page else 1,
                     conversation_query=conversation_query,
                     conversation_type=conversation_type,
                 ),
@@ -600,10 +632,11 @@ def create_admin_router(
                         conversation_page_data,
                         "/admin/messages",
                         page_name="conversation_page",
+                        fragment="conversation-directory",
                         user_id=selected_user["id"],
-                        chat_id=chat_id,
+                        chat_id=selected_chat["chat_id"] if selected_chat else None,
                         user_page=user_page_data["page"],
-                        page=page,
+                        page=content_page["page"] if content_page else 1,
                         conversation_query=conversation_query,
                         conversation_type=conversation_type,
                     )
@@ -615,6 +648,7 @@ def create_admin_router(
                     pagination(
                         content_page,
                         "/admin/messages",
+                        fragment="message-panel",
                         user_id=selected_user["id"],
                         chat_id=selected_chat["chat_id"],
                         user_page=user_page_data["page"],
