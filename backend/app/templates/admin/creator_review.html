@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}达人归属复核 · 管理台{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-review.css?v=20260905">{% endblock %}
+{% block body %}
+<div class="page creator-review">
+  {% include "admin/_nav.html" %}
+  <div class="page-wrapper"><main class="page-body pt-0"><div class="container-xl creator-review__container">
+    <header class="cr-hero">
+      <div>
+        <div class="cr-eyebrow">CREATOR REVIEW · 达人管理</div>
+        <h1>达人归属复核</h1>
+        <p>看清每位达人的负责人，以及账号与联系人的对应依据。</p>
+      </div>
+      <span class="cr-preview"><span aria-hidden="true"></span>试用中 · 仅所有者可见</span>
+    </header>
+
+    <section class="cr-stats" aria-label="正式达人总览统计">
+      <div class="cr-stat"><span>全部正式达人</span><strong>{{ summary.creators }}<small>人</small></strong><p>以联系人计数</p></div>
+      <div class="cr-stat"><span>已记录账号</span><strong>{{ summary.handles }}<small>个</small></strong><p>同一达人可有多个 handle</p></div>
+      <div class="cr-stat"><span>依据已记录</span><strong>{{ summary.documented }}<small>人</small></strong><p>可查看导入与身份定位依据</p></div>
+      <div class="cr-stat cr-stat--review"><span>依据待复核</span><strong>{{ summary.needs_review }}<small>人</small></strong><p>已关联，仍需补充或核对依据</p></div>
+    </section>
+
+    <section class="cr-method" aria-label="如何理解归属依据">
+      <div class="cr-method__title">如何看懂归属</div>
+      <div><span class="cr-step-number">1</span><p><strong>账号与负责人</strong><span>Excel 的 handle 和负责人提供主关系</span></p></div>
+      <div><span class="cr-step-number">2</span><p><strong>定位到具体联系人</strong><span>结合群名、成员、姓名与明确别名</span></p></div>
+      <div><span class="cr-step-number">3</span><p><strong>聊天辅助复核</strong><span>单聊仅作旁证，不单独决定归属</span></p></div>
+    </section>
+
+    <section class="card cr-directory" aria-labelledby="cr-directory-title">
+      <div class="cr-section-header">
+        <div><h2 id="cr-directory-title">达人与负责人</h2><p>系统关联状态与依据情况分别展示，便于逐项复核。</p></div>
+        <span class="cr-readonly">只读预览</span>
+      </div>
+      <form class="cr-filters" method="get" action="/admin/creator-review" role="search">
+        <div class="cr-search"><label for="cr-search">搜索达人</label><input id="cr-search" class="form-control" name="q" value="{{ q }}" placeholder="输入 handle 或联系人姓名" maxlength="120"></div>
+        <div><label for="cr-owner">当前负责人</label><select id="cr-owner" class="form-select" name="responsible_id"><option value="">全部负责人</option>{% for owner in owners %}<option value="{{ owner.id }}" {% if responsible_id == owner.id %}selected{% endif %}>{{ owner.name }}</option>{% endfor %}</select></div>
+        <div><label for="cr-evidence">依据情况</label><select id="cr-evidence" class="form-select" name="evidence"><option value="all" {% if evidence == 'all' %}selected{% endif %}>全部依据情况</option><option value="documented" {% if evidence == 'documented' %}selected{% endif %}>依据已记录</option><option value="review" {% if evidence == 'review' %}selected{% endif %}>依据待复核</option></select></div>
+        <div class="cr-filter-actions"><button class="btn btn-primary" type="submit">筛选</button>{% if q or responsible_id or evidence != 'all' %}<a class="btn btn-link" href="/admin/creator-review">重置</a>{% endif %}</div>
+      </form>
+      {% if creators %}
+      <div class="table-responsive">
+        <table class="table table-vcenter cr-table">
+          <thead><tr><th scope="col">达人账号 / 联系人</th><th scope="col">当前负责人</th><th scope="col">归属来源</th><th scope="col">依据情况</th><th scope="col"><span class="visually-hidden">查看详情</span></th></tr></thead>
+          <tbody>{% for creator in creators %}
+            <tr>
+              <td><div class="cr-handles">{% for handle in creator.handles %}<span>@{{ handle }}</span>{% else %}<span class="cr-muted">账号待补充</span>{% endfor %}</div><div class="cr-person">{{ creator.display_name or '联系人姓名待补充' }}{% if creator.handles|length > 1 %}<span class="cr-multi">{{ creator.handles|length }} 个账号 · 同一联系人</span>{% endif %}</div></td>
+              <td><div class="cr-owner">{{ creator.responsible_name or '尚未设置负责人' }}</div><div class="cr-meta">{{ creator.assignment_label }}</div></td>
+              <td><span class="cr-source">{{ creator.source_label or '来源待补充' }}</span><div class="cr-meta">{{ creator.updated_at_label }}</div></td>
+              <td><span class="cr-status {% if creator.evidence_status == 'review' %}cr-status--review{% else %}cr-status--documented{% endif %}">{{ creator.evidence_label }}</span><div class="cr-reason">{{ creator.evidence_reason }}</div></td>
+              <td class="cr-table__action"><a class="cr-detail-link" href="{{ creator.detail_url }}" aria-label="查看 {{ creator.display_name }} 的依据与聊天">查看依据<span aria-hidden="true"> →</span></a></td>
+            </tr>
+          {% endfor %}</tbody>
+        </table>
+      </div>
+      {% with pager=creator_page %}{% include "admin/_pagination.html" %}{% endwith %}
+      {% else %}
+      <div class="cr-empty"><div class="cr-empty__mark" aria-hidden="true">—</div><h3>{% if q or responsible_id or evidence != 'all' %}没有符合筛选条件的达人{% else %}暂时没有正式达人{% endif %}</h3><p>{% if q or responsible_id or evidence != 'all' %}尝试其他 handle、联系人姓名或负责人。{% else %}完成达人导入与关联后，可在这里查看归属依据。{% endif %}</p>{% if q or responsible_id or evidence != 'all' %}<a class="btn btn-outline-primary" href="/admin/creator-review">清空筛选</a>{% endif %}</div>
+      {% endif %}
+    </section>
+    <p class="cr-footnote">上方总览统计覆盖全部正式达人，筛选仅影响下方列表。“依据已记录”表示有可追溯记录，不代表自动判定准确率。</p>
+  </div></main></div>
+</div>
+{% endblock %}

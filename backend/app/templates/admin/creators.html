@@ -4,7 +4,7 @@
 <div class="page admin-directory">
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl admin-directory__container">
-    <div class="alert alert-info">这里只展示已确认的达人 / 创作者。负责人待确认表示已有 70% 及以上的 AI 建议；达到候选推送阈值的建议会出现在对应 CM/AM 的个人首页，由本人确认后生效。较低分数显示为“尚无可靠匹配”。</div>
+    <div class="alert alert-info">这里只展示已确认的达人 / 创作者及当前负责人。系统归属与依据完整性分别记录；可在<a href="/admin/creator-review">达人归属复核</a>中查看手动导入依据及相关聊天。</div>
     <div class="btn-list mb-3" aria-label="负责人筛选">
       <a class="btn btn-sm {% if assignment == 'all' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/creators?assignment=all">全部</a>
       <a class="btn btn-sm {% if assignment == 'confirmed' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/creators?assignment=confirmed">负责人已确认</a>

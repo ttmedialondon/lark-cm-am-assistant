@@ -23,6 +23,7 @@ from . import (
     ai_feature_config,
     contact_assessments,
     contact_assignments,
+    creator_review,
     organization_sync,
 )
 from .config import get_settings
@@ -540,6 +541,124 @@ def create_admin_router(
             },
         )
         response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
+    @router.get("/admin/creator-review")
+    def admin_creator_review(
+        request: Request,
+        page: int = 1,
+        q: str = "",
+        responsible_id: str = "",
+        evidence: str = "all",
+    ) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        try:
+            responsible_id = UUID(responsible_id) if responsible_id else None
+        except ValueError:
+            return render_template(
+                request, "error.html",
+                {"title": "负责人参数无效", "detail": "请从负责人列表中选择。"},
+                400,
+            )
+        q = admin_reporting.normalize_message_conversation_query(q)
+        evidence = evidence if evidence in {"all", "documented", "review"} else "all"
+        result = creator_review.directory(page, q, responsible_id, evidence)
+        source_query = urlencode(
+            {"page": result["page"], "q": q, "evidence": evidence,
+             **({"responsible_id": str(responsible_id)} if responsible_id else {})}
+        )
+        creators = [
+            {**item, "detail_url": f"/admin/creator-review/{item['id']}?{source_query}"}
+            for item in result["items"]
+        ]
+        response = render_template(
+            request,
+            "admin/creator_review.html",
+            {
+                **page_context(access_context, "creator-review"),
+                "creators": creators,
+                "summary": result["summary"],
+                "owners": result["owners"],
+                "q": q,
+                "responsible_id": str(responsible_id) if responsible_id else "",
+                "evidence": evidence,
+                "creator_page": pagination(
+                    result, "/admin/creator-review", q=q,
+                    responsible_id=responsible_id, evidence=evidence,
+                ),
+            },
+        )
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Referrer-Policy"] = "same-origin"
+        return response
+
+    @router.get("/admin/creator-review/{contact_id}")
+    def admin_creator_review_detail(
+        request: Request,
+        contact_id: UUID,
+        page: int = 1,
+        q: str = "",
+        responsible_id: UUID | None = None,
+        evidence: str = "all",
+        chat_id: str | None = None,
+        message_page: int = 1,
+    ) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        detail = creator_review.detail(contact_id)
+        if detail is None:
+            return render_template(
+                request, "error.html",
+                {"title": "未找到可复核的达人", "detail": "该联系人不在已确认达人范围内。"},
+                404,
+            )
+        q = admin_reporting.normalize_message_conversation_query(q)
+        evidence = evidence if evidence in {"all", "documented", "review"} else "all"
+        filters = {"page": max(1, min(page, admin_reporting.MAX_PAGE)), "q": q, "evidence": evidence}
+        if responsible_id:
+            filters["responsible_id"] = str(responsible_id)
+        path = f"/admin/creator-review/{contact_id}"
+        conversations = [
+            {**item, "url": f"{path}?{urlencode({**filters, 'chat_id': item['chat_id']})}"}
+            for item in detail["conversations"]
+        ]
+        detail = {**detail, "conversations": conversations}
+        selected_chat = None
+        content_page = None
+        pager = None
+        if chat_id is not None:
+            selected_chat = next((item for item in conversations if item["chat_id"] == chat_id), None)
+            if selected_chat is not None:
+                content_page = creator_review.messages(contact_id, chat_id, message_page)
+            if selected_chat is None or content_page is None:
+                return render_template(
+                    request, "error.html",
+                    {"title": "会话不在复核范围内", "detail": "请从该达人的可查看会话中选择。"},
+                    404,
+                )
+            creator_review.record_view(access_context["authorization"]["id"], contact_id, chat_id)
+            pager = pagination(
+                content_page, path, page_name="message_page", chat_id=chat_id, **filters,
+            )
+        response = render_template(
+            request,
+            "admin/creator_review_detail.html",
+            {
+                **page_context(access_context, "creator-review"),
+                "detail": detail,
+                "back_url": f"/admin/creator-review?{urlencode(filters)}",
+                "selected_chat": selected_chat,
+                "content_page": content_page,
+                "message_page": pager,
+            },
+        )
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Referrer-Policy"] = "same-origin"
         return response
 
     @router.get("/admin/creators")
