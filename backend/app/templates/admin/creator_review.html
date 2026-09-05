@@ -1,17 +1,15 @@
 {% extends "base.html" %}
-{% block title %}达人归属复核 · 管理台{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-review.css?v=20260905">{% endblock %}
+{% block title %}达人归属复核{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-review.css?v=20260905-standalone">{% endblock %}
 {% block body %}
 <div class="page creator-review">
-  {% include "admin/_nav.html" %}
   <div class="page-wrapper"><main class="page-body pt-0"><div class="container-xl creator-review__container">
     <header class="cr-hero">
       <div>
-        <div class="cr-eyebrow">CREATOR REVIEW · 达人管理</div>
+        <div class="cr-eyebrow">CREATOR REVIEW</div>
         <h1>达人归属复核</h1>
         <p>看清每位达人的负责人，以及账号与联系人的对应依据。</p>
       </div>
-      <span class="cr-preview"><span aria-hidden="true"></span>{% if admin_role == 'owner' %}系统主人 · 全部权限{% else %}只读查阅 · 已获页面授权{% endif %}</span>
     </header>
 
     <section class="cr-stats" aria-label="正式达人总览统计">
@@ -31,7 +29,6 @@
     <section class="card cr-directory" aria-labelledby="cr-directory-title">
       <div class="cr-section-header">
         <div><h2 id="cr-directory-title">达人与负责人</h2><p>系统关联状态与依据情况分别展示，便于逐项复核。</p></div>
-        <span class="cr-readonly">只读预览</span>
       </div>
       <form class="cr-filters" method="get" action="/admin/creator-review" role="search">
         <div class="cr-search"><label for="cr-search">搜索达人</label><input id="cr-search" class="form-control" name="q" value="{{ q }}" placeholder="输入 handle 或联系人姓名" maxlength="120"></div>

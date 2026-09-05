@@ -69,6 +69,13 @@ def create_admin_router(
     original_render = render_template
 
     def render_template(request: Request, name: str, context: dict[str, Any], status_code: int = 200) -> Response:
+        if name == "error.html" and request.scope["route"].path in {
+            "/admin/creator-review", "/admin/creator-review/{contact_id}",
+        }:
+            context = {**context, "error_section": "达人归属复核",
+                       "return_url": "/admin/creator-review", "return_label": "返回达人归属复核"}
+            if status_code == 403:
+                context.update(title="暂时无法查看", detail="当前无法查看此内容，请联系页面提供者。")
         response = original_render(request, name, context, status_code)
         response.headers["Cache-Control"] = "no-store, max-age=0"
         response.headers["Referrer-Policy"] = "same-origin"

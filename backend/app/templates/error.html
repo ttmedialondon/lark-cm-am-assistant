@@ -1,11 +1,11 @@
 {% extends "base.html" %}
-{% block title %}{{ title }} · Lark CM/AM Assistant{% endblock %}
+{% block title %}{{ title }} · {{ error_section|default('Lark CM/AM Assistant') }}{% endblock %}
 {% block body %}
 <main class="page page-center"><div class="container-tight py-4">
   <div class="card card-md"><div class="card-body text-center">
     <h1 class="h2">{{ title }}</h1>
     <p class="text-secondary">{{ detail }}</p>
-    <a class="btn btn-primary" href="/">返回首页</a>
+    <a class="btn btn-primary" href="{{ return_url|default('/') }}">{{ return_label|default('返回首页') }}</a>
   </div></div>
 </div></main>
 {% endblock %}
