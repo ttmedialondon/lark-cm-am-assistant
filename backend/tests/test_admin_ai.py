@@ -2,11 +2,20 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from uuid import uuid4
 
+import pytest
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from fastapi.testclient import TestClient
 
-from app import admin, admin_reporting, ai_feature_config
+from app import admin, admin_permissions, admin_reporting, ai_feature_config
+
+
+@pytest.fixture(autouse=True)
+def legacy_role_scenarios_use_explicit_acl(monkeypatch):
+    monkeypatch.setattr(admin_permissions, "access_for", lambda authorization_id: admin_permissions._access({
+        "status": "active", "role": admin_reporting.admin_role_for(authorization_id),
+        "role_active": True, "permissions": [],
+    }))
 
 
 class _Connection:

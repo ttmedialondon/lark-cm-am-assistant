@@ -1,27 +1,63 @@
 {% extends "base.html" %}
-{% block title %}授权人员 · 管理台{% endblock %}
+{% block title %}人员与后台权限 · 管理台{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/admin-users.css?v=20260905">{% endblock %}
 {% block body %}
-<div class="page admin-directory">
+<div class="page admin-users">
   {% include "admin/_nav.html" %}
-  <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl admin-directory__container">
-    <div class="card admin-directory__card">
-      <div class="card-header"><div><h3 class="card-title mb-1">已授权人员</h3><div class="text-secondary small">先看“接入状态”：它把发现、首次回填和定时更新收敛成一个阶段。即使还没有消息索引，已授权人员也会保留在列表中。</div></div></div>
+  <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl admin-users__content">
+    <div class="admin-users__heading">
+      <div><div class="subheader mb-1">人员管理</div><h1 class="mb-2">人员与后台权限</h1><p class="text-secondary mb-0">接入状态和后台权限分开管理：完成 Lark 授权，不代表可以进入后台。</p></div>
+      <span class="badge {% if admin_role == 'owner' %}bg-indigo-lt{% else %}bg-secondary-lt{% endif %}">{% if admin_role == 'owner' %}系统主人 · 全部权限{% else %}只读查看{% endif %}</span>
+    </div>
+    {% if saved %}<div class="alert alert-success" role="status">后台权限已保存。未勾选任何页面的人员只能使用前台，不能进入后台。</div>{% endif %}
+    <div class="admin-users__stats" aria-label="全部人员的权限统计">
+      <div class="card"><div class="card-body"><div class="text-secondary">全部已接入人员</div><div class="admin-users__number">{{ summary.total }}</div></div></div>
+      <div class="card"><div class="card-body"><div class="text-secondary">可进入后台</div><div class="admin-users__number text-primary">{{ summary.backend }}</div></div></div>
+      <div class="card"><div class="card-body"><div class="text-secondary">仅可使用前台</div><div class="admin-users__number">{{ summary.frontend }}</div></div></div>
+      <div class="card"><div class="card-body"><div class="text-secondary">系统主人</div><div class="admin-users__number">{{ summary.owners }}</div></div></div>
+    </div>
+    <p class="text-secondary small mt-2 mb-3">以上为全局统计，不随下方筛选变化。系统主人始终拥有全部后台入口。</p>
+    <div class="card">
+      <div class="card-header admin-users__filters">
+        <form action="/admin/users" method="get" class="admin-users__filter-form" role="search">
+          <div class="admin-users__search"><label for="users-q" class="form-label">搜索人员</label><input class="form-control" type="search" id="users-q" name="q" value="{{ q }}" maxlength="120" placeholder="输入姓名"></div>
+          <div class="admin-users__filter"><label for="users-permission" class="form-label">后台权限</label><select class="form-select" id="users-permission" name="permission_filter">
+            <option value="all"{% if permission_filter == 'all' %} selected{% endif %}>全部人员</option>
+            <option value="none"{% if permission_filter == 'none' %} selected{% endif %}>仅前台 · 无后台权限</option>
+            <option value="any"{% if permission_filter == 'any' %} selected{% endif %}>已开放后台</option>
+            <option value="owner"{% if permission_filter == 'owner' %} selected{% endif %}>系统主人</option>
+            {% for permission in permission_pages %}<option value="{{ permission.key }}"{% if permission_filter == permission.key %} selected{% endif %}>可查看 · {{ permission.label }}</option>{% endfor %}
+          </select></div>
+          <button class="btn btn-primary" type="submit">筛选</button><a class="btn btn-outline-secondary" href="/admin/users">重置</a>
+        </form>
+      </div>
+      <div class="admin-users__notice">
+        {% if admin_role == 'owner' %}点击人员的“设置权限”，逐项勾选允许查看的后台页面；全部取消勾选并保存，即收回后台访问权限。其他人员只有查看权限，修改业务数据和分配权限仍由你操作。
+        {% else %}你可以查看人员信息，但不能修改后台权限或业务数据。需要变更权限时，由系统主人设置。{% endif %}
+      </div>
       {% if users %}
-      <div class="table-responsive admin-directory__table"><table class="table table-vcenter card-table">
-        <thead><tr><th>人员</th><th>授权</th><th>接入状态</th><th>会话范围</th><th>首次回填</th><th>消息索引</th><th>最近同步</th></tr></thead>
+      <div class="table-responsive"><table class="table table-vcenter card-table admin-users__table">
+        <thead><tr><th>人员</th><th>接入状态</th><th>会话 / 消息</th><th>后台权限</th><th>最近同步</th><th>操作</th></tr></thead>
         <tbody>{% for user in users %}<tr>
-          <td><a href="/admin/users/{{ user.id }}?page={{ user_page.page }}">{{ user.display_name }}</a><div class="text-secondary small mt-1">{{ user.assignment_eligible_label }}</div></td>
-          <td><span class="badge bg-{{ user.authorization_status_badge }}-lt">{{ user.authorization_status_label }}</span></td>
-          <td><span class="badge bg-{{ user.sync_state_badge }}-lt">{{ user.sync_state_label }}</span><div class="text-secondary small mt-1">{{ user.sync_state_detail }}</div></td>
-          <td>{{ user.group_count }} 个群聊 · {{ user.p2p_count }} 个私聊<div class="text-secondary small mt-1">{{ user.p2p_status_label }}{% if user.archived_conversation_count %} · {{ user.archived_conversation_count }} 个已归档/解散{% endif %}</div></td>
-          <td>{{ user.sync_progress_label }}<div class="text-secondary small mt-1">群聊 {{ user.group_content_progress_label }} · 私聊 {{ user.p2p_content_progress_label }}</div></td>
-          <td>{{ user.message_count_label }}<div class="text-secondary small mt-1">本人 {{ user.own_message_count }}</div></td>
+          <td class="admin-users__person"><a class="fw-semibold" href="/admin/users/{{ user.id }}?page={{ user_page.page }}&amp;q={{ q|urlencode }}&amp;permission_filter={{ permission_filter|urlencode }}">{{ user.display_name }}</a><div class="text-secondary small mt-1">{{ user.assignment_eligible_label }}</div></td>
+          <td class="admin-users__sync"><div class="d-flex flex-wrap gap-1"><span class="badge bg-{{ user.authorization_status_badge }}-lt">{{ user.authorization_status_label }}</span><span class="badge bg-{{ user.sync_state_badge }}-lt">{{ user.sync_state_label }}</span></div><div class="text-secondary small mt-2">{{ user.sync_state_detail }}</div><div class="text-secondary small mt-1">首次回填 {{ user.sync_progress_label }}</div></td>
+          <td class="admin-users__counts"><div>{{ user.group_count }} 个群聊 · {{ user.p2p_count }} 个私聊</div><div class="text-secondary small mt-1">{{ user.message_count_label }} · 本人 {{ user.own_message_count }}</div><div class="text-secondary small mt-1">{{ user.p2p_status_label }}{% if user.archived_conversation_count %} · {{ user.archived_conversation_count }} 个已归档/解散{% endif %}</div></td>
+          <td class="admin-users__access">
+            {% if user.access.is_owner or user.access.is_owner_account %}
+              <span class="badge bg-indigo-lt">{% if user.access.is_owner %}系统主人 · 全部权限{% else %}主人账号 · 当前不可用{% endif %}</span><div class="text-secondary small mt-2">{% if user.access.is_owner %}所有后台入口均可用，无需勾选。{% else %}账号或主人角色已停用，当前不能进入后台。{% endif %}</div>
+            {% else %}
+              <span class="badge {% if user.access.permissions %}bg-azure-lt{% else %}bg-secondary-lt{% endif %}">{{ user.access.access_label }}</span>
+              {% if user.access.permission_labels %}<div class="admin-users__permission-labels">{% for label in user.access.permission_labels[:3] %}<span>{{ label }}</span>{% endfor %}{% if user.access.permission_labels|length > 3 %}<span>另 {{ user.access.permission_labels|length - 3 }} 项</span>{% endif %}</div>{% else %}<div class="text-secondary small mt-2">没有后台入口，只能使用前台。</div>{% endif %}
+              {% if admin_role == 'owner' %}{% with permission_access=user.access, permission_page=user_page.page %}{% include "admin/_user_permissions.html" %}{% endwith %}{% endif %}
+            {% endif %}
+          </td>
           <td class="text-secondary text-nowrap">{{ user.last_synced_at_label }}</td>
+          <td><a class="btn btn-sm btn-outline-secondary" href="/admin/users/{{ user.id }}?page={{ user_page.page }}&amp;q={{ q|urlencode }}&amp;permission_filter={{ permission_filter|urlencode }}">查看详情</a></td>
         </tr>{% endfor %}</tbody>
       </table></div>
       {% with pager=user_page %}{% include "admin/_pagination.html" %}{% endwith %}
       {% else %}
-      <div class="card-body text-secondary">尚未有用户完成授权。</div>
+      <div class="admin-users__empty"><h3>没有符合条件的人员</h3><p class="text-secondary mb-0">尝试更换姓名或后台权限条件。尚未完成 Lark 接入的人员不会显示在这里。</p></div>
       {% endif %}
     </div>
   </div></div></div>

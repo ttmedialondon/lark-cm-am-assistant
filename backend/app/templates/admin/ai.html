@@ -8,7 +8,7 @@
     {% if ai_dispatch.state == 'paused' %}
     <div class="alert alert-danger d-flex align-items-center justify-content-between" role="alert">
       <div><strong>{{ ai_dispatch.label }}</strong><div class="small">{{ ai_dispatch.message }} 两个 AI 功能都会停止领取新任务。</div></div>
-      <form action="/admin/ai/resume" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger" type="submit">处理后恢复队列</button></form>
+      {% if admin_role == 'owner' %}<form action="/admin/ai/resume" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger" type="submit">处理后恢复队列</button></form>{% endif %}
     </div>
     {% elif ai_dispatch.state == 'throttled' %}
     <div class="alert alert-warning" role="alert"><strong>{{ ai_dispatch.label }}</strong>：{{ ai_dispatch.message }} 两个 AI 功能会自动恢复，无需人工操作。</div>
@@ -23,7 +23,7 @@
           <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">已保存密钥</div><div class="h3 mb-0">{{ config.api_key_label }}</div></div></div></div>
           <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">最近 AI 调用</div><div class="h3 mb-0">{{ config.last_tested_at_label }}</div><div class="text-secondary small"><span class="badge bg-{{ config.last_test_badge }}-lt">{{ config.last_test_status_label }}</span></div></div></div></div>
         </div>
-        <form action="/admin/ai" method="post" class="row g-3">
+        {% if admin_role == 'owner' %}<form action="/admin/ai" method="post" class="row g-3">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="feature" value="{{ feature.feature }}">
           <div class="col-md-3"><label class="form-label" for="ai-provider-{{ feature.id_suffix }}">提供商</label><input class="form-control" id="ai-provider-{{ feature.id_suffix }}" value="{{ config.provider_label }}" readonly></div>
           <div class="col-md-3"><label class="form-label" for="ai-project-id-{{ feature.id_suffix }}">Project ID</label><input class="form-control" id="ai-project-id-{{ feature.id_suffix }}" name="project_id" value="{{ config.project_id }}" maxlength="160" required autocomplete="off"></div>
@@ -32,7 +32,7 @@
           <div class="col-md-8"><label class="form-label" for="ai-api-key-{{ feature.id_suffix }}">Service-account API key</label><input class="form-control" id="ai-api-key-{{ feature.id_suffix }}" name="api_key" type="password" maxlength="1024" autocomplete="new-password" spellcheck="false" placeholder="{{ '留空则保留 ' ~ config.api_key_label if config.key_configured else '首次配置时必填' }}"><div class="form-hint">填写新密钥即轮换；页面只显示最后 4 位。</div></div>
           <div class="col-md-4 d-flex align-items-end"><label class="form-check form-switch mb-2"><input class="form-check-input" type="checkbox" name="enabled" value="1" {% if config.enabled %}checked{% endif %}><span class="form-check-label">{{ feature.enabled_label }}</span></label></div>
           <div class="col-12 d-flex justify-content-end"><button class="btn btn-primary" type="submit">保存配置{% if config.key_configured %} / 轮换密钥{% endif %}</button></div>
-        </form>
+        </form>{% else %}<p class="text-secondary mb-0">只读配置 · 模型：{{ config.model or '未配置' }}。修改配置和密钥仅限系统主人。</p>{% endif %}
       </div>
     </div>
     {% endfor %}

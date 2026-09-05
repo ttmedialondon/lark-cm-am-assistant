@@ -1,5 +1,7 @@
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from uuid import uuid4
 
 from app import admin_reporting
 
@@ -46,6 +48,9 @@ def test_message_conversation_filter_values_are_bounded_and_allowlisted():
     assert admin_reporting.normalize_organization_query("x" * 121) == "x" * 120
     assert admin_reporting.normalize_creator_assignment_filter("pending") == "pending"
     assert admin_reporting.normalize_creator_assignment_filter("unexpected") == "all"
+    assert admin_reporting.normalize_user_permission_filter("creator-review") == "creator-review"
+    assert admin_reporting.normalize_user_permission_filter("none") == "none"
+    assert admin_reporting.normalize_user_permission_filter("unexpected") == "all"
 
 
 def test_creator_pending_filter_requires_the_latest_actionable_assignment_suggestion(monkeypatch):
@@ -210,3 +215,52 @@ def test_message_retry_is_shown_as_a_specific_delayed_conversation():
     assert admin_reporting._message_page_activity(
         {"sync_status": "failed_retryable", "page_retry_at": now + timedelta(minutes=2)}
     ).startswith("等待重试于")
+
+
+def _empty_reporting_database(monkeypatch, first_row):
+    calls = []
+
+    def execute(query, params=()):
+        assert query.count("%s") == len(params)
+        calls.append((query, params))
+        return SimpleNamespace(fetchone=lambda: first_row, fetchall=lambda: [])
+
+    monkeypatch.setattr(admin_reporting, "connection", lambda: nullcontext(SimpleNamespace(execute=execute)))
+    return calls
+
+
+def test_personnel_permission_filter_binds_values_and_keeps_global_summary(monkeypatch):
+    calls = _empty_reporting_database(monkeypatch, {"total": 7, "backend": 2, "owners": 1, "total_count": 0})
+    page = admin_reporting.users(99, "  Remi_%  ", "creator-review")
+    expected_filter = ("Remi_%", *(["creator-review"] * 5), sorted(admin_reporting.PAGE_KEYS), "creator-review")
+    assert calls[0][1] == expected_filter
+    assert calls[1][1] == (*expected_filter, admin_reporting.LIST_PAGE_SIZE + 1, 0)
+    assert "strpos(LOWER" in calls[0][0]
+    assert "a.status = 'active'" in calls[0][0]
+    assert "admin_page_permissions" in calls[0][0]
+    for query, _ in calls:
+        assert "COALESCE(r.role = 'owner', FALSE) AND COALESCE(r.is_active, FALSE)" in query
+        assert "NOT COALESCE(r.role = 'owner', FALSE) AND EXISTS" in query
+        assert "LEFT JOIN admin_roles r ON r.authorization_id = a.id AND r.is_active" not in query
+    assert "COUNT(*) FILTER (WHERE COALESCE(r.role = 'owner', FALSE)) AS owners" in calls[0][0]
+    assert page["items"] == []
+    assert page["page"] == 1
+    assert page["total_count"] == 0
+    assert page["summary"] == {"total": 7, "backend": 2, "owners": 1, "frontend": 5}
+
+
+def test_personnel_detail_skips_ungranted_conversation_and_job_queries(monkeypatch):
+    authorization_id = uuid4()
+    calls = _empty_reporting_database(monkeypatch, {"id": authorization_id, "authorization_status": "active"})
+    detail = admin_reporting.user_detail(authorization_id, include_conversations=False, include_jobs=False)
+    assert len(calls) == 1
+    assert detail["conversations"]["items"] == []
+    assert detail["jobs"]["items"] == []
+
+
+def test_contact_detail_skips_ungranted_conversation_queries(monkeypatch):
+    calls = _empty_reporting_database(monkeypatch, {"contact_id": uuid4(), "tenant_key": None})
+    detail = admin_reporting.contact_detail("ou_contact", include_conversations=False)
+    assert len(calls) == 3
+    assert all("conversation_ids" not in query and "chat_messages" not in query for query, _ in calls)
+    assert detail["conversations"]["items"] == []

@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-from app import contact_assignments, main
+from app import admin_permissions, contact_assignments, main
 
 
 def _request_with_session(session: str | None = None) -> Request:
@@ -71,7 +71,7 @@ def test_dashboard_loads_confirmed_creators_when_ai_is_disabled(monkeypatch: pyt
         },
     )
     monkeypatch.setattr(main, "_dashboard_stats", lambda _authorization_id: {})
-    monkeypatch.setattr(main, "admin_role_for", lambda _authorization_id: None)
+    monkeypatch.setattr(admin_permissions, "access_for", lambda _: admin_permissions._access(None))
     monkeypatch.setattr(main, "_admin_csrf_token", lambda _authorization: "csrf")
     monkeypatch.setattr(contact_assignments, "assignment_available", lambda: False)
     monkeypatch.setattr(

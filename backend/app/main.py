@@ -18,8 +18,8 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import admin, contact_assignments
-from .admin_reporting import admin_role_for, sync_summary
+from . import admin, admin_permissions, contact_assignments
+from .admin_reporting import sync_summary
 from .config import get_settings
 from .crypto import TokenCipher
 from .db import connection, database_is_ready
@@ -256,12 +256,15 @@ def dashboard(request: Request):
         authorization["status"] == "active" and contact_assignments.assignment_available()
     )
     creator_workbench = contact_assignments.creator_workbench(authorization["id"])
+    admin_access = admin_permissions.access_for(authorization["id"])
     response = _template(
         request,
         "dashboard.html",
         {
             "authorization": authorization,
-            "admin_role": admin_role_for(authorization["id"]),
+            "admin_role": ("owner" if admin_access["is_owner"] else "member"
+                           if admin_access["has_admin_access"] else None),
+            "admin_landing_path": admin_access["landing_path"],
             "stats": stats,
             "body_consent": bool(authorization["body_consent_at"]),
             "creator_features_enabled": creator_features_enabled,

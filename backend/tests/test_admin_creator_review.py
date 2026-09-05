@@ -5,12 +5,14 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from fastapi.testclient import TestClient
 
-from app import admin, admin_reporting, creator_review
+from app import admin, admin_permissions, creator_review
 
 
 def client(monkeypatch, *, role="owner", active=True, contexts=None):
     actor = {"id": uuid4(), "status": "active" if active else "revoked"}
-    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _: role)
+    monkeypatch.setattr(admin_permissions, "access_for", lambda _: admin_permissions._access({
+        "status": actor["status"], "role": role, "role_active": True, "permissions": [],
+    }))
     app = FastAPI()
 
     def render(_request, name, context, status_code=200):

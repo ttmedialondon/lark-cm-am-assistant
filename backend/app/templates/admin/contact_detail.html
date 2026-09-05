@@ -6,7 +6,7 @@
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
     <div class="d-flex align-items-center mb-3"><div><div class="d-flex flex-wrap align-items-center gap-2"><h2 class="page-title mb-0">{{ contact.display_name }}</h2><span class="badge bg-{{ contact.category_badge }}-lt">{{ contact.category_label }}</span>{% for label in contact.confirmed_role_labels[1:] %}<span class="badge bg-secondary-lt">辅助：{{ label }}</span>{% endfor %}</div><div class="text-secondary">稳定 Lark 身份 · {{ contact.open_id }}</div></div><a class="btn btn-outline-secondary ms-auto" href="/admin/contacts?{{ source_query }}">返回人员目录</a></div>
     <div class="alert alert-info">以下是此 Lark 联系人的可验证会话事实。AI 只使用当前授权范围内的消息与结构化互动关系，不读取或使用组织资料。</div>
-    <div class="card mb-4">
+    {% if admin_role == 'owner' %}<div class="card mb-4">
       <div class="card-header"><div><h3 class="card-title mb-1">AI 自动识别</h3><div class="text-secondary small">联系人具备可读的授权消息后，后台会自动识别。只有 90% 及以上、唯一且具备强证据的身份会自动确认；其余建议保留在此联系人详情中，供你核对后确认。</div></div></div>
       <div class="card-body d-flex flex-wrap align-items-center gap-3">
         {% if contact.primary_role == 'internal_colleague' %}
@@ -21,20 +21,21 @@
         {% endif %}
       </div>
     </div>
+    {% endif %}
     {% if is_creator %}
     <div class="card mb-4">
-      <div class="card-header"><div><h3 class="card-title mb-1">负责人</h3><div class="text-secondary small">每位达人只有一位当前负责人。P2P 或明确回复 / @ 才是强证据；普通群聊共现只作背景。交接必须人工完成。</div></div></div>
+      <div class="card-header"><div><h3 class="card-title mb-1">负责人</h3><div class="text-secondary small">账号及负责人以人工导入资料和身份对应依据为准；聊天只作辅助，交接由系统主人完成。</div></div></div>
       <div class="card-body">
         {% if assignment %}
         <div class="d-flex flex-wrap align-items-center gap-2 mb-3"><strong>{{ assignment.responsible_name }}</strong><span class="badge bg-success-lt">当前负责人</span><span class="text-secondary small">{{ assignment.source_label }}{% if assignment.confidence_label != '—' %} · {{ assignment.confidence_label }}{% endif %} · 自 {{ assignment.started_at_label }}</span></div>
-        {% if assignment_choices %}
+        {% if assignment_choices and admin_role == 'owner' %}
         <form action="/admin/contacts/{{ contact.open_id }}/assignment/handoff?{{ source_query }}" method="post" class="row g-2 align-items-end"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="col-md-7"><label class="form-label">人工交接给</label><select class="form-select" name="responsible_authorization_id" required><option value="">选择已接入 CM / AM</option>{% for assignee in assignment_choices %}<option value="{{ assignee.id }}">{{ assignee.display_name }}</option>{% endfor %}</select></div><div class="col-md-5"><button class="btn btn-outline-primary" type="submit">确认交接</button></div></form>
-        {% else %}<div class="text-secondary small">目前没有其他已接入且可分配的 CM / AM。</div>{% endif %}
+        {% else %}<div class="text-secondary small">{% if admin_role == 'owner' %}目前没有其他已接入且可分配的 CM / AM。{% else %}只读查看；负责人交接由系统主人操作。{% endif %}</div>{% endif %}
         {% else %}
         {% if assignment_assessment %}<div class="mb-3"><span class="badge bg-{{ assignment_assessment.status_badge }}-lt">{{ assignment_assessment.status_label }}</span><span class="text-secondary small ms-2">{{ assignment_assessment.outcome_label }} · {{ assignment_assessment.created_at_label }}{% if assignment_assessment.candidate_name %} · 建议 {{ assignment_assessment.candidate_name }}（{{ assignment_assessment.confidence_label }}）{% endif %}</span>{% if assignment_assessment.error_label %}<div class="text-danger small mt-1">{{ assignment_assessment.error_label }}</div>{% endif %}</div>
         {% elif assignment_available %}<div class="text-secondary small mb-3">系统会在发现 P2P、明确回复或 @ 关系后自动安排匹配。</div>
-        {% else %}<div class="text-secondary small mb-3">负责人 AI 匹配尚未启用；仍可人工设置负责人。</div>{% endif %}
-        {% if assignees %}<form action="/admin/contacts/{{ contact.open_id }}/assignment?{{ source_query }}" method="post" class="row g-2 align-items-end"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="col-md-7"><label class="form-label">人工确认负责人</label><select class="form-select" name="responsible_authorization_id" required><option value="">选择已接入 CM / AM</option>{% for assignee in assignees %}<option value="{{ assignee.id }}">{{ assignee.display_name }}</option>{% endfor %}</select></div><div class="col-md-5"><button class="btn btn-primary" type="submit">确认负责人</button></div></form>{% else %}<div class="text-secondary small">尚无已接入且可分配的 CM / AM。</div>{% endif %}
+        {% else %}<div class="text-secondary small mb-3">{% if admin_role == 'owner' %}负责人 AI 匹配尚未启用；仍可人工设置负责人。{% else %}暂无已确认负责人；由系统主人设置。{% endif %}</div>{% endif %}
+        {% if assignees and admin_role == 'owner' %}<form action="/admin/contacts/{{ contact.open_id }}/assignment?{{ source_query }}" method="post" class="row g-2 align-items-end"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="col-md-7"><label class="form-label">人工确认负责人</label><select class="form-select" name="responsible_authorization_id" required><option value="">选择已接入 CM / AM</option>{% for assignee in assignees %}<option value="{{ assignee.id }}">{{ assignee.display_name }}</option>{% endfor %}</select></div><div class="col-md-5"><button class="btn btn-primary" type="submit">确认负责人</button></div></form>{% elif admin_role == 'owner' %}<div class="text-secondary small">尚无已接入且可分配的 CM / AM。</div>{% endif %}
         {% endif %}
       </div>
     </div>
@@ -46,7 +47,9 @@
         {% for organization in organizations %}<tr><td>{{ organization.canonical_name }}<div class="text-secondary small">{{ organization.organization_kind_label }}</div></td><td><span class="badge bg-{{ organization.status_badge }}-lt">{{ organization.status_label }}</span></td><td>{{ organization.relationship_label }}</td><td>{{ organization.source_label }}</td><td class="text-secondary">{{ organization.last_seen_at_label }}</td></tr>{% endfor %}
       </tbody></table></div>
       {% else %}<div class="card-body text-secondary">尚未从 Lark 关联组织、CRM 或人工资料得到可验证的组织归属。</div>{% endif %}
+      {% if admin_role == 'owner' %}
       <div class="card-body border-top"><details><summary class="fw-medium">人工确认组织归属</summary><div class="text-secondary small mt-2 mb-3">仅在你已核验来源时使用。默认只关联此人；勾选租户映射会影响当前 tenant_key 下已发现的 {{ tenant_population }} 个联系人。</div><form action="/admin/contacts/{{ contact.open_id }}/organization?{{ source_query }}" method="post" class="row g-2 align-items-end"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="col-md-5"><label class="form-label">组织名称</label><input class="form-control" name="canonical_name" maxlength="320" required placeholder="例如 TT MEDIA ITALY"></div><div class="col-md-4"><label class="form-label">组织类型</label><select class="form-select" name="organization_kind"><option value="unknown">类型未标注</option><option value="mcn_or_agency">MCN / 代理机构</option><option value="merchant_or_brand">商家 / 品牌</option><option value="platform">平台</option><option value="partner_service">合作服务商</option><option value="other">其他组织</option></select></div><div class="col-md-3"><button class="btn btn-outline-primary w-100" type="submit">确认组织</button></div>{% if contact.tenant_key %}<div class="col-12"><label class="form-check"><input class="form-check-input" type="checkbox" name="map_current_tenant" value="1"><span class="form-check-label">同时映射此人的当前 Lark 租户</span></label></div>{% else %}<div class="col-12 text-secondary small">此稳定身份未返回 tenant_key，因此只能确认此人。</div>{% endif %}</form></details></div>
+      {% endif %}
     </div>
     <div class="card mb-4">
       <div class="card-header"><h3 class="card-title">稳定身份</h3></div>
@@ -54,7 +57,7 @@
         <tbody>{% for identity in identities %}<tr><td>{{ identity.display_name }}</td><td><code>{{ identity.open_id }}</code></td><td><span class="badge bg-{{ identity.tenant_classification_badge }}-lt">{{ identity.tenant_classification_label }}</span></td><td>{{ identity.first_seen_at_label }}</td><td>{{ identity.last_seen_at_label }}</td></tr>{% endfor %}</tbody>
       </table></div>
     </div>
-    <div class="card mb-4">
+    {% if can_view_conversations %}<div class="card mb-4">
       <div class="card-header"><div><h3 class="card-title mb-1">相关会话</h3><div class="text-secondary small">仅展示会话元数据和统计，不在此页读取消息正文。</div></div></div>
       {% if conversations %}
       <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>会话</th><th>类型</th><th>群成员</th><th>会话消息</th><th>该联系人发送</th><th>最近消息</th></tr></thead>
@@ -62,7 +65,7 @@
       </table></div>
       {% with pager=conversation_page %}{% include "admin/_pagination.html" %}{% endwith %}
       {% else %}<div class="card-body text-secondary">暂未在同步数据中找到相关会话。</div>{% endif %}
-    </div>
+    </div>{% endif %}
   </div></div></div>
 </div>
 {% endblock %}

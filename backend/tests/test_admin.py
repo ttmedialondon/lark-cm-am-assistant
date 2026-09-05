@@ -1,11 +1,24 @@
 from contextlib import contextmanager, nullcontext
 from uuid import uuid4
 
+import pytest
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from fastapi.testclient import TestClient
 
-from app import admin, admin_reporting, contact_assessments, contact_assignments, organization_sync
+from app import admin, admin_permissions, admin_reporting, contact_assessments, contact_assignments, organization_sync
+
+
+@pytest.fixture(autouse=True)
+def legacy_role_scenarios_use_explicit_acl(monkeypatch):
+    """Keep these original owner/denied scenarios while using the new live ACL boundary."""
+    monkeypatch.setattr(admin_permissions, "access_for", lambda authorization_id: admin_permissions._access({
+        "status": "active", "role": admin_reporting.admin_role_for(authorization_id),
+        "role_active": True, "permissions": [],
+    }))
+    monkeypatch.setattr(admin_permissions, "users_access_data", lambda ids: {
+        authorization_id: admin_permissions._access(None) for authorization_id in ids
+    })
 
 
 def _page(items, page=1, has_next=False, **metadata):
@@ -64,13 +77,14 @@ def test_admin_users_uses_server_pagination(monkeypatch):
     monkeypatch.setattr(
         admin_reporting,
         "users",
-        lambda page: pages.append(page) or _page([], page=page, has_next=True),
+        lambda page, q, permission_filter: pages.append((page, q, permission_filter))
+        or _page([], page=page, has_next=True, summary={}),
     )
 
     response = _client(lambda _request: {"id": uuid4(), "status": "active"}, contexts).get("/admin/users?page=2")
 
     assert response.status_code == 200
-    assert pages == [2]
+    assert pages == [(2, "", "all")]
     assert contexts[-1][1]["user_page"]["previous_url"] == "/admin/users?page=1"
     assert contexts[-1][1]["user_page"]["next_url"] == "/admin/users?page=3"
 
@@ -81,7 +95,9 @@ def test_admin_users_numbered_pagination_keeps_edge_pages(monkeypatch):
     monkeypatch.setattr(
         admin_reporting,
         "users",
-        lambda page: _page([], page=page, total_count=850, total_pages=17, page_size=50),
+        lambda page, q, permission_filter: _page(
+            [], page=page, total_count=850, total_pages=17, page_size=50, summary={}
+        ),
     )
     client = _client(lambda _request: {"id": uuid4(), "status": "active"}, contexts)
 
@@ -224,7 +240,7 @@ def test_owner_contact_detail_reads_only_that_contact_without_message_content(mo
     monkeypatch.setattr(
         admin_reporting,
         "contact_detail",
-        lambda *args: reads.append(args)
+        lambda *args, include_conversations: reads.append((*args, include_conversations))
         or {
             "contact": {"contact_id": uuid4()},
             "identities": [],
@@ -241,7 +257,7 @@ def test_owner_contact_detail_reads_only_that_contact_without_message_content(mo
 
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store, max-age=0"
-    assert reads == [("ou_contact", 2)]
+    assert reads == [("ou_contact", 2, True)]
     assert contexts[-1][0] == "admin/contact_detail.html"
     assert contexts[-1][1]["assessment"] is None
     assert contexts[-1][1]["assessment_available"] is True

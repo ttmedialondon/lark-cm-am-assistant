@@ -6,7 +6,7 @@
     <div class="container-xl">
       <a class="navbar-brand" href="/">TT Media 消息提醒</a>
       <div class="navbar-nav flex-row order-md-last">
-        {% if admin_role %}<div class="nav-item"><a class="nav-link" href="/admin">管理台</a></div>{% endif %}
+        {% if admin_role %}<div class="nav-item"><a class="nav-link" href="{{ admin_landing_path }}">管理台</a></div>{% endif %}
         <div class="nav-item"><span class="nav-link text-secondary">{{ authorization.display_name or "CM / AM" }}</span></div>
       </div>
     </div>

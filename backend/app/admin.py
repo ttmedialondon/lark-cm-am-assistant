@@ -18,6 +18,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse, Response
 
 from . import (
+    admin_permissions,
     admin_reporting,
     ai_dispatch,
     ai_feature_config,
@@ -65,6 +66,13 @@ def create_admin_router(
     """Build the internal routes with dependencies supplied by the app shell."""
 
     router = APIRouter(include_in_schema=False)
+    original_render = render_template
+
+    def render_template(request: Request, name: str, context: dict[str, Any], status_code: int = 200) -> Response:
+        response = original_render(request, name, context, status_code)
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Referrer-Policy"] = "same-origin"
+        return response
 
     def access(request: Request) -> tuple[dict[str, Any] | None, Response | None]:
         authorization = current_authorization(request)
@@ -78,21 +86,39 @@ def create_admin_router(
                 403,
             )
 
-        role = admin_reporting.admin_role_for(authorization["id"])
-        if not role:
+        acl = admin_permissions.access_for(authorization["id"])
+        if not acl["has_admin_access"]:
             return None, render_template(
                 request,
                 "error.html",
-                {"title": "没有管理台权限", "detail": "当前 Lark 账号尚未列入管理台人员。"},
+                {"title": "没有后台页面权限", "detail": "你仍可使用前台。后台页面需由系统主人勾选授权。"},
                 403,
             )
-        return {"authorization": authorization, "admin_role": role}, None
+        route_path = request.scope["route"].path
+        permission = {
+            "/admin": "overview", "/admin/users": "users", "/admin/users/{authorization_id}": "users",
+            "/admin/chats": "chats", "/admin/messages": "messages", "/admin/contacts": "contacts",
+            "/admin/contacts/{open_id}": "contacts", "/admin/creators": "creators",
+            "/admin/creator-review": "creator-review", "/admin/creator-review/{contact_id}": "creator-review",
+            "/admin/ai": "ai", "/admin/jobs": "jobs",
+        }.get(route_path)
+        if not acl["is_owner"]:
+            if request.method == "GET" and route_path == "/admin" and "overview" not in acl["permissions"]:
+                return None, RedirectResponse(acl["landing_path"], status_code=303,
+                                              headers={"Cache-Control": "no-store, max-age=0"})
+            if request.method != "GET" or permission not in acl["permissions"]:
+                return None, render_template(request, "error.html", {
+                    "title": "当前页面或操作未获授权", "detail": "仅可查看系统主人已勾选的页面；管理操作仅限主人。",
+                }, 403)
+        return {"authorization": authorization, "admin_role": "owner" if acl["is_owner"] else "member",
+                "admin_permissions": acl["permissions"], "admin_landing_path": acl["landing_path"]}, None
 
     def page_context(access_context: dict[str, Any], active_page: str) -> dict[str, Any]:
         return {
             **access_context,
             "active_page": active_page,
             "admin_role_label": _role_label(access_context["admin_role"]),
+            "permission_pages": admin_permissions.PAGES,
             "csrf_token": csrf_token(access_context["authorization"]),
         }
 
@@ -297,21 +323,62 @@ def create_admin_router(
         )
 
     @router.get("/admin/users")
-    def admin_users(request: Request, page: int = 1) -> Response:
+    def admin_users(request: Request, page: int = 1, q: str = "", permission_filter: str = "all",
+                    saved: bool = False) -> Response:
         access_context, denied = access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        user_page = admin_reporting.users(page)
+        q = admin_reporting.normalize_message_conversation_query(q)
+        permission_filter = admin_reporting.normalize_user_permission_filter(permission_filter)
+        user_page = admin_reporting.users(page, q, permission_filter)
+        access_by_user = admin_permissions.users_access_data(item["id"] for item in user_page["items"])
         return render_template(
             request,
             "admin/users.html",
             {
                 **page_context(access_context, "users"),
-                "users": user_page["items"],
-                "user_page": pagination(user_page, "/admin/users"),
+                "users": [{**item, "access": access_by_user[item["id"]]} for item in user_page["items"]],
+                "summary": user_page["summary"], "q": q, "permission_filter": permission_filter, "saved": saved,
+                "user_page": pagination(user_page, "/admin/users", q=q or None,
+                                        permission_filter=permission_filter if permission_filter != "all" else None),
             },
         )
+
+    @router.post("/admin/users/{authorization_id}/permissions")
+    async def admin_set_page_permissions(request: Request, authorization_id: UUID) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        try:
+            if request.headers.get("content-type", "").split(";", 1)[0] != "application/x-www-form-urlencoded":
+                raise ValueError("请通过人员页面提交权限设置。")
+            body = await request.body()
+            if len(body) > 4096:
+                raise ValueError("提交内容过长。")
+            parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True, max_num_fields=20)
+            if set(parsed) - {"csrf_token", "permissions", "page", "q", "permission_filter"} or any(
+                len(values) != 1 for key, values in parsed.items() if key != "permissions"
+            ):
+                raise ValueError("权限设置包含无效字段。")
+            form = {key: values[0] for key, values in parsed.items() if key != "permissions"}
+            if not _csrf_matches(form, csrf_token(access_context["authorization"])):
+                raise ValueError("请求校验失败，请刷新人员页面后重试。")
+            source_page = max(1, min(int(form.get("page", "1")), admin_reporting.MAX_PAGE))
+            q = admin_reporting.normalize_message_conversation_query(form.get("q", ""))
+            permission_filter = admin_reporting.normalize_user_permission_filter(form.get("permission_filter", "all"))
+            admin_permissions.set_permissions(access_context["authorization"]["id"], authorization_id,
+                                              parsed.get("permissions", []))
+        except (ValueError, UnicodeDecodeError) as exc:
+            return render_template(request, "error.html", {"title": "权限未保存", "detail": str(exc)}, 400)
+        except PermissionError as exc:
+            return render_template(request, "error.html", {"title": "权限未保存", "detail": str(exc)}, 403)
+        except LookupError as exc:
+            return render_template(request, "error.html", {"title": "未找到人员", "detail": str(exc)}, 404)
+        query = urlencode({"page": source_page, "q": q, "permission_filter": permission_filter, "saved": "true"})
+        return RedirectResponse(f"/admin/users?{query}", status_code=303,
+                                headers={"Cache-Control": "no-store, max-age=0"})
 
     @router.get("/admin/users/{authorization_id}")
     def admin_user_detail(
@@ -320,12 +387,19 @@ def create_admin_router(
         page: int = 1,
         conversations_page: int = 1,
         jobs_page: int = 1,
+        q: str = "",
+        permission_filter: str = "all",
     ) -> Response:
         access_context, denied = access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        detail = admin_reporting.user_detail(authorization_id, conversations_page, jobs_page)
+        q = admin_reporting.normalize_message_conversation_query(q)
+        permission_filter = admin_reporting.normalize_user_permission_filter(permission_filter)
+        can_view_conversations = bool({"chats", "messages"} & access_context["admin_permissions"])
+        can_view_jobs = "jobs" in access_context["admin_permissions"]
+        detail = admin_reporting.user_detail(authorization_id, conversations_page, jobs_page,
+                                             include_conversations=can_view_conversations, include_jobs=can_view_jobs)
         if not detail:
             return render_template(
                 request,
@@ -341,7 +415,10 @@ def create_admin_router(
             {
                 **page_context(access_context, "users"),
                 "user": detail["user"],
+                "user_access": admin_permissions.access_for(authorization_id),
+                "can_view_conversations": can_view_conversations, "can_view_jobs": can_view_jobs,
                 "source_page": page,
+                "q": q, "permission_filter": permission_filter,
                 "conversations": conversation_page["items"],
                 "conversation_page": pagination(
                     conversation_page,
@@ -349,6 +426,7 @@ def create_admin_router(
                     page_name="conversations_page",
                     page=page,
                     jobs_page=job_page["page"],
+                    q=q or None, permission_filter=permission_filter if permission_filter != "all" else None,
                 ),
                 "jobs": job_page["items"],
                 "job_page": pagination(
@@ -357,6 +435,7 @@ def create_admin_router(
                     page_name="jobs_page",
                     page=page,
                     conversations_page=conversation_page["page"],
+                    q=q or None, permission_filter=permission_filter if permission_filter != "all" else None,
                 ),
             },
         )
@@ -449,7 +528,7 @@ def create_admin_router(
         conversation_query: str = "",
         conversation_type: str = "all",
     ) -> Response:
-        access_context, denied = owner_access(request)
+        access_context, denied = access(request)
         if denied is not None:
             return denied
         assert access_context is not None
@@ -552,7 +631,7 @@ def create_admin_router(
         responsible_id: str = "",
         evidence: str = "all",
     ) -> Response:
-        access_context, denied = owner_access(request)
+        access_context, denied = access(request)
         if denied is not None:
             return denied
         assert access_context is not None
@@ -607,7 +686,7 @@ def create_admin_router(
         chat_id: str | None = None,
         message_page: int = 1,
     ) -> Response:
-        access_context, denied = owner_access(request)
+        access_context, denied = access(request)
         if denied is not None:
             return denied
         assert access_context is not None
@@ -664,7 +743,7 @@ def create_admin_router(
 
     @router.get("/admin/creators")
     def admin_creators(request: Request, page: int = 1, assignment: str = "all") -> Response:
-        access_context, denied = owner_access(request)
+        access_context, denied = access(request)
         if denied is not None:
             return denied
         assert access_context is not None
@@ -672,7 +751,7 @@ def create_admin_router(
 
     @router.get("/admin/ai")
     def admin_ai_config(request: Request) -> Response:
-        access_context, denied = owner_access(request)
+        access_context, denied = access(request)
         if denied is not None:
             return denied
         assert access_context is not None
@@ -686,7 +765,7 @@ def create_admin_router(
         organization_status: str = "all",
         organization_query: str = "",
     ) -> Response:
-        access_context, denied = owner_access(request)
+        access_context, denied = access(request)
         if denied is not None:
             return denied
         assert access_context is not None
@@ -729,14 +808,17 @@ def create_admin_router(
         organization_query: str = "",
         conversations_page: int = 1,
     ) -> Response:
-        access_context, denied = owner_access(request)
+        access_context, denied = access(request)
         if denied is not None:
             return denied
         assert access_context is not None
         category = admin_reporting.normalize_contact_category(category)
         organization_status = admin_reporting.normalize_organization_status(organization_status)
         organization_query = admin_reporting.normalize_organization_query(organization_query)
-        detail = admin_reporting.contact_detail(open_id, conversations_page)
+        can_view_conversations = bool({"chats", "messages"} & access_context["admin_permissions"])
+        is_owner = access_context["admin_role"] == "owner"
+        detail = admin_reporting.contact_detail(open_id, conversations_page,
+                                                include_conversations=can_view_conversations)
         if not detail:
             return render_template(
                 request,
@@ -746,14 +828,19 @@ def create_admin_router(
             )
         conversations = detail["conversations"]
         is_creator = detail["contact"].get("primary_role") == "creator"
-        latest_assessment = contact_assessments.latest_contact_assessment(detail["contact"]["contact_id"])
+        latest_assessment = (
+            contact_assessments.latest_contact_assessment(detail["contact"]["contact_id"]) if is_owner else None
+        )
         assignment = contact_assignments.active_assignment(detail["contact"]["contact_id"]) if is_creator else None
         assignment_assessment = (
             contact_assignments.latest_contact_assignment_assessment(detail["contact"]["contact_id"])
-            if is_creator
+            if is_creator and is_owner
             else None
         )
-        assignees = contact_assignments.assignable_authorizations(detail["contact"]["contact_id"]) if is_creator else []
+        assignees = (
+            contact_assignments.assignable_authorizations(detail["contact"]["contact_id"])
+            if is_creator and is_owner else []
+        )
         assignment_choices = [
             item
             for item in assignees
@@ -779,11 +866,12 @@ def create_admin_router(
                     organization_query=organization_query,
                 ),
                 "assessment": latest_assessment,
-                "assessment_available": contact_assessments.assessment_available(),
+                "assessment_available": contact_assessments.assessment_available() if is_owner else False,
+                "can_view_conversations": can_view_conversations,
                 "is_creator": is_creator,
                 "assignment": assignment,
                 "assignment_assessment": assignment_assessment,
-                "assignment_available": contact_assignments.assignment_available() if is_creator else False,
+                "assignment_available": bool(is_creator and is_owner and contact_assignments.assignment_available()),
                 "assignees": assignees,
                 "assignment_choices": assignment_choices,
                 "conversations": conversations["items"],
@@ -1223,8 +1311,8 @@ async def _form_fields(request: Request) -> dict[str, str]:
 
 def _csrf_matches(form: dict[str, str], expected: str) -> bool:
     supplied = form.get("csrf_token")
-    return bool(supplied) and hmac.compare_digest(supplied, expected)
+    return bool(supplied) and hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
 
 
 def _role_label(role: str) -> str:
-    return {"owner": "所有者", "operator": "运营管理员", "viewer": "只读管理员"}.get(role, "管理员")
+    return {"owner": "系统主人", "member": "按页面授权 · 只读"}.get(role, "管理员")

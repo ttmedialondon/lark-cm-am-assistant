@@ -11,7 +11,7 @@
         <h1>达人归属复核</h1>
         <p>看清每位达人的负责人，以及账号与联系人的对应依据。</p>
       </div>
-      <span class="cr-preview"><span aria-hidden="true"></span>试用中 · 仅所有者可见</span>
+      <span class="cr-preview"><span aria-hidden="true"></span>{% if admin_role == 'owner' %}系统主人 · 全部权限{% else %}只读查阅 · 已获页面授权{% endif %}</span>
     </header>
 
     <section class="cr-stats" aria-label="正式达人总览统计">

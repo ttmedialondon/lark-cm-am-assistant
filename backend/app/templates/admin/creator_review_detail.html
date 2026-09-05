@@ -6,7 +6,7 @@
 <div class="page creator-review">
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><main class="page-body pt-0"><div class="container-xl creator-review__container">
-    <div class="cr-detail-top"><a class="cr-back" href="{{ back_url }}"><span aria-hidden="true">← </span>返回达人归属复核</a><span class="cr-preview cr-preview--light"><span aria-hidden="true"></span>试用中 · 仅所有者可见</span></div>
+    <div class="cr-detail-top"><a class="cr-back" href="{{ back_url }}"><span aria-hidden="true">← </span>返回达人归属复核</a><span class="cr-preview cr-preview--light"><span aria-hidden="true"></span>{% if admin_role == 'owner' %}系统主人 · 全部权限{% else %}只读查阅 · 已获页面授权{% endif %}</span></div>
     <header class="cr-profile">
       <div class="cr-profile__identity"><div class="cr-eyebrow">达人档案</div><h1>{% if creator.handles %}@{{ creator.handles[0] }}{% else %}{{ creator.display_name or '账号待补充' }}{% endif %}</h1>{% if creator.handles|length > 1 %}<div class="cr-profile__aliases">{% for handle in creator.handles[1:] %}<span>@{{ handle }}</span>{% endfor %}<span class="cr-multi">同一联系人</span></div>{% endif %}<p>Lark 联系人：{{ creator.display_name or '姓名待补充' }}{% if not creator.handles %} · handle 待补充{% endif %}</p></div>
       <div class="cr-profile__owner"><span>当前负责人</span><strong>{{ creator.responsible_name or '尚未设置' }}</strong><span class="cr-meta">{{ creator.assignment_label }}</span></div>

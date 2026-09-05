@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 from cryptography.exceptions import InvalidTag
 
+from .admin_permissions import PAGE_KEYS
 from .config import get_settings
 from .contact_assignments import MANUAL_REVIEW_CONFIDENCE_FLOOR, POLICY_VERSION
 from .contact_taxonomy import CONTACT_ROLE_CODES, ORGANIZATION_KIND_LABELS, ROLE_LABELS, role_label
@@ -55,7 +56,8 @@ MESSAGE_CONVERSATION_DIRECTORY_SQL = """
     JOIN chats c ON c.chat_id = ac.chat_id
     LEFT JOIN lark_identities counterpart ON counterpart.open_id = ac.p2p_counterpart_open_id
     WHERE a.id = %s
-      AND ac.is_visible
+      AND a.status = 'active' AND a.body_consent_at IS NOT NULL
+      AND ac.is_visible AND ac.sync_enabled
       AND COALESCE(c.chat_status, 'normal') = 'normal'
 """
 MESSAGE_CONVERSATION_FILTER_SQL = """
@@ -408,13 +410,32 @@ def runtime_settings() -> tuple[dict[str, str], ...]:
     )
 
 
-def users(page: int = 1) -> dict[str, Any]:
+def normalize_user_permission_filter(value: str) -> str:
+    return value if value in {"all", "none", "any", "owner"} | PAGE_KEYS else "all"
+
+
+def users(page: int = 1, query: str = "", permission_filter: str = "all") -> dict[str, Any]:
     """Return per-user statistics without double-counting canonical messages."""
 
+    query = normalize_message_conversation_query(query)
+    permission_filter = normalize_user_permission_filter(permission_filter)
+    owner_account = "COALESCE(r.role = 'owner', FALSE)"
+    owner = f"({owner_account} AND COALESCE(r.is_active, FALSE))"
+    backend_access = f"""(a.status = 'active' AND ({owner} OR (NOT {owner_account} AND EXISTS (
+        SELECT 1 FROM admin_page_permissions grant_row WHERE grant_row.authorization_id = a.id))))"""
+    filters = f"""strpos(LOWER(COALESCE(a.display_name, '')), LOWER(%s)) > 0 AND (
+        %s = 'all' OR (%s = 'none' AND NOT {backend_access}) OR (%s = 'any' AND {backend_access})
+        OR (%s = 'owner' AND {owner_account}) OR (%s = ANY(%s::text[]) AND a.status = 'active' AND (
+            {owner} OR (NOT {owner_account} AND EXISTS (SELECT 1 FROM admin_page_permissions grant_row
+                              WHERE grant_row.authorization_id = a.id AND grant_row.permission = %s)))))"""
+    filter_params = (query, *([permission_filter] * 5), sorted(PAGE_KEYS), permission_filter)
     with connection() as conn:
-        total_count = int(
-            conn.execute("SELECT COUNT(*) AS total_count FROM authorizations").fetchone()["total_count"] or 0
-        )
+        counts = conn.execute(f"""
+            SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE {backend_access}) AS backend,
+                   COUNT(*) FILTER (WHERE {owner_account}) AS owners, COUNT(*) FILTER (WHERE {filters}) AS total_count
+            FROM authorizations a LEFT JOIN admin_roles r ON r.authorization_id = a.id
+        """, filter_params).fetchone()
+        total_count = int(counts["total_count"] or 0)
         page, limit, offset = _page_window(page, total_count=total_count)
         rows = conn.execute(
             f"""
@@ -475,19 +496,23 @@ def users(page: int = 1) -> dict[str, Any]:
                 j.last_http_status AS job_last_http_status,
                 j.last_error_code AS job_last_error_code
             FROM authorizations a
-            LEFT JOIN admin_roles r ON r.authorization_id = a.id AND r.is_active
+            LEFT JOIN admin_roles r ON r.authorization_id = a.id
             LEFT JOIN conversation_counts g ON g.authorization_id = a.id
             LEFT JOIN message_counts m ON m.authorization_id = a.id
             LEFT JOIN latest_jobs j ON j.authorization_id = a.id
+            WHERE {filters}
             ORDER BY a.authorized_at DESC
             LIMIT %s OFFSET %s
             """,
-            (limit, offset),
+            (*filter_params, limit, offset),
         ).fetchall()
-    return _page_result([_decorate_user(row) for row in rows], page, total_count=total_count)
+    summary = {key: int(counts[key] or 0) for key in ("total", "backend", "owners")}
+    summary["frontend"] = summary["total"] - summary["backend"]
+    return {**_page_result([_decorate_user(row) for row in rows], page, total_count=total_count), "summary": summary}
 
 
-def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: int = 1) -> dict[str, Any] | None:
+def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: int = 1, *,
+                include_conversations: bool = True, include_jobs: bool = True) -> dict[str, Any] | None:
     """Return one user plus their current conversation relationships and jobs."""
 
     with connection() as conn:
@@ -577,14 +602,14 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
                 (authorization_id,),
             ).fetchone()["total_count"]
             or 0
-        )
+        ) if include_conversations else 0
         job_total_count = int(
             conn.execute(
                 "SELECT COUNT(*) AS total_count FROM sync_jobs WHERE authorization_id = %s",
                 (authorization_id,),
             ).fetchone()["total_count"]
             or 0
-        )
+        ) if include_jobs else 0
         conversation_page, conversation_limit, conversation_offset = _page_window(
             conversation_page, DETAIL_PAGE_SIZE, total_count=conversation_total_count
         )
@@ -634,7 +659,7 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
             LIMIT %s OFFSET %s
             """,
             (authorization_id, conversation_limit, conversation_offset),
-        ).fetchall()
+        ).fetchall() if include_conversations else []
         jobs = conn.execute(
             """
             SELECT
@@ -647,7 +672,7 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
             LIMIT %s OFFSET %s
             """,
             (authorization_id, job_limit, job_offset),
-        ).fetchall()
+        ).fetchall() if include_jobs else []
 
     return {
         "user": _decorate_user(user),
@@ -989,7 +1014,8 @@ def organization_sync_status() -> dict[str, Any]:
     return item
 
 
-def contact_detail(open_id: str, conversation_page: int = 1) -> dict[str, Any] | None:
+def contact_detail(open_id: str, conversation_page: int = 1, *,
+                   include_conversations: bool = True) -> dict[str, Any] | None:
     """Return one stable Lark contact with role, organization, and conversation facts."""
 
     with connection() as conn:
@@ -1096,7 +1122,7 @@ def contact_detail(open_id: str, conversation_page: int = 1) -> dict[str, Any] |
                 (contact_id,),
             ).fetchone()["total_count"]
             or 0
-        )
+        ) if include_conversations else 0
         conversation_page, conversation_limit, conversation_offset = _page_window(
             conversation_page, DETAIL_PAGE_SIZE, total_count=conversation_total_count
         )
@@ -1155,7 +1181,7 @@ def contact_detail(open_id: str, conversation_page: int = 1) -> dict[str, Any] |
             LIMIT %s OFFSET %s
             """,
             (contact_id, conversation_limit, conversation_offset),
-        ).fetchall()
+        ).fetchall() if include_conversations else []
 
     return {
         "contact": _decorate_contact(contact),
@@ -1291,9 +1317,10 @@ def message_page(
                   ON o.authorization_id = ac.authorization_id AND o.chat_id = ac.chat_id
                 JOIN chat_messages m ON m.chat_id = o.chat_id AND m.message_id = o.message_id
                 WHERE a.id = %s
+                  AND a.status = 'active'
                   AND a.body_consent_at IS NOT NULL
                   AND o.observed_at >= a.body_consent_at
-                  AND ac.is_visible
+                  AND ac.is_visible AND ac.sync_enabled
                   AND COALESCE(c.chat_status, 'normal') = 'normal'
                   AND NOT m.is_deleted
                   AND m.chat_id = %s
@@ -1323,9 +1350,10 @@ def message_page(
                 JOIN chat_messages m ON m.chat_id = o.chat_id AND m.message_id = o.message_id
                 LEFT JOIN lark_identities identity ON identity.open_id = m.sender_open_id
                 WHERE a.id = %s
+                  AND a.status = 'active'
                   AND a.body_consent_at IS NOT NULL
                   AND o.observed_at >= a.body_consent_at
-                  AND ac.is_visible
+                  AND ac.is_visible AND ac.sync_enabled
                   AND COALESCE(c.chat_status, 'normal') = 'normal'
                   AND NOT m.is_deleted
                   AND m.chat_id = %s

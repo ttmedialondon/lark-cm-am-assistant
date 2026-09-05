@@ -1,6 +1,6 @@
 <header class="navbar navbar-expand-md d-print-none">
   <div class="container-xl">
-    <a class="navbar-brand" href="/admin">Lark CM/AM Assistant</a>
+    <a class="navbar-brand" href="{{ admin_landing_path }}">Lark CM/AM Assistant</a>
     <div class="navbar-nav flex-row order-md-last">
       <div class="nav-item"><span class="nav-link text-secondary">{{ authorization.display_name or "管理员" }} · {{ admin_role_label }}</span></div>
       <div class="nav-item"><a class="nav-link" href="/dashboard">我的统计</a></div>
@@ -11,15 +11,8 @@
   <div class="container-xl">
     <div class="d-flex flex-wrap align-items-center gap-2">
       <h2 class="page-title me-3">管理台</h2>
-      <a class="btn btn-sm {% if active_page == 'overview' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin">概览</a>
-      <a class="btn btn-sm {% if active_page == 'users' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/users">人员</a>
-      <a class="btn btn-sm {% if active_page == 'chats' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/chats">群聊</a>
-      {% if admin_role == 'owner' %}<a class="btn btn-sm {% if active_page == 'messages' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/messages">消息内容</a>{% endif %}
-      {% if admin_role == 'owner' %}<a class="btn btn-sm {% if active_page == 'contacts' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts">人员目录</a>{% endif %}
-      {% if admin_role == 'owner' %}<a class="btn btn-sm {% if active_page == 'creators' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/creators">达人</a>{% endif %}
-      {% if admin_role == 'owner' %}<a class="btn btn-sm {% if active_page == 'creator-review' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/creator-review">达人归属复核</a>{% endif %}
-      {% if admin_role == 'owner' %}<a class="btn btn-sm {% if active_page == 'ai' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/ai">AI 功能</a>{% endif %}
-      <a class="btn btn-sm {% if active_page == 'jobs' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/jobs">同步任务</a>
+      {% for page in permission_pages %}{% if page.key in admin_permissions %}<a class="btn btn-sm {% if active_page == page.key %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="{{ page.path }}">{{ page.label }}</a>{% endif %}{% endfor %}
     </div>
+    {% if admin_role != 'owner' %}<p class="text-secondary small mt-3 mb-0">当前为只读访问，仅展示系统主人已授权的页面。权限设置及业务修改仅由系统主人操作。</p>{% endif %}
   </div>
 </div>

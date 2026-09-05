@@ -28,7 +28,7 @@
               <div class="table-responsive"><table class="table table-vcenter card-table">
                 <thead><tr><th>人员</th><th>接入状态</th><th>会话</th><th>首次回填</th><th>最近同步</th></tr></thead>
                 <tbody>{% for item in attention %}<tr>
-                  <td><a href="/admin/users/{{ item.id }}">{{ item.display_name }}</a></td>
+                  <td>{% if 'users' in admin_permissions %}<a href="/admin/users/{{ item.id }}">{{ item.display_name }}</a>{% else %}{{ item.display_name }}{% endif %}</td>
                   <td><span class="badge bg-{{ item.sync_state_badge }}-lt">{{ item.sync_state_label }}</span><div class="text-secondary small mt-1">{{ item.sync_state_detail }}</div></td>
                   <td>{{ item.group_count }} 群 · {{ item.p2p_count }} 私聊</td>
                   <td>{{ item.sync_progress_label }}</td>
@@ -42,7 +42,7 @@
           </div>
           <div class="col-lg-6">
             <div class="card h-100">
-              <div class="card-header"><h3 class="card-title">最近同步任务</h3><div class="card-actions"><a href="/admin/jobs" class="btn btn-sm btn-outline-secondary">查看全部</a></div></div>
+              <div class="card-header"><h3 class="card-title">最近同步任务</h3>{% if 'jobs' in admin_permissions %}<div class="card-actions"><a href="/admin/jobs" class="btn btn-sm btn-outline-secondary">查看全部</a></div>{% endif %}</div>
               {% if recent_jobs %}
               <div class="table-responsive"><table class="table table-vcenter card-table">
                 <thead><tr><th>人员</th><th>模式</th><th>状态</th><th>目录</th><th>新增消息</th><th>最近进度</th></tr></thead>

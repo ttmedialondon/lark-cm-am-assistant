@@ -1,14 +1,15 @@
 {% extends "base.html" %}
 {% block title %}{{ user.display_name }} · 管理台{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/admin-users.css?v=20260905">{% endblock %}
 {% block body %}
-<div class="page">
+<div class="page admin-users">
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
-    <div class="d-flex align-items-center mb-3"><a class="btn btn-sm btn-outline-secondary" href="/admin/users?page={{ source_page }}">返回人员列表</a></div>
+    <div class="d-flex align-items-center mb-3"><a class="btn btn-sm btn-outline-secondary" href="/admin/users?page={{ source_page }}&amp;q={{ q|default('')|urlencode }}&amp;permission_filter={{ permission_filter|default('all')|urlencode }}">返回人员列表</a></div>
     <div class="card mb-4"><div class="card-body">
       <div class="row g-3 align-items-center">
         <div class="col-md"><h3 class="mb-1">{{ user.display_name }}</h3><div class="text-secondary">授权于 {{ user.authorized_at_label }} · 最近更新 {{ user.updated_at_label }}</div></div>
-        <div class="col-md-auto"><span class="badge bg-{{ user.authorization_status_badge }}-lt">{{ user.authorization_status_label }}</span>{% if user.admin_role %}<span class="badge bg-azure-lt ms-1">{{ user.admin_role }}</span>{% endif %}</div>
+        <div class="col-md-auto"><span class="badge bg-{{ user.authorization_status_badge }}-lt">{{ user.authorization_status_label }}</span><span class="badge {% if user_access.is_owner or user_access.is_owner_account %}bg-indigo-lt{% else %}bg-secondary-lt{% endif %} ms-1">{{ user_access.access_label }}</span></div>
       </div>
       <div class="alert alert-{{ user.sync_state_badge }} mt-3 mb-0" role="status"><strong>{{ user.sync_state_label }}</strong><span class="ms-2">{{ user.sync_state_detail }}</span></div>
       <div class="row row-cards mt-2">
@@ -18,9 +19,18 @@
         <div class="col-sm-6 col-lg-3"><div class="subheader">私聊目录</div><div class="h5 mb-1">{{ user.p2p_status_label }}</div><div class="text-secondary small">目录发现不等于私聊正文已回填</div></div>
       </div>
       {% if user.archived_conversation_count %}<div class="text-secondary small mt-3">已发现 {{ user.discovered_conversation_count }} 个会话；其中 {{ user.archived_conversation_count }} 个被 Lark 标为已归档/解散，因此不计划回填。</div>{% endif %}
-      {% if admin_role == 'owner' %}<div class="d-flex flex-wrap gap-2 mt-3"><a class="btn btn-sm btn-outline-primary" href="/admin/messages?user_id={{ user.id }}&amp;user_page={{ source_page }}">查看此人的会话</a><form action="/admin/users/{{ user.id }}/assignment-eligibility?page={{ source_page }}" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="enabled" value="{% if user.assignment_eligible %}0{% else %}1{% endif %}"><button class="btn btn-sm {% if user.assignment_eligible %}btn-outline-secondary{% else %}btn-outline-success{% endif %}" type="submit">{% if user.assignment_eligible %}移出负责人匹配{% else %}可担任负责人{% endif %}</button></form><span class="badge bg-{{ user.assignment_eligible_badge }}-lt align-self-center">{{ user.assignment_eligible_label }}</span></div>{% endif %}
+      <div class="d-flex flex-wrap gap-2 mt-3">{% if 'messages' in admin_permissions %}<a class="btn btn-sm btn-outline-primary" href="/admin/messages?user_id={{ user.id }}&amp;user_page={{ source_page }}">查看此人的会话</a>{% endif %}{% if admin_role == 'owner' %}<form action="/admin/users/{{ user.id }}/assignment-eligibility?page={{ source_page }}" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="enabled" value="{% if user.assignment_eligible %}0{% else %}1{% endif %}"><button class="btn btn-sm {% if user.assignment_eligible %}btn-outline-secondary{% else %}btn-outline-success{% endif %}" type="submit">{% if user.assignment_eligible %}移出负责人匹配{% else %}可担任负责人{% endif %}</button></form>{% endif %}<span class="badge bg-{{ user.assignment_eligible_badge }}-lt align-self-center">{{ user.assignment_eligible_label }}</span></div>
     </div></div>
 
+    <div class="card mb-4 admin-users__detail-access"><div class="card-header"><h3 class="card-title">后台访问权限</h3></div><div class="card-body">
+      {% if user_access.is_owner or user_access.is_owner_account %}<span class="badge bg-indigo-lt">{% if user_access.is_owner %}系统主人 · 全部权限{% else %}主人账号 · 当前不可用{% endif %}</span><p class="text-secondary mt-2 mb-0">{% if user_access.is_owner %}拥有所有后台入口和管理操作权限。{% else %}账号或主人角色已停用，当前不能进入后台。{% endif %}主人账号的权限不在这里变更。</p>
+      {% else %}<span class="badge {% if user_access.permissions %}bg-azure-lt{% else %}bg-secondary-lt{% endif %}">{{ user_access.access_label }}</span>
+        {% if user_access.permission_labels %}<div class="d-flex flex-wrap gap-2 mt-2">{% for label in user_access.permission_labels %}<span class="badge bg-secondary-lt">{{ label }}</span>{% endfor %}</div><p class="text-secondary small mt-2 mb-0">仅能查看以上页面，不能修改业务数据或分配权限。</p>{% else %}<p class="text-secondary mt-2 mb-0">未开放任何后台页面，只能使用前台。</p>{% endif %}
+        {% if admin_role == 'owner' %}{% with permission_access=user_access, permission_page=source_page %}{% include "admin/_user_permissions.html" %}{% endwith %}{% else %}<p class="text-secondary small mt-2 mb-0">后台权限只能由系统主人修改。</p>{% endif %}
+      {% endif %}
+    </div></div>
+
+    {% if can_view_conversations %}
     <div class="card mb-4">
       <div class="card-header"><div><h3 class="card-title mb-1">当前可见会话</h3><div class="text-secondary small">同步状态属于该人员的授权关系。即使尚无消息索引，会话也会保留在这里；群成员人数是独立目录元数据。</div></div></div>
       {% if conversations %}
@@ -36,6 +46,8 @@
       {% else %}<div class="card-body text-secondary">该用户目前没有可展示的会话。</div>{% endif %}
     </div>
 
+    {% endif %}
+    {% if can_view_jobs %}
     <div class="card">
       <div class="card-header"><div><h3 class="card-title mb-1">同步任务</h3><div class="text-secondary small">分页续跑属于同一个任务，不会标成错误重试。</div></div></div>
       {% if jobs %}
@@ -46,6 +58,7 @@
       {% with pager=job_page %}{% include "admin/_pagination.html" %}{% endwith %}
       {% else %}<div class="card-body text-secondary">尚未创建同步任务。</div>{% endif %}
     </div>
+    {% endif %}
   </div></div></div>
 </div>
 {% endblock %}
