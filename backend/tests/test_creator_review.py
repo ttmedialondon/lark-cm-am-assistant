@@ -114,7 +114,8 @@ def test_directory_filters_handle_owner_and_evidence_without_exposing_raw_audit(
     conn = bind(monkeypatch, [first, second])
     result = creator_review.directory(99, " example.HANDLE ", OWNER, "documented")
     assert result["total_count"] == 1 and result["page"] == 1
-    assert result["summary"] == {"creators": 2, "handles": 1, "documented": 1, "needs_review": 1}
+    assert result["summary"] == {"creators": 2, "handles": 1, "documented": 1, "needs_review": 1,
+                                 "archive_needed": 1, "identity_review": 0}
     assert result["items"][0]["id"] == CONTACT
     assert "role_audits" not in result["items"][0]
     assert "role.role = 'creator' AND role.status = 'confirmed' AND role.is_primary" in conn.calls[0][0]
@@ -138,7 +139,7 @@ def test_history_is_available_independent_of_evidence_or_current_assignment(monk
     conn = bind(monkeypatch, row, [conversation_row()])
     result = creator_review.detail(CONTACT)
     assert len(result["conversations"]) == 1
-    assert result["creator"]["evidence_status"] == "review"
+    assert result["creator"]["evidence_status"] == "archive_needed"
     assert conn.calls[1][1] == (CONTACT, NOW)
 
 

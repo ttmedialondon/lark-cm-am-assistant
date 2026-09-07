@@ -24,6 +24,7 @@ from . import (
     ai_feature_config,
     contact_assessments,
     contact_assignments,
+    creator_preparation,
     creator_review,
     organization_sync,
 )
@@ -70,7 +71,7 @@ def create_admin_router(
 
     def render_template(request: Request, name: str, context: dict[str, Any], status_code: int = 200) -> Response:
         if name == "error.html" and request.scope["route"].path in {
-            "/admin/creator-review", "/admin/creator-review/{contact_id}",
+            "/admin/creator-review", "/admin/creator-review/{contact_id}", "/admin/creator-review/preparation",
         }:
             context = {**context, "error_section": "达人归属复核",
                        "return_url": "/admin/creator-review", "return_label": "返回达人归属复核"}
@@ -664,6 +665,23 @@ def create_admin_router(
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 
+    @router.get("/admin/creator-review/preparation")
+    def admin_creator_preparation(request: Request, page: int = 1, q: str = "", category: str = "all") -> Response:
+        access_context, denied = access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        if access_context["admin_role"] != "owner":
+            return render_template(request, "error.html", {
+                "title": "暂时无法查看", "detail": "当前无法查看此内容。",
+            }, 403)
+        result = creator_preparation.directory(page, q, category)
+        return render_template(request, "admin/creator_preparation.html", {
+            **page_context(access_context, "creator-review"), "preparation": result,
+            "preparation_page": pagination(result, "/admin/creator-review/preparation",
+                                            q=result["query"], category=result["category"]),
+        })
+
     @router.get("/admin/creator-review")
     def admin_creator_review(
         request: Request,
@@ -684,8 +702,10 @@ def create_admin_router(
                 {"title": "负责人参数无效", "detail": "请从负责人列表中选择。"},
                 400,
             )
-        q = admin_reporting.normalize_message_conversation_query(q)
-        evidence = evidence if evidence in {"all", "documented", "review"} else "all"
+        q = creator_preparation.normalize_query(q)
+        evidence = evidence if evidence in {
+            "all", "documented", "review", "archive_needed", "identity_review",
+        } else "all"
         result = creator_review.directory(page, q, responsible_id, evidence)
         source_query = urlencode(
             {"page": result["page"], "q": q, "evidence": evidence,
@@ -706,6 +726,8 @@ def create_admin_router(
                 "q": q,
                 "responsible_id": str(responsible_id) if responsible_id else "",
                 "evidence": evidence,
+                "preparation_url": "/admin/creator-review/preparation"
+                if access_context["admin_role"] == "owner" else None,
                 "creator_page": pagination(
                     result, "/admin/creator-review", q=q,
                     responsible_id=responsible_id, evidence=evidence,
@@ -738,8 +760,10 @@ def create_admin_router(
                 {"title": "未找到可复核的达人", "detail": "该联系人不在已确认达人范围内。"},
                 404,
             )
-        q = admin_reporting.normalize_message_conversation_query(q)
-        evidence = evidence if evidence in {"all", "documented", "review"} else "all"
+        q = creator_preparation.normalize_query(q)
+        evidence = evidence if evidence in {
+            "all", "documented", "review", "archive_needed", "identity_review",
+        } else "all"
         filters = {"page": max(1, min(page, admin_reporting.MAX_PAGE)), "q": q, "evidence": evidence}
         if responsible_id:
             filters["responsible_id"] = str(responsible_id)

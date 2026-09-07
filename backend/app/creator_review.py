@@ -18,6 +18,7 @@ from .admin_reporting import (
     _readable_body,
 )
 from .config import get_settings
+from .creator_preparation import binding_matches, normalize_handle, normalize_query
 from .crypto import message_body_cipher
 from .db import connection
 
@@ -38,7 +39,8 @@ _CREATORS_SQL = """
            responsible.display_name AS responsible_name,
            role_audits.records AS role_audits,
            assignment_audit.id AS assignment_audit_id,
-           assignment_audit.metadata AS assignment_audit
+           assignment_audit.metadata AS assignment_audit,
+           review_preparation.metadata AS review_preparation
     FROM contacts contact
     JOIN contact_roles role ON role.contact_id = contact.id
       AND role.role = 'creator' AND role.status = 'confirmed' AND role.is_primary
@@ -65,6 +67,17 @@ _CREATORS_SQL = """
           AND audit.created_at >= assignment.started_at
         ORDER BY audit.created_at DESC, audit.id DESC LIMIT 1
     ) assignment_audit ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT audit.metadata FROM audit_events audit
+        WHERE audit.action = 'creator_handle_identity_review_flagged'
+          AND audit.metadata ->> 'contact_id' = contact.id::text
+          AND audit.metadata ->> 'batch_id' = (
+              SELECT latest.id::text FROM audit_events latest
+              WHERE latest.action = 'creator_handle_roster_prepared'
+              ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+          )
+        ORDER BY audit.created_at DESC, audit.id DESC LIMIT 1
+    ) review_preparation ON TRUE
     WHERE contact.entity_type = 'person'
       AND NOT EXISTS (
           SELECT 1 FROM lark_identities internal
@@ -195,8 +208,7 @@ def _handles(metadata: dict[str, Any]) -> list[str]:
     if not isinstance(values, list):
         values = []
     values = [*values, metadata.get("creator_handle"), metadata.get("handle")]
-    return sorted({value.lstrip("@") for value in values
-                   if isinstance(value, str) and re.fullmatch(r"@?[\w.\-]{1,160}", value)})
+    return sorted({handle for value in values if (handle := normalize_handle(value))})
 
 
 def _rows(value: Any) -> list[int]:
@@ -231,6 +243,7 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
         and latest.get("decision_id") == assignment.get("decision_id")
         and evidence == _dict(assignment.get("evidence"))
         and evidence.get("p2p_policy") == "auxiliary_only_not_used"
+        and set(handles).issubset(set(_handles(latest)) & set(_handles(assignment)))
         and ((kind == "non_p2p_group_membership" and valid_group)
              or (kind == "excel_identity" and _retained_text(primary.get("resolution_rule"))))
     )
@@ -239,13 +252,19 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
                   if kind == "non_p2p_group_membership" else
                   "Excel 中的账号与负责人记录，结合表内姓名或明确别名完成联系人对应。")
     elif row.get("role_source") == "manual_p2p_confirmed":
-        reason = "历史导入留存了单聊依据；本页未留存可独立核验的主证据，需要补充复核。"
+        reason = "历史导入留存了单聊依据；Excel、群或身份主依据未完整归档，不等于匹配错误。"
     elif row.get("role_source") == "manual_excel_import":
-        reason = "已留存 Excel 行号及人工匹配规则，但对应群的标识未留存，需要补充证据。"
+        reason = "已留存 Excel 行号及人工匹配规则，但对应群等主依据未完整归档，不等于匹配错误。"
     else:
-        reason = "当前归属的主证据未完整留存，或归属已发生变化，需要补充复核。"
+        reason = "当前归属的依据未完整归档，或正式归属已变化，需补齐对应记录。"
+    note = _dict(row.get("review_preparation"))
+    identity_review = bool(note.get("handle") in handles
+                           and binding_matches(note, row, note.get("responsible_id")))
+    if identity_review:
+        reason = _label(note.get("reason"), "现有账号与联系人的对应关系需要人工确认。")
     return {
         "documented": documented, "handles": handles, "rows": rows, "reason": reason,
+        "identity_review": identity_review,
         "kind": kind, "group_ids": [group] if documented and valid_group else [],
         "owner_label": next((audit["owner_label"] for audit in audits
                              if isinstance(audit.get("owner_label"), str)), None),
@@ -262,8 +281,10 @@ def _item(row: dict[str, Any], facts: dict[str, Any]) -> dict[str, Any]:
         "source_label": {"manual_excel_import": "Excel 人工导入",
                          "manual_excel_and_identity_confirmed": "Excel 人工导入",
                          "manual_p2p_confirmed": "历史人工导入"}.get(row.get("role_source"), "历史记录"),
-        "evidence_status": "documented" if facts["documented"] else "review",
-        "evidence_label": "主证据已留存" if facts["documented"] else "主证据待补充",
+        "evidence_status": "identity_review" if facts["identity_review"] else "documented"
+        if facts["documented"] else "archive_needed",
+        "evidence_label": "匹配待确认" if facts["identity_review"] else "依据已归档"
+        if facts["documented"] else "依据未完整归档",
         "evidence_reason": facts["reason"],
         "updated_at_label": _format_time(row.get("started_at") or row.get("reviewed_at")),
     }
@@ -271,8 +292,8 @@ def _item(row: dict[str, Any], facts: dict[str, Any]) -> dict[str, Any]:
 
 def directory(page: int = 1, query: str = "", responsible_id: UUID | None = None,
               evidence: str = "all") -> dict[str, Any]:
-    query = " ".join(query.split())[:120]
-    evidence = evidence if evidence in {"all", "documented", "review"} else "all"
+    query = normalize_query(query)
+    evidence = evidence if evidence in {"all", "documented", "review", "archive_needed", "identity_review"} else "all"
     with connection() as conn:
         rows = conn.execute(_CREATORS_SQL + " ORDER BY contact.display_name NULLS LAST, contact.id").fetchall()
     # ponytail: the reviewed registry is small; move evidence projection into SQL
@@ -282,10 +303,13 @@ def directory(page: int = 1, query: str = "", responsible_id: UUID | None = None
     summary = {"creators": len(items), "handles": len({handle for item in items for handle in item["handles"]}),
                "documented": sum(item["evidence_status"] == "documented" for item in items)}
     summary["needs_review"] = summary["creators"] - summary["documented"]
+    summary["archive_needed"] = sum(item["evidence_status"] == "archive_needed" for item in items)
+    summary["identity_review"] = sum(item["evidence_status"] == "identity_review" for item in items)
     items = [item for item in items
              if (not query or query.casefold() in " ".join([item["display_name"], *item["handles"]]).casefold())
              and (not responsible_id or str(item["responsible_id"]) == str(responsible_id))
-             and (evidence == "all" or item["evidence_status"] == evidence)]
+             and (evidence == "all" or item["evidence_status"] == evidence
+                  or (evidence == "review" and item["evidence_status"] != "documented"))]
     page, _, offset = _page_window(page, PAGE_SIZE, total_count=len(items))
     return {**_page_result(items[offset:offset + PAGE_SIZE], page, PAGE_SIZE, total_count=len(items)),
             "summary": summary, "owners": [{"id": key, "name": name} for key, name in sorted(

@@ -383,6 +383,8 @@ def test_every_admin_route_is_in_the_access_matrix(monkeypatch):
         actual.update((method, path) for method in route.methods)
     expected = {("GET", path.split("?", 1)[0]) for _, path in GET_ROUTES}
     expected.add(("GET", ASSESSMENT_ROUTE))
+    # This owner-only roster has its own deny-before-query matrix.
+    expected.add(("GET", "/admin/creator-review/preparation"))
     expected.update(("POST", path) for path in POST_ROUTES)
     assert actual == expected
 

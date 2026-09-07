@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}{{ detail.creator.display_name }} · 达人归属复核{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-review.css?v=20260905-nav">{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-review.css?v=20260907-preparation">{% endblock %}
 {% block body %}
 {% set creator = detail.creator %}
 <div class="page creator-review">
@@ -10,19 +10,19 @@
     <header class="cr-profile">
       <div class="cr-profile__identity"><div class="cr-eyebrow">达人档案</div><h1>{% if creator.handles %}@{{ creator.handles[0] }}{% else %}{{ creator.display_name or '账号待补充' }}{% endif %}</h1>{% if creator.handles|length > 1 %}<div class="cr-profile__aliases">{% for handle in creator.handles[1:] %}<span>@{{ handle }}</span>{% endfor %}<span class="cr-multi">同一联系人</span></div>{% endif %}<p>Lark 联系人：{{ creator.display_name or '姓名待补充' }}{% if not creator.handles %} · handle 待补充{% endif %}</p></div>
       <div class="cr-profile__owner"><span>当前负责人</span><strong>{{ creator.responsible_name or '尚未设置' }}</strong><span class="cr-meta">{{ creator.assignment_label }}</span></div>
-      <div class="cr-profile__status"><span class="cr-status {% if creator.evidence_status == 'review' %}cr-status--review{% else %}cr-status--documented{% endif %}">{{ creator.evidence_label }}</span><p>{{ creator.evidence_reason }}</p></div>
+      <div class="cr-profile__status"><span class="cr-status {% if creator.evidence_status == 'documented' %}cr-status--documented{% elif creator.evidence_status == 'identity_review' %}cr-status--decision{% else %}cr-status--review{% endif %}">{{ creator.evidence_label }}</span><p>{{ creator.evidence_reason }}</p></div>
     </header>
 
     <section class="card cr-evidence" aria-labelledby="cr-evidence-title">
       <div class="cr-section-header"><div><h2 id="cr-evidence-title">为什么关联到这位负责人</h2><p>先核对主关系与身份定位，再用聊天补充理解。</p></div><span class="cr-readonly">归属依据</span></div>
       <ol class="cr-evidence-steps">
-        {% for step in detail.evidence_steps %}<li><span class="cr-step-number">{{ loop.index }}</span><div><h3>{{ step.title }}</h3><p>{{ step.detail }}</p>{% if step.source %}<span class="cr-step-source">{{ step.source }}</span>{% endif %}</div></li>{% else %}<li><span class="cr-step-number">!</span><div><h3>归属依据待补充</h3><p>系统已建立达人档案，暂未记录完整的账号与联系人对应依据。</p></div></li>{% endfor %}
+        {% for step in detail.evidence_steps %}<li><span class="cr-step-number">{{ loop.index }}</span><div><h3>{{ step.title }}</h3><p>{{ step.detail }}</p>{% if step.source %}<span class="cr-step-source">{{ step.source }}</span>{% endif %}</div></li>{% else %}<li><span class="cr-step-number">!</span><div><h3>依据未完整归档</h3><p>系统已建立达人档案，但对应依据尚未完整留存；这不等于联系人匹配有误。</p></div></li>{% endfor %}
       </ol>
       <dl class="cr-source-facts"><div><dt>归属来源</dt><dd>{{ detail.source_label or '未记录' }}</dd></div><div><dt>Excel 行号</dt><dd>{{ detail.source_rows_label or '未记录' }}</dd></div><div><dt>来源负责人</dt><dd>{{ detail.source_owner_label or '未记录' }}</dd></div><div><dt>最近归属记录</dt><dd>{{ detail.reviewed_at_label or '未记录' }}</dd></div></dl>
     </section>
 
     <section class="cr-chat-section" aria-labelledby="cr-chat-title">
-      <div class="cr-section-header cr-section-header--plain"><div><h2 id="cr-chat-title">达人相关会话 <span class="cr-readonly">已同步授权范围</span></h2><p>左侧列出与这个达人账号相关的群聊和单聊，可逐个查看会话记录。归属依据待补充不影响人工查阅；单聊仍不能单独作为归属主证据。</p></div></div>
+      <div class="cr-section-header cr-section-header--plain"><div><h2 id="cr-chat-title">达人相关会话 <span class="cr-readonly">已同步授权范围</span></h2><p>左侧列出与这个达人账号相关的群聊和单聊，可逐个查看会话记录。依据未完整归档不影响查阅；单聊只作辅助，不单独决定身份或归属。</p></div></div>
       {% if detail.conversation_notice %}<div class="cr-notice">{{ detail.conversation_notice }}</div>{% endif %}
       <div class="cr-chat-workspace">
         <aside class="card cr-conversations" aria-label="达人相关会话列表">
