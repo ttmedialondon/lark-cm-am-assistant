@@ -18,7 +18,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import admin, admin_permissions, contact_assignments
+from . import admin, admin_permissions, contact_assignments, creator_setup_preview
 from .admin_reporting import sync_summary
 from .config import get_settings
 from .crypto import TokenCipher
@@ -34,6 +34,7 @@ SESSION_COOKIE = "__Host-lark_message_stats"
 OAUTH_STATE_COOKIE = "__Host-lark_oauth_state"
 SESSION_DAYS = 30
 LONDON_TIME_ZONE = ZoneInfo("Europe/London")
+CREATOR_SETUP_PREVIEW_AUTHORIZATION_ID = uuid.UUID("9d5f4370-6463-4c3a-a2ed-67753a1cabc0")
 
 
 def _template(request: Request, name: str, context: dict[str, Any], status_code: int = 200):
@@ -269,10 +270,46 @@ def dashboard(request: Request):
             "body_consent": bool(authorization["body_consent_at"]),
             "creator_features_enabled": creator_features_enabled,
             "creator_workbench": creator_workbench,
+            "creator_setup_preview_enabled": _can_preview_creator_setup(authorization, admin_access),
             "csrf_token": _admin_csrf_token(authorization),
         },
     )
     response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
+
+
+def _can_preview_creator_setup(authorization: dict[str, Any], admin_access: dict[str, Any]) -> bool:
+    """A named-user prototype, not a new permission or a general CM feature."""
+    return bool(
+        str(authorization.get("id")) == str(CREATOR_SETUP_PREVIEW_AUTHORIZATION_ID)
+        and authorization.get("status") == "active"
+        and admin_access.get("is_owner")
+    )
+
+
+@app.get("/dashboard/creator-setup-preview")
+def creator_setup_preview_page(request: Request):
+    authorization = _current_authorization(request)
+    if not authorization:
+        response = RedirectResponse(url="/", status_code=303)
+    else:
+        access = (
+            admin_permissions.access_for(authorization["id"])
+            if str(authorization["id"]) == str(CREATOR_SETUP_PREVIEW_AUTHORIZATION_ID)
+            and authorization["status"] == "active" else {}
+        )
+        if not _can_preview_creator_setup(authorization, access):
+            response = _template(request, "error.html", {
+                "title": "页面不可用", "detail": "当前无法查看此页面。",
+            }, 404)
+        else:
+            response = _template(request, "creator_setup_preview.html", {
+                "authorization": authorization, "preview_data": creator_setup_preview.data(),
+            })
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Robots-Tag"] = "noindex, nofollow"
+    response.headers["Content-Security-Policy"] = "connect-src 'none'; form-action 'none'; frame-ancestors 'none'"
     return response
 
 
