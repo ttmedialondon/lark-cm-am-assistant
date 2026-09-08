@@ -10,6 +10,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -18,7 +19,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import admin, admin_permissions, contact_assignments, creator_setup_preview
+from . import admin, admin_permissions, contact_assignments, creator_review, creator_setup_preview
 from .admin_reporting import sync_summary
 from .config import get_settings
 from .crypto import TokenCipher
@@ -280,26 +281,30 @@ def dashboard(request: Request):
 
 
 def _can_preview_creator_setup(authorization: dict[str, Any], admin_access: dict[str, Any]) -> bool:
-    """A two-user prototype, not a new admin permission or a general CM feature."""
+    """Named-user Remi review; real data also requires the existing live review grant."""
     actor_id = str(authorization.get("id"))
     return bool(
         authorization.get("status") == "active"
         and (
-            actor_id == str(CREATOR_SETUP_PREVIEW_SHANG_MA_ID)
+            (actor_id == str(CREATOR_SETUP_PREVIEW_SHANG_MA_ID)
+             and "creator-review" in admin_access.get("permissions", ()))
             or (actor_id == str(CREATOR_SETUP_PREVIEW_AUTHORIZATION_ID) and admin_access.get("is_owner"))
         )
     )
 
 
 @app.get("/dashboard/creator-setup-preview")
-def creator_setup_preview_page(request: Request):
+def creator_setup_preview_page(request: Request, handle: str = "", chat_id: str | None = None,
+                               message_page: int = 1):
     authorization = _current_authorization(request)
     if not authorization:
         response = RedirectResponse(url="/", status_code=303)
     else:
         access = (
             admin_permissions.access_for(authorization["id"])
-            if str(authorization["id"]) == str(CREATOR_SETUP_PREVIEW_AUTHORIZATION_ID)
+            if str(authorization["id"]) in {
+                str(CREATOR_SETUP_PREVIEW_AUTHORIZATION_ID), str(CREATOR_SETUP_PREVIEW_SHANG_MA_ID),
+            }
             and authorization["status"] == "active" else {}
         )
         if not _can_preview_creator_setup(authorization, access):
@@ -307,14 +312,65 @@ def creator_setup_preview_page(request: Request):
                 "title": "页面不可用", "detail": "当前无法查看此页面。",
             }, 404)
         else:
-            response = _template(request, "creator_setup_preview.html", {
-                "authorization": authorization, "preview_data": creator_setup_preview.data(),
-            })
+            response = _creator_setup_review(request, authorization, handle, chat_id, message_page)
     response.headers["Cache-Control"] = "no-store, max-age=0"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["X-Robots-Tag"] = "noindex, nofollow"
     response.headers["Content-Security-Policy"] = "connect-src 'none'; form-action 'none'; frame-ancestors 'none'"
     return response
+
+
+def _creator_setup_review(request: Request, authorization: dict[str, Any], handle: str,
+                          chat_id: str | None, message_page: int):
+    """Only source-bound Remi handles can reach the scoped conversation reader."""
+    path = "/dashboard/creator-setup-preview"
+    data = creator_setup_preview.data()
+    for account in data["accounts"]:
+        account["detail_url"] = (f"{path}?{urlencode({'handle': account['handle']})}#review-detail"
+                                 if account["can_view_conversations"] else None)
+    selected_account = next((account for account in data["accounts"] if account["handle"] == handle), None)
+    detail = selected_chat = content_page = None
+    previous_url = next_url = None
+
+    def unavailable():
+        return _template(request, "error.html", {
+            "title": "当前无法查看", "detail": "账号或会话不在当前 Remi 核对范围内，请返回名单重新选择。",
+        }, 404)
+
+    if handle:
+        if not selected_account or not selected_account["can_view_conversations"]:
+            return unavailable()
+        contact_id = uuid.UUID(selected_account["contact_id"])
+        detail = creator_review.detail(contact_id, responsible_id=creator_setup_preview.REMI_ID)
+        if detail is None:
+            return unavailable()
+        for conversation in detail["conversations"]:
+            query = {"handle": handle, "chat_id": conversation["chat_id"]}
+            conversation["url"] = f"{path}?{urlencode(query)}#review-detail"
+        if chat_id is not None:
+            selected_chat = next((chat for chat in detail["conversations"] if chat["chat_id"] == chat_id), None)
+            if selected_chat is None:
+                return unavailable()
+            content_page = creator_review.messages(contact_id, chat_id, message_page,
+                                                    responsible_id=creator_setup_preview.REMI_ID)
+            if content_page is None:
+                return unavailable()
+            # A read-only business view still records the existing security read audit.
+            # Audit failure must stop rendering; never serve an unrecorded body read.
+            creator_review.record_view(authorization["id"], contact_id, chat_id)
+            page = content_page["page"]
+            query = {"handle": handle, "chat_id": chat_id}
+            if page > 1:
+                previous_url = f"{path}?{urlencode({**query, 'message_page': page - 1})}#review-detail"
+            if content_page["has_next"]:
+                next_url = f"{path}?{urlencode({**query, 'message_page': page + 1})}#review-detail"
+    elif chat_id is not None:
+        return unavailable()
+    return _template(request, "creator_setup_preview.html", {
+        "authorization": authorization, "preview_data": data,
+        "selected_account": selected_account, "detail": detail, "selected_chat": selected_chat,
+        "content_page": content_page, "message_prev_url": previous_url, "message_next_url": next_url,
+    })
 
 
 @app.post("/dashboard/creator-candidates/{assessment_id}/confirm")

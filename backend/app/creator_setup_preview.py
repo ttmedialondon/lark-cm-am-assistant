@@ -1,230 +1,40 @@
-"""Fixed fictional data for the isolated, browser-only creator setup prototype."""
+"""Read-only projection of Remi's real preparation roster for named reviewers."""
+
+from uuid import UUID
+
+from . import creator_preparation
+
+REMI_ID = UUID("24d1ef13-3762-4359-ba11-d26c03cf1f7f")
+ACCOUNT_FIELDS = (
+    "handle", "display_name", "source_rows", "cm_values", "tap_cm_values", "source_group_names",
+    "category", "category_label", "issue", "issue_label", "reason", "next_step", "is_stale",
+    "contact_id", "suggested_contact_id",
+)
 
 
 def data() -> dict:
-    """Return a fresh JSON-safe demo; never inspect the database or real conversations."""
-    conversations = []
-    for key, kind, title, people in [
-        ("mint_launch", "group", "薄荷工作室 · 上新讨论（虚构）", ["虚构联系人 · 栗子", "演示 CM"]),
-        ("mint_samples", "group", "薄荷工作室 · 样品跟进（虚构）", ["虚构联系人 · 栗子", "虚构助理 · 小枝"]),
-        ("mint_direct", "p2p", "与虚构联系人栗子的私聊", ["虚构联系人 · 栗子", "演示 CM"]),
-        ("cloud_launch", "group", "云朵好物 · 内容合作（虚构）", ["虚构联系人 · 云朵", "演示 CM"]),
-        ("cloud_direct", "p2p", "与虚构联系人云朵的私聊", ["虚构联系人 · 云朵", "演示 CM"]),
-        ("berry_launch", "group", "莓果日记 · 本月合作（虚构）", ["虚构联系人 · 莓莓", "演示 CM"]),
-        ("berry_direct", "p2p", "与虚构联系人莓莓的私聊", ["虚构联系人 · 莓莓", "演示 CM"]),
-        ("cedar_old", "group", "杉木选物 · 旧项目（虚构）", ["虚构联系人 · 杉杉", "演示 CM"]),
-        ("cedar_new", "group", "杉木选物 · 新计划（虚构）", ["虚构联系人 · 杉杉", "演示 CM"]),
-        ("coral_team", "group", "珊瑚手记 · 协作群（虚构）", ["虚构联系人 · 珊瑚", "虚构 CM · 北辰"]),
-        ("river_direct", "p2p", "与虚构昵称小河的私聊", ["虚构昵称 · 小河", "演示 CM"]),
-        (
-            "shared_studio",
-            "group",
-            "双账号联合工作室（虚构共享群）",
-            ["虚构品牌团队 · 灯塔", "虚构协作人 · 小舟", "演示 CM"],
-        ),
-        ("lantern_direct", "p2p", "与虚构品牌团队灯塔的私聊", ["虚构品牌团队 · 灯塔", "演示 CM"]),
-        ("moon_old", "group", "月亮厨房 · 历史合作（虚构）", ["虚构联系人 · 月月", "演示 CM"]),
-        ("paper_launch", "group", "纸飞机生活 · 讨论群（虚构）", ["虚构联系人 · 纸纸", "演示 CM"]),
-        ("paper_direct", "p2p", "与虚构联系人纸纸的私聊", ["虚构联系人 · 纸纸", "演示 CM"]),
-    ]:
-        conversations.append(
-            {
-                "id": f"demo_{key}",
-                "type": kind,
-                "title": title,
-                "participants": people,
-                "context": "纯虚构会话，仅用于体验选择与预览，不是身份或归属证据。",
-                "messages": [
-                    {
-                        "sender": people[0],
-                        "time": "演示 09:30",
-                        "text": "【模拟记录】这个群用于讨论演示项目，请先核对账号，再选择要保留的会话。",
-                    },
-                    {
-                        "sender": "演示 CM",
-                        "time": "演示 09:32",
-                        "text": "【模拟记录】收到。账号负责人和聊天范围会分别确认，联系人资料可以之后补充。",
-                    },
-                ],
-            }
-        )
-    specifications = [
-        (
-            "sunny_notes",
-            "Excel 名单",
-            "虚构 Excel 第 8 行",
-            "",
-            "联系人待补不阻塞账号确认",
-            "仅有名单，尚未找到会话；仍可确认由我负责。",
-            "",
-            "pending",
-            [],
-            [],
-        ),
-        (
-            "mint_studio",
-            "Excel 名单",
-            "虚构 Excel 第 12 行",
-            "虚构联系人 · 栗子",
-            "姓名只是联系人资料，不自动证明身份",
-            "同一账号可关联多个群聊和私聊，请逐个选择。",
-            "",
-            "pending",
-            ["mint_launch", "mint_samples", "mint_direct"],
-            [],
-        ),
-        (
-            "cloud_finds",
-            "CM 补充",
-            "演示 CM 手动补充",
-            "虚构联系人 · 云朵",
-            "联系人与账号分开维护",
-            "来源是 CM 补充，不代表已经确认负责人。",
-            "",
-            "pending",
-            ["cloud_launch", "cloud_direct"],
-            [],
-        ),
-        (
-            "berry_diary",
-            "Excel 名单",
-            "虚构 Excel 第 18 行",
-            "虚构联系人 · 莓莓",
-            "已留存演示联系人",
-            "这是既有演示确认；已选群会恢复，新增私聊仍需单独选择。",
-            "",
-            "mine",
-            ["berry_launch", "berry_direct"],
-            ["berry_launch"],
-        ),
-        (
-            "cedar_picks",
-            "Excel 名单",
-            "虚构 Excel 第 23 行",
-            "虚构联系人 · 杉杉",
-            "资料等待进一步核对",
-            "可以暂缓，不必为了清空待办而认领。",
-            "",
-            "defer",
-            ["cedar_old", "cedar_new"],
-            [],
-        ),
-        (
-            "coral_journal",
-            "Excel 名单",
-            "虚构 Excel 第 27 行",
-            "虚构联系人 · 珊瑚",
-            "负责人冲突不等于联系人错误",
-            "演示中已有其他 CM 负责，不允许直接认领覆盖。",
-            "虚构 CM · 北辰",
-            "pending",
-            ["coral_team"],
-            [],
-        ),
-        (
-            "river_days",
-            "CM 补充",
-            "演示 CM 补充账号",
-            "",
-            "仅有虚构昵称，自然人身份待补",
-            "私聊仅供辅助查阅，不单独判定账号身份与归属。",
-            "",
-            "pending",
-            ["river_direct"],
-            [],
-        ),
-        (
-            "lantern_brand",
-            "Excel 名单",
-            "虚构 Excel 第 31 行",
-            "虚构协作人 · 小舟",
-            "团队共享账号；小舟是对接人，不是唯一所有者",
-            "这是品牌共享账号，不强行绑定成一个自然人。",
-            "",
-            "pending",
-            ["shared_studio", "lantern_direct"],
-            [],
-        ),
-        (
-            "little_boat",
-            "CM 补充",
-            "演示 CM 补充第二个账号",
-            "虚构协作人 · 小舟",
-            "小舟也对接灯塔账号；两个 handle 仍独立管理",
-            "与灯塔账号共用一个群；两个账号独立确认，该群只统计一次。",
-            "",
-            "pending",
-            ["shared_studio"],
-            [],
-        ),
-        (
-            "moon_kitchen",
-            "Excel 名单",
-            "虚构 Excel 第 38 行",
-            "虚构联系人 · 月月",
-            "保留来源供后续处理",
-            "演示初始状态为“不是我的”，不会加入我的账号结果。",
-            "",
-            "not_mine",
-            ["moon_old"],
-            [],
-        ),
-        (
-            "quiet_garden",
-            "CM 补充",
-            "演示 CM 已确认补充",
-            "",
-            "联系人与会话均可后补",
-            "已确认账号也可以暂时没有任何会话。",
-            "",
-            "mine",
-            [],
-            [],
-        ),
-        (
-            "paper_plane",
-            "Excel 名单",
-            "虚构 Excel 第 42 行",
-            "虚构联系人 · 纸纸",
-            "别名资料待人工核对",
-            "先确认账号负责人；会话选择、联系人资料后续可增量维护。",
-            "",
-            "pending",
-            ["paper_launch", "paper_direct"],
-            [],
-        ),
-    ]
-    accounts = [
-        {
-            "id": f"demo_account_{index:02d}",
-            "handle": f"demo_{handle}",
-            "source_label": source,
-            "source_detail": source_detail,
-            "contact_label": contact,
-            "contact_note": contact_note,
-            "note": note,
-            "owner_conflict": conflict,
-            "decision": decision,
-            "conversation_ids": [f"demo_{key}" for key in conversation_ids],
-            "selected_conversations": [f"demo_{key}" for key in selected],
-        }
-        for index, (
-            handle,
-            source,
-            source_detail,
-            contact,
-            contact_note,
-            note,
-            conflict,
-            decision,
-            conversation_ids,
-            selected,
-        ) in enumerate(specifications, 1)
-    ]
+    """Expose roster metadata only; never infer a chat binding or read message bodies."""
+    roster = creator_preparation.roster(REMI_ID)
+    accounts = []
+    for item in roster["items"]:
+        account = {key: item[key] for key in ACCOUNT_FIELDS}
+        account["can_view_conversations"] = bool(item["contact_id"] and not item["is_stale"])
+        if item["is_stale"]:
+            mapping_label = "历史整理记录已变化，当前映射待核对"
+        elif item["contact_id"]:
+            mapping_label = ("已有历史映射，身份关系仍待确认" if item["issue"] == "identity_risk"
+                             else "当前正式关联 Remi")
+        elif item["suggested_contact_id"]:
+            mapping_label = "候选联系人，别名尚未确认"
+        else:
+            mapping_label = "联系人尚未确定"
+        account["mapping_label"] = mapping_label
+        accounts.append(account)
+    summary = {**roster["summary"], **roster["formal_summary"]}
+    summary.update({issue: sum(item["issue"] == issue for item in accounts)
+                    for issue in ("unresolved", "alias_missing", "identity_risk")})
     return {
-        "version": 1,
-        "storage_key": "ttmedia.creator-setup-preview.v1",
-        "cm_label": "我（演示 CM）",
-        "accounts": accounts,
-        "conversations": conversations,
+        "available": roster["available"], "responsible_name": "Remi · Quanzhen Liang",
+        "responsible_id": str(REMI_ID), "source_filename": roster.get("source_filename", ""),
+        "prepared_at_label": roster.get("prepared_at_label", ""), "summary": summary, "accounts": accounts,
     }

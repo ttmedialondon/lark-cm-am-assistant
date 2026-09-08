@@ -140,7 +140,7 @@ def test_history_is_available_independent_of_evidence_or_current_assignment(monk
     result = creator_review.detail(CONTACT)
     assert len(result["conversations"]) == 1
     assert result["creator"]["evidence_status"] == "archive_needed"
-    assert conn.calls[1][1] == (CONTACT, NOW)
+    assert conn.calls[1][1] == (CONTACT, NOW, None, None)
 
 
 def test_detail_lists_all_identity_related_sources_with_counts_and_times(monkeypatch):
@@ -148,7 +148,7 @@ def test_detail_lists_all_identity_related_sources_with_counts_and_times(monkeyp
     conn = bind(monkeypatch, row, [conversation_row(), conversation_row(
         chat_id=OTHER_CHAT, chat_mode="p2p", name=None, source_names=["Another CM"])])
     result = creator_review.detail(CONTACT)
-    assert conn.calls[1][1] == (CONTACT, NOW)
+    assert conn.calls[1][1] == (CONTACT, NOW, None, None)
     group, direct = result["conversations"]
     assert group["context_label"] == "曾观察到达人账号参与"
     assert group["source_label"] == "Another CM、Owner Person"
@@ -165,7 +165,7 @@ def test_messages_reject_noncreator_and_unrelated_chat(monkeypatch):
     conn = bind(monkeypatch, documented_row(), None)
     assert creator_review.messages(CONTACT, OTHER_CHAT) is None
     assert len(conn.calls) == 2
-    assert conn.calls[1][1] == (CONTACT, NOW, OTHER_CHAT)
+    assert conn.calls[1][1] == (CONTACT, NOW, None, None, OTHER_CHAT)
     assert creator_review.messages(CONTACT, "' OR 1=1 --") is None
 
 
@@ -181,7 +181,7 @@ def test_each_message_read_rechecks_creator_and_all_current_authorized_sources(m
                                 "created_at_label": "2026-09-05 01:00 BST", "content": "Hello creator",
                                 "sent_by_author": True, "message_type_label": "文字"}]
     for sql, params in conn.calls[2:]:
-        assert params[:3] == (CONTACT, NOW, CHAT)
+        assert params[:5] == (CONTACT, NOW, None, None, CHAT)
         for guard in ["role.role = 'creator' AND role.status = 'confirmed' AND role.is_primary",
                       "source.status = 'active' AND source.body_consent_at IS NOT NULL",
                       "access.is_visible AND access.sync_enabled", "role.updated_at = %s",
@@ -192,6 +192,46 @@ def test_each_message_read_rechecks_creator_and_all_current_authorized_sources(m
         for obsolete in ["role.source =", "assignment_eligible", "message.message_type = 'text'",
                          "message.body_ciphertext IS NOT NULL", "chat.chat_id = ANY"]:
             assert obsolete not in sql
+
+
+@pytest.mark.parametrize("reader", ["detail", "messages"])
+def test_owner_scoped_reader_stops_before_conversations_for_missing_assignment(monkeypatch, reader):
+    conn = bind(monkeypatch, None)
+    args = (CONTACT,) if reader == "detail" else (CONTACT, CHAT)
+    assert getattr(creator_review, reader)(*args, responsible_id=OWNER) is None
+    assert len(conn.calls) == 1
+    sql, params = conn.calls[0]
+    assert params == (CONTACT, OWNER, OWNER)
+    assert "assignment.ended_at IS NULL" in sql
+    assert "assignment.responsible_authorization_id = %s::uuid" in sql
+
+
+def test_owner_scope_rechecks_live_assignment_in_conversation_and_every_message_query(monkeypatch):
+    detail_conn = bind(monkeypatch, documented_row(), [conversation_row()])
+    result = creator_review.detail(CONTACT, responsible_id=OWNER)
+    assert result["conversations"][0]["source_label"] == "Another CM、Owner Person"
+    assert detail_conn.calls[0][1] == (CONTACT, OWNER, OWNER)
+    assert detail_conn.calls[1][1] == (CONTACT, NOW, OWNER, OWNER)
+
+    conn = bind(monkeypatch, documented_row(), {"chat_id": CHAT}, {"total_count": 0}, [])
+    monkeypatch.setattr(creator_review, "get_settings", lambda: SimpleNamespace(token_encryption_key=b"r" * 32))
+    assert creator_review.messages(CONTACT, CHAT, responsible_id=OWNER)["items"] == []
+    assert conn.calls[0][1] == (CONTACT, OWNER, OWNER)
+    for sql, params in [detail_conn.calls[1], *conn.calls[1:]]:
+        assert params[:4] == (CONTACT, NOW, OWNER, OWNER)
+        assert "scoped_assignment.contact_id = target.id" in sql
+        assert "scoped_assignment.ended_at IS NULL" in sql
+        assert "scoped_assignment.responsible_authorization_id = %s::uuid" in sql
+        assert "source.status = 'active' AND source.body_consent_at IS NOT NULL" in sql
+    assert all(params[4] == CHAT for _, params in conn.calls[1:])
+
+
+def test_owner_handover_before_chat_scope_check_never_reads_message_bodies(monkeypatch):
+    conn = bind(monkeypatch, documented_row(), None)
+    assert creator_review.messages(CONTACT, CHAT, responsible_id=OWNER) is None
+    assert len(conn.calls) == 2
+    assert "body_ciphertext" not in conn.calls[-1][0]
+    assert conn.calls[-1][1] == (CONTACT, NOW, OWNER, OWNER, CHAT)
 
 
 def test_text_renderer_extracts_stored_body_only_and_masks_common_identifiers():

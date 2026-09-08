@@ -1,35 +1,90 @@
 {% extends "base.html" %}
-{% block title %}达人账号设置 · 交互演示{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-setup-preview.css?v=20260908-demo">{% endblock %}
+{% block title %}Remi 的达人账号核对{% endblock %}
+{% block extra_head %}
+<link rel="stylesheet" href="/static/creator-review.css?v=20260907-preparation">
+<link rel="stylesheet" href="/static/creator-setup-preview.css?v=20260908-live">
+{% endblock %}
 {% block body %}
-<div class="page creator-setup-preview">
-  <header class="navbar"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media 消息提醒</a><div class="csp-header-user"><span>{{ authorization.display_name or '当前用户' }}</span><a href="/dashboard">返回前台</a></div></div></header>
+<div class="page creator-review creator-setup-preview">
+  <header class="navbar"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media 消息提醒</a><div class="csp-header-user"><span>查看人：{{ authorization.display_name or '当前用户' }}</span><a href="/dashboard">返回前台</a></div></div></header>
   <main class="container-xl csp-main" id="creator-setup-preview">
-    <header class="csp-heading"><div><h1>确认我的达人账号 <span class="csp-demo-badge">纯假数据演示</span></h1><p>先确认账号由谁负责，再独立选择需要保留的群聊和私聊。</p></div><a class="btn btn-outline-primary" href="#demo-results">查看演示结果</a></header>
-    <div class="csp-demo-notice"><strong>本页不连接真实达人或聊天记录。</strong> 所有 demo_ 账号、联系人、会话和消息均为虚构；操作不会提交服务器，也不会修改正式名单。</div>
-    <noscript><div class="csp-warning">需要启用浏览器 JavaScript 才能体验筛选、选择和标签内保存；此页面不会提交表单。</div></noscript>
-    <section class="csp-stats" aria-label="演示账号统计"><div><span>演示账号</span><strong>{{ preview_data.accounts|length }}<small>个</small></strong></div><div><span>由我负责</span><strong id="demo-mine-count">—</strong></div><div><span>待确认</span><strong id="demo-pending-count">—</strong></div><div><span>暂缓 / 不是我的</span><strong id="demo-other-count">—</strong></div></section>
-    <section class="csp-workspace" aria-labelledby="demo-workspace-title">
-      <div class="csp-workspace-heading"><div><h2 id="demo-workspace-title">逐个账号确认</h2><p>来源只是名单出处；“由我负责”才是你的账号决策。勾选会话不会自动认领账号。</p></div><span id="demo-visible-count" class="csp-muted">{{ preview_data.accounts|length }} 个账号</span></div>
-      <div class="csp-filters" role="search"><div><label for="demo-search">搜索账号、虚构联系人或群名</label><input id="demo-search" class="form-control" type="search" placeholder="例如 @demo_mint、栗子、共享群" maxlength="120" autocomplete="off"></div><div><label for="demo-filter">确认状态</label><select id="demo-filter" class="form-select"><option value="all">全部状态</option><option value="pending">待确认</option><option value="mine">由我负责</option><option value="defer">暂缓</option><option value="not_mine">不是我的</option><option value="conflict">归属冲突</option></select></div><button id="demo-clear-filters" class="btn btn-outline-secondary" type="button">清空筛选</button></div>
-      <div class="csp-table-wrap"><table class="csp-table"><thead><tr><th scope="col">账号 / 来源</th><th scope="col">联系人资料</th><th scope="col">账号决策</th><th scope="col">会话范围（独立选择）</th></tr></thead><tbody>
-        {% for account in preview_data.accounts %}
-        {% set related = preview_data.conversations|selectattr('id', 'in', account.conversation_ids)|list %}
-        <tr data-account-id="{{ account.id }}">
-          <td data-label="账号 / 来源"><div class="csp-account-handle">@{{ account.handle }}</div><span class="csp-source">{{ account.source_label }}</span><div class="csp-small">{{ account.source_detail }}</div><p class="csp-account-note">{{ account.note }}</p></td>
-          <td data-label="联系人资料"><strong class="csp-contact">{{ account.contact_label or '联系人待补' }}</strong><p class="csp-small">{{ account.contact_note }}</p></td>
-          <td data-label="账号决策"><label class="visually-hidden" for="decision-{{ account.id }}">{{ account.handle }} 的账号决策</label><select id="decision-{{ account.id }}" class="form-select csp-decision" data-account-id="{{ account.id }}"><option value="pending" {% if account.decision == 'pending' %}selected{% endif %}>待确认</option><option value="mine" {% if account.decision == 'mine' %}selected{% endif %} {% if account.owner_conflict %}disabled{% endif %}>由我负责</option><option value="defer" {% if account.decision == 'defer' %}selected{% endif %}>暂缓</option><option value="not_mine" {% if account.decision == 'not_mine' %}selected{% endif %}>不是我的</option></select>{% if account.owner_conflict %}<div class="csp-conflict">已归 {{ account.owner_conflict }}<br>归属冲突 · 不可直接认领</div>{% else %}<p class="csp-small">无需先补联系人或选择会话</p>{% endif %}</td>
-          <td data-label="会话范围">{% if related %}<details class="csp-conversation-picker"><summary>{{ related|length }} 个候选会话 · <span data-selected-count="{{ account.id }}">{{ account.selected_conversations|length }}</span> 个已选</summary><div class="csp-conversation-list">{% for kind, label in [('group', '群聊'), ('p2p', '私聊')] %}{% set group = related|selectattr('type', 'equalto', kind)|list %}{% if group %}<fieldset><legend>{{ label }} · {{ group|length }} 个</legend>{% for conversation in group %}<div class="csp-conversation-option"><label><input type="checkbox" data-account-id="{{ account.id }}" data-conversation-id="{{ conversation.id }}" {% if conversation.id in account.selected_conversations %}checked{% endif %}><span>{{ conversation.title }}</span></label><button type="button" class="csp-preview-link" data-preview-conversation="{{ conversation.id }}" aria-label="预览 {{ conversation.title }}">预览</button></div>{% endfor %}</fieldset>{% endif %}{% endfor %}<p class="csp-small">默认不勾选；仅既有演示确认恢复已选项。私聊只作辅助。</p></div></details>{% else %}<div class="csp-no-conversations">会话待补</div><p class="csp-small">可以先确认账号，之后再添加会话。</p>{% endif %}<div class="csp-scope-note" data-scope-note="{{ account.id }}"></div></td>
-        </tr>{% endfor %}
-      </tbody></table></div><div id="demo-empty" class="csp-empty" hidden>没有符合条件的演示账号。可以清空筛选后继续。</div>
+    <header class="csp-heading"><div><h1>Remi 的达人账号核对 <span class="csp-readonly-badge">真实数据 · 只读</span></h1><p>数据负责人：{{ preview_data.responsible_name or 'Remi · Quanzhen Liang' }}。你正在核对她的账号、联系人及候选会话，不会将账号转到自己名下。</p></div><a class="btn btn-outline-primary" href="#account-list">查看账号清单</a></header>
+    <div class="csp-notice"><strong>本页仅展示服务器真实数据，不会修改正式名单。</strong> 当前正式联系人归属不等于 CM 已逐个确认账号或会话；本页不提供认领、勾选保存或入库操作。</div>
+    {% if preview_data.available %}
+    {% set summary = preview_data.summary %}
+    <section class="csp-stats" aria-label="Remi 账号整理状态">
+      <div><span>来源账号</span><strong>{{ summary.total }}<small>个</small></strong></div>
+      <div><span>依据已归档</span><strong>{{ summary.documented }}<small>个</small></strong></div>
+      <div><span>依据待归档</span><strong>{{ summary.archive_needed }}<small>个</small></strong></div>
+      <div><span>待人工处理</span><strong>{{ summary.decision_needed }}<small>个</small></strong></div>
     </section>
-    <section class="csp-save-bar" aria-label="保存演示结果"><div><strong id="demo-selection-total">正在准备演示…</strong><p id="demo-save-status" role="status" aria-live="polite">仅在当前浏览器标签内暂存；刷新保留已保存内容，不是跨设备保存。</p></div><div class="csp-save-actions"><button id="demo-reset" type="button" class="btn btn-outline-secondary">恢复演示初始数据</button><button id="demo-save" type="button" class="btn btn-primary">保存演示结果</button></div></section>
-    <p class="csp-footnote">统计覆盖全部演示账号，不受筛选影响。只有“由我负责”的账号和它们勾选的会话进入结果；其他状态保留为选择草稿，共享会话仅统计一次。未保存的修改刷新后不保留。</p>
-    <section id="demo-results" class="csp-results" aria-labelledby="demo-results-title"><div class="csp-workspace-heading"><div><h2 id="demo-results-title" tabindex="-1">演示结果概览</h2><p id="demo-results-description">初始演示状态；账号确认与会话范围分别展示。</p></div><span class="csp-demo-badge">不代表正式数据</span></div><div id="demo-results-summary" class="csp-result-summary"></div><div id="demo-result-accounts" class="csp-result-accounts"></div><details class="csp-result-conversations"><summary>已选会话（去重）</summary><ul id="demo-result-conversations"></ul></details></section>
-    <details class="csp-rules"><summary>业务规则与关系</summary><div class="csp-rule-grid"><p><strong>账号分别关联负责人和会话</strong>每个 handle 独立确认负责人；一个账号可以选多个群和私聊，共享会话去重统计。</p><p><strong>联系人独立维护</strong>联系人待补不阻塞账号确认；多人共享账号、多个 handle 共用群，都不等于同一个自然人。</p><p><strong>先确认，再增量维护</strong>确认账号时可以不选会话。后续新增会话、资料或归属变更分别处理，不自动覆盖其他 CM。</p></div></details>
-    <dialog id="demo-conversation-dialog" class="csp-dialog" aria-labelledby="demo-dialog-title"><div class="csp-dialog-header"><span class="csp-demo-badge">纯虚构会话预览</span><button id="demo-dialog-close" class="btn btn-sm btn-outline-secondary" type="button">关闭</button></div><h2 id="demo-dialog-title"></h2><p id="demo-dialog-context" class="csp-small"></p><p id="demo-dialog-participants" class="csp-small"></p><div id="demo-dialog-messages" class="csp-dialog-messages"></div><p class="csp-small">以上全部为模拟记录，不是真实聊天，也不是账号身份或归属证据。</p></dialog>
+    <p class="csp-provenance">来源：{{ preview_data.source_filename or '来源文件未记录' }} · 整理时间：{{ preview_data.prepared_at_label or '未记录' }}<br>当前正式名单：{{ summary.formal_people }} 位联系人 / {{ summary.formal_handles }} 个 handle。上方统计是来源清单的整理状态，不是置信度，也不是 CM 确认数量。</p>
+    <details class="csp-rules" id="data-gaps"><summary>当前数据缺口：{{ summary.archive_needed }} 个待归档，{{ summary.decision_needed }} 个待处理{% if summary.stale %}，{{ summary.stale }} 个快照已过期{% endif %}</summary>
+      <div class="csp-rule-grid">
+        <p><strong>{{ summary.archive_needed }} 个 · 依据待归档</strong>现有联系人关系不等于原始主证据已完整留存，需要补齐归档。</p>
+        <p><strong>{{ summary.unresolved }} 个 · 联系人尚未定位</strong>保留 Excel 中的账号和负责人信息；不凭相似名字或单聊直接指认联系人。</p>
+        <p><strong>{{ summary.alias_missing }} 个 · 别名依据待补；{{ summary.identity_risk }} 个 · 身份需复核</strong>按每行原因继续核对，不能把历史建议或高相似度当作已确认身份。</p>
+      </div>
+      <p class="csp-small">尚未建立“CM 已确认的账号 ↔ 会话”绑定。下方列出的联系人相关会话均是该 handle 的候选范围；Excel 群名也不等于已匹配到真实群聊。</p>
+      {% if summary.stale %}<p class="csp-warning">{{ summary.stale }} 个账号的整理快照与当前资料不一致，已标记为过期；请先重新核对资料。</p>{% endif %}
+      {% if summary.unlisted_formal_handles %}<p class="csp-warning">当前正式名单另有 {{ summary.unlisted_formal_handles }} 个 handle 未纳入本次来源快照，需要补充来源清单后再核对。</p>{% endif %}
+    </details>
+
+    {% if selected_account %}
+    <section class="csp-detail" id="review-detail" aria-labelledby="review-detail-title">
+      <div class="csp-workspace-heading"><div><h2 id="review-detail-title">@{{ selected_account.handle }} · 联系人相关会话</h2><p>联系人：{{ selected_account.display_name or '尚未定位' }} · {{ selected_account.mapping_label }}{% if selected_account.is_stale %} · 整理快照已过期{% endif %}</p></div><a href="#account-list" class="btn btn-outline-secondary">返回账号清单</a></div>
+      <div class="csp-notice csp-detail-notice"><strong>候选会话，不是已经确认的账号绑定。</strong> 群聊或私聊可能同时涉及其他 handle；来源可能包含其他仍有效授权的 CM。私聊仅作辅助，不能单独证明身份或归属。消息仅在点击会话后读取，查阅会留下访问审计记录。</div>
+      {% if selected_account.reason %}<p class="csp-detail-reason">当前核对说明：{{ selected_account.reason }}</p>{% endif %}
+      {% if detail %}
+      <p class="csp-small">仅显示当前授权范围内已同步、未删除的记录；常见联系方式已遮盖，附件仅显示类型，正文仍可能提及其他参与者。</p>
+      <div class="cr-chat-workspace">
+        <aside class="card cr-conversations" aria-label="联系人候选会话列表">
+          <div class="cr-conversations__header"><h3>群聊与私聊 · 候选</h3><span>{{ detail.conversations|length }} 个</span></div>
+          {% if detail.conversations %}
+          <nav class="cr-conversations__list" aria-label="选择会话">{% for conversation in detail.conversations %}
+            <a class="cr-conversation {% if selected_chat and selected_chat.chat_id == conversation.chat_id %}is-current{% endif %}" href="{{ conversation.url }}" {% if selected_chat and selected_chat.chat_id == conversation.chat_id %}aria-current="true"{% endif %}>
+              <span class="cr-conversation__summary"><span class="cr-conversation__type">{{ conversation.chat_mode_label }}</span><span>{{ conversation.message_count }} 条记录</span></span>
+              <strong>{{ conversation.name }}</strong><span class="cr-conversation__context">{{ conversation.context_label }}</span>
+              <span class="cr-conversation__context">最近记录：{{ conversation.last_message_at_label or '暂无已同步记录' }}</span><span class="cr-conversation__context">授权来源：{{ conversation.source_label or '未记录' }}</span>
+            </a>
+          {% endfor %}</nav>
+          {% else %}<div class="cr-empty cr-empty--compact"><h3>当前没有可查看的会话</h3><p>已同步授权范围内未找到相关会话，不代表这个账号没有聊天记录。</p></div>{% endif %}
+        </aside>
+        <section class="card cr-chat-content" aria-label="会话消息">
+          {% if selected_chat %}
+          <div class="cr-chat-content__header"><span class="cr-conversation__type">{{ selected_chat.chat_mode_label }}</span><h3>{{ selected_chat.name }}</h3><p>{{ selected_chat.context_label }} · {{ selected_chat.message_count }} 条已同步授权记录</p><p>授权来源：{{ selected_chat.source_label or '未记录' }} · 不表示此会话已归属于 @{{ selected_account.handle }}</p></div>
+          <div class="cr-messages">
+            {% if content_page and content_page['items'] %}
+            {% for message in content_page['items'] %}<article class="cr-message {% if message.sent_by_author %}cr-message--owner{% endif %}"><div class="cr-message__meta"><strong>{{ message.sender_label }}</strong>{% if message.sender_role_label %}<span class="cr-message__role">{{ message.sender_role_label }}</span>{% endif %}{% if message.message_type_label %}<span class="cr-message__role">{{ message.message_type_label }}</span>{% endif %}<span>{{ message.created_at_label }}</span></div><div class="cr-message__body">{{ message.content }}</div></article>{% endfor %}
+            {% else %}<div class="cr-empty"><h3>当前没有可展示的记录</h3><p>此会话在当前授权范围内没有可展示的已同步记录，不代表原会话没有消息。</p></div>{% endif %}
+          </div>
+          {% if content_page %}<div class="csp-message-pagination"><span class="csp-small">第 {{ content_page.page }} / {{ content_page.total_pages or 1 }} 页 · 共 {{ content_page.total_count }} 条可用记录</span><nav aria-label="会话记录分页">{% if message_prev_url %}<a class="btn btn-outline-secondary" href="{{ message_prev_url }}">上一页记录</a>{% endif %}{% if message_next_url %}<a class="btn btn-outline-secondary" href="{{ message_next_url }}">下一页记录</a>{% endif %}</nav></div>{% endif %}
+          {% else %}<div class="cr-empty cr-chat-empty"><div class="cr-empty__mark" aria-hidden="true">···</div><h3>{% if detail.conversations %}选择一个会话，查看真实记录{% else %}暂无已同步授权会话{% endif %}</h3><p>左侧是联系人相关的候选会话。打开后查看消息上下文，再判断是否属于当前 handle；页面不会自动确认关系。</p></div>{% endif %}
+        </section>
+      </div>
+      {% else %}<div class="csp-empty"><strong>暂不能展开联系人会话</strong><p>{{ selected_account.mapping_label }}。{{ selected_account.next_step }}</p></div>{% endif %}
+    </section>
+    {% endif %}
+
+    <section class="csp-workspace" id="account-list" aria-labelledby="account-list-title">
+      <div class="csp-workspace-heading"><div><h2 id="account-list-title">Remi 来源账号清单</h2><p>保留未定位和待处理账号，逐项展示来源、当前关联及数据缺口。</p></div><span id="review-visible-count" class="csp-muted" role="status" aria-live="polite">{{ preview_data.accounts|length }} / {{ preview_data.accounts|length }} 个账号</span></div>
+      <noscript><div class="csp-warning">当前显示全部账号；启用 JavaScript 后可使用本地搜索和状态筛选。会话链接仍可正常打开。</div></noscript>
+      <div class="csp-filters" role="search"><div><label for="review-search">搜索 handle、联系人或来源群名</label><input id="review-search" class="form-control" type="search" placeholder="输入 handle、联系人姓名或 Excel 群名" maxlength="120" autocomplete="off"></div><div><label for="review-filter">整理状态 / 数据缺口</label><select id="review-filter" class="form-select"><option value="all">全部账号</option><option value="documented">依据已归档</option><option value="archive_needed">依据待归档</option><option value="decision_needed">待人工处理</option><option value="unresolved">联系人尚未定位</option><option value="alias_missing">别名依据待补</option><option value="identity_risk">身份需复核</option><option value="stale">快照已过期</option></select></div><button id="review-clear-filters" class="btn btn-outline-secondary" type="button">清空筛选</button></div>
+      <div class="csp-table-wrap"><table class="csp-table"><thead><tr><th scope="col">账号 / Excel 来源</th><th scope="col">当前联系人关联</th><th scope="col">整理状态 / 缺口</th><th scope="col">下一步 / 候选会话</th></tr></thead><tbody>
+        {% for account in preview_data.accounts %}
+        <tr data-review-account data-category="{{ account.category }}" data-issue="{{ account.issue }}" data-stale="{{ 'true' if account.is_stale else 'false' }}">
+          <td data-label="账号 / Excel 来源"><div class="csp-account-handle" data-search-text>@{{ account.handle }}</div><div class="csp-small">Excel 行号：{{ account.source_rows|join('、') or '未记录' }}</div><div class="csp-small">CM：{{ account.cm_values|join('、') or '未记录' }}<br>TAP CM：{{ account.tap_cm_values|join('、') or '未记录' }}</div>{% if account.source_group_names %}<details class="csp-source-groups"><summary>来源群名 · {{ account.source_group_names|length }} 个</summary><ul data-search-text>{% for group_name in account.source_group_names %}<li>{{ group_name }}</li>{% endfor %}</ul><p>仅为 Excel 原文，尚不代表已绑定真实群聊。</p></details>{% else %}<p class="csp-small">Excel 未提供群名</p>{% endif %}</td>
+          <td data-label="当前联系人关联"><strong class="csp-contact" data-search-text>{{ account.display_name or '尚未定位到联系人' }}</strong><p class="csp-small">{{ account.mapping_label }}</p>{% if account.suggested_contact_id and not account.contact_id %}<p class="csp-warning">只有历史建议，不能当作身份已确认。</p>{% endif %}</td>
+          <td data-label="整理状态 / 缺口"><span class="cr-status {% if account.category == 'documented' %}cr-status--documented{% elif account.category == 'decision_needed' %}cr-status--decision{% else %}cr-status--review{% endif %}">{{ account.category_label }}</span>{% if account.issue and account.issue != 'none' %}<div class="csp-issue-label">{{ account.issue_label }}</div>{% endif %}<p class="csp-small">{{ account.reason }}</p>{% if account.is_stale %}<p class="csp-warning">整理快照已过期，不能沿用旧关联。</p>{% endif %}</td>
+          <td data-label="下一步 / 候选会话"><p class="csp-next-step">{{ account.next_step }}</p>{% if account.can_view_conversations and account.detail_url %}<a class="btn btn-outline-primary csp-detail-link" href="{{ account.detail_url }}" aria-label="查看 {{ account.handle }} 的联系人相关会话">查看联系人相关会话</a><p class="csp-small">仅候选范围，未确认属于此 handle。</p>{% else %}<div class="csp-unavailable">暂不能查看联系人会话</div><p class="csp-small">{{ account.mapping_label }}；请先处理本行数据缺口。</p>{% endif %}</td>
+        </tr>{% endfor %}
+      </tbody></table></div><div id="review-empty" class="csp-empty" hidden>没有符合条件的账号，可以清空筛选后继续。</div>
+    </section>
+    <p class="csp-footnote">只读核对不会更新负责人、达人标识或账号关联。来源清单来自已整理快照；当前联系人和会话按服务器现有授权范围读取。未找到记录不等于没有记录。</p>
+    {% else %}
+    <section class="csp-empty csp-unavailable-page"><h2>真实来源数据暂不可用</h2><p>尚未找到 Remi 的有效整理快照，这是当前的数据缺口。页面不会使用假数据或空白统计代替，请先补齐服务器来源数据。</p></section>
+    {% endif %}
   </main>
 </div>
-<script id="creator-setup-data" type="application/json">{{ preview_data|tojson }}</script>
-<script src="/static/creator-setup-preview.js?v=20260908-demo" defer></script>
+<script src="/static/creator-setup-preview.js?v=20260908-live" defer></script>
 {% endblock %}

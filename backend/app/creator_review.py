@@ -85,8 +85,9 @@ _CREATORS_SQL = """
       )
 """
 
-# Scope is independent of import evidence/assignment. Exact identity links, not
-# handle/name similarity, bind every read to the creator and live source consent.
+# Exact identity links, not handle/name similarity, bind every read to the
+# creator and live source consent. A scoped frontend can also require a live
+# owner assignment; each query rechecks it, including after a handover.
 _CONVERSATION_SCOPE_SQL = """
     FROM contacts target
     JOIN contact_roles role ON role.contact_id = target.id
@@ -95,6 +96,12 @@ _CONVERSATION_SCOPE_SQL = """
     JOIN authorization_chats access ON access.authorization_id = source.id
     JOIN chats chat ON chat.chat_id = access.chat_id
     WHERE target.id = %s AND role.updated_at = %s
+      AND (%s::uuid IS NULL OR EXISTS (
+          SELECT 1 FROM contact_assignments scoped_assignment
+          WHERE scoped_assignment.contact_id = target.id
+            AND scoped_assignment.ended_at IS NULL
+            AND scoped_assignment.responsible_authorization_id = %s::uuid
+      ))
       AND target.entity_type = 'person'
       AND access.is_visible AND access.sync_enabled
       AND COALESCE(chat.chat_status, 'normal') = 'normal'
@@ -317,17 +324,20 @@ def directory(page: int = 1, query: str = "", responsible_id: UUID | None = None
             "responsible_id": str(responsible_id) if responsible_id else ""}
 
 
-def _scope_params(row: dict[str, Any]) -> tuple[Any, ...]:
-    return (row["id"], row["role_updated_at"])
+def _scope_params(row: dict[str, Any], responsible_id: UUID | None = None) -> tuple[Any, ...]:
+    return (row["id"], row["role_updated_at"], responsible_id, responsible_id)
 
 
-def detail(contact_id: UUID) -> dict[str, Any] | None:
+def detail(contact_id: UUID, *, responsible_id: UUID | None = None) -> dict[str, Any] | None:
     with connection() as conn:
-        row = conn.execute(_CREATORS_SQL + " AND contact.id = %s", (contact_id,)).fetchone()
+        row = conn.execute(_CREATORS_SQL + """
+            AND contact.id = %s
+            AND (%s::uuid IS NULL OR assignment.responsible_authorization_id = %s::uuid)
+        """, (contact_id, responsible_id, responsible_id)).fetchone()
         if not row:
             return None
         facts = _evidence(row)
-        conversations = conn.execute(_CONVERSATIONS_SQL, _scope_params(row)).fetchall()
+        conversations = conn.execute(_CONVERSATIONS_SQL, _scope_params(row, responsible_id)).fetchall()
     item = _item(row, facts)
     source_rows = "、".join(map(str, facts["rows"])) or "未留存"
     return {
@@ -371,14 +381,18 @@ def _text_content(ciphertext: str | None, cipher: Any, message_type: str | None 
     return text
 
 
-def messages(contact_id: UUID, chat_id: str, page: int = 1) -> dict[str, Any] | None:
+def messages(contact_id: UUID, chat_id: str, page: int = 1, *,
+             responsible_id: UUID | None = None) -> dict[str, Any] | None:
     if not isinstance(chat_id, str) or not re.fullmatch(r"oc_[A-Za-z0-9]{8,80}", chat_id):
         return None
     with connection() as conn:
-        row = conn.execute(_CREATORS_SQL + " AND contact.id = %s", (contact_id,)).fetchone()
+        row = conn.execute(_CREATORS_SQL + """
+            AND contact.id = %s
+            AND (%s::uuid IS NULL OR assignment.responsible_authorization_id = %s::uuid)
+        """, (contact_id, responsible_id, responsible_id)).fetchone()
         if not row:
             return None
-        params = (*_scope_params(row), chat_id)
+        params = (*_scope_params(row, responsible_id), chat_id)
         if not conn.execute("SELECT chat.chat_id " + _CONVERSATION_SCOPE_SQL + " AND chat.chat_id = %s",
                             params).fetchone():
             return None

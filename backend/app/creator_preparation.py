@@ -135,29 +135,39 @@ def load_snapshot(conn: Any) -> dict[str, Any] | None:
         return None
 
 
-def directory(page: int = 1, query: str = "", category: str = "all") -> dict[str, Any]:
+def roster(responsible_id: UUID | None = None) -> dict[str, Any]:
+    """Read every source handle once, retaining the existing live-state checks."""
     from . import creator_review
 
-    query = normalize_query(query)
-    category = category if category in CATEGORIES else "all"
     with connection() as conn:
         payload = load_snapshot(conn)
+        if payload and responsible_id is not None and payload["responsible_id"] != str(responsible_id):
+            payload = None
         rows = conn.execute(creator_review._CREATORS_SQL).fetchall() if payload else []
-    result = {"available": bool(payload), "query": query, "category": category,
-              "summary": {"total": 0, "documented": 0, "archive_needed": 0, "decision_needed": 0, "stale": 0}}
+    result = {"available": bool(payload),
+              "summary": {"total": 0, "documented": 0, "archive_needed": 0, "decision_needed": 0, "stale": 0},
+              "formal_summary": {"formal_people": 0, "formal_handles": 0, "unlisted_formal_handles": 0}}
     items = []
     if payload:
-        result.update({k: payload[k] for k in ("source_filename", "source_sha256", "responsible_name")})
+        result.update({k: payload[k] for k in (
+            "source_filename", "source_sha256", "responsible_name", "responsible_id")})
         result["prepared_at_label"] = _format_time(_date(payload["prepared_at"]))
         current = {str(row["id"]): row for row in rows}
-        current_handles = {h for row in rows for h in creator_review._evidence(row)["handles"]}
+        facts_by_contact = {str(row["id"]): creator_review._evidence(row) for row in rows}
+        current_handles = {h for facts in facts_by_contact.values() for h in facts["handles"]}
+        owner_rows = [row for row in rows if str(row["responsible_id"]) == payload["responsible_id"]]
+        owner_handles = {h for row in owner_rows for h in facts_by_contact[str(row["id"])]["handles"]}
+        result["formal_summary"] = {
+            "formal_people": len(owner_rows), "formal_handles": len(owner_handles),
+            "unlisted_formal_handles": len(owner_handles - {item["handle"] for item in payload["items"]}),
+        }
         for source in payload["items"]:
             item = dict(source)
             contact_id = item["contact_id"] or item["suggested_contact_id"]
             row = current.get(contact_id)
             stale = (not binding_matches(item, row, payload["responsible_id"]) if contact_id
                      else item["handle"] in current_handles)
-            facts = creator_review._evidence(row) if row else None
+            facts = facts_by_contact.get(contact_id)
             if item["contact_id"] and facts and item["handle"] not in facts["handles"]:
                 stale = True
             if item["issue"] == "alias_missing" and item["handle"] in current_handles:
@@ -170,12 +180,23 @@ def directory(page: int = 1, query: str = "", category: str = "all") -> dict[str
             if stale:
                 item.update(category="decision_needed", reason="整理后正式记录已变化，需要重新核对当前状态。",
                             next_step="不要沿用这份旧建议；重新确认账号、联系人和负责人。")
+            elif row:
+                item["display_name"] = creator_review._label(row.get("display_name"), "姓名未返回")
             item["category_label"] = CATEGORIES[item["category"]]
             item["issue_label"] = "正式记录已变化" if stale else ISSUE_LABELS[item["issue"]]
             result["summary"][item["category"]] += 1
             result["summary"]["stale"] += int(stale)
             items.append(item)
         result["summary"]["total"] = len(items)
+    return {**result, "items": items}
+
+
+def directory(page: int = 1, query: str = "", category: str = "all") -> dict[str, Any]:
+    query = normalize_query(query)
+    category = category if category in CATEGORIES else "all"
+    result = roster()
+    items = result.pop("items")
+    result.update(query=query, category=category)
     items = [item for item in items if (category == "all" or item["category"] == category)
              and (not query or query in f"{item['handle']} {item['display_name']}".casefold())]
     order = {"decision_needed": 0, "archive_needed": 1, "documented": 2}
