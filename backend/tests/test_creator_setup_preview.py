@@ -1,4 +1,4 @@
-"""A single-account, synthetic-only preview must not become a new data capability."""
+"""A named-account, synthetic-only preview must not become a new data capability."""
 
 import json
 import re
@@ -13,6 +13,7 @@ from app import admin_permissions, admin_reporting, contact_assignments, creator
 
 PATH = "/dashboard/creator-setup-preview"
 PREVIEW_ACTOR = UUID("9d5f4370-6463-4c3a-a2ed-67753a1cabc0")
+SHANG_MA_ACTOR = UUID("1225b4a0-fbd8-431e-962e-25e66943a8a0")
 OTHER_ACTOR = UUID("00000000-0000-4000-8000-000000000099")
 
 
@@ -48,14 +49,20 @@ def preview_client(monkeypatch, *, actor_id=PREVIEW_ACTOR, status="active", owne
 
 @pytest.mark.parametrize(("actor_id", "status", "owner", "expected"), [
     (PREVIEW_ACTOR, "active", True, True),
+    (SHANG_MA_ACTOR, "active", False, True),
+    (SHANG_MA_ACTOR, "active", True, True),
+    (str(SHANG_MA_ACTOR), "active", False, True),
+    (SHANG_MA_ACTOR, "revoked", False, False),
+    (SHANG_MA_ACTOR, "attention_required", False, False),
     (OTHER_ACTOR, "active", True, False),
     (PREVIEW_ACTOR, "active", False, False),
     (PREVIEW_ACTOR, "revoked", True, False),
     (PREVIEW_ACTOR, "attention_required", True, False),
     (None, "active", True, False),
 ])
-def test_access_helper_requires_exact_account_active_status_and_current_owner(actor_id, status, owner, expected):
+def test_access_helper_requires_exact_active_account_and_owner_only_for_shuxuan(actor_id, status, owner, expected):
     assert main.CREATOR_SETUP_PREVIEW_AUTHORIZATION_ID == PREVIEW_ACTOR
+    assert main.CREATOR_SETUP_PREVIEW_SHANG_MA_ID == SHANG_MA_ACTOR
     authorization = {"id": actor_id, "status": status, "display_name": "Shuxuan Li"}
     assert main._can_preview_creator_setup(authorization, {"is_owner": owner}) is expected
 
@@ -64,6 +71,8 @@ def test_access_helper_requires_exact_account_active_status_and_current_owner(ac
     {"actor_id": OTHER_ACTOR, "owner": True},
     {"actor_id": OTHER_ACTOR, "owner": False},
     {"owner": False}, {"status": "revoked"}, {"status": "attention_required"},
+    {"actor_id": SHANG_MA_ACTOR, "owner": False, "status": "revoked"},
+    {"actor_id": SHANG_MA_ACTOR, "owner": False, "status": "attention_required"},
 ])
 def test_denied_accounts_cannot_discover_preview_or_load_business_data(monkeypatch, options):
     client, _, reads = preview_client(monkeypatch, **options)
@@ -88,15 +97,23 @@ def test_signed_out_preview_redirects_without_even_loading_acl(monkeypatch):
     assert reads == []
 
 
-def test_preview_access_is_not_a_display_name_check(monkeypatch):
-    client, _, _ = preview_client(monkeypatch, name="Renamed account")
+@pytest.mark.parametrize(("actor_id", "owner", "name"), [
+    (PREVIEW_ACTOR, True, "Shuxuan Li"),
+    (SHANG_MA_ACTOR, False, "Shang Ma"),
+])
+def test_preview_access_is_not_a_display_name_check(monkeypatch, actor_id, owner, name):
+    client, _, _ = preview_client(monkeypatch, actor_id=actor_id, owner=owner, name="Renamed account")
     assert client.get(PATH).status_code == 200
-    client, _, _ = preview_client(monkeypatch, actor_id=OTHER_ACTOR, name="Shuxuan Li")
+    client, _, _ = preview_client(monkeypatch, actor_id=OTHER_ACTOR, name=name)
     assert client.get(PATH).status_code == 404
 
 
-def test_allowed_get_uses_only_synthetic_data_and_is_not_cached(monkeypatch):
-    client, _, reads = preview_client(monkeypatch)
+@pytest.mark.parametrize(("actor_id", "owner", "expected_acl_reads"), [
+    (PREVIEW_ACTOR, True, [PREVIEW_ACTOR]),
+    (SHANG_MA_ACTOR, False, []),
+])
+def test_allowed_get_uses_only_synthetic_data_and_is_not_cached(monkeypatch, actor_id, owner, expected_acl_reads):
+    client, _, reads = preview_client(monkeypatch, actor_id=actor_id, owner=owner)
     response = client.get(PATH)
     assert response.status_code == 200
     assert 'id="creator-setup-data"' in response.text
@@ -107,24 +124,27 @@ def test_allowed_get_uses_only_synthetic_data_and_is_not_cached(monkeypatch):
     assert "connect-src 'none'" in csp
     assert "form-action 'none'" in csp
     assert "frame-ancestors 'none'" in csp
-    assert reads == [PREVIEW_ACTOR]
+    assert reads == expected_acl_reads
     assert re.search(r'method\s*=\s*["\']post["\']', response.text, re.IGNORECASE) is None
     assert not re.search(r"\b(?:oc|ou|on|cli)_[A-Za-z0-9]+\b", response.text)
 
 
-def test_revocation_applies_on_next_request_not_only_initial_page_load(monkeypatch):
-    client, state, _ = preview_client(monkeypatch)
+@pytest.mark.parametrize(("actor_id", "owner"), [(PREVIEW_ACTOR, True), (SHANG_MA_ACTOR, False)])
+def test_revocation_applies_on_next_request_not_only_initial_page_load(monkeypatch, actor_id, owner):
+    client, state, _ = preview_client(monkeypatch, actor_id=actor_id, owner=owner)
     assert client.get(PATH).status_code == 200
-    state["owner"] = False
-    assert client.get(PATH).status_code == 404
-    state["owner"] = True
+    if actor_id == PREVIEW_ACTOR:
+        state["owner"] = False
+        assert client.get(PATH).status_code == 404
+        state["owner"] = True
     state["authorization"]["status"] = "revoked"
     assert client.get(PATH).status_code == 404
 
 
-def test_preview_has_no_mutating_endpoint_even_for_the_allowed_account(monkeypatch):
-    client, _, reads = preview_client(monkeypatch)
-    response = client.post(PATH, json={"handle": "live.handle", "confirm": True, "cm": str(PREVIEW_ACTOR)})
+@pytest.mark.parametrize(("actor_id", "owner"), [(PREVIEW_ACTOR, True), (SHANG_MA_ACTOR, False)])
+def test_preview_has_no_mutating_endpoint_even_for_the_allowed_account(monkeypatch, actor_id, owner):
+    client, _, reads = preview_client(monkeypatch, actor_id=actor_id, owner=owner)
+    response = client.post(PATH, json={"handle": "live.handle", "confirm": True, "cm": str(actor_id)})
     assert response.status_code == 405
     assert reads == []
     assert all(route.methods == {"GET"} for route in main.app.routes if route.path.startswith(PATH))
@@ -133,6 +153,11 @@ def test_preview_has_no_mutating_endpoint_even_for_the_allowed_account(monkeypat
 @pytest.mark.parametrize(("options", "visible"), [
     ({}, True), ({"actor_id": OTHER_ACTOR}, False), ({"owner": False}, False),
     ({"status": "revoked"}, False), ({"name": "Renamed account"}, True),
+    ({"actor_id": SHANG_MA_ACTOR, "owner": False, "name": "Shang Ma"}, True),
+    ({"actor_id": SHANG_MA_ACTOR, "owner": False, "name": "Renamed account"}, True),
+    ({"actor_id": SHANG_MA_ACTOR, "owner": False, "status": "revoked"}, False),
+    ({"actor_id": SHANG_MA_ACTOR, "owner": False, "status": "attention_required"}, False),
+    ({"actor_id": OTHER_ACTOR, "name": "Shang Ma"}, False),
 ])
 def test_dashboard_preview_entry_uses_the_same_server_side_boundary(monkeypatch, options, visible):
     client, _, _ = preview_client(monkeypatch, **options)
@@ -149,6 +174,8 @@ def test_dashboard_preview_entry_uses_the_same_server_side_boundary(monkeypatch,
     assert response.status_code == 200
     assert (f'href="{PATH}"' in response.text) is visible
     assert "我的达人（正式）" in response.text
+    if options.get("actor_id") == SHANG_MA_ACTOR:
+        assert 'href="/admin"' not in response.text
 
 
 def test_preview_dataset_contains_no_real_provider_or_database_identifiers():

@@ -35,6 +35,7 @@ OAUTH_STATE_COOKIE = "__Host-lark_oauth_state"
 SESSION_DAYS = 30
 LONDON_TIME_ZONE = ZoneInfo("Europe/London")
 CREATOR_SETUP_PREVIEW_AUTHORIZATION_ID = uuid.UUID("9d5f4370-6463-4c3a-a2ed-67753a1cabc0")
+CREATOR_SETUP_PREVIEW_SHANG_MA_ID = uuid.UUID("1225b4a0-fbd8-431e-962e-25e66943a8a0")
 
 
 def _template(request: Request, name: str, context: dict[str, Any], status_code: int = 200):
@@ -279,11 +280,14 @@ def dashboard(request: Request):
 
 
 def _can_preview_creator_setup(authorization: dict[str, Any], admin_access: dict[str, Any]) -> bool:
-    """A named-user prototype, not a new permission or a general CM feature."""
+    """A two-user prototype, not a new admin permission or a general CM feature."""
+    actor_id = str(authorization.get("id"))
     return bool(
-        str(authorization.get("id")) == str(CREATOR_SETUP_PREVIEW_AUTHORIZATION_ID)
-        and authorization.get("status") == "active"
-        and admin_access.get("is_owner")
+        authorization.get("status") == "active"
+        and (
+            actor_id == str(CREATOR_SETUP_PREVIEW_SHANG_MA_ID)
+            or (actor_id == str(CREATOR_SETUP_PREVIEW_AUTHORIZATION_ID) and admin_access.get("is_owner"))
+        )
     )
 
 
