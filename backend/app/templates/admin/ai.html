@@ -7,11 +7,11 @@
     <div class="alert alert-info">每项功能可配置独立的 OpenAI Project 与 service-account key，便于按功能查看费用。当前所有 AI 调用共用安全并发与限速门控；密钥提交后立即加密保存，完整值不会再次显示；不要粘贴 Organization Admin Key。</div>
     {% if ai_dispatch.state == 'paused' %}
     <div class="alert alert-danger d-flex align-items-center justify-content-between" role="alert">
-      <div><strong>{{ ai_dispatch.label }}</strong><div class="small">{{ ai_dispatch.message }} 两个 AI 功能都会停止领取新任务。</div></div>
+      <div><strong>{{ ai_dispatch.label }}</strong><div class="small">{{ ai_dispatch.message }} 所有 AI 功能都会停止领取新任务。</div></div>
       {% if admin_role == 'owner' %}<form action="/admin/ai/resume" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger" type="submit">处理后恢复队列</button></form>{% endif %}
     </div>
     {% elif ai_dispatch.state == 'throttled' %}
-    <div class="alert alert-warning" role="alert"><strong>{{ ai_dispatch.label }}</strong>：{{ ai_dispatch.message }} 两个 AI 功能会自动恢复，无需人工操作。</div>
+    <div class="alert alert-warning" role="alert"><strong>{{ ai_dispatch.label }}</strong>：{{ ai_dispatch.message }} 已启用的 AI 功能会自动恢复，无需人工操作。</div>
     {% endif %}
     {% if form_error %}<div class="alert alert-danger" role="alert">{{ form_error }}</div>{% endif %}
     {% for feature in configs %}{% set config = feature.config %}

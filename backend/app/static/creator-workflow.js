@@ -185,9 +185,12 @@
     details.append(element("summary", "查看依据"));
     for (const evidence of item.evidence || []) {
       const source = evidence.source_data || {};
+      const sourceRows = source.row ? [source.row] : source.rows || source.source_rows || [];
+      const sourceCM = source.cm_name || [source.cm, source.tap_cm].flat().filter(Boolean).join(" / ");
       const lines = [source.filename || source.source_filename, source.sheet || source.sheet_name,
-        source.row ? `第 ${source.row} 行` : null, source.reason || source.rationale || source.summary,
-        source.cm_name ? `来源负责人：${source.cm_name}` : null].filter(Boolean);
+        sourceRows.length ? `第 ${sourceRows.join("、")} 行` : null, source.reason || source.rationale || source.summary,
+        sourceCM ? `来源负责人：${sourceCM}` : null,
+        source.original_handle || source.handle_raw ? `原始账号：${source.original_handle || source.handle_raw}` : null].filter(Boolean);
       if (!lines.length) lines.push(evidence.label || (evidence.source_type === "excel" ? "Excel 导入来源" : "AI 推荐依据"));
       details.append(element("div", lines.join(" · "), "cw-source-detail"));
     }

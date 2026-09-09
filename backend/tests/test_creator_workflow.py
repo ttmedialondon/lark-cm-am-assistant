@@ -484,3 +484,66 @@ def test_last_selectable_message_fact_is_locked_during_confirmation(db, people):
         other.execute("SET lock_timeout='50ms'")
         with pytest.raises(psycopg.errors.LockNotAvailable):
             other.execute("DELETE FROM authorization_message_observations WHERE authorization_id=%s", (people["cm"],))
+
+
+def test_batch_contacts_are_not_truncated_at_search_limit_and_load_only_once(db, people, monkeypatch):
+    db.execute("""INSERT INTO contacts(id,display_name,entity_type)
+        SELECT gen_random_uuid(),'Bulk person ' || n,'person' FROM generate_series(1,300) n""")
+    db.execute("""INSERT INTO lark_identities(open_id,contact_id,display_name)
+        SELECT 'bulk_' || id::text,id,display_name FROM contacts WHERE display_name LIKE 'Bulk person %%'""")
+    db.execute(
+        """INSERT INTO chat_members(chat_id,open_id,last_observed_by_authorization_id)
+        SELECT 'chat_cm',open_id,%s FROM lark_identities WHERE open_id LIKE 'bulk_%%'""",
+        (people["cm"],),
+    )
+    db.execute(
+        """INSERT INTO creator_workflow_candidates(id,normalized_handle,responsible_authorization_id,
+        contact_id,relationship)
+        SELECT gen_random_uuid(),'bulk' || row_number() OVER(ORDER BY id),%s,id,'owner'
+        FROM contacts WHERE display_name LIKE 'Bulk person %%'""",
+        (people["cm"],),
+    )
+    calls = []
+
+    class Counted:
+        def execute(self, query, params=None):
+            calls.append(str(query))
+            return db.execute(query, params)
+
+    monkeypatch.setattr(workflow, "connection", lambda: nullcontext(Counted()))
+    scope = workflow.get_scope(people["cm"])
+    result = workflow.list_records(scope, page=3, page_size=100)
+    assert result["total"] == 300 and len(result["items"]) == 100
+    assert all(
+        item["contact"] and item["contact"]["display_name"].startswith("Bulk person") for item in result["items"]
+    )
+    assert sum("WITH scoped_authorization AS MATERIALIZED" in query for query in calls) == 1
+    assert sum("FROM creator_workflow_sources" in query for query in calls) == 1
+
+
+def test_union_search_preserves_every_scope_guard(db, people):
+    scope = workflow.get_scope(people["cm"])
+    db.execute("UPDATE authorization_chats SET p2p_counterpart_open_id=NULL WHERE authorization_id=%s", (people["cm"],))
+    db.execute("DELETE FROM authorization_message_observations WHERE authorization_id=%s", (people["cm"],))
+    # A globally known sender without this CM's own observation is not selectable.
+    assert workflow.search_users(scope, "Same") == []
+    db.execute(
+        """INSERT INTO chat_members(chat_id,open_id,last_observed_by_authorization_id)
+        VALUES('chat_cm','ou_person',%s)""",
+        (people["cm2"],),
+    )
+    assert workflow.search_users(scope, "Same") == []
+    db.execute("UPDATE chat_members SET last_observed_by_authorization_id=%s", (people["cm"],))
+    assert [r["contact_id"] for r in workflow.search_users(scope, "Same")] == [str(people["person"])]
+    db.execute("DELETE FROM chat_members")
+    db.execute(
+        """INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+        VALUES(%s,'chat_cm','message1')""",
+        (people["cm"],),
+    )
+    assert len(workflow.search_users(scope, "Same")) == 1
+    db.execute("UPDATE chat_messages SET is_deleted=TRUE WHERE chat_id='chat_cm'")
+    assert workflow.search_users(scope, "Same") == []
+    db.execute("UPDATE chat_messages SET is_deleted=FALSE WHERE chat_id='chat_cm'")
+    db.execute("UPDATE authorizations SET body_consent_at=NOW()+INTERVAL '1 minute' WHERE id=%s", (people["cm"],))
+    assert workflow.search_users(scope, "Same") == []

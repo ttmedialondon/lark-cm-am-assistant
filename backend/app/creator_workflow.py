@@ -150,30 +150,38 @@ def _fresh(conn: Any, scope: dict, *, write: bool = False) -> dict:
 
 
 _SELECTABLE_SQL = """
-    SELECT DISTINCT identity.contact_id, identity.open_id,
-           COALESCE(identity.display_name, contact.display_name, identity.open_id) AS display_name
-    FROM authorizations auth
-    JOIN authorization_chats access ON access.authorization_id=auth.id
-    JOIN lark_identities identity ON identity.identity_type='user' AND identity.contact_id IS NOT NULL
-    JOIN contacts contact ON contact.id=identity.contact_id
-    WHERE auth.id=%s AND auth.status='active' AND auth.body_consent_at IS NOT NULL
-      AND access.is_visible AND access.sync_enabled AND identity.open_id <> auth.open_id
-      AND (
-        (access.p2p_counterpart_type='user' AND access.p2p_counterpart_open_id=identity.open_id)
-        OR EXISTS (SELECT 1 FROM chat_members member
-            WHERE member.chat_id=access.chat_id AND member.open_id=identity.open_id
-              AND member.member_type='user' AND member.last_observed_by_authorization_id=auth.id)
-        OR EXISTS (SELECT 1 FROM authorization_message_observations observation
-            JOIN chat_messages message ON message.chat_id=observation.chat_id
-              AND message.message_id=observation.message_id
-            WHERE observation.authorization_id=auth.id AND observation.chat_id=access.chat_id
-              AND observation.observed_at >= auth.body_consent_at AND NOT message.is_deleted
-              AND message.sender_open_id=identity.open_id)
-      )
-      AND (%s::uuid IS NULL OR identity.contact_id=%s)
-      AND (%s='' OR identity.display_name ILIKE %s ESCAPE '\\' OR contact.display_name ILIKE %s ESCAPE '\\'
-           OR identity.open_id=%s)
-    ORDER BY display_name, identity.open_id LIMIT %s
+    WITH scoped_authorization AS MATERIALIZED (
+        SELECT id,open_id,body_consent_at FROM authorizations
+        WHERE id=%s AND status='active' AND body_consent_at IS NOT NULL
+    ), visible_chats AS MATERIALIZED (
+        SELECT access.chat_id,access.p2p_counterpart_open_id,access.p2p_counterpart_type,
+               auth.id AS authorization_id,auth.body_consent_at
+        FROM scoped_authorization auth JOIN authorization_chats access ON access.authorization_id=auth.id
+        WHERE access.is_visible AND access.sync_enabled
+    ), identities AS MATERIALIZED (
+        SELECT identity.contact_id,identity.open_id,
+               COALESCE(identity.display_name,contact.display_name,identity.open_id) AS display_name
+        FROM scoped_authorization auth JOIN lark_identities identity
+          ON identity.identity_type='user' AND identity.contact_id IS NOT NULL AND identity.open_id<>auth.open_id
+        JOIN contacts contact ON contact.id=identity.contact_id
+        WHERE (%s::uuid[] IS NULL OR identity.contact_id=ANY(%s::uuid[]))
+          AND (%s='' OR identity.display_name ILIKE %s ESCAPE '\\' OR contact.display_name ILIKE %s ESCAPE '\\'
+            OR identity.open_id=%s)
+    ), visible_users AS (
+        SELECT identity.* FROM identities identity JOIN visible_chats access
+          ON access.p2p_counterpart_type='user' AND access.p2p_counterpart_open_id=identity.open_id
+        UNION
+        SELECT identity.* FROM identities identity JOIN chat_members member ON member.open_id=identity.open_id
+        JOIN visible_chats access ON access.chat_id=member.chat_id
+          AND member.member_type='user' AND member.last_observed_by_authorization_id=access.authorization_id
+        UNION
+        SELECT identity.* FROM identities identity JOIN chat_messages message ON message.sender_open_id=identity.open_id
+        JOIN visible_chats access ON access.chat_id=message.chat_id
+        JOIN authorization_message_observations observation ON observation.authorization_id=access.authorization_id
+          AND observation.chat_id=message.chat_id AND observation.message_id=message.message_id
+        WHERE NOT message.is_deleted AND observation.observed_at>=access.body_consent_at
+    )
+    SELECT * FROM visible_users ORDER BY display_name,open_id LIMIT %s
 """
 
 
@@ -181,13 +189,19 @@ def selectable_users(
     conn: Any, responsible_id: UUID, query: str = "", contact_id: UUID | None = None, limit: int = 20
 ) -> list[dict]:
     """No global directory query, no sync side effect, and no candidate-derived access."""
+    return _selectable_users(conn, responsible_id, query, [contact_id] if contact_id else None, min(max(limit, 1), 200))
+
+
+def _selectable_users(
+    conn: Any, responsible_id: UUID, query: str, contact_ids: list[UUID] | None, limit: int | None
+) -> list[dict]:
     if not responsible_id:
         return []
     query = str(query).strip()[:100]
     pattern = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
     rows = conn.execute(
         _SELECTABLE_SQL,
-        (_uuid(responsible_id), contact_id, contact_id, query, pattern, pattern, query, min(max(limit, 1), 200)),
+        (_uuid(responsible_id), contact_ids, contact_ids, query, pattern, pattern, query, limit),
     ).fetchall()
     return [
         {
@@ -348,21 +362,32 @@ def _reasons(conn: Any, row: dict, contact: dict | None) -> list[dict]:
     ]
 
 
-def _record(conn: Any, row: dict, scope: dict) -> dict:
+def _record(
+    conn: Any, row: dict, scope: dict, *, contacts: dict | None = None, source_rows: dict | None = None
+) -> dict:
     # An importer may discover that its handle already exists elsewhere. A safe
     # receipt is not a read grant to that other CM's source material or identity.
     outside_scope = not scope["is_owner"] and str(row["responsible_authorization_id"]) != scope["responsible_id"]
-    options = (
-        selectable_users(conn, row["responsible_authorization_id"], contact_id=row.get("contact_id"))
-        if row.get("contact_id") and not outside_scope
-        else []
+    if contacts is not None:
+        contact = contacts.get((row["responsible_authorization_id"], str(row.get("contact_id"))))
+    else:
+        options = (
+            selectable_users(conn, row["responsible_authorization_id"], contact_id=row.get("contact_id"))
+            if row.get("contact_id") and not outside_scope
+            else []
+        )
+        contact = options[0] if options else None
+    if outside_scope:
+        contact = None
+    sources = (
+        [dict(item) for item in source_rows.get(row["id"], [])]
+        if source_rows is not None
+        else conn.execute(
+            "SELECT id, source_type, source_key, source_data, created_at FROM creator_workflow_sources "
+            "WHERE candidate_id=%s ORDER BY created_at,id",
+            (row["id"],),
+        ).fetchall()
     )
-    contact = options[0] if options else None
-    sources = conn.execute(
-        "SELECT id, source_type, source_key, source_data, created_at FROM creator_workflow_sources "
-        "WHERE candidate_id=%s ORDER BY created_at,id",
-        (row["id"],),
-    ).fetchall()
     if outside_scope:
         sources = []
     else:
@@ -458,9 +483,28 @@ def list_records(
         """,
             (scope["responsible_id"], scope["responsible_id"], scope["is_owner"]),
         ).fetchall()
-        # ponytail: share confirmation validation for small CM rosters;
-        # paginate in SQL if rosters grow past thousands.
-        items = [_record(conn, row, scope) for row in rows]
+        # Read a CM's permitted identities once, not once per row. This cache lives
+        # only inside this request; every draft/confirmation still rechecks live scope.
+        ids_by_cm: dict[UUID, set[UUID]] = {}
+        for row in rows:
+            if row["responsible_authorization_id"] and row["contact_id"]:
+                ids_by_cm.setdefault(row["responsible_authorization_id"], set()).add(row["contact_id"])
+        contacts = {}
+        for cm_id, contact_ids in ids_by_cm.items():
+            for contact in _selectable_users(conn, cm_id, "", sorted(contact_ids, key=str), None):
+                contacts.setdefault((cm_id, contact["contact_id"]), contact)
+        source_rows: dict[UUID, list[dict]] = {}
+        if rows:
+            for item in conn.execute(
+                "SELECT id,candidate_id,source_type,source_key,source_data,created_at FROM creator_workflow_sources "
+                "WHERE candidate_id=ANY(%s::uuid[]) ORDER BY created_at,id",
+                ([row["id"] for row in rows],),
+            ).fetchall():
+                candidate_id = item.pop("candidate_id")
+                source_rows.setdefault(candidate_id, []).append(item)
+        # ponytail: keep reason filtering in Python for small rosters; move it
+        # into SQL if a single CM's roster grows past thousands of accounts.
+        items = [_record(conn, row, scope, contacts=contacts, source_rows=source_rows) for row in rows]
     summary = {
         "total": len(items),
         "pending": sum(r["status"] != "confirmed" for r in items),

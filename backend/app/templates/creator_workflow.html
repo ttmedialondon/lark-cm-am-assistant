@@ -28,5 +28,5 @@
 {% endif %}
 <dialog id="cw-evidence-dialog" class="cw-dialog cw-evidence-dialog" aria-labelledby="cw-evidence-title"><div class="cw-dialog-heading"><h2 id="cw-evidence-title">核对依据</h2><button class="btn btn-sm btn-outline-secondary" type="button" id="cw-evidence-close">关闭</button></div><p class="cw-small">仅显示你当前有权查看的会话。群聊或私聊是核对线索，不会自动证明账号归属。</p><div id="cw-evidence-feedback" class="cw-feedback" role="status" aria-live="polite" hidden></div><div class="cw-evidence-layout"><nav id="cw-conversations" aria-label="相关会话"></nav><section id="cw-messages" aria-label="会话消息"><p class="cw-empty">选择一个会话，查看记录。</p></section></div><div id="cw-message-pages" class="cw-pagination"></div></dialog>
 <script id="creator-workflow-data" type="application/json">{{ {'scope': scope, 'csrf_token': csrf_token, 'data': creator_data, 'responsibles': responsibles|default([])}|tojson }}</script>
-<script src="/static/creator-workflow.js?v=20260909-1" defer></script>
+<script src="/static/creator-workflow.js?v=20260909-2" defer></script>
 {% endblock %}
