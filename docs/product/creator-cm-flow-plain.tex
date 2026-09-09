@@ -1,0 +1,81 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper,fontset=none]{ctexart}
+\setCJKmainfont{PingFang SC}[AutoFakeBold=1.3]
+\setCJKsansfont{PingFang SC}[AutoFakeBold=1.3]
+\usepackage[top=17mm,bottom=17mm,left=19mm,right=19mm]{geometry}
+\usepackage{xcolor,tikz,enumitem,tabularx,array,booktabs,hyperref}
+\usetikzlibrary{arrows.meta}
+\hypersetup{unicode=true,hidelinks,pdftitle={我的达人：导入与确认},pdfauthor={TT Media}}
+\definecolor{ink}{HTML}{1D2C3E}
+\definecolor{muted}{HTML}{5B6977}
+\definecolor{blue}{HTML}{2864D7}
+\definecolor{pale}{HTML}{EEF4FF}
+\definecolor{green}{HTML}{EAF5EF}
+\definecolor{sand}{HTML}{FFF4DC}
+\definecolor{line}{HTML}{CBD4DF}
+\renewcommand{\familydefault}{\sfdefault}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+\linespread{1.17}
+\pagestyle{empty}
+\setlist[itemize]{leftmargin=1.3em,itemsep=5pt,topsep=3pt,parsep=0pt}
+\newcommand{\blocktitle}[2]{\vspace{6pt}{\large\bfseries\color{blue}#1}\quad{\large\bfseries #2}\par\vspace{2pt}}
+\begin{document}
+\color{ink}
+{\small\color{muted}TT MEDIA\hfill 2026.09.09 · 方案说明，尚未实施}\par
+\vspace{7pt}
+{\fontsize{25}{31}\selectfont\bfseries 我的达人：导入与确认}\par
+\vspace{4pt}
+{\large 确定的直接收，不确定的让 CM 点确认。}\par
+
+\blocktitle{01}{名单怎么进来？}
+\begin{center}
+\begin{tikzpicture}[
+  x=1cm,y=1cm,
+  box/.style={rounded corners=2.5mm,minimum height=0.84cm,text width=4.7cm,align=center,inner sep=7pt,font=\small,fill=pale},
+  arrow/.style={-{Stealth[length=2.2mm]},draw=muted,line width=0.8pt},
+  label/.style={font=\small,text=muted,fill=white,inner sep=3pt}
+]
+\node[box] (excel) at (0,0) {\textbf{Excel 导入}};
+\node[box] (ai) at (8,0) {\textbf{AI 推荐}};
+\node[box,fill=sand] (pending) at (8,-1.45) {放到“待确认”};
+\node[box,fill=pale,minimum height=1.25cm] (check) at (8,-3.1) {\textbf{CM 核对}\\是不是我负责？\\对应哪个 Lark 用户？};
+\node[box,fill=green,minimum height=1.1cm] (list) at (0,-3.1) {\textbf{放进这个 CM 的名单}\\缺少用户就标“待关联”};
+\node[box,fill=sand] (admin) at (8,-5.1) {退回管理员核对};
+\draw[arrow] (excel.south) -- node[label,align=center] {账号和负责人明确\\而且没有冲突} (list.north);
+\draw[arrow] (excel.east) -- node[label,above,sloped] {有疑问} (pending.west);
+\draw[arrow] (ai.south) -- (pending.north);
+\draw[arrow] (pending.south) -- (check.north);
+\draw[arrow] (check.west) -- node[label,above] {确认没问题} (list.east);
+\draw[arrow] (check.south) -- node[label,right] {不是我负责} (admin.north);
+\end{tikzpicture}
+\end{center}
+\vspace{-4pt}
+{\small\color{muted}AI 推荐再有把握，也要 CM 确认。连负责人都找不准，或归属有冲突的，先交管理员。}\par
+
+\blocktitle{02}{拿 Remi 举个例子}
+\begin{itemize}
+  \item \textbf{Excel 写清楚了：} \texttt{@abc} 归 Remi，账号和负责人都对得上、没有冲突，就直接放进她的名单。
+  \item \textbf{AI 猜到的：} \texttt{@xyz} 可能归 Remi，先放到“待确认”。Remi 看过再确认；推荐的人不对，就换一个用户。
+  \item \textbf{人还没找到：} 确定归 Remi，但还没找到对应的 Lark 用户，可以先收进名单，标“待关联用户”。
+\end{itemize}
+{\small\color{muted}上面的 handle 仅作说明，不是真实匹配结果。}\par
+
+\blocktitle{03}{页面就看这四列}
+\renewcommand{\arraystretch}{1.35}
+\begin{tabularx}{\linewidth}{@{}>{\centering\arraybackslash}X>{\centering\arraybackslash}X>{\centering\arraybackslash}X>{\centering\arraybackslash}X@{}}
+\toprule
+\textbf{达人 handle} & \textbf{哪里来的} & \textbf{对应用户} & \textbf{现在的状态}\\
+\bottomrule
+\end{tabularx}\par
+\vspace{6pt}
+拿不准时，再点开有权限看的聊天记录。\textbf{不用先勾群，也不要求一定有私聊。}\par
+
+\blocktitle{04}{先做哪几步？}
+\textbf{先做 Excel 导入和确认按钮}\quad$\rightarrow$\quad\textbf{再接 AI 推荐}\quad$\rightarrow$\quad\textbf{用 Remi 试一遍}\par
+\vspace{4pt}
+以后确认过的不用反复确认，只处理新增和有变化的。\par
+\vfill
+{\color{line}\hrule}\vspace{5pt}
+{\small\color{muted}一句话记住：账号归谁负责，和它对应哪个 Lark 用户，是两件可以分开完成的事。}
+\end{document}
