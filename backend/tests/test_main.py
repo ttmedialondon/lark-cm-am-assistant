@@ -53,7 +53,7 @@ def test_dashboard_is_reminder_focused_and_transparent() -> None:
     assert "权限与数据使用" in rendered
     assert "已同步消息总数" not in rendered
     assert "待我确认的达人候选" not in rendered
-    assert "我的达人（正式）" in rendered
+    assert "历史联系人归属" in rendered
     assert "暂无正式负责的达人。" in rendered
 
 
@@ -91,7 +91,7 @@ def test_dashboard_loads_confirmed_creators_when_ai_is_disabled(monkeypatch: pyt
     body = response.body.decode()
 
     assert "待我确认的达人候选" not in body
-    assert "我的达人（正式）" in body
+    assert "历史联系人归属" in body
     assert "正式达人" in body
 
 
@@ -130,7 +130,7 @@ def test_dashboard_shows_pending_candidates_and_confirmed_creators() -> None:
     assert "96%" in rendered
     assert f'/dashboard/creator-candidates/{assessment_id}/confirm' in rendered
     assert 'name="csrf_token" value="csrf"' in rendered
-    assert "我的达人（正式）" in rendered
+    assert "历史联系人归属" in rendered
     assert "正式达人" in rendered
 
 

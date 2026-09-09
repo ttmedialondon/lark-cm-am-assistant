@@ -45,6 +45,11 @@ class TemplateRenderer(Protocol):
 CurrentAuthorization = Callable[[Request], dict[str, Any] | None]
 CsrfToken = Callable[[dict[str, Any]], str]
 AI_FEATURES = {
+    "creator_workflow": {
+        "title": "达人账号候选（CM 确认）",
+        "description": "在选定 CM 的有效授权范围内按需查找账号线索；所有结果一律待本人确认，不自动认人或分配。",
+        "enabled_label": "启用新达人候选入口",
+    },
     "contact_assessment": {
         "title": "联系人身份识别",
         "description": "自动判断外部联系人的业务身份；高置信度结果才会确认身份。",

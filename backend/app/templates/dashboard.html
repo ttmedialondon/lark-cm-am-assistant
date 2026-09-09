@@ -24,6 +24,7 @@
     </div>
     <div class="page-body">
       <div class="container-xl">
+        <section class="card mb-4 border-primary"><div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3"><div><h3 class="card-title mb-1">达人名单与确认</h3><p class="text-secondary mb-0">查看 Excel 和 AI 来源；缺失资料可先补齐，再确认入库。</p></div><a class="btn btn-primary" href="/dashboard/creators">打开达人名单</a></div></section>
         {% if creator_setup_preview_enabled %}
         <section class="card mb-4 border-primary" aria-labelledby="creator-setup-preview-title">
           <div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3">
@@ -57,7 +58,7 @@
         </div>
         {% endif %}
         <div class="card mt-4">
-          <div class="card-header"><h3 class="card-title">我的达人（正式）</h3></div>
+          <div class="card-header"><h3 class="card-title">历史联系人归属</h3><a class="ms-auto" href="/dashboard/creators?status=confirmed">查看账号级正式名单</a></div>
           {% if creator_workbench is defined and creator_workbench.confirmed_creators %}
           <div class="table-responsive"><table class="table table-vcenter card-table">
             <thead><tr><th>达人</th><th>状态</th><th>开始负责</th></tr></thead>

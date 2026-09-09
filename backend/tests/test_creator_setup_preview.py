@@ -240,4 +240,4 @@ def test_dashboard_entry_matches_live_access_without_loading_roster(monkeypatch,
     response = client.get("/dashboard")
     assert response.status_code == 200
     assert (f'href="{PATH}"' in response.text) is visible
-    assert "我的达人（正式）" in response.text
+    assert "历史联系人归属" in response.text

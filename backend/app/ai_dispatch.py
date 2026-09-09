@@ -42,6 +42,9 @@ def can_claim(conn: psycopg.Connection) -> bool:
             UNION ALL
             SELECT id FROM contact_assignment_assessments
             WHERE status = 'running' AND lease_until > NOW()
+            UNION ALL
+            SELECT id FROM creator_workflow_ai_tasks
+            WHERE status = 'running' AND lease_until > NOW()
         ) AS active
         """
     ).fetchone()

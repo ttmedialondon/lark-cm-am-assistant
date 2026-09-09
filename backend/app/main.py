@@ -19,7 +19,14 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import admin, admin_permissions, contact_assignments, creator_review, creator_setup_preview
+from . import (
+    admin,
+    admin_permissions,
+    contact_assignments,
+    creator_review,
+    creator_setup_preview,
+    creator_workflow_routes,
+)
 from .admin_reporting import sync_summary
 from .config import get_settings
 from .crypto import TokenCipher
@@ -603,3 +610,8 @@ app.include_router(
         csrf_token=_admin_csrf_token,
     )
 )
+app.include_router(creator_workflow_routes.create_router(
+    current_authorization=_current_authorization,
+    render_template=_template,
+    csrf_token=_admin_csrf_token,
+))
