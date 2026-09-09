@@ -30,6 +30,7 @@ REASON_LABELS = {
     "handle_uncertain": "handle 尚不确定",
     "source_conflict": "新来源与已记录信息不一致",
     "missing_relationship": "请选择达人本人或代表关系",
+    "details_changed": "资料已修改，请重新核对账号、用户及关系",
 }
 COMPUTED_REASONS = frozenset(
     {
@@ -582,6 +583,49 @@ def _editable(row: dict) -> None:
         raise WorkflowInputError("只有待确认记录可以修改；正式关联和已否认记录须另行核对。")
 
 
+def recheck_candidate(scope: dict, candidate_id: UUID, version: int) -> dict:
+    """Suggest current-scope users for saved data, without selecting or promoting anyone."""
+    with connection() as conn, conn.transaction():
+        scope = _fresh(conn, scope, write=True)
+        row = _candidate(conn, candidate_id, scope)
+        _version(row, version)
+        _editable(row)
+        record = _record(conn, row, scope)
+        handle = row["normalized_handle"]
+        suggestions = {}
+        if handle:
+            known = conn.execute(
+                """SELECT DISTINCT mapping.contact_id FROM social_accounts account
+                JOIN contact_social_accounts mapping ON mapping.social_account_id=account.id
+                WHERE account.platform=%s AND account.normalized_handle=%s AND mapping.status='confirmed'""",
+                (row["platform"], handle),
+            ).fetchall()
+            exact = (
+                _selectable_users(conn, row["responsible_authorization_id"], "", [m["contact_id"] for m in known], 20)
+                if known else []
+            )
+            for user in exact:
+                suggestions[user["contact_id"]] = {
+                    **user, "match_type": "existing_account", "match_label": "已有账号关联，仍需你核对",
+                }
+            for user in selectable_users(conn, row["responsible_authorization_id"], query=handle):
+                suggestions.setdefault(user["contact_id"], {
+                    **user, "match_type": "name_match", "match_label": "名称包含 handle，仅供参考",
+                })
+        items = list(suggestions.values())[:20]
+        notice = (
+            "请先补充 handle 并保存；也可以直接搜索你拥有的用户。" if not handle else
+            "已重新检查。以下是你当前可见范围内的建议，需你选择并核对，不会自动关联。" if items else
+            "已重新检查，暂未找到建议用户。可手动搜索你拥有的用户；未补齐的信息仍保留待确认。"
+        )
+        if any(r["code"] in {"ownership_conflict", "identity_conflict"} for r in record["reasons"]):
+            notice = "已重新检查，账号与现有归属或用户关联存在冲突，不能直接入库，请核对。"
+        return {
+            "candidate_id": record["id"], "version": record["version"], "handle": handle,
+            "items": items, "reasons": record["reasons"], "notice": notice,
+        }
+
+
 def save_draft(
     scope: dict,
     candidate_id: UUID,
@@ -623,6 +667,14 @@ def save_draft(
         _editable(row)
         if set(resolved_reasons) - set(row["uncertainties"]):
             raise WorkflowInputError("只能解除当前记录中明确列出的待核对项。")
+        changed = (handle, contact_id, relationship) != (
+            row["normalized_handle"], row["contact_id"], row["relationship"]
+        )
+        # A previous acknowledgement cannot travel to a different account or person.
+        # Even when explicitly supplied, details_changed cannot be cleared in the edit itself.
+        uncertainties = set(row["uncertainties"]) - set(resolved_reasons)
+        if changed:
+            uncertainties.add("details_changed")
         if contact_id:
             _lock_contact_scope(conn, _uuid(scope["responsible_id"]), contact_id)
         if handle:
@@ -659,7 +711,7 @@ def save_draft(
                     uncertainties=%s,version=version+1,updated_at=NOW() WHERE id=%s RETURNING *""",
                     (
                         contact_id,
-                        sorted((set(row["uncertainties"]) | set(duplicate["uncertainties"])) - set(resolved_reasons)),
+                        sorted(uncertainties | (set(duplicate["uncertainties"]) - set(resolved_reasons))),
                         duplicate["id"],
                     ),
                 ).fetchone()
@@ -667,7 +719,7 @@ def save_draft(
         updated = conn.execute(
             """UPDATE creator_workflow_candidates SET normalized_handle=%s,contact_id=%s,relationship=%s,
             uncertainties=%s,status='pending',version=version+1,updated_at=NOW() WHERE id=%s RETURNING *""",
-            (handle, contact_id, relationship, sorted(set(row["uncertainties"]) - set(resolved_reasons)), row["id"]),
+            (handle, contact_id, relationship, sorted(uncertainties), row["id"]),
         ).fetchone()
         return _finish(conn, scope, updated, request_id, digest, "draft_saved", row)
 

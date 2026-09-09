@@ -19,7 +19,8 @@ const rows = items => ({items, summary: {total: items.length, pending: items.fil
 async function fixture(t, {readonly = false, owner = false, item = candidate()} = {}) {
   const scope = {responsible_id: "cm-remi", responsible_name: "Remi", readonly, can_write: !readonly,
     can_admin: owner, can_import: !readonly || owner};
-  const state = {items: [item], calls: [], holdSave: null};
+  const state = {items: [item], calls: [], holdSave: null, holdRecheck: null, holdConfirm: null,
+    recheckItems: [{...contacts[0], match_type: "handle", match_label: "账号相似"}]};
   const rendered = spawnSync(path.join(backend, ".venv/bin/python"), ["-c",
     "import json,sys; from jinja2 import Environment,FileSystemLoader,select_autoescape; data=json.load(sys.stdin); print(Environment(loader=FileSystemLoader('app/templates'),autoescape=select_autoescape()).get_template('creator_workflow.html').render(**data))"],
     {cwd: backend, input: JSON.stringify({scope, authorization: {display_name: "Tester"}, csrf_token: "test-csrf", creator_data: rows(state.items), responsibles: [{id: "cm-other", display_name: "Other CM"}]}), encoding: "utf8"});
@@ -49,12 +50,28 @@ async function fixture(t, {readonly = false, owner = false, item = candidate()} 
     if (url.pathname.endsWith("/draft")) {
       const body = request.postDataJSON(); assert.equal(request.headers()["x-csrf-token"], "test-csrf");
       if (state.holdSave) await state.holdSave();
+      const identityChanged = body.handle !== state.items[0].handle || body.contact_id !== (state.items[0].contact?.contact_id || null)
+        || body.relationship !== state.items[0].relationship;
       state.items[0] = {...state.items[0], handle: body.handle, contact: contacts.find(c => c.contact_id === body.contact_id) || null,
         relationship: body.relationship, version: state.items[0].version + 1,
         reasons: state.items[0].reasons.filter(r => !body.resolved_reasons.includes(r.code) && !(r.code === "missing_handle" && body.handle) && !(r.code === "missing_user" && body.contact_id))};
+      if (identityChanged) state.items[0].reasons = [...state.items[0].reasons.filter(r => r.code !== "details_changed"),
+        {code: "details_changed", label: "资料已修改，请重新核对账号、用户及关系", resolvable: true}];
       return json(state.items[0]);
     }
-    if (url.pathname.endsWith("/confirm")) { state.items[0] = {...state.items[0], status: "confirmed", reasons: [], version: state.items[0].version + 1}; return json(state.items[0]); }
+    if (url.pathname.endsWith("/recheck")) {
+      const snapshot = {...state.items[0]};
+      assert.equal(url.searchParams.get("version"), String(snapshot.version));
+      if (state.holdRecheck) await state.holdRecheck();
+      if (state.recheckError) return route.fulfill({status: 500, json: {detail: "重新检查暂不可用"}});
+      return json({candidate_id: snapshot.id, version: snapshot.version, handle: snapshot.handle,
+        items: state.recheckItems, reasons: snapshot.reasons, notice: "检索结果仅为建议，请核对后选择；不会自动关联或入库。"});
+    }
+    if (url.pathname.endsWith("/confirm")) {
+      if (state.holdConfirm) await state.holdConfirm();
+      state.items[0] = {...state.items[0], status: "confirmed", reasons: [], version: state.items[0].version + 1};
+      return json(state.items[0]);
+    }
     if (url.pathname.endsWith("/assign")) { state.items[0] = {...state.items[0], responsible_id: request.postDataJSON().responsible_id, status: "pending", version: state.items[0].version + 1}; return json(state.items[0]); }
     if (url.pathname.endsWith("/import/preview")) return json({batch_id: "batch-1", rows: [{sheet: "Sheet1", row: 2, handle: null, status: "pending", reasons: ["缺用户"]}], summary: {total: 1, ready: 0, pending: 1, invalid: 0}});
     if (url.pathname.endsWith("/import/batch-1/commit")) return json({imported: 1, formal: 0, pending: 1, skipped: 0, items: [{handle: null, status: "pending", reasons: ["缺用户"]}]});
@@ -72,8 +89,12 @@ test("real-result selection, missing values and draft/confirm remain distinct", 
   const {page, state, errors} = await fixture(t);
   const row = page.locator("#cw-rows tr");
   assert.equal(await row.locator(".cw-handle").textContent(), "—");
+  assert.equal(await row.locator(".cw-user-name").textContent(), "—");
   assert(await row.getByRole("button", {name: "确认并入库", exact: true}).isDisabled());
   const search = row.getByPlaceholder("搜索我的 Lark 用户");
+  assert(!(await search.isVisible()));
+  assert(!(await row.getByPlaceholder("填写 handle").isVisible()));
+  await row.getByRole("button", {name: "选择用户", exact: true}).click();
   await search.fill("none"); await row.getByText("未找到可选用户，仍保留为待确认。").waitFor();
   await search.fill("fail"); await row.getByText("搜索失败：搜索暂不可用").waitFor();
   await search.fill("Same"); await row.locator(".cw-search-results button").nth(1).waitFor();
@@ -81,14 +102,24 @@ test("real-result selection, missing values and draft/confirm remain distinct", 
   await row.locator(".cw-search-results button").nth(1).click();
   assert((await row.locator(".cw-user").textContent()).includes("稳定身份 2"));
   assert.equal(state.calls.filter(c => c.method === "POST").length, 0);
+  await row.getByRole("button", {name: "填写 handle", exact: true}).click();
   await row.getByPlaceholder("填写 handle").fill("correct.handle");
   await row.getByLabel("这位用户与账号的关系").selectOption("representative");
   await row.getByLabel("已核对：AI 推荐待核对").check();
   await row.getByLabel("我确认由我负责，且所选用户及关系正确").check();
-  await row.getByRole("button", {name: "保存草稿", exact: true}).click();
-  await page.getByText("草稿已保存，仍在待确认。").first().waitFor();
+  assert(await row.getByRole("button", {name: "确认并入库", exact: true}).isDisabled());
+  await Promise.all([
+    page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/recheck")),
+    row.getByRole("button", {name: "保存并重新检查", exact: true}).click(),
+  ]);
+  await row.getByLabel("已核对：资料已修改，请重新核对账号、用户及关系").waitFor();
   assert.equal(state.items[0].status, "pending");
   assert.equal(state.items[0].contact.contact_id, "user-2");
+  assert(!(await row.getByLabel("我确认由我负责，且所选用户及关系正确").isChecked()));
+  assert(await row.getByRole("button", {name: "确认并入库", exact: true}).isDisabled());
+  assert.equal(state.calls.filter(c => c.url.pathname.endsWith("/confirm")).length, 0);
+  for (const checkbox of await row.getByLabel(/^已核对：/).all()) await checkbox.check();
+  await row.getByLabel("我确认由我负责，且所选用户及关系正确").check();
   await row.getByRole("button", {name: "确认并入库", exact: true}).click();
   await row.getByText("已确认入库", {exact: true}).waitFor();
   assert.equal(state.calls.filter(c => c.url.pathname.endsWith("/confirm")).length, 1);
@@ -99,19 +130,163 @@ test("a late draft response preserves edits typed while save is in flight", asyn
   const {page, state, errors} = await fixture(t);
   let release; state.holdSave = () => new Promise(resolve => { release = resolve; });
   const row = page.locator("#cw-rows tr");
+  await row.getByRole("button", {name: "填写 handle", exact: true}).click();
   await row.getByPlaceholder("填写 handle").fill("first.handle");
-  await Promise.all([page.waitForRequest(request => request.url().includes("/draft")), row.getByRole("button", {name: "保存草稿", exact: true}).click()]);
+  await Promise.all([page.waitForRequest(request => request.url().includes("/draft")), row.getByRole("button", {name: "保存并重新检查", exact: true}).click()]);
   await row.getByPlaceholder("填写 handle").fill("newer.handle");
   release();
-  await page.getByText("草稿已保存，仍在待确认。").first().waitFor();
+  await row.getByText("资料已修改，请重新核对账号、用户及关系", {exact: true}).waitFor();
   assert.equal(await row.getByPlaceholder("填写 handle").inputValue(), "newer.handle");
   assert.equal(state.items[0].handle, "first.handle");
+  assert(await row.getByRole("button", {name: "确认并入库", exact: true}).isDisabled());
+  assert.equal(await row.getByRole("button", {name: "选择此用户", exact: true}).count(), 0);
+  assert.deepEqual(errors, []);
+});
+
+test("recheck proposes users without selecting one and supports an explicit choice", async t => {
+  const {page, state, errors} = await fixture(t);
+  const row = page.locator("#cw-rows tr");
+  await row.getByRole("button", {name: "填写 handle", exact: true}).click();
+  await row.getByPlaceholder("填写 handle").fill("suggested.handle");
+  await row.getByRole("button", {name: "保存并重新检查", exact: true}).click();
+  const choose = row.getByRole("button", {name: "选择此用户", exact: true});
+  await choose.waitFor();
+  if (process.env.CW_SCREENSHOT_DIR) await page.screenshot({path: path.join(process.env.CW_SCREENSHOT_DIR, "creator-workflow-recheck.png"), fullPage: true});
+  assert.equal(await row.locator(".cw-user-name").textContent(), "—");
+  assert.equal(state.items[0].contact, null);
+  assert.equal(state.calls.filter(c => c.url.pathname.endsWith("/draft")).length, 1);
+  assert.equal(state.calls.filter(c => c.url.pathname.endsWith("/confirm")).length, 0);
+  assert(await row.getByRole("button", {name: "确认并入库", exact: true}).isDisabled());
+  await choose.click();
+  assert((await row.locator(".cw-user").textContent()).includes("稳定身份 1"));
+  assert.equal(await row.getByLabel("这位用户与账号的关系").inputValue(), "");
+  assert.equal(state.items[0].contact, null);
+  assert.equal(state.calls.filter(c => c.method === "POST").length, 1);
+  assert(await row.getByRole("button", {name: "确认并入库", exact: true}).isDisabled());
+  assert.deepEqual(errors, []);
+});
+
+test("editing a handle or choosing a different user invalidates previous verification", async t => {
+  const item = {...candidate(), handle: "old.handle", contact: contacts[0], relationship: "owner",
+    reasons: [{code: "ai_review", label: "AI 推荐待核对", resolvable: true}]};
+  const {page, state, errors} = await fixture(t, {item});
+  const row = page.locator("#cw-rows tr"), ack = row.getByLabel("我确认由我负责，且所选用户及关系正确");
+  const reviewed = row.getByLabel("已核对：AI 推荐待核对");
+  await reviewed.check(); await ack.check();
+  assert(!(await row.getByRole("button", {name: "确认并入库", exact: true}).isDisabled()));
+  await row.getByRole("button", {name: "修改 handle", exact: true}).click();
+  await row.getByPlaceholder("填写 handle").fill("corrected.handle");
+  assert(!(await reviewed.isChecked())); assert(!(await ack.isChecked()));
+  assert(await row.getByRole("button", {name: "确认并入库", exact: true}).isDisabled());
+  await reviewed.check(); await ack.check();
+  await row.getByRole("button", {name: "更换用户", exact: true}).click();
+  await row.getByPlaceholder("搜索我的 Lark 用户").fill("Same");
+  await row.locator(".cw-search-results button").nth(1).click();
+  assert(!(await reviewed.isChecked())); assert(!(await ack.isChecked()));
+  assert.equal(await row.getByLabel("这位用户与账号的关系").inputValue(), "");
+  assert((await row.locator(".cw-user").textContent()).includes("稳定身份 2"));
+  assert.equal(state.calls.filter(c => c.method === "POST").length, 0);
+  assert.deepEqual(errors, []);
+});
+
+test("late recheck suggestions are discarded if the handle changes during retrieval", async t => {
+  const {page, state, errors} = await fixture(t);
+  let release; state.holdRecheck = () => new Promise(resolve => { release = resolve; });
+  const row = page.locator("#cw-rows tr");
+  await row.getByRole("button", {name: "填写 handle", exact: true}).click();
+  await row.getByPlaceholder("填写 handle").fill("first.handle");
+  await Promise.all([
+    page.waitForRequest(request => new URL(request.url()).pathname.endsWith("/recheck")),
+    row.getByRole("button", {name: "保存并重新检查", exact: true}).click(),
+  ]);
+  await row.getByPlaceholder("填写 handle").fill("newer.handle");
+  release();
+  await page.getByText(/你刚修改的内容仍未保存/).first().waitFor();
+  assert.equal(await row.getByPlaceholder("填写 handle").inputValue(), "newer.handle");
+  assert.equal(state.items[0].handle, "first.handle");
+  assert.equal(await row.getByRole("button", {name: "选择此用户", exact: true}).count(), 0);
+  assert(await row.getByRole("button", {name: "确认并入库", exact: true}).isDisabled());
+  assert.deepEqual(errors, []);
+});
+
+test("a failed recheck keeps saved details pending and can be retried without automatic association", async t => {
+  const {page, state, errors} = await fixture(t);
+  state.recheckError = true;
+  const row = page.locator("#cw-rows tr");
+  await row.getByRole("button", {name: "填写 handle", exact: true}).click();
+  await row.getByPlaceholder("填写 handle").fill("saved.handle");
+  await row.getByRole("button", {name: "保存并重新检查", exact: true}).click();
+  await row.getByText(/重新检查暂不可用/).waitFor();
+  assert.equal(state.items[0].handle, "saved.handle");
+  assert.equal(state.items[0].status, "pending");
+  assert.equal(state.items[0].contact, null);
+  assert(await row.getByRole("button", {name: "确认并入库", exact: true}).isDisabled());
+  state.recheckError = false; state.recheckItems = [];
+  await Promise.all([
+    page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/recheck") && response.status() === 200),
+    row.getByRole("button", {name: "保存并重新检查", exact: true}).click(),
+  ]);
+  await row.getByRole("button", {name: "选择用户", exact: true}).click();
+  await row.getByPlaceholder("搜索我的 Lark 用户").fill("Same");
+  await row.locator(".cw-search-results button").first().waitFor();
+  assert.equal(state.calls.filter(c => c.url.pathname.endsWith("/confirm")).length, 0);
+  assert.deepEqual(errors, []);
+});
+
+test("confirm locks identity editing and suggestions even after the list refreshes", async t => {
+  const item = {...candidate(), handle: "checked.handle", contact: contacts[0], relationship: "owner", reasons: []};
+  const {page, state, errors} = await fixture(t, {item});
+  state.recheckItems = [{...contacts[1], match_type: "handle", match_label: "账号相似"}];
+  let release; state.holdConfirm = () => new Promise(resolve => { release = resolve; });
+  const row = page.locator("#cw-rows tr");
+  await row.getByRole("button", {name: "保存并重新检查", exact: true}).click();
+  await row.getByRole("button", {name: "选择此用户", exact: true}).waitFor();
+  await row.getByRole("button", {name: "修改 handle", exact: true}).click();
+  await row.getByRole("button", {name: "更换用户", exact: true}).click();
+  await Promise.all([
+    page.waitForRequest(request => request.url().includes("q=slow")),
+    row.getByPlaceholder("搜索我的 Lark 用户").fill("slow"),
+  ]);
+  await row.getByLabel("我确认由我负责，且所选用户及关系正确").check();
+  await Promise.all([
+    page.waitForRequest(request => new URL(request.url()).pathname.endsWith("/confirm")),
+    row.getByRole("button", {name: "确认并入库", exact: true}).click(),
+  ]);
+  async function assertLocked() {
+    for (const name of ["选择此用户", "更换用户", "清除", "修改 handle", "重新载入此行"]) {
+      assert(await row.getByRole("button", {name, exact: true}).isDisabled(), `${name} must stay disabled during confirmation`);
+    }
+    for (const control of await row.locator("input,select,button").all()) assert(await control.isDisabled());
+    await row.getByRole("button", {name: "选择此用户", exact: true}).evaluate(button => button.click());
+    assert((await row.locator(".cw-user").textContent()).includes("稳定身份 1"));
+  }
+  state.releaseSearch();
+  await row.locator(".cw-search-results button").first().waitFor();
+  assert.equal(await row.locator(".cw-search-results button").count(), 2);
+  await row.locator(".cw-search-results button").nth(1).evaluate(button => button.click());
+  await assertLocked();
+  await Promise.all([
+    page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/data")),
+    page.getByRole("button", {name: "刷新列表", exact: true}).click(),
+  ]);
+  await row.getByRole("button", {name: "选择此用户", exact: true}).waitFor();
+  await assertLocked();
+  release();
+  await row.getByText("已确认入库", {exact: true}).waitFor();
+  assert.equal(state.items[0].contact.contact_id, "user-1");
+  assert.equal(state.items[0].handle, "checked.handle");
+  assert.equal(state.items[0].relationship, "owner");
+  assert.equal(state.calls.filter(c => c.url.pathname.endsWith("/draft")).length, 1);
+  assert.equal(state.calls.filter(c => c.url.pathname.endsWith("/confirm")).length, 1);
   assert.deepEqual(errors, []);
 });
 
 test("reviewer sees no writing, search or evidence-view controls", async t => {
   const {page, state, errors} = await fixture(t, {readonly: true});
   assert.equal(await page.getByPlaceholder("搜索我的 Lark 用户").count(), 0);
+  for (const name of ["选择用户", "更换用户", "填写 handle", "修改 handle", "保存并重新检查", "选择此用户"]) {
+    assert.equal(await page.getByRole("button", {name, exact: true}).count(), 0);
+  }
   assert.equal(await page.locator("#cw-import-open, #cw-ai-scan, #cw-confirm-selected").count(), 0);
   assert.equal(await page.locator("#cw-responsible").inputValue(), "cm-remi");
   assert.equal(state.calls.length, 0);
@@ -147,6 +322,7 @@ test("source filter offers AI and Excel and a shared record retains both labels 
 test("late search results cannot replace a newer query and clearing requires selection again", async t => {
   const {page, state, errors} = await fixture(t);
   const row = page.locator("#cw-rows tr"), search = row.getByPlaceholder("搜索我的 Lark 用户");
+  await row.getByRole("button", {name: "选择用户", exact: true}).click();
   await Promise.all([page.waitForRequest(request => request.url().includes("q=slow")), search.fill("slow")]);
   await search.fill("none"); await row.getByText("未找到可选用户，仍保留为待确认。").waitFor();
   state.releaseSearch();

@@ -6,13 +6,16 @@
   function newDraft(item) {
     return {version: item.version, handle: item.handle || "", contact: item.contact || null,
       relationship: item.relationship || "", resolved_reasons: [], acknowledged: false,
-      dirty: false, revision: 0, request: null, searchOpen: !item.contact};
+      dirty: false, identityDirty: false, revision: 0, request: null, searchOpen: false,
+      handleOpen: false, recheck: null,
+      recheckRequired: (item.reasons || []).some(reason => reasonCode(reason) === "details_changed")};
   }
   function missingFields(draft, item) {
     const missing = [];
     if (!draft.handle.trim() || /^[—–-]+$/.test(draft.handle.trim())) missing.push("handle");
     if (!draft.contact?.contact_id) missing.push("对应用户（请从搜索结果中选中）");
     if (!["owner", "representative"].includes(draft.relationship)) missing.push("用户与账号的关系");
+    if (draft.identityDirty || draft.recheckRequired) missing.push("请先保存并重新检查修改后的资料");
     for (const reason of item.reasons || []) {
       if (reason.resolvable && !draft.resolved_reasons.includes(reasonCode(reason))) missing.push(reason.label);
       if (["missing_cm", "ownership_conflict", "identity_conflict"].includes(reasonCode(reason))) missing.push(reason.label);
@@ -29,7 +32,9 @@
   function savedDraft(draft, item, sentRevision) {
     if (draft.revision === sentRevision) {
       const fresh = newDraft(item);
-      return {...fresh, acknowledged: draft.acknowledged, searchOpen: draft.searchOpen};
+      return {...fresh, acknowledged: draft.identityDirty ? false : draft.acknowledged,
+        searchOpen: draft.searchOpen, handleOpen: draft.handleOpen, recheck: draft.recheck,
+        recheckRequired: draft.identityDirty || draft.recheckRequired};
     }
     return {...draft, version: item.version, dirty: true, request: null};
   }
@@ -43,7 +48,7 @@
   const root = document.getElementById("creator-workflow");
   root.classList.toggle("cw-readonly", !writable);
   const $ = id => document.getElementById(id);
-  const drafts = new Map(), records = new Map(), selected = new Set(), busy = new Set();
+  const drafts = new Map(), records = new Map(), selected = new Set(), busy = new Set(), locked = new Set();
   let listing = data, page = data.page || 1, loading = 0, aiTimer = null, importPreview = null;
   const form = $("cw-filters");
   const requestId = () => crypto.randomUUID();
@@ -94,6 +99,13 @@
     return drafts.get(item.id);
   };
   function changed(draft) { draft.dirty = true; draft.revision++; draft.request = null; draft.confirmRequest = null; }
+  function identityChanged(draft, row) {
+    changed(draft); draft.identityDirty = true; draft.recheckRequired = true; draft.acknowledged = false;
+    draft.resolved_reasons = []; draft.recheck = null;
+    for (const input of row.querySelectorAll("[data-acknowledgement], [data-review]")) input.checked = false;
+    const results = row.querySelector(".cw-recheck"); if (results) results.replaceChildren();
+    row.dispatchEvent(new Event("workflow-draft-change"));
+  }
   function updateSelected() {
     if (!writable) return;
     const control = $("cw-confirm-selected");
@@ -112,6 +124,17 @@
     const block = element("div"), selectedUser = element("div"), search = element("div", "", "cw-search");
     parent.append(block); block.append(selectedUser, search);
     let controller = null, generation = 0, timer = null;
+    function openSearch() { draft.searchOpen = true; search.hidden = false; showUser(); input.focus(); }
+    function chooseUser(contact) {
+      if (locked.has(parent.closest("tr").dataset.candidateId)) return;
+      generation++; clearTimeout(timer); controller?.abort();
+      draft.contact = contact; draft.relationship = ""; draft.searchOpen = !contact;
+      input.value = ""; results.replaceChildren(); status.textContent = "";
+      const row = parent.closest("tr"), relation = row.querySelector("[data-relationship]");
+      if (relation) relation.value = "";
+      identityChanged(draft, row); showUser(); search.hidden = !draft.searchOpen;
+      if (!contact) input.focus();
+    }
     function showUser() {
       selectedUser.replaceChildren();
       const contact = draft.contact;
@@ -133,13 +156,9 @@
       } else selectedUser.append(element("span", "—", "cw-user-name"));
       if (editable) {
         const actions = element("div", "", "cw-user-tools");
-        if (contact) actions.append(button("更换用户", () => { draft.searchOpen = true; search.hidden = false; input.focus(); }, "cw-link"),
-          button("清除", () => {
-            generation++; controller?.abort(); input.value = ""; results.replaceChildren();
-            draft.contact = null; draft.searchOpen = true; draft.acknowledged = false; changed(draft);
-            const ack = parent.closest("tr").querySelector("[data-acknowledgement]"); if (ack) ack.checked = false;
-            showUser(); search.hidden = false; parent.closest("tr").dispatchEvent(new Event("workflow-draft-change"));
-          }, "cw-link"));
+        const open = button(contact ? "更换用户" : "选择用户", openSearch, "cw-link");
+        open.setAttribute("aria-expanded", String(draft.searchOpen)); actions.append(open);
+        if (contact) actions.append(button("清除", () => chooseUser(null), "cw-link"));
         selectedUser.append(actions);
       }
     }
@@ -149,7 +168,11 @@
     input.placeholder = "搜索我的 Lark 用户"; input.setAttribute("aria-label", "搜索我的 Lark 用户");
     status.setAttribute("role", "status"); status.setAttribute("aria-live", "polite");
     if (editable) {
-      search.append(input, status, results); search.hidden = !draft.searchOpen;
+      search.append(input, status, results, button("收起搜索", () => {
+        generation++; clearTimeout(timer); controller?.abort(); draft.searchOpen = false;
+        search.hidden = true; results.replaceChildren(); status.textContent = ""; showUser();
+        selectedUser.querySelector("button")?.focus();
+      }, "cw-link")); search.hidden = !draft.searchOpen;
       input.addEventListener("input", () => {
         clearTimeout(timer); controller?.abort(); const stamp = ++generation;
         results.replaceChildren(); status.textContent = ""; status.classList.remove("cw-error");
@@ -161,12 +184,8 @@
             if (generation !== stamp || !block.isConnected) return;
             status.textContent = response.items.length ? "请选中具体用户；只输入姓名不会关联。" : "未找到可选用户，仍保留为待确认。";
             for (const contact of response.items) {
-              const choice = button("", () => {
-                generation++; controller?.abort(); draft.contact = contact; draft.searchOpen = false;
-                draft.acknowledged = false; changed(draft); input.value = ""; results.replaceChildren();
-                const ack = parent.closest("tr").querySelector("[data-acknowledgement]"); if (ack) ack.checked = false;
-                showUser(); search.hidden = true; parent.closest("tr").dispatchEvent(new Event("workflow-draft-change"));
-              }, "");
+              const choice = button("", () => chooseUser(contact), "");
+              choice.disabled = locked.has(parent.closest("tr").dataset.candidateId);
               choice.append(element("strong", contact.display_name || "—"), element("div", contact.identity_hint || contact.open_id || contact.contact_id, "cw-small"));
               const item = element("li"); item.append(choice); results.append(item);
             }
@@ -179,6 +198,7 @@
       });
     } else search.hidden = true;
     showUser();
+    return chooseUser;
   }
   function renderRow(item) {
     const row = element("tr"); row.dataset.candidateId = item.id;
@@ -196,32 +216,58 @@
     if (editable) {
       const input = element("input", "", "form-control"); input.value = draft.handle; input.maxLength = 80;
       input.placeholder = "填写 handle"; input.autocomplete = "off";
-      input.addEventListener("input", () => { draft.handle = input.value; draft.acknowledged = false; changed(draft); const ack = row.querySelector("[data-acknowledgement]"); if (ack) ack.checked = false; handleCell.querySelector(".cw-handle").textContent = input.value.trim() ? `@${input.value.replace(/^@/, "")}` : "—"; });
-      handleCell.append(labelInput("补充 / 修改 handle", input));
+      const editor = labelInput("达人 handle", input); editor.hidden = !draft.handleOpen;
+      const open = button(draft.handle ? "修改 handle" : "填写 handle", () => {
+        draft.handleOpen = !draft.handleOpen; editor.hidden = !draft.handleOpen;
+        open.setAttribute("aria-expanded", String(draft.handleOpen)); if (draft.handleOpen) input.focus();
+      }, "cw-link");
+      open.setAttribute("aria-expanded", String(draft.handleOpen));
+      input.addEventListener("input", () => {
+        draft.handle = input.value; identityChanged(draft, row);
+        handleCell.querySelector(".cw-handle").textContent = input.value.trim() ? `@${input.value.replace(/^@/, "")}` : "—";
+      });
+      handleCell.append(open, editor);
     }
     if (!(item.sources || []).length) sourceCell.append(element("span", "—"));
     for (const source of item.sources || []) sourceCell.append(element("span", source === "excel" ? "Excel" : source === "ai" ? "AI" : source, `cw-pill cw-pill--${source === "excel" ? "excel" : "ai"}`));
-    renderUser(userCell, draft, editable);
+    const selectUser = renderUser(userCell, draft, editable);
     if (editable) {
       const relation = element("select", "", "form-select");
       for (const [value, label] of [["", "—"], ["owner", "达人本人"], ["representative", "达人代表 / 代运营"]]) {
         const option = element("option", label); option.value = value; relation.append(option);
       }
       relation.value = draft.relationship;
-      relation.addEventListener("change", () => { draft.relationship = relation.value; draft.acknowledged = false; changed(draft); const ack = row.querySelector("[data-acknowledgement]"); if (ack) ack.checked = false; });
+      relation.dataset.relationship = "true";
+      relation.addEventListener("change", () => { draft.relationship = relation.value; identityChanged(draft, row); });
       userCell.append(labelInput("这位用户与账号的关系", relation));
+      const recheck = element("div", "", "cw-recheck"); userCell.append(recheck);
+      if (draft.recheck) {
+        recheck.append(element("p", draft.recheck.notice || "已重新检查。检索结果只供选择，不会自动关联。", "cw-small"));
+        for (const contact of draft.recheck.items || []) {
+          const suggestion = element("div", "", "cw-suggestion");
+          suggestion.append(element("strong", contact.display_name || "—"),
+            element("div", contact.identity_hint || contact.open_id || contact.contact_id, "cw-small"),
+            element("div", contact.match_label || "可能对应的用户，仍需你核对", "cw-small"),
+            button("选择此用户", () => selectUser(contact), "cw-link")); recheck.append(suggestion);
+        }
+      }
     } else if (draft.relationship) userCell.append(element("p", draft.relationship === "owner" ? "达人本人" : "达人代表 / 代运营", "cw-small"));
     statusCell.append(element("span", item.status_label || (item.status === "confirmed" ? "已确认入库" : item.status === "deferred" ? "待确认 · 暂缓" : "待确认"), `cw-pill cw-pill--${item.status === "confirmed" ? "confirmed" : "pending"}`));
-    if (draft.dirty) statusCell.append(element("div", "有未保存的补充资料", "cw-small"));
+    const editStatus = element("div", "", "cw-small"); statusCell.append(editStatus);
+    const updateEditStatus = () => { editStatus.textContent = draft.identityDirty ? "资料已修改，请保存并重新检查。" : draft.recheckRequired ? "资料已保存，尚未完成重新检查。" : draft.dirty ? "有未保存的核对结果" : ""; };
+    row.addEventListener("workflow-draft-change", updateEditStatus); updateEditStatus();
     if ((item.reasons || []).length) {
       const reasons = element("ul", "", "cw-reasons");
       for (const reason of item.reasons) reasons.append(element("li", reason.label || reasonCode(reason)));
       statusCell.append(reasons);
     }
     if (editable) {
-      for (const reason of item.reasons || []) if (reason.resolvable) statusCell.append(check(`已核对：${reason.label}`, draft.resolved_reasons.includes(reason.code), value => {
-        draft.resolved_reasons = value ? [...new Set([...draft.resolved_reasons, reason.code])] : draft.resolved_reasons.filter(code => code !== reason.code); changed(draft);
-      }));
+      for (const reason of item.reasons || []) if (reason.resolvable) {
+        const review = check(`已核对：${reason.label}`, draft.resolved_reasons.includes(reason.code), value => {
+          draft.resolved_reasons = value ? [...new Set([...draft.resolved_reasons, reason.code])] : draft.resolved_reasons.filter(code => code !== reason.code); changed(draft);
+        });
+        review.querySelector("input").dataset.review = "true"; statusCell.append(review);
+      }
       const ack = check("我确认由我负责，且所选用户及关系正确", draft.acknowledged, value => { draft.acknowledged = value; });
       ack.querySelector("input").dataset.acknowledgement = "true"; statusCell.append(ack);
       const actions = element("div", "", "cw-row-actions");
@@ -229,7 +275,7 @@
       const checkReady = () => { confirm.disabled = busy.has(item.id) || missingFields(draft, item).length > 0; };
       for (const event of ["input", "change", "workflow-draft-change"]) row.addEventListener(event, checkReady);
       checkReady();
-      actions.append(button("保存草稿", () => rowAction(item, "draft")), confirm,
+      actions.append(button("保存并重新检查", () => rowAction(item, "draft")), confirm,
         button("不是我负责", () => { if (window.confirm("这条记录将交回管理员核对，不会自动转给其他 CM。确定不是你负责？")) rowAction(item, "reject"); }),
         button("暂缓", () => rowAction(item, "defer")),
         button("重新载入此行", async () => { if (!draft.dirty || window.confirm("重新载入会放弃此行尚未保存的补充资料，继续？")) { drafts.delete(item.id); selected.delete(item.id); await load(); } }, "cw-link"));
@@ -245,6 +291,7 @@
     } else actionCell.append(element("span", item.status === "confirmed" ? "已完成" : "仅核对", "cw-small"));
     const message = element("div", "", "cw-row-feedback"); message.dataset.rowFeedback = "true"; message.setAttribute("role", "status"); actionCell.append(message);
     if (busy.has(item.id)) for (const node of row.querySelectorAll("button")) node.disabled = true;
+    if (locked.has(item.id)) setRowLocked(row, true);
     return row;
   }
   function render() {
@@ -277,13 +324,16 @@
     const row = [...$("cw-rows").children].find(node => node.dataset.candidateId === id);
     if (row) feedback(text, error, row.querySelector("[data-row-feedback]"));
   }
-  function lockRowInputs(id, locked) {
-    const row = [...$("cw-rows").children].find(node => node.dataset.candidateId === id);
-    if (!row) return;
-    for (const input of row.querySelectorAll("input,select")) {
-      if (locked && input.dataset.cwLocked === undefined) { input.dataset.cwLocked = String(input.disabled); input.disabled = true; }
-      else if (!locked && input.dataset.cwLocked !== undefined) { input.disabled = input.dataset.cwLocked === "true"; delete input.dataset.cwLocked; }
+  function setRowLocked(row, value) {
+    for (const input of row.querySelectorAll("input,select,button")) {
+      if (value && input.dataset.cwLocked === undefined) { input.dataset.cwLocked = String(input.disabled); input.disabled = true; }
+      else if (!value && input.dataset.cwLocked !== undefined) { input.disabled = input.dataset.cwLocked === "true"; delete input.dataset.cwLocked; }
     }
+  }
+  function lockRowInputs(id, value) {
+    value ? locked.add(id) : locked.delete(id);
+    const row = [...$("cw-rows").children].find(node => node.dataset.candidateId === id);
+    if (row) setRowLocked(row, value);
   }
   async function assignCandidate(item, responsibleId) {
     if (!scope.can_admin || !responsibleId || busy.has(item.id)) return;
@@ -307,12 +357,32 @@
       await load();
       throw new Error("相同 handle 的来源已合并到已有记录。请重新核对合并后的依据，再确认入库。");
     }
-    drafts.set(item.id, savedDraft(draft, updated, revision)); records.set(item.id, updated);
+    // Keep the same object: existing input listeners may still receive edits while rechecking.
+    Object.assign(draft, savedDraft(draft, updated, revision));
+    drafts.set(item.id, draft); records.set(item.id, updated);
     return updated;
   }
   async function perform(item, action) {
     let draft = getDraft(item);
-    if (action === "draft") { await save(item); return "草稿已保存，仍在待确认。"; }
+    if (action === "draft") {
+      draft.acknowledged = false; draft.recheck = null;
+      item = await save(item); draft = getDraft(item);
+      const newerEdits = "已保存提交时的资料；你刚修改的内容仍未保存，请再次检查。";
+      if (draft.dirty) return newerEdits;
+      const revision = draft.revision;
+      draft.recheckRequired = true;
+      let result;
+      try {
+        result = await api(`/${encodeURIComponent(item.id)}/recheck`, {params: {version: draft.version}});
+        if (result.candidate_id !== item.id || result.version !== draft.version) throw new Error("记录版本已变化，请刷新后重新核对。");
+      } catch (error) {
+        await load();
+        throw new Error(`资料已保存，仍在待确认；重新检查未完成：${error.message} 请重试“保存并重新检查”。`);
+      }
+      if (draft.dirty || draft.revision !== revision) return newerEdits;
+      draft.recheck = result; draft.recheckRequired = false; draft.acknowledged = false;
+      return "资料已保存并重新检查，仍在待确认。请核对用户和关系，再勾选确认入库。";
+    }
     if (action === "confirm") {
       const missing = missingFields(draft, item);
       if (missing.length) throw new Error(`还不能入库，请补齐 / 核对：${missing.join("、")}。`);
@@ -334,7 +404,7 @@
   }
   async function rowAction(item, action) {
     if (!writable || busy.has(item.id)) return;
-    busy.add(item.id); updateSelected(); rowMessage(item.id, "正在保存…");
+    busy.add(item.id); updateSelected(); rowMessage(item.id, action === "draft" ? "正在保存并重新检查…" : "正在保存…");
     try { const message = await perform(item, action); await load(); rowMessage(item.id, message); feedback(message); }
     catch (error) { rowMessage(item.id, error.message, true); }
     finally { busy.delete(item.id); lockRowInputs(item.id, false); updateSelected(); const row = [...$("cw-rows").children].find(node => node.dataset.candidateId === item.id); if (row) { row.setAttribute("aria-busy", "false"); for (const node of row.querySelectorAll("button")) node.disabled = false; row.dispatchEvent(new Event("workflow-draft-change")); } }

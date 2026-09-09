@@ -118,7 +118,13 @@ def test_search_scopes_ids_and_selection_is_only_a_draft(db, people):
     filled = workflow.save_draft(
         scope, row["id"], row["version"], handle="abc", contact_id=people["person"], relationship="owner"
     )
-    assert filled["status"] == "pending" and filled["can_confirm"]
+    assert filled["status"] == "pending" and not filled["can_confirm"]
+    assert [r["code"] for r in filled["reasons"]] == ["details_changed"]
+    filled = workflow.save_draft(
+        scope, filled["id"], filled["version"], handle="abc", contact_id=people["person"],
+        relationship="owner", resolved_reasons=["details_changed"],
+    )
+    assert filled["can_confirm"]
     assert db.execute("SELECT count(*) AS n FROM creator_account_assignments").fetchone()["n"] == 0
     cleared = workflow.save_draft(scope, filled["id"], filled["version"], handle="abc", contact_id=None)
     assert cleared["contact"] is None and not cleared["can_confirm"]
@@ -283,7 +289,7 @@ def test_unknown_and_unclear_are_distinct_and_not_auto_cleared(db, people):
     filled = workflow.save_draft(
         scope, row["id"], row["version"], handle="abc", contact_id=people["person"], relationship="owner"
     )
-    assert [r["code"] for r in filled["reasons"]] == ["identity_uncertain"]
+    assert {r["code"] for r in filled["reasons"]} == {"identity_uncertain", "details_changed"}
     assert not filled["can_confirm"]
 
 

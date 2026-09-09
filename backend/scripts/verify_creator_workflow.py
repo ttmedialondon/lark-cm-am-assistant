@@ -48,6 +48,17 @@ def main_check():
         assert scope["can_write"] is (actor_id == REMI)
         search = client.get(f"/dashboard/creators/users?responsible_id={REMI}&q=a")
         assert search.status_code == (200 if actor_id == REMI else 403)
+        pending = next((item for item in data.json()["items"] if item["status"] == "pending"), None)
+        recheck_status = None
+        if pending:
+            recheck = client.get(
+                f"/dashboard/creators/{pending['id']}/recheck?responsible_id={REMI}&version={pending['version']}"
+            )
+            recheck_status = recheck.status_code
+            assert recheck_status == (200 if actor_id == REMI else 403)
+            if actor_id == REMI:
+                assert recheck.json()["version"] == pending["version"]
+                assert recheck.json()["candidate_id"] == pending["id"]
         print(
             json.dumps(
                 {
@@ -56,6 +67,7 @@ def main_check():
                     "readonly": scope["readonly"],
                     "summary": data.json()["summary"],
                     "search_status": search.status_code,
+                    "recheck_status": recheck_status,
                 },
                 ensure_ascii=False,
             )

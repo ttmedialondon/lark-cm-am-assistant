@@ -8,6 +8,8 @@ const item = {id: "candidate", version: 4, status: "pending", handle: "example",
 test("missing fields stay empty and free text is not a selected identity", () => {
   const draft = newDraft({...item, handle: null, contact: null, relationship: null});
   assert.equal(draft.handle, "");
+  assert.equal(draft.searchOpen, false);
+  assert.equal(draft.handleOpen, false);
   assert.equal(draftBody(draft, "retry-id").handle, null);
   assert.equal(draftBody(draft, "retry-id").contact_id, null);
   draft.contact = {display_name: "Same name"};
@@ -48,6 +50,30 @@ test("late save keeps new local edits but advances the optimistic version", () =
   const noRace = savedDraft(draft, {...item, version: 5, handle: "saved-value"}, 3);
   assert.equal(noRace.handle, "saved-value");
   assert.equal(noRace.dirty, false);
+});
+
+test("identity edits and incomplete rechecks block confirmation despite checked acknowledgements", () => {
+  const draft = {...newDraft(item), acknowledged: true, identityDirty: true};
+  assert(missingFields(draft, item).includes("请先保存并重新检查修改后的资料"));
+  draft.identityDirty = false; draft.recheckRequired = true;
+  assert(missingFields(draft, item).includes("请先保存并重新检查修改后的资料"));
+  draft.recheckRequired = false;
+  assert.deepEqual(missingFields(draft, item), []);
+});
+
+test("saving identity changes resets acknowledgement and requires recheck, while review-only saves preserve it", () => {
+  const draft = {...newDraft(item), dirty: true, identityDirty: true, acknowledged: true, revision: 2,
+    resolved_reasons: ["ai_review"], handleOpen: true};
+  const updated = {...item, version: 5, reasons: [{code: "details_changed", label: "资料已修改，请重新核对账号、用户及关系", resolvable: true}]};
+  const result = savedDraft(draft, updated, 2);
+  assert.equal(result.acknowledged, false);
+  assert.equal(result.recheckRequired, true);
+  assert.deepEqual(result.resolved_reasons, []);
+  assert.equal(result.handleOpen, true);
+  assert.equal(newDraft(updated).recheckRequired, true);
+  const review = savedDraft({...draft, identityDirty: false, recheckRequired: false}, {...item, version: 5}, 2);
+  assert.equal(review.acknowledged, true);
+  assert.equal(review.recheckRequired, false);
 });
 
 test("deferred stays pending, formal and rejected are not editable pending records", () => {

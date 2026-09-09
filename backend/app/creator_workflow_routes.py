@@ -139,6 +139,17 @@ def create_router(*, current_authorization, render_template, csrf_token):
         except (ValueError, PermissionError, LookupError) as exc:
             return failure(exc)
 
+    @router.get("/{candidate_id}/recheck")
+    def recheck(request: Request, candidate_id: UUID):
+        try:
+            _, scope = authorize(request)
+            version = request.query_params.get("version", "")
+            if not version.isdecimal():
+                raise workflow.WorkflowInputError("缺少有效的记录版本，请刷新后重试。")
+            return response(workflow.recheck_candidate(scope, candidate_id, int(version)))
+        except (ValueError, PermissionError, LookupError) as exc:
+            return failure(exc)
+
     @router.post("/import/preview")
     async def import_preview(request: Request):
         try:
