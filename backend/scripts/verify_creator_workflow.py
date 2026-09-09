@@ -39,6 +39,9 @@ def main_check():
         client = TestClient(app)
         page = client.get(f"/dashboard/creators?responsible_id={REMI}")
         assert page.status_code == 200, (name, page.status_code)
+        assert '<option value="ai">AI</option>' in page.text
+        assert '<option value="excel">Excel</option>' in page.text
+        assert 'id="cw-evidence-dialog"' not in page.text
         data = client.get(f"/dashboard/creators/data?responsible_id={REMI}")
         assert data.status_code == 200, (name, data.status_code)
         scope = creator_workflow.get_scope(actor_id, REMI)

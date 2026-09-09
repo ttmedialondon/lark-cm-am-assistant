@@ -56,3 +56,16 @@ def test_client_does_not_persist_real_data_or_interpolate_it_as_html():
     assert 'credentials: "same-origin"' in script
     assert 'redirect: "error"' in script
     assert 'headers["X-CSRF-Token"] = csrfToken' in script
+
+
+def test_sources_are_only_ai_and_excel_and_evidence_view_is_removed():
+    html = render()
+    source_filter = re.search(r'<select name="source"[^>]*>(.*?)</select>', html).group(1)
+    assert set(re.findall(r'<option value="(.*?)">(.*?)</option>', source_filter)) == {
+        ("", "全部来源"), ("ai", "AI"), ("excel", "Excel"),
+    }
+    script = (APP / "static" / "creator-workflow.js").read_text()
+    for forbidden in ("查看依据", "cw-evidence-dialog", "cw-conversations", "cw-messages"):
+        assert forbidden not in html
+        assert forbidden not in script
+    assert "renderEvidence" not in script

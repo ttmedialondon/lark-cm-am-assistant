@@ -180,56 +180,6 @@
     } else search.hidden = true;
     showUser();
   }
-  function renderEvidence(cell, item) {
-    const details = element("details", "", "cw-source-details");
-    details.append(element("summary", "查看依据"));
-    for (const evidence of item.evidence || []) {
-      const source = evidence.source_data || {};
-      const sourceRows = source.row ? [source.row] : source.rows || source.source_rows || [];
-      const sourceCM = source.cm_name || [source.cm, source.tap_cm].flat().filter(Boolean).join(" / ");
-      const lines = [source.filename || source.source_filename, source.sheet || source.sheet_name,
-        sourceRows.length ? `第 ${sourceRows.join("、")} 行` : null, source.reason || source.rationale || source.summary,
-        sourceCM ? `来源负责人：${sourceCM}` : null,
-        source.original_handle || source.handle_raw ? `原始账号：${source.original_handle || source.handle_raw}` : null].filter(Boolean);
-      if (!lines.length) lines.push(evidence.label || (evidence.source_type === "excel" ? "Excel 导入来源" : "AI 推荐依据"));
-      details.append(element("div", lines.join(" · "), "cw-source-detail"));
-    }
-    details.append(button("查看相关会话记录", () => openEvidence(item), "cw-link"));
-    cell.append(details);
-  }
-  let evidenceSequence = 0;
-  async function openEvidence(item, chatId = "", messagePage = 1) {
-    const dialog = $("cw-evidence-dialog"), sequence = ++evidenceSequence;
-    $("cw-evidence-title").textContent = `${item.handle ? "@" + item.handle : "—"} · 核对依据`;
-    if (!dialog.open) dialog.showModal();
-    $("cw-conversations").replaceChildren(); $("cw-messages").replaceChildren(); $("cw-message-pages").replaceChildren();
-    feedback("正在读取当前授权范围内的记录…", false, $("cw-evidence-feedback"));
-    try {
-      const result = await api(`/${encodeURIComponent(item.id)}/evidence`, {params: {chat_id: chatId, page: messagePage}});
-      if (sequence !== evidenceSequence || !dialog.open) return;
-      feedback(result.notice || "", false, $("cw-evidence-feedback"));
-      for (const chat of result.conversations || []) {
-        const control = button("", () => openEvidence(item, chat.chat_id), "cw-conversation");
-        control.append(element("strong", chat.name || "—"), element("span", chat.chat_mode === "p2p" ? "私聊" : "群聊", "cw-small"));
-        if (chat.chat_id === chatId) control.setAttribute("aria-current", "true");
-        $("cw-conversations").append(control);
-      }
-      if (!(result.conversations || []).length) $("cw-conversations").append(element("p", "当前没有可查看的相关会话。", "cw-small"));
-      for (const message of result.messages || []) {
-        const article = element("article", "", "cw-message"), meta = element("div", "", "cw-small");
-        meta.append(element("strong", message.sender_name || "—"), element("span", message.time || "—"));
-        article.append(meta, element("p", message.text || "—")); $("cw-messages").append(article);
-      }
-      if (!(result.messages || []).length) $("cw-messages").append(element("p", chatId ? "当前授权范围内没有可展示的消息。" : "选择左侧会话，再查看记录。", "cw-empty"));
-      if (chatId && result.pages > 1) {
-        const prev = button("上一页", () => openEvidence(item, chatId, result.page - 1)); prev.disabled = result.page <= 1;
-        const next = button("下一页", () => openEvidence(item, chatId, result.page + 1)); next.disabled = result.page >= result.pages;
-        $("cw-message-pages").append(prev, element("span", `第 ${result.page} / ${result.pages} 页`), next);
-      }
-    } catch (error) { if (sequence === evidenceSequence && dialog.open) feedback(error.message, true, $("cw-evidence-feedback")); }
-  }
-  $("cw-evidence-close").addEventListener("click", () => $("cw-evidence-dialog").close());
-  $("cw-evidence-dialog").addEventListener("close", () => { evidenceSequence++; $("cw-conversations").replaceChildren(); $("cw-messages").replaceChildren(); });
   function renderRow(item) {
     const row = element("tr"); row.dataset.candidateId = item.id;
     const editable = writable && pending(item), draft = getDraft(item);
@@ -251,7 +201,7 @@
     }
     if (!(item.sources || []).length) sourceCell.append(element("span", "—"));
     for (const source of item.sources || []) sourceCell.append(element("span", source === "excel" ? "Excel" : source === "ai" ? "AI" : source, `cw-pill cw-pill--${source === "excel" ? "excel" : "ai"}`));
-    renderEvidence(sourceCell, item); renderUser(userCell, draft, editable);
+    renderUser(userCell, draft, editable);
     if (editable) {
       const relation = element("select", "", "form-select");
       for (const [value, label] of [["", "—"], ["owner", "达人本人"], ["representative", "达人代表 / 代运营"]]) {

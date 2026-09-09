@@ -11,7 +11,8 @@ const candidate = () => ({id: "candidate-1", version: 1, platform: "tiktok", han
   sources: ["excel", "ai"], contact: null, relationship: null, reasons: [
     {code: "missing_handle", label: "请补充达人 handle", resolvable: false},
     {code: "missing_user", label: "请选择对应 Lark 用户", resolvable: false},
-    {code: "ai_review", label: "AI 推荐待核对", resolvable: true}], evidence: []});
+    {code: "ai_review", label: "AI 推荐待核对", resolvable: true}],
+  evidence: [{source_type: "excel", source_data: {filename: "private-source.xlsx", reason: "Private source detail"}}]});
 const contacts = [1, 2].map(id => ({contact_id: `user-${id}`, open_id: `open-${id}`, display_name: "Same Name", identity_hint: `稳定身份 ${id}`}));
 const rows = items => ({items, summary: {total: items.length, pending: items.filter(i => i.status !== "confirmed").length,
   confirmed: items.filter(i => i.status === "confirmed").length}, total: items.length, page: 1, pages: 1});
@@ -45,8 +46,6 @@ async function fixture(t, {readonly = false, owner = false, item = candidate()} 
       if (url.searchParams.get("q") === "slow") await new Promise(resolve => { state.releaseSearch = resolve; });
       return json({items: url.searchParams.get("q") === "none" ? [] : contacts});
     }
-    if (url.pathname.endsWith("/evidence")) return json({conversations: [{chat_id: "chat-1", name: "相关群聊", chat_mode: "group"}],
-      messages: url.searchParams.get("chat_id") ? [{message_id: "message-1", sender_name: "Creator", time: "2026-09-09", text: "<script>non executable evidence</script>"}] : [], notice: "仅在当前授权范围内核对。", page: 1, pages: 1});
     if (url.pathname.endsWith("/draft")) {
       const body = request.postDataJSON(); assert.equal(request.headers()["x-csrf-token"], "test-csrf");
       if (state.holdSave) await state.holdSave();
@@ -110,18 +109,38 @@ test("a late draft response preserves edits typed while save is in flight", asyn
   assert.deepEqual(errors, []);
 });
 
-test("reviewer sees no writing/search and evidence remains lazy and text-only", async t => {
+test("reviewer sees no writing, search or evidence-view controls", async t => {
   const {page, state, errors} = await fixture(t, {readonly: true});
   assert.equal(await page.getByPlaceholder("搜索我的 Lark 用户").count(), 0);
   assert.equal(await page.locator("#cw-import-open, #cw-ai-scan, #cw-confirm-selected").count(), 0);
   assert.equal(await page.locator("#cw-responsible").inputValue(), "cm-remi");
   assert.equal(state.calls.length, 0);
-  await page.getByText("查看依据", {exact: true}).click();
-  await page.getByRole("button", {name: "查看相关会话记录"}).click();
-  await page.getByRole("button", {name: "相关群聊"}).click();
-  await page.getByText("<script>non executable evidence</script>", {exact: true}).waitFor();
-  assert.equal(state.calls.filter(c => c.method === "POST").length, 0);
-  assert.equal(await page.locator("#cw-messages script").count(), 0);
+  assert.equal(await page.getByText("查看依据", {exact: true}).count(), 0);
+  assert.equal(await page.getByRole("button", {name: "查看相关会话记录"}).count(), 0);
+  assert.equal(await page.locator("#cw-evidence-dialog, #cw-conversations, #cw-messages, .cw-source-details").count(), 0);
+  assert.equal(await page.getByText("private-source.xlsx", {exact: false}).count(), 0);
+  assert.equal(await page.getByText("Private source detail", {exact: false}).count(), 0);
+  assert.deepEqual(errors, []);
+});
+
+test("source filter offers AI and Excel and a shared record retains both labels without evidence", async t => {
+  const {page, state, errors} = await fixture(t);
+  const source = page.locator('select[name="source"]');
+  assert.deepEqual(await source.locator("option").evaluateAll(options => options.map(option => [option.value, option.textContent])),
+    [["", "全部来源"], ["ai", "AI"], ["excel", "Excel"]]);
+  const row = page.locator("#cw-rows tr");
+  assert.equal(await row.locator(".cw-pill--ai").textContent(), "AI");
+  assert.equal(await row.locator(".cw-pill--excel").textContent(), "Excel");
+  assert.equal(await row.locator("details").count(), 0);
+  assert.equal(await page.locator("#cw-evidence-dialog, #cw-conversations, #cw-messages").count(), 0);
+  for (const value of ["ai", "excel"]) {
+    await source.selectOption(value);
+    await Promise.all([
+      page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/data") && new URL(response.url()).searchParams.get("source") === value),
+      page.locator("#cw-filters").getByRole("button", {name: "查找", exact: true}).click(),
+    ]);
+  }
+  assert.equal(state.calls.filter(c => c.method === "POST" || c.url.pathname.endsWith("/evidence")).length, 0);
   assert.deepEqual(errors, []);
 });
 
