@@ -26,7 +26,7 @@
 \vspace{7pt}
 {\fontsize{25}{31}\selectfont\bfseries 我的达人：导入与确认}\par
 \vspace{4pt}
-{\large 确定的直接收，不确定的让 CM 点确认。}\par
+{\large 资料齐、关系清楚才入库；缺信息或拿不准，都待确认。}\par
 
 \blocktitle{01}{名单怎么进来？}
 \begin{center}
@@ -38,26 +38,28 @@
 ]
 \node[box] (excel) at (0,0) {\textbf{Excel 导入}};
 \node[box] (ai) at (8,0) {\textbf{AI 推荐}};
-\node[box,fill=sand] (pending) at (8,-1.45) {放到“待确认”};
-\node[box,fill=pale,minimum height=1.25cm] (check) at (8,-3.1) {\textbf{CM 核对}\\是不是我负责？\\对应哪个 Lark 用户？};
-\node[box,fill=green,minimum height=1.1cm] (list) at (0,-3.1) {\textbf{放进这个 CM 的名单}\\缺少用户就标“待关联”};
-\node[box,fill=sand] (admin) at (8,-5.1) {退回管理员核对};
-\draw[arrow] (excel.south) -- node[label,align=center] {账号和负责人明确\\而且没有冲突} (list.north);
-\draw[arrow] (excel.east) -- node[label,above,sloped] {有疑问} (pending.west);
+\node[box,fill=sand] (pending) at (8,-1.45) {\textbf{待确认}\\写明缺什么、哪里拿不准};
+\node[box,fill=pale,minimum height=1.65cm] (check) at (8,-3.55) {\textbf{CM 补齐并核对}\\handle 是什么？\\是不是我负责？\\对应哪个 Lark 用户？};
+\node[box,fill=green,minimum height=1.1cm] (list) at (0,-3.55) {\textbf{进入 CM 的正式名单}\\handle、CM、用户均已确认};
+\node[box,fill=sand] (admin) at (8,-5.85) {交管理员继续待确认};
+\draw[arrow] (excel.south) -- node[label,align=center] {handle、CM、Lark 用户\\都明确，而且没有冲突} (list.north);
+\draw[arrow] (excel.east) -- node[label,above,sloped] {缺信息或有疑问} (pending.west);
 \draw[arrow] (ai.south) -- (pending.north);
 \draw[arrow] (pending.south) -- (check.north);
-\draw[arrow] (check.west) -- node[label,above] {确认没问题} (list.east);
+\draw[arrow] (check.west) -- node[label,above,align=center] {全部补齐\\且确认无误} (list.east);
+\draw[arrow] (check.east) -- ++(0.85,0) |- (pending.east);
+\node[label,align=center] at (11.15,-2.55) {还缺信息\\或拿不准};
 \draw[arrow] (check.south) -- node[label,right] {不是我负责} (admin.north);
 \end{tikzpicture}
 \end{center}
 \vspace{-4pt}
-{\small\color{muted}AI 推荐再有把握，也要 CM 确认。连负责人都找不准，或归属有冲突的，先交管理员。}\par
+{\small\color{muted}AI 推荐一律先待确认。负责人不明或归属有冲突的，也留在待确认，由管理员核对。}\par
 
 \blocktitle{02}{拿 Remi 举个例子}
 \begin{itemize}
-  \item \textbf{Excel 写清楚了：} \texttt{@abc} 归 Remi，账号和负责人都对得上、没有冲突，就直接放进她的名单。
+  \item \textbf{Excel 资料全了：} \texttt{@abc}、Remi 和对应 Lark 用户都已确认，没有冲突，才直接入库。
   \item \textbf{AI 猜到的：} \texttt{@xyz} 可能归 Remi，先放到“待确认”。Remi 看过再确认；推荐的人不对，就换一个用户。
-  \item \textbf{人还没找到：} 确定归 Remi，但还没找到对应的 Lark 用户，可以先收进名单，标“待关联用户”。
+  \item \textbf{还有信息没齐：} 就算确定归 Remi，只要缺 handle、缺 Lark 用户，或者不知道选谁，都继续待确认，不能先入库。
 \end{itemize}
 {\small\color{muted}上面的 handle 仅作说明，不是真实匹配结果。}\par
 
@@ -69,13 +71,15 @@
 \bottomrule
 \end{tabularx}\par
 \vspace{6pt}
-拿不准时，再点开有权限看的聊天记录。\textbf{不用先勾群，也不要求一定有私聊。}\par
+待确认旁边写清原因：\textbf{缺 handle / 缺 Lark 用户 / 用户不确定 / 负责人不明。}\\
+可以补资料、换用户、保存进度；\textbf{信息没齐，不能点“确认并入库”。}\\
+聊天记录只作核对依据，不用先勾群，也不要求一定有私聊。\par
 
 \blocktitle{04}{先做哪几步？}
-\textbf{先做 Excel 导入和确认按钮}\quad$\rightarrow$\quad\textbf{再接 AI 推荐}\quad$\rightarrow$\quad\textbf{用 Remi 试一遍}\par
+\textbf{先做导入、补资料和确认}\quad$\rightarrow$\quad\textbf{再接 AI 推荐}\quad$\rightarrow$\quad\textbf{用 Remi 试一遍}\par
 \vspace{4pt}
 以后确认过的不用反复确认，只处理新增和有变化的。\par
 \vfill
 {\color{line}\hrule}\vspace{5pt}
-{\small\color{muted}一句话记住：账号归谁负责，和它对应哪个 Lark 用户，是两件可以分开完成的事。}
+{\small\color{muted}一句话记住：可以先保存线索，但不能先转正式；任何必需信息缺失或不清楚，都留待确认。}
 \end{document}
