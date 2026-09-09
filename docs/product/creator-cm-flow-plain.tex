@@ -38,7 +38,7 @@
 ]
 \node[box] (excel) at (0,0) {\textbf{Excel 导入}};
 \node[box] (ai) at (8,0) {\textbf{AI 推荐}};
-\node[box,fill=sand] (pending) at (8,-1.45) {\textbf{待确认}\\写明缺什么、哪里拿不准};
+\node[box,fill=sand] (pending) at (8,-1.45) {\textbf{待确认}\\缺的字段显示“\textemdash”};
 \node[box,fill=pale,minimum height=1.65cm] (check) at (8,-3.55) {\textbf{CM 补齐并核对}\\handle 是什么？\\是不是我负责？\\对应哪个 Lark 用户？};
 \node[box,fill=green,minimum height=1.1cm] (list) at (0,-3.55) {\textbf{进入 CM 的正式名单}\\handle、CM、用户均已确认};
 \node[box,fill=sand] (admin) at (8,-5.85) {交管理员继续待确认};
@@ -68,12 +68,15 @@
 \begin{tabularx}{\linewidth}{@{}>{\centering\arraybackslash}X>{\centering\arraybackslash}X>{\centering\arraybackslash}X>{\centering\arraybackslash}X@{}}
 \toprule
 \textbf{达人 handle} & \textbf{哪里来的} & \textbf{对应用户} & \textbf{现在的状态}\\
+\midrule
+\textemdash & Excel & \textemdash\quad\fcolorbox{line}{white}{\scriptsize 搜索我的用户} & 待确认\\
 \bottomrule
 \end{tabularx}\par
 \vspace{6pt}
-待确认旁边写清原因：\textbf{缺 handle / 缺 Lark 用户 / 用户不确定 / 负责人不明。}\\
-可以补资料、换用户、保存进度；\textbf{信息没齐，不能点“确认并入库”。}\\
-聊天记录只作核对依据，不用先勾群，也不要求一定有私聊。\par
+\textbf{缺什么，那一格就显示“\textemdash”。} 上面是搜索框示意，不是真实数据。\\
+缺对应用户时，输入姓名，\textbf{从这个 CM 自己有权查看的 Lark 用户里选中一个。}\\
+搜不到就保持横线；选中只是补资料。\textbf{资料齐全后，还要点“确认并入库”。}\\
+可以换用户、保存进度；不用先勾群，也不要求一定有私聊。\par
 
 \blocktitle{04}{先做哪几步？}
 \textbf{先做导入、补资料和确认}\quad$\rightarrow$\quad\textbf{再接 AI 推荐}\quad$\rightarrow$\quad\textbf{用 Remi 试一遍}\par
