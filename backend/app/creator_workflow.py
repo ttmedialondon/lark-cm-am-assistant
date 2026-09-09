@@ -11,6 +11,13 @@ from uuid import UUID, uuid4
 from .creator_preparation import normalize_handle
 from .db import connection
 
+# Explicit pilot grants: existing review access is still required and can revoke them.
+TEST_CM_ID = UUID("24d1ef13-3762-4359-ba11-d26c03cf1f7f")
+TEST_EDITOR_IDS = frozenset({
+    UUID("9d5f4370-6463-4c3a-a2ed-67753a1cabc0"),
+    UUID("1225b4a0-fbd8-431e-962e-25e66943a8a0"),
+})
+
 
 class WorkflowInputError(ValueError):
     """Incomplete, conflicting, or stale intake data; no partial promotion is allowed."""
@@ -113,13 +120,21 @@ def _scope(conn: Any, actor_id: UUID, responsible_id: UUID | None, *, lock: bool
         raise LookupError("找不到该负责人。")
     if target_id != actor_id and not owner and "creator-review" not in grants:
         raise PermissionError("只能查看自己的达人名单。")
-    can_write = bool(target_id == actor_id and actor["assignment_eligible"])
+    own_list = bool(target_id == actor_id and actor["assignment_eligible"])
+    test_editor = bool(
+        actor_id in TEST_EDITOR_IDS and target_id == TEST_CM_ID
+        and target and target["status"] == "active" and target["assignment_eligible"]
+        and (owner or "creator-review" in grants)
+    )
+    can_write = own_list or test_editor
     return {
         "actor_id": str(actor_id),
         "responsible_id": str(target_id) if target_id else None,
         "responsible_name": target["display_name"] if target else "管理员待确认列表",
         "can_write": can_write,
-        "can_import": can_write or owner,
+        "test_editor": test_editor,
+        "can_import": own_list or owner,
+        "can_scan": own_list or owner,
         "can_admin": owner,
         "is_owner": owner,
         "readonly": not can_write,
@@ -146,7 +161,7 @@ def list_responsibles(actor_id: UUID) -> list[dict]:
 def _fresh(conn: Any, scope: dict, *, write: bool = False) -> dict:
     current = _scope(conn, _uuid(scope["actor_id"]), _uuid(scope.get("responsible_id"), optional=True), lock=write)
     if write and not current["can_write"]:
-        raise PermissionError("只有负责这份名单的 CM 本人可以补资料和确认；评审权限不能代确认。")
+        raise PermissionError("只有负责人本人或已授权的测试账号可以补资料和确认；普通评审权限不能代确认。")
     return current
 
 

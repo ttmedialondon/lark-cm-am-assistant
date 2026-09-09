@@ -9,12 +9,14 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 APP = Path(__file__).resolve().parents[1] / "app"
 
 
-def render(*, readonly=False, owner=False):
+def render(*, readonly=False, owner=False, test_editor=False):
     env = Environment(loader=FileSystemLoader(APP / "templates"), autoescape=select_autoescape())
     return env.get_template("creator_workflow.html").render(
         authorization={"display_name": "Reviewer"},
         scope={"responsible_id": "remi-id", "responsible_name": "Remi", "readonly": readonly,
-               "can_write": not readonly, "can_import": not readonly or owner, "can_admin": owner},
+               "can_write": not readonly, "can_import": (not readonly and not test_editor) or owner,
+               "can_scan": (not readonly and not test_editor) or owner,
+               "can_admin": owner, "test_editor": test_editor},
         csrf_token="csrf-test",
         creator_data={"items": [{"handle": "</script><script>alert(1)</script>"}], "summary": {}, "page": 1},
     )
@@ -46,6 +48,16 @@ def test_owner_can_submit_sources_but_cannot_confirm_for_another_cm():
     for control in ("cw-import-open", "cw-import-dialog", "cw-ai-scan"):
         assert f'id="{control}"' in html
     assert 'id="cw-confirm-selected"' not in html
+
+
+def test_scoped_test_editor_can_edit_without_scan_or_import_permissions():
+    html = render(test_editor=True)
+    for control in ("cw-import-open", "cw-import-dialog", "cw-ai-scan"):
+        assert f'id="{control}"' not in html
+    assert 'id="cw-confirm-selected"' in html
+    assert "测试编辑：你正在操作 Remi 的真实名单。修改会保存，确认后仍归 Remi，系统记录实际操作人。" in html
+    assert "只读核对" not in html
+    assert "不能补填、代确认" not in html
 
 
 def test_client_does_not_persist_real_data_or_interpolate_it_as_html():

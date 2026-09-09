@@ -20,7 +20,7 @@
       if (reason.resolvable && !draft.resolved_reasons.includes(reasonCode(reason))) missing.push(reason.label);
       if (["missing_cm", "ownership_conflict", "identity_conflict"].includes(reasonCode(reason))) missing.push(reason.label);
     }
-    if (!draft.acknowledged) missing.push("本人负责及用户关系确认");
+    if (!draft.acknowledged) missing.push("负责人及用户关系确认");
     return missing;
   }
   function draftBody(draft, requestId) {
@@ -45,6 +45,7 @@
   if (!bootstrap) return;
   const {scope, csrf_token: csrfToken, data, responsibles = []} = JSON.parse(bootstrap.textContent);
   const writable = scope.can_write === true && !scope.readonly;
+  const canScan = scope.can_scan === true;
   const root = document.getElementById("creator-workflow");
   root.classList.toggle("cw-readonly", !writable);
   const $ = id => document.getElementById(id);
@@ -165,7 +166,8 @@
     const input = element("input", "", "form-control"), results = element("ul", "", "cw-search-results");
     const status = element("div", "", "cw-search-status");
     input.type = "search"; input.autocomplete = "off"; input.maxLength = 80;
-    input.placeholder = "搜索我的 Lark 用户"; input.setAttribute("aria-label", "搜索我的 Lark 用户");
+    input.placeholder = scope.test_editor ? `搜索 ${scope.responsible_name} 的 Lark 用户` : "搜索我的 Lark 用户";
+    input.setAttribute("aria-label", input.placeholder);
     status.setAttribute("role", "status"); status.setAttribute("aria-live", "polite");
     if (editable) {
       search.append(input, status, results, button("收起搜索", () => {
@@ -268,7 +270,7 @@
         });
         review.querySelector("input").dataset.review = "true"; statusCell.append(review);
       }
-      const ack = check("我确认由我负责，且所选用户及关系正确", draft.acknowledged, value => { draft.acknowledged = value; });
+      const ack = check(scope.test_editor ? `我已核对：仍由 ${scope.responsible_name} 负责，所选用户及关系正确` : "我确认由我负责，且所选用户及关系正确", draft.acknowledged, value => { draft.acknowledged = value; });
       ack.querySelector("input").dataset.acknowledgement = "true"; statusCell.append(ack);
       const actions = element("div", "", "cw-row-actions");
       const confirm = button("确认并入库", () => rowAction(item, "confirm"), "btn btn-primary");
@@ -276,7 +278,7 @@
       for (const event of ["input", "change", "workflow-draft-change"]) row.addEventListener(event, checkReady);
       checkReady();
       actions.append(button("保存并重新检查", () => rowAction(item, "draft")), confirm,
-        button("不是我负责", () => { if (window.confirm("这条记录将交回管理员核对，不会自动转给其他 CM。确定不是你负责？")) rowAction(item, "reject"); }),
+        button(scope.test_editor ? `不由 ${scope.responsible_name} 负责` : "不是我负责", () => { if (window.confirm(scope.test_editor ? `这条记录将交回管理员核对，不会自动转给其他 CM。确定不由 ${scope.responsible_name} 负责？` : "这条记录将交回管理员核对，不会自动转给其他 CM。确定不是你负责？")) rowAction(item, "reject"); }),
         button("暂缓", () => rowAction(item, "defer")),
         button("重新载入此行", async () => { if (!draft.dirty || window.confirm("重新载入会放弃此行尚未保存的补充资料，继续？")) { drafts.delete(item.id); selected.delete(item.id); await load(); } }, "cw-link"));
       actionCell.append(actions);
@@ -414,7 +416,7 @@
   for (const select of form.querySelectorAll("select")) select.addEventListener("change", () => { page = 1; load(); });
   $("cw-prev").addEventListener("click", () => { page = Math.max(1, page - 1); load(); });
   $("cw-next").addEventListener("click", () => { page++; load(); });
-  if (writable || scope.can_admin || scope.can_import) {
+  if (writable || canScan || scope.can_import) {
     if (writable) $("cw-confirm-selected").addEventListener("click", async () => {
       if (!selected.size || !window.confirm(`确认逐项核对过的 ${selected.size} 条记录？缺资料或存在冲突的会保留待确认，并逐项显示结果。`)) return;
       const ids = [...selected], results = $("cw-batch-results"); results.replaceChildren(); results.hidden = false;
@@ -427,9 +429,10 @@
       }
       await load(); updateSelected();
     });
-    const retryAI = (writable || scope.can_admin) ? button("重试未完成", () => startAI(true), "btn btn-outline-primary") : null;
+    const retryAI = canScan ? button("重试未完成", () => startAI(true), "btn btn-outline-primary") : null;
     if (retryAI) { retryAI.hidden = true; retryAI.id = "cw-ai-retry"; $("cw-ai-scan").after(retryAI); }
     async function startAI(retryFailed = false) {
+      if (!canScan) return;
       const control = $("cw-ai-scan"); control.disabled = true;
       if (retryAI) retryAI.hidden = true;
       try {
@@ -438,8 +441,9 @@
         pollAI();
       } catch (error) { feedback(error.message, true); control.disabled = false; }
     }
-    if (writable || scope.can_admin) $("cw-ai-scan").addEventListener("click", () => startAI());
+    if (canScan) $("cw-ai-scan").addEventListener("click", () => startAI());
     async function pollAI() {
+      if (!canScan) return;
       clearTimeout(aiTimer);
       try {
         const response = await api("/ai/status");

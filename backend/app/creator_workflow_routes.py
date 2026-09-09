@@ -16,8 +16,8 @@ from . import creator_workflow_ai as ai
 from . import creator_workflow_evidence
 from . import creator_workflow_import as imports
 
-REMI_ID = "24d1ef13-3762-4359-ba11-d26c03cf1f7f"
-REVIEWERS = {"9d5f4370-6463-4c3a-a2ed-67753a1cabc0", "1225b4a0-fbd8-431e-962e-25e66943a8a0"}
+REMI_ID = str(workflow.TEST_CM_ID)
+REVIEWERS = {str(actor_id) for actor_id in workflow.TEST_EDITOR_IDS}
 
 
 def create_router(*, current_authorization, render_template, csrf_token):

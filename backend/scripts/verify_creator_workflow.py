@@ -45,9 +45,14 @@ def main_check():
         data = client.get(f"/dashboard/creators/data?responsible_id={REMI}")
         assert data.status_code == 200, (name, data.status_code)
         scope = creator_workflow.get_scope(actor_id, REMI)
-        assert scope["can_write"] is (actor_id == REMI)
+        assert scope["can_write"] and not scope["readonly"]
+        assert scope["test_editor"] is (actor_id != REMI)
+        if actor_id != REMI:
+            assert "测试编辑" in page.text
+        assert scope["can_import"] is (name != "Shang Ma")
+        assert scope["can_scan"] is (name != "Shang Ma")
         search = client.get(f"/dashboard/creators/users?responsible_id={REMI}&q=a")
-        assert search.status_code == (200 if actor_id == REMI else 403)
+        assert search.status_code == 200
         pending = next((item for item in data.json()["items"] if item["status"] == "pending"), None)
         recheck_status = None
         if pending:
@@ -55,16 +60,16 @@ def main_check():
                 f"/dashboard/creators/{pending['id']}/recheck?responsible_id={REMI}&version={pending['version']}"
             )
             recheck_status = recheck.status_code
-            assert recheck_status == (200 if actor_id == REMI else 403)
-            if actor_id == REMI:
-                assert recheck.json()["version"] == pending["version"]
-                assert recheck.json()["candidate_id"] == pending["id"]
+            assert recheck_status == 200
+            assert recheck.json()["version"] == pending["version"]
+            assert recheck.json()["candidate_id"] == pending["id"]
         print(
             json.dumps(
                 {
                     "actor": name,
                     "page_status": page.status_code,
                     "readonly": scope["readonly"],
+                    "test_editor": scope["test_editor"],
                     "summary": data.json()["summary"],
                     "search_status": search.status_code,
                     "recheck_status": recheck_status,

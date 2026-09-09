@@ -16,9 +16,10 @@ const candidate = () => ({id: "candidate-1", version: 1, platform: "tiktok", han
 const contacts = [1, 2].map(id => ({contact_id: `user-${id}`, open_id: `open-${id}`, display_name: "Same Name", identity_hint: `稳定身份 ${id}`}));
 const rows = items => ({items, summary: {total: items.length, pending: items.filter(i => i.status !== "confirmed").length,
   confirmed: items.filter(i => i.status === "confirmed").length}, total: items.length, page: 1, pages: 1});
-async function fixture(t, {readonly = false, owner = false, item = candidate()} = {}) {
+async function fixture(t, {readonly = false, owner = false, testEditor = false, item = candidate()} = {}) {
   const scope = {responsible_id: "cm-remi", responsible_name: "Remi", readonly, can_write: !readonly,
-    can_admin: owner, can_import: !readonly || owner};
+    can_admin: owner, can_import: (!readonly && !testEditor) || owner,
+    can_scan: (!readonly && !testEditor) || owner, test_editor: testEditor};
   const state = {items: [item], calls: [], holdSave: null, holdRecheck: null, holdConfirm: null,
     recheckItems: [{...contacts[0], match_type: "handle", match_label: "账号相似"}]};
   const rendered = spawnSync(path.join(backend, ".venv/bin/python"), ["-c",
@@ -295,6 +296,35 @@ test("reviewer sees no writing, search or evidence-view controls", async t => {
   assert.equal(await page.locator("#cw-evidence-dialog, #cw-conversations, #cw-messages, .cw-source-details").count(), 0);
   assert.equal(await page.getByText("private-source.xlsx", {exact: false}).count(), 0);
   assert.equal(await page.getByText("Private source detail", {exact: false}).count(), 0);
+  assert.deepEqual(errors, []);
+});
+
+test("scoped tester can correct and confirm Remi records without AI or Excel controls", async t => {
+  const item = {...candidate(), responsible_id: "cm-remi", handle: "wrong.handle", contact: contacts[0],
+    relationship: "owner", reasons: []};
+  const {page, state, errors} = await fixture(t, {testEditor: true, item});
+  const row = page.locator("#cw-rows tr");
+  await page.getByText("测试编辑：你正在操作 Remi 的真实名单。修改会保存，确认后仍归 Remi，系统记录实际操作人。", {exact: true}).waitFor();
+  assert.equal(await page.locator("#cw-import-open, #cw-import-dialog, #cw-ai-scan, #cw-ai-retry").count(), 0);
+  assert.equal(await row.getByLabel("我确认由我负责，且所选用户及关系正确").count(), 0);
+  assert.equal(await row.getByRole("button", {name: "不是我负责", exact: true}).count(), 0);
+  assert.equal(await row.getByRole("button", {name: "不由 Remi 负责", exact: true}).count(), 1);
+  await row.getByRole("button", {name: "修改 handle", exact: true}).click();
+  await row.getByPlaceholder("填写 handle").fill("corrected.handle");
+  await row.getByRole("button", {name: "更换用户", exact: true}).click();
+  await row.getByPlaceholder("搜索 Remi 的 Lark 用户").fill("Same");
+  await row.locator(".cw-search-results button").nth(1).click();
+  await row.getByLabel("这位用户与账号的关系").selectOption("owner");
+  await row.getByRole("button", {name: "保存并重新检查", exact: true}).click();
+  await row.getByLabel("已核对：资料已修改，请重新核对账号、用户及关系").check();
+  await row.getByLabel("我已核对：仍由 Remi 负责，所选用户及关系正确").check();
+  await row.getByRole("button", {name: "确认并入库", exact: true}).click();
+  await row.getByText("已确认入库", {exact: true}).waitFor();
+  assert.equal(state.items[0].handle, "corrected.handle");
+  assert.equal(state.items[0].contact.contact_id, "user-2");
+  assert.equal(state.items[0].responsible_id, "cm-remi");
+  assert.equal(state.calls.filter(call => /\/ai\/|\/import\//.test(call.url.pathname)).length, 0);
+  assert.equal(state.calls.filter(call => call.url.pathname.endsWith("/confirm")).length, 1);
   assert.deepEqual(errors, []);
 });
 
