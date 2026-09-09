@@ -42,6 +42,8 @@ def main_check():
         assert '<option value="ai">AI</option>' in page.text
         assert '<option value="excel">Excel</option>' in page.text
         assert 'id="cw-evidence-dialog"' not in page.text
+        assert 'id="cw-reason"' not in page.text
+        assert "填好 handle、选好 Lark 用户" in page.text
         data = client.get(f"/dashboard/creators/data?responsible_id={REMI}")
         assert data.status_code == 200, (name, data.status_code)
         scope = creator_workflow.get_scope(actor_id, REMI)
@@ -53,16 +55,11 @@ def main_check():
         assert scope["can_scan"] is (name != "Shang Ma")
         search = client.get(f"/dashboard/creators/users?responsible_id={REMI}&q=a")
         assert search.status_code == 200
-        pending = next((item for item in data.json()["items"] if item["status"] == "pending"), None)
-        recheck_status = None
-        if pending:
-            recheck = client.get(
-                f"/dashboard/creators/{pending['id']}/recheck?responsible_id={REMI}&version={pending['version']}"
+        listing = data.json()
+        for item in listing["items"]:
+            assert item["can_confirm"] is (
+                item["status"] in {"pending", "deferred"} and not item["blocking_reasons"]
             )
-            recheck_status = recheck.status_code
-            assert recheck_status == 200
-            assert recheck.json()["version"] == pending["version"]
-            assert recheck.json()["candidate_id"] == pending["id"]
         print(
             json.dumps(
                 {
@@ -70,9 +67,9 @@ def main_check():
                     "page_status": page.status_code,
                     "readonly": scope["readonly"],
                     "test_editor": scope["test_editor"],
-                    "summary": data.json()["summary"],
+                    "summary": listing["summary"],
                     "search_status": search.status_code,
-                    "recheck_status": recheck_status,
+                    "simple_confirmation": True,
                 },
                 ensure_ascii=False,
             )

@@ -26,7 +26,7 @@ def db(monkeypatch):
         conn.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(psycopg.sql.Identifier(schema)))
         conn.execute(psycopg.sql.SQL("SET LOCAL search_path TO {}").format(psycopg.sql.Identifier(schema)))
         for path in sorted((Path(__file__).parents[1] / "migrations").glob("*.sql")):
-            if int(path.name[:3]) <= 28:
+            if int(path.name[:3]) <= 28 or int(path.name[:3]) == 31:
                 conn.execute(path.read_text())
         monkeypatch.setattr(workflow, "connection", lambda: nullcontext(conn))
         try:
@@ -118,7 +118,7 @@ def test_search_scopes_ids_and_selection_is_only_a_draft(db, people):
     filled = workflow.save_draft(
         scope, row["id"], row["version"], handle="abc", contact_id=people["person"], relationship="owner"
     )
-    assert filled["status"] == "pending" and not filled["can_confirm"]
+    assert filled["status"] == "pending" and filled["can_confirm"]
     assert [r["code"] for r in filled["reasons"]] == ["details_changed"]
     filled = workflow.save_draft(
         scope, filled["id"], filled["version"], handle="abc", contact_id=people["person"],
@@ -135,20 +135,9 @@ def test_ai_never_promotes_and_sources_merge(db, people):
     ai_data = {"evidence": [{"authorization_id": str(people["cm"]), "chat_id": "chat_cm", "message_id": "message1"}]}
     ai = source(people, source_type="ai", source_key="message:abc", source_data=ai_data, trusted_identity=True)
     assert ai["id"] == excel["id"] and ai["sources"] == ["ai", "excel"] and ai["status"] == "pending"
-    assert not ai["can_confirm"]
+    assert ai["can_confirm"] and ai["blocking_reasons"] == []
     scope = workflow.get_scope(people["cm"])
-    with pytest.raises(workflow.WorkflowInputError, match="未核对"):
-        workflow.confirm_candidate(scope, ai["id"], ai["version"], request_id=uuid4())
-    draft = workflow.save_draft(
-        scope,
-        ai["id"],
-        ai["version"],
-        handle="abc",
-        contact_id=people["person"],
-        relationship="owner",
-        resolved_reasons=["ai_review"],
-    )
-    confirmed = workflow.confirm_candidate(scope, draft["id"], draft["version"], request_id=uuid4())
+    confirmed = workflow.confirm_candidate(scope, ai["id"], ai["version"], request_id=uuid4())
     assert confirmed["status"] == "confirmed"
     again = source(people, source_type="ai", source_key="message:new", source_data=ai_data, trusted_identity=True)
     assert again["status"] == "confirmed" and again["version"] == confirmed["version"]
@@ -229,7 +218,7 @@ def test_unknown_handle_merges_without_duplicate_or_erasing_uncertainty(db, peop
     merged = workflow.save_draft(
         scope, first["id"], first["version"], handle="abc", contact_id=people["person"], relationship="owner"
     )
-    assert merged["id"] == known["id"] and not merged["can_confirm"]
+    assert merged["id"] == known["id"] and merged["can_confirm"]
     assert len(merged["evidence"]) == 2
     assert workflow.list_records(scope)["total"] == 1
 
@@ -290,10 +279,10 @@ def test_unknown_and_unclear_are_distinct_and_not_auto_cleared(db, people):
         scope, row["id"], row["version"], handle="abc", contact_id=people["person"], relationship="owner"
     )
     assert {r["code"] for r in filled["reasons"]} == {"identity_uncertain", "details_changed"}
-    assert not filled["can_confirm"]
+    assert filled["can_confirm"] and filled["blocking_reasons"] == []
 
 
-def test_relation_can_stay_unknown_but_cannot_promote(db, people):
+def test_unknown_relation_stays_pending_until_manual_association_confirmation(db, people):
     row = source(people, relationship=None, trusted_identity=True, source_data={"stable_open_id": "ou_person"})
     assert row["status"] == "pending" and row["relationship"] is None
     assert any(r["code"] == "missing_relationship" for r in row["reasons"])
@@ -301,9 +290,11 @@ def test_relation_can_stay_unknown_but_cannot_promote(db, people):
     saved = workflow.save_draft(
         scope, row["id"], row["version"], handle="abc", contact_id=people["person"], relationship=None
     )
-    assert not saved["can_confirm"]
-    with pytest.raises(workflow.WorkflowInputError):
-        workflow.confirm_candidate(scope, saved["id"], saved["version"], request_id=uuid4())
+    assert saved["can_confirm"] and saved["blocking_reasons"] == []
+    confirmed = workflow.confirm_candidate(scope, saved["id"], saved["version"], request_id=uuid4())
+    assert confirmed["relationship"] == "associated" and confirmed["status"] == "confirmed"
+    assert db.execute("SELECT relationship FROM contact_social_accounts").fetchone()["relationship"] == "associated"
+    assert db.execute("SELECT count(*) n FROM contact_roles").fetchone()["n"] == 0
 
 
 def test_changed_owner_creates_admin_review_and_preserves_formal(db, people):
@@ -375,12 +366,12 @@ def test_stale_version_and_forged_scope_cannot_write(db, people):
         workflow.save_draft(forged, row["id"], saved["version"], handle="abc", contact_id=None)
 
 
-def test_representative_confirmation_does_not_label_person_creator(db, people):
+def test_manual_confirmation_does_not_assert_proposed_representative_or_creator_role(db, people):
     row = source(people, relationship="representative")
     confirmed = workflow.confirm_candidate(
         workflow.get_scope(people["cm"]), row["id"], row["version"], request_id=uuid4()
     )
-    assert confirmed["relationship"] == "representative"
+    assert confirmed["relationship"] == "associated"
     assert db.execute("SELECT count(*) AS n FROM contact_roles").fetchone()["n"] == 0
 
 

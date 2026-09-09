@@ -81,3 +81,17 @@ def test_sources_are_only_ai_and_excel_and_evidence_view_is_removed():
         assert forbidden not in html
         assert forbidden not in script
     assert "renderEvidence" not in script
+
+
+def test_confirmation_has_no_relationship_review_or_recheck_steps():
+    html = render()
+    script = (APP / "static" / "creator-workflow.js").read_text()
+    for forbidden in (
+        "保存并重新检查", "这位用户与账号的关系", "data-acknowledgement",
+        "data-review", "cw-recheck", 'id="cw-reason"', '$("cw-reason")', 'name="reason"',
+    ):
+        assert forbidden not in html
+        assert forbidden not in script
+    assert 'button("确认入库"' in script
+    assert 'button("保存草稿"' in script
+    assert "/recheck" not in script

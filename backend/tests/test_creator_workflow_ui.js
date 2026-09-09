@@ -20,24 +20,19 @@ test("missing fields stay empty and free text is not a selected identity", () =>
   }
 });
 
-test("selection requires explicit acknowledgement and unresolved doubts are not auto-selected", () => {
-  const risk = {...item, reasons: [{code: "ai_review", label: "AI 推荐待核对", resolvable: true}]};
+test("handle plus a selected identity suffice without review acknowledgements or relationship", () => {
+  const risk = {...item, relationship: null, reasons: [
+    {code: "ai_review", label: "AI 推荐待核对", resolvable: true},
+    {code: "details_changed", label: "资料已修改", resolvable: true},
+    {code: "missing_relationship", label: "用户关系待核对", resolvable: false}]};
   const draft = newDraft(risk);
-  assert.deepEqual(draft.resolved_reasons, []);
-  assert.equal(draft.acknowledged, false);
-  assert(missingFields(draft, risk).includes("AI 推荐待核对"));
-  draft.acknowledged = true;
-  assert(missingFields(draft, risk).length > 0);
-  draft.resolved_reasons = ["ai_review"];
   assert.deepEqual(missingFields(draft, risk), []);
-  assert.equal(draftBody(draft, "request").contact_id, "actual-id");
-  assert.equal(draftBody(draft, "request").version, 4);
-});
-
-test("a conflict cannot be bypassed with a local resolution checkbox", () => {
-  const risk = {...item, reasons: [{code: "ownership_conflict", label: "归属冲突", resolvable: false}]};
-  const draft = {...newDraft(risk), acknowledged: true, resolved_reasons: ["ownership_conflict"]};
-  assert(missingFields(draft, risk).includes("归属冲突"));
+  assert.deepEqual(draftBody(draft, "request"), {
+    version: 4, handle: "example", contact_id: "actual-id", request_id: "request",
+  });
+  for (const field of ["relationship", "resolved_reasons", "acknowledged", "identityDirty", "recheckRequired", "recheck"]) {
+    assert.equal(field in draft, false, `${field} is no longer a confirmation step`);
+  }
 });
 
 test("late save keeps new local edits but advances the optimistic version", () => {
@@ -52,28 +47,24 @@ test("late save keeps new local edits but advances the optimistic version", () =
   assert.equal(noRace.dirty, false);
 });
 
-test("identity edits and incomplete rechecks block confirmation despite checked acknowledgements", () => {
-  const draft = {...newDraft(item), acknowledged: true, identityDirty: true};
-  assert(missingFields(draft, item).includes("请先保存并重新检查修改后的资料"));
-  draft.identityDirty = false; draft.recheckRequired = true;
-  assert(missingFields(draft, item).includes("请先保存并重新检查修改后的资料"));
-  draft.recheckRequired = false;
+test("complete edits can be confirmed and emptying either field makes the draft incomplete", () => {
+  const draft = {...newDraft(item), dirty: true, handle: "corrected.handle", contact: {contact_id: "another-id"}};
   assert.deepEqual(missingFields(draft, item), []);
+  draft.handle = "";
+  assert(missingFields(draft, item).includes("handle"));
+  draft.handle = "corrected.handle"; draft.contact = null;
+  assert(missingFields(draft, item).some(reason => reason.includes("对应用户")));
 });
 
-test("saving identity changes resets acknowledgement and requires recheck, while review-only saves preserve it", () => {
-  const draft = {...newDraft(item), dirty: true, identityDirty: true, acknowledged: true, revision: 2,
-    resolved_reasons: ["ai_review"], handleOpen: true};
-  const updated = {...item, version: 5, reasons: [{code: "details_changed", label: "资料已修改，请重新核对账号、用户及关系", resolvable: true}]};
+test("saving corrected identity preserves editor visibility and does not add another verification gate", () => {
+  const draft = {...newDraft(item), dirty: true, revision: 2, handleOpen: true, searchOpen: true};
+  const updated = {...item, version: 5, reasons: [{code: "details_changed", label: "资料已修改", resolvable: true}]};
   const result = savedDraft(draft, updated, 2);
-  assert.equal(result.acknowledged, false);
-  assert.equal(result.recheckRequired, true);
-  assert.deepEqual(result.resolved_reasons, []);
+  assert.equal(result.version, 5);
+  assert.equal(result.dirty, false);
   assert.equal(result.handleOpen, true);
-  assert.equal(newDraft(updated).recheckRequired, true);
-  const review = savedDraft({...draft, identityDirty: false, recheckRequired: false}, {...item, version: 5}, 2);
-  assert.equal(review.acknowledged, true);
-  assert.equal(review.recheckRequired, false);
+  assert.equal(result.searchOpen, true);
+  assert.deepEqual(missingFields(result, updated), []);
 });
 
 test("deferred stays pending, formal and rejected are not editable pending records", () => {

@@ -90,24 +90,22 @@ def test_recheck_reports_conflict_without_exposing_out_of_scope_user(db, people)
     assert str(people["other"]) not in str(result) and "ou_other" not in str(result)
 
 
-def test_identity_edits_invalidate_previous_acknowledgement_until_separate_review(db, people):
+def test_identity_edits_are_ready_for_one_manual_confirmation_without_separate_review(db, people):
     row = source(people)
     scope = workflow.get_scope(people["cm"])
     changed = workflow.save_draft(
         scope, row["id"], row["version"], handle="corrected", contact_id=people["person"], relationship="owner",
     )
-    assert not changed["can_confirm"]
+    assert changed["can_confirm"] and changed["blocking_reasons"] == []
     assert [r["code"] for r in changed["reasons"]] == ["details_changed"]
     changed = workflow.save_draft(
         scope, changed["id"], changed["version"], handle="corrected_again", contact_id=people["person"],
         relationship="owner", resolved_reasons=["details_changed"],
     )
-    assert not changed["can_confirm"]
+    assert changed["can_confirm"]
     assert [r["code"] for r in changed["reasons"]] == ["details_changed"]
     result = workflow.recheck_candidate(scope, changed["id"], changed["version"])
     assert result["reasons"] == changed["reasons"]
-    with pytest.raises(workflow.WorkflowInputError, match="未核对"):
-        workflow.confirm_candidate(scope, changed["id"], changed["version"], request_id=uuid4())
     reviewed = workflow.save_draft(
         scope, changed["id"], changed["version"], handle="corrected_again", contact_id=people["person"],
         relationship="owner", resolved_reasons=["details_changed"],
@@ -117,7 +115,7 @@ def test_identity_edits_invalidate_previous_acknowledgement_until_separate_revie
         scope, reviewed["id"], reviewed["version"], handle="corrected_again", contact_id=people["person"],
         relationship="representative",
     )
-    assert not relation_changed["can_confirm"]
+    assert relation_changed["can_confirm"]
     assert db.execute("SELECT count(*) n FROM creator_account_assignments").fetchone()["n"] == 0
 
 

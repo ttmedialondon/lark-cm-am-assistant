@@ -315,7 +315,7 @@ def _lock_contact_scope(conn: Any, responsible_id: UUID, contact_id: UUID) -> di
     return options[0]
 
 
-def _conflicts(conn: Any, row: dict) -> list[str]:
+def _conflicts(conn: Any, row: dict, *, manual: bool = False) -> list[str]:
     if not row.get("normalized_handle"):
         return []
     owners = conn.execute(
@@ -341,9 +341,9 @@ def _conflicts(conn: Any, row: dict) -> list[str]:
     ).fetchall()
     reasons = []
     for known in owners:
-        if (row.get("contact_id") and str(known["contact_id"]) != str(row["contact_id"])) or known[
-            "relationship"
-        ] != row["relationship"]:
+        if (row.get("contact_id") and str(known["contact_id"]) != str(row["contact_id"])) or (
+            not manual and known["relationship"] != row["relationship"]
+        ):
             reasons.append("identity_conflict")
     for known in owners + legacy:
         if known["responsible_authorization_id"] and str(known["responsible_authorization_id"]) != str(
@@ -352,7 +352,7 @@ def _conflicts(conn: Any, row: dict) -> list[str]:
             reasons.append("ownership_conflict")
         if (
             row.get("contact_id")
-            and known["relationship"] == row["relationship"]
+            and (manual or known["relationship"] == row["relationship"])
             and str(known["contact_id"]) != str(row["contact_id"])
         ):
             reasons.append("identity_conflict")
@@ -371,7 +371,7 @@ def _reasons(conn: Any, row: dict, contact: dict | None) -> list[dict]:
             codes.append(reason)
     if row.get("contact_id") and not contact:
         codes.append("contact_unavailable")
-    codes += _conflicts(conn, row)
+    codes += _conflicts(conn, row, manual=True)
     return [
         {"code": code, "label": REASON_LABELS.get(code, code), "resolvable": code not in COMPUTED_REASONS}
         for code in dict.fromkeys(codes)
@@ -425,6 +425,7 @@ def _record(
         else []
     )
     source_types = sorted({s["source_type"] for s in sources})
+    blocking_reasons = [r for r in reasons if r["code"] in COMPUTED_REASONS - {"missing_relationship"}]
     return {
         "id": str(row["id"]),
         "version": row["version"],
@@ -448,8 +449,11 @@ def _record(
         "sources": source_types,
         "source_label": " + ".join("Excel" if s == "excel" else "AI" for s in source_types),
         "reasons": reasons,
+        "blocking_reasons": blocking_reasons,
         "evidence": [{**s, "id": str(s["id"])} for s in sources],
-        "can_confirm": bool(scope["can_write"] and row["status"] in {"pending", "deferred"} and not reasons),
+        "can_confirm": bool(
+            scope["can_write"] and row["status"] in {"pending", "deferred"} and not blocking_reasons
+        ),
     }
 
 
@@ -682,11 +686,13 @@ def save_draft(
         _editable(row)
         if set(resolved_reasons) - set(row["uncertainties"]):
             raise WorkflowInputError("只能解除当前记录中明确列出的待核对项。")
+        # Keep source metadata for the same pair, never carry an old role to edits.
+        if relationship is None and (handle, contact_id) == (row["normalized_handle"], row["contact_id"]):
+            relationship = row["relationship"]
         changed = (handle, contact_id, relationship) != (
             row["normalized_handle"], row["contact_id"], row["relationship"]
         )
-        # A previous acknowledgement cannot travel to a different account or person.
-        # Even when explicitly supplied, details_changed cannot be cleared in the edit itself.
+        # Keep an identity-edit trace for audit; manual confirmation resolves it.
         uncertainties = set(row["uncertainties"]) - set(resolved_reasons)
         if changed:
             uncertainties.add("details_changed")
@@ -709,7 +715,7 @@ def save_draft(
                     or contact_id
                     and duplicate["contact_id"]
                     and duplicate["contact_id"] != contact_id
-                    or duplicate["relationship"] != relationship
+                    or relationship and duplicate["relationship"] and duplicate["relationship"] != relationship
                 ):
                     raise WorkflowInputError("这个 handle 已在另一条记录中，请先核对现有记录，不能覆盖或重复入库。")
                 conn.execute(
@@ -723,9 +729,12 @@ def save_draft(
                 )
                 updated = conn.execute(
                     """UPDATE creator_workflow_candidates SET contact_id=COALESCE(%s,contact_id),
+                    relationship=%s,
                     uncertainties=%s,version=version+1,updated_at=NOW() WHERE id=%s RETURNING *""",
                     (
                         contact_id,
+                        duplicate["relationship"] if not contact_id or contact_id == duplicate["contact_id"]
+                        else relationship,
                         sorted(uncertainties | (set(duplicate["uncertainties"]) - set(resolved_reasons))),
                         duplicate["id"],
                     ),
@@ -761,7 +770,7 @@ def _promote(conn: Any, row: dict, scope: dict, source: str) -> dict:
             "SELECT * FROM creator_account_assignments WHERE social_account_id=%s AND ended_at IS NULL FOR UPDATE",
             (account["id"],),
         ).fetchall()
-    if _conflicts(conn, row):
+    if _conflicts(conn, row, manual=source == "cm_confirmation"):
         raise WorkflowInputError("现有账号归属或用户关联有冲突，已保留待确认，不会覆盖旧关系。")
     if account:
         current = conn.execute(
@@ -788,6 +797,20 @@ def _promote(conn: Any, row: dict, scope: dict, source: str) -> dict:
             VALUES(%s,%s,%s,%s) RETURNING id""",
             (uuid4(), row["platform"], row["normalized_handle"], "@" + row["normalized_handle"]),
         ).fetchone()
+    elif source == "cm_confirmation":
+        # Reuse an established relationship without inventing a new owner claim.
+        known = conn.execute(
+            """SELECT relationship FROM contact_social_accounts
+            WHERE social_account_id=%s AND contact_id=%s AND status='confirmed'
+            ORDER BY relationship='owner' DESC,relationship LIMIT 1""",
+            (account["id"], row["contact_id"]),
+        ).fetchone()
+        if known:
+            row = {**row, "relationship": known["relationship"]}
+            conn.execute(
+                "UPDATE creator_workflow_candidates SET relationship=%s WHERE id=%s",
+                (row["relationship"], row["id"]),
+            )
     conn.execute(
         """INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source,
           reviewed_by_authorization_id,reviewed_at)
@@ -837,7 +860,15 @@ def confirm_candidate(scope: dict, candidate_id: UUID, version: int, *, request_
         row = _candidate(conn, candidate_id, scope, lock=True)
         _version(row, version)
         _editable(row)
-        updated = _promote(conn, row, scope, "cm_confirmation")
+        if not all(row.get(k) for k in ("normalized_handle", "responsible_authorization_id", "contact_id")):
+            raise WorkflowInputError("handle、负责人和对应 Lark 用户必须全部补齐后才能入库。")
+        # This explicit click confirms the displayed account/user pair. Historical
+        # flags stay in source records and the audit's before snapshot, not a checklist.
+        reviewed = conn.execute(
+            """UPDATE creator_workflow_candidates SET relationship='associated',
+            uncertainties='{}' WHERE id=%s RETURNING *""", (row["id"],),
+        ).fetchone()
+        updated = _promote(conn, reviewed, scope, "cm_confirmation")
         return _finish(conn, scope, updated, request_id, digest, "confirmed", row)
 
 
@@ -1038,7 +1069,7 @@ def ingest_source(
                 or contact_id
                 and row["contact_id"] != contact_id
                 or relationship
-                and row["relationship"] != relationship
+                and row["relationship"] not in {"associated", relationship}
             )
         ):
             # Preserve the formal row and assignment. A changed proposal is a separate
