@@ -454,6 +454,33 @@ def test_rate_limit_has_a_finite_retry_budget(monkeypatch, run_harness, attempts
     assert bool(throttled) == (expected == "queued")
 
 
+@pytest.mark.parametrize("failure_kind", ["database", "timeout"])
+def test_execution_failures_keep_safe_stage_without_replaying_model(monkeypatch, run_harness, caplog, failure_kind):
+    h = run_harness
+    secret = "private-chat-and-api-key"
+    failure = psycopg.errors.DeadlockDetected(secret)
+    if failure_kind == "timeout":
+        failure = ai.contact_assessments.ContactAssessmentInputError(secret)
+        failure.__cause__ = ai.httpx.ReadTimeout(secret)
+
+    def fail(*_args, **_kwargs):
+        raise failure
+
+    if failure_kind == "database":
+        monkeypatch.setattr(ai.creator_workflow, "ingest_source", fail)
+    else:
+        monkeypatch.setattr(ai.contact_assessments, "call_openai", fail)
+    ai.run_claimed_creator_scan(h.job, h.settings)
+    args, kwargs = h.finished[0]
+    assert args[1] == "failed" and not h.ingested
+    assert secret not in args[2] + caplog.text
+    if failure_kind == "database":
+        assert "保存结果失败：数据库死锁" in args[2] and "OpenAI 已返回" in args[2]
+        assert kwargs["response"]["response_id"] == "response" and len(h.model_calls) == 1
+    else:
+        assert "OpenAI 请求超时" in args[2] and kwargs["response"] is None
+
+
 def test_same_evidence_never_reopens_a_denied_source(monkeypatch, run_harness):
     h = run_harness
     original = ai.connection
@@ -672,10 +699,14 @@ def test_real_queue_claim_model_candidate_and_unchanged_incremental(pg, real_sca
     assert ai.queue_scan(ids["owner"], ids["cm"])["run_id"] == run["id"]
     job = ai.claim_next_creator_scan()
     assert job["attempts"] == 1 and job["chat_id"] == "chat"
+    assert ai.scan_status(ids["owner"], ids["cm"])["dispatch"] == {
+        "max_concurrency": 3, "running_count": 1, "status": "ready",
+    }
     ai.run_claimed_creator_scan(job, settings)
     status = ai.scan_status(ids["owner"], ids["cm"])
     assert status["status"] == "succeeded", status
     assert status["candidate_count"] == 1 and status["counts"] == {"succeeded": 1}
+    assert status["error_summary"] == [] and status["dispatch"]["running_count"] == 0
     row = pg.execute("SELECT * FROM creator_workflow_candidates").fetchone()
     assert row["status"] == "confirmed" and row["responsible_authorization_id"] == ids["cm"]
     assert row["contact_id"] == ids["person"] and row["normalized_handle"] == "alice"
@@ -690,7 +721,12 @@ def test_real_queue_claim_model_candidate_and_unchanged_incremental(pg, real_sca
         == 0
     )
     advance_scan(pg)
-    again = start_scan(pg, ids["owner"], ids["cm"])
+    ai.queue_scan(ids["owner"], ids["cm"])
+    preparing = ai.scan_status(ids["owner"], ids["cm"])
+    assert preparing["status"] == "scanning" and preparing["counts"] == {}
+    assert preparing["error_summary"] == [] and "id" not in preparing
+    advance_scan(pg)
+    again = ai.scan_status(ids["owner"], ids["cm"])
     assert again["total_chats"] == 0 and len(calls) == 1
     assert ai.claim_next_creator_scan() is None
 
@@ -746,7 +782,14 @@ def test_real_failed_output_is_retryable_only_by_explicit_request(pg, real_scan,
     monkeypatch.setattr(ai.contact_assessments, "call_openai", lambda *_a, **_k: {"text": "refusal"})
     start_scan(pg, ids["owner"], ids["cm"])
     ai.run_claimed_creator_scan(ai.claim_next_creator_scan(), settings)
-    assert ai.scan_status(ids["owner"], ids["cm"])["status"] == "failed"
+    status = ai.scan_status(ids["owner"], ids["cm"])
+    assert status["status"] == "failed"
+    assert status["error_summary"] == [{
+        "status": "invalid", "count": 1,
+        "message": "AI 未返回有效的结构化结果。本段未生成候选。",
+    }]
+    assert status["errors"] == [status["error_summary"][0]["message"]]
+    assert status["dispatch"]["running_count"] == 0
     advance_scan(pg)
     assert onboarding.get_status(pg, ids["cm"])["status"] == "failed"
     assert ai.claim_next_creator_scan() is None

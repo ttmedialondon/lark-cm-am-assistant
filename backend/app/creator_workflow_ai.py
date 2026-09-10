@@ -12,6 +12,8 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
+import psycopg
 from cryptography.exceptions import InvalidTag
 
 from . import ai_dispatch, contact_assessments, creator_workflow
@@ -257,11 +259,16 @@ def scan_status(actor_id, responsible_id) -> dict | None:
     with connection() as conn:
         creator_workflow._scope(conn, actor_id, responsible_id)
         onboarding = get_status(conn, responsible_id)
+        dispatch = {"max_concurrency": ai_dispatch.MAX_CONCURRENT_REQUESTS,
+                    "running_count": 0, "status": ai_dispatch.status(conn)["state"]}
         run = conn.execute(
-            """SELECT * FROM creator_workflow_ai_runs WHERE responsible_authorization_id = %s
-               ORDER BY (id=(SELECT run_id FROM creator_workflow_onboarding WHERE authorization_id=%s))
-                 DESC NULLS LAST,created_at DESC,id DESC LIMIT 1""",
-            (responsible_id, responsible_id),
+            """SELECT run.* FROM creator_workflow_ai_runs run
+               LEFT JOIN creator_workflow_onboarding initial
+                 ON initial.authorization_id=run.responsible_authorization_id
+               WHERE run.responsible_authorization_id=%s
+                 AND (initial.authorization_id IS NULL OR run.id=initial.run_id)
+               ORDER BY run.created_at DESC,run.id DESC LIMIT 1""",
+            (responsible_id,),
         ).fetchone()
         if not run:
             return (
@@ -270,30 +277,34 @@ def scan_status(actor_id, responsible_id) -> dict | None:
                     "counts": {},
                     "candidate_count": 0,
                     "errors": [],
+                    "error_summary": [],
+                    "dispatch": dispatch,
                     "onboarding": onboarding,
                 }
                 if onboarding
                 else None
             )
         counts = conn.execute(
-            """SELECT status, COUNT(*) AS count, SUM(candidate_count) AS candidate_count
+            """SELECT status, COUNT(*) AS count, SUM(candidate_count) AS candidate_count,
+                      COUNT(*) FILTER (WHERE status='running' AND lease_until>NOW()) AS leased_count
                FROM creator_workflow_ai_tasks WHERE run_id = %s GROUP BY status""",
             (run["id"],),
         ).fetchall()
         errors = conn.execute(
-            """SELECT error_message FROM (
-                 SELECT DISTINCT ON (t.chat_id) t.status, t.error_message, t.created_at
-                 FROM creator_workflow_ai_tasks t JOIN creator_workflow_ai_runs r ON r.id = t.run_id
-                 WHERE r.responsible_authorization_id = %s ORDER BY t.chat_id, t.created_at DESC
-               ) latest WHERE status <> 'succeeded' AND error_message IS NOT NULL
-               ORDER BY created_at DESC LIMIT 5""",
-            (responsible_id,),
+            """SELECT status,error_message AS message,COUNT(*) AS count
+               FROM creator_workflow_ai_tasks WHERE run_id=%s
+                 AND status IN ('failed','invalid','cancelled')
+               GROUP BY status,error_message ORDER BY count DESC,status,error_message""",
+            (run["id"],),
         ).fetchall()
+        dispatch["running_count"] = sum(r["leased_count"] for r in counts)
     return {
         **dict(run),
         "counts": {r["status"]: r["count"] for r in counts},
         "candidate_count": sum(r["candidate_count"] or 0 for r in counts),
-        "errors": [r["error_message"] for r in errors],
+        "errors": [r["message"] for r in errors if r["message"]],
+        "error_summary": [dict(r) for r in errors],
+        "dispatch": dispatch,
         "onboarding": onboarding,
     }
 
@@ -817,6 +828,7 @@ def _finish(job, status, error=None, *, retry_delay=None, response=None, model=N
 
 def run_claimed_creator_scan(job: Mapping[str, Any], settings: Settings) -> None:
     response = None
+    stage = "准备消息"
     try:
         with connection() as conn:
             config = conn.execute(
@@ -850,6 +862,7 @@ def run_claimed_creator_scan(job: Mapping[str, Any], settings: Settings) -> None
             ).fetchone()
             if not task or task["status"] != "running" or task["attempts"] != job["attempts"] or not task["leased"]:
                 return
+        stage = "请求 OpenAI"
         response = contact_assessments.call_openai(
             config,
             key,
@@ -859,7 +872,9 @@ def run_claimed_creator_scan(job: Mapping[str, Any], settings: Settings) -> None
             output_format=_format(evidence),
             max_output_tokens=4800,
         )
+        stage = "校验 AI 结果"
         candidates = _validate(response["text"], evidence)
+        stage = "保存结果"
         with connection() as conn, conn.transaction():
             task = conn.execute(
                 """SELECT status, attempts, lease_until > NOW() AS leased
@@ -965,8 +980,19 @@ def run_claimed_creator_scan(job: Mapping[str, Any], settings: Settings) -> None
                 ),
             )
             _refresh_run(conn, job["run_id"])
-    except (InvalidModelOutput, contact_assessments._ModelOutputError):
-        _finish(job, "invalid", "模型拒答、输出不完整或缺少真实依据；未生成候选。", response=response)
+    except (InvalidModelOutput, contact_assessments._ModelOutputError) as exc:
+        message = {
+            "unfinished response": "OpenAI 返回未完成，可能达到输出上限或被中断。",
+            "invalid response": "OpenAI 返回格式无法读取。",
+            "invalid json": "AI 未返回有效的结构化结果。",
+            "invented quote": "AI 引用与消息原文不符，未通过依据校验。",
+            "invented handle": "AI 提供的 handle 未出现在所引用的依据中。",
+            "invented alternate handle": "AI 提供的备用 handle 未出现在依据中。",
+            "unknown reference": "AI 引用的消息编号无效。",
+            "unknown identity": "AI 选择了本次输入范围外的用户或负责人。",
+            "unsupported attribution": "AI 未提供达人身份或归属所需的消息依据。",
+        }.get(str(exc), "AI 输出格式或依据未通过校验。")
+        _finish(job, "invalid", message + "本段未生成候选。", response=response)
     except contact_assessments.OpenAIRequestError as exc:
         if exc.is_quota:
             ai_dispatch.pause_for_quota()
@@ -982,7 +1008,19 @@ def run_claimed_creator_scan(job: Mapping[str, Any], settings: Settings) -> None
         )
     except (PermissionError, ScanInputError, creator_workflow.WorkflowInputError):
         _finish(job, "cancelled", "授权、资料或来源发生变化；未生成候选。", response=response)
+    except contact_assessments.ContactAssessmentInputError as exc:
+        message = "OpenAI 请求超时" if isinstance(exc.__cause__, httpx.TimeoutException) else "OpenAI 连接异常"
+        _finish(job, "failed", message + "；未收到可用结果，本段未生成候选。", response=response)
+    except psycopg.Error as exc:
+        category = {
+            "40P01": "数据库死锁", "40001": "数据库并发冲突", "55P03": "数据库锁等待失败",
+            "57014": "数据库查询被中止或超时", "23505": "数据库记录重复冲突",
+            "23503": "数据库关联约束冲突",
+        }.get(exc.sqlstate, "数据库处理异常")
+        # Only fixed labels and task IDs: never exception prose, SQL or chat content.
+        LOGGER.warning("creator scan failed: task=%s stage=%s category=%s", job["id"], stage, category)
+        received = "OpenAI 已返回" if response else "尚未取得 AI 结果"
+        _finish(job, "failed", f"{stage}失败：{category}；{received}，本段未保存。", response=response)
     except Exception:
-        # Exception details may include database values or decrypted payloads.
-        LOGGER.warning("creator workflow scan failed; no user content logged")
-        _finish(job, "failed", "AI 扫描未完成；未生成候选，请检查服务状态。", response=response)
+        LOGGER.warning("creator scan failed: task=%s stage=%s category=internal_error", job["id"], stage)
+        _finish(job, "failed", f"{stage}发生程序异常；本段未保存，需检查服务日志。", response=response)

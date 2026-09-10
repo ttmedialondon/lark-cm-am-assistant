@@ -16,11 +16,11 @@ const candidate = () => ({id: "candidate-1", version: 1, platform: "tiktok", han
 const contacts = [1, 2].map(id => ({contact_id: `user-${id}`, open_id: `open-${id}`, display_name: "Same Name", identity_hint: `稳定身份 ${id}`}));
 const rows = items => ({items, summary: {total: items.length, pending: items.filter(i => i.status !== "confirmed").length,
   confirmed: items.filter(i => i.status === "confirmed").length}, total: items.length, page: 1, pages: 1});
-async function fixture(t, {readonly = false, owner = false, testEditor = false, actorName = "Tester", item = candidate(), onboarding = null} = {}) {
+async function fixture(t, {readonly = false, owner = false, testEditor = false, actorName = "Tester", item = candidate(), onboarding = null, run = null} = {}) {
   const scope = {responsible_id: "cm-remi", responsible_name: "Remi", readonly, can_write: !readonly,
     can_admin: owner, can_import: (!readonly && !testEditor) || owner,
     can_scan: (!readonly && !testEditor) || owner, test_editor: testEditor};
-  const state = {items: [item], calls: [], holdSave: null, holdConfirm: null, onboarding, run: null};
+  const state = {items: [item], calls: [], holdSave: null, holdConfirm: null, onboarding, run};
   const rendered = spawnSync(path.join(backend, ".venv/bin/python"), ["-c",
     "import json,sys; from jinja2 import Environment,FileSystemLoader,select_autoescape; data=json.load(sys.stdin); print(Environment(loader=FileSystemLoader('app/templates'),autoescape=select_autoescape()).get_template('creator_workflow.html').render(**data))"],
     {cwd: backend, input: JSON.stringify({scope, authorization: {display_name: actorName}, csrf_token: "test-csrf", creator_data: rows(state.items), responsibles: [{id: "cm-other", display_name: "Other CM"}]}), encoding: "utf8"});
@@ -84,6 +84,7 @@ async function fixture(t, {readonly = false, owner = false, testEditor = false, 
       assert.equal(typeof request.postDataJSON().request_id, "string");
       if (state.initialRetryError) return route.fulfill({status: 409, json: {error: state.initialRetryError}});
       state.onboarding = {...state.onboarding, status: "scanning", error_message: null};
+      if (state.run) state.run = {...state.run, status: "queued", errors: [], error_summary: []};
       return json({onboarding: state.onboarding});
     }
     if (url.pathname.endsWith("/ai/scan")) {
@@ -318,11 +319,30 @@ test("CAP Excel preflight precedes commit and the browser does not confirm AI ca
 });
 
 test("failed initial scan retries only on explicit authorized click and rejected consent changes remain stopped", async t => {
-  const onboarding = {status: "failed", total_chats: 120, checked_chats: 100, queued_chats: 3, truncated_chats: 1,
+  const onboarding = {status: "failed", total_chats: 1193, checked_chats: 100, queued_chats: 262,
     error_message: "本批有失败，请手动重试。"};
-  const {page, state, errors} = await fixture(t, {onboarding});
+  const run = {id: "run-1", status: "failed", candidate_count: 55,
+    counts: {succeeded: 212, invalid: 48, failed: 2, queued: 0, running: 0, cancelled: 0},
+    error_summary: [{status: "invalid", message: "候选未通过证据校验。", count: 48},
+      {status: "failed", message: "AI 扫描未完成；未生成候选，请检查服务状态。", count: 2}],
+    dispatch: {max_concurrency: 3, running_count: 0, status: "ready"}};
+  const {page, state, errors} = await fixture(t, {onboarding, run});
   const retry = page.getByRole("button", {name: "重试历史扫描", exact: true});
   await retry.waitFor();
+  assert.equal(await page.locator("#cw-initial-status").textContent(), "整体未完成");
+  assert((await page.locator("#cw-initial-message").textContent()).includes("后续会话未继续；已有结果已保留"));
+  assert((await page.locator("#cw-initial-counts").textContent()).includes("100 / 1193"));
+  assert((await page.locator("#cw-initial-counts").textContent()).includes("不是 AI 完成比例"));
+  assert.equal(await page.locator("#cw-batch-progress").getAttribute("value"), "212");
+  assert.equal(await page.locator("#cw-batch-progress").getAttribute("max"), "262");
+  assert((await page.locator("#cw-batch-label").textContent()).includes("80%"));
+  assert((await page.locator("#cw-batch-processed").textContent()).includes("262 / 262"));
+  assert(await page.getByText("校验未通过 · 48 段：候选未通过证据校验。", {exact: true}).isVisible());
+  assert((await page.locator("#cw-scan-error-list").textContent()).includes("执行异常 · 2 段"));
+  assert((await page.locator("#cw-scan-error-list").textContent()).includes("历史记录未保留具体异常类型"));
+  assert((await page.locator("#cw-scan-dispatch").textContent()).includes("本批正在执行 0 段"));
+  assert((await page.locator("#cw-scan-dispatch").textContent()).includes("全系统 AI 队列共享最多 3 个并行任务"));
+  if (process.env.CW_SCREENSHOT_DIR) await page.screenshot({path: path.join(process.env.CW_SCREENSHOT_DIR, "creator-workflow-progress-failed.png"), fullPage: true});
   assert.equal(state.calls.filter(call => call.method !== "GET").length, 0);
   state.initialRetryError = "正文授权已变化，旧首次筛选不可重放；请使用当前范围的手动扫描。";
   await retry.click();
@@ -331,10 +351,44 @@ test("failed initial scan retries only on explicit authorized click and rejected
   assert(!(await retry.isDisabled()));
   state.initialRetryError = null;
   await retry.click();
-  await page.locator("#cw-initial-status").getByText("筛选中", {exact: true}).waitFor();
+  await page.locator("#cw-initial-status").getByText("扫描中", {exact: true}).waitFor();
   assert(!(await retry.isVisible()));
   assert.deepEqual(state.calls.filter(call => call.method !== "GET").map(call => call.url.pathname),
     ["/dashboard/creators/ai/initial-retry", "/dashboard/creators/ai/initial-retry"]);
   assert.equal(state.items[0].status, "pending");
+  assert.deepEqual(errors, []);
+});
+
+test("progress refresh is single-flight and only refreshes roster changes without discarding drafts", async t => {
+  const onboarding = {status: "scanning", total_chats: 1193, checked_chats: 100, queued_chats: 4};
+  const run = {id: "run-1", status: "running", candidate_count: 1, counts: {succeeded: 1, queued: 2, running: 1}};
+  const {page, state, errors} = await fixture(t, {onboarding, run, item: {...candidate(), handle: "existing", contact: contacts[0]}});
+  const refresh = page.getByRole("button", {name: "刷新进度", exact: true});
+  await page.locator("#cw-initial-updated").getByText(/上次更新/).waitFor();
+  let release; state.holdStatus = () => new Promise(resolve => { release = resolve; });
+  state.run = {...run, counts: {succeeded: 2, queued: 1, running: 1}};
+  const before = state.calls.filter(call => call.url.pathname.endsWith("/ai/status")).length;
+  await Promise.all([page.waitForRequest(request => request.url().includes("/ai/status")), refresh.click()]);
+  assert(await page.getByRole("button", {name: "读取中…", exact: true}).isDisabled());
+  await page.locator("#cw-initial-refresh").evaluate(button => { button.click(); button.click(); });
+  assert.equal(state.calls.filter(call => call.url.pathname.endsWith("/ai/status")).length, before + 1);
+  state.holdStatus = null; release();
+  await page.locator("#cw-scan-succeeded").getByText("2", {exact: true}).waitFor();
+  assert.equal(state.calls.filter(call => call.url.pathname.endsWith("/data")).length, 0);
+  state.run.candidate_count = 2;
+  await Promise.all([page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/data")), refresh.click()]);
+  const row = page.locator("#cw-rows tr");
+  await row.getByRole("button", {name: "修改 handle", exact: true}).click();
+  await row.getByPlaceholder("填写 handle").fill("unsaved.handle");
+  state.run.candidate_count = 3;
+  await refresh.click();
+  await page.locator("#cw-list-stale").waitFor({state: "visible"});
+  assert.equal(await row.getByPlaceholder("填写 handle").inputValue(), "unsaved.handle");
+  assert.equal(state.calls.filter(call => call.url.pathname.endsWith("/data")).length, 1);
+  state.statusError = "暂时无法读取进度";
+  await refresh.click();
+  await page.locator("#cw-initial-status").getByText("进度读取失败", {exact: true}).waitFor();
+  assert(!(await refresh.isDisabled()));
+  assert.equal(state.calls.filter(call => call.method !== "GET").length, 0);
   assert.deepEqual(errors, []);
 });
