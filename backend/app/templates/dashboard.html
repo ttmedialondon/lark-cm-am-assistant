@@ -25,6 +25,9 @@
     <div class="page-body">
       <div class="container-xl">
         <section class="card mb-4 border-primary"><div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3"><div><h3 class="card-title mb-1">达人名单与确认</h3><p class="text-secondary mb-0">查看 Excel 和 AI 来源；缺失资料可先补齐，再确认入库。</p></div><a class="btn btn-primary" href="/dashboard/creators">打开达人名单</a></div></section>
+        {% if offhours_summary_visible %}
+        <section class="card mb-4 border-primary"><div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3"><div><h3 class="card-title mb-1">下班消息总结</h3><p class="text-secondary mb-0">Remi 已确认达人 · 看一晚发生了什么、进展怎样、哪些事情要先看。</p></div><a class="btn btn-primary" href="/dashboard/offhours-summary">查看消息总结</a></div></section>
+        {% endif %}
         {% if creator_setup_preview_enabled %}
         <section class="card mb-4 border-primary" aria-labelledby="creator-setup-preview-title">
           <div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3">

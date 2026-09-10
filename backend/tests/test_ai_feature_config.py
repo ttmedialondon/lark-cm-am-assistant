@@ -108,7 +108,8 @@ def test_blank_key_retains_existing_credential() -> None:
     )
 
     inserted = conn.calls[-1][1]
-    assert inserted[6] is None
+    assert cipher.decrypt(inserted[6]) == previous_key
+    assert inserted[8:10] == (False, False)  # Retaining a key is not a rotation.
     assert conn.row["key_suffix"] == "9876"
 
 

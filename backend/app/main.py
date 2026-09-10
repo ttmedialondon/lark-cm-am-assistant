@@ -26,6 +26,7 @@ from . import (
     creator_review,
     creator_setup_preview,
     creator_workflow_routes,
+    offhours_summary_routes,
 )
 from .admin_reporting import sync_summary
 from .config import get_settings
@@ -280,6 +281,13 @@ def dashboard(request: Request):
             "creator_features_enabled": creator_features_enabled,
             "creator_workbench": creator_workbench,
             "creator_setup_preview_enabled": _can_preview_creator_setup(authorization, admin_access),
+            "offhours_summary_visible": (
+                authorization["status"] == "active" and (
+                    str(authorization["id"]) == "24d1ef13-3762-4359-ba11-d26c03cf1f7f"
+                    or admin_access["is_owner"]
+                    or _can_preview_creator_setup(authorization, admin_access)
+                )
+            ),
             "csrf_token": _admin_csrf_token(authorization),
         },
     )
@@ -614,4 +622,8 @@ app.include_router(creator_workflow_routes.create_router(
     current_authorization=_current_authorization,
     render_template=_template,
     csrf_token=_admin_csrf_token,
+))
+app.include_router(offhours_summary_routes.create_router(
+    current_authorization=_current_authorization,
+    render_template=_template,
 ))

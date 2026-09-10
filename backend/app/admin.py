@@ -26,6 +26,7 @@ from . import (
     contact_assignments,
     creator_preparation,
     creator_review,
+    offhours_summary,
     organization_sync,
 )
 from .config import get_settings
@@ -45,6 +46,11 @@ class TemplateRenderer(Protocol):
 CurrentAuthorization = Callable[[Request], dict[str, Any] | None]
 CsrfToken = Callable[[dict[str, Any]], str]
 AI_FEATURES = {
+    "offhours_summary": {
+        "title": "下班消息总结（Remi 试用）",
+        "description": "只整理 Remi 已确认达人的消息，合并事项并按 P0–P3 分级；不生成或发送回复。",
+        "enabled_label": "开启下班消息总结（保存后立即排队）",
+    },
     "creator_workflow": {
         "title": "达人账号候选（CM 确认）",
         "description": "在选定 CM 的有效授权范围内按需查找账号线索；所有结果一律待本人确认，不自动认人或分配。",
@@ -257,6 +263,7 @@ def create_admin_router(
                 for feature in AI_FEATURES
             ]
             dispatch_status = ai_dispatch.status(conn)
+            summary_settings = offhours_summary.get_settings_view(conn)
         response = render_template(
             request,
             "admin/ai.html",
@@ -264,6 +271,8 @@ def create_admin_router(
                 **page_context(access_context, "ai"),
                 "configs": configs,
                 "ai_dispatch": dispatch_status,
+                "summary_settings": summary_settings,
+                "summary_saved": request.query_params.get("saved") == "offhours-summary",
                 # Retain this template-safe alias while external callers migrate to ``configs``.
                 "config": configs[0]["config"],
                 "form_error": error,
@@ -1297,6 +1306,10 @@ def create_admin_router(
                         "auto_confirm_threshold", str(ai_feature_config.DEFAULT_AUTO_CONFIRM_THRESHOLD)
                     ),
                 )
+                if feature == offhours_summary.FEATURE:
+                    offhours_summary.save_settings_and_enqueue(
+                        conn, access_context["authorization"]["id"], form,
+                    )
                 conn.execute(
                     "INSERT INTO audit_events (id, authorization_id, action, metadata) VALUES (%s, %s, %s, %s::jsonb)",
                     (
@@ -1318,7 +1331,11 @@ def create_admin_router(
                 )
         except ai_feature_config.FeatureConfigInputError as exc:
             return render_ai_config(request, access_context, error=str(exc), status_code=400)
-        response = RedirectResponse(url="/admin/ai", status_code=303)
+        response = RedirectResponse(
+            url=("/admin/ai?saved=offhours-summary#offhours-summary"
+                 if feature == offhours_summary.FEATURE else "/admin/ai"),
+            status_code=303,
+        )
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 

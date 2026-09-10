@@ -1,0 +1,144 @@
+"""Read-only HTTP and template boundaries; backend scope checks have their own SQL tests."""
+
+import json
+import re
+from contextlib import nullcontext
+from pathlib import Path
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+from fastapi.testclient import TestClient
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+from app import admin, ai_feature_config
+from app import offhours_summary_routes as routes
+
+APP = Path(__file__).resolve().parents[1] / "app"
+
+
+def render(data):
+    env = Environment(loader=FileSystemLoader(APP / "templates"), autoescape=select_autoescape())
+    return env.get_template("offhours_summary.html").render(
+        authorization={"display_name": "Tester"}, summary_data=data,
+    )
+
+
+def render_admin(role="owner"):
+    env = Environment(loader=FileSystemLoader(APP / "templates"), autoescape=select_autoescape())
+    configs = [{
+        **feature, "feature": name, "id_suffix": name.replace("_", "-"),
+        "config": ai_feature_config.display_config({"feature": name, "enabled": False, "key_suffix": "test"}),
+    } for name, feature in admin.AI_FEATURES.items()]
+    return env.get_template("admin/ai.html").render(
+        authorization={"display_name": "Fixture Reviewer"}, admin_role=role,
+        active_page="ai", admin_landing_path="/admin/ai", admin_permissions=["ai"],
+        permission_pages=[{"key": "ai", "path": "/admin/ai", "label": "AI 配置"}],
+        ai_dispatch={"state": "ready"}, configs=configs, csrf_token="fixture-csrf",
+        summary_settings={"status_label": "未开启", "window_start_input": "2026-09-09T18:00",
+                          "window_end_input": "2026-09-10T12:00"},
+    )
+
+
+def test_admin_summary_form_has_native_window_inputs_and_disabled_default_without_identity_threshold():
+    html = render_admin()
+    first_form = re.search(r'<form action="/admin/ai".*?</form>', html, re.S).group(0)
+    assert 'name="feature" value="offhours_summary"' in first_form
+    assert 'name="csrf_token" value="fixture-csrf"' in first_form
+    assert 'type="datetime-local" id="summary-window-start" name="window_start" value="2026-09-09T18:00"' in first_form
+    assert 'type="datetime-local" id="summary-window-end" name="window_end" value="2026-09-10T12:00"' in first_form
+    assert 'name="auto_confirm_threshold"' not in first_form
+    assert 'name="enabled" value="1" checked' not in first_form
+    assert "保存配置（开启则立即执行）" in first_form
+    secret_field = re.search(r'<input[^>]*name="api_key"[^>]*>', first_form).group(0)
+    assert 'type="password"' in secret_field
+    assert ' value=' not in secret_field
+
+
+def test_readonly_admin_has_no_save_resume_key_or_window_edit_controls():
+    html = render_admin("reviewer")
+    assert '<form ' not in html
+    assert '<input ' not in html
+    assert "只读配置" in html
+    assert 'id="offhours-summary"' in html
+
+
+def test_template_never_exposes_admin_to_a_viewer_and_escapes_private_json():
+    hostile = "</script><script>alert(1)</script>"
+    html = render({"can_manage": False, "events": [{"title": hostile}]})
+    assert 'href="/admin/' not in html
+    assert hostile not in html
+    raw = re.search(r'<script id="offhours-summary-data" type="application/json">(.*?)</script>', html).group(1)
+    assert json.loads(raw)["events"][0]["title"] == hostile
+    assert 'href="/admin/ai#offhours-summary"' in render({"can_manage": True})
+
+
+def test_client_is_read_only_and_does_not_persist_or_interpolate_messages_as_html():
+    script = (APP / "static/offhours-summary.js").read_text()
+    for forbidden in ("localStorage", "sessionStorage", "innerHTML", "insertAdjacentHTML", 'method: "POST"'):
+        assert forbidden not in script
+    assert 'cache: "no-store"' in script
+    assert 'credentials: "same-origin"' in script
+    assert 'redirect: "error"' in script
+
+
+@pytest.fixture
+def client(monkeypatch):
+    auth = {"id": uuid4(), "status": "active"}
+    calls = []
+    conn = SimpleNamespace(transaction=nullcontext)
+    monkeypatch.setattr(routes, "connection", lambda: nullcontext(conn))
+    monkeypatch.setattr(
+        routes.offhours_summary, "get_summary_view",
+        lambda connection, actor: calls.append((connection, actor)) or {"events": []},
+    )
+    app = FastAPI()
+    app.include_router(routes.create_router(
+        current_authorization=lambda _: auth,
+        render_template=lambda *_: HTMLResponse("page"),
+    ))
+    return TestClient(app), auth, calls, conn
+
+
+def test_route_uses_session_identity_not_query_scope_and_is_uncacheable(client):
+    api, auth, calls, conn = client
+    result = api.get(f"/dashboard/offhours-summary/data?responsible_id={uuid4()}&actor_id={uuid4()}")
+    assert result.status_code == 200
+    assert calls == [(conn, auth["id"])]
+    assert result.headers["cache-control"].startswith("no-store")
+    assert "frame-ancestors 'none'" in result.headers["content-security-policy"]
+    assert result.headers["x-content-type-options"] == "nosniff"
+    assert api.post("/dashboard/offhours-summary/data", json={}).status_code == 405
+
+
+def test_revoked_session_and_backend_scope_denial_never_render_data(client, monkeypatch):
+    api, auth, calls, _ = client
+    auth["status"] = "revoked"
+    assert api.get("/dashboard/offhours-summary/data").status_code == 403
+    assert not calls
+    auth["status"] = "active"
+
+    def deny(*_):
+        raise PermissionError("当前账号不能查看此总结。")
+
+    monkeypatch.setattr(routes.offhours_summary, "get_summary_view", deny)
+    result = api.get("/dashboard/offhours-summary")
+    assert result.status_code == 403
+    assert "page" not in result.text
+    assert result.headers["cache-control"].startswith("no-store")
+
+
+def test_source_cm_authorization_loss_returns_forbidden_so_browser_clears_results(client, monkeypatch):
+    api, _, _, _ = client
+
+    def revoked_source(*_):
+        raise routes.offhours_summary.SummaryInputError("Remi 的消息读取授权已失效。")
+
+    monkeypatch.setattr(routes.offhours_summary, "get_summary_view", revoked_source)
+    for path in ("/dashboard/offhours-summary", "/dashboard/offhours-summary/data"):
+        result = api.get(path)
+        assert result.status_code == 403
+        assert result.headers["cache-control"].startswith("no-store")
+        assert "page" not in result.text

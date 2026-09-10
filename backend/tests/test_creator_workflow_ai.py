@@ -351,6 +351,26 @@ def test_paid_request_gate_prevents_claim(monkeypatch):
     assert not any("FOR UPDATE OF t SKIP LOCKED" in q for q in calls)
 
 
+def test_blank_feature_key_can_be_enabled_on_real_postgres(pg):
+    from app.ai_feature_config import api_key_cipher, save_feature_config
+
+    owner = uuid4()
+    pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,%s,'test')",
+               (owner, "ou_" + owner.hex))
+    values = dict(provider="openai", project_id="proj_test", model="configured-model",
+                  updated_by_authorization_id=owner)
+    cipher = api_key_cipher(b"k" * 32)
+    save_feature_config(pg, cipher, "offhours_summary", **values, enabled=False, api_key="sk-test-only-1234")
+    key_columns = "api_key_ciphertext,key_updated_at,key_updated_by_authorization_id"
+    before = pg.execute(f"SELECT {key_columns} FROM ai_feature_configs WHERE feature='offhours_summary'").fetchone()
+    saved = save_feature_config(pg, cipher, "offhours_summary", **values, enabled=True, api_key="")
+    after = pg.execute(f"SELECT {key_columns} FROM ai_feature_configs WHERE feature='offhours_summary'").fetchone()
+    assert saved["enabled"] and saved["key_suffix"] == "1234"
+    assert after["api_key_ciphertext"] == before["api_key_ciphertext"]
+    assert after["key_updated_at"] == before["key_updated_at"]
+    assert after["key_updated_by_authorization_id"] == before["key_updated_by_authorization_id"]
+
+
 @pytest.fixture
 def pg(monkeypatch):
     dsn = os.environ.get("CREATOR_WORKFLOW_AI_TEST_DATABASE_URL")
@@ -366,7 +386,7 @@ def pg(monkeypatch):
         conn.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(psycopg.sql.Identifier(schema)))
         conn.execute(psycopg.sql.SQL("SET LOCAL search_path TO {}").format(psycopg.sql.Identifier(schema)))
         for path in sorted((Path(__file__).parents[1] / "migrations").glob("*.sql")):
-            if int(path.name[:3]) <= 29 or int(path.name[:3]) == 31:
+            if int(path.name[:3]) <= 29 or int(path.name[:3]) in (31, 32):
                 conn.execute(path.read_text())
         monkeypatch.setattr(ai, "connection", lambda: nullcontext(conn))
         monkeypatch.setattr(ai.creator_workflow, "connection", lambda: nullcontext(conn))

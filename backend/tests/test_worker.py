@@ -189,6 +189,8 @@ def test_dispatch_uses_at_most_three_slots_and_alternates_queues(monkeypatch) ->
 
     assessment_jobs = iter(({"id": "identity-1"}, {"id": "identity-2"}))
     assignment_jobs = iter(({"id": "assignment-1"},))
+    monkeypatch.setattr(worker.offhours_summary, "claim_next_summary", lambda: None)
+    monkeypatch.setattr(worker.creator_workflow_ai, "claim_next_creator_scan", lambda: None)
     monkeypatch.setattr(worker.contact_assessments, "claim_next_contact_assessment", lambda: next(assessment_jobs))
     monkeypatch.setattr(worker.contact_assignments, "claim_next_contact_assignment", lambda: next(assignment_jobs))
 
@@ -200,6 +202,23 @@ def test_dispatch_uses_at_most_three_slots_and_alternates_queues(monkeypatch) ->
 
     assert (submitted_one, submitted_two, submitted_three, submitted_four) == (True, True, True, False)
     assert [job["id"] for _runner, job in submitted] == ["identity-1", "assignment-1", "identity-2"]
+
+
+def test_offhours_tasks_fill_three_parallel_slots_without_waiting(monkeypatch) -> None:
+    jobs = iter({"id": index} for index in range(3))
+    submitted = []
+
+    class Executor:
+        def submit(self, runner, job, settings):
+            assert runner is worker.offhours_summary.run_claimed_summary
+            submitted.append(job["id"])
+            return object()
+
+    monkeypatch.setattr(worker.offhours_summary, "claim_next_summary", lambda: next(jobs))
+    futures = set()
+    worker._fill_ai_slots(object(), Executor(), futures, False)
+    assert submitted == [0, 1, 2]
+    assert len(futures) == 3
 
 
 def test_page_claim_uses_locked_conversation_cursor(monkeypatch) -> None:

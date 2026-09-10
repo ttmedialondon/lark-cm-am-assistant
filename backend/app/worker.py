@@ -15,7 +15,14 @@ from typing import Any
 import httpx
 import psycopg
 
-from . import ai_dispatch, contact_assessments, contact_assignments, creator_workflow_ai, organization_sync
+from . import (
+    ai_dispatch,
+    contact_assessments,
+    contact_assignments,
+    creator_workflow_ai,
+    offhours_summary,
+    organization_sync,
+)
 from .config import Settings, get_settings
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
@@ -201,7 +208,9 @@ def _dispatch_ai_turn(
         ),
     )
     # The new candidate queue never enables either legacy identity/assignment feature.
-    queues = ((creator_workflow_ai.claim_next_creator_scan,
+    queues = ((offhours_summary.claim_next_summary,
+               offhours_summary.run_claimed_summary, prefer_assignment),
+              (creator_workflow_ai.claim_next_creator_scan,
                creator_workflow_ai.run_claimed_creator_scan, prefer_assignment),) + queues
     for claim, runner, next_preference in queues:
         try:

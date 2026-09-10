@@ -1,5 +1,7 @@
 # Lark CM/AM Assistant（测试版）
 
+当前下班总结试点见[通俗需求](../docs/product/message-risk-priority-v1.0.md)：后台 `/admin/ai` 独立配置 `offhours_summary`，保存并开启后立即排队，前台 `/dashboard/offhours-summary` 查看。仅 Remi 已确认达人，默认关闭，不回复；复用全局最多 3 个并行 AI 请求。下文旧自动身份/关联描述仅作历史基线，不会被新功能重新启用。
+
 这是一个独立于现有 `lark-user-ingress/` Node 骨架的 Python 服务。
 
 它让 CM/AM 通过 Lark OAuth 授权后，同步自己当前可见的**群聊与私聊**：

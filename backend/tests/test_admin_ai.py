@@ -91,6 +91,7 @@ def test_owner_can_view_only_safe_ai_config_fields(monkeypatch):
     monkeypatch.setattr(admin, "connection", _connection)
     monkeypatch.setattr(ai_feature_config, "get_feature_config", lambda *_args: {"api_key_ciphertext": "secret"})
     monkeypatch.setattr(ai_feature_config, "display_config", lambda _row: _config())
+    monkeypatch.setattr(admin.offhours_summary, "get_settings_view", lambda _: {"status_label": "未开启"})
     monkeypatch.setattr(
         admin.ai_dispatch,
         "status",
@@ -105,6 +106,8 @@ def test_owner_can_view_only_safe_ai_config_fields(monkeypatch):
     assert contexts[-1][1]["config"]["api_key_label"] == "已配置 · …abcd"
     assert "api_key_ciphertext" not in contexts[-1][1]["config"]
     assert contexts[-1][1]["ai_dispatch"]["state"] == "paused"
+    assert contexts[-1][1]["summary_settings"]["status_label"] == "未开启"
+    assert contexts[-1][1]["configs"][0]["feature"] == "offhours_summary"
 
 
 def test_owner_post_passes_key_to_encrypted_store_without_rendering_it(monkeypatch):
@@ -184,3 +187,37 @@ def test_owner_can_resume_the_shared_ai_queue(monkeypatch):
     audit = connections[0].calls[-1][1]
     assert audit[2] == "ai_queue_resumed"
     assert audit[3] == '{"scope": "shared"}'
+
+
+@pytest.mark.parametrize("enabled", ["1", ""])
+def test_summary_save_uses_same_transaction_and_immediately_schedules(monkeypatch, enabled):
+    owner_id = uuid4()
+    called = []
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _: "owner")
+    monkeypatch.setattr(admin, "connection", _connection)
+    monkeypatch.setattr(admin, "get_settings", lambda: SimpleNamespace(token_encryption_key=b"k" * 32))
+    monkeypatch.setattr(ai_feature_config, "save_feature_config", lambda conn, *a, **kw: called.append(
+        ("config", conn, kw["enabled"])))
+    monkeypatch.setattr(admin.offhours_summary, "save_settings_and_enqueue", lambda conn, actor, fields: called.append(
+        ("summary", conn, actor, fields)))
+    response = _client(lambda _: {"id": owner_id, "status": "active"}).post("/admin/ai", data={
+        "csrf_token": "csrf", "feature": "offhours_summary", "project_id": "project",
+        "model": "configured-model", "enabled": enabled,
+        "window_start": "2026-09-09T18:00", "window_end": "2026-09-10T12:00",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/ai?saved=offhours-summary#offhours-summary"
+    assert [item[0] for item in called] == ["config", "summary"]
+    assert called[0][1] is called[1][1]
+    assert called[0][2] == (enabled == "1")
+    assert called[1][2] == owner_id
+    assert called[1][3]["window_end"] == "2026-09-10T12:00"
+
+
+def test_summary_csrf_failure_does_not_save_or_schedule(monkeypatch):
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _: "owner")
+    monkeypatch.setattr(admin, "connection", lambda: pytest.fail("must reject before DB"))
+    response = _client(lambda _: {"id": uuid4(), "status": "active"}).post("/admin/ai", data={
+        "csrf_token": "wrong", "feature": "offhours_summary", "enabled": "1",
+    })
+    assert response.status_code == 400

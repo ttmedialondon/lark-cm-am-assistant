@@ -1,10 +1,10 @@
 # Lark CM/AM Assistant
 
-Internal system for authorised CM/AM Lark message sync and creator/account review. The next planned scope is an off-hours message summary for the next shift, organised by P0–P3 urgency, without reply suggestions or automatic replies.
+Internal system for authorised CM/AM Lark message sync, creator/account review, and an owner-enabled off-hours message summary, organised by P0–P3 urgency, without reply suggestions or automatic replies.
 
 ## Current status
 
-- [Off-hours message summary — plain-language requirements](docs/product/message-risk-priority-v1.0.md) is the current scope: summarise the CM's off-hours messages by event and P0–P3 urgency for review when work resumes, without real-time alerts, reply suggestions or automatic actions. 18:00–10:00 is an example, not an enabled schedule. The summary/classification feature is not implemented yet; this document overrides conflicting requirements in the older PRD/TDD.
+- [Off-hours message summary — plain-language requirements](docs/product/message-risk-priority-v1.0.md) is the current scope. The first pilot uses Remi's confirmed accounts and a fixed London window (2026-09-09 18:00–2026-09-10 12:00). Owner save+enable at `/admin/ai` immediately queues analysis; results appear at `/dashboard/offhours-summary`. Disabled by default, no automatic daily schedule, real-time alerts, reply suggestions or automatic actions. This overrides conflicting requirements in the older PRD/TDD.
 - `backend/` contains the deployed FastAPI service for authorised CM/AM conversation sync and the owner-only content console.
 - `docs/architecture/TDD_v2.0.md` defines the approved target architecture; it remains a technical-review draft until its P0 governance decisions are closed.
 - `docs/architecture/contact-identity-organization-model-v0.4.md` documents the deployed person, organization, role, and creator-owner model.
@@ -21,7 +21,7 @@ Internal system for authorised CM/AM Lark message sync and creator/account revie
 
 1. GitHub is the sole source of truth; production servers deploy a reviewed release and are never edited directly.
 2. Secrets, tokens, customer messages, production exports, and backups must never be committed.
-3. Message bodies are collected only after the revised OAuth agreement, encrypted at rest, excluded from logs, and visible only to the designated owner through the audited admin page. AI never sends Lark messages; contact classification is an owner-configured, evidence-bound feature.
+3. Message bodies are collected only after the revised OAuth agreement, encrypted at rest, and excluded from logs. Content views enforce live owner or explicit feature-scoped reviewer/CM access and are audited. Roster editing does not grant message access. AI never sends Lark messages; analysis uses owner-configured, evidence-bound features.
 
 ## Getting started
 

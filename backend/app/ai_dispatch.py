@@ -1,4 +1,4 @@
-"""Shared OpenAI admission state for the two durable AI queues.
+"""Shared OpenAI admission state for the durable AI queues.
 
 The worker stays single-process for Lark sync.  This module only coordinates
 the small number of paid OpenAI requests it may hand to worker threads.
@@ -44,6 +44,9 @@ def can_claim(conn: psycopg.Connection) -> bool:
             WHERE status = 'running' AND lease_until > NOW()
             UNION ALL
             SELECT id FROM creator_workflow_ai_tasks
+            WHERE status = 'running' AND lease_until > NOW()
+            UNION ALL
+            SELECT id FROM offhours_summary_tasks
             WHERE status = 'running' AND lease_until > NOW()
         ) AS active
         """

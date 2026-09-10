@@ -95,11 +95,11 @@ def save_feature_config(
             api_key_ciphertext = COALESCE(EXCLUDED.api_key_ciphertext, ai_feature_configs.api_key_ciphertext),
             key_suffix = COALESCE(EXCLUDED.key_suffix, ai_feature_configs.key_suffix),
             key_updated_at = CASE
-                WHEN EXCLUDED.api_key_ciphertext IS NULL THEN ai_feature_configs.key_updated_at
+                WHEN EXCLUDED.key_updated_at IS NULL THEN ai_feature_configs.key_updated_at
                 ELSE EXCLUDED.key_updated_at
             END,
             key_updated_by_authorization_id = CASE
-                WHEN EXCLUDED.api_key_ciphertext IS NULL THEN ai_feature_configs.key_updated_by_authorization_id
+                WHEN EXCLUDED.key_updated_at IS NULL THEN ai_feature_configs.key_updated_by_authorization_id
                 ELSE EXCLUDED.key_updated_by_authorization_id
             END,
             automatic_queue_checked_at = '-infinity'::timestamptz,
@@ -115,8 +115,10 @@ def save_feature_config(
             model,
             enabled,
             auto_confirm_threshold,
-            ciphertext if api_key else None,
-            api_key[-4:] if api_key else None,
+            # PostgreSQL validates the proposed INSERT before ON CONFLICT;
+            # retaining a key must satisfy enabled/key constraints at that point.
+            ciphertext,
+            api_key[-4:] if api_key else (current["key_suffix"] if current else None),
             bool(api_key),
             bool(api_key),
             updated_by_authorization_id,
