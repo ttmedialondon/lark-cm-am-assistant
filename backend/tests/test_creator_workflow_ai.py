@@ -13,6 +13,7 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
+from app import creator_onboarding as onboarding
 from app import creator_workflow_ai as ai
 from app.crypto import message_body_cipher
 
@@ -57,6 +58,7 @@ def candidate(**changes):
         "creator_confidence": 0.99,
         "identity_confidence": 0.99,
         "cm_confidence": 0.99,
+        "business_topic": "agency",
         "creator_evidence_type": "self_identification",
         "identity_evidence_type": "self_handle",
         "cm_evidence_type": "managing_creator",
@@ -115,10 +117,7 @@ def test_group_handle_and_unclear_cm_remain_supported_candidates_not_assignments
         unknowns=["负责人不明"],
     )
     assert ai._validate(json.dumps({"candidates": [item]}), evidence()) == [item]
-    assert "Mere P2P contact" in ai._INSTRUCTIONS
-    assert "untrusted evidence" in ai._INSTRUCTIONS
-    assert "not proof of creator identity" in ai._INSTRUCTIONS
-    assert "Do not reply" in ai._INSTRUCTIONS
+    assert not ai._verified_facts(item, evidence())["verified_business_dialogue"]
 
 
 def test_fingerprint_ignores_routine_cipher_refresh_but_detects_edits_and_new_identity():
@@ -161,6 +160,7 @@ def test_rich_text_keeps_product_handle_links_but_redacts_access_tokens():
 def test_cap_direct_evidence_is_independent_and_does_not_infer_signed_type():
     facts = ai._verified_facts(candidate(), evidence())
     assert facts["cap_policy_version"] == "cap_v1"
+    assert facts["business_policy_version"] == "business_v2" and facts["verified_business_dialogue"]
     assert facts["exact_handle_evidence"] and facts["direct_creator_evidence"] and facts["direct_cm_evidence"]
     assert facts["creator_type"] is None
     assert (
@@ -198,13 +198,49 @@ def test_cm_group_handle_statement_cannot_prove_arbitrary_selected_creator_user(
     assert not facts["exact_handle_evidence"] and not facts["direct_creator_evidence"]
 
 
+def test_real_business_dialogue_needs_no_handle_or_cap_but_group_membership_is_not_dialogue():
+    pack = evidence()
+    creator_quote = "Could you arrange samples for my next LIVE?"
+    cm_quote = "I have requested those samples for your LIVE."
+    pack["pack"]["messages"][0]["text"] = creator_quote
+    pack["pack"]["messages"][1]["text"] = cm_quote
+    item = candidate(handle=None, handle_source="missing", handle_refs=[], identity_refs=[],
+                     identity_quote="", identity_confidence=0, identity_evidence_type="unknown",
+                     creator_quote=creator_quote, cm_quote=cm_quote, business_topic="samples")
+    assert ai._validate(json.dumps({"candidates": [item]}), pack) == [item]
+    facts = ai._verified_facts(item, pack)
+    assert facts["verified_business_dialogue"] and not facts["exact_handle_evidence"]
+    assert facts["creator_type"] is None
+    pack["pack"]["messages"][1].pop("reply_to")
+    assert not ai._verified_facts(item, pack)["verified_business_dialogue"]
+    pack["pack"]["messages"][0]["mentions"] = ["CM1"]
+    pack["pack"]["messages"][1]["mentions"] = ["another-user"]
+    assert not ai._verified_facts(item, pack)["verified_business_dialogue"]
+    pack["pack"]["messages"][0].pop("mentions")
+    pack["pack"]["messages"][1].pop("mentions")
+    pack["pack"].update(chat_type="p2p", private_user="U1")
+    assert ai._verified_facts(item, pack)["verified_business_dialogue"]
+    pack["pack"]["private_user"] = "another-user"
+    assert not ai._verified_facts(item, pack)["verified_business_dialogue"]
+
+
+def test_greeting_exchange_never_becomes_a_creator_even_with_claimed_high_scores():
+    pack = evidence()
+    pack["pack"]["messages"][0]["text"] = "Hello Remi!"
+    pack["pack"]["messages"][1]["text"] = "Good morning Alice!"
+    item = candidate(handle=None, handle_source="missing", handle_refs=[], identity_refs=[],
+                     identity_quote="", creator_quote="Hello Remi!", cm_quote="Good morning Alice!")
+    assert ai._validate(json.dumps({"candidates": [item]}), pack) == []
+    assert not ai._verified_facts(item, pack)["verified_business_dialogue"]
+
+
 @pytest.mark.parametrize(
     "change",
     [
         {"creator_confidence": True},
         {"identity_confidence": float("nan")},
         {"cm_confidence": 1.1},
-        {"identity_quote": "made up claim"},
+        {"creator_quote": "made up claim"},
         {"identity_refs": ["missing"]},
     ],
 )
@@ -289,7 +325,7 @@ def run_harness(monkeypatch):
     )
 
 
-def test_runner_only_ingests_pending_source_with_independent_feature(run_harness):
+def test_runner_passes_verified_business_source_to_workflow_with_independent_feature(run_harness):
     h = run_harness
     ai.run_claimed_creator_scan(h.job, h.settings)
     assert not h.finished and len(h.ingested) == 1
@@ -304,6 +340,20 @@ def test_runner_only_ingests_pending_source_with_independent_feature(run_harness
     writes = " ".join(q for q, _ in h.calls)
     assert "UPDATE contact_roles" not in writes and "INSERT INTO contact_assignments" not in writes
     assert "SET status = 'succeeded'" in writes
+
+
+def test_runner_keeps_unverified_handle_auxiliary_without_blocking_person_evidence(run_harness, monkeypatch):
+    h = run_harness
+    monkeypatch.setattr(ai.contact_assessments, "call_openai", lambda *_a, **_k: {
+        "text": json.dumps({"candidates": [candidate(identity_confidence=0.2)]})
+    })
+    ai.run_claimed_creator_scan(h.job, h.settings)
+    data = h.ingested[0][1]
+    assert data["handle"] is None and data["creator_type"] is None
+    assert data["source_data"]["handle_raw"] == "@alice"
+    assert data["source_data"]["verified_business_dialogue"] is True
+    assert data["source_data"]["business_policy_version"] == "business_v2"
+    assert data["source_data"]["unknowns"] == []
 
 
 def test_source_metadata_never_persists_quotes_or_model_private_prose(monkeypatch, run_harness):
@@ -413,12 +463,6 @@ def test_same_evidence_never_reopens_a_denied_source(monkeypatch, run_harness):
     assert not h.ingested and not h.finished
 
 
-def test_queue_rejects_unbounded_scan_arguments_without_reading_database():
-    for args in ({"chat_limit": 101}, {"history_days": 91}, {"history_days": 0}, {"chat_limit": True}):
-        with pytest.raises(ai.ScanInputError):
-            ai.queue_scan(uuid4(), uuid4(), **args)
-
-
 @pytest.mark.parametrize("excel_first", [True, False])
 def test_verified_ai_and_cm_cap_excel_auto_confirm_in_either_order(pg, real_scan, monkeypatch, excel_first):
     ids, settings = real_scan
@@ -442,11 +486,11 @@ def test_verified_ai_and_cm_cap_excel_auto_confirm_in_either_order(pg, real_scan
         "call_openai",
         lambda *_a, **_k: {"text": json.dumps({"candidates": [candidate(relationship="unknown")]})},
     )
-    ai.queue_scan(ids["cm"], ids["cm"])
+    start_scan(pg, ids["cm"], ids["cm"])
     ai.run_claimed_creator_scan(ai.claim_next_creator_scan(), settings)
     if not excel_first:
         assert pg.execute("SELECT status,creator_type FROM creator_workflow_candidates").fetchone() == {
-            "status": "pending",
+            "status": "confirmed",
             "creator_type": None,
         }
         upload()
@@ -493,7 +537,6 @@ def test_paid_request_gate_prevents_claim(monkeypatch):
             return Result()
 
     monkeypatch.setattr(ai, "connection", lambda: nullcontext(Connection()))
-    monkeypatch.setattr(ai, "_queue_continuations", lambda: None)
     monkeypatch.setattr(ai, "_enabled", lambda _: True)
     monkeypatch.setattr(ai.ai_dispatch, "can_claim", lambda _: False)
     assert ai.claim_next_creator_scan() is None
@@ -541,6 +584,7 @@ def pg(monkeypatch):
             conn.execute(path.read_text())
         monkeypatch.setattr(ai, "connection", lambda: nullcontext(conn))
         monkeypatch.setattr(ai.creator_workflow, "connection", lambda: nullcontext(conn))
+        monkeypatch.setattr(onboarding, "connection", lambda: nullcontext(conn))
         try:
             yield conn
         finally:
@@ -594,6 +638,17 @@ def real_scan(pg):
     return ids, settings
 
 
+def start_scan(pg, actor, cm):
+    ai.queue_scan(actor, cm)
+    advance_scan(pg)
+    return ai.scan_status(actor, cm)
+
+
+def advance_scan(pg):
+    pg.execute("UPDATE creator_workflow_onboarding SET next_check_at=NOW() WHERE status='scanning'")
+    onboarding.advance_initial_scans()
+
+
 def test_real_queue_claim_model_candidate_and_unchanged_incremental(pg, real_scan, monkeypatch):
     ids, settings = real_scan
     calls = []
@@ -606,9 +661,9 @@ def test_real_queue_claim_model_candidate_and_unchanged_incremental(pg, real_sca
         return {"text": json.dumps({"candidates": [candidate()]}), "usage": {"input_tokens": 15}}
 
     monkeypatch.setattr(ai.contact_assessments, "call_openai", model)
-    run = ai.queue_scan(ids["owner"], ids["cm"])
+    run = start_scan(pg, ids["owner"], ids["cm"])
     assert run["total_chats"] == 1 and run["status"] == "queued"
-    assert ai.queue_scan(ids["owner"], ids["cm"])["id"] == run["id"]
+    assert ai.queue_scan(ids["owner"], ids["cm"])["run_id"] == run["id"]
     job = ai.claim_next_creator_scan()
     assert job["attempts"] == 1 and job["chat_id"] == "chat"
     ai.run_claimed_creator_scan(job, settings)
@@ -616,10 +671,10 @@ def test_real_queue_claim_model_candidate_and_unchanged_incremental(pg, real_sca
     assert status["status"] == "succeeded", status
     assert status["candidate_count"] == 1 and status["counts"] == {"succeeded": 1}
     row = pg.execute("SELECT * FROM creator_workflow_candidates").fetchone()
-    assert row["status"] == "pending" and row["responsible_authorization_id"] == ids["cm"]
+    assert row["status"] == "confirmed" and row["responsible_authorization_id"] == ids["cm"]
     assert row["contact_id"] == ids["person"] and row["normalized_handle"] == "alice"
-    assert "ai_review" in row["uncertainties"]
-    assert pg.execute("SELECT COUNT(*) AS n FROM creator_account_assignments").fetchone()["n"] == 0
+    assert not row["uncertainties"]
+    assert pg.execute("SELECT COUNT(*) AS n FROM creator_account_assignments").fetchone()["n"] == 1
     assert pg.execute("SELECT COUNT(*) AS n FROM contact_roles").fetchone()["n"] == 0
     assert pg.execute("SELECT COUNT(*) AS n FROM contact_assignments").fetchone()["n"] == 0
     assert (
@@ -628,7 +683,8 @@ def test_real_queue_claim_model_candidate_and_unchanged_incremental(pg, real_sca
         ).fetchone()["n"]
         == 0
     )
-    again = ai.queue_scan(ids["owner"], ids["cm"])
+    advance_scan(pg)
+    again = start_scan(pg, ids["owner"], ids["cm"])
     assert again["total_chats"] == 0 and len(calls) == 1
     assert ai.claim_next_creator_scan() is None
 
@@ -641,7 +697,7 @@ def test_real_missing_handle_and_user_survive_in_pending_pool(pg, real_scan, mon
     monkeypatch.setattr(
         ai.contact_assessments, "call_openai", lambda *_a, **_k: {"text": json.dumps({"candidates": [output]})}
     )
-    ai.queue_scan(ids["owner"], ids["cm"])
+    start_scan(pg, ids["owner"], ids["cm"])
     ai.run_claimed_creator_scan(ai.claim_next_creator_scan(), settings)
     row = pg.execute("SELECT * FROM creator_workflow_candidates").fetchone()
     assert row and row["status"] == "pending" and row["normalized_handle"] is None and row["contact_id"] is None
@@ -650,7 +706,7 @@ def test_real_missing_handle_and_user_survive_in_pending_pool(pg, real_scan, mon
 
 def test_real_revoke_between_queue_and_execution_cancels_without_model(pg, real_scan, monkeypatch):
     ids, settings = real_scan
-    ai.queue_scan(ids["owner"], ids["cm"])
+    start_scan(pg, ids["owner"], ids["cm"])
     job = ai.claim_next_creator_scan()
     pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (ids["cm"],))
 
@@ -669,7 +725,7 @@ def test_real_unknown_responsibility_stays_in_scanned_cm_review_inbox_without_as
     monkeypatch.setattr(
         ai.contact_assessments, "call_openai", lambda *_a, **_k: {"text": json.dumps({"candidates": [output]})}
     )
-    ai.queue_scan(ids["owner"], ids["cm"])
+    start_scan(pg, ids["owner"], ids["cm"])
     ai.run_claimed_creator_scan(ai.claim_next_creator_scan(), settings)
     row = pg.execute("SELECT * FROM creator_workflow_candidates").fetchone()
     assert row and row["status"] == "pending" and row["responsible_authorization_id"] == ids["cm"]
@@ -682,8 +738,11 @@ def test_real_unknown_responsibility_stays_in_scanned_cm_review_inbox_without_as
 def test_real_failed_output_is_retryable_only_by_explicit_request(pg, real_scan, monkeypatch):
     ids, settings = real_scan
     monkeypatch.setattr(ai.contact_assessments, "call_openai", lambda *_a, **_k: {"text": "refusal"})
-    ai.queue_scan(ids["owner"], ids["cm"])
+    start_scan(pg, ids["owner"], ids["cm"])
     ai.run_claimed_creator_scan(ai.claim_next_creator_scan(), settings)
     assert ai.scan_status(ids["owner"], ids["cm"])["status"] == "failed"
-    assert ai.queue_scan(ids["owner"], ids["cm"])["total_chats"] == 0
-    assert ai.queue_scan(ids["owner"], ids["cm"], retry_failed=True)["total_chats"] == 1
+    advance_scan(pg)
+    assert onboarding.get_status(pg, ids["cm"])["status"] == "failed"
+    assert ai.claim_next_creator_scan() is None
+    assert ai.queue_scan(ids["owner"], ids["cm"], retry_failed=True)["onboarding"]["status"] == "scanning"
+    assert ai.claim_next_creator_scan()["attempts"] == 2

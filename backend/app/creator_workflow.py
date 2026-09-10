@@ -1,4 +1,4 @@
-"""Account-level creator intake. Candidates grant neither identity nor chat access."""
+"""Creator/CM intake with optional social accounts; candidates never grant chat access."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ TEST_EDITOR_IDS = frozenset({
     UUID("1225b4a0-fbd8-431e-962e-25e66943a8a0"),
 })
 CAP_POLICY_VERSION = "cap_v1"
+BUSINESS_POLICY_VERSION = "business_v2"
 AUTO_CONFIRM_THRESHOLD = 0.95
 _UNSET = object()
 
@@ -273,7 +274,7 @@ def search_users(scope: dict, query: str, limit: int = 20) -> list[dict]:
 
 
 def validate_evidence(conn: Any, responsible_id: UUID | None, refs: list[dict]) -> list[dict]:
-    if not isinstance(refs, list) or not 1 <= len(refs) <= 30:
+    if not isinstance(refs, list) or not 1 <= len(refs) <= 80:
         raise WorkflowInputError("AI 推荐必须带有当前有效授权下的消息依据。")
     checked = []
     for ref in refs:
@@ -287,12 +288,14 @@ def validate_evidence(conn: Any, responsible_id: UUID | None, refs: list[dict]) 
             SELECT observation.chat_id, observation.message_id
             FROM authorizations auth
             JOIN authorization_chats access ON access.authorization_id=auth.id
+            JOIN chats conversation ON conversation.chat_id=access.chat_id
             JOIN authorization_message_observations observation
               ON observation.authorization_id=auth.id AND observation.chat_id=access.chat_id
             JOIN chat_messages message ON message.chat_id=observation.chat_id
               AND message.message_id=observation.message_id
             WHERE auth.id=%s AND auth.status='active' AND auth.body_consent_at IS NOT NULL
               AND access.is_visible AND access.sync_enabled AND observation.observed_at >= auth.body_consent_at
+              AND COALESCE(conversation.chat_status,'normal')='normal'
               AND observation.chat_id=%s AND observation.message_id=%s AND NOT message.is_deleted
               AND message.body_ciphertext IS NOT NULL
             FOR SHARE OF auth, access, observation, message
@@ -349,8 +352,18 @@ def _lock_contact_scope(conn: Any, responsible_id: UUID, contact_id: UUID) -> di
 
 
 def _conflicts(conn: Any, row: dict, *, manual: bool = False) -> list[str]:
+    people = conn.execute(
+        "SELECT responsible_authorization_id,creator_type FROM creator_account_assignments "
+        "WHERE contact_id=%s AND ended_at IS NULL", (row.get("contact_id"),),
+    ).fetchall() if row.get("contact_id") else []
+    reasons = []
+    for known in people:
+        if str(known["responsible_authorization_id"]) != str(row.get("responsible_authorization_id")):
+            reasons.append("ownership_conflict")
+        if known.get("creator_type") and row.get("creator_type") and known["creator_type"] != row["creator_type"]:
+            reasons.append("creator_type_conflict")
     if not row.get("normalized_handle"):
-        return []
+        return sorted(set(reasons))
     owners = conn.execute(
         """
         SELECT assignment.responsible_authorization_id, assignment.contact_id, assignment.relationship,
@@ -373,7 +386,6 @@ def _conflicts(conn: Any, row: dict, *, manual: bool = False) -> list[str]:
     """,
         (row["platform"], row["normalized_handle"]),
     ).fetchall()
-    reasons = []
     for known in owners:
         if known.get("creator_type") and row.get("creator_type") and known["creator_type"] != row["creator_type"]:
             reasons.append("creator_type_conflict")
@@ -462,7 +474,9 @@ def _record(
         else []
     )
     source_types = sorted({s["source_type"] for s in sources})
-    blocking_reasons = [r for r in reasons if r["code"] in COMPUTED_REASONS - {"missing_relationship"}]
+    blocking_reasons = [r for r in reasons if r["code"] in COMPUTED_REASONS - {
+        "missing_relationship", "missing_handle", "missing_creator_type",
+    }]
     return {
         "id": str(row["id"]),
         "version": row["version"],
@@ -729,9 +743,26 @@ def save_draft(
             )
         row = _candidate(conn, candidate_id, scope, lock=True)
         _version(row, version)
-        _editable(row)
         if creator_type is _UNSET:
             creator_type = row.get("creator_type")
+        if row["status"] == "confirmed":
+            if (
+                contact_id != row["contact_id"]
+                or relationship not in {None, row["relationship"]}
+                or row["normalized_handle"] and handle != row["normalized_handle"]
+                or row.get("creator_type") and creator_type != row["creator_type"]
+                or resolved_reasons
+            ):
+                raise WorkflowInputError("已确认达人只能补充首次 handle 或未知类型，不能更换用户、负责人或已有资料。")
+            if not conn.execute(
+                "SELECT id FROM creator_account_assignments WHERE candidate_id=%s AND ended_at IS NULL FOR UPDATE",
+                (row["id"],),
+            ).fetchone():
+                raise WorkflowInputError("这位达人的正式负责关系已结束，请重新核对。")
+            updated = _promote(conn, {**row, "normalized_handle": handle, "creator_type": creator_type},
+                               scope, "cm_confirmation")
+            return _finish(conn, scope, updated, request_id, digest, "confirmed_details_added", row)
+        _editable(row)
         if set(resolved_reasons) - set(row["uncertainties"]):
             raise WorkflowInputError("只能解除当前记录中明确列出的待核对项。")
         # Keep source metadata for the same pair, never carry an old role to edits.
@@ -800,57 +831,50 @@ def save_draft(
 
 
 def _promote(conn: Any, row: dict, scope: dict, source: str) -> dict:
-    if not all(row.get(k) for k in ("normalized_handle", "responsible_authorization_id", "contact_id", "relationship")):
-        raise WorkflowInputError("handle、负责人和对应 Lark 用户必须全部补齐后才能入库。")
-    if row.get("creator_type") not in {"cap", "non_cap"}:
-        raise WorkflowInputError("请先选择 CAP 或非 CAP，再确认入库。")
+    if not all(row.get(k) for k in ("responsible_authorization_id", "contact_id", "relationship")):
+        raise WorkflowInputError("请先确定负责人和对应 Lark 用户。")
     if row["uncertainties"]:
         raise WorkflowInputError("还有未核对清楚的信息，请先保存核对结果。")
     _lock_contact_scope(conn, row["responsible_authorization_id"], row["contact_id"])
-    conn.execute(
-        "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
-        (f"creator-account:{row['platform']}:{row['normalized_handle']}",),
-    )
+    if _conflicts(conn, row, manual=True):
+        raise WorkflowInputError("现有达人归属或账号关联有冲突，已保留待确认，不会覆盖旧关系。")
     account = conn.execute(
         "SELECT id FROM social_accounts WHERE platform=%s AND normalized_handle=%s FOR UPDATE",
         (row["platform"], row["normalized_handle"]),
-    ).fetchone()
+    ).fetchone() if row["normalized_handle"] else None
     if account:
         conn.execute(
             "SELECT * FROM contact_social_accounts WHERE social_account_id=%s FOR UPDATE", (account["id"],)
         ).fetchall()
+    # Reuse an existing person entry, including when its first handle arrives later.
+    current = conn.execute(
+        """SELECT * FROM creator_account_assignments WHERE ended_at IS NULL AND (
+          candidate_id=%s OR social_account_id=%s OR
+          (contact_id=%s AND (%s::text IS NULL OR social_account_id IS NULL)))
+          ORDER BY (candidate_id=%s) DESC,started_at,id LIMIT 1 FOR UPDATE""",
+        (row["id"], account["id"] if account else None, row["contact_id"], row["normalized_handle"], row["id"]),
+    ).fetchone()
+    if current and current["candidate_id"] != row["id"]:
+        known = conn.execute("SELECT * FROM creator_workflow_candidates WHERE id=%s FOR UPDATE",
+                             (current["candidate_id"],)).fetchone()
+        conn.execute("UPDATE creator_workflow_sources SET candidate_id=%s WHERE candidate_id=%s",
+                     (known["id"], row["id"]))
         conn.execute(
-            "SELECT * FROM creator_account_assignments WHERE social_account_id=%s AND ended_at IS NULL FOR UPDATE",
-            (account["id"],),
-        ).fetchall()
-    if _conflicts(conn, row, manual=source in {"cm_confirmation", "excel_ai_verified"}):
-        raise WorkflowInputError("现有账号归属或用户关联有冲突，已保留待确认，不会覆盖旧关系。")
-    if account:
-        current = conn.execute(
-            "SELECT candidate_id FROM creator_account_assignments WHERE social_account_id=%s AND ended_at IS NULL",
-            (account["id"],),
-        ).fetchone()
-        if current and current["candidate_id"] != row["id"]:
-            conn.execute(
-                "UPDATE creator_workflow_sources SET candidate_id=%s WHERE candidate_id=%s",
-                (current["candidate_id"], row["id"]),
-            )
-            conn.execute(
-                "UPDATE creator_workflow_candidates SET status='merged',merged_into=%s,"
-                "version=version+1,updated_at=NOW() WHERE id=%s",
-                (current["candidate_id"], row["id"]),
-            )
-            return conn.execute(
-                "UPDATE creator_workflow_candidates SET version=version+1,updated_at=NOW() WHERE id=%s RETURNING *",
-                (current["candidate_id"],),
-            ).fetchone()
-    if not account:
+            "UPDATE creator_workflow_candidates SET status='merged',merged_into=%s,"
+            "version=version+1,updated_at=NOW() WHERE id=%s", (known["id"], row["id"]),
+        )
+        row = {**known, "platform": known["platform"] if known["normalized_handle"] else row["platform"],
+               "normalized_handle": known["normalized_handle"] or row["normalized_handle"],
+               "creator_type": known.get("creator_type") or row.get("creator_type")}
+        if known["social_account_id"]:
+            account = {"id": known["social_account_id"]}
+    if row["normalized_handle"] and not account:
         account = conn.execute(
             """INSERT INTO social_accounts(id,platform,normalized_handle,display_handle)
             VALUES(%s,%s,%s,%s) RETURNING id""",
             (uuid4(), row["platform"], row["normalized_handle"], "@" + row["normalized_handle"]),
         ).fetchone()
-    elif source in {"cm_confirmation", "excel_ai_verified"}:
+    elif account:
         # Reuse an established relationship without inventing a new owner claim.
         known = conn.execute(
             """SELECT relationship FROM contact_social_accounts
@@ -860,40 +884,37 @@ def _promote(conn: Any, row: dict, scope: dict, source: str) -> dict:
         ).fetchone()
         if known:
             row = {**row, "relationship": known["relationship"]}
-            conn.execute(
-                "UPDATE creator_workflow_candidates SET relationship=%s WHERE id=%s",
-                (row["relationship"], row["id"]),
-            )
-    conn.execute(
-        """INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source,
+    account_id = account["id"] if account else None
+    if account:
+        conn.execute(
+            """INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source,
           reviewed_by_authorization_id,reviewed_at)
         VALUES(%s,%s,%s,'confirmed',%s,%s,NOW())
         ON CONFLICT(contact_id,social_account_id,relationship) DO UPDATE SET status='confirmed',source=EXCLUDED.source,
           reviewed_by_authorization_id=EXCLUDED.reviewed_by_authorization_id,reviewed_at=NOW(),updated_at=NOW()
         WHERE contact_social_accounts.status <> 'confirmed'""",
-        (row["contact_id"], account["id"], row["relationship"], "creator_workflow_" + source, scope["actor_id"]),
-    )
-    conn.execute(
-        """INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,contact_id,
-        relationship,source,candidate_id,created_by_authorization_id,creator_type) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        ON CONFLICT(social_account_id) WHERE ended_at IS NULL DO NOTHING""",
-        (
-            uuid4(),
-            account["id"],
-            row["responsible_authorization_id"],
-            row["contact_id"],
-            row["relationship"],
-            source,
-            row["id"],
-            scope["actor_id"],
-            row["creator_type"],
-        ),
-    )
-    # Deliberately do not touch contact_roles/contact_assignments: one account is not every account of that person.
+            (row["contact_id"], account_id, row["relationship"], "creator_workflow_" + source, scope["actor_id"]),
+        )
+    if current:
+        conn.execute(
+            "UPDATE creator_account_assignments SET social_account_id=%s,creator_type=%s,relationship=%s WHERE id=%s",
+            (account_id, row.get("creator_type"), row["relationship"], current["id"]),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,contact_id,
+            relationship,source,candidate_id,created_by_authorization_id,creator_type)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (uuid4(), account_id, row["responsible_authorization_id"], row["contact_id"], row["relationship"],
+             source, row["id"], scope["actor_id"], row.get("creator_type")),
+        )
+    # The legacy person-role/assignment system stays separate.
     return conn.execute(
         """UPDATE creator_workflow_candidates SET status='confirmed',social_account_id=%s,
+        normalized_handle=%s,platform=%s,creator_type=%s,relationship=%s,
         version=version+1,updated_at=NOW() WHERE id=%s RETURNING *""",
-        (account["id"], row["id"]),
+        (account_id, row["normalized_handle"], row["platform"], row.get("creator_type"),
+         row["relationship"], row["id"]),
     ).fetchone()
 
 
@@ -914,8 +935,8 @@ def confirm_candidate(scope: dict, candidate_id: UUID, version: int, *, request_
         row = _candidate(conn, candidate_id, scope, lock=True)
         _version(row, version)
         _editable(row)
-        if not all(row.get(k) for k in ("normalized_handle", "responsible_authorization_id", "contact_id")):
-            raise WorkflowInputError("handle、负责人和对应 Lark 用户必须全部补齐后才能入库。")
+        if not all(row.get(k) for k in ("responsible_authorization_id", "contact_id")):
+            raise WorkflowInputError("请先确定负责人和对应 Lark 用户。")
         # This explicit click confirms the displayed account/user pair. Historical
         # flags stay in source records and the audit's before snapshot, not a checklist.
         reviewed = conn.execute(
@@ -1008,7 +1029,7 @@ def _evidence_revision(conn: Any, refs: list[dict]) -> str:
     for ref in refs:
         row = conn.execute(
             """SELECT m.message_update_time,m.sender_open_id,m.parent_id,m.root_id,m.thread_id,m.mentions_json,
-                      i.contact_id,i.tenant_classification,c.name,c.chat_mode,ac.p2p_counterpart_open_id
+                      i.contact_id,i.tenant_classification,c.name,c.chat_mode,c.chat_status,ac.p2p_counterpart_open_id
             FROM chat_messages m JOIN chats c ON c.chat_id=m.chat_id
             LEFT JOIN lark_identities i ON i.open_id=m.sender_open_id
             LEFT JOIN authorization_chats ac ON ac.chat_id=m.chat_id AND ac.authorization_id=%s
@@ -1020,53 +1041,33 @@ def _evidence_revision(conn: Any, refs: list[dict]) -> str:
 
 
 def _maybe_auto_confirm(conn: Any, row: dict, scope: dict) -> dict:
-    """Two independent sources must agree; a score or upload alone is never enough."""
+    """A verified business dialogue can establish the person before their handle is known."""
     if (
-        row["status"] != "pending" or row.get("creator_type") != "cap"
-        or not all(row.get(k) for k in ("normalized_handle", "responsible_authorization_id", "contact_id"))
-        or set(row["uncertainties"]) - {"ai_review"}
-        or _conflicts(conn, row, manual=True)
+        row["status"] != "pending"
+        or not all(row.get(k) for k in ("responsible_authorization_id", "contact_id"))
+        or set(row["uncertainties"]) - {"ai_review", "handle_uncertain"}
+        or _conflicts(conn, {**row, "normalized_handle": None}, manual=True)
     ):
         return row
-    sources = conn.execute(
-        "SELECT source_type,source_data FROM creator_workflow_sources WHERE candidate_id=%s "
-        "ORDER BY created_at DESC,id DESC",
+    source = conn.execute(
+        "SELECT source_data FROM creator_workflow_sources WHERE candidate_id=%s AND source_type='ai' "
+        "ORDER BY created_at DESC,id DESC LIMIT 1",
         (row["id"],),
-    ).fetchall()
-    excel, ai = [], []
-    latest_ai_seen = False
-    for source in sources:
-        data = source["source_data"]
-        if source["source_type"] == "ai":
-            if latest_ai_seen:
-                continue
-            # A newer uncertain result supersedes an older high score, even across runs.
-            latest_ai_seen = True
-        if (
-            data.get("cap_policy_version") != CAP_POLICY_VERSION
-            or data.get("proposed_handle") != row["normalized_handle"]
-            or data.get("proposed_platform") != row["platform"]
-            or data.get("proposed_cm_id") != str(row["responsible_authorization_id"])
-        ):
-            continue
-        if source["source_type"] == "excel":
-            if (
-                data.get("type_evidence") == "cm_excel_upload" and data.get("creator_type") == "cap"
-                and data.get("proposed_contact_id") in {None, str(row["contact_id"])}
-            ):
-                excel.append(data)
-            continue
-        scores = [data.get(k) for k in ("creator_confidence", "identity_confidence", "cm_confidence")]
-        if (
-            data.get("proposed_contact_id") == str(row["contact_id"])
-            and all(type(score) in {int, float} and math.isfinite(score)
-                    and AUTO_CONFIRM_THRESHOLD <= score <= 1 for score in scores)
-            and all(data.get(k) is True for k in
-                    ("exact_handle_evidence", "direct_creator_evidence", "direct_cm_evidence"))
-            and not data.get("unknowns")
-        ):
-            ai.append(data)
-    if not excel or not ai:
+    ).fetchone()
+    if not source:
+        return row
+    data = source["source_data"]
+    scores = [data.get(k) for k in ("creator_confidence", "cm_confidence")]
+    if (
+        data.get("business_policy_version") != BUSINESS_POLICY_VERSION
+        or data.get("proposed_cm_id") != str(row["responsible_authorization_id"])
+        or data.get("proposed_contact_id") != str(row["contact_id"])
+        or not all(type(score) in {int, float} and math.isfinite(score)
+                   and AUTO_CONFIRM_THRESHOLD <= score <= 1 for score in scores)
+        or not all(data.get(k) is True for k in
+                   ("verified_business_dialogue", "direct_creator_evidence", "direct_cm_evidence"))
+        or data.get("unknowns")
+    ):
         return row
     if conn.execute(
         """SELECT 1 FROM audit_events WHERE action='creator_handle_identity_review_flagged'
@@ -1074,19 +1075,25 @@ def _maybe_auto_confirm(conn: Any, row: dict, scope: dict) -> dict:
         (str(row["contact_id"]), row["normalized_handle"]),
     ).fetchone():
         return row
-    for data in ai:
-        try:
-            refs = validate_evidence(conn, row["responsible_authorization_id"], data.get("evidence"))
-        except (WorkflowInputError, PermissionError):
-            continue
-        if data.get("evidence_revision") != _evidence_revision(conn, refs):
-            continue
-        reviewed = conn.execute(
-            "UPDATE creator_workflow_candidates SET uncertainties='{}',relationship='associated' "
-            "WHERE id=%s RETURNING *", (row["id"],),
-        ).fetchone()
-        return _promote(conn, reviewed, scope, "excel_ai_verified")
-    return row
+    try:
+        refs = validate_evidence(conn, row["responsible_authorization_id"], data.get("evidence"))
+    except (WorkflowInputError, PermissionError):
+        return row
+    if data.get("evidence_revision") != _evidence_revision(conn, refs):
+        return row
+    handle = row["normalized_handle"]
+    if (
+        not data.get("exact_handle_evidence") or data.get("proposed_handle") != handle
+        or _conflicts(conn, row, manual=True)
+    ):
+        # Establishing a person does not establish an unverified/conflicting
+        # social account. Keep that proposal in its source for later CM review.
+        handle = None
+    reviewed = conn.execute(
+        "UPDATE creator_workflow_candidates SET uncertainties='{}',relationship='associated',normalized_handle=%s "
+        "WHERE id=%s RETURNING *", (handle, row["id"]),
+    ).fetchone()
+    return _promote(conn, reviewed, scope, "ai_business_verified")
 
 
 def ingest_source(
@@ -1106,7 +1113,7 @@ def ingest_source(
     request_id: UUID | None = None,
     conn: Any = None,
 ) -> dict:
-    """Server-side ingestion. Legacy trusted_identity never bypasses the dual-source gate."""
+    """Server-side ingestion; legacy confidence/import flags do not prove a business relationship."""
     if source_type not in {"excel", "ai"} or not isinstance(source_key, str) or not 1 <= len(source_key) <= 500:
         raise WorkflowInputError("来源类型或来源编号不正确。")
     if not isinstance(source_data, dict) or len(json.dumps(source_data, default=str)) > 100_000:
@@ -1145,6 +1152,7 @@ def ingest_source(
         envelope["source_data"] = {key: source_data.get(key) for key in (
             "evidence", "cap_policy_version", "creator_confidence", "identity_confidence", "cm_confidence",
             "exact_handle_evidence", "direct_creator_evidence", "direct_cm_evidence", "unknowns",
+            "business_policy_version", "verified_business_dialogue",
         )}
     fingerprint = _digest(envelope)
     with nullcontext(conn) if conn is not None else connection() as active, active.transaction():
@@ -1199,6 +1207,14 @@ def ingest_source(
             if handle
             else None
         )
+        if not row and contact_id and responsible_id:
+            row = active.execute(
+                """SELECT * FROM creator_workflow_candidates WHERE contact_id=%s AND responsible_authorization_id=%s
+                AND merged_into IS NULL AND status IN ('pending','deferred','confirmed')
+                AND (normalized_handle IS NULL OR %s::text IS NULL OR (platform=%s AND normalized_handle=%s))
+                ORDER BY (status='confirmed') DESC,updated_at DESC LIMIT 1 FOR UPDATE""",
+                (contact_id, responsible_id, handle, platform, handle),
+            ).fetchone()
         if not row:
             old_source = active.execute(
                 "SELECT candidate_id FROM creator_workflow_sources WHERE source_type=%s AND source_key=%s "
@@ -1213,7 +1229,7 @@ def ingest_source(
             row
             and row["status"] == "confirmed"
             and (
-                handle
+                handle and row["normalized_handle"]
                 and row["normalized_handle"] != handle
                 or responsible_id
                 and row["responsible_authorization_id"] != responsible_id
@@ -1237,7 +1253,17 @@ def ingest_source(
                 contact_id,relationship,creator_type,uncertainties) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
                 (uuid4(), platform, handle, responsible_id, contact_id, relationship, creator_type, unknowns),
             ).fetchone()
-        elif row["status"] != "confirmed":
+        elif row["status"] == "confirmed":
+            # Exact known identity/CM only: imports may supply a first account or
+            # CAP declaration, never silently replace an existing fact.
+            proposed = {**row, "normalized_handle": row["normalized_handle"] or handle,
+                        "platform": row["platform"] if row["normalized_handle"] or not handle else platform,
+                        "creator_type": row.get("creator_type") or creator_type}
+            if (proposed["normalized_handle"], proposed.get("creator_type")) != (
+                row["normalized_handle"], row.get("creator_type")
+            ):
+                row = _promote(active, proposed, scope, "cm_confirmation")
+        else:
             differences = (
                 row["normalized_handle"]
                 and handle
@@ -1263,7 +1289,9 @@ def ingest_source(
             )
             # New material evidence may reopen a denial, but it goes to the administrator, never the next guessed CM.
             row = active.execute(
-                """UPDATE creator_workflow_candidates SET normalized_handle=COALESCE(normalized_handle,%s),
+                """UPDATE creator_workflow_candidates SET
+                platform=CASE WHEN normalized_handle IS NULL AND %s::text IS NOT NULL THEN %s ELSE platform END,
+                normalized_handle=COALESCE(normalized_handle,%s),
                 contact_id=COALESCE(contact_id,%s),relationship=COALESCE(relationship,%s),
                 creator_type=COALESCE(creator_type,%s),uncertainties=%s,
                 status=CASE WHEN status='deferred' THEN 'deferred' ELSE 'pending' END,
@@ -1273,7 +1301,7 @@ def ingest_source(
                   ELSE COALESCE(responsible_authorization_id,%s) END,
                 version=version+1,updated_at=NOW()
                 WHERE id=%s RETURNING *""",
-                (handle, contact_id, relationship, creator_type, merged_unknowns,
+                (handle, platform, handle, contact_id, relationship, creator_type, merged_unknowns,
                  different_cm, responsible_id, row["id"]),
             ).fetchone()
         active.execute(
@@ -1302,8 +1330,8 @@ def ingest_source(
                 "source_type": source_type,
                 "source_key": source_key,
                 "fingerprint": fingerprint,
-                "excel_ai_auto_confirmed": promoted,
-                "cap_policy_version": CAP_POLICY_VERSION,
+                "ai_auto_confirmed": promoted,
+                "business_policy_version": BUSINESS_POLICY_VERSION,
             },
         )
         return _record(active, row, view_scope)

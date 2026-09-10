@@ -50,9 +50,12 @@ AI_FEATURES = {
         "enabled_label": "开启下班消息总结（保存后立即排队）",
     },
     "creator_workflow": {
-        "title": "达人账号候选（CM 确认）",
-        "description": "在选定 CM 的有效授权范围内按需查找账号线索；所有结果一律待本人确认，不自动认人或分配。",
-        "enabled_label": "启用新达人候选入口",
+        "title": "达人历史业务识别",
+        "description": (
+            "扫描已授权、已同步的历史业务对话；身份和负责关系明确可入库，"
+            "不确定的交 CM 确认，handle 可后补。"
+        ),
+        "enabled_label": "启用达人业务识别",
     },
     "contact_assessment": {
         "title": "联系人身份识别",

@@ -200,11 +200,11 @@ def _roster(conn):
     return conn.execute(
         """SELECT ca.contact_id, sa.display_handle, sa.id AS account_id, i.open_id,
                   COALESCE(i.display_name,c.display_name) AS name
-           FROM creator_account_assignments ca JOIN social_accounts sa ON sa.id=ca.social_account_id
+           FROM creator_account_assignments ca LEFT JOIN social_accounts sa ON sa.id=ca.social_account_id
            JOIN contacts c ON c.id=ca.contact_id
            JOIN lark_identities i ON i.contact_id=ca.contact_id AND i.identity_type='user'
            WHERE ca.responsible_authorization_id=%s AND ca.ended_at IS NULL
-           ORDER BY ca.contact_id,sa.id,i.open_id FOR SHARE OF ca,sa,c,i""",
+           ORDER BY ca.contact_id,sa.id,i.open_id FOR SHARE OF ca,c,i""",
         (REMI_ID,),
     ).fetchall()
 
@@ -299,7 +299,7 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None):
         label = str(row["contact_id"])
         if label not in people:
             people[label] = {"contact_id": label, "name": row["name"], "handles": [], "open_ids": []}
-        if row["display_handle"] not in people[label]["handles"]:
+        if row["display_handle"] and row["display_handle"] not in people[label]["handles"]:
             people[label]["handles"].append(row["display_handle"])
         if row["open_id"] not in people[label]["open_ids"]:
             people[label]["open_ids"].append(row["open_id"])

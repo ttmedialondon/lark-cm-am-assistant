@@ -6,12 +6,12 @@
 
 | 文档 | 回答的问题 |
 |---|---|
-| [达人名单与 CM 确认](product/creator-management.md) | CAP / 非 CAP、CM 自传 Excel、AI 首次筛选、双来源自动入库及补项确认 |
+| [达人名单与 CM 确认](product/creator-management.md) | 历史业务对话识别、先按人入库、handle / CAP 后补、CM 自传 Excel |
 | [指定时段消息总结](product/message-summary.md) | 哪些消息要分析，P0–P3 怎么分，显示什么，哪些事不做？ |
 | [后台权限与用户显示](product/admin-access.md) | 谁能看或修改哪些页面，领导能看哪些聊天，姓名和 @ 怎么显示？ |
 | [系统技术说明](architecture/system-design.md) | 页面、同步、身份、账号、授权、并发和旧快照如何关联？ |
 
-这四份按当前实现维护。本版已确定 CAP / 非 CAP 与双来源规则；Remi 之前清空的名单仍不恢复，不自动上传旧 Excel。新规则只处理新的导入、主动扫描和新 CM 首次筛选，清空范围见下方历史记录。
+这四份按当前实现维护。本版采用业务对话规则，替代“必须 Excel + AI、必须有 handle 才入库”。按用户决定重置所有 CM 的达人派生数据，保留联系人、聊天原文和授权；不自动恢复旧名单、上传旧 Excel 或给所有 CM 启动扫描。
 
 ## 开发与运行
 

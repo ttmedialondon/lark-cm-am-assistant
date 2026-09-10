@@ -2,7 +2,7 @@
 
 import json
 from contextlib import nullcontext
-from datetime import timedelta
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -79,7 +79,7 @@ def test_keyset_pages_cover_over_100_chats_once_and_share_normal_task_queue(pg, 
     tick(pg)
     first = onboarding.get_status(pg, ids["cm"])
     assert first["total_chats"] == 109 and first["checked_chats"] == 100 and first["queued_chats"] == 0
-    assert first["window_end"] - first["window_start"] == timedelta(days=90)
+    assert first["window_start"] == ai.HISTORY_START and first["history_days"] is None
     tick(pg)
     second = onboarding.get_status(pg, ids["cm"])
     assert second["checked_chats"] == 109 and second["queued_chats"] == 1
@@ -148,15 +148,15 @@ def test_frozen_window_excludes_new_messages_and_non_normal_chats(pg, initial):
     assert not pg.execute(ai._MESSAGES_SQL, (ids["cm"], "chat", row["window_start"], row["window_end"], 30)).fetchall()
 
 
-def test_first_scan_reports_per_chat_limits_and_locks_evidence_before_decryption(pg, initial, monkeypatch):
+def test_all_history_segments_include_old_messages_and_lock_fixed_ids_before_decryption(pg, initial, monkeypatch):
     ids, settings = initial
     cipher = message_body_cipher(settings.token_encryption_key)
-    for number in range(35):
+    for number in range(95):
         message_id = f"long-{number:02d}"
         pg.execute(
             """INSERT INTO chat_messages
                (chat_id,message_id,sender_open_id,message_type,body_ciphertext,message_create_time)
-               VALUES('chat',%s,'ou_person','text',%s,NOW()-INTERVAL '10 seconds')""",
+               VALUES('chat',%s,'ou_person','text',%s,NOW()-INTERVAL '200 days')""",
             (message_id, cipher.encrypt(json.dumps({"text": "x" * 2000}))),
         )
         pg.execute(
@@ -167,7 +167,11 @@ def test_first_scan_reports_per_chat_limits_and_locks_evidence_before_decryption
     synced(pg, ids["cm"])
     tick(pg)
     status = onboarding.get_status(pg, ids["cm"])
-    assert status["truncated_chats"] == 1
+    assert status["queued_chats"] == 2 and status["history_days"] is None
+    segments = pg.execute("SELECT message_ids FROM creator_workflow_ai_tasks").fetchall()
+    ids_seen = {mid for segment in segments for mid in segment["message_ids"]}
+    assert len(ids_seen) == 97  # includes all old messages, not only a recent tail.
+    assert len(set(segments[0]["message_ids"]) & set(segments[1]["message_ids"])) == ai.MESSAGE_OVERLAP
     job = ai.claim_next_creator_scan()
     queries = []
 
@@ -186,5 +190,28 @@ def test_first_scan_reports_per_chat_limits_and_locks_evidence_before_decryption
     monkeypatch.setattr(ai, "message_body_cipher", lambda _: Cipher())
     evidence = ai._load_evidence(LockedReader(), job, settings)
     assert evidence["pack"]["input_truncated"] and evidence["pack"]["history_synced"]
-    assert len(evidence["pack"]["messages"]) == 30
-    assert all(len(message["text"]) == 1500 for message in evidence["pack"]["messages"])
+    assert len(evidence["pack"]["messages"]) == ai.MAX_MESSAGES
+    assert all(len(message["text"]) <= ai.MAX_BODY_CHARS for message in evidence["pack"]["messages"])
+
+
+def test_all_cm_reset_removes_derived_roster_not_source_people_messages_or_permissions(pg, real_scan):
+    ids, _ = real_scan
+    workflow = ai.creator_workflow
+    row = workflow.ingest_source(
+        ids["cm"], source_type="excel", source_key="reset-fixture", source_data={},
+        responsible_id=ids["cm"], contact_id=ids["person"], conn=pg,
+    )
+    workflow.confirm_candidate(workflow.get_scope(ids["cm"]), row["id"], row["version"], request_id=uuid4())
+    workflow.ingest_source(ids["owner"], source_type="excel", source_key="unassigned-fixture", source_data={}, conn=pg)
+    ai.queue_scan(ids["owner"], ids["cm"])
+    onboarding.advance_initial_scans()
+    protected = ("contacts", "lark_identities", "chat_messages", "authorization_message_observations",
+                 "authorizations", "admin_roles", "admin_page_permissions")
+    before = {table: pg.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"] for table in protected}
+    pg.execute((Path(__file__).parents[1] / "migrations/039_reset_all_creator_data.sql").read_text())
+    for table in ("creator_workflow_candidates", "creator_workflow_sources", "creator_account_assignments",
+                  "social_accounts", "contact_social_accounts", "creator_workflow_onboarding",
+                  "creator_workflow_ai_tasks", "creator_workflow_ai_runs", "creator_workflow_requests"):
+        assert pg.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"] == 0
+    assert before == {table: pg.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"] for table in protected}
+    assert not ai._enabled(pg)

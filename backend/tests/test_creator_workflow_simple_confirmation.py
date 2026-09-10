@@ -101,26 +101,11 @@ def test_later_sources_do_not_replace_manual_association_with_a_guessed_owner_ro
     assert db.execute("SELECT relationship FROM contact_social_accounts").fetchone()["relationship"] == "associated"
 
 
-@pytest.mark.parametrize("missing", ["handle", "contact_id"])
-def test_missing_field_still_blocks_manual_confirmation(db, people, missing):
-    row = source(people, **{missing: None}, relationship=None)
-    assert not row["can_confirm"]
-    assert {r["code"] for r in row["blocking_reasons"]} == {
-        "missing_handle" if missing == "handle" else "missing_user"
-    }
-    with pytest.raises(workflow.WorkflowInputError, match="全部补齐"):
-        workflow.confirm_candidate(workflow.get_scope(people["cm"]), row["id"], row["version"], request_id=uuid4())
-    assert db.execute("SELECT count(*) n FROM creator_account_assignments").fetchone()["n"] == 0
-
-
-def test_two_field_edit_can_merge_same_user_duplicate_without_relationship_payload(db, people):
+def test_handle_arriving_later_reuses_the_same_person_candidate(db, people):
     missing_handle = source(people, handle=None)
     known = source(people, source_key="known-handle")
     scope = workflow.get_scope(people["cm"])
-    merged = workflow.save_draft(
-        scope, missing_handle["id"], missing_handle["version"], handle="abc", contact_id=people["person"],
-    )
-    assert merged["id"] == known["id"] and merged["can_confirm"]
-    formal = workflow.confirm_candidate(scope, merged["id"], merged["version"], request_id=uuid4())
+    assert missing_handle["id"] == known["id"] and known["can_confirm"]
+    formal = workflow.confirm_candidate(scope, known["id"], known["version"], request_id=uuid4())
     assert formal["status"] == "confirmed" and formal["relationship"] == "associated"
     assert db.execute("SELECT count(*) n FROM creator_account_assignments").fetchone()["n"] == 1

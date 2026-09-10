@@ -26,7 +26,7 @@ def db(monkeypatch):
         conn.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(psycopg.sql.Identifier(schema)))
         conn.execute(psycopg.sql.SQL("SET LOCAL search_path TO {}").format(psycopg.sql.Identifier(schema)))
         for path in sorted((Path(__file__).parents[1] / "migrations").glob("*.sql")):
-            if int(path.name[:3]) <= 28 or int(path.name[:3]) in (31, 34):
+            if int(path.name[:3]) <= 28 or int(path.name[:3]) in (31, 34, 37):
                 conn.execute(path.read_text())
         monkeypatch.setattr(workflow, "connection", lambda: nullcontext(conn))
         try:

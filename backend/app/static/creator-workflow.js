@@ -9,9 +9,7 @@
   }
   function missingFields(draft) {
     const missing = [];
-    if (!draft.handle.trim() || /^[—–-]+$/.test(draft.handle.trim())) missing.push("handle");
     if (!draft.contact?.contact_id) missing.push("对应用户（请从搜索结果中选中）");
-    if (!["cap", "non_cap"].includes(draft.creator_type)) missing.push("达人类型（请选择 CAP 或非 CAP）");
     return missing;
   }
   function draftBody(draft, requestId) {
@@ -187,6 +185,7 @@
   function renderRow(item) {
     const row = element("tr"); row.dataset.candidateId = item.id;
     const editable = writable && pending(item), draft = getDraft(item);
+    const supplement = writable && item.status === "confirmed" && (!item.handle || !item.creator_type);
     row.setAttribute("aria-busy", String(busy.has(item.id)));
     if (writable) {
       const cell = element("td"), input = element("input", "", "form-check-input");
@@ -197,7 +196,7 @@
     const handleCell = element("td"), typeCell = element("td", "", "cw-type"), sourceCell = element("td"), userCell = element("td"), statusCell = element("td"), actionCell = element("td");
     row.append(handleCell, typeCell, sourceCell, userCell, statusCell, actionCell);
     handleCell.append(element("div", draft.handle ? `@${draft.handle.replace(/^@/, "")}` : "—", "cw-handle"), element("span", item.platform || "—", "cw-small"));
-    if (editable) {
+    if (editable || (supplement && !item.handle)) {
       const input = element("input", "", "form-control"); input.value = draft.handle; input.maxLength = 80;
       input.placeholder = "填写 handle"; input.autocomplete = "off";
       const editor = labelInput("达人 handle", input); editor.hidden = !draft.handleOpen;
@@ -212,7 +211,7 @@
       });
       handleCell.append(open, editor);
     }
-    if (editable) {
+    if (editable || (supplement && !item.creator_type)) {
       const select = element("select", "", "form-select");
       select.setAttribute("aria-label", "达人类型");
       for (const [value, label] of [["", "—（未确定）"], ["cap", "CAP"], ["non_cap", "非 CAP"]]) {
@@ -230,7 +229,7 @@
     renderUser(userCell, draft, editable);
     statusCell.append(element("span", item.status_label || (item.status === "confirmed" ? "已确认入库" : item.status === "deferred" ? "待确认 · 暂缓" : "待确认"), `cw-pill cw-pill--${item.status === "confirmed" ? "confirmed" : "pending"}`));
     const editStatus = element("div", "", "cw-small"); statusCell.append(editStatus);
-    const updateEditStatus = () => { editStatus.textContent = draft.dirty ? "有未保存的修改，确认时会一并保存。" : ""; };
+    const updateEditStatus = () => { editStatus.textContent = draft.dirty ? item.status === "confirmed" ? "有未保存的补充资料。" : "有未保存的修改，确认时会一并保存。" : ""; };
     row.addEventListener("workflow-draft-change", updateEditStatus); updateEditStatus();
     if ((item.blocking_reasons || []).length) {
       const reasons = element("ul", "", "cw-reasons");
@@ -242,7 +241,7 @@
     if (editable) {
       const actions = element("div", "", "cw-row-actions");
       const confirm = button("确认入库", () => rowAction(item, "confirm"), "btn btn-primary");
-      const checkReady = () => { confirm.disabled = busy.has(item.id) || missingFields(draft).length > 0; };
+      const checkReady = () => { confirm.disabled = busy.has(item.id) || !scope.responsible_id || missingFields(draft).length > 0; };
       for (const event of ["input", "change", "workflow-draft-change"]) row.addEventListener(event, checkReady);
       checkReady();
       actions.append(confirm, button("保存草稿", () => rowAction(item, "draft")),
@@ -251,6 +250,15 @@
         button("重新载入此行", async () => { if (!draft.dirty || window.confirm("重新载入会放弃此行尚未保存的补充资料，继续？")) { drafts.delete(item.id); selected.delete(item.id); await load(); } }, "cw-link"));
       actionCell.append(actions);
       if (draft.version !== item.version) actionCell.append(element("p", "服务器资料已变化。草稿仍保留，请重新载入此行后核对。", "cw-row-feedback cw-error"));
+    } else if (supplement) {
+      const actions = element("div", "", "cw-row-actions");
+      const saveExtra = button("保存补充", () => rowAction(item, "draft"), "btn btn-outline-primary");
+      const checkExtra = () => { saveExtra.disabled = busy.has(item.id) || !draft.dirty; };
+      row.addEventListener("workflow-draft-change", checkExtra); checkExtra();
+      actions.append(saveExtra,
+        button("重新载入此行", async () => { if (!draft.dirty || window.confirm("重新载入会放弃此行尚未保存的补充资料，继续？")) { drafts.delete(item.id); await load(); } }, "cw-link"),
+        element("span", "仅补缺失资料，不变更已确认的用户和负责人。", "cw-small"));
+      actionCell.append(actions);
     } else if (scope.can_admin && !item.responsible_id && ["pending", "deferred", "rejected"].includes(item.status)) {
       const target = element("select", "", "form-select"), placeholder = element("option", "—"); placeholder.value = ""; target.append(placeholder);
       for (const responsible of responsibles) { const option = element("option", responsible.display_name); option.value = responsible.id; target.append(option); }
@@ -330,10 +338,12 @@
   async function perform(item, action) {
     let draft = getDraft(item);
     if (action === "draft") {
+      if (item.status === "confirmed") lockRowInputs(item.id, true);
       await save(item);
-      return getDraft(item).dirty ? "已保存提交时的资料；你刚修改的内容仍未保存。" : "草稿已保存，尚未入库。";
+      return getDraft(item).dirty ? "已保存提交时的资料；你刚修改的内容仍未保存。" : item.status === "confirmed" ? "补充资料已保存，正式归属未变。" : "草稿已保存，尚未入库。";
     }
     if (action === "confirm") {
+      if (!scope.responsible_id) throw new Error("请先明确这位达人的负责 CM。");
       const missing = missingFields(draft);
       if (missing.length) throw new Error(`还不能入库，请补齐：${missing.join("、")}。`);
       lockRowInputs(item.id, true);
@@ -366,7 +376,7 @@
   $("cw-next").addEventListener("click", () => { page++; load(); });
   if (scope.responsible_id || writable || canScan || scope.can_import) {
     if (writable) $("cw-confirm-selected").addEventListener("click", async () => {
-      if (!selected.size || !window.confirm(`确认将所选 ${selected.size} 条记录入库？缺 handle、用户、达人类型或存在冲突的记录会保留待确认。`)) return;
+      if (!selected.size || !window.confirm(`确认将所选 ${selected.size} 条记录入库？用户或负责人不明确、存在冲突的记录会保留待确认；handle 和类型可稍后补充。`)) return;
       const ids = [...selected], results = $("cw-batch-results"); results.replaceChildren(); results.hidden = false;
       for (const id of ids) busy.add(id); updateSelected();
       for (const id of ids) {
@@ -387,17 +397,17 @@
       if (!initial) return;
       const labels = {waiting_sync: "等待准备", scanning: "筛选中", succeeded: "已完成", failed: "未完成", cancelled: "已停止"};
       const messages = {
-        waiting_sync: "等待首次同步与 AI 配置就绪后再开始；不会把没有数据当成没有达人。",
-        scanning: "正在分批检查最近 90 天的已授权会话。会话检查完不等于 AI 已分析完，请以最终状态为准。",
-        succeeded: "首次筛选已完成，请核对名单。无候选不代表不存在达人；未确定的类型仍保留待确认。",
-        failed: "首次筛选尚未完成，已停止自动重试；处理原因后可手动重试。",
-        cancelled: "首次筛选已停止，请先核对授权；旧批次不能重放时，请使用当前范围的手动扫描。",
+        waiting_sync: "等待同步与 AI 配置就绪后再开始；不会把没有数据当成没有达人。",
+        scanning: "正在分批检查当前授权下已同步的历史业务对话，不限最近消息。扫描完成前，名单只是部分结果。",
+        succeeded: "历史扫描已完成，请核对名单。无候选不代表不存在达人；未确定的 handle 和类型显示“—”。",
+        failed: "历史扫描尚未完成，已停止自动重试；处理原因后可手动重试。",
+        cancelled: "历史扫描已停止，请先核对授权；旧批次不能重放时，请使用当前范围的手动扫描。",
       };
       $("cw-initial-status").textContent = labels[initial.status] || "待核对";
       $("cw-initial-message").textContent = initial.error_message || messages[initial.status] || "当前状态需核对。";
       $("cw-initial-message").classList.toggle("cw-error", ["failed", "cancelled"].includes(initial.status));
-      $("cw-initial-counts").textContent = `已检查会话 ${initial.checked_chats ?? 0} / ${initial.total_chats ?? 0} · 累计排队 ${initial.queued_chats ?? 0} 个会话`;
-      $("cw-initial-limit").textContent = `最近 ${initial.history_days ?? 90} 天；每个会话最多 ${initial.message_limit ?? 30} 条消息、每条 ${initial.message_char_limit ?? 1500} 字符。${initial.truncated_chats ? `已有 ${initial.truncated_chats} 个会话截断，结果可能不完整。` : "不是全量聊天分析。"}`;
+      $("cw-initial-counts").textContent = `已检查会话 ${initial.checked_chats ?? 0} / ${initial.total_chats ?? 0} · 累计排队 ${initial.queued_chats ?? 0} 个消息段`;
+      $("cw-initial-limit").textContent = `扫描本轮开始前已同步、当前授权可读的历史；每段 ${initial.message_limit ?? 80} 条，相邻重叠 ${initial.message_overlap ?? 20} 条，逐段处理到底。每条最多 ${initial.message_char_limit ?? 1500} 字符；未同步消息、图片和附件内容不在本次范围内。`;
       if (initialRetry) { initialRetry.hidden = !["failed", "cancelled"].includes(initial.status); initialRetry.disabled = running; }
     }
     async function startAI(retryFailed = false) {
@@ -407,7 +417,7 @@
       if (retryAI) retryAI.hidden = true;
       try {
         const result = await api("/ai/scan", {body: {request_id: requestId(), retry_failed: retryFailed}});
-        feedback(result.message || "候选分析已提交。与 CAP 名单准确匹配且资料完整的记录可自动入库，其他记录待确认。");
+        feedback(result.message || "历史业务对话扫描已提交。明确是达人且由当前 CM 负责的记录可入库；不确定的留待确认，handle 可后补。");
         pollAI();
       } catch (error) { feedback(error.message, true); control.disabled = false; }
     }
@@ -428,7 +438,7 @@
         if (!result) { if (showAIProgress) feedback("当前没有正在运行的候选分析。"); if (retryAI) retryAI.hidden = true; return; }
         const errors = (result.errors || []).map(error => typeof error === "string" ? error : error.message || error.error || "部分候选分析失败");
         const active = running || initialActive;
-        if (showAIProgress) feedback([result.message || (active ? "AI 正在查找候选并匹配 CAP 名单；不明确的记录保留待确认。" : "本轮候选分析已结束，请核对名单和待确认项。"), ...errors].join("；"), errors.length > 0 || ["failed", "partial"].includes(result.status));
+        if (showAIProgress) feedback([result.message || (active ? "AI 正在核对历史业务对话与 CM 关系；不明确的记录保留待确认。" : "本轮候选分析已结束，请核对名单和待确认项。"), ...errors].join("；"), errors.length > 0 || ["failed", "partial"].includes(result.status));
         if (retryAI) retryAI.hidden = Boolean(initialActive || ["failed", "cancelled"].includes(initial?.status)) || !(errors.length || ["failed", "partial"].includes(result.status));
         const progress = JSON.stringify([result.id, result.status, result.counts, result.candidate_count, initial]);
         const changed = lastAIProgress !== null && lastAIProgress !== progress;

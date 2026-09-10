@@ -67,7 +67,7 @@ async function fixture(t, {readonly = false, owner = false, testEditor = false, 
       assert.equal(body.version, state.items[0].version);
       if (state.holdConfirm) await state.holdConfirm();
       if (state.confirmError) return route.fulfill({status: state.confirmError.status, json: {detail: state.confirmError.message}});
-      assert(state.items[0].handle && state.items[0].contact?.contact_id && ["cap", "non_cap"].includes(state.items[0].creator_type));
+      assert(state.items[0].contact?.contact_id);
       state.items[0] = {...state.items[0], status: "confirmed", reasons: [], version: state.items[0].version + 1};
       return json(state.items[0]);
     }
@@ -125,7 +125,7 @@ test("missing values require a real user selection and complete edits confirm in
   assert(await confirm.isDisabled());
   await row.locator(".cw-search-results button").nth(1).click();
   assert((await row.locator(".cw-user").textContent()).includes("稳定身份 2"));
-  assert(await confirm.isDisabled());
+  assert(!(await confirm.isDisabled()));
   assert.equal(state.calls.filter(c => c.method === "POST").length, 0);
   await row.getByRole("button", {name: "填写 handle", exact: true}).click();
   await row.getByPlaceholder("填写 handle").fill("correct.handle");
@@ -248,46 +248,50 @@ test("reviewer sees no writing, search or evidence-view controls", async t => {
   assert.deepEqual(errors, []);
 });
 
-test("AI-only unknown type is not guessed as non-CAP and must be chosen before confirmation", async t => {
-  const item = {...candidate(), sources: ["ai"], handle: "known.handle", contact: contacts[0], creator_type: null};
+test("known user confirms without handle or type and only missing details can be added later", async t => {
+  const item = {...candidate(), sources: ["ai"], handle: null, contact: contacts[0], creator_type: null};
   const {page, state, errors} = await fixture(t, {item});
   const row = page.locator("#cw-rows tr"), type = row.getByLabel("达人类型", {exact: true});
   const confirm = row.getByRole("button", {name: "确认入库", exact: true});
   assert.equal(await type.inputValue(), "");
   assert.equal(await type.locator("option:checked").textContent(), "—（未确定）");
-  assert(await confirm.isDisabled());
-  await type.selectOption("cap");
   assert(!(await confirm.isDisabled()));
-  await type.selectOption("");
-  assert(await confirm.isDisabled());
-  await row.getByRole("button", {name: "保存草稿", exact: true}).click();
-  await page.getByText("草稿已保存，尚未入库。", {exact: true}).first().waitFor();
-  assert.equal(state.items[0].creator_type, null);
-  assert.equal(state.items[0].status, "pending");
-  assert(await confirm.isDisabled());
-  await type.selectOption("non_cap");
   await confirm.click();
   await row.getByText("已确认入库", {exact: true}).waitFor();
+  assert.equal(state.items[0].creator_type, null);
+  assert.equal(state.items[0].handle, null);
+  assert.equal(await row.locator(".cw-handle").textContent(), "—");
+  for (const name of ["更换用户", "清除", "确认入库"]) assert.equal(await row.getByRole("button", {name, exact: true}).count(), 0);
+  assert(await row.getByRole("checkbox").isDisabled());
+  await row.getByRole("button", {name: "填写 handle", exact: true}).click();
+  await row.getByPlaceholder("填写 handle").fill("later.handle");
+  await type.selectOption("non_cap");
+  await row.getByRole("button", {name: "保存补充", exact: true}).click();
+  await page.getByText("补充资料已保存，正式归属未变。", {exact: true}).first().waitFor();
+  assert.equal(state.items[0].handle, "later.handle");
+  assert.equal(state.items[0].contact.contact_id, "user-1");
+  assert.equal(state.items[0].status, "confirmed");
   assert.equal(state.items[0].creator_type, "non_cap");
   assert.equal(await row.locator(".cw-type").textContent(), "非 CAP");
+  assert.equal(await row.getByRole("button", {name: "修改 handle", exact: true}).count(), 0);
+  assert.equal(await row.getByLabel("达人类型", {exact: true}).count(), 0);
   assert.deepEqual(state.calls.filter(c => c.method === "POST").map(c => c.url.pathname),
-    ["/dashboard/creators/candidate-1/draft", "/dashboard/creators/candidate-1/draft", "/dashboard/creators/candidate-1/confirm"]);
+    ["/dashboard/creators/candidate-1/confirm", "/dashboard/creators/candidate-1/draft"]);
   assert.deepEqual(errors, []);
 });
 
-test("bulk confirmation requires handle, selected user and known creator type", async t => {
-  for (const missing of [null, "user", "type"]) {
+test("bulk confirmation requires a selected user, not handle or creator type", async t => {
+  for (const missing of [null, "user"]) {
     const complete = missing === null;
     await t.test(complete ? "complete record confirms" : `missing ${missing} stays pending`, async sub => {
-      const item = {...candidate(), handle: "bulk.handle", contact: missing === "user" ? null : contacts[0],
-        creator_type: missing === "type" ? null : "cap"};
+      const item = {...candidate(), handle: null, contact: missing === "user" ? null : contacts[0], creator_type: null};
       const {page, state, errors} = await fixture(sub, {item});
       const row = page.locator("#cw-rows tr");
       await row.getByRole("checkbox", {name: /用于批量确认/}).check();
       await page.locator("#cw-confirm-selected").click();
       await page.locator("#cw-batch-results div").waitFor();
       if (complete) await row.getByText("已确认入库", {exact: true}).waitFor();
-      else await page.locator("#cw-batch-results").getByText(missing === "user" ? /对应用户/ : /达人类型/).waitFor();
+      else await page.locator("#cw-batch-results").getByText(/对应用户/).waitFor();
       assert.equal(state.items[0].status, complete ? "confirmed" : "pending");
       assert.equal(state.calls.filter(c => c.url.pathname.endsWith("/confirm")).length, complete ? 1 : 0);
       assert.deepEqual(errors, []);
@@ -307,7 +311,7 @@ test("CAP Excel preflight precedes commit and the browser does not confirm AI ca
   await page.getByRole("button", {name: "确认提交这份预检结果"}).click();
   await page.getByText("已导入 1 行 · 正式入库 0 行 · 待确认 1 行 · 跳过 0 行").waitFor();
   await page.locator("#cw-import-close").click();
-  await page.getByRole("button", {name: "查找 AI 候选"}).click();
+  await page.getByRole("button", {name: "扫描历史业务对话"}).click();
   await page.getByText("候选分析已完成", {exact: true}).waitFor();
   assert.equal(state.calls.filter(c => c.url.pathname.endsWith("/confirm")).length, 0);
   assert.deepEqual(errors, []);
@@ -317,7 +321,7 @@ test("failed initial scan retries only on explicit authorized click and rejected
   const onboarding = {status: "failed", total_chats: 120, checked_chats: 100, queued_chats: 3, truncated_chats: 1,
     error_message: "本批有失败，请手动重试。"};
   const {page, state, errors} = await fixture(t, {onboarding});
-  const retry = page.getByRole("button", {name: "重试首次筛选", exact: true});
+  const retry = page.getByRole("button", {name: "重试历史扫描", exact: true});
   await retry.waitFor();
   assert.equal(state.calls.filter(call => call.method !== "GET").length, 0);
   state.initialRetryError = "正文授权已变化，旧首次筛选不可重放；请使用当前范围的手动扫描。";

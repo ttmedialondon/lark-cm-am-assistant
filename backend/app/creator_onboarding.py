@@ -1,8 +1,8 @@
-"""One durable 90-day candidate pass, registered only by a new OAuth insert."""
+"""One durable historical pass, requested by the CM/owner or a new OAuth insert."""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from uuid import UUID
 
 from . import creator_workflow_ai as ai
@@ -31,7 +31,8 @@ def get_status(conn, authorization_id):
         **dict(row),
         "message_limit": ai.MAX_MESSAGES,
         "message_char_limit": ai.MAX_BODY_CHARS,
-        "history_days": 90,
+        "history_days": None,
+        "message_overlap": ai.MESSAGE_OVERLAP,
     }
 
 
@@ -114,12 +115,12 @@ def advance_initial_scans():
                     """UPDATE creator_workflow_onboarding SET status='scanning',started_at=%s,
                        window_start=%s,window_end=%s,consent_at=%s,total_chats=%s,error_message=NULL
                        WHERE authorization_id=%s""",
-                    (end, end - timedelta(days=90), end, auth["body_consent_at"], total, row["authorization_id"]),
+                    (end, ai.HISTORY_START, end, auth["body_consent_at"], total, row["authorization_id"]),
                 )
                 row = {
                     **row,
                     "started_at": end,
-                    "window_start": end - timedelta(days=90),
+                    "window_start": ai.HISTORY_START,
                     "window_end": end,
                     "consent_at": auth["body_consent_at"],
                 }
@@ -132,7 +133,11 @@ def advance_initial_scans():
                 if not run or run["status"] != "succeeded":
                     _stop(conn, row, "failed", "本批有失败或资料变化，首次筛选未完成；请手动重试，不会无限调用。")
                     continue
-            batch = ai.queue_initial_batch(conn, row)
+            try:
+                batch = ai.queue_initial_batch(conn, row)
+            except (PermissionError, ai.ScanInputError):
+                _stop(conn, row, "cancelled", "请求人或 CM 的授权已变化；历史筛选已停止。")
+                continue
             if batch is None:  # A separately requested scan currently owns this CM.
                 continue
             if batch["checked"] == 0:

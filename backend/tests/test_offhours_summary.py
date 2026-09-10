@@ -117,7 +117,7 @@ def pg(monkeypatch):
         conn.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(psycopg.sql.Identifier(schema)))
         conn.execute(psycopg.sql.SQL("SET LOCAL search_path TO {}").format(psycopg.sql.Identifier(schema)))
         for path in sorted((Path(__file__).parents[1] / "migrations").glob("*.sql")):
-            if int(path.name[:3]) <= 32:
+            if int(path.name[:3]) <= 32 or int(path.name[:3]) in (34, 37):
                 conn.execute(path.read_text())
         monkeypatch.setattr(ai, "connection", lambda: nullcontext(conn))
         monkeypatch.setattr(ai.ai_dispatch, "connection", lambda: nullcontext(conn))
@@ -237,7 +237,9 @@ def seeded(pg, monkeypatch):
         assert kwargs["output_format"]["strict"]
         message = next(m for m in input_pack["messages"] if m["in_window"] and m["speaker"] == "U1")
         return {
-            "text": json.dumps({"events": [sample_event(evidence_refs=[message["ref"]])]}),
+            "text": json.dumps({"events": [sample_event(
+                evidence_refs=[message["ref"]], handle=next(iter(input_pack["users"]["U1"]["handles"]), None)
+            )]}),
             "usage": {"input_tokens": 1},
         }
 
@@ -247,8 +249,12 @@ def seeded(pg, monkeypatch):
     )
 
 
-def test_save_enabled_immediately_queues_claims_and_stores_encrypted_summary(pg, seeded):
+@pytest.mark.parametrize("with_handle", [True, False])
+def test_save_enabled_immediately_queues_claims_and_stores_encrypted_summary(pg, seeded, with_handle):
     s = seeded
+    if not with_handle:
+        pg.execute("UPDATE creator_workflow_candidates SET normalized_handle=NULL,social_account_id=NULL")
+        pg.execute("UPDATE creator_account_assignments SET social_account_id=NULL")
     assert s.save(False)["enabled"] is False
     assert ai.claim_next_summary() is None
     queued = s.save()
@@ -260,6 +266,9 @@ def test_save_enabled_immediately_queues_claims_and_stores_encrypted_summary(pg,
     assert len(s.calls) == 1 and len(view["events"]) == 1
     assert view["window"]["is_open"]
     assert view["events"][0]["priority"] == "P2"
+    if not with_handle:
+        assert s.calls[0]["users"]["U1"]["handles"] == []
+        assert view["events"][0]["creator_handle"] is None
     assert "unrelated outsider secret" not in json.dumps(s.calls)
     assert "future CM reply" not in json.dumps(s.calls)
     record = pg.execute("SELECT * FROM offhours_summary_tasks").fetchone()
