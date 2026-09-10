@@ -274,6 +274,32 @@ def test_model_run_metadata_does_not_repush_denied_evidence(db, people):
     assert replay["version"] == denied["version"] and replay["status"] == "rejected"
 
 
+def test_preview_never_promotes_or_changes_formal_and_empty_ai_results_stay_off_roster(db, people):
+    data = {
+        "evidence": [{"authorization_id": str(people["cm"]), "chat_id": "chat_cm", "message_id": "message1"}],
+        "business_policy_version": workflow.BUSINESS_POLICY_VERSION,
+        "creator_confidence": 1, "cm_confidence": 1,
+        "verified_business_dialogue": True, "direct_creator_evidence": True,
+        "direct_cm_evidence": True, "preview_only": True,
+    }
+    with pytest.raises(workflow.WorkflowInputError, match="具体用户"):
+        source(people, source_type="ai", source_data=data, handle=None, contact_id=None)
+    row = source(people, source_type="ai", source_data=data, handle=None, creator_type=None)
+    assert row["status"] == "pending"
+    assert not db.execute("SELECT 1 FROM creator_account_assignments").fetchone()
+    scope = workflow.get_scope(people["cm"])
+    formal = workflow.confirm_candidate(scope, row["id"], row["version"], request_id=uuid4())
+    source(people, source_type="ai", source_key="preview:later", source_data=data, handle="abc")
+    unchanged = workflow.get_record(scope, formal["id"])
+    assert unchanged["status"] == "confirmed" and unchanged["handle"] is None and unchanged["creator_type"] is None
+    # Retain legacy audit/source records without presenting an anonymous "creator".
+    old_id = uuid4()
+    db.execute("INSERT INTO creator_workflow_candidates(id,responsible_authorization_id) VALUES(%s,%s)",
+               (old_id, people["cm"]))
+    assert workflow.list_records(scope)["total"] == 1
+    assert db.execute("SELECT 1 FROM creator_workflow_candidates WHERE id=%s", (old_id,)).fetchone()
+
+
 def test_stale_version_and_forged_scope_cannot_write(db, people):
     row = source(people)
     scope = workflow.get_scope(people["cm"])

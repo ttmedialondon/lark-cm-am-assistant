@@ -38,6 +38,7 @@
   const drafts = new Map(), records = new Map(), selected = new Set(), busy = new Set(), locked = new Set();
   let listing = data, page = data.page || 1, loading = 0, aiTimer = null, importPreview = null;
   let aiLoading = 0, lastAIProgress = null, showAIProgress = false, aiReading = false, aiPollAgain = false;
+  let aiRun = null, aiSubmitting = false, previewRunId = null;
   const form = $("cw-filters");
   form.elements.type_filter.value = data.type_filter || new URLSearchParams(location.search).get("type_filter") || "all";
   const requestId = () => crypto.randomUUID();
@@ -388,64 +389,118 @@
       }
       await load(); updateSelected();
     });
-    const retryAI = canScan ? button("重试未完成", () => startAI(true), "btn btn-outline-primary") : null;
-    if (retryAI) { retryAI.hidden = true; retryAI.id = "cw-ai-retry"; $("cw-ai-scan").after(retryAI); }
-    const initialRetry = $("cw-initial-retry");
-    function showInitial(initial, result, running) {
+    const activeRun = result => result?.targeted === true && ["queued", "running"].includes(result.status);
+    const retryableRun = result => result?.targeted === true && ["failed", "cancelled"].includes(result.status) && result.retryable_people > 0;
+    function scanControls() {
+      if (!canScan) return;
+      $("cw-ai-scan").disabled = !scope.responsible_id || aiSubmitting || activeRun(aiRun);
+      const start = $("cw-ai-start"), pause = $("cw-ai-pause");
+      if (start) {
+        start.hidden = aiRun?.targeted !== true || !(aiRun.status === "ready" || retryableRun(aiRun));
+        start.textContent = retryableRun(aiRun) ? "继续未完成（限本批预算）" : "开始 AI 核对（最多 30 人）";
+        start.disabled = aiSubmitting || !aiRun?.total_people;
+      }
+      if (pause) {
+        pause.hidden = aiRun?.targeted !== true || !["ready", "queued", "running"].includes(aiRun.status);
+        pause.textContent = aiRun?.status === "ready" ? "取消本批准备" : "暂停";
+        pause.disabled = aiSubmitting;
+      }
+    }
+    function showInitial(result) {
       const panel = $("cw-initial-scan");
       if (!panel) return;
       panel.hidden = !result;
       if (!result) return;
-      const status = initial?.status || result.status;
-      const stopped = ["failed", "partial", "cancelled"].includes(status);
-      const labels = {waiting_sync: "等待准备", queued: "扫描中", running: "扫描中", scanning: "扫描中", succeeded: initial ? "全部已完成" : "本轮已完成", failed: "整体未完成", partial: "整体未完成", cancelled: "已停止"};
+      const targeted = result.targeted === true, status = result.status;
+      const stopped = ["failed", "cancelled"].includes(status);
+      const labels = {ready: "准备完成 · 尚未发送", queued: "等待 AI 核对", running: "核对中", succeeded: "本批核对完成", failed: "本批有未完成项", cancelled: "已停止"};
       const messages = {
-        waiting_sync: "等待同步与 AI 配置就绪后再开始；不会把没有数据当成没有达人。",
-        scanning: "正在分批检查剩余历史业务对话；个别消息段未成功，不会拦住后续扫描。扫描完成前，名单只是部分结果。",
-        succeeded: "历史扫描已完成，请核对名单。无候选不代表不存在达人；未确定的 handle 和类型显示“—”。",
-        failed: "本轮仍有未成功或未处理的消息段；已有结果已保留，可重试未完成项。刷新只读取状态，不会重新调用 AI。",
-        cancelled: "扫描已停止；已有结果已保留。请核对当前授权和可读范围，刷新不会恢复执行。",
+        ready: "已在服务器按用户选好少量业务对话，还没有发送给 OpenAI。可先展开查看本批送审内容，再开始核对。",
+        queued: "本批已排队，仅核对下方人数范围；不会继续扩大到整群或全部聊天。",
+        running: "AI 正在逐人核对：是不是达人、是否由当前 CM 负责。本批只生成待核对预览，不自动入库。",
+        succeeded: "本批核对已结束，不代表全部联系人已检查。请人工核对预览；没有足够证据不等于不是达人。",
+        failed: "部分用户尚未完成核对；已有结果保留。刷新只读取进度，不会重新调用 AI。",
+        cancelled: "已停止安排新请求。已发出的请求无法撤回，其迟到结果不会入库；刷新不会恢复执行。",
       };
-      $("cw-initial-status").textContent = labels[status] || "待核对";
-      $("cw-initial-message").textContent = (["waiting_sync", "cancelled"].includes(status) && initial?.error_message) || messages[status] || (stopped ? messages.failed : messages.scanning);
-      $("cw-initial-message").classList.toggle("cw-error", stopped);
-      $("cw-initial-counts").textContent = initial ? `会话检查与分批安排：${initial.checked_chats ?? 0} / ${initial.total_chats ?? 0} · 已安排 ${initial.queued_chats ?? 0} 个消息段。下方累计本轮已安排的消息段，不是全部历史的完成比例。` : "下方累计本轮已安排的消息段，不代表全部历史已处理。";
-      const countLabels = {succeeded: "成功", queued: "排队", running: "进行中", invalid: "校验未通过", failed: "执行异常", cancelled: "已取消"};
+      $("cw-initial-status").textContent = targeted ? labels[status] || "待核对" : "旧扫描已停用";
+      $("cw-initial-message").textContent = targeted ? messages[status] || "本批仅供人工核对，不自动入库。" : "原来的整段历史扫描不会恢复。请点击“准备核对”，先按具体用户在服务器筛选业务对话。";
+      $("cw-initial-message").classList.toggle("cw-error", targeted && stopped);
+      $("cw-initial-counts").textContent = targeted ? `本批 ${result.total_people ?? 0} 人 · 送审共 ${result.message_count ?? 0} 条消息、${result.char_count ?? 0} 字符 · 请求预算 ${result.request_count ?? 0} / ${result.request_limit ?? 0} 次（含重试）。` : "";
+      const countLabels = {succeeded: "核对完成", queued: "等待核对", running: "正在核对", invalid: "证据未通过", failed: "执行异常", cancelled: "已停止"};
       const counts = Object.fromEntries(Object.keys(countLabels).map(key => [key, Math.max(0, Number(result.counts?.[key]) || 0)]));
-      const total = Object.values(counts).reduce((sum, value) => sum + value, 0);
+      const total = result.total_people || Object.values(counts).reduce((sum, value) => sum + value, 0);
       const processed = counts.succeeded + counts.invalid + counts.failed + counts.cancelled;
       for (const key of Object.keys(countLabels)) $("cw-scan-" + key).textContent = counts[key];
-      $("cw-batch-summary").hidden = total === 0;
-      $("cw-batch-label").textContent = `本轮已安排消息段：成功 ${counts.succeeded} / ${total} 段（${total ? Math.floor(counts.succeeded / total * 100) : 0}%）`;
+      $("cw-batch-summary").hidden = !targeted || total === 0;
+      $("cw-batch-label").textContent = `本批核对完成 ${counts.succeeded} / ${total} 人（${total ? Math.floor(counts.succeeded / total * 100) : 0}%）`;
       const progress = $("cw-batch-progress"); progress.max = total || 1; progress.value = counts.succeeded;
       progress.classList.toggle("cw-progress-incomplete", stopped || counts.invalid + counts.failed + counts.cancelled > 0);
-      $("cw-batch-processed").textContent = `本轮已处理 ${processed} / ${total} 段 · 待处理 ${counts.queued + counts.running} 段。已处理包括未成功的结果，不等于全部历史扫描完成。`;
+      $("cw-batch-processed").textContent = `已结束 ${processed} / ${total} 人 · 等待或正在核对 ${counts.queued + counts.running} 人。已结束包含异常与停止项，不代表全部核对成功。`;
+      const outcomes = result.outcomes || {};
+      $("cw-scan-outcomes").textContent = targeted ? `可供人工确认 ${outcomes.review ?? 0} 人 · 信息不足 ${outcomes.uncertain ?? 0} 人 · 本次未发现明确候选 ${outcomes.no_candidate ?? 0} 人。所有结果仍需结合原文核实。` : "";
       const dispatch = result.dispatch;
-      $("cw-scan-dispatch").textContent = dispatch ? `本轮正在执行 ${dispatch.running_count ?? "—"} 段 · 全系统 AI 队列共享最多 ${dispatch.max_concurrency ?? "—"} 个并行任务。${{ready: "队列正常。", paused: "队列已暂停，请管理员检查。", throttled: "队列限速等待中。"}[dispatch.status] || "队列状态待核对。"}这是应用并发上限，不是 OpenAI 账户配额。` : "并发状态暂未返回；无法据此判断 OpenAI 是否异常。";
+      $("cw-scan-dispatch").textContent = !targeted ? "" : dispatch ? `本批正在核对 ${dispatch.running_count ?? 0} 人 · 全系统 AI 队列共享最多 ${dispatch.max_concurrency ?? 3} 路并行。${{ready: "队列正常。", paused: "队列已暂停，请管理员检查。", throttled: "队列限速等待中。"}[dispatch.status] || "队列状态待核对。"}` : "最多 3 路并行，与系统其他 AI 任务共用名额。";
       const details = result.error_summary?.length ? result.error_summary : (result.errors || []).map(error => ({message: typeof error === "string" ? error : error.message || error.error}));
       const errorList = $("cw-scan-error-list"); errorList.replaceChildren();
-      for (const group of details) {
-        let message = group.message || "没有保留具体错误信息。";
-        if (message.includes("AI 扫描未完成；未生成候选，请检查服务状态。")) message += " 历史记录未保留具体异常类型。";
-        errorList.append(element("li", `${countLabels[group.status] || "历史提示"}${group.count == null ? "（未提供次数）" : ` · ${group.count} 段`}：${message}`));
+      if (targeted) for (const group of details) {
+        errorList.append(element("li", `${countLabels[group.status] || "提示"}${group.count == null ? "" : ` · ${group.count} 人`}：${group.message || "没有保留具体错误信息。"}`));
       }
-      if (!details.length && counts.invalid + counts.failed + counts.cancelled > 0) errorList.append(element("li", "本轮存在未成功的消息段，接口尚未提供具体错误分类。"));
       $("cw-scan-errors").hidden = errorList.children.length === 0;
-      $("cw-initial-limit").textContent = `扫描本轮开始前已同步、当前授权可读的历史；每段 ${initial?.message_limit ?? 80} 条，相邻重叠 ${initial?.message_overlap ?? 20} 条。每条最多 ${initial?.message_char_limit ?? 1500} 字符；未同步消息、图片和附件内容不在本次范围内。`;
-      if (initialRetry) { initialRetry.hidden = !["failed", "cancelled"].includes(initial?.status); initialRetry.disabled = running; }
+      const limits = result.limits || {};
+      $("cw-initial-limit").textContent = targeted ? `本批最多 ${limits.people ?? 30} 人；每人最多 ${limits.messages_per_person ?? 30} 条消息、${limits.chats_per_person ?? 3} 个会话、${limits.chars_per_person ?? 16000} 字符，最多 ${limits.attempts_per_person ?? 2} 次请求（含重试）。只取已同步且当前有权读取的业务片段，尽量遮盖无关个人信息；不上传图片、附件或整个群聊。信息不足不自动补查，留给 CM 核对。本批不自动入库。` : "";
+      $("cw-preflight").hidden = !targeted || !result.id;
+      if (previewRunId !== result.id) { $("cw-preflight-content").replaceChildren(); $("cw-preflight-content").hidden = true; previewRunId = null; }
     }
-    async function startAI(retryFailed = false) {
-      if (!canScan) return;
+    async function changeScan(action) {
+      if (!canScan || aiSubmitting || !scope.responsible_id) return;
+      if (action === "scan" && (!aiRun?.preflight_id || !(aiRun.status === "ready" || retryableRun(aiRun)))) return;
       ++aiLoading; clearTimeout(aiTimer); showAIProgress = true;
-      const control = $("cw-ai-scan"); control.disabled = true;
-      if (retryAI) retryAI.hidden = true;
+      aiSubmitting = true; scanControls();
+      feedback(action === "preflight" ? "正在服务器准备本批业务片段，尚未发送给 AI…" : action === "pause" ? "正在停止后续请求…" : "正在提交本批核对…");
       try {
-        const result = await api("/ai/scan", {body: {request_id: requestId(), retry_failed: retryFailed}});
-        feedback(result.message || "历史业务对话扫描已提交。明确是达人且由当前 CM 负责的记录可入库；不确定的留待确认，handle 可后补。");
-        pollAI();
-      } catch (error) { feedback(error.message, true); control.disabled = false; }
+        const result = await api(`/ai/${action}`, {body: {request_id: requestId(), ...(action === "scan" ? {preflight_id: aiRun.preflight_id, retry_failed: retryableRun(aiRun)} : {})}});
+        aiRun = result; showInitial(result);
+        feedback(result.message || (action === "preflight" ? "准备完成；现在可查看送审内容，再开始 AI 核对。" : action === "pause" ? "已停止后续请求。" : "本批已开始并行核对，不自动入库。"));
+        await pollAI();
+      } catch (error) { feedback(error.message, true); }
+      finally { aiSubmitting = false; scanControls(); }
     }
-    if (canScan) $("cw-ai-scan").addEventListener("click", () => startAI());
+    if (canScan) $("cw-ai-scan").addEventListener("click", () => changeScan("preflight"));
+    $("cw-ai-start")?.addEventListener("click", () => changeScan("scan"));
+    $("cw-ai-pause")?.addEventListener("click", () => changeScan("pause"));
+    $("cw-preflight-open")?.addEventListener("click", async () => {
+      if (!aiRun?.targeted || !aiRun.id) return;
+      const control = $("cw-preflight-open"), box = $("cw-preflight-content"), runId = aiRun.id;
+      control.disabled = true; box.hidden = false; box.replaceChildren(element("p", "正在读取当前授权范围内的送审片段…"));
+      try {
+        const result = await api(`/ai/preflight/${encodeURIComponent(runId)}`);
+        if (aiRun?.id !== runId) return;
+        previewRunId = runId; box.replaceChildren();
+        box.append(element("p", "下方是这批准备发送的业务片段；姓名仅在本页对应，模型看到 CM / 用户代号。仅允许有限重试，信息不足不会自动扩大检索范围。", "cw-small"));
+        for (const person of result.people || []) {
+          const details = element("details", "", "cw-person-preview");
+          const outcome = {review: "可供人工确认", uncertain: "信息不足", no_candidate: "本次未发现明确候选"}[person.outcome];
+          details.append(element("summary", `${person.name || person.display_name || "用户姓名暂缺"} · ${person.message_count ?? person.messages?.length ?? 0} 条消息 · ${person.chat_count ?? 0} 个会话${outcome ? ` · ${outcome}` : ""}`));
+          if (person.unavailable) details.append(element("p", "当前权限或原文已变化，不能展示这位用户的送审片段。", "cw-small"));
+          for (const message of person.messages || []) {
+            const item = element("div", "", "cw-preview-message");
+            item.append(element("p", `${message.ref || ""} · ${message.user || message.speaker || "用户"} · ${message.time || "时间暂缺"}`, "cw-small"), element("pre", message.text || "—"));
+            details.append(item);
+          }
+          box.append(details);
+        }
+        if (!result.people?.length) box.append(element("p", "本批没有可送审用户；这不代表没有达人。"));
+        if (result.local_pending?.length) {
+          const pending = element("details", "", "cw-person-preview"), list = element("ul");
+          pending.append(element("summary", `仅有本地线索（未发送 AI） · ${result.local_pending.length} 人`));
+          pending.append(element("p", "这些线索不足以证明达人或负责人关系，等待 CM 核对；没有创建达人记录，也不会自动入库。", "cw-small"));
+          for (const person of result.local_pending) list.append(element("li", `${person.display_name || "用户姓名暂缺"}：${person.reason || "业务关系尚不明确"}`));
+          pending.append(list); box.append(pending);
+        }
+        if (result.local_pending_hidden_count) box.append(element("p", "另有部分本地线索当前已无权查看，未在本页展示。", "cw-small"));
+      } catch (error) { box.replaceChildren(element("p", error.message, "cw-error")); }
+      finally { control.disabled = false; }
+    });
     async function pollAI() {
       if (!scope.responsible_id) return;
       if (aiReading) { aiPollAgain = true; return; }
@@ -458,23 +513,15 @@
         const response = await api("/ai/status");
         if (sequence !== aiLoading) return;
         const result = response.run;
-        const initial = result?.onboarding;
-        const cancelled = (initial?.status || result?.status) === "cancelled";
-        const running = !cancelled && result && ["queued", "running"].includes(result.status);
-        const initialActive = !cancelled && initial && ["waiting_sync", "scanning"].includes(initial.status);
-        showInitial(initial, result, running);
+        aiRun = result;
+        const active = activeRun(result);
+        showInitial(result); scanControls();
         $("cw-initial-updated").textContent = `上次更新：${new Date().toLocaleTimeString("en-GB", {timeZone: "Europe/London"})}（英国时间）`;
-        if (canScan) $("cw-ai-scan").disabled = Boolean(running || initialActive);
-        if (!result) { if (showAIProgress) feedback("当前没有正在运行的候选分析。"); if (retryAI) retryAI.hidden = true; return; }
-        const errors = (result.errors || []).map(error => typeof error === "string" ? error : error.message || error.error || "部分候选分析失败");
-        const active = running || initialActive;
-        if (showAIProgress) feedback([result.message || (active ? "AI 正在核对历史业务对话与 CM 关系；不明确的记录保留待确认。" : "本轮候选分析已结束，请核对名单和待确认项。"), ...errors].join("；"), errors.length > 0 || ["failed", "partial"].includes(result.status));
-        if (retryAI) retryAI.hidden = Boolean(initialActive || ["failed", "cancelled"].includes(initial?.status)) || !(errors.length || ["failed", "partial"].includes(result.status));
-        const terminal = status => ["succeeded", "failed", "partial", "cancelled"].includes(status) ? status : "";
-        const progress = JSON.stringify([result.candidate_count, terminal(result.status), terminal(initial?.status)]);
+        if (!result) { if (showAIProgress) feedback("当前没有核对任务；点击“准备核对”先在服务器整理少量业务片段。"); return; }
+        const progress = JSON.stringify([result.id, result.candidate_count, result.outcomes, ["succeeded", "failed", "cancelled"].includes(result.status) ? result.status : ""]);
         const changed = lastAIProgress !== null && lastAIProgress !== progress;
         lastAIProgress = progress;
-        if (changed || (showAIProgress && !active)) {
+        if (changed && result.targeted) {
           if ([...drafts.values()].some(draft => draft.dirty)) $("cw-list-stale").hidden = false;
           else await load();
         }
@@ -489,7 +536,7 @@
           $("cw-initial-message").textContent = `暂时未能读取分析进度：${error.message} 请点击“刷新进度”，不会重新启动分析。`;
           $("cw-initial-message").classList.add("cw-error");
         }
-        if (canScan) $("cw-ai-scan").disabled = false;
+        scanControls();
       } finally {
         aiReading = false;
         if (refresh) { refresh.disabled = false; refresh.textContent = "刷新进度"; refresh.setAttribute("aria-busy", "false"); }
@@ -497,17 +544,6 @@
       }
     }
     $("cw-initial-refresh")?.addEventListener("click", pollAI);
-    if (initialRetry) initialRetry.addEventListener("click", async () => {
-      if (!canScan || initialRetry.disabled) return;
-      ++aiLoading; clearTimeout(aiTimer); initialRetry.disabled = true;
-      try {
-        await api("/ai/initial-retry", {body: {request_id: requestId()}});
-        await pollAI();
-      } catch (error) {
-        $("cw-initial-message").textContent = error.message; $("cw-initial-message").classList.add("cw-error");
-        initialRetry.disabled = false;
-      }
-    });
     if (scope.responsible_id) pollAI();
     if (scope.can_import) {
       const dialog = $("cw-import-dialog"), fileInput = $("cw-import-file"), resultBox = $("cw-import-results");

@@ -31,8 +31,8 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 | `creator_workflow_candidates`、`creator_workflow_sources`、`creator_workflow_requests` | 待确认线索、来源和请求幂等记录 |
 | `creator_account_assignments` | 用户与 CM 的正式归属；账号可以为空，是名单与总结取数依据 |
 | `contact_assignments` | 旧联系人级负责人关系；不能代替账号级确认，也不能认领一个 handle 就转走同人的其他 handle |
-| `creator_workflow_ai_runs`、`creator_workflow_ai_tasks`、`creator_workflow_ai_chat_checks` | AI 候选扫描、会话任务及变化检查 |
-| `creator_workflow_onboarding` | 新授权首扫及手动历史扫描；保存启动时刻、会话/消息段游标、进度及失败 |
+| `creator_workflow_ai_runs`、`creator_workflow_ai_tasks` | 按人 AI 核对、冻结消息引用与输入指纹、预览模式及硬预算；旧会话任务只留历史 |
+| `creator_workflow_onboarding` | 新授权同步就绪检查，不自动调用 AI；旧游标只留历史 |
 | `offhours_summary_settings`、`offhours_summary_runs`、`offhours_summary_tasks` | 指定总结时段、执行版本和会话结果 |
 | `admin_roles`、`admin_page_permissions`、`audit_events` | 主人身份、逐页权限、必要的查看/修改审计 |
 
@@ -63,11 +63,13 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 
 AI 调用复用现有 OpenAI 配置与结构化输出。服务端验证本人和 CM 的双向业务原话、真实私聊对端或群回复/@；仅同群、昵称或 handle 文本不构成负责关系。短摘引只在内存核验，来源只存引用、类型、评分和校验标记，不存正文、模型自由理由或 prompt。
 
-`business_v2` 下，达人身份和 CM 负责关系均 ≥ 0.95，用户唯一、直接业务证据有效且无冲突，可以只凭 AI 入库。CM Excel 补充 CAP 声明和账号来源；类型未知保持 NULL。账号必须另有本人精确账号证据且对应评分 ≥ 0.95 才绑定，否则只保存辅助线索、不阻挡按人入库。旧来源版本不能触发新自动门槛；采用最新 AI 判断，不挑历史最高分。
+`business_v2` 的高置信门槛保留，但新按人核对首批强制 `preview_only`：高分也只进入待确认，不自动入库，不给正式记录补写账号/类型。CM Excel 补充 CAP 声明和账号来源；类型未知保持 NULL。账号必须另有本人精确账号证据才作为已核实账号。旧来源版本不能触发新自动门槛；采用最新 AI 判断，不挑历史最高分。新 AI 结果拒绝用户和 handle 双空，历史双空记录保留来源但不展示在名单。
 
 人工确认需明确 CM 和选定 Lark 用户，handle / 类型不必齐全。037 允许正式归属的账号为空；补缺失账号或类型仍经过事务、版本、幂等和冲突检查，不更换已确认用户/CM或已有账号。消息总结 LEFT JOIN 可选账号，只给模型实际已知 handles，没有 handle 的已确认用户仍参与总结。
 
-OAuth 只在首次 INSERT 成功时登记首扫；旧账号重登不登记。worker 等 CM 资格、正文同意、同步和 AI 配置就绪；手动历史扫描复用同一进度机制。范围固定至本轮启动时刻、覆盖当前授权下已同步历史，不限近90天。按每100会话分页，每段80条、相邻重叠20条，逐段处理；每条1500字符、每段最多8候选。不做OCR/附件读取，不声称尚未同步的历史已分析。未完成批次保留进度，有限重试失败后需明确操作。
+OAuth 只在首次 INSERT 成功时登记同步就绪检查；旧账号重登不登记。worker 不再自动生成全历史 AI 队列，旧消息段任务取消且不能被 claim。明确准备核对时，服务器遍历当前有效授权内已同步历史，以 CM + contact 为单位挑选两人直接业务片段；群中其他成员不打包。消息引用和输入指纹冻结，预览、调用前、保存前重新核对授权、作者、原文变化与删除状态，不扩大范围。
+
+每批最多30人，每人最多3组对话、30条、整个输入包16,000字符，每条最多1,500字符。模型只接收 CM1 / U1 等代号；常见电话、邮箱等做遮盖，原始身份映射留服务器，不承诺自由文本完全匿名。沿用现有持久任务、租约和3路共享并发，无新队列服务。每人最多2次调用尝试（含重试），预算不足或判断不清交人工，不自动扩展；数据库保存最多3次复用已返回结果。按人显示进度；刷新页面不会启动扫描，暂停后过期租约不能写入结果。不做 OCR / 附件读取。
 
 旧 `contact_assessment`、`contact_assignment` 已停用；新 `creator_workflow` 和 `offhours_summary` 是独立配置。清空某位 CM 的数据不等于关闭全部 AI 配置。总结输入、输出、限额及缺口见消息总结文档；本期不回复、不发通知、不代办业务。
 

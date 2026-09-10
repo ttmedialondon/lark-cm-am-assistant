@@ -79,17 +79,30 @@ async function fixture(t, {readonly = false, owner = false, testEditor = false, 
     if (url.pathname.endsWith("/assign")) { state.items[0] = {...state.items[0], responsible_id: request.postDataJSON().responsible_id, status: "pending", version: state.items[0].version + 1}; return json(state.items[0]); }
     if (url.pathname.endsWith("/import/preview")) return json({batch_id: "batch-1", rows: [{sheet: "Sheet1", row: 2, handle: null, status: "pending", reasons: ["缺用户"]}], summary: {total: 1, ready: 0, pending: 1, invalid: 0}});
     if (url.pathname.endsWith("/import/batch-1/commit")) return json({imported: 1, formal: 0, pending: 1, skipped: 0, items: [{handle: null, status: "pending", reasons: ["缺用户"]}]});
-    if (url.pathname.endsWith("/ai/initial-retry")) {
+    if (url.pathname.endsWith("/ai/preflight")) {
       assert.equal(request.headers()["x-csrf-token"], "test-csrf");
       assert.equal(typeof request.postDataJSON().request_id, "string");
-      if (state.initialRetryError) return route.fulfill({status: 409, json: {error: state.initialRetryError}});
-      state.onboarding = {...state.onboarding, status: "scanning", error_message: null};
-      if (state.run) state.run = {...state.run, status: "queued", errors: [], error_summary: []};
-      return json({onboarding: state.onboarding});
+      state.run = {id: "run-1", preflight_id: "run-1", targeted: true, preview_only: true, status: "ready",
+        total_people: 3, message_count: 20, char_count: 2000, request_count: 0, request_limit: 6,
+        counts: {queued: 3}, outcomes: {}, dispatch: {max_concurrency: 3, running_count: 0, status: "ready"}};
+      return json(state.run);
+    }
+    if (url.pathname.endsWith("/ai/preflight/run-1")) {
+      return json({...state.run, local_pending: [{display_name: "Local only user", reason: "只有同群发言，尚不能确定业务关系"}], people: [{name: "Preview user", message_count: 2, chat_count: 1,
+        messages: [{ref: "M1", user: "U1", text: "Please send a sample. [email hidden]"},
+          {ref: "M2", user: "CM1", text: "<script>not executable</script> I can arrange the sample."}]}]});
     }
     if (url.pathname.endsWith("/ai/scan")) {
-      state.run = {id: "run-1", status: "succeeded", message: "候选分析已完成"};
-      return json({id: "run-1", status: "queued"});
+      assert.equal(request.headers()["x-csrf-token"], "test-csrf");
+      assert.equal(request.postDataJSON().preflight_id, "run-1");
+      state.run = {...state.run, status: "running", counts: {running: 3}, request_count: 3,
+        dispatch: {...state.run.dispatch, running_count: 3}};
+      return json(state.run);
+    }
+    if (url.pathname.endsWith("/ai/pause")) {
+      assert.equal(request.headers()["x-csrf-token"], "test-csrf");
+      state.run = {...state.run, status: "cancelled", retryable_people: 3, counts: {cancelled: 3}, dispatch: {...state.run.dispatch, running_count: 0}};
+      return json(state.run);
     }
     if (url.pathname.endsWith("/ai/status")) {
       if (state.statusError) return route.fulfill({status: 500, json: {error: state.statusError}});
@@ -312,79 +325,67 @@ test("CAP Excel preflight precedes commit and the browser does not confirm AI ca
   await page.getByRole("button", {name: "确认提交这份预检结果"}).click();
   await page.getByText("已导入 1 行 · 正式入库 0 行 · 待确认 1 行 · 跳过 0 行").waitFor();
   await page.locator("#cw-import-close").click();
-  await page.getByRole("button", {name: "扫描历史业务对话"}).click();
-  await page.getByText("候选分析已完成", {exact: true}).waitFor();
+  await page.getByRole("button", {name: "准备核对", exact: true}).click();
+  await page.locator("#cw-initial-status").getByText("准备完成 · 尚未发送", {exact: true}).waitFor();
+  assert.equal(state.calls.filter(c => c.url.pathname.endsWith("/ai/scan")).length, 0);
   assert.equal(state.calls.filter(c => c.url.pathname.endsWith("/confirm")).length, 0);
   assert.deepEqual(errors, []);
 });
 
-test("historical scan continues after a failed batch, retains errors, and retries only with current authorization", async t => {
-  const onboarding = {status: "scanning", total_chats: 1193, checked_chats: 100, queued_chats: 262};
-  const run = {id: "run-1", status: "failed", candidate_count: 55,
-    counts: {succeeded: 212, invalid: 48, failed: 2, queued: 0, running: 0, cancelled: 0},
-    error_summary: [{status: "invalid", message: "候选未通过证据校验。", count: 48},
-      {status: "failed", message: "AI 扫描未完成；未生成候选，请检查服务状态。", count: 2}],
-    dispatch: {max_concurrency: 3, running_count: 0, status: "ready"}};
-  const {page, state, errors} = await fixture(t, {onboarding, run});
-  const retry = page.getByRole("button", {name: "重试历史扫描", exact: true});
-  await page.locator("#cw-initial-status").getByText("扫描中", {exact: true}).waitFor();
-  assert(!(await retry.isVisible()));
-  assert(await page.getByRole("button", {name: "扫描历史业务对话", exact: true}).isDisabled());
-  assert((await page.locator("#cw-initial-message").textContent()).includes("不会拦住后续扫描"));
-  assert((await page.locator("#cw-initial-counts").textContent()).includes("100 / 1193"));
-  assert((await page.locator("#cw-initial-counts").textContent()).includes("不是全部历史的完成比例"));
-  assert.equal(await page.locator("#cw-batch-progress").getAttribute("value"), "212");
-  assert.equal(await page.locator("#cw-batch-progress").getAttribute("max"), "262");
-  assert((await page.locator("#cw-batch-label").textContent()).includes("80%"));
-  assert((await page.locator("#cw-batch-processed").textContent()).includes("262 / 262"));
-  assert(await page.getByText("校验未通过 · 48 段：候选未通过证据校验。", {exact: true}).isVisible());
-  assert((await page.locator("#cw-scan-error-list").textContent()).includes("执行异常 · 2 段"));
-  assert((await page.locator("#cw-scan-error-list").textContent()).includes("历史记录未保留具体异常类型"));
-  assert((await page.locator("#cw-scan-dispatch").textContent()).includes("本轮正在执行 0 段"));
-  assert((await page.locator("#cw-scan-dispatch").textContent()).includes("全系统 AI 队列共享最多 3 个并行任务"));
-  state.run = {...run, status: "cancelled"};
-  await Promise.all([
-    page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/ai/status")),
-    page.getByRole("button", {name: "刷新进度", exact: true}).click(),
-  ]);
-  assert.equal(await page.locator("#cw-initial-status").textContent(), "扫描中");
-  assert(!(await retry.isVisible()));
-  // A cancelled message batch is not revoked CM authorization: keep polling the pass.
-  await page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/ai/status"), {timeout: 6500});
-  assert.equal(await page.locator("#cw-initial-status").textContent(), "扫描中");
-  state.run = run;
-  state.onboarding = {...onboarding, status: "failed", checked_chats: 1193,
-    error_message: "全部会话已检查，仍有 50 段未完成。"};
-  await page.getByRole("button", {name: "刷新进度", exact: true}).click();
-  await retry.waitFor();
-  assert.equal(await page.locator("#cw-initial-status").textContent(), "整体未完成");
-  assert((await page.locator("#cw-initial-message").textContent()).includes("本轮仍有未成功或未处理的消息段"));
-  assert(!(await page.locator("#cw-initial-message").textContent()).includes("后续会话未继续"));
-  assert((await page.locator("#cw-initial-counts").textContent()).includes("1193 / 1193"));
-  assert(await page.getByText("校验未通过 · 48 段：候选未通过证据校验。", {exact: true}).isVisible());
-  if (process.env.CW_SCREENSHOT_DIR) await page.screenshot({path: path.join(process.env.CW_SCREENSHOT_DIR, "creator-workflow-progress-failed.png"), fullPage: true});
+test("targeted preflight shows bounded excerpts before starting and pause never resumes legacy history", async t => {
+  const {page, state, errors} = await fixture(t, {run: {status: "cancelled", targeted: false}});
+  await page.locator("#cw-initial-status").getByText("旧扫描已停用", {exact: true}).waitFor();
+  assert.equal(await page.locator("#cw-ai-retry, #cw-initial-retry").count(), 0);
   assert.equal(state.calls.filter(call => call.method !== "GET").length, 0);
-  state.onboarding = {...state.onboarding, status: "cancelled", error_message: "正文授权已变化；历史扫描已停止。"};
+  await page.getByRole("button", {name: "准备核对", exact: true}).click();
+  await page.locator("#cw-initial-status").getByText("准备完成 · 尚未发送", {exact: true}).waitFor();
+  assert.equal(state.calls.filter(call => call.url.pathname.endsWith("/ai/scan")).length, 0);
+  assert(await page.getByRole("button", {name: "取消本批准备", exact: true}).isVisible());
+  assert((await page.locator("#cw-initial-counts").textContent()).includes("本批 3 人"));
+  assert((await page.locator("#cw-initial-counts").textContent()).includes("0 / 6 次"));
+  await page.getByRole("button", {name: "查看本批送审内容", exact: true}).click();
+  const preview = page.locator(".cw-person-preview").filter({has: page.locator("summary", {hasText: "Preview user"})});
+  await preview.locator("summary").getByText(/Preview user/).waitFor();
+  await preview.locator("summary").click();
+  assert(await preview.getByText("Please send a sample. [email hidden]", {exact: true}).isVisible());
+  assert.equal(await preview.locator("script").count(), 0);
+  assert((await preview.textContent()).includes("<script>not executable</script>"));
+  await page.getByText("仅有本地线索（未发送 AI） · 1 人", {exact: true}).click();
+  assert(await page.getByText("Local only user：只有同群发言，尚不能确定业务关系", {exact: true}).isVisible());
+  await page.getByRole("button", {name: "开始 AI 核对（最多 30 人）", exact: true}).click();
+  await page.locator("#cw-initial-status").getByText("核对中", {exact: true}).waitFor();
+  assert(await page.getByRole("button", {name: "准备核对", exact: true}).isDisabled());
+  assert((await page.locator("#cw-scan-dispatch").textContent()).includes("本批正在核对 3 人"));
+  assert((await page.locator("#cw-initial-limit").textContent()).includes("本批不自动入库"));
+  assert.equal(await page.locator("#cw-batch-progress").getAttribute("max"), "3");
+  state.run = {...state.run, counts: {succeeded: 1, invalid: 1, running: 1}, outcomes: {uncertain: 1},
+    error_summary: [{status: "invalid", count: 1, message: "候选未通过证据校验。"}]};
   await page.getByRole("button", {name: "刷新进度", exact: true}).click();
+  await page.getByText("证据未通过 · 1 人：候选未通过证据校验。", {exact: true}).waitFor();
+  assert((await page.locator("#cw-scan-outcomes").textContent()).includes("信息不足 1 人"));
+  await page.getByRole("button", {name: "暂停", exact: true}).click();
   await page.locator("#cw-initial-status").getByText("已停止", {exact: true}).waitFor();
-  state.initialRetryError = "正文授权已变化，旧首次筛选不可重放；请使用当前范围的手动扫描。";
-  await retry.click();
-  await page.locator("#cw-initial-message").getByText(state.initialRetryError, {exact: true}).waitFor();
-  assert.equal(state.onboarding.status, "cancelled");
-  assert(!(await retry.isDisabled()));
-  state.initialRetryError = null;
-  await retry.click();
-  await page.locator("#cw-initial-status").getByText("扫描中", {exact: true}).waitFor();
-  assert(!(await retry.isVisible()));
+  assert(!(await page.getByRole("button", {name: "暂停", exact: true}).isVisible()));
+  await page.getByRole("button", {name: "刷新进度", exact: true}).click();
+  assert.equal(await page.locator("#cw-initial-status").textContent(), "已停止");
   assert.deepEqual(state.calls.filter(call => call.method !== "GET").map(call => call.url.pathname),
-    ["/dashboard/creators/ai/initial-retry", "/dashboard/creators/ai/initial-retry"]);
+    ["/dashboard/creators/ai/preflight", "/dashboard/creators/ai/scan", "/dashboard/creators/ai/pause"]);
+  await page.getByRole("button", {name: "继续未完成（限本批预算）", exact: true}).click();
+  await page.locator("#cw-initial-status").getByText("核对中", {exact: true}).waitFor();
+  const resumed = state.calls.filter(call => call.url.pathname.endsWith("/ai/scan"));
+  assert.equal(resumed.length, 2);
+  assert.equal(JSON.parse(resumed[1].body).retry_failed, true);
+  assert.equal(JSON.parse(resumed[1].body).preflight_id, "run-1");
+  state.run = {...state.run, status: "failed", retryable_people: 0};
+  await page.getByRole("button", {name: "刷新进度", exact: true}).click();
+  assert(!(await page.locator("#cw-ai-start").isVisible()));
   assert.equal(state.items[0].status, "pending");
   assert.deepEqual(errors, []);
 });
 
 test("progress refresh is single-flight and only refreshes roster changes without discarding drafts", async t => {
   const onboarding = {status: "scanning", total_chats: 1193, checked_chats: 100, queued_chats: 4};
-  const run = {id: "run-1", status: "running", candidate_count: 1, counts: {succeeded: 1, queued: 2, running: 1}};
+  const run = {id: "run-1", targeted: true, status: "running", total_people: 4, candidate_count: 1, counts: {succeeded: 1, queued: 2, running: 1}};
   const {page, state, errors} = await fixture(t, {onboarding, run, item: {...candidate(), handle: "existing", contact: contacts[0]}});
   const refresh = page.getByRole("button", {name: "刷新进度", exact: true});
   await page.locator("#cw-initial-updated").getByText(/上次更新/).waitFor();

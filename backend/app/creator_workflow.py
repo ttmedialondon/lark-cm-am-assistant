@@ -547,6 +547,7 @@ def list_records(
             FROM creator_workflow_candidates candidate
             LEFT JOIN authorizations responsible ON responsible.id=candidate.responsible_authorization_id
             WHERE candidate.merged_into IS NULL
+              AND (candidate.normalized_handle IS NOT NULL OR candidate.contact_id IS NOT NULL)
               AND (candidate.status <> 'confirmed' OR EXISTS (SELECT 1 FROM creator_account_assignments formal
                 WHERE formal.candidate_id=candidate.id AND formal.ended_at IS NULL))
               AND ((%s::uuid IS NULL AND candidate.responsible_authorization_id IS NULL)
@@ -1059,7 +1060,8 @@ def _maybe_auto_confirm(conn: Any, row: dict, scope: dict) -> dict:
     data = source["source_data"]
     scores = [data.get(k) for k in ("creator_confidence", "cm_confidence")]
     if (
-        data.get("business_policy_version") != BUSINESS_POLICY_VERSION
+        data.get("preview_only") is True
+        or data.get("business_policy_version") != BUSINESS_POLICY_VERSION
         or data.get("proposed_cm_id") != str(row["responsible_authorization_id"])
         or data.get("proposed_contact_id") != str(row["contact_id"])
         or not all(type(score) in {int, float} and math.isfinite(score)
@@ -1121,6 +1123,8 @@ def ingest_source(
     if relationship not in {None, "owner", "representative"} or platform not in {"tiktok", "instagram", "youtube"}:
         raise WorkflowInputError("平台或用户关系不正确。")
     handle, contact_id = _handle(handle), _uuid(contact_id, optional=True)
+    if source_type == "ai" and not handle and not contact_id:
+        raise WorkflowInputError("AI 核对必须指向具体用户；没有用户和 handle 的结果不能成为达人记录。")
     creator_type = _creator_type(creator_type)
     responsible_id = _uuid(responsible_id, optional=True)
     actor_id = _uuid(actor_id)
@@ -1152,7 +1156,7 @@ def ingest_source(
         envelope["source_data"] = {key: source_data.get(key) for key in (
             "evidence", "cap_policy_version", "creator_confidence", "identity_confidence", "cm_confidence",
             "exact_handle_evidence", "direct_creator_evidence", "direct_cm_evidence", "unknowns",
-            "business_policy_version", "verified_business_dialogue",
+            "business_policy_version", "verified_business_dialogue", "preview_only",
         )}
     fingerprint = _digest(envelope)
     with nullcontext(conn) if conn is not None else connection() as active, active.transaction():
@@ -1259,8 +1263,9 @@ def ingest_source(
             proposed = {**row, "normalized_handle": row["normalized_handle"] or handle,
                         "platform": row["platform"] if row["normalized_handle"] or not handle else platform,
                         "creator_type": row.get("creator_type") or creator_type}
-            if (proposed["normalized_handle"], proposed.get("creator_type")) != (
-                row["normalized_handle"], row.get("creator_type")
+            if source_data.get("preview_only") is not True and (
+                proposed["normalized_handle"], proposed.get("creator_type")
+            ) != (row["normalized_handle"], row.get("creator_type")
             ):
                 row = _promote(active, proposed, scope, "cm_confirmation")
         else:

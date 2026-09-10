@@ -10,12 +10,12 @@ from uuid import UUID
 from fastapi import APIRouter, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, RedirectResponse
+from starlette.concurrency import run_in_threadpool
 
 from . import creator_workflow as workflow
 from . import creator_workflow_ai as ai
 from . import creator_workflow_evidence
 from . import creator_workflow_import as imports
-from .creator_onboarding import retry_initial_scan
 
 REMI_ID = str(workflow.TEST_CM_ID)
 REVIEWERS = {str(actor_id) for actor_id in workflow.TEST_EDITOR_IDS}
@@ -190,20 +190,45 @@ def create_router(*, current_authorization, render_template, csrf_token):
             workflow._uuid(payload.get("request_id"))
             if not scope["responsible_id"]:
                 raise workflow.WorkflowInputError("请先选择一位负责人。")
-            return response(ai.queue_scan(auth["id"], scope["responsible_id"],
-                                          retry_failed=payload.get("retry_failed") is True))
+            return response(ai.queue_scan(
+                auth["id"], scope["responsible_id"],
+                preflight_id=workflow._uuid(payload.get("preflight_id")),
+                retry_failed=payload.get("retry_failed") is True,
+            ))
         except (ValueError, PermissionError, LookupError) as exc:
             return failure(exc)
 
-    @router.post("/ai/initial-retry")
-    async def initial_retry(request: Request):
+    @router.post("/ai/preflight")
+    async def ai_preflight(request: Request):
         try:
             auth, scope = authorize(request)
             payload = await body(request, auth)
             workflow._uuid(payload.get("request_id"))
             if not scope["responsible_id"]:
                 raise workflow.WorkflowInputError("请先选择一位负责人。")
-            return response({"onboarding": retry_initial_scan(auth["id"], scope["responsible_id"])})
+            return response(await run_in_threadpool(ai.preflight_scan, auth["id"], scope["responsible_id"], limit=30))
+        except (ValueError, PermissionError, LookupError) as exc:
+            return failure(exc)
+
+    @router.get("/ai/preflight/{run_id}")
+    def ai_preflight_details(request: Request, run_id: UUID):
+        try:
+            auth, scope = authorize(request)
+            if not scope["responsible_id"]:
+                raise workflow.WorkflowInputError("请先选择一位负责人。")
+            return response(ai.preflight_details(auth["id"], scope["responsible_id"], run_id))
+        except (ValueError, PermissionError, LookupError) as exc:
+            return failure(exc)
+
+    @router.post("/ai/pause")
+    async def ai_pause(request: Request):
+        try:
+            auth, scope = authorize(request)
+            payload = await body(request, auth)
+            workflow._uuid(payload.get("request_id"))
+            if not scope["responsible_id"]:
+                raise workflow.WorkflowInputError("请先选择一位负责人。")
+            return response(ai.pause_scan(auth["id"], scope["responsible_id"]))
         except (ValueError, PermissionError, LookupError) as exc:
             return failure(exc)
 

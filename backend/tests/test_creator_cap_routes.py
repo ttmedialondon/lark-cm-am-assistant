@@ -1,88 +1,73 @@
-"""The initial-scan retry URL must retain session, CSRF and CM-scope boundaries."""
+"""Bounded AI preparation, start and preview retain session/CSRF/CM boundaries."""
 
 from uuid import uuid4
 
 import pytest
-import test_creator_onboarding as onboarding_fixtures
 import test_creator_workflow_http_import as http_fixtures
 
-from app import creator_onboarding as onboarding
 from app import creator_workflow as workflow
 from app import creator_workflow_routes as routes
 
 client = http_fixtures.client
-pg = onboarding_fixtures.pg
-real_scan = onboarding_fixtures.real_scan
-initial = onboarding_fixtures.initial
-URL = "/dashboard/creators/ai/initial-retry"
+BASE = "/dashboard/creators/ai"
 
 
-def test_initial_retry_http_route_uses_authorized_query_scope_not_body_or_candidate_route(client, monkeypatch):
+def test_targeted_routes_use_query_scope_and_frozen_preflight_id(client, monkeypatch):
     api, actor, scope = client
-    target, claimed = uuid4(), uuid4()
-    calls, scope_calls = [], []
+    target, claimed, preflight_id = uuid4(), uuid4(), uuid4()
+    calls = []
+    monkeypatch.setattr(workflow, "get_scope", lambda _, cm: {**scope, "responsible_id": str(cm)})
+    for name in ("preflight_scan", "queue_scan", "pause_scan", "preflight_details"):
+        monkeypatch.setattr(routes.ai, name, lambda *args, _name=name, **kwargs:
+                            calls.append((_name, args, kwargs)) or {"targeted": True}, raising=False)
+    payload = {"request_id": str(uuid4()), "responsible_id": str(claimed),
+               "preflight_id": str(preflight_id), "limit": 999}
+    for action in ("preflight", "scan", "pause"):
+        response = api.post(f"{BASE}/{action}?responsible_id={target}",
+                            headers={"X-CSRF-Token": "csrf", "Origin": "http://testserver"}, json=payload)
+        assert response.status_code == 200 and response.json() == {"targeted": True}
+        assert response.headers["cache-control"].startswith("no-store")
+    response = api.get(f"{BASE}/preflight/{preflight_id}?responsible_id={target}")
+    assert response.status_code == 200 and response.headers["cache-control"].startswith("no-store")
+    assert calls == [
+        ("preflight_scan", (actor["id"], str(target)), {"limit": 30}),
+        ("queue_scan", (actor["id"], str(target)), {"preflight_id": preflight_id, "retry_failed": False}),
+        ("pause_scan", (actor["id"], str(target)), {}),
+        ("preflight_details", (actor["id"], str(target), preflight_id), {}),
+    ]
 
-    def get_scope(actor_id, responsible_id):
-        scope_calls.append((actor_id, responsible_id))
-        return {**scope, "responsible_id": str(responsible_id)}
 
-    monkeypatch.setattr(workflow, "get_scope", get_scope)
-    monkeypatch.setattr(
-        routes, "retry_initial_scan", lambda actor_id, cm_id: calls.append((actor_id, cm_id)) or {"status": "scanning"}
-    )
-    # No candidate UUID or version is sent: a shadowing /{candidate_id}/{action}
-    # route would fail instead of dispatching this dedicated service.
-    response = api.post(
-        f"{URL}?responsible_id={target}",
-        headers={"X-CSRF-Token": "csrf", "Origin": "http://testserver"},
-        json={"request_id": str(uuid4()), "responsible_id": str(claimed)},
-    )
-    assert response.status_code == 200 and response.json() == {"onboarding": {"status": "scanning"}}
-    assert scope_calls == [(actor["id"], target)] and calls == [(actor["id"], str(target))]
-    assert response.headers["cache-control"].startswith("no-store")
-
-
-@pytest.mark.parametrize("headers", [{}, {"X-CSRF-Token": "wrong"},
-                                     {"X-CSRF-Token": "csrf", "Origin": "https://evil.invalid"}])
-def test_initial_retry_http_rejects_csrf_or_cross_origin_before_service(client, monkeypatch, headers):
+def test_targeted_writes_reject_csrf_origin_and_invalid_ids_before_service(client, monkeypatch):
     api, _, _ = client
-    monkeypatch.setattr(routes, "retry_initial_scan", lambda *_: pytest.fail("must not retry"))
-    assert api.post(URL, headers=headers, json={"request_id": str(uuid4())}).status_code == 403
+    for name in ("preflight_scan", "queue_scan", "pause_scan"):
+        monkeypatch.setattr(routes.ai, name, lambda *_args, **_kwargs: pytest.fail("must not execute"), raising=False)
+    for action in ("preflight", "scan", "pause"):
+        for headers in ({}, {"X-CSRF-Token": "wrong"}, {"X-CSRF-Token": "csrf", "Origin": "https://evil.invalid"}):
+            assert api.post(f"{BASE}/{action}", headers=headers, json={"request_id": str(uuid4())}).status_code == 403
+        for request_id in (None, "not-a-uuid", 123):
+            assert api.post(f"{BASE}/{action}", headers={"X-CSRF-Token": "csrf"},
+                            json={"request_id": request_id}).status_code == 409
+    assert api.post(f"{BASE}/scan", headers={"X-CSRF-Token": "csrf"},
+                    json={"request_id": str(uuid4())}).status_code == 409
 
 
-@pytest.mark.parametrize("request_id", [None, "not-a-uuid", 123])
-def test_initial_retry_http_requires_valid_request_id(client, monkeypatch, request_id):
-    api, _, _ = client
-    monkeypatch.setattr(routes, "retry_initial_scan", lambda *_: pytest.fail("must not retry"))
-    assert api.post(URL, headers={"X-CSRF-Token": "csrf"}, json={"request_id": request_id}).status_code == 409
-
-
-def test_initial_retry_http_requires_selected_cm_and_returns_service_permission_failure(client, monkeypatch):
+def test_targeted_routes_require_selected_cm_and_preserve_service_permission_failure(client, monkeypatch):
     api, _, scope = client
-    payload, headers = {"request_id": str(uuid4())}, {"X-CSRF-Token": "csrf"}
-    monkeypatch.setattr(routes, "retry_initial_scan", lambda *_: pytest.fail("must not retry without CM"))
-    scope["responsible_id"] = None
-    assert api.post(URL, headers=headers, json=payload).status_code == 409
-    scope["responsible_id"] = str(uuid4())
+    def forbidden(*_args, **_kwargs):
+        raise PermissionError("只能核对本人范围")
 
-    def forbidden(*_):
-        raise PermissionError("只能扫描本人范围")
+    for name in ("preflight_scan", "queue_scan", "pause_scan", "preflight_details"):
+        monkeypatch.setattr(routes.ai, name, forbidden, raising=False)
+    payload = {"request_id": str(uuid4()), "preflight_id": str(uuid4())}
+    for cm, code in ((None, 409), (str(uuid4()), 403)):
+        scope["responsible_id"] = cm
+        for action in ("preflight", "scan", "pause"):
+            assert api.post(f"{BASE}/{action}", headers={"X-CSRF-Token": "csrf"}, json=payload).status_code == code
+        assert api.get(f"{BASE}/preflight/{uuid4()}").status_code == code
 
-    monkeypatch.setattr(routes, "retry_initial_scan", forbidden)
-    assert api.post(URL, headers=headers, json=payload).status_code == 403
 
-
-def test_retry_service_rejects_non_owner_cross_cm_without_changing_onboarding(pg, initial):
-    ids, _ = initial  # Includes the required onboarding.connection patch to this isolated database.
-    outsider = uuid4()
-    pg.execute(
-        """INSERT INTO authorizations(id,open_id,display_name,access_token_ciphertext,
-        assignment_eligible,body_consent_at) VALUES(%s,'ou_outsider','Other CM','test',TRUE,NOW())""",
-        (outsider,),
-    )
-    pg.execute("UPDATE creator_workflow_onboarding SET status='failed' WHERE authorization_id=%s", (ids["cm"],))
-    before = onboarding.get_status(pg, ids["cm"])
-    with pytest.raises(PermissionError, match="跨 CM 操作仅限系统主人"):
-        onboarding.retry_initial_scan(outsider, ids["cm"])
-    assert onboarding.get_status(pg, ids["cm"]) == before
-    assert not pg.execute("SELECT 1 FROM creator_workflow_ai_tasks").fetchone()
+def test_old_history_retry_endpoint_cannot_restart_work(client, monkeypatch):
+    api, _, _ = client
+    monkeypatch.setattr(routes.ai, "queue_scan", lambda *_args, **_kwargs: pytest.fail("legacy must not start"))
+    assert api.post(f"{BASE}/initial-retry", headers={"X-CSRF-Token": "csrf"},
+                    json={"request_id": str(uuid4())}).status_code in (404, 422)

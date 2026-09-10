@@ -24,7 +24,8 @@ def render(*, readonly=False, owner=False, test_editor=False, responsible_id="re
 
 def test_read_only_scope_has_no_write_or_import_controls():
     html = render(readonly=True)
-    for control in ("cw-import-open", "cw-import-dialog", "cw-ai-scan", "cw-initial-retry", "cw-confirm-selected"):
+    for control in ("cw-import-open", "cw-import-dialog", "cw-ai-scan", "cw-ai-start",
+                    "cw-ai-pause", "cw-confirm-selected"):
         assert f'id="{control}"' not in html
     assert "只读核对" in html
     assert "不能补填、代确认" in html
@@ -35,7 +36,7 @@ def test_read_only_scope_has_no_write_or_import_controls():
     assert 'id="cw-confirm-selected"' not in owner
     tester = render(test_editor=True)
     assert 'id="cw-confirm-selected"' in tester
-    for control in ("cw-import-open", "cw-ai-scan", "cw-initial-retry"):
+    for control in ("cw-import-open", "cw-ai-scan", "cw-ai-start", "cw-ai-pause"):
         assert f'id="{control}"' not in tester
 
 

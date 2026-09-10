@@ -1,8 +1,6 @@
-"""Isolated database coverage for the once-only OAuth registration and cursor."""
+"""OAuth readiness must never restart the retired whole-chat AI scan."""
 
-import json
 from contextlib import nullcontext
-from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -11,268 +9,51 @@ from test_creator_workflow_ai import real_scan as real_scan_fixture
 
 from app import creator_onboarding as onboarding
 from app import creator_workflow_ai as ai
-from app.crypto import message_body_cipher
 
 pg, real_scan = pg_fixture, real_scan_fixture
 
 
-@pytest.fixture
-def initial(pg, real_scan, monkeypatch):
-    ids, settings = real_scan
-    monkeypatch.setattr(onboarding, "connection", lambda: nullcontext(pg))
-    onboarding.register_initial_scan(pg, ids["cm"])
-    return ids, settings
-
-
-def tick(pg):
-    pg.execute("UPDATE creator_workflow_onboarding SET next_check_at=NOW() WHERE status IN ('waiting_sync','scanning')")
-    onboarding.advance_initial_scans()
-
-
-def synced(pg, cm):
-    pg.execute(
-        """INSERT INTO sync_jobs(id,authorization_id,mode,status,finished_at)
-           VALUES(%s,%s,'backfill','succeeded',NOW())""",
-        (uuid4(), cm),
-    )
-    pg.execute("UPDATE authorization_chats SET backfill_complete=TRUE WHERE authorization_id=%s", (cm,))
-
-
-def test_old_authorizations_are_not_seeded_and_registration_is_idempotent(pg, real_scan):
+def test_registration_waits_for_consent_and_sync_but_never_calls_ai(pg, real_scan, monkeypatch):
     ids, _ = real_scan
-    assert not pg.execute("SELECT 1 FROM creator_workflow_onboarding").fetchone()
+    monkeypatch.setattr(onboarding, "connection", lambda: nullcontext(pg))
     onboarding.register_initial_scan(pg, ids["cm"])
     before = onboarding.get_status(pg, ids["cm"])
     onboarding.register_initial_scan(pg, ids["cm"])
     assert onboarding.get_status(pg, ids["cm"]) == before
     assert onboarding.get_status(pg, ids["owner"]) is None
 
+    def tick():
+        pg.execute("UPDATE creator_workflow_onboarding SET next_check_at=NOW()")
+        onboarding.advance_initial_scans()
 
-def test_waits_for_cm_consent_configuration_and_first_sync_without_losing_request(pg, initial):
-    ids, _ = initial
     pg.execute("UPDATE authorizations SET assignment_eligible=FALSE WHERE id=%s", (ids["cm"],))
-    tick(pg)
+    tick()
     assert "CM 资格" in onboarding.get_status(pg, ids["cm"])["error_message"]
     pg.execute("UPDATE authorizations SET assignment_eligible=TRUE WHERE id=%s", (ids["cm"],))
-    pg.execute("UPDATE ai_feature_configs SET enabled=FALSE WHERE feature=%s", (ai.FEATURE,))
-    tick(pg)
-    assert "配置" in onboarding.get_status(pg, ids["cm"])["error_message"]
-    pg.execute("UPDATE ai_feature_configs SET enabled=TRUE WHERE feature=%s", (ai.FEATURE,))
-    tick(pg)
-    status = ai.scan_status(ids["owner"], ids["cm"])
-    assert status["onboarding"]["status"] == "waiting_sync"
-    assert "同步完成" in status["onboarding"]["error_message"]
+    tick()
+    assert "同步完成" in onboarding.get_status(pg, ids["cm"])["error_message"]
+    pg.execute(
+        """INSERT INTO sync_jobs(id,authorization_id,mode,status,finished_at)
+           VALUES(%s,%s,'backfill','succeeded',NOW())""", (uuid4(), ids["cm"]),
+    )
+    tick()
+    assert onboarding.get_status(pg, ids["cm"])["status"] == "ready"
+    onboarding.register_initial_scan(pg, ids["cm"])
+    tick()
     assert not pg.execute("SELECT 1 FROM creator_workflow_ai_tasks").fetchone()
-    synced(pg, ids["cm"])
-    tick(pg)
-    assert onboarding.get_status(pg, ids["cm"])["status"] == "scanning"
-    assert pg.execute("SELECT COUNT(*) AS n FROM creator_workflow_ai_tasks").fetchone()["n"] == 1
-
-
-def test_keyset_pages_cover_over_100_chats_once_and_share_normal_task_queue(pg, initial, monkeypatch):
-    ids, settings = initial
-    for number in range(108):
-        chat = f"b{number:03d}"
-        pg.execute("INSERT INTO chats(chat_id,chat_mode) VALUES(%s,'group')", (chat,))
-        pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,%s)", (ids["cm"], chat))
-    synced(pg, ids["cm"])
-    tick(pg)
-    first = onboarding.get_status(pg, ids["cm"])
-    assert first["total_chats"] == 109 and first["checked_chats"] == 100 and first["queued_chats"] == 0
-    assert first["window_start"] == ai.HISTORY_START and first["history_days"] is None
-    tick(pg)
-    second = onboarding.get_status(pg, ids["cm"])
-    assert second["checked_chats"] == 109 and second["queued_chats"] == 1
-    calls = []
-    monkeypatch.setattr(
-        ai.contact_assessments, "call_openai", lambda *_a, **_k: calls.append(True) or {"text": '{"candidates":[]}'}
-    )
-    ai.run_claimed_creator_scan(ai.claim_next_creator_scan(), settings)
-    tick(pg)
-    assert onboarding.get_status(pg, ids["cm"])["status"] == "succeeded"
-    onboarding.register_initial_scan(pg, ids["cm"])
-    tick(pg)
-    assert ai.claim_next_creator_scan() is None and calls == [True]
-    assert pg.execute("SELECT COUNT(*) AS n FROM creator_workflow_ai_runs").fetchone()["n"] == 2
-
-
-def test_revocation_cancels_first_scan_without_late_model_call_or_old_authorization_rescan(pg, initial, monkeypatch):
-    ids, settings = initial
-    synced(pg, ids["cm"])
-    tick(pg)
-    job = ai.claim_next_creator_scan()
-    pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (ids["cm"],))
-    tick(pg)
-    assert onboarding.get_status(pg, ids["cm"])["status"] == "cancelled"
-    calls = []
-    monkeypatch.setattr(ai.contact_assessments, "call_openai", lambda *_a, **_k: calls.append(True))
-    ai.run_claimed_creator_scan(job, settings)
-    assert not calls
-    pg.execute("UPDATE authorizations SET status='active' WHERE id=%s", (ids["cm"],))
-    onboarding.register_initial_scan(pg, ids["cm"])
-    tick(pg)
-    assert onboarding.get_status(pg, ids["cm"])["status"] == "cancelled"
     assert ai.claim_next_creator_scan() is None
 
 
-def test_failed_batches_continue_and_explicit_retry_replays_only_incomplete_current_pass(pg, initial, monkeypatch):
-    ids, settings = initial
-    for number in range(200):
-        chat = f"b{number:03d}"
-        pg.execute("INSERT INTO chats(chat_id,chat_mode) VALUES(%s,'group')", (chat,))
-        pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,%s)", (ids["cm"], chat))
-        if number in (0, 100):
-            pg.execute(
-                """INSERT INTO chat_messages
-                   (chat_id,message_id,sender_open_id,message_type,body_ciphertext,message_create_time)
-                   SELECT %s,message_id,sender_open_id,message_type,body_ciphertext,message_create_time
-                   FROM chat_messages WHERE chat_id='chat'""", (chat,),
-            )
-            pg.execute(
-                """INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
-                   SELECT %s,%s,message_id FROM chat_messages WHERE chat_id='chat'""", (ids["cm"], chat),
-            )
-    synced(pg, ids["cm"])
-    tick(pg)
-    monkeypatch.setattr(ai.contact_assessments, "call_openai", lambda *_a, **_k: {"text": "invalid JSON"})
-    failed = []
-    for checked in (200, 201):
-        job = ai.claim_next_creator_scan()
-        failed.append(job["id"])
-        ai.run_claimed_creator_scan(job, settings)
-        tick(pg)
-        status = onboarding.get_status(pg, ids["cm"])
-        assert status["status"] == "scanning" and status["checked_chats"] == checked
-        progress = ai.scan_status(ids["owner"], ids["cm"])
-        assert progress["counts"]["invalid"] == len(failed) and progress["counts"]["queued"] == 1
-    monkeypatch.setattr(ai.contact_assessments, "call_openai", lambda *_a, **_k: {"text": '{"candidates":[]}'})
-    success = ai.claim_next_creator_scan()
-    ai.run_claimed_creator_scan(success, settings)
-    succeeded = pg.execute("SELECT * FROM creator_workflow_ai_tasks WHERE id=%s", (success["id"],)).fetchone()
-    # A different historical pass must not be included in this retry or its final result.
-    old_run, old_task = uuid4(), uuid4()
-    pg.execute(
-        """INSERT INTO creator_workflow_ai_runs
-           (id,responsible_authorization_id,requested_by_authorization_id,status,history_days,chat_limit,
-            window_start,window_end,onboarding_authorization_id)
-           SELECT %s,responsible_authorization_id,requested_by_authorization_id,'failed',history_days,chat_limit,
-                  window_start,window_end-INTERVAL '1 second',onboarding_authorization_id
-           FROM creator_workflow_ai_runs WHERE id=%s""", (old_run, success["run_id"]),
-    )
-    pg.execute(
-        """INSERT INTO creator_workflow_ai_tasks(id,run_id,chat_id,input_fingerprint,status,attempts)
-           VALUES(%s,%s,'chat','old-pass','invalid',4)""", (old_task, old_run),
-    )
-    tick(pg)
-    assert onboarding.get_status(pg, ids["cm"])["status"] == "failed"
-    assert "2 段未完成" in onboarding.get_status(pg, ids["cm"])["error_message"]
-    progress = ai.scan_status(ids["owner"], ids["cm"])
-    assert progress["counts"] == {"invalid": 2, "succeeded": 1}
-    assert progress["error_summary"] == [{
-        "status": "invalid", "count": 2,
-        "message": "AI 未返回有效的结构化结果。本段未生成候选。",
-    }]
-    tick(pg)
-    assert ai.claim_next_creator_scan() is None
-    result = onboarding.retry_initial_scan(ids["owner"], ids["cm"])
-    assert result["status"] == "scanning"
-    retried = []
-    for _ in range(2):
-        retry = ai.claim_next_creator_scan()
-        retried.append(retry["id"])
-        assert retry["attempts"] == 2
-        assert ai.claim_next_creator_scan() is None  # The other retry run is not active yet.
-        ai.run_claimed_creator_scan(retry, settings)
-        tick(pg)
-    assert set(retried) == set(failed)
-    assert onboarding.get_status(pg, ids["cm"])["status"] == "succeeded"
-    assert pg.execute("SELECT * FROM creator_workflow_ai_tasks WHERE id=%s", (success["id"],)).fetchone() == succeeded
-    assert pg.execute("SELECT status,attempts FROM creator_workflow_ai_tasks WHERE id=%s", (old_task,)).fetchone() == {
-        "status": "invalid", "attempts": 4,
-    }
-    assert ai.claim_next_creator_scan() is None
-
-
-def test_frozen_window_excludes_new_messages_and_non_normal_chats(pg, initial):
-    ids, _ = initial
-    synced(pg, ids["cm"])
-    tick(pg)
-    row = pg.execute("SELECT * FROM creator_workflow_onboarding").fetchone()
-    pg.execute("UPDATE chat_messages SET message_create_time=%s", (row["window_end"],))
-    assert not pg.execute(ai._MESSAGES_SQL, (ids["cm"], "chat", row["window_start"], row["window_end"], 30)).fetchall()
-    pg.execute("UPDATE chat_messages SET message_create_time=%s", (row["window_start"],))
-    assert (
-        len(pg.execute(ai._MESSAGES_SQL, (ids["cm"], "chat", row["window_start"], row["window_end"], 30)).fetchall())
-        == 2
-    )
-    pg.execute("UPDATE chats SET chat_status='dissolved' WHERE chat_id='chat'")
-    assert not pg.execute(ai._MESSAGES_SQL, (ids["cm"], "chat", row["window_start"], row["window_end"], 30)).fetchall()
-
-
-def test_all_history_segments_include_old_messages_and_lock_fixed_ids_before_decryption(pg, initial, monkeypatch):
-    ids, settings = initial
-    cipher = message_body_cipher(settings.token_encryption_key)
-    for number in range(95):
-        message_id = f"long-{number:02d}"
-        pg.execute(
-            """INSERT INTO chat_messages
-               (chat_id,message_id,sender_open_id,message_type,body_ciphertext,message_create_time)
-               VALUES('chat',%s,'ou_person','text',%s,NOW()-INTERVAL '200 days')""",
-            (message_id, cipher.encrypt(json.dumps({"text": "x" * 2000}))),
-        )
-        pg.execute(
-            """INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
-               VALUES(%s,'chat',%s)""",
-            (ids["cm"], message_id),
-        )
-    synced(pg, ids["cm"])
-    tick(pg)
-    status = onboarding.get_status(pg, ids["cm"])
-    assert status["queued_chats"] == 2 and status["history_days"] is None
-    segments = pg.execute("SELECT message_ids FROM creator_workflow_ai_tasks").fetchall()
-    ids_seen = {mid for segment in segments for mid in segment["message_ids"]}
-    assert len(ids_seen) == 97  # includes all old messages, not only a recent tail.
-    assert len(set(segments[0]["message_ids"]) & set(segments[1]["message_ids"])) == ai.MESSAGE_OVERLAP
-    job = ai.claim_next_creator_scan()
-    queries = []
-
-    class LockedReader:
-        def execute(self, query, params=None):
-            queries.append(query)
-            return pg.execute(query, params)
-
-    class Cipher:
-        def decrypt(self, body):
-            assert any("FOR SHARE OF ac,c" in q for q in queries)
-            assert any("FOR SHARE OF m,o" in q for q in queries)
-            assert any("ORDER BY open_id FOR SHARE" in q for q in queries)
-            return cipher.decrypt(body)
-
-    monkeypatch.setattr(ai, "message_body_cipher", lambda _: Cipher())
-    evidence = ai._load_evidence(LockedReader(), job, settings)
-    assert evidence["pack"]["input_truncated"] and evidence["pack"]["history_synced"]
-    assert len(evidence["pack"]["messages"]) == ai.MAX_MESSAGES
-    assert all(len(message["text"]) <= ai.MAX_BODY_CHARS for message in evidence["pack"]["messages"])
-
-
-def test_all_cm_reset_removes_derived_roster_not_source_people_messages_or_permissions(pg, real_scan):
+def test_revocation_and_legacy_retry_cannot_send_history(pg, real_scan, monkeypatch):
     ids, _ = real_scan
-    workflow = ai.creator_workflow
-    row = workflow.ingest_source(
-        ids["cm"], source_type="excel", source_key="reset-fixture", source_data={},
-        responsible_id=ids["cm"], contact_id=ids["person"], conn=pg,
-    )
-    workflow.confirm_candidate(workflow.get_scope(ids["cm"]), row["id"], row["version"], request_id=uuid4())
-    workflow.ingest_source(ids["owner"], source_type="excel", source_key="unassigned-fixture", source_data={}, conn=pg)
-    ai.queue_scan(ids["owner"], ids["cm"])
+    monkeypatch.setattr(onboarding, "connection", lambda: nullcontext(pg))
+    onboarding.register_initial_scan(pg, ids["cm"])
+    pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (ids["cm"],))
     onboarding.advance_initial_scans()
-    protected = ("contacts", "lark_identities", "chat_messages", "authorization_message_observations",
-                 "authorizations", "admin_roles", "admin_page_permissions")
-    before = {table: pg.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"] for table in protected}
-    pg.execute((Path(__file__).parents[1] / "migrations/039_reset_all_creator_data.sql").read_text())
-    for table in ("creator_workflow_candidates", "creator_workflow_sources", "creator_account_assignments",
-                  "social_accounts", "contact_social_accounts", "creator_workflow_onboarding",
-                  "creator_workflow_ai_tasks", "creator_workflow_ai_runs", "creator_workflow_requests"):
-        assert pg.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"] == 0
-    assert before == {table: pg.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"] for table in protected}
-    assert not ai._enabled(pg)
+    assert onboarding.get_status(pg, ids["cm"])["status"] == "cancelled"
+    with pytest.raises(PermissionError):
+        onboarding.retry_initial_scan(ids["owner"], ids["cm"])
+    pg.execute("UPDATE authorizations SET status='active' WHERE id=%s", (ids["cm"],))
+    with pytest.raises(ai.ScanInputError, match="全量聊天扫描已停用"):
+        onboarding.retry_initial_scan(ids["owner"], ids["cm"])
+    assert not pg.execute("SELECT 1 FROM creator_workflow_ai_tasks").fetchone()

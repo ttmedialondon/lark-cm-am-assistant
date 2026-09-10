@@ -6,8 +6,8 @@ TT Media 内部助手：同步已授权的 Lark 聊天、维护达人与 CM 的�
 
 - 产品和开发都从 [文档总入口](docs/README.md) 开始：当前只维护三份业务规则和一份技术说明。
 - [本地开发](backend/README.md) · [部署与回退](docs/runbooks/deploy-mvp.md) · [AI 协作约定](AGENTS.md)。
-- 2026-09-10 新规则：AI 按 CM 与达人的实际业务对话判断，检查全部已同步且当前授权的历史；高置信、直接证据通过可先按 Lark 用户入库，handle 和 CAP 类型可后补。Excel 用于 CAP 名单和账号资料补充。详见 [达人管理](docs/product/creator-management.md)。
-- 按用户决定清空所有 CM 的达人派生数据，保留联系人、原始 Lark 消息和授权；不自动重传旧 Excel 或批量启动所有 CM 的扫描。
+- 2026-09-11：改为按人准备少量业务对话，再明确启动 AI；首批最多 30 人、共享 3 路并发，只做核对预览。handle 和 CAP 类型可后补，Excel 补充 CAP 名单及账号资料。详见 [达人管理](docs/product/creator-management.md)。
+- 旧全量聊天扫描已停用。本轮保留已有正式名单、联系人、原始消息和授权；历史数据重置不重复执行，不自动重传 Excel 或扫描所有 CM。
 
 ## 代码在哪里
 

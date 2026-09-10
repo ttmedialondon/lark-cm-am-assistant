@@ -77,7 +77,7 @@ def candidate(**changes):
 
 def test_structured_candidates_preserve_missing_fields_and_exact_spelling():
     pack = evidence()
-    item = candidate(handle=None, user=None, handle_source="missing", handle_refs=[], unknowns=["Lark 用户不明"])
+    item = candidate(handle=None, handle_source="missing", handle_refs=[])
     assert ai._validate(json.dumps({"candidates": [item]}), pack) == [item]
     assert ai._validate('{"candidates": []}', pack) == []
     shape = ai._format(pack)
@@ -91,6 +91,7 @@ def test_structured_candidates_preserve_missing_fields_and_exact_spelling():
     "change",
     [
         {"user": "arbitrary-population-id"},
+        {"user": None},
         {"responsible": "other-CM"},
         {"creator_refs": []},
         {"creator_refs": ["fabricated"]},
@@ -118,25 +119,6 @@ def test_group_handle_and_unclear_cm_remain_supported_candidates_not_assignments
     )
     assert ai._validate(json.dumps({"candidates": [item]}), evidence()) == [item]
     assert not ai._verified_facts(item, evidence())["verified_business_dialogue"]
-
-
-def test_fingerprint_ignores_routine_cipher_refresh_but_detects_edits_and_new_identity():
-    first = {
-        "message_id": "one",
-        "message_update_time": None,
-        "first_observed_at": "first",
-        "sender_open_id": "ou_1",
-        "contact_id": "contact",
-        "sender_name": "Alice",
-        "body_ciphertext": "random ciphertext",
-        "last_observed_at": "today",
-    }
-    chat = {"name": "@alice X TT", "chat_type": "group"}
-    stable = ai._fingerprint(chat, [first])
-    assert ai._fingerprint(chat, [{**first, "body_ciphertext": "new cipher", "last_observed_at": "tomorrow"}]) == stable
-    assert ai._fingerprint(chat, [{**first, "message_update_time": "new edit"}]) != stable
-    assert ai._fingerprint(chat, [{**first, "contact_id": "other person"}]) != stable
-    assert ai._fingerprint({**chat, "name": "renamed"}, [first]) != stable
 
 
 def test_rich_text_keeps_product_handle_links_but_redacts_access_tokens():
@@ -420,7 +402,7 @@ def test_edited_evidence_during_model_call_cannot_commit(monkeypatch, run_harnes
 
     def load(*_):
         loads.append(True)
-        if len(loads) > 1:
+        if len(loads) > 2:
             raise ai.ScanInputError("edited")
         return h.evidence
 
@@ -438,7 +420,7 @@ def test_feature_disabled_never_calls_old_or_new_models(run_harness):
     assert h.finished[0][0][1] == "cancelled"
 
 
-@pytest.mark.parametrize("attempts,expected", [(1, "queued"), (3, "failed")])
+@pytest.mark.parametrize("attempts,expected", [(1, "queued"), (2, "failed")])
 def test_rate_limit_has_a_finite_retry_budget(monkeypatch, run_harness, attempts, expected):
     h = run_harness
     h.job["attempts"] = attempts
@@ -531,45 +513,6 @@ def test_same_evidence_never_reopens_a_denied_source(monkeypatch, run_harness):
     assert not h.ingested and not h.finished
 
 
-@pytest.mark.parametrize("excel_first", [True, False])
-def test_verified_ai_and_cm_cap_excel_auto_confirm_in_either_order(pg, real_scan, monkeypatch, excel_first):
-    ids, settings = real_scan
-
-    def upload():
-        return ai.creator_workflow.ingest_source(
-            ids["cm"],
-            source_type="excel",
-            source_key="my-cap-row",
-            source_data={"cap_policy_version": "cap_v1", "creator_type": "cap", "type_evidence": "cm_excel_upload"},
-            responsible_id=ids["cm"],
-            handle="alice",
-            creator_type="cap",
-            conn=pg,
-        )
-
-    if excel_first:
-        assert upload()["status"] == "pending"
-    monkeypatch.setattr(
-        ai.contact_assessments,
-        "call_openai",
-        lambda *_a, **_k: {"text": json.dumps({"candidates": [candidate(relationship="unknown")]})},
-    )
-    start_scan(pg, ids["cm"], ids["cm"])
-    ai.run_claimed_creator_scan(ai.claim_next_creator_scan(), settings)
-    if not excel_first:
-        assert pg.execute("SELECT status,creator_type FROM creator_workflow_candidates").fetchone() == {
-            "status": "confirmed",
-            "creator_type": None,
-        }
-        upload()
-    row = pg.execute(
-        "SELECT status,creator_type,relationship,uncertainties FROM creator_workflow_candidates"
-    ).fetchone()
-    assert row == {"status": "confirmed", "creator_type": "cap", "relationship": "associated", "uncertainties": []}
-    assignment = pg.execute("SELECT * FROM creator_account_assignments").fetchone()
-    assert assignment["responsible_authorization_id"] == ids["cm"] and assignment["creator_type"] == "cap"
-
-
 def test_authorization_does_not_equate_readonly_review_with_permission_to_scan(monkeypatch):
     actor, cm = uuid4(), uuid4()
     rows = [
@@ -660,9 +603,10 @@ def pg(monkeypatch):
 
 
 @pytest.fixture
-def real_scan(pg):
+def real_scan(pg, monkeypatch):
     ids = {name: uuid4() for name in ("cm", "owner", "person", "other")}
     settings = SimpleNamespace(token_encryption_key=b"x" * 32)
+    monkeypatch.setattr(ai, "get_settings", lambda: settings)
     for name in ("cm", "owner"):
         pg.execute(
             """INSERT INTO authorizations
@@ -707,9 +651,8 @@ def real_scan(pg):
 
 
 def start_scan(pg, actor, cm):
-    ai.queue_scan(actor, cm)
-    advance_scan(pg)
-    return ai.scan_status(actor, cm)
+    run = ai.preflight_scan(actor, cm)
+    return ai.queue_scan(actor, cm, preflight_id=run["id"])
 
 
 def advance_scan(pg):
@@ -724,14 +667,19 @@ def test_real_queue_claim_model_candidate_and_unchanged_incremental(pg, real_sca
     def model(config, key, pack, cm_id, **kwargs):
         calls.append(pack)
         assert cm_id == ids["cm"] and config["model"] == "existing-model"
-        assert [u["name"] for u in pack["users"]] == ["person"]
+        assert [u["name"] for u in pack["users"]] == ["U1"]
         assert pack["messages"][1]["speaker"] == "CM1"
         return {"text": json.dumps({"candidates": [candidate()]}), "usage": {"input_tokens": 15}}
 
     monkeypatch.setattr(ai.contact_assessments, "call_openai", model)
-    run = start_scan(pg, ids["owner"], ids["cm"])
-    assert run["total_chats"] == 1 and run["status"] == "queued"
-    assert ai.queue_scan(ids["owner"], ids["cm"])["run_id"] == run["id"]
+    run = ai.preflight_scan(ids["owner"], ids["cm"])
+    assert run["total_people"] == 1 and run["status"] == "ready" and run["preview_only"]
+    assert not calls and ai.claim_next_creator_scan() is None
+    preview = ai.preflight_details(ids["owner"], ids["cm"], run["id"])
+    assert len(preview["people"][0]["messages"]) == 2
+    assert run["request_count"] == 0 and run["request_limit"] == 2
+    assert ai.queue_scan(ids["owner"], ids["cm"], preflight_id=run["id"])["id"] == run["id"]
+    assert ai.queue_scan(ids["owner"], ids["cm"], preflight_id=run["id"])["id"] == run["id"]
     job = ai.claim_next_creator_scan()
     assert job["attempts"] == 1 and job["chat_id"] == "chat"
     assert ai.scan_status(ids["owner"], ids["cm"])["dispatch"] == {
@@ -755,10 +703,11 @@ def test_real_queue_claim_model_candidate_and_unchanged_incremental(pg, real_sca
     assert status["candidate_count"] == 1 and status["counts"] == {"succeeded": 1}
     assert status["error_summary"] == [] and status["dispatch"]["running_count"] == 0
     row = pg.execute("SELECT * FROM creator_workflow_candidates").fetchone()
-    assert row["status"] == "confirmed" and row["responsible_authorization_id"] == ids["cm"]
+    assert row["status"] == "pending" and row["responsible_authorization_id"] == ids["cm"]
     assert row["contact_id"] == ids["person"] and row["normalized_handle"] == "alice"
-    assert not row["uncertainties"]
-    assert pg.execute("SELECT COUNT(*) AS n FROM creator_account_assignments").fetchone()["n"] == 1
+    assert "ai_review" in row["uncertainties"]
+    assert status["outcomes"] == {"review": 1} and status["request_count"] == 1
+    assert pg.execute("SELECT COUNT(*) AS n FROM creator_account_assignments").fetchone()["n"] == 0
     assert pg.execute("SELECT COUNT(*) AS n FROM contact_roles").fetchone()["n"] == 0
     assert pg.execute("SELECT COUNT(*) AS n FROM contact_assignments").fetchone()["n"] == 0
     assert (
@@ -767,18 +716,12 @@ def test_real_queue_claim_model_candidate_and_unchanged_incremental(pg, real_sca
         ).fetchone()["n"]
         == 0
     )
-    advance_scan(pg)
-    ai.queue_scan(ids["owner"], ids["cm"])
-    preparing = ai.scan_status(ids["owner"], ids["cm"])
-    assert preparing["status"] == "scanning" and preparing["counts"] == {}
-    assert preparing["error_summary"] == [] and "id" not in preparing
-    advance_scan(pg)
-    again = ai.scan_status(ids["owner"], ids["cm"])
-    assert again["total_chats"] == 0 and len(calls) == 1
+    again = ai.preflight_scan(ids["owner"], ids["cm"])
+    assert again["total_people"] == 0 and again["status"] == "succeeded" and len(calls) == 1
     assert ai.claim_next_creator_scan() is None
 
 
-def test_real_missing_handle_and_user_survive_in_pending_pool(pg, real_scan, monkeypatch):
+def test_real_missing_handle_and_user_are_rejected_without_placeholder(pg, real_scan, monkeypatch):
     ids, settings = real_scan
     output = candidate(
         handle=None, user=None, handle_source="missing", handle_refs=[], unknowns=["Lark 用户不明"]
@@ -789,7 +732,8 @@ def test_real_missing_handle_and_user_survive_in_pending_pool(pg, real_scan, mon
     start_scan(pg, ids["owner"], ids["cm"])
     ai.run_claimed_creator_scan(ai.claim_next_creator_scan(), settings)
     row = pg.execute("SELECT * FROM creator_workflow_candidates").fetchone()
-    assert row and row["status"] == "pending" and row["normalized_handle"] is None and row["contact_id"] is None
+    assert row is None
+    assert ai.scan_status(ids["owner"], ids["cm"])["counts"] == {"invalid": 1}
     assert pg.execute("SELECT COUNT(*) AS n FROM social_accounts").fetchone()["n"] == 0
 
 
@@ -797,6 +741,13 @@ def test_real_revoke_between_queue_and_execution_cancels_without_model(pg, real_
     ids, settings = real_scan
     start_scan(pg, ids["owner"], ids["cm"])
     job = ai.claim_next_creator_scan()
+    pg.execute(
+        "UPDATE creator_workflow_ai_runs SET preflight_json=preflight_json||%s::jsonb WHERE id=%s",
+        (json.dumps({"local_pending": [{"contact_id": str(ids["person"]), "display_name": "old name"}]}),
+         job["run_id"]),
+    )
+    before = ai.preflight_details(ids["owner"], ids["cm"], job["run_id"])
+    assert before["local_pending"][0]["display_name"] == "person"
     pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (ids["cm"],))
 
     def never(*_a, **_k):
@@ -806,6 +757,36 @@ def test_real_revoke_between_queue_and_execution_cancels_without_model(pg, real_
     ai.run_claimed_creator_scan(job, settings)
     assert ai.scan_status(ids["owner"], ids["cm"])["status"] == "cancelled"
     assert pg.execute("SELECT COUNT(*) AS n FROM creator_workflow_sources").fetchone()["n"] == 0
+    preview = ai.preflight_details(ids["owner"], ids["cm"], job["run_id"])
+    person = preview["people"][0]
+    assert person["unavailable"] and person["messages"] == []
+    assert "contact_id" not in person and "name" not in person
+    assert preview["local_pending"] == [] and preview["local_pending_hidden_count"] == 1
+    assert "local_pending" not in preview["preflight_json"]
+
+
+def test_targeted_pause_fences_inflight_results_and_never_claims_legacy(pg, real_scan, monkeypatch):
+    ids, settings = real_scan
+    with pytest.raises(PermissionError):
+        ai.preflight_scan(ids["other"], ids["cm"])
+    with pytest.raises(ai.ScanInputError):
+        ai.preflight_scan(ids["owner"], ids["cm"], limit=31)
+    run = start_scan(pg, ids["owner"], ids["cm"])
+    job = ai.claim_next_creator_scan()
+
+    def model(*_args, **_kwargs):
+        ai.pause_scan(ids["owner"], ids["cm"])
+        return {"text": json.dumps({"candidates": [candidate()]})}
+
+    monkeypatch.setattr(ai.contact_assessments, "call_openai", model)
+    ai.run_claimed_creator_scan(job, settings)
+    assert ai.scan_status(ids["owner"], ids["cm"])["counts"] == {"cancelled": 1}
+    assert pg.execute("SELECT COUNT(*) AS n FROM creator_workflow_sources").fetchone()["n"] == 0
+    assert ai.claim_next_creator_scan() is None
+    # Even a stale caller manually requeuing a legacy job cannot restore bulk export.
+    pg.execute("UPDATE creator_workflow_ai_runs SET status='queued',scan_mode='legacy' WHERE id=%s", (run["id"],))
+    pg.execute("UPDATE creator_workflow_ai_tasks SET status='queued' WHERE run_id=%s", (run["id"],))
+    assert ai.claim_next_creator_scan() is None
 
 
 def test_real_unknown_responsibility_stays_in_scanned_cm_review_inbox_without_assignment(pg, real_scan, monkeypatch):
@@ -831,14 +812,61 @@ def test_real_failed_output_is_retryable_only_by_explicit_request(pg, real_scan,
     ai.run_claimed_creator_scan(ai.claim_next_creator_scan(), settings)
     status = ai.scan_status(ids["owner"], ids["cm"])
     assert status["status"] == "failed"
+    assert status["retryable_people"] == 1
     assert status["error_summary"] == [{
         "status": "invalid", "count": 1,
-        "message": "AI 未返回有效的结构化结果。本段未生成候选。",
+        "message": "AI 未返回有效的结构化结果。此人未生成候选。",
     }]
     assert status["errors"] == [status["error_summary"][0]["message"]]
     assert status["dispatch"]["running_count"] == 0
-    advance_scan(pg)
-    assert onboarding.get_status(pg, ids["cm"])["status"] == "failed"
     assert ai.claim_next_creator_scan() is None
-    assert ai.queue_scan(ids["owner"], ids["cm"], retry_failed=True)["onboarding"]["status"] == "scanning"
-    assert ai.claim_next_creator_scan()["attempts"] == 2
+    with pytest.raises(ai.ScanInputError):
+        ai.queue_scan(ids["owner"], ids["cm"], retry_failed=True)
+    assert ai.queue_scan(ids["owner"], ids["cm"], preflight_id=status["id"], retry_failed=True)["status"] == "queued"
+    job = ai.claim_next_creator_scan()
+    assert job["attempts"] == 2
+    ai.run_claimed_creator_scan(job, settings)
+    exhausted = ai.scan_status(ids["owner"], ids["cm"])
+    assert exhausted["request_count"] == 2 and exhausted["retryable_people"] == 0
+    with pytest.raises(ai.ScanInputError):
+        ai.queue_scan(ids["owner"], ids["cm"], preflight_id=status["id"], retry_failed=True)
+    assert ai.preflight_scan(ids["owner"], ids["cm"])["total_people"] == 0
+
+
+def test_person_preflight_keeps_historical_pairs_private_and_revalidates_frozen_source(pg, real_scan):
+    from app import creator_targeting as targeting
+
+    ids, settings = real_scan
+    cipher = message_body_cipher(settings.token_encryption_key)
+    original = ("My creator account is @alice. Contact alice@example.test or +44 7911 123456. "
+                "Delivery address: 42 Example Road\nI need samples for my next LIVE.")
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='1'",
+               (cipher.encrypt(json.dumps({"text": original})),))
+    pg.execute("UPDATE chat_messages SET message_create_time=message_create_time-INTERVAL '2 years'")
+    pg.execute(
+        """INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,body_ciphertext,message_create_time)
+           VALUES('chat','third-party','ou_other','text',%s,NOW()-INTERVAL '2 years')""",
+        (cipher.encrypt(json.dumps({"text": "THIRD-PARTY SECRET: I need campaign samples too"})),),
+    )
+    pg.execute(
+        """INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+           VALUES(%s,'chat','third-party')""", (ids["cm"],),
+    )
+    preflight = targeting.build_preflight(pg, settings, ids["cm"])
+    assert preflight["summary"]["selected_people"] == 1
+    assert preflight["summary"]["local_pending_people"] == 1
+    person = preflight["people"][0]
+    assert person["contact_id"] == str(ids["person"])
+    assert person["message_count"] == 2 and person["char_count"] <= targeting.MAX_PACK_CHARS
+    encoded = json.dumps(person["pack"], ensure_ascii=False, separators=(",", ":"))
+    assert person["char_count"] == len(encoded)
+    assert "THIRD-PARTY SECRET" not in encoded and "alice@example.test" not in encoded
+    assert "7911" not in encoded and "42 Example Road" not in encoded and "@alice" in encoded
+    assert person["pack"]["users"] == [{"id": "U1", "name": "U1"}]
+    assert all(m["interaction"] == "E1" for m in person["pack"]["messages"])
+    job = {**person, "responsible_authorization_id": ids["cm"], "window_end": preflight["window_end"]}
+    assert targeting.load_person_evidence(pg, job, settings)["pack"] == person["pack"]
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='1'",
+               (cipher.encrypt(json.dumps({"text": original + " Changed after preflight."})),))
+    with pytest.raises(ai.ScanInputError, match="已变化"):
+        targeting.load_person_evidence(pg, job, settings)
