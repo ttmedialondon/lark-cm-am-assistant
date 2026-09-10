@@ -19,6 +19,7 @@ from . import (
     ai_dispatch,
     contact_assessments,
     contact_assignments,
+    creator_onboarding,
     creator_workflow_ai,
     offhours_summary,
     organization_sync,
@@ -134,6 +135,7 @@ def run_forever() -> None:
                 _reap_page_futures(page_futures, settings)
                 _reap_member_futures(member_futures)
                 _recover_expired_leases()
+                creator_onboarding.advance_initial_scans()
                 prefer_assignment = _fill_ai_slots(settings, ai_executor, ai_futures, prefer_assignment)
                 if settings.app_secret_configured and time.monotonic() >= next_organization_check:
                     _run_organization_sync(settings, client)

@@ -2,3 +2,5 @@
 .cw-scope{display:flex;gap:12px;align-items:center;margin-bottom:16px}.cw-scope select{max-width:260px}@media(max-width:700px){.cw-scope{flex-wrap:wrap}}
 .cw-link:focus-visible{outline:2px solid #206bc4;outline-offset:3px}
 .cw-handle+.cw-small{display:block;margin-bottom:6px}
+.cw-table{min-width:1080px}.cw-table th:nth-last-child(6){width:19%}.cw-table th:nth-last-child(5){width:13%}.cw-table th:nth-last-child(4){width:9%}.cw-table th:nth-last-child(3){width:25%}.cw-table th:nth-last-child(2){width:17%}.cw-type .form-select{min-width:110px;font-size:13px}.cw-readonly .cw-table{min-width:880px}
+.cw-initial-scan .cw-toolbar{padding:0;margin-bottom:8px}.cw-initial-scan p{margin:5px 0}.cw-initial-scan .cw-pill{margin:0}

@@ -2,7 +2,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {newDraft, missingFields, draftBody, savedDraft, pending} = require("../app/static/creator-workflow.js");
-const item = {id: "candidate", version: 4, status: "pending", handle: "example", relationship: "owner",
+const item = {id: "candidate", version: 4, status: "pending", handle: "example", relationship: "owner", creator_type: "cap",
   contact: {contact_id: "actual-id", display_name: "Same name"}, reasons: []};
 
 test("missing fields stay empty and free text is not a selected identity", () => {
@@ -20,7 +20,7 @@ test("missing fields stay empty and free text is not a selected identity", () =>
   }
 });
 
-test("handle plus a selected identity suffice without review acknowledgements or relationship", () => {
+test("handle, selected identity and type suffice without review acknowledgements or relationship", () => {
   const risk = {...item, relationship: null, reasons: [
     {code: "ai_review", label: "AI 推荐待核对", resolvable: true},
     {code: "details_changed", label: "资料已修改", resolvable: true},
@@ -28,23 +28,40 @@ test("handle plus a selected identity suffice without review acknowledgements or
   const draft = newDraft(risk);
   assert.deepEqual(missingFields(draft, risk), []);
   assert.deepEqual(draftBody(draft, "request"), {
-    version: 4, handle: "example", contact_id: "actual-id", request_id: "request",
+    version: 4, handle: "example", contact_id: "actual-id", creator_type: "cap", request_id: "request",
   });
   for (const field of ["relationship", "resolved_reasons", "acknowledged", "identityDirty", "recheckRequired", "recheck"]) {
     assert.equal(field in draft, false, `${field} is no longer a confirmation step`);
   }
 });
 
+test("unknown AI-only type stays empty until explicitly selected and can be cleared again", () => {
+  const draft = newDraft({...item, sources: ["ai"], creator_type: null});
+  assert.equal(draft.creator_type, null);
+  assert(missingFields(draft).some(reason => reason.includes("达人类型")));
+  assert.equal(draftBody(draft, "request").creator_type, null);
+  for (const value of ["cap", "non_cap"]) {
+    draft.creator_type = value;
+    assert.deepEqual(missingFields(draft), []);
+    assert.equal(draftBody(draft, "request").creator_type, value);
+  }
+  draft.creator_type = null;
+  assert(missingFields(draft).some(reason => reason.includes("达人类型")));
+  assert.equal(newDraft({...item, creator_type: "unverified"}).creator_type, null);
+});
+
 test("late save keeps new local edits but advances the optimistic version", () => {
-  const draft = {...newDraft(item), dirty: true, revision: 3, handle: "newer-local", request: "old-request"};
+  const draft = {...newDraft(item), dirty: true, revision: 3, handle: "newer-local", creator_type: "non_cap", request: "old-request"};
   const result = savedDraft(draft, {...item, version: 5, handle: "older-saved"}, 2);
   assert.equal(result.handle, "newer-local");
   assert.equal(result.version, 5);
   assert.equal(result.dirty, true);
   assert.equal(result.request, null);
+  assert.equal(result.creator_type, "non_cap");
   const noRace = savedDraft(draft, {...item, version: 5, handle: "saved-value"}, 3);
   assert.equal(noRace.handle, "saved-value");
   assert.equal(noRace.dirty, false);
+  assert.equal(noRace.creator_type, "cap");
 });
 
 test("complete edits can be confirmed and emptying either field makes the draft incomplete", () => {

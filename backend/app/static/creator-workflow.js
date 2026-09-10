@@ -4,17 +4,19 @@
   const pending = item => ["pending", "deferred"].includes(item.status);
   function newDraft(item) {
     return {version: item.version, handle: item.handle || "", contact: item.contact || null,
+      creator_type: ["cap", "non_cap"].includes(item.creator_type) ? item.creator_type : null,
       dirty: false, revision: 0, request: null, confirmRequest: null, searchOpen: false, handleOpen: false};
   }
   function missingFields(draft) {
     const missing = [];
     if (!draft.handle.trim() || /^[—–-]+$/.test(draft.handle.trim())) missing.push("handle");
     if (!draft.contact?.contact_id) missing.push("对应用户（请从搜索结果中选中）");
+    if (!["cap", "non_cap"].includes(draft.creator_type)) missing.push("达人类型（请选择 CAP 或非 CAP）");
     return missing;
   }
   function draftBody(draft, requestId) {
     return {version: draft.version, handle: draft.handle.trim() || null,
-      contact_id: draft.contact?.contact_id || null, request_id: requestId};
+      contact_id: draft.contact?.contact_id || null, creator_type: draft.creator_type || null, request_id: requestId};
   }
   // A late save updates the revision token, never overwrites edits made during that save.
   function savedDraft(draft, item, sentRevision) {
@@ -37,7 +39,9 @@
   const $ = id => document.getElementById(id);
   const drafts = new Map(), records = new Map(), selected = new Set(), busy = new Set(), locked = new Set();
   let listing = data, page = data.page || 1, loading = 0, aiTimer = null, importPreview = null;
+  let aiLoading = 0, lastAIProgress = null, showAIProgress = false;
   const form = $("cw-filters");
+  form.elements.type_filter.value = data.type_filter || new URLSearchParams(location.search).get("type_filter") || "all";
   const requestId = () => crypto.randomUUID();
   const element = (tag, text = "", className = "") => {
     const node = document.createElement(tag);
@@ -190,8 +194,8 @@
       input.setAttribute("aria-label", `选择 ${draft.handle || "待补 handle 的记录"}，用于批量确认`);
       input.addEventListener("change", () => { input.checked ? selected.add(item.id) : selected.delete(item.id); updateSelected(); }); cell.append(input); row.append(cell);
     }
-    const handleCell = element("td"), sourceCell = element("td"), userCell = element("td"), statusCell = element("td"), actionCell = element("td");
-    row.append(handleCell, sourceCell, userCell, statusCell, actionCell);
+    const handleCell = element("td"), typeCell = element("td", "", "cw-type"), sourceCell = element("td"), userCell = element("td"), statusCell = element("td"), actionCell = element("td");
+    row.append(handleCell, typeCell, sourceCell, userCell, statusCell, actionCell);
     handleCell.append(element("div", draft.handle ? `@${draft.handle.replace(/^@/, "")}` : "—", "cw-handle"), element("span", item.platform || "—", "cw-small"));
     if (editable) {
       const input = element("input", "", "form-control"); input.value = draft.handle; input.maxLength = 80;
@@ -208,6 +212,19 @@
       });
       handleCell.append(open, editor);
     }
+    if (editable) {
+      const select = element("select", "", "form-select");
+      select.setAttribute("aria-label", "达人类型");
+      for (const [value, label] of [["", "—（未确定）"], ["cap", "CAP"], ["non_cap", "非 CAP"]]) {
+        const option = element("option", label); option.value = value; select.append(option);
+      }
+      select.value = draft.creator_type || "";
+      select.addEventListener("change", () => {
+        if (locked.has(item.id)) { select.value = draft.creator_type || ""; return; }
+        draft.creator_type = select.value || null; identityChanged(draft, row);
+      });
+      typeCell.append(select);
+    } else typeCell.append(element("span", {cap: "CAP", non_cap: "非 CAP"}[draft.creator_type] || "—"));
     if (!(item.sources || []).length) sourceCell.append(element("span", "—"));
     for (const source of item.sources || []) sourceCell.append(element("span", source === "excel" ? "Excel" : source === "ai" ? "AI" : source, `cw-pill cw-pill--${source === "excel" ? "excel" : "ai"}`));
     renderUser(userCell, draft, editable);
@@ -347,9 +364,9 @@
   for (const select of form.querySelectorAll("select")) select.addEventListener("change", () => { page = 1; load(); });
   $("cw-prev").addEventListener("click", () => { page = Math.max(1, page - 1); load(); });
   $("cw-next").addEventListener("click", () => { page++; load(); });
-  if (writable || canScan || scope.can_import) {
+  if (scope.responsible_id || writable || canScan || scope.can_import) {
     if (writable) $("cw-confirm-selected").addEventListener("click", async () => {
-      if (!selected.size || !window.confirm(`确认将所选 ${selected.size} 条记录入库？缺 handle、缺用户或存在冲突的记录会保留待确认。`)) return;
+      if (!selected.size || !window.confirm(`确认将所选 ${selected.size} 条记录入库？缺 handle、用户、达人类型或存在冲突的记录会保留待确认。`)) return;
       const ids = [...selected], results = $("cw-batch-results"); results.replaceChildren(); results.hidden = false;
       for (const id of ids) busy.add(id); updateSelected();
       for (const id of ids) {
@@ -362,31 +379,88 @@
     });
     const retryAI = canScan ? button("重试未完成", () => startAI(true), "btn btn-outline-primary") : null;
     if (retryAI) { retryAI.hidden = true; retryAI.id = "cw-ai-retry"; $("cw-ai-scan").after(retryAI); }
+    const initialRetry = $("cw-initial-retry");
+    function showInitial(initial, running) {
+      const panel = $("cw-initial-scan");
+      if (!panel) return;
+      panel.hidden = !initial;
+      if (!initial) return;
+      const labels = {waiting_sync: "等待准备", scanning: "筛选中", succeeded: "已完成", failed: "未完成", cancelled: "已停止"};
+      const messages = {
+        waiting_sync: "等待首次同步与 AI 配置就绪后再开始；不会把没有数据当成没有达人。",
+        scanning: "正在分批检查最近 90 天的已授权会话。会话检查完不等于 AI 已分析完，请以最终状态为准。",
+        succeeded: "首次筛选已完成，请核对名单。无候选不代表不存在达人；未确定的类型仍保留待确认。",
+        failed: "首次筛选尚未完成，已停止自动重试；处理原因后可手动重试。",
+        cancelled: "首次筛选已停止，请先核对授权；旧批次不能重放时，请使用当前范围的手动扫描。",
+      };
+      $("cw-initial-status").textContent = labels[initial.status] || "待核对";
+      $("cw-initial-message").textContent = initial.error_message || messages[initial.status] || "当前状态需核对。";
+      $("cw-initial-message").classList.toggle("cw-error", ["failed", "cancelled"].includes(initial.status));
+      $("cw-initial-counts").textContent = `已检查会话 ${initial.checked_chats ?? 0} / ${initial.total_chats ?? 0} · 累计排队 ${initial.queued_chats ?? 0} 个会话`;
+      $("cw-initial-limit").textContent = `最近 ${initial.history_days ?? 90} 天；每个会话最多 ${initial.message_limit ?? 30} 条消息、每条 ${initial.message_char_limit ?? 1500} 字符。${initial.truncated_chats ? `已有 ${initial.truncated_chats} 个会话截断，结果可能不完整。` : "不是全量聊天分析。"}`;
+      if (initialRetry) { initialRetry.hidden = !["failed", "cancelled"].includes(initial.status); initialRetry.disabled = running; }
+    }
     async function startAI(retryFailed = false) {
       if (!canScan) return;
+      ++aiLoading; clearTimeout(aiTimer); showAIProgress = true;
       const control = $("cw-ai-scan"); control.disabled = true;
       if (retryAI) retryAI.hidden = true;
       try {
         const result = await api("/ai/scan", {body: {request_id: requestId(), retry_failed: retryFailed}});
-        feedback(result.message || "候选分析已提交。AI 结果只进入待确认，不会自动入库。");
+        feedback(result.message || "候选分析已提交。与 CAP 名单准确匹配且资料完整的记录可自动入库，其他记录待确认。");
         pollAI();
       } catch (error) { feedback(error.message, true); control.disabled = false; }
     }
     if (canScan) $("cw-ai-scan").addEventListener("click", () => startAI());
     async function pollAI() {
-      if (!canScan) return;
+      if (!scope.responsible_id) return;
       clearTimeout(aiTimer);
+      const sequence = ++aiLoading;
       try {
         const response = await api("/ai/status");
+        if (sequence !== aiLoading) return;
         const result = response.run;
-        if (!result) { feedback("当前没有正在运行的候选分析。"); $("cw-ai-scan").disabled = false; return; }
-        const terminal = ["completed", "succeeded", "failed", "cancelled", "partial"].includes(result.status);
+        const initial = result?.onboarding;
+        const running = result && ["queued", "running"].includes(result.status);
+        const initialActive = initial && ["waiting_sync", "scanning"].includes(initial.status);
+        showInitial(initial, running);
+        if (canScan) $("cw-ai-scan").disabled = Boolean(running || initialActive);
+        if (!result) { if (showAIProgress) feedback("当前没有正在运行的候选分析。"); if (retryAI) retryAI.hidden = true; return; }
         const errors = (result.errors || []).map(error => typeof error === "string" ? error : error.message || error.error || "部分候选分析失败");
-        feedback([result.message || (terminal ? "本轮候选分析已结束，请核对待确认名单。" : "AI 正在查找候选；结果仍需你确认。"), ...errors].join("；"), errors.length > 0 || ["failed", "partial"].includes(result.status));
-        if (terminal) { $("cw-ai-scan").disabled = false; if (retryAI) retryAI.hidden = !(errors.length || ["failed", "partial"].includes(result.status)); await load(); }
-        else aiTimer = setTimeout(pollAI, 5000);
-      } catch (error) { feedback(`暂时未能读取分析进度：${error.message}`, true); $("cw-ai-scan").disabled = false; }
+        const active = running || initialActive;
+        if (showAIProgress) feedback([result.message || (active ? "AI 正在查找候选并匹配 CAP 名单；不明确的记录保留待确认。" : "本轮候选分析已结束，请核对名单和待确认项。"), ...errors].join("；"), errors.length > 0 || ["failed", "partial"].includes(result.status));
+        if (retryAI) retryAI.hidden = Boolean(initialActive || ["failed", "cancelled"].includes(initial?.status)) || !(errors.length || ["failed", "partial"].includes(result.status));
+        const progress = JSON.stringify([result.id, result.status, result.counts, result.candidate_count, initial]);
+        const changed = lastAIProgress !== null && lastAIProgress !== progress;
+        lastAIProgress = progress;
+        if (changed || (showAIProgress && !active)) await load();
+        if (sequence !== aiLoading) return;
+        if (active) aiTimer = setTimeout(pollAI, 5000);
+        else showAIProgress = false;
+      } catch (error) {
+        if (sequence !== aiLoading) return;
+        const panel = $("cw-initial-scan");
+        if (panel) {
+          panel.hidden = false; $("cw-initial-status").textContent = "进度读取失败";
+          $("cw-initial-message").textContent = `暂时未能读取分析进度：${error.message} 请点击“刷新进度”，不会重新启动分析。`;
+          $("cw-initial-message").classList.add("cw-error");
+        }
+        if (canScan) $("cw-ai-scan").disabled = false;
+      }
     }
+    $("cw-initial-refresh")?.addEventListener("click", pollAI);
+    if (initialRetry) initialRetry.addEventListener("click", async () => {
+      if (!canScan || initialRetry.disabled) return;
+      ++aiLoading; clearTimeout(aiTimer); initialRetry.disabled = true;
+      try {
+        await api("/ai/initial-retry", {body: {request_id: requestId()}});
+        await pollAI();
+      } catch (error) {
+        $("cw-initial-message").textContent = error.message; $("cw-initial-message").classList.add("cw-error");
+        initialRetry.disabled = false;
+      }
+    });
+    if (scope.responsible_id) pollAI();
     if (scope.can_import) {
       const dialog = $("cw-import-dialog"), fileInput = $("cw-import-file"), resultBox = $("cw-import-results");
       $("cw-import-open").addEventListener("click", () => dialog.showModal());
@@ -394,14 +468,14 @@
       fileInput.addEventListener("change", () => { importPreview = null; resultBox.replaceChildren(); $("cw-import-commit").hidden = true; });
       function showImport(result) {
         resultBox.replaceChildren();
-        if (result.summary) resultBox.append(element("p", `共 ${result.summary.total} 行 · 可直接入库 ${result.summary.ready} 行 · 待确认 ${result.summary.pending} 行 · 无效 ${result.summary.invalid} 行`, "cw-note"));
+        if (result.summary) resultBox.append(element("p", `共 ${result.summary.total} 行 · 可提交 ${result.summary.ready + result.summary.pending} 行 · 无效 ${result.summary.invalid} 行；提交时重新核验 AI 匹配，确定是否自动入库。`, "cw-note"));
         else if (result.imported != null) resultBox.append(element("p", `已导入 ${result.imported} 行 · 正式入库 ${result.formal} 行 · 待确认 ${result.pending} 行 · 跳过 ${result.skipped} 行`, "cw-note"));
         const table = element("table", "", "cw-import-table"), head = element("tr"), body = element("tbody");
         for (const text of ["行", "handle", "结果", "说明"]) head.append(element("th", text));
         const thead = element("thead"); thead.append(head); table.append(thead, body);
         for (const row of result.items || result.rows || []) {
           const line = element("tr"), reasons = (row.reasons || []).map(reason => reason.label || reason).join("；");
-          const statusLabels = {ready: "可直接入库", pending: "待确认", invalid: "无效行", confirmed: "已确认入库", skipped: "已跳过", error: "失败"};
+          const statusLabels = {ready: "可提交", pending: result.summary ? "提交后匹配或确认" : "待确认", invalid: "无效行", confirmed: "已确认入库", skipped: "已跳过", error: "失败"};
           for (const value of [[row.sheet, row.row_number || row.row].filter(Boolean).join(" · ") || "—", row.handle || "—", row.status_label || statusLabels[row.status] || row.status || "—", row.message || reasons || "—"]) line.append(element("td", String(value)));
           body.append(line);
         }

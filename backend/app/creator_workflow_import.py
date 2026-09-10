@@ -1,4 +1,4 @@
-"""Bounded Excel preflight and idempotent, per-row intake; original files stay untouched."""
+"""Scoped CAP Excel intake; uploads prove CAP membership, not Lark identity."""
 
 from __future__ import annotations
 
@@ -17,13 +17,13 @@ from .db import connection
 
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_ROWS = 3000
+CAP_POLICY_VERSION = "cap_v1"
 HEADERS = {
     "handle": {"creatorhandle", "handle", "达人handle", "tiktokhandle", "达人账号"},
-    "cm": {"cm", "负责人"},
+    "cm": {"cm", "负责人", "cm/tapcm"},
     "tap_cm": {"tapcm"},
     "open_id": {"larkopenid", "openid", "lark用户id"},
     "contact_id": {"contactid", "联系人id"},
-    "relationship": {"relationship", "用户关系", "本人或代表"},
 }
 
 
@@ -111,6 +111,9 @@ def _aliases(conn):
 
 def resolve_rows(conn, scope, rows):
     aliases = _aliases(conn)
+    responsible = scope.get("responsible_id")
+    if not responsible or aliases.get(responsible) != {responsible}:
+        raise workflow.WorkflowInputError("请先选择当前有效的负责人，再上传 CAP 名单。")
     result = []
     for source in rows:
         reasons = []
@@ -129,29 +132,21 @@ def resolve_rows(conn, scope, rows):
                 matched = aliases.get(token.strip().casefold(), set())
                 ids.update(matched)
                 unknown |= len(matched) != 1
-        responsible = next(iter(ids)) if len(ids) == 1 and not unknown else None
-        if not responsible:
-            reasons.append("ownership_uncertain" if any(cm_values) else "missing_cm")
-        # No guessing another CM for a self-service upload. Preserve as a visible row error.
-        forbidden = bool(not scope["is_owner"] and ids and ids != {scope["actor_id"]})
-        if forbidden:
+        # The selected upload scope owns every row, even for an owner test upload.
+        # Extra CM columns can contradict that scope, never silently redirect it.
+        if any(cm_values) and (unknown or ids != {responsible}):
             result.append(
                 {
                     **source,
                     "handle": handle,
+                    "responsible_id": responsible,
                     "status": "invalid",
-                    "reasons": ["文件中这一行属于其他负责人，未导入。"],
+                    "reasons": ["CM / TAP CM 与当前负责人不一致或无法唯一确定，未导入。"],
                     "cm_name": " / ".join(filter(None, cm_values)),
                 }
             )
             continue
-        contact_id, contact_name, stable_open_id, trusted = None, None, None, False
-        relationship = {
-            "本人": "owner",
-            "owner": "owner",
-            "代表": "representative",
-            "representative": "representative",
-        }.get(source.get("relationship"))
+        contact_id, contact_name, stable_open_id = None, None, None
         stable = source.get("contact_id") or source.get("open_id")
         if responsible and stable and not source.get("formula"):
             try:
@@ -166,12 +161,11 @@ def resolve_rows(conn, scope, rows):
                     contact_id = next(iter(ids_found))
                     contact_name = next(u["display_name"] for u in users if u["contact_id"] == contact_id)
                     stable_open_id = next(u["open_id"] for u in users if u["contact_id"] == contact_id)
-                    trusted = True
             except (ValueError, TypeError):
                 pass
         if not stable and handle and responsible:
             matches = conn.execute(
-                """SELECT link.contact_id,link.relationship,contact.display_name
+                """SELECT link.contact_id,contact.display_name
                 FROM social_accounts account
                 JOIN contact_social_accounts link ON link.social_account_id=account.id
                 JOIN contacts contact ON contact.id=link.contact_id
@@ -182,16 +176,9 @@ def resolve_rows(conn, scope, rows):
             if len(matches) == 1 and workflow.selectable_users(
                 conn, UUID(responsible), contact_id=matches[0]["contact_id"]
             ):
-                contact_id, contact_name, trusted = str(matches[0]["contact_id"]), matches[0]["display_name"], True
-                if relationship and relationship != matches[0]["relationship"]:
-                    reasons.append("identity_uncertain")
-                    trusted = False
-                else:
-                    relationship = matches[0]["relationship"]
+                contact_id, contact_name = str(matches[0]["contact_id"]), matches[0]["display_name"]
         if not contact_id:
             reasons.append("identity_uncertain" if stable else "missing_user")
-        if not relationship:
-            reasons.append("missing_relationship")
         if (
             contact_id
             and conn.execute(
@@ -203,7 +190,7 @@ def resolve_rows(conn, scope, rows):
         ):
             reasons.append("identity_risk")
         if source.get("formula"):
-            handle, contact_id, trusted = None, None, False
+            handle, contact_id, contact_name, stable_open_id = None, None, None, None
             reasons.extend(["handle_uncertain", "identity_uncertain"])
         if handle:
             existing = conn.execute(
@@ -225,11 +212,12 @@ def resolve_rows(conn, scope, rows):
                 "responsible_id": responsible,
                 "contact_id": contact_id,
                 "contact_name": contact_name,
-                "cm_name": " / ".join(filter(None, cm_values)) or None,
+                "cm_name": scope["responsible_name"],
                 "stable_open_id": stable_open_id,
-                "relationship": relationship,
-                "trusted_identity": trusted,
-                "status": "ready" if not reasons else "pending",
+                "creator_type": "cap",
+                "relationship": None,
+                "trusted_identity": False,
+                "status": "pending",
                 "reasons": reasons,
             }
         )
@@ -243,7 +231,10 @@ def preview(scope, content: bytes, filename: str):
         current = workflow._fresh(conn, scope)
         if not current["can_import"]:
             raise PermissionError("当前页面为只读，不能导入。")
-        rows = parse_workbook(content, filename)
+        rows = [
+            {**row, "cap_policy_version": CAP_POLICY_VERSION}
+            for row in parse_workbook(content, filename)
+        ]
         resolved = resolve_rows(conn, current, rows)
         conn.execute(
             """INSERT INTO creator_workflow_import_batches(id,actor_id,responsible_id,filename,file_hash,rows)
@@ -285,6 +276,8 @@ def commit(scope, batch_id: UUID, request_id: UUID):
             return batch["result"]
         if not batch["valid"]:
             raise workflow.WorkflowInputError("导入预检已过期，请重新上传。")
+        if any(row.get("cap_policy_version") != CAP_POLICY_VERSION for row in batch["rows"]):
+            raise workflow.WorkflowInputError("导入规则已更新，请重新上传 CAP 名单。")
         resolved = resolve_rows(conn, current, batch["rows"])
         result = {"imported": 0, "formal": 0, "pending": 0, "skipped": 0, "items": []}
         for row in resolved:
@@ -308,7 +301,11 @@ def commit(scope, batch_id: UUID, request_id: UUID):
                             "tap_cm": row.get("tap_cm"),
                             "original_handle": row.get("original_handle"),
                             "stable_open_id": row.get("stable_open_id"),
+                            "creator_type": "cap",
+                            "type_evidence": "cm_excel_upload",
+                            "cap_policy_version": CAP_POLICY_VERSION,
                         },
+                        creator_type="cap",
                         responsible_id=row.get("responsible_id"),
                         handle=row.get("handle"),
                         contact_id=row.get("contact_id"),

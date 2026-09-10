@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from contextlib import nullcontext
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from .creator_preparation import normalize_handle
@@ -17,6 +19,9 @@ TEST_EDITOR_IDS = frozenset({
     UUID("9d5f4370-6463-4c3a-a2ed-67753a1cabc0"),
     UUID("1225b4a0-fbd8-431e-962e-25e66943a8a0"),
 })
+CAP_POLICY_VERSION = "cap_v1"
+AUTO_CONFIRM_THRESHOLD = 0.95
+_UNSET = object()
 
 
 class WorkflowInputError(ValueError):
@@ -24,6 +29,8 @@ class WorkflowInputError(ValueError):
 
 
 REASON_LABELS = {
+    "missing_creator_type": "请选择 CAP 或非 CAP",
+    "creator_type_conflict": "达人类型与现有记录冲突",
     "missing_handle": "请补充达人 handle",
     "missing_cm": "负责人尚未确定",
     "missing_user": "请选择对应 Lark 用户",
@@ -48,6 +55,8 @@ COMPUTED_REASONS = frozenset(
         "ownership_conflict",
         "identity_conflict",
         "missing_relationship",
+        "missing_creator_type",
+        "creator_type_conflict",
     }
 )
 
@@ -64,10 +73,34 @@ def _uuid(value: Any, *, optional: bool = False) -> UUID | None:
 def _handle(value: Any) -> str | None:
     if value is None or value == "":
         return None
+    if not isinstance(value, str):
+        raise WorkflowInputError("请输入文字格式的 handle。")
+    value = value.strip()
+    if "://" in value:
+        try:
+            parsed = urlsplit(value)
+        except ValueError as exc:
+            raise WorkflowInputError("主页链接格式不正确，请填写 handle 或有效 TikTok 主页链接。") from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or parsed.netloc.lower() not in {"tiktok.com", "www.tiktok.com", "m.tiktok.com"}
+            or not parsed.path.startswith("/@")
+            or "/" in parsed.path[2:].rstrip("/")
+        ):
+            raise WorkflowInputError("请填写 handle 或 TikTok 主页链接，不支持视频、短链或其他网站链接。")
+        value = parsed.path[2:].rstrip("/")
     result = normalize_handle(value)
     if not result or value in {"—", "-"}:
         raise WorkflowInputError("请输入有效 handle；空字段请留空，不要填写横线或用户姓名。")
     return result
+
+
+def _creator_type(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str) or value not in {"cap", "non_cap"}:
+        raise WorkflowInputError("达人类型只能选择 CAP、非 CAP，或留空待确认。")
+    return value
 
 
 def _digest(value: Any) -> str:
@@ -320,7 +353,8 @@ def _conflicts(conn: Any, row: dict, *, manual: bool = False) -> list[str]:
         return []
     owners = conn.execute(
         """
-        SELECT assignment.responsible_authorization_id, assignment.contact_id, assignment.relationship
+        SELECT assignment.responsible_authorization_id, assignment.contact_id, assignment.relationship,
+               assignment.creator_type
         FROM social_accounts account JOIN creator_account_assignments assignment
           ON assignment.social_account_id=account.id AND assignment.ended_at IS NULL
         WHERE account.platform=%s AND account.normalized_handle=%s
@@ -341,6 +375,8 @@ def _conflicts(conn: Any, row: dict, *, manual: bool = False) -> list[str]:
     ).fetchall()
     reasons = []
     for known in owners:
+        if known.get("creator_type") and row.get("creator_type") and known["creator_type"] != row["creator_type"]:
+            reasons.append("creator_type_conflict")
         if (row.get("contact_id") and str(known["contact_id"]) != str(row["contact_id"])) or (
             not manual and known["relationship"] != row["relationship"]
         ):
@@ -366,6 +402,7 @@ def _reasons(conn: Any, row: dict, contact: dict | None) -> list[dict]:
         ("responsible_authorization_id", "missing_cm"),
         ("contact_id", "missing_user"),
         ("relationship", "missing_relationship"),
+        ("creator_type", "missing_creator_type"),
     ):
         if not row.get(field):
             codes.append(reason)
@@ -434,6 +471,7 @@ def _record(
         "contact": contact,
         "contact_id": contact["contact_id"] if contact else None,
         "relationship": row["relationship"],
+        "creator_type": row.get("creator_type"),
         "responsible_id": str(row["responsible_authorization_id"])
         if row["responsible_authorization_id"] and not outside_scope
         else None,
@@ -485,6 +523,7 @@ def list_records(
     query: str = "",
     page: int = 1,
     page_size: int = 50,
+    type_filter: str = "all",
 ) -> dict:
     with connection() as conn:
         scope = _fresh(conn, scope)
@@ -535,12 +574,15 @@ def list_records(
         raise WorkflowInputError("无效的状态筛选。")
     if source and source not in {"excel", "ai"}:
         raise WorkflowInputError("无效的来源筛选。")
+    if type_filter not in {"all", "cap", "non_cap", "unknown"}:
+        raise WorkflowInputError("无效的达人类型筛选。")
     query = query.strip().lstrip("@").casefold()[:100]
     items = [
         r
         for r in items
         if (status == "all" or r["status"] == status or status == "pending" and r["status"] in {"deferred", "rejected"})
         and (not source or source in r["sources"])
+        and (type_filter == "all" or (r["creator_type"] or "unknown") == type_filter)
         and (not reason or any(x["code"] == reason for x in r["reasons"]))
         and (
             not query
@@ -653,10 +695,13 @@ def save_draft(
     handle: str | None,
     contact_id: UUID | None,
     relationship: str | None = None,
+    creator_type: Any = _UNSET,
     resolved_reasons: list[str] | tuple = (),
     request_id: UUID | None = None,
 ) -> dict:
     handle, contact_id = _handle(handle), _uuid(contact_id, optional=True)
+    if creator_type is not _UNSET:
+        creator_type = _creator_type(creator_type)
     if relationship not in {None, "owner", "representative"}:
         raise WorkflowInputError("请选择本人或代表关系。")
     if not isinstance(resolved_reasons, list | tuple) or any(not isinstance(r, str) for r in resolved_reasons):
@@ -668,6 +713,7 @@ def save_draft(
         "handle": handle,
         "contact_id": contact_id,
         "relationship": relationship,
+        "creator_type": "unchanged" if creator_type is _UNSET else creator_type,
         "resolved": sorted(set(resolved_reasons)),
     }
     with connection() as conn, conn.transaction():
@@ -684,13 +730,15 @@ def save_draft(
         row = _candidate(conn, candidate_id, scope, lock=True)
         _version(row, version)
         _editable(row)
+        if creator_type is _UNSET:
+            creator_type = row.get("creator_type")
         if set(resolved_reasons) - set(row["uncertainties"]):
             raise WorkflowInputError("只能解除当前记录中明确列出的待核对项。")
         # Keep source metadata for the same pair, never carry an old role to edits.
         if relationship is None and (handle, contact_id) == (row["normalized_handle"], row["contact_id"]):
             relationship = row["relationship"]
-        changed = (handle, contact_id, relationship) != (
-            row["normalized_handle"], row["contact_id"], row["relationship"]
+        changed = (handle, contact_id, relationship, creator_type) != (
+            row["normalized_handle"], row["contact_id"], row["relationship"], row.get("creator_type")
         )
         # Keep an identity-edit trace for audit; manual confirmation resolves it.
         uncertainties = set(row["uncertainties"]) - set(resolved_reasons)
@@ -716,6 +764,7 @@ def save_draft(
                     and duplicate["contact_id"]
                     and duplicate["contact_id"] != contact_id
                     or relationship and duplicate["relationship"] and duplicate["relationship"] != relationship
+                    or creator_type and duplicate.get("creator_type") and duplicate["creator_type"] != creator_type
                 ):
                     raise WorkflowInputError("这个 handle 已在另一条记录中，请先核对现有记录，不能覆盖或重复入库。")
                 conn.execute(
@@ -729,28 +778,32 @@ def save_draft(
                 )
                 updated = conn.execute(
                     """UPDATE creator_workflow_candidates SET contact_id=COALESCE(%s,contact_id),
-                    relationship=%s,
+                    relationship=%s,creator_type=%s,
                     uncertainties=%s,version=version+1,updated_at=NOW() WHERE id=%s RETURNING *""",
                     (
                         contact_id,
                         duplicate["relationship"] if not contact_id or contact_id == duplicate["contact_id"]
                         else relationship,
+                        creator_type or duplicate.get("creator_type"),
                         sorted(uncertainties | (set(duplicate["uncertainties"]) - set(resolved_reasons))),
                         duplicate["id"],
                     ),
                 ).fetchone()
                 return _finish(conn, scope, updated, request_id, digest, "candidate_merged", row)
         updated = conn.execute(
-            """UPDATE creator_workflow_candidates SET normalized_handle=%s,contact_id=%s,relationship=%s,
+            """UPDATE creator_workflow_candidates SET normalized_handle=%s,contact_id=%s,
+            relationship=%s,creator_type=%s,
             uncertainties=%s,status='pending',version=version+1,updated_at=NOW() WHERE id=%s RETURNING *""",
-            (handle, contact_id, relationship, sorted(uncertainties), row["id"]),
+            (handle, contact_id, relationship, creator_type, sorted(uncertainties), row["id"]),
         ).fetchone()
         return _finish(conn, scope, updated, request_id, digest, "draft_saved", row)
 
 
 def _promote(conn: Any, row: dict, scope: dict, source: str) -> dict:
     if not all(row.get(k) for k in ("normalized_handle", "responsible_authorization_id", "contact_id", "relationship")):
-        raise WorkflowInputError("handle、负责人、对应 Lark 用户及本人/代表关系必须全部补齐后才能入库。")
+        raise WorkflowInputError("handle、负责人和对应 Lark 用户必须全部补齐后才能入库。")
+    if row.get("creator_type") not in {"cap", "non_cap"}:
+        raise WorkflowInputError("请先选择 CAP 或非 CAP，再确认入库。")
     if row["uncertainties"]:
         raise WorkflowInputError("还有未核对清楚的信息，请先保存核对结果。")
     _lock_contact_scope(conn, row["responsible_authorization_id"], row["contact_id"])
@@ -770,7 +823,7 @@ def _promote(conn: Any, row: dict, scope: dict, source: str) -> dict:
             "SELECT * FROM creator_account_assignments WHERE social_account_id=%s AND ended_at IS NULL FOR UPDATE",
             (account["id"],),
         ).fetchall()
-    if _conflicts(conn, row, manual=source == "cm_confirmation"):
+    if _conflicts(conn, row, manual=source in {"cm_confirmation", "excel_ai_verified"}):
         raise WorkflowInputError("现有账号归属或用户关联有冲突，已保留待确认，不会覆盖旧关系。")
     if account:
         current = conn.execute(
@@ -797,7 +850,7 @@ def _promote(conn: Any, row: dict, scope: dict, source: str) -> dict:
             VALUES(%s,%s,%s,%s) RETURNING id""",
             (uuid4(), row["platform"], row["normalized_handle"], "@" + row["normalized_handle"]),
         ).fetchone()
-    elif source == "cm_confirmation":
+    elif source in {"cm_confirmation", "excel_ai_verified"}:
         # Reuse an established relationship without inventing a new owner claim.
         known = conn.execute(
             """SELECT relationship FROM contact_social_accounts
@@ -822,7 +875,7 @@ def _promote(conn: Any, row: dict, scope: dict, source: str) -> dict:
     )
     conn.execute(
         """INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,contact_id,
-        relationship,source,candidate_id,created_by_authorization_id) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+        relationship,source,candidate_id,created_by_authorization_id,creator_type) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT(social_account_id) WHERE ended_at IS NULL DO NOTHING""",
         (
             uuid4(),
@@ -833,6 +886,7 @@ def _promote(conn: Any, row: dict, scope: dict, source: str) -> dict:
             source,
             row["id"],
             scope["actor_id"],
+            row["creator_type"],
         ),
     )
     # Deliberately do not touch contact_roles/contact_assignments: one account is not every account of that person.
@@ -948,6 +1002,93 @@ def _uncertainties(values: Any) -> list[str]:
     return sorted({source_reasons.get(v, v) for v in values if v not in COMPUTED_REASONS or v in source_reasons})
 
 
+def _evidence_revision(conn: Any, refs: list[dict]) -> str:
+    """Do not reuse edited/rebound evidence; ignore randomized encryption refreshes."""
+    values = []
+    for ref in refs:
+        row = conn.execute(
+            """SELECT m.message_update_time,m.sender_open_id,m.parent_id,m.root_id,m.thread_id,m.mentions_json,
+                      i.contact_id,i.tenant_classification,c.name,c.chat_mode,ac.p2p_counterpart_open_id
+            FROM chat_messages m JOIN chats c ON c.chat_id=m.chat_id
+            LEFT JOIN lark_identities i ON i.open_id=m.sender_open_id
+            LEFT JOIN authorization_chats ac ON ac.chat_id=m.chat_id AND ac.authorization_id=%s
+            WHERE m.chat_id=%s AND m.message_id=%s""",
+            (ref["authorization_id"], ref["chat_id"], ref["message_id"]),
+        ).fetchone()
+        values.append([ref, dict(row) if row else None])
+    return _digest(values)
+
+
+def _maybe_auto_confirm(conn: Any, row: dict, scope: dict) -> dict:
+    """Two independent sources must agree; a score or upload alone is never enough."""
+    if (
+        row["status"] != "pending" or row.get("creator_type") != "cap"
+        or not all(row.get(k) for k in ("normalized_handle", "responsible_authorization_id", "contact_id"))
+        or set(row["uncertainties"]) - {"ai_review"}
+        or _conflicts(conn, row, manual=True)
+    ):
+        return row
+    sources = conn.execute(
+        "SELECT source_type,source_data FROM creator_workflow_sources WHERE candidate_id=%s "
+        "ORDER BY created_at DESC,id DESC",
+        (row["id"],),
+    ).fetchall()
+    excel, ai = [], []
+    latest_ai_seen = False
+    for source in sources:
+        data = source["source_data"]
+        if source["source_type"] == "ai":
+            if latest_ai_seen:
+                continue
+            # A newer uncertain result supersedes an older high score, even across runs.
+            latest_ai_seen = True
+        if (
+            data.get("cap_policy_version") != CAP_POLICY_VERSION
+            or data.get("proposed_handle") != row["normalized_handle"]
+            or data.get("proposed_platform") != row["platform"]
+            or data.get("proposed_cm_id") != str(row["responsible_authorization_id"])
+        ):
+            continue
+        if source["source_type"] == "excel":
+            if (
+                data.get("type_evidence") == "cm_excel_upload" and data.get("creator_type") == "cap"
+                and data.get("proposed_contact_id") in {None, str(row["contact_id"])}
+            ):
+                excel.append(data)
+            continue
+        scores = [data.get(k) for k in ("creator_confidence", "identity_confidence", "cm_confidence")]
+        if (
+            data.get("proposed_contact_id") == str(row["contact_id"])
+            and all(type(score) in {int, float} and math.isfinite(score)
+                    and AUTO_CONFIRM_THRESHOLD <= score <= 1 for score in scores)
+            and all(data.get(k) is True for k in
+                    ("exact_handle_evidence", "direct_creator_evidence", "direct_cm_evidence"))
+            and not data.get("unknowns")
+        ):
+            ai.append(data)
+    if not excel or not ai:
+        return row
+    if conn.execute(
+        """SELECT 1 FROM audit_events WHERE action='creator_handle_identity_review_flagged'
+        AND metadata->>'contact_id'=%s AND (metadata->>'handle'=%s OR metadata->>'handle' IS NULL) LIMIT 1""",
+        (str(row["contact_id"]), row["normalized_handle"]),
+    ).fetchone():
+        return row
+    for data in ai:
+        try:
+            refs = validate_evidence(conn, row["responsible_authorization_id"], data.get("evidence"))
+        except (WorkflowInputError, PermissionError):
+            continue
+        if data.get("evidence_revision") != _evidence_revision(conn, refs):
+            continue
+        reviewed = conn.execute(
+            "UPDATE creator_workflow_candidates SET uncertainties='{}',relationship='associated' "
+            "WHERE id=%s RETURNING *", (row["id"],),
+        ).fetchone()
+        return _promote(conn, reviewed, scope, "excel_ai_verified")
+    return row
+
+
 def ingest_source(
     actor_id: UUID,
     *,
@@ -959,12 +1100,13 @@ def ingest_source(
     handle: str | None = None,
     contact_id: UUID | None = None,
     relationship: str | None = None,
+    creator_type: str | None = None,
     uncertainties: list[str] | tuple = (),
     trusted_identity: bool = False,
     request_id: UUID | None = None,
     conn: Any = None,
 ) -> dict:
-    """Trusted server-side ingestion. UI must not pass its own trusted_identity assertion."""
+    """Server-side ingestion. Legacy trusted_identity never bypasses the dual-source gate."""
     if source_type not in {"excel", "ai"} or not isinstance(source_key, str) or not 1 <= len(source_key) <= 500:
         raise WorkflowInputError("来源类型或来源编号不正确。")
     if not isinstance(source_data, dict) or len(json.dumps(source_data, default=str)) > 100_000:
@@ -972,6 +1114,7 @@ def ingest_source(
     if relationship not in {None, "owner", "representative"} or platform not in {"tiktok", "instagram", "youtube"}:
         raise WorkflowInputError("平台或用户关系不正确。")
     handle, contact_id = _handle(handle), _uuid(contact_id, optional=True)
+    creator_type = _creator_type(creator_type)
     responsible_id = _uuid(responsible_id, optional=True)
     actor_id = _uuid(actor_id)
     unknowns = _uncertainties(uncertainties)
@@ -984,6 +1127,8 @@ def ingest_source(
             "proposed_cm_id": str(responsible_id) if responsible_id else None,
             "proposed_contact_id": str(contact_id) if contact_id else None,
             "proposed_relationship": relationship,
+            "proposed_creator_type": creator_type,
+            "proposed_platform": platform,
         }
     )
     envelope = {
@@ -993,11 +1138,14 @@ def ingest_source(
         "contact": contact_id,
         "platform": platform,
         "relationship": relationship,
+        "creator_type": creator_type,
         "uncertainties": unknowns,
     }
     if source_type == "ai":
-        envelope["source_data"] = {"evidence": source_data.get("evidence")}
-        envelope.pop("uncertainties")
+        envelope["source_data"] = {key: source_data.get(key) for key in (
+            "evidence", "cap_policy_version", "creator_confidence", "identity_confidence", "cm_confidence",
+            "exact_handle_evidence", "direct_creator_evidence", "direct_cm_evidence", "unknowns",
+        )}
     fingerprint = _digest(envelope)
     with nullcontext(conn) if conn is not None else connection() as active, active.transaction():
         scope = _scope(active, actor_id, responsible_id or actor_id, lock=True)
@@ -1014,6 +1162,9 @@ def ingest_source(
             source_data["evidence"] = validate_evidence(
                 active, responsible_id or (None if scope["is_owner"] else actor_id), source_data.get("evidence")
             )
+            source_data["evidence_revision"] = _evidence_revision(active, source_data["evidence"])
+            envelope["source_data"]["evidence_revision"] = source_data["evidence_revision"]
+            fingerprint = _digest(envelope)
         if contact_id and responsible_id:
             _lock_contact_scope(active, responsible_id, contact_id)
         elif contact_id:
@@ -1070,6 +1221,7 @@ def ingest_source(
                 and row["contact_id"] != contact_id
                 or relationship
                 and row["relationship"] not in {"associated", relationship}
+                or creator_type and row.get("creator_type") and row["creator_type"] != creator_type
             )
         ):
             # Preserve the formal row and assignment. A changed proposal is a separate
@@ -1082,8 +1234,8 @@ def ingest_source(
         if not row:
             row = active.execute(
                 """INSERT INTO creator_workflow_candidates(id,platform,normalized_handle,responsible_authorization_id,
-                contact_id,relationship,uncertainties) VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
-                (uuid4(), platform, handle, responsible_id, contact_id, relationship, unknowns),
+                contact_id,relationship,creator_type,uncertainties) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+                (uuid4(), platform, handle, responsible_id, contact_id, relationship, creator_type, unknowns),
             ).fetchone()
         elif row["status"] != "confirmed":
             differences = (
@@ -1099,6 +1251,7 @@ def ingest_source(
                 or row["relationship"]
                 and relationship
                 and row["relationship"] != relationship
+                or row.get("creator_type") and creator_type and row["creator_type"] != creator_type
             )
             merged_unknowns = sorted(
                 set(row["uncertainties"]) | set(unknowns) | ({"source_conflict"} if differences else set())
@@ -1111,19 +1264,22 @@ def ingest_source(
             # New material evidence may reopen a denial, but it goes to the administrator, never the next guessed CM.
             row = active.execute(
                 """UPDATE creator_workflow_candidates SET normalized_handle=COALESCE(normalized_handle,%s),
-                contact_id=COALESCE(contact_id,%s),relationship=COALESCE(relationship,%s),uncertainties=%s,status='pending',
+                contact_id=COALESCE(contact_id,%s),relationship=COALESCE(relationship,%s),
+                creator_type=COALESCE(creator_type,%s),uncertainties=%s,
+                status=CASE WHEN status='deferred' THEN 'deferred' ELSE 'pending' END,
                 responsible_authorization_id=CASE WHEN %s OR status='rejected'
                   OR (responsible_authorization_id IS NULL
                     AND uncertainties && ARRAY['source_conflict','ownership_uncertain']) THEN NULL
                   ELSE COALESCE(responsible_authorization_id,%s) END,
                 version=version+1,updated_at=NOW()
                 WHERE id=%s RETURNING *""",
-                (handle, contact_id, relationship, merged_unknowns, different_cm, responsible_id, row["id"]),
+                (handle, contact_id, relationship, creator_type, merged_unknowns,
+                 different_cm, responsible_id, row["id"]),
             ).fetchone()
         active.execute(
             """INSERT INTO creator_workflow_sources(id,candidate_id,source_type,source_key,source_data,fingerprint,
-              submitted_by_authorization_id)
-            VALUES(%s,%s,%s,%s,%s::jsonb,%s,%s)""",
+              submitted_by_authorization_id,created_at)
+            VALUES(%s,%s,%s,%s,%s::jsonb,%s,%s,clock_timestamp())""",
             (
                 uuid4(),
                 row["id"],
@@ -1134,57 +1290,9 @@ def ingest_source(
                 actor_id,
             ),
         )
-        promoted = False
-        has_ai_source = active.execute(
-            "SELECT 1 FROM creator_workflow_sources WHERE candidate_id=%s AND source_type='ai' LIMIT 1", (row["id"],)
-        ).fetchone()
-        if (
-            source_type == "excel"
-            and trusted_identity
-            and row["status"] != "confirmed"
-            and not row["uncertainties"]
-            and not has_ai_source
-        ):
-            stable_id = source_data.get("stable_open_id")
-            mapped = (
-                active.execute(
-                    """SELECT 1 FROM social_accounts account JOIN contact_social_accounts mapping
-                ON mapping.social_account_id=account.id AND mapping.status='confirmed'
-                WHERE account.platform=%s AND account.normalized_handle=%s
-                  AND mapping.contact_id=%s AND mapping.relationship=%s""",
-                    (platform, handle, contact_id, relationship),
-                ).fetchone()
-                if handle and contact_id
-                else None
-            )
-            stable = (
-                active.execute(
-                    "SELECT 1 FROM lark_identities WHERE open_id=%s AND contact_id=%s AND identity_type='user'",
-                    (stable_id, contact_id),
-                ).fetchone()
-                if stable_id and contact_id
-                else None
-            )
-            risky = (
-                active.execute(
-                    """SELECT 1 FROM audit_events WHERE action='creator_handle_identity_review_flagged'
-                AND metadata->>'contact_id'=%s AND (metadata->>'handle'=%s OR metadata->>'handle' IS NULL) LIMIT 1""",
-                    (str(contact_id), handle),
-                ).fetchone()
-                if contact_id
-                else None
-            )
-            if risky:
-                row = active.execute(
-                    "UPDATE creator_workflow_candidates SET uncertainties=array_append(uncertainties,'identity_risk'),"
-                    "version=version+1 WHERE id=%s RETURNING *",
-                    (row["id"],),
-                ).fetchone()
-            elif all((handle, responsible_id, contact_id, relationship, mapped or stable)) and not _conflicts(
-                active, row
-            ):
-                row = _promote(active, row, scope, "excel_verified")
-                promoted = True
+        was_confirmed = row["status"] == "confirmed"
+        row = _maybe_auto_confirm(active, row, scope)
+        promoted = not was_confirmed and row["status"] == "confirmed"
         _audit(
             active,
             actor_id,
@@ -1194,7 +1302,8 @@ def ingest_source(
                 "source_type": source_type,
                 "source_key": source_key,
                 "fingerprint": fingerprint,
-                "excel_direct_confirmed": promoted,
+                "excel_ai_auto_confirmed": promoted,
+                "cap_policy_version": CAP_POLICY_VERSION,
             },
         )
         return _record(active, row, view_scope)

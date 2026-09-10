@@ -26,7 +26,13 @@ def evidence():
             "users": [{"id": "U1", "name": "Alice"}],
             "messages": [
                 {"ref": "M1", "user": "U1", "text": "My creator account is @alice", "speaker": "external_or_unknown"},
-                {"ref": "M2", "user": None, "text": "I am your CM and will manage your campaign", "speaker": "CM1"},
+                {
+                    "ref": "M2",
+                    "user": None,
+                    "text": "I am your CM and will manage your campaign",
+                    "speaker": "CM1",
+                    "reply_to": "M1",
+                },
             ],
         },
         "users": {"U1": {"contact_id": uuid4(), "name": "Alice"}},
@@ -46,7 +52,20 @@ def candidate(**changes):
         "responsible": "CM1",
         "relationship": "owner",
         "creator_refs": ["M1"],
+        "identity_refs": ["M1"],
         "responsibility_refs": ["M2"],
+        "creator_confidence": 0.99,
+        "identity_confidence": 0.99,
+        "cm_confidence": 0.99,
+        "creator_evidence_type": "self_identification",
+        "identity_evidence_type": "self_handle",
+        "cm_evidence_type": "managing_creator",
+        "creator_quote": "My creator account is @alice" if changes.get("creator_refs") != [] else "",
+        "identity_quote": "My creator account is @alice",
+        "cm_quote": "I am your CM and will manage your campaign" if changes.get("responsibility_refs") != [] else "",
+        "creator_type": None,
+        "type_refs": [],
+        "type_quote": "",
         "reason": "本人说明账号，CM 明确承接合作。",
         "unknowns": [],
         "alternative_handles": [],
@@ -139,6 +158,73 @@ def test_rich_text_keeps_product_handle_links_but_redacts_access_tokens():
     assert "private" not in text and "unneeded-media-secret" not in text
 
 
+def test_cap_direct_evidence_is_independent_and_does_not_infer_signed_type():
+    facts = ai._verified_facts(candidate(), evidence())
+    assert facts["cap_policy_version"] == "cap_v1"
+    assert facts["exact_handle_evidence"] and facts["direct_creator_evidence"] and facts["direct_cm_evidence"]
+    assert facts["creator_type"] is None
+    assert (
+        ai._verified_facts(
+            candidate(creator_type="cap", type_refs=["M1"], type_quote="My creator account is @alice"), evidence()
+        )["creator_type"]
+        is None
+    )
+    assert ai._verified_facts(candidate(relationship="unknown"), evidence()) == facts
+    weak = evidence()
+    weak["pack"]["messages"][1].pop("reply_to")
+    assert not ai._verified_facts(candidate(), weak)["direct_cm_evidence"]
+    weak["pack"]["messages"][1]["mentions"] = ["U1"]
+    assert ai._verified_facts(candidate(), weak)["direct_cm_evidence"]
+    weak["pack"]["messages"][1]["mentions"] = ["other"]
+    assert not ai._verified_facts(candidate(), weak)["direct_cm_evidence"]
+
+
+def test_group_title_fuzzy_handle_and_other_speakers_never_prove_account_identity():
+    pack = evidence()
+    assert not ai._verified_facts(candidate(handle="@ali"), pack)["exact_handle_evidence"]
+    assert not ai._exact_handle("@alice_shop", "alice")
+    assert not ai._exact_handle("xalice", "alice")
+    assert not ai._exact_handle("@alice-shop", "alice")
+    pack["pack"]["messages"][0]["user"] = "other"
+    facts = ai._verified_facts(candidate(), pack)
+    assert not facts["exact_handle_evidence"] and not facts["direct_creator_evidence"]
+    assert not facts["direct_cm_evidence"]
+
+
+def test_cm_group_handle_statement_cannot_prove_arbitrary_selected_creator_user():
+    pack = evidence()
+    pack["pack"]["messages"][0].update(user=None, speaker="CM1", mentions=["U1"])
+    facts = ai._verified_facts(candidate(), pack)
+    assert not facts["exact_handle_evidence"] and not facts["direct_creator_evidence"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"creator_confidence": True},
+        {"identity_confidence": float("nan")},
+        {"cm_confidence": 1.1},
+        {"identity_quote": "made up claim"},
+        {"identity_refs": ["missing"]},
+    ],
+)
+def test_confidence_and_ephemeral_direct_quotes_are_validated(change):
+    with pytest.raises(ai.InvalidModelOutput):
+        ai._validate(json.dumps({"candidates": [candidate(**change)]}), evidence())
+
+
+def test_plain_text_mentions_resolve_only_metadata_and_remove_link_secrets():
+    cipher = SimpleNamespace(
+        decrypt=lambda _: json.dumps({"text": "Hi @_user_1 https://tiktok.com/@alice?token=private"})
+    )
+    row = {
+        "message_type": "text",
+        "body_ciphertext": "cipher",
+        "mentions_json": [{"key": "@_user_1", "id_type": "open_id", "id": "ou_cm", "name": "old"}],
+    }
+    assert ai._body(cipher, row, {"ou_cm": "Remi"}) == "Hi @Remi https://tiktok.com/@alice?token=[redacted]"
+
+
 class Result:
     def __init__(self, row=None, rows=()):
         self.row, self.rows = row, list(rows)
@@ -218,6 +304,30 @@ def test_runner_only_ingests_pending_source_with_independent_feature(run_harness
     writes = " ".join(q for q, _ in h.calls)
     assert "UPDATE contact_roles" not in writes and "INSERT INTO contact_assignments" not in writes
     assert "SET status = 'succeeded'" in writes
+
+
+def test_source_metadata_never_persists_quotes_or_model_private_prose(monkeypatch, run_harness):
+    h = run_harness
+    monkeypatch.setattr(
+        ai.contact_assessments,
+        "call_openai",
+        lambda *_a, **_k: {
+            "text": json.dumps(
+                {
+                    "candidates": [
+                        candidate(reason="private customer details", unknowns=["private quote in doubt"]),
+                    ]
+                }
+            )
+        },
+    )
+    ai.run_claimed_creator_scan(h.job, h.settings)
+    source = h.ingested[0][1]["source_data"]
+    stored = json.dumps(source)
+    assert "private customer" not in stored and "private quote" not in stored
+    assert "My creator account" not in stored
+    assert source["creator_confidence"] == 0.99 and source["cap_policy_version"] == "cap_v1"
+    assert "ai_review" not in source["unknowns"]
 
 
 def test_refusal_invalid_output_does_not_become_success_or_candidate(monkeypatch, run_harness):
@@ -309,6 +419,45 @@ def test_queue_rejects_unbounded_scan_arguments_without_reading_database():
             ai.queue_scan(uuid4(), uuid4(), **args)
 
 
+@pytest.mark.parametrize("excel_first", [True, False])
+def test_verified_ai_and_cm_cap_excel_auto_confirm_in_either_order(pg, real_scan, monkeypatch, excel_first):
+    ids, settings = real_scan
+
+    def upload():
+        return ai.creator_workflow.ingest_source(
+            ids["cm"],
+            source_type="excel",
+            source_key="my-cap-row",
+            source_data={"cap_policy_version": "cap_v1", "creator_type": "cap", "type_evidence": "cm_excel_upload"},
+            responsible_id=ids["cm"],
+            handle="alice",
+            creator_type="cap",
+            conn=pg,
+        )
+
+    if excel_first:
+        assert upload()["status"] == "pending"
+    monkeypatch.setattr(
+        ai.contact_assessments,
+        "call_openai",
+        lambda *_a, **_k: {"text": json.dumps({"candidates": [candidate(relationship="unknown")]})},
+    )
+    ai.queue_scan(ids["cm"], ids["cm"])
+    ai.run_claimed_creator_scan(ai.claim_next_creator_scan(), settings)
+    if not excel_first:
+        assert pg.execute("SELECT status,creator_type FROM creator_workflow_candidates").fetchone() == {
+            "status": "pending",
+            "creator_type": None,
+        }
+        upload()
+    row = pg.execute(
+        "SELECT status,creator_type,relationship,uncertainties FROM creator_workflow_candidates"
+    ).fetchone()
+    assert row == {"status": "confirmed", "creator_type": "cap", "relationship": "associated", "uncertainties": []}
+    assignment = pg.execute("SELECT * FROM creator_account_assignments").fetchone()
+    assert assignment["responsible_authorization_id"] == ids["cm"] and assignment["creator_type"] == "cap"
+
+
 def test_authorization_does_not_equate_readonly_review_with_permission_to_scan(monkeypatch):
     actor, cm = uuid4(), uuid4()
     rows = [
@@ -355,10 +504,13 @@ def test_blank_feature_key_can_be_enabled_on_real_postgres(pg):
     from app.ai_feature_config import api_key_cipher, save_feature_config
 
     owner = uuid4()
-    pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,%s,'test')",
-               (owner, "ou_" + owner.hex))
-    values = dict(provider="openai", project_id="proj_test", model="configured-model",
-                  updated_by_authorization_id=owner)
+    pg.execute(
+        "INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,%s,'test')",
+        (owner, "ou_" + owner.hex),
+    )
+    values = dict(
+        provider="openai", project_id="proj_test", model="configured-model", updated_by_authorization_id=owner
+    )
     cipher = api_key_cipher(b"k" * 32)
     save_feature_config(pg, cipher, "offhours_summary", **values, enabled=False, api_key="sk-test-only-1234")
     key_columns = "api_key_ciphertext,key_updated_at,key_updated_by_authorization_id"
@@ -386,8 +538,7 @@ def pg(monkeypatch):
         conn.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(psycopg.sql.Identifier(schema)))
         conn.execute(psycopg.sql.SQL("SET LOCAL search_path TO {}").format(psycopg.sql.Identifier(schema)))
         for path in sorted((Path(__file__).parents[1] / "migrations").glob("*.sql")):
-            if int(path.name[:3]) <= 29 or int(path.name[:3]) in (31, 32):
-                conn.execute(path.read_text())
+            conn.execute(path.read_text())
         monkeypatch.setattr(ai, "connection", lambda: nullcontext(conn))
         monkeypatch.setattr(ai.creator_workflow, "connection", lambda: nullcontext(conn))
         try:
@@ -425,13 +576,14 @@ def real_scan(pg):
         pg.execute(
             """INSERT INTO chat_messages
                       (chat_id,message_id,sender_open_id,message_type,body_ciphertext,message_create_time)
-                      VALUES('chat',%s,%s,'text',%s,NOW()+%s*INTERVAL '1 second')""",
+                      VALUES('chat',%s,%s,'text',%s,NOW()-INTERVAL '1 minute'+%s*INTERVAL '1 second')""",
             (str(number), "ou_" + name, cipher.encrypt(json.dumps({"text": text})), number),
         )
         pg.execute(
             "INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) VALUES(%s,'chat',%s)",
             (ids["cm"], str(number)),
         )
+    pg.execute("UPDATE chat_messages SET parent_id='1' WHERE message_id='2'")
     key = ai.api_key_cipher(settings.token_encryption_key).encrypt("test-key-not-real")
     for feature in ("creator_workflow", "contact_assessment", "contact_assignment"):
         pg.execute(
@@ -511,7 +663,7 @@ def test_real_revoke_between_queue_and_execution_cancels_without_model(pg, real_
     assert pg.execute("SELECT COUNT(*) AS n FROM creator_workflow_sources").fetchone()["n"] == 0
 
 
-def test_real_unknown_cm_goes_to_admin_without_identity_grant(pg, real_scan, monkeypatch):
+def test_real_unknown_responsibility_stays_in_scanned_cm_review_inbox_without_assignment(pg, real_scan, monkeypatch):
     ids, settings = real_scan
     output = candidate(responsible=None, responsibility_refs=[], unknowns=["负责人不明"])
     monkeypatch.setattr(
@@ -520,8 +672,11 @@ def test_real_unknown_cm_goes_to_admin_without_identity_grant(pg, real_scan, mon
     ai.queue_scan(ids["owner"], ids["cm"])
     ai.run_claimed_creator_scan(ai.claim_next_creator_scan(), settings)
     row = pg.execute("SELECT * FROM creator_workflow_candidates").fetchone()
-    assert row and row["status"] == "pending" and row["responsible_authorization_id"] is None
-    assert row["contact_id"] is None
+    assert row and row["status"] == "pending" and row["responsible_authorization_id"] == ids["cm"]
+    assert row["contact_id"] == ids["person"] and "ownership_uncertain" in row["uncertainties"]
+    source = pg.execute("SELECT source_data FROM creator_workflow_sources").fetchone()["source_data"]
+    assert not source["responsibility_confirmed"] and not source["direct_cm_evidence"]
+    assert not pg.execute("SELECT 1 FROM creator_account_assignments").fetchone()
 
 
 def test_real_failed_output_is_retryable_only_by_explicit_request(pg, real_scan, monkeypatch):

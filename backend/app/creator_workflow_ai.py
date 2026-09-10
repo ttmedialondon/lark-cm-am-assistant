@@ -1,7 +1,7 @@
-"""Bounded, CM-scoped AI discovery; every result is an unconfirmed candidate.
+"""Bounded, CM-scoped AI discovery; AI alone is never automatic confirmation.
 
-No role, assignment, social account or authorization writes live in this module.
-The shared workflow alone owns source ingestion and eventual human confirmation.
+The shared workflow owns candidate ingestion, dual-source CAP auto-confirmation
+and manual confirmation. Legacy person-wide roles/assignments remain untouched.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
@@ -22,9 +23,11 @@ from .ai_feature_config import api_key_cipher
 from .config import Settings
 from .crypto import message_body_cipher
 from .db import connection
+from .message_mentions import mention_names, mention_targets, resolve_mentions, rich_mention_text
 
 FEATURE = "creator_workflow"
-POLICY_VERSION = "creator-workflow-v1"
+POLICY_VERSION = "creator-workflow-cap-v1"
+CAP_POLICY_VERSION = "cap_v1"
 MAX_MESSAGES = 30
 MAX_BODY_CHARS = 1500
 MAX_CANDIDATES = 8
@@ -72,7 +75,7 @@ def _enabled(conn) -> bool:
 
 _MESSAGES_SQL = """
     SELECT m.chat_id, m.message_id, m.message_type, m.message_create_time,
-           m.message_update_time, m.sender_open_id, m.body_ciphertext,
+           m.message_update_time, m.sender_open_id, m.body_ciphertext, m.mentions_json,
            m.parent_id AS parent_message_id, m.root_id AS root_message_id, m.thread_id,
            i.contact_id, i.display_name AS sender_name, i.tenant_classification,
            o.first_observed_at
@@ -80,15 +83,17 @@ _MESSAGES_SQL = """
     JOIN authorizations a ON a.id = o.authorization_id
     JOIN authorization_chats ac ON ac.authorization_id = a.id AND ac.chat_id = o.chat_id
     JOIN chat_messages m ON m.chat_id = o.chat_id AND m.message_id = o.message_id
+    JOIN chats c ON c.chat_id = m.chat_id
     LEFT JOIN lark_identities i ON i.open_id = m.sender_open_id
     WHERE a.id = %s AND o.chat_id = %s AND a.status = 'active'
       AND a.body_consent_at IS NOT NULL AND o.observed_at >= a.body_consent_at
       AND ac.is_visible AND ac.sync_enabled AND NOT m.is_deleted
+      AND COALESCE(c.chat_status,'normal') = 'normal'
       AND m.body_ciphertext IS NOT NULL
       AND COALESCE(m.message_create_time, o.first_observed_at) >= %s
-      AND o.first_observed_at <= %s
+      AND COALESCE(m.message_create_time, o.first_observed_at) < %s
     ORDER BY COALESCE(m.message_create_time, o.first_observed_at) DESC, m.message_id DESC
-    LIMIT %s
+    LIMIT %s FOR SHARE OF m,o
 """
 
 
@@ -107,6 +112,9 @@ def _fingerprint(chat: Mapping[str, Any], rows: list[Mapping[str, Any]]) -> str:
                 r.get("sender_open_id"),
                 str(r.get("contact_id")),
                 r.get("sender_name"),
+                r.get("tenant_classification"),
+                r.get("mentions_json"),
+                r.get("parent_message_id"),
             ]
             for r in rows
         ],
@@ -149,6 +157,7 @@ def queue_scan(
                LEFT JOIN creator_workflow_ai_chat_checks checked ON checked.chat_id = ac.chat_id
                  AND checked.responsible_authorization_id = ac.authorization_id
                WHERE ac.authorization_id = %s AND ac.is_visible AND ac.sync_enabled
+                 AND COALESCE(c.chat_status,'normal') = 'normal'
                ORDER BY checked.checked_at NULLS FIRST, ac.chat_id LIMIT 300""",
             (responsible_id,),
         ).fetchall()
@@ -203,17 +212,104 @@ def queue_scan(
         return dict(row)
 
 
+def queue_initial_batch(conn, onboarding):
+    """One keyset page of the frozen first scan; never silently stop at 25 chats."""
+    cm_id = onboarding["authorization_id"]
+    _authorize(conn, cm_id, cm_id)
+    if not _enabled(conn):
+        return None
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"creator-scan:{cm_id}",))
+    if conn.execute(
+        """SELECT 1 FROM creator_workflow_ai_runs WHERE responsible_authorization_id=%s
+           AND status IN ('queued','running')""",
+        (cm_id,),
+    ).fetchone():
+        return None
+    chats = conn.execute(
+        """SELECT c.chat_id,c.name,c.chat_mode AS chat_type
+           FROM authorization_chats ac JOIN chats c USING(chat_id)
+           WHERE ac.authorization_id=%s AND ac.is_visible AND ac.sync_enabled
+             AND COALESCE(c.chat_status,'normal')='normal' AND ac.discovered_at<=%s
+             AND (%s::text IS NULL OR c.chat_id>%s)
+           ORDER BY c.chat_id LIMIT 100""",
+        (cm_id, onboarding["window_end"], onboarding["last_chat_id"], onboarding["last_chat_id"]),
+    ).fetchall()
+    if not chats:
+        return {"checked": 0}
+    tasks, truncated = [], 0
+    for chat in chats:
+        rows = conn.execute(
+            _MESSAGES_SQL,
+            (cm_id, chat["chat_id"], onboarding["window_start"], onboarding["window_end"], MAX_MESSAGES + 1),
+        ).fetchall()
+        if not rows:
+            continue
+        truncated += len(rows) > MAX_MESSAGES
+        fingerprint = _fingerprint(chat, rows[:MAX_MESSAGES])
+        if not conn.execute(
+            """SELECT 1 FROM creator_workflow_ai_tasks t JOIN creator_workflow_ai_runs r ON r.id=t.run_id
+               WHERE r.responsible_authorization_id=%s AND t.chat_id=%s AND t.input_fingerprint=%s
+                 AND t.status='succeeded' LIMIT 1""",
+            (cm_id, chat["chat_id"], fingerprint),
+        ).fetchone():
+            tasks.append((chat["chat_id"], fingerprint))
+    run_id = uuid4()
+    conn.execute(
+        """INSERT INTO creator_workflow_ai_runs
+           (id,responsible_authorization_id,requested_by_authorization_id,status,history_days,chat_limit,
+            window_start,window_end,total_chats,finished_at,onboarding_authorization_id)
+           VALUES(%s,%s,%s,%s,90,100,%s,%s,%s,CASE WHEN %s THEN NOW() ELSE NULL END,%s)""",
+        (
+            run_id,
+            cm_id,
+            cm_id,
+            "queued" if tasks else "succeeded",
+            onboarding["window_start"],
+            onboarding["window_end"],
+            len(tasks),
+            not tasks,
+            cm_id,
+        ),
+    )
+    for chat_id, fingerprint in tasks:
+        conn.execute(
+            """INSERT INTO creator_workflow_ai_tasks(id,run_id,chat_id,input_fingerprint)
+               VALUES(%s,%s,%s,%s)""",
+            (uuid4(), run_id, chat_id, fingerprint),
+        )
+    return {
+        "run_id": run_id,
+        "last_chat_id": chats[-1]["chat_id"],
+        "checked": len(chats),
+        "queued": len(tasks),
+        "truncated": truncated,
+    }
+
+
 def scan_status(actor_id, responsible_id) -> dict | None:
+    from .creator_onboarding import get_status
+
     actor_id, responsible_id = UUID(str(actor_id)), UUID(str(responsible_id))
     with connection() as conn:
         creator_workflow._scope(conn, actor_id, responsible_id)
+        onboarding = get_status(conn, responsible_id)
         run = conn.execute(
             """SELECT * FROM creator_workflow_ai_runs WHERE responsible_authorization_id = %s
                ORDER BY created_at DESC LIMIT 1""",
             (responsible_id,),
         ).fetchone()
         if not run:
-            return None
+            return (
+                {
+                    "status": onboarding["status"],
+                    "counts": {},
+                    "candidate_count": 0,
+                    "errors": [],
+                    "onboarding": onboarding,
+                }
+                if onboarding
+                else None
+            )
         counts = conn.execute(
             """SELECT status, COUNT(*) AS count, SUM(candidate_count) AS candidate_count
                FROM creator_workflow_ai_tasks WHERE run_id = %s GROUP BY status""",
@@ -233,6 +329,7 @@ def scan_status(actor_id, responsible_id) -> dict | None:
         "counts": {r["status"]: r["count"] for r in counts},
         "candidate_count": sum(r["candidate_count"] or 0 for r in counts),
         "errors": [r["error_message"] for r in errors],
+        "onboarding": onboarding,
     }
 
 
@@ -309,51 +406,72 @@ def claim_next_creator_scan() -> dict | None:
     return {**dict(row), "attempts": row["attempts"] + 1}
 
 
-def _body(cipher, row) -> str:
+def _body(cipher, row, names=None, *, clip=True) -> str:
     raw = cipher.decrypt(row["body_ciphertext"])
     if row["message_type"] == "text":
-        return contact_assessments._readable_body(raw, "text")[:MAX_BODY_CHARS]
+        text = contact_assessments._readable_body(raw, "text")
+
     # Preserve links/handles in rich text, but omit attachment tokens and unrelated
     # payload metadata. Never fetch a URL or execute instructions in chat content.
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        return raw[:MAX_BODY_CHARS]
-
     def fragments(value):
         if isinstance(value, dict):
+            if value.get("tag") == "at":
+                yield rich_mention_text(value.get("user_id"), row.get("mentions_json"), names)
+                return
             for key, item in value.items():
                 if key in {"text", "href", "url", "title"} and isinstance(item, str):
-                    yield re.sub(
-                        r"([?&](?:token|access_token|key|signature)=)[^&\s]+", r"\1[redacted]", item, flags=re.I
-                    )
+                    yield item
                 elif isinstance(item, dict | list):
                     yield from fragments(item)
         elif isinstance(value, list):
             for item in value:
                 yield from fragments(item)
 
-    return " ".join(fragments(data))[:MAX_BODY_CHARS]
+    if row["message_type"] != "text":
+        try:
+            text = " ".join(fragments(json.loads(raw)))
+        except ValueError:
+            text = raw
+    text = resolve_mentions(text, row.get("mentions_json"), names)
+    text = re.sub(r"([?&](?:token|access_token|key|signature)=)[^&\s]+", r"\1[redacted]", text, flags=re.I)
+    return text[:MAX_BODY_CHARS] if clip else text
 
 
 def _load_evidence(conn, job, settings) -> dict:
     cm_id = job["responsible_authorization_id"]
+    # Short read/final-commit transactions only; callers close these before HTTP.
+    # Lock scope before reading, then lock message rows as they are returned.
+    conn.execute("SELECT id FROM authorizations WHERE id=%s FOR SHARE", (cm_id,)).fetchall()
     _authorize(conn, job["requested_by_authorization_id"], cm_id)
     chat = conn.execute(
-        """SELECT c.chat_id, c.name, c.chat_mode AS chat_type, a.display_name AS cm_name, a.open_id AS cm_open_id
+        """SELECT c.chat_id, c.name, c.chat_mode AS chat_type, a.display_name AS cm_name, a.open_id AS cm_open_id,
+                  ac.p2p_counterpart_open_id,ac.backfill_complete
            FROM authorization_chats ac JOIN chats c USING (chat_id)
            JOIN authorizations a ON a.id = ac.authorization_id
-           WHERE ac.authorization_id = %s AND ac.chat_id = %s AND ac.is_visible AND ac.sync_enabled""",
+           WHERE ac.authorization_id = %s AND ac.chat_id = %s AND ac.is_visible AND ac.sync_enabled
+             AND COALESCE(c.chat_status,'normal')='normal' FOR SHARE OF ac,c""",
         (cm_id, job["chat_id"]),
     ).fetchone()
     if not chat:
         raise ScanInputError("会话已不在当前 CM 的授权范围。")
     rows = conn.execute(
-        _MESSAGES_SQL, (cm_id, job["chat_id"], job["window_start"], job["window_end"], MAX_MESSAGES)
+        _MESSAGES_SQL, (cm_id, job["chat_id"], job["window_start"], job["window_end"], MAX_MESSAGES + 1)
     ).fetchall()
+    conn.execute(
+        "SELECT open_id FROM lark_identities WHERE open_id=ANY(%s::text[]) ORDER BY open_id FOR SHARE",
+        (sorted({r["sender_open_id"] for r in rows if r["sender_open_id"]}),),
+    ).fetchall()
+    # A profile/contact binding may have changed immediately before its lock.
+    # Re-read the joined identity values while those rows are now stable.
+    rows = conn.execute(
+        _MESSAGES_SQL, (cm_id, job["chat_id"], job["window_start"], job["window_end"], MAX_MESSAGES + 1)
+    ).fetchall()
+    truncated = len(rows) > MAX_MESSAGES
+    rows = rows[:MAX_MESSAGES]
     if not rows or _fingerprint(chat, rows) != job["input_fingerprint"]:
         raise ScanInputError("消息或用户线索已变化，本轮结果取消，等待增量重新核对。")
     cipher = message_body_cipher(settings.token_encryption_key)
+    names = mention_names(conn, rows)
     users, messages, refs = {}, [], []
     for row in reversed(rows):
         contact_id = row.get("contact_id")
@@ -366,8 +484,14 @@ def _load_evidence(conn, job, settings) -> dict:
                 label = next((k for k, v in users.items() if str(v["contact_id"]) == str(contact_id)), None)
                 if label is None:
                     label = f"U{len(users) + 1}"
-                    users[label] = {"contact_id": contact_id, "name": row.get("sender_name")}
-        text = _body(cipher, row)
+                    users[label] = {
+                        "contact_id": contact_id,
+                        "name": row.get("sender_name"),
+                        "open_id": row.get("sender_open_id"),
+                    }
+        text = _body(cipher, row, names, clip=False)
+        truncated = truncated or len(text) > MAX_BODY_CHARS
+        text = text[:MAX_BODY_CHARS]
         if not text.strip():
             continue
         ref_label = f"M{len(messages) + 1}"
@@ -386,6 +510,7 @@ def _load_evidence(conn, job, settings) -> dict:
                 "text": text,
                 "time": str(row["message_create_time"]),
                 "parent_message_id": row.get("parent_message_id"),
+                "message_id": row["message_id"],
             }
         )
         refs.append(
@@ -396,6 +521,18 @@ def _load_evidence(conn, job, settings) -> dict:
                 "message_id": row["message_id"],
             }
         )
+    by_id = {m["message_id"]: m for m in messages}
+    by_open_id = {user["open_id"]: label for label, user in users.items()}
+    rows_by_id = {r["message_id"]: r for r in rows}
+    for message in messages:
+        row = rows_by_id[message.pop("message_id")]
+        parent = by_id.get(message.pop("parent_message_id"))
+        message["reply_to"] = parent["ref"] if parent else None
+        message["mentions"] = [
+            "CM1" if target["open_id"] == chat["cm_open_id"] else by_open_id.get(target["open_id"], "other")
+            for target in mention_targets(row.get("mentions_json"))
+            if target["open_id"]
+        ]
     if not messages:
         raise ScanInputError("没有可用于识别的授权消息正文。")
     creator_workflow.validate_evidence(conn, cm_id, refs)
@@ -406,6 +543,9 @@ def _load_evidence(conn, job, settings) -> dict:
             "chat_type": chat["chat_type"],
             "users": [{"id": key, "name": value["name"]} for key, value in users.items()],
             "messages": messages,
+            "input_truncated": truncated,
+            "history_synced": bool(chat["backfill_complete"]),
+            "private_user": by_open_id.get(chat["p2p_counterpart_open_id"]),
         },
         "users": users,
         "refs": refs,
@@ -433,11 +573,31 @@ do not discard a genuine creator candidate merely for a missing field. Preserve
 handle spelling exactly as seen (including similar spelling); never invent, translate,
 merge or silently correct handles. Cite message references for handles, or select
 chat_name when the exact handle occurs only in that title. List alternate handle
-spellings only when visible verbatim in evidence. Do not output a confidence score.
+spellings only when visible verbatim in evidence.
+Score creator_confidence (this is a creator), identity_confidence (this precise
+Lark user is associated with this precise handle), and cm_confidence (CM1 manages
+this creator) independently from 0 to 1. Scores >=0.95 need direct, specific
+evidence, not name similarity, chat titles, shared membership, or generic greetings.
+Provide creator_quote, identity_quote and cm_quote as short exact contiguous spans
+in the corresponding cited messages, only for this call's verification. Use empty
+quotes and evidence_type=unknown when no direct evidence exists. Identity evidence
+needs this user's exact handle in their own message. A CM's statement alone can
+support a review candidate but cannot prove which group user owns the handle.
+Creator direct proof likewise requires this user's own business message. For CM evidence,
+reply_to, mentions and private_user contain server-verified aliases; a generic
+group message is not proof of responsibility for every member. Do not confuse a
+brand/product link with ownership of a creator profile.
+creator_type is cap only for explicit signed/CAP proof, non_cap only for explicit
+non-CAP proof, otherwise null. Cite type_refs and type_quote for a known type.
+Unknown creator_type alone is NOT an unknown/ambiguity: Excel can establish CAP.
+Unknown owner-versus-representative relationship alone is NOT an ambiguity in
+the account association. unknowns should only contain actual handle/user/CM gaps.
+input_truncated/history_synced describe evidence coverage; never claim full history.
 Reason should be one short Chinese explanation of the evidence type, not quotations,
 message summaries, private contact details or sensitive personal information.
 Unknowns are short Chinese descriptions of missing information or ambiguity.
-Every result is a suggestion and requires human CM confirmation, regardless of strength.
+AI-only results are always suggestions. A separate server policy may combine verified
+AI evidence with the CM's CAP Excel; you cannot confirm or modify any account yourself.
 """
 
 
@@ -452,7 +612,23 @@ def _format(evidence) -> dict:
         "responsible": {"type": ["string", "null"], "enum": ["CM1", None]},
         "relationship": {"type": "string", "enum": ["owner", "representative", "unknown"]},
         "creator_refs": reference_list,
+        "identity_refs": reference_list,
         "responsibility_refs": reference_list,
+        "creator_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "identity_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "cm_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "creator_evidence_type": {
+            "type": "string",
+            "enum": ["self_identification", "content_ownership", "collaboration", "unknown"],
+        },
+        "identity_evidence_type": {"type": "string", "enum": ["self_handle", "reply_or_mention", "unknown"]},
+        "cm_evidence_type": {"type": "string", "enum": ["managing_creator", "handoff", "unknown"]},
+        "creator_quote": {"type": "string", "maxLength": 300},
+        "identity_quote": {"type": "string", "maxLength": 300},
+        "cm_quote": {"type": "string", "maxLength": 300},
+        "creator_type": {"type": ["string", "null"], "enum": ["cap", "non_cap", None]},
+        "type_refs": reference_list,
+        "type_quote": {"type": "string", "maxLength": 300},
         "reason": {"type": "string", "maxLength": 600},
         "unknowns": {"type": "array", "items": {"type": "string", "maxLength": 160}, "maxItems": 10},
         "alternative_handles": {"type": "array", "items": {"type": "string", "maxLength": 320}, "maxItems": 5},
@@ -498,7 +674,7 @@ def _validate(raw, evidence) -> list[dict]:
             raise InvalidModelOutput("candidate shape")
         if item["user"] not in {*evidence["users"], None} or item["responsible"] not in {"CM1", None}:
             raise InvalidModelOutput("unknown identity")
-        for name in ("creator_refs", "responsibility_refs", "handle_refs"):
+        for name in ("creator_refs", "identity_refs", "responsibility_refs", "handle_refs", "type_refs"):
             if (
                 not isinstance(item[name], list)
                 or len(item[name]) > MAX_MESSAGES
@@ -509,6 +685,25 @@ def _validate(raw, evidence) -> list[dict]:
             raise InvalidModelOutput("unsupported attribution")
         if item["relationship"] not in {"owner", "representative", "unknown"}:
             raise InvalidModelOutput("relationship")
+        properties = _format(evidence)["schema"]["properties"]["candidates"]["items"]["properties"]
+        for field in ("creator_confidence", "identity_confidence", "cm_confidence"):
+            value = item[field]
+            if type(value) not in {int, float} or not math.isfinite(value) or not 0 <= value <= 1:
+                raise InvalidModelOutput("confidence")
+        for field in ("creator_type", "creator_evidence_type", "identity_evidence_type", "cm_evidence_type"):
+            if item[field] not in properties[field]["enum"]:
+                raise InvalidModelOutput("evidence type")
+        for field, reference_field in (
+            ("creator_quote", "creator_refs"),
+            ("identity_quote", "identity_refs"),
+            ("cm_quote", "responsibility_refs"),
+            ("type_quote", "type_refs"),
+        ):
+            quote = item[field]
+            if not isinstance(quote, str) or len(quote) > 300:
+                raise InvalidModelOutput("quote")
+            if quote and not any(quote in messages[ref] for ref in item[reference_field]):
+                raise InvalidModelOutput("invented quote")
         if item["handle_source"] not in {"message", "chat_name", "missing"}:
             raise InvalidModelOutput("handle source")
         handle = item["handle"]
@@ -538,6 +733,94 @@ def _validate(raw, evidence) -> list[dict]:
             raise InvalidModelOutput("invented alternate handle")
         result.append(item)
     return result
+
+
+def _exact_handle(text, handle):
+    """Full platform handle, not alice inside alice_shop or a fuzzy name match."""
+    if not handle:
+        return False
+    value = handle.strip().lstrip("@")
+    return bool(value and re.search(r"(?<![\w.@-])@?" + re.escape(value) + r"(?![\w.-])", text, re.I | re.ASCII))
+
+
+def _verified_facts(item, evidence):
+    """Verify quoted spans and identity targeting; never persist those spans."""
+    messages = {m["ref"]: m for m in evidence["pack"]["messages"]}
+    user = item["user"]
+
+    def targeted(message):
+        parent = messages.get(message.get("reply_to"), {})
+        return bool(
+            user
+            and (
+                user in message.get("mentions", [])
+                or parent.get("user") == user
+                or evidence["pack"].get("private_user") == user
+                or _exact_handle(message["text"], item["handle"])
+            )
+        )
+
+    def direct(quote_field, ref_field, who):
+        quote = item[quote_field]
+        return bool(
+            quote.strip() and any(quote in messages[ref]["text"] and who(messages[ref]) for ref in item[ref_field])
+        )
+
+    creator = item["creator_evidence_type"] != "unknown" and direct(
+        "creator_quote",
+        "creator_refs",
+        lambda m: bool(user) and m.get("user") == user,
+    )
+    identity = (
+        item["identity_evidence_type"] != "unknown"
+        and _exact_handle(item["identity_quote"], item["handle"])
+        and direct(
+            "identity_quote",
+            "identity_refs",
+            lambda m: bool(user) and m.get("user") == user,
+        )
+    )
+    cm = (
+        item["responsible"] == "CM1"
+        and item["cm_evidence_type"] != "unknown"
+        and direct(
+            "cm_quote",
+            "responsibility_refs",
+            lambda m: m.get("speaker") == "CM1" and targeted(m),
+        )
+    )
+    known_type = (
+        item["creator_type"]
+        if direct(
+            "type_quote",
+            "type_refs",
+            lambda m: bool(user) and (m.get("user") == user or m.get("speaker") == "CM1" and targeted(m)),
+        )
+        else None
+    )
+    # Signed status needs an explicit statement, never absence from an Excel or
+    # a generic collaboration/product discussion. Other languages stay unknown.
+    negative_type = bool(
+        re.search(r"\bnon[ -]?cap\b|\bnot signed\b|\bunsigned\b|未签约|非\s*CAP", item["type_quote"], re.I)
+    )
+    positive_type = bool(re.search(r"\bCAP\b|\bsigned\b.{0,60}\bagency\b|签约", item["type_quote"], re.I))
+    if known_type == "cap" and (not positive_type or negative_type):
+        known_type = None
+    if known_type == "non_cap" and not negative_type:
+        known_type = None
+    return {
+        "cap_policy_version": CAP_POLICY_VERSION,
+        "creator_confidence": item["creator_confidence"],
+        "identity_confidence": item["identity_confidence"],
+        "cm_confidence": item["cm_confidence"],
+        "exact_handle_evidence": bool(identity),
+        "direct_creator_evidence": bool(creator),
+        "direct_cm_evidence": bool(cm),
+        "creator_type": known_type,
+        "creator_evidence_type": item["creator_evidence_type"],
+        "identity_evidence_type": item["identity_evidence_type"],
+        "cm_evidence_type": item["cm_evidence_type"],
+    }
 
 
 def _finish(job, status, error=None, *, retry_delay=None, response=None, model=None, count=0):
@@ -593,6 +876,13 @@ def run_claimed_creator_scan(job: Mapping[str, Any], settings: Settings) -> None
             creator_workflow.validate_evidence(conn, job["responsible_authorization_id"], evidence["refs"])
             if not _enabled(conn):
                 raise ScanInputError("达人候选 AI 已停用。")
+            task = conn.execute(
+                """SELECT status, attempts, lease_until > NOW() AS leased
+                   FROM creator_workflow_ai_tasks WHERE id=%s""",
+                (job["id"],),
+            ).fetchone()
+            if not task or task["status"] != "running" or task["attempts"] != job["attempts"] or not task["leased"]:
+                return
         response = contact_assessments.call_openai(
             config,
             key,
@@ -600,7 +890,7 @@ def run_claimed_creator_scan(job: Mapping[str, Any], settings: Settings) -> None
             job["responsible_authorization_id"],
             instructions=_INSTRUCTIONS,
             output_format=_format(evidence),
-            max_output_tokens=2400,
+            max_output_tokens=4800,
         )
         candidates = _validate(response["text"], evidence)
         with connection() as conn, conn.transaction():
@@ -618,28 +908,44 @@ def run_claimed_creator_scan(job: Mapping[str, Any], settings: Settings) -> None
                 raise ScanInputError("调用期间证据已变化；未保存模型结果。")
             inserted_count = 0
             for candidate in candidates:
-                labels = set(candidate["creator_refs"] + candidate["responsibility_refs"] + candidate["handle_refs"])
+                labels = set(
+                    candidate["creator_refs"]
+                    + candidate["responsibility_refs"]
+                    + candidate["handle_refs"]
+                    + candidate["identity_refs"]
+                    + candidate["type_refs"]
+                )
                 refs = [r for r in evidence["refs"] if r["label"] in labels]
                 identity = evidence["users"].get(candidate["user"], {})
-                unknowns = ["ai_review", *candidate["unknowns"]]
-                if candidate["relationship"] == "unknown":
-                    unknowns.append("本人或代表关系不清楚")
+                # Free model prose can contain private chat excerpts. Persist only
+                # controlled gap labels and structural evidence, never raw quotes.
+                gaps = ["AI 对账号、用户或负责人仍有疑问"] if candidate["unknowns"] else []
+                if not candidate["responsible"]:
+                    gaps.append("ownership_uncertain")
+                unknowns = ["ai_review", *gaps]
+                facts = _verified_facts(candidate, evidence)
                 source = {
                     "evidence": refs,
-                    "reason": candidate["reason"],
-                    "unknowns": unknowns,
+                    "reason": "消息中的达人业务、账号身份及负责人线索。",
+                    "unknowns": gaps,
                     "handle_raw": candidate["handle"],
                     "alternative_handles": candidate["alternative_handles"],
                     "model": config["model"],
                     "run_id": str(job["run_id"]),
                     "policy_version": POLICY_VERSION,
                     "relationship_unknown": candidate["relationship"] == "unknown",
+                    "responsibility_confirmed": candidate["responsible"] == "CM1",
+                    **facts,
+                    "input_truncated": evidence["pack"].get("input_truncated", False),
                 }
                 # Same evidence is idempotent across unchanged continuations. A
                 # new message/edited body is real new evidence, not a new account.
                 source_key = hashlib.sha256(
                     json.dumps(
                         [
+                            CAP_POLICY_VERSION,
+                            facts,
+                            gaps,
                             str(job["responsible_authorization_id"]),
                             candidate["handle"].strip().lstrip("@").casefold()
                             if candidate["handle"]
@@ -662,10 +968,12 @@ def run_claimed_creator_scan(job: Mapping[str, Any], settings: Settings) -> None
                     source_type="ai",
                     source_key=source_key,
                     source_data=source,
-                    responsible_id=job["responsible_authorization_id"] if candidate["responsible"] else None,
+                    # This is the CM's review inbox, not a confirmed assignment.
+                    responsible_id=job["responsible_authorization_id"],
                     platform="tiktok",
                     handle=candidate["handle"],
                     contact_id=identity.get("contact_id"),
+                    creator_type=facts["creator_type"],
                     relationship=candidate["relationship"] if candidate["relationship"] != "unknown" else None,
                     uncertainties=unknowns,
                     trusted_identity=False,

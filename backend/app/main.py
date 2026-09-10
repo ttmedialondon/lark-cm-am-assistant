@@ -23,6 +23,7 @@ from . import (
     admin,
     admin_permissions,
     contact_assignments,
+    creator_onboarding,
     creator_review,
     creator_setup_preview,
     creator_workflow_routes,
@@ -193,6 +194,8 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 scopes,
             ),
         ).fetchone()
+        if row["id"] == authorization_id:
+            creator_onboarding.register_initial_scan(conn, authorization_id)
         authorization_id = row["id"]
         # Page commits lock sync_jobs before authorization_chats. Preserve
         # that order here so OAuth reauthorization cannot deadlock with a

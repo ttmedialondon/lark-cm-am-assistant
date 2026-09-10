@@ -6,7 +6,8 @@ TT Media 内部助手：同步已授权的 Lark 聊天、维护达人与 CM 的�
 
 - 产品和开发都从 [文档总入口](docs/README.md) 开始：当前只维护三份业务规则和一份技术说明。
 - [本地开发](backend/README.md) · [部署与回退](docs/runbooks/deploy-mvp.md) · [AI 协作约定](AGENTS.md)。
-- 2026-09-10 已按主人要求清空 Remi 的达人名单及相关派生结果，保留原始 Lark 数据；新逻辑待定。详见 [重置与文档整理记录](docs/status/2026-09-10-reset-and-docs.md)。文档整理没有重启识别或分析。
+- 2026-09-10 新规则：CM 上传自己的 CAP Excel，新授权 CM 完成同步后进行 AI 首次筛选；双来源一致且通过高置信证据校验才自动入库，缺项留待确认。详见 [达人管理](docs/product/creator-management.md)。
+- Remi 此前清空的名单和分析结果不自动恢复，原始 Lark 数据保留。详见 [历史重置记录](docs/status/2026-09-10-reset-and-docs.md)。
 
 ## 代码在哪里
 

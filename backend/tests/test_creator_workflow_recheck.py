@@ -65,6 +65,7 @@ def test_recheck_requires_current_cm_pending_record_and_version(db, people):
     with pytest.raises(workflow.WorkflowInputError, match="刚刚发生"):
         workflow.recheck_candidate(scope, row["id"], row["version"] + 1)
     formal = source(people, source_key="formal", trusted_identity=True, source_data={"stable_open_id": "ou_person"})
+    formal = workflow.confirm_candidate(scope, formal["id"], formal["version"], request_id=uuid4())
     with pytest.raises(workflow.WorkflowInputError, match="只有待确认"):
         workflow.recheck_candidate(scope, formal["id"], formal["version"])
 

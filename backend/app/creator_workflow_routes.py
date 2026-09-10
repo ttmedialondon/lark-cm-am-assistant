@@ -15,6 +15,7 @@ from . import creator_workflow as workflow
 from . import creator_workflow_ai as ai
 from . import creator_workflow_evidence
 from . import creator_workflow_import as imports
+from .creator_onboarding import retry_initial_scan
 
 REMI_ID = str(workflow.TEST_CM_ID)
 REVIEWERS = {str(actor_id) for actor_id in workflow.TEST_EDITOR_IDS}
@@ -86,6 +87,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
             reason=params.get("reason", ""),
             query=params.get("q", params.get("query", "")),
             page=int(params.get("page", 1)),
+            type_filter=params.get("type_filter", "all"),
         )
 
     @router.get("")
@@ -193,6 +195,18 @@ def create_router(*, current_authorization, render_template, csrf_token):
         except (ValueError, PermissionError, LookupError) as exc:
             return failure(exc)
 
+    @router.post("/ai/initial-retry")
+    async def initial_retry(request: Request):
+        try:
+            auth, scope = authorize(request)
+            payload = await body(request, auth)
+            workflow._uuid(payload.get("request_id"))
+            if not scope["responsible_id"]:
+                raise workflow.WorkflowInputError("请先选择一位负责人。")
+            return response({"onboarding": retry_initial_scan(auth["id"], scope["responsible_id"])})
+        except (ValueError, PermissionError, LookupError) as exc:
+            return failure(exc)
+
     @router.post("/{candidate_id}/{action}")
     async def mutate(request: Request, candidate_id: UUID, action: str):
         try:
@@ -213,6 +227,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
                     handle=payload["handle"],
                     contact_id=payload["contact_id"],
                     relationship=payload.get("relationship"),
+                    creator_type=payload.get("creator_type", workflow._UNSET),
                     resolved_reasons=payload.get("resolved_reasons", []),
                     request_id=request_id,
                 )

@@ -26,7 +26,7 @@ def db(monkeypatch):
         conn.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(psycopg.sql.Identifier(schema)))
         conn.execute(psycopg.sql.SQL("SET LOCAL search_path TO {}").format(psycopg.sql.Identifier(schema)))
         for path in sorted((Path(__file__).parents[1] / "migrations").glob("*.sql")):
-            if int(path.name[:3]) <= 28 or int(path.name[:3]) == 31:
+            if int(path.name[:3]) <= 28 or int(path.name[:3]) in (31, 34):
                 conn.execute(path.read_text())
         monkeypatch.setattr(workflow, "connection", lambda: nullcontext(conn))
         try:
@@ -88,6 +88,7 @@ def source(people, **extra):
         "handle": "@abc",
         "contact_id": people["person"],
         "relationship": "owner",
+        "creator_type": "cap",
     }
     data.update(extra)
     return workflow.ingest_source(people["cm"], **data)
@@ -143,11 +144,10 @@ def test_ai_never_promotes_and_sources_merge(db, people):
     assert again["status"] == "confirmed" and again["version"] == confirmed["version"]
 
 
-def test_excel_verified_is_direct_but_claimed_confidence_is_not(db, people):
+def test_excel_alone_never_confirms_even_with_stable_id_or_claimed_confidence(db, people):
     row = source(people, trusted_identity=True, source_data={"stable_open_id": "ou_person"})
-    assert row["status"] == "confirmed"
-    assignment = db.execute("SELECT * FROM creator_account_assignments").fetchone()
-    assert assignment["source"] == "excel_verified"
+    assert row["status"] == "pending"
+    assert db.execute("SELECT count(*) n FROM creator_account_assignments").fetchone()["n"] == 0
     assert db.execute("SELECT count(*) AS n FROM contact_assignments").fetchone()["n"] == 0
     assert db.execute("SELECT count(*) AS n FROM contact_roles").fetchone()["n"] == 0
     pending = source(
@@ -263,6 +263,7 @@ def test_one_person_many_accounts_does_not_reassign_legacy_person(db, people):
         (legacy_id, people["person"], people["cm2"]),
     )
     row = source(people, trusted_identity=True, source_data={"stable_open_id": "ou_person"})
+    row = workflow.confirm_candidate(workflow.get_scope(people["cm"]), row["id"], row["version"], request_id=uuid4())
     assert row["status"] == "confirmed"
     assert (
         db.execute("SELECT responsible_authorization_id FROM contact_assignments WHERE id=%s", (legacy_id,)).fetchone()[
@@ -299,6 +300,9 @@ def test_unknown_relation_stays_pending_until_manual_association_confirmation(db
 
 def test_changed_owner_creates_admin_review_and_preserves_formal(db, people):
     formal = source(people, trusted_identity=True, source_data={"stable_open_id": "ou_person"})
+    formal = workflow.confirm_candidate(
+        workflow.get_scope(people["cm"]), formal["id"], formal["version"], request_id=uuid4()
+    )
     changed = workflow.ingest_source(
         people["cm2"],
         source_type="excel",
@@ -382,7 +386,7 @@ def test_schema_keeps_confirmation_constraint_and_old_data_additive():
     assert "DROP TABLE" not in sql and "UPDATE contact_assignments" not in sql
 
 
-@pytest.mark.parametrize("value", ["—", "-", " a b ", "https://tiktok.com/@abc", 123])
+@pytest.mark.parametrize("value", ["—", "-", " a b ", "https://tiktok.com/@abc/video/123", "https://[broken/@abc", 123])
 def test_placeholder_and_nonhandle_input_never_become_a_handle(value):
     with pytest.raises(workflow.WorkflowInputError):
         workflow._handle(value)
@@ -438,7 +442,8 @@ def test_new_evidence_after_denial_stays_with_admin_until_explicit_reassignment(
 
 
 def test_new_evidence_cannot_silently_assign_an_existing_source_conflict(db, people):
-    source(people, trusted_identity=True, source_data={"stable_open_id": "ou_person"})
+    row = source(people, trusted_identity=True, source_data={"stable_open_id": "ou_person"})
+    workflow.confirm_candidate(workflow.get_scope(people["cm"]), row["id"], row["version"], request_id=uuid4())
     for n in (1, 2, 3):
         row = workflow.ingest_source(
             people["cm2"],

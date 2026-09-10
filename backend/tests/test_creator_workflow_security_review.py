@@ -36,20 +36,20 @@ def test_draft_without_relationship_never_defaults_to_creator_owner(client, monk
     assert selected[0]["relationship"] is None
 
 
-def test_ordinary_cm_import_unknown_owner_stays_unassigned(db, people, real_import):
+def test_ordinary_cm_handle_import_uses_current_upload_scope(db, people, real_import):
     preview = imports.preview(real_import, workbook([["handle", "CM"], ["owner_unknown", None]]), "missing.xlsx")
-    assert preview["rows"][0]["responsible_id"] is None
+    assert preview["rows"][0]["responsible_id"] == str(people["cm"])
     result = imports.commit(real_import, preview["batch_id"], uuid4())
     assert result["pending"] == 1
     assert (
         db.execute("SELECT responsible_authorization_id FROM creator_workflow_candidates").fetchone()[
             "responsible_authorization_id"
         ]
-        is None
+        == people["cm"]
     )
 
 
-def test_excel_explicit_representative_is_not_overwritten_by_known_owner(db, people, real_import):
+def test_excel_existing_owner_only_prefills_candidate_and_ignores_relationship_column(db, people, real_import):
     account = uuid4()
     db.execute(
         "INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) VALUES(%s,'tiktok','alice','alice')",
@@ -63,9 +63,14 @@ def test_excel_explicit_representative_is_not_overwritten_by_known_owner(db, peo
     preview = imports.preview(
         real_import, workbook([["handle", "CM", "relationship"], ["alice", "cm", "representative"]]), "a.xlsx"
     )
-    assert preview["rows"][0]["relationship"] == "representative"
+    assert preview["rows"][0]["relationship"] is None
+    assert preview["rows"][0]["contact_id"] == str(people["person"])
+    assert preview["rows"][0]["trusted_identity"] is False
+    assert "missing_relationship" not in preview["rows"][0]["reasons"]
     assert preview["rows"][0]["status"] == "pending"
     assert imports.commit(real_import, preview["batch_id"], uuid4())["formal"] == 0
+    assert db.execute("SELECT COUNT(*) n FROM creator_account_assignments").fetchone()["n"] == 0
+    assert db.execute("SELECT relationship FROM contact_social_accounts").fetchone()["relationship"] == "owner"
 
 
 def test_parse_all_populated_sheets_not_just_first():

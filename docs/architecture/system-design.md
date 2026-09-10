@@ -1,6 +1,6 @@
 # 系统技术说明
 
-核对日期：2026-09-10。本文合并旧后端设计、人员模型、姓名机制及后台实现说明，只描述现有结构。业务以 [达人名单](../product/creator-management.md)、[消息总结](../product/message-summary.md)、[后台权限](../product/admin-access.md) 为准；未来改版尚未定义。
+核对日期：2026-09-10。本文合并旧后端设计、人员模型、姓名机制及后台实现说明。业务以 [达人名单](../product/creator-management.md)、[消息总结](../product/message-summary.md)、[后台权限](../product/admin-access.md) 为准；本版增加 CAP 分类、双来源确认和新 CM 首次筛选。
 
 ## 1. 实际架构
 
@@ -32,6 +32,7 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 | `creator_account_assignments` | 新流程的账号级 CM 正式归属；是名单与总结取数依据 |
 | `contact_assignments` | 旧联系人级负责人关系；不能代替账号级确认，也不能认领一个 handle 就转走同人的其他 handle |
 | `creator_workflow_ai_runs`、`creator_workflow_ai_tasks`、`creator_workflow_ai_chat_checks` | AI 候选扫描、会话任务及变化检查 |
+| `creator_workflow_onboarding` | 仅新 OAuth 授权登记的一次首次筛选；保存等待状态、固定时窗、会话游标、进度及失败 |
 | `offhours_summary_settings`、`offhours_summary_runs`、`offhours_summary_tasks` | 指定总结时段、执行版本和会话结果 |
 | `admin_roles`、`admin_page_permissions`、`audit_events` | 主人身份、逐页权限、必要的查看/修改审计 |
 
@@ -60,7 +61,13 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 
 `ai_dispatch` 为 AI 功能共用最多 3 个有效并发槽，与 Lark 请求限流是不同机制。任务、租约、输入指纹、有限重试及配额暂停持久化；结果写入前重验当前配置、授权、任务版本及证据。
 
-新候选 AI 只写待确认，不因高分建立正式归属。人工确认 handle 与用户关联时，在同一事务保存账号归属、用户关联和审计；重复提交不重复入库，跨 CM 冲突不能覆盖。
+AI 调用复用现有 OpenAI 配置与结构化输出。服务端验证候选引用、作者、精确 handle 和 CM 跟进关系；短摘引只在内存核验，来源只存引用、类型、评分和校验标记，不存正文、模型自由理由或 prompt。
+
+候选与正式归属新增 nullable `creator_type`：`cap` / `non_cap` / NULL。旧数据不回填猜测。CM Excel 是 CAP 声明且绑定上传 scope；AI 单独不能自动确认。`cap_v1` 下相同账号、CM、唯一用户的双来源且三项评分均 ≥ 0.95，直接证据有效、无冲突时，统一由 workflow 事务写正式归属（来源 `excel_ai_verified`）。旧来源版本不能触发新自动门槛；最新 AI 判断覆盖旧分数，不挑历史最高分。
+
+人工确认需 handle、选定用户及类型；保存账号归属、用户关联和审计仍在同一事务，重复请求不重复入库，跨 CM、类型或身份冲突不能覆盖。用户关系统一确认关联，不推断本人或代表。
+
+OAuth 只在首次 INSERT 成功时同事务登记 onboarding，已有授权 UPDATE 不登记。worker 的元数据 tick 等 CM 资格、正文同意、成功首轮回填和 AI 配置；固定近90天、按 chat_id 每100会话分页排队。每会话最多30条、每条1500字符，截断计数可见。失败需明确重试，不无限扫描；前台沿用现有名单页显示状态。034/035 为增量迁移，不重新导入 Remi 或开启旧识别。
 
 旧 `contact_assessment`、`contact_assignment` 已停用；新 `creator_workflow` 和 `offhours_summary` 是独立配置。清空某位 CM 的数据不等于关闭全部 AI 配置。总结输入、输出、限额及缺口见消息总结文档；本期不回复、不发通知、不代办业务。
 
