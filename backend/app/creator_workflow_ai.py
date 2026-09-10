@@ -22,9 +22,10 @@ from .db import connection
 from .message_mentions import mention_names, mention_targets, resolve_mentions, rich_mention_text
 
 FEATURE = "creator_workflow"
-POLICY_VERSION = "creator-workflow-business-v2"
+POLICY_VERSION = "creator-workflow-business-v2-typed-unknowns"
 CAP_POLICY_VERSION = "cap_v1"
 BUSINESS_POLICY_VERSION = "business_v2"
+BUSINESS_UNKNOWNS = ("达人身份不明", "Lark 用户不明", "CM 归属不明")
 MAX_MESSAGES = 80
 MESSAGE_OVERLAP = 20
 HISTORY_START = datetime(1970, 1, 1, tzinfo=UTC)
@@ -534,15 +535,19 @@ proof. Unverified handles will not be attached to the formal person relationship
 creator_type is cap only with explicit signed/CAP proof, non_cap only with explicit
 non-CAP proof, otherwise null. Cite type_refs/type_quote. Missing CAP status and unclear
 owner-versus-representative labels are not blockers or unknowns for a person relationship.
-unknowns is only for actual creator identity, Lark user, or CM-responsibility uncertainty.
+unknowns must be [] when the creator, Lark user and CM relationship are clear.
+Otherwise select only genuine blockers from these exact values: "达人身份不明",
+"Lark 用户不明", "CM 归属不明". Never include missing handle, missing CAP proof,
+missing Excel, or optional account/owner labels, and never substitute another blocker
+just because one of those optional facts is missing.
 The server, not the model, decides confirmation from the independently verified business
 evidence. Excel may separately supply CAP/account information, but is not needed to
 recognize an actual creator-CM business relationship.
 
 business_topic identifies the creator business in these messages; choose unknown if
 not supported. input_truncated/history_synced describe coverage; do not claim full context.
-Reason and unknowns should be short Chinese descriptions without private message content,
-contact details or raw quotations. Quotes are ephemeral verification data only.
+Reason should be a short Chinese description without private message content or contact
+details; unknowns contains only the fixed labels above. Quotes are ephemeral verification data only.
 """
 
 
@@ -580,7 +585,8 @@ def _format(evidence) -> dict:
         "type_refs": reference_list,
         "type_quote": {"type": "string", "maxLength": 300},
         "reason": {"type": "string", "maxLength": 600},
-        "unknowns": {"type": "array", "items": {"type": "string", "maxLength": 160}, "maxItems": 10},
+        "unknowns": {"type": "array", "items": {"type": "string", "enum": list(BUSINESS_UNKNOWNS)},
+                     "maxItems": len(BUSINESS_UNKNOWNS)},
         "alternative_handles": {"type": "array", "items": {"type": "string", "maxLength": 320}, "maxItems": 5},
     }
     return {
@@ -673,13 +679,15 @@ def _validate(raw, evidence) -> list[dict]:
             raise InvalidModelOutput("missing handle")
         if not isinstance(item["reason"], str) or not 1 <= len(item["reason"].strip()) <= 600:
             raise InvalidModelOutput("reason")
-        for field, limit, length in (("unknowns", 10, 160), ("alternative_handles", 5, 320)):
+        for field, limit, length in (("unknowns", len(BUSINESS_UNKNOWNS), 160), ("alternative_handles", 5, 320)):
             if (
                 not isinstance(item[field], list)
                 or len(item[field]) > limit
                 or any(not isinstance(v, str) or not 1 <= len(v) <= length for v in item[field])
             ):
                 raise InvalidModelOutput(field)
+        if any(reason not in BUSINESS_UNKNOWNS for reason in item["unknowns"]):
+            raise InvalidModelOutput("unknowns")
         all_text = " ".join(messages.values()) + " " + (evidence["pack"]["chat_name"] or "")
         if any(h not in all_text for h in item["alternative_handles"]):
             raise InvalidModelOutput("invented alternate handle")
@@ -878,7 +886,7 @@ def run_claimed_creator_scan(job: Mapping[str, Any], settings: Settings) -> None
                 identity = evidence["users"].get(candidate["user"], {})
                 # Free model prose can contain private chat excerpts. Persist only
                 # controlled gap labels and structural evidence, never raw quotes.
-                gaps = ["AI 对达人、用户或负责人仍有疑问"] if candidate["unknowns"] else []
+                gaps = list(candidate["unknowns"])
                 if not candidate["responsible"]:
                     gaps.append("ownership_uncertain")
                 unknowns = ["ai_review", *gaps]

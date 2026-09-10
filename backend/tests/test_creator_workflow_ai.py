@@ -77,7 +77,7 @@ def candidate(**changes):
 
 def test_structured_candidates_preserve_missing_fields_and_exact_spelling():
     pack = evidence()
-    item = candidate(handle=None, user=None, handle_source="missing", handle_refs=[], unknowns=["handle 和用户缺失"])
+    item = candidate(handle=None, user=None, handle_source="missing", handle_refs=[], unknowns=["Lark 用户不明"])
     assert ai._validate(json.dumps({"candidates": [item]}), pack) == [item]
     assert ai._validate('{"candidates": []}', pack) == []
     shape = ai._format(pack)
@@ -114,7 +114,7 @@ def test_group_handle_and_unclear_cm_remain_supported_candidates_not_assignments
         responsible=None,
         responsibility_refs=[],
         relationship="representative",
-        unknowns=["负责人不明"],
+        unknowns=["CM 归属不明"],
     )
     assert ai._validate(json.dumps({"candidates": [item]}), evidence()) == [item]
     assert not ai._verified_facts(item, evidence())["verified_business_dialogue"]
@@ -208,6 +208,11 @@ def test_real_business_dialogue_needs_no_handle_or_cap_but_group_membership_is_n
                      identity_quote="", identity_confidence=0, identity_evidence_type="unknown",
                      creator_quote=creator_quote, cm_quote=cm_quote, business_topic="samples")
     assert ai._validate(json.dumps({"candidates": [item]}), pack) == [item]
+    schema = ai._format(pack)["schema"]["properties"]["candidates"]["items"]["properties"]["unknowns"]
+    assert schema["items"]["enum"] == ["达人身份不明", "Lark 用户不明", "CM 归属不明"]
+    invalid = {**item, "unknowns": ["未提供创作者账号句柄", "未提供CAP或非CAP证明"]}
+    with pytest.raises(ai.InvalidModelOutput, match="unknowns"):
+        ai._validate(json.dumps({"candidates": [invalid]}), pack)
     facts = ai._verified_facts(item, pack)
     assert facts["verified_business_dialogue"] and not facts["exact_handle_evidence"]
     assert facts["creator_type"] is None
@@ -365,7 +370,7 @@ def test_source_metadata_never_persists_quotes_or_model_private_prose(monkeypatc
             "text": json.dumps(
                 {
                     "candidates": [
-                        candidate(reason="private customer details", unknowns=["private quote in doubt"]),
+                        candidate(reason="private customer details", unknowns=["达人身份不明"]),
                     ]
                 }
             )
@@ -378,6 +383,7 @@ def test_source_metadata_never_persists_quotes_or_model_private_prose(monkeypatc
     assert "My creator account" not in stored
     assert source["creator_confidence"] == 0.99 and source["cap_policy_version"] == "cap_v1"
     assert "ai_review" not in source["unknowns"]
+    assert source["unknowns"] == ["达人身份不明"]
 
 
 def test_refusal_invalid_output_does_not_become_success_or_candidate(monkeypatch, run_harness):
@@ -692,7 +698,7 @@ def test_real_queue_claim_model_candidate_and_unchanged_incremental(pg, real_sca
 def test_real_missing_handle_and_user_survive_in_pending_pool(pg, real_scan, monkeypatch):
     ids, settings = real_scan
     output = candidate(
-        handle=None, user=None, handle_source="missing", handle_refs=[], unknowns=["需要补充 handle 和具体用户"]
+        handle=None, user=None, handle_source="missing", handle_refs=[], unknowns=["Lark 用户不明"]
     )
     monkeypatch.setattr(
         ai.contact_assessments, "call_openai", lambda *_a, **_k: {"text": json.dumps({"candidates": [output]})}
@@ -721,7 +727,7 @@ def test_real_revoke_between_queue_and_execution_cancels_without_model(pg, real_
 
 def test_real_unknown_responsibility_stays_in_scanned_cm_review_inbox_without_assignment(pg, real_scan, monkeypatch):
     ids, settings = real_scan
-    output = candidate(responsible=None, responsibility_refs=[], unknowns=["负责人不明"])
+    output = candidate(responsible=None, responsibility_refs=[], unknowns=["CM 归属不明"])
     monkeypatch.setattr(
         ai.contact_assessments, "call_openai", lambda *_a, **_k: {"text": json.dumps({"candidates": [output]})}
     )
