@@ -59,7 +59,6 @@ def _authorize(conn, actor_id, *, owner_only=False):
     for table, column in (
         ("authorizations", "id"),
         ("admin_roles", "authorization_id"),
-        ("admin_page_permissions", "authorization_id"),
     ):
         conn.execute(
             f"SELECT {column} FROM {table} WHERE {column}=ANY(%s::uuid[]) FOR SHARE",
@@ -76,12 +75,7 @@ def _authorize(conn, actor_id, *, owner_only=False):
     # These are explicit pilot read grants, not a consequence of roster editing.
     tester = (
         actor_id in TEST_VIEWERS
-        and bool(
-            conn.execute(
-                "SELECT 1 FROM admin_page_permissions WHERE authorization_id=%s AND permission='creator-review'",
-                (actor_id,),
-            ).fetchone()
-        )
+        and (owner or actor_id != UUID("9d5f4370-6463-4c3a-a2ed-67753a1cabc0"))
         and not (actor["role"] == "owner" and not actor["is_active"])
     )
     if (owner_only and not owner) or (not owner and actor_id != REMI_ID and not tester):

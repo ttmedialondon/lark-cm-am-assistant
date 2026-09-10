@@ -18,13 +18,6 @@ PAGES = (
         "description": "所有已授权人员的可用聊天记录（含非达人）",
     },
     {"key": "contacts", "label": "人员目录", "path": "/admin/contacts", "description": "查看联系人身份与关联资料"},
-    {"key": "creators", "label": "达人", "path": "/admin/creators", "description": "查看正式达人及当前负责人"},
-    {
-        "key": "creator-review",
-        "label": "达人归属复核",
-        "path": "/admin/creator-review",
-        "description": "仅正式达人相关聊天，含群内各方记录；可查看归属依据",
-    },
     {"key": "ai", "label": "AI 功能", "path": "/admin/ai", "description": "查看 AI 功能与运行配置，不可修改"},
     {"key": "jobs", "label": "同步任务", "path": "/admin/jobs", "description": "查看同步任务及运行结果"},
 )

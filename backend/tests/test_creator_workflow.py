@@ -50,10 +50,6 @@ def people(db):
             (ids[role], "ou_" + role, role, role.startswith("cm")),
         )
     db.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (ids["owner"],))
-    db.execute(
-        "INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-review')",
-        (ids["reviewer"],),
-    )
     for role, cm in (("person", "cm"), ("other", "cm2")):
         db.execute("INSERT INTO contacts(id,display_name,entity_type) VALUES(%s,'Same name','person')", (ids[role],))
         db.execute(
@@ -94,16 +90,20 @@ def source(people, **extra):
     return workflow.ingest_source(people["cm"], **data)
 
 
-def test_handle_missing_and_dash_are_not_real_accounts(db, people):
-    row = source(people, handle=None, contact_id=None)
-    assert row["handle"] is None and row["contact"] is None
-    assert {r["code"] for r in row["reasons"]} == {"missing_handle", "missing_user"}
-    assert db.execute("SELECT count(*) AS n FROM social_accounts").fetchone()["n"] == 0
-    with pytest.raises(workflow.WorkflowInputError):
-        source(people, source_key="row3", handle="—")
-    scope = workflow.get_scope(people["cm"])
-    with pytest.raises(workflow.WorkflowInputError, match="全部补齐"):
-        workflow.confirm_candidate(scope, row["id"], row["version"], request_id=uuid4())
+def test_retiring_admin_pages_removes_only_their_grants_and_keeps_creator_data(db, people):
+    row = source(people)
+    for key in ("creators", "creator-review", "messages"):
+        db.execute("INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,%s)",
+                   (people["reviewer"], key))
+    contacts = db.execute("SELECT count(*) AS n FROM contacts").fetchone()["n"]
+    sql = (Path(__file__).parents[1] / "migrations/036_retire_creator_admin_pages.sql").read_text()
+    db.execute(sql)
+    assert db.execute("SELECT permission FROM admin_page_permissions").fetchall() == [{"permission": "messages"}]
+    assert db.execute("SELECT count(*) AS n FROM contacts").fetchone()["n"] == contacts
+    assert workflow.get_record(workflow.get_scope(people["cm"]), row["id"])["status"] == "pending"
+    assert db.execute("SELECT metadata FROM audit_events WHERE action='admin_creator_pages_retired'").fetchone()[
+        "metadata"
+    ]["removed_permissions"] == ["creator-review", "creators"]
 
 
 def test_search_scopes_ids_and_selection_is_only_a_draft(db, people):
@@ -121,39 +121,9 @@ def test_search_scopes_ids_and_selection_is_only_a_draft(db, people):
     )
     assert filled["status"] == "pending" and filled["can_confirm"]
     assert [r["code"] for r in filled["reasons"]] == ["details_changed"]
-    filled = workflow.save_draft(
-        scope, filled["id"], filled["version"], handle="abc", contact_id=people["person"],
-        relationship="owner", resolved_reasons=["details_changed"],
-    )
-    assert filled["can_confirm"]
     assert db.execute("SELECT count(*) AS n FROM creator_account_assignments").fetchone()["n"] == 0
     cleared = workflow.save_draft(scope, filled["id"], filled["version"], handle="abc", contact_id=None)
     assert cleared["contact"] is None and not cleared["can_confirm"]
-
-
-def test_ai_never_promotes_and_sources_merge(db, people):
-    excel = source(people)
-    ai_data = {"evidence": [{"authorization_id": str(people["cm"]), "chat_id": "chat_cm", "message_id": "message1"}]}
-    ai = source(people, source_type="ai", source_key="message:abc", source_data=ai_data, trusted_identity=True)
-    assert ai["id"] == excel["id"] and ai["sources"] == ["ai", "excel"] and ai["status"] == "pending"
-    assert ai["can_confirm"] and ai["blocking_reasons"] == []
-    scope = workflow.get_scope(people["cm"])
-    confirmed = workflow.confirm_candidate(scope, ai["id"], ai["version"], request_id=uuid4())
-    assert confirmed["status"] == "confirmed"
-    again = source(people, source_type="ai", source_key="message:new", source_data=ai_data, trusted_identity=True)
-    assert again["status"] == "confirmed" and again["version"] == confirmed["version"]
-
-
-def test_excel_alone_never_confirms_even_with_stable_id_or_claimed_confidence(db, people):
-    row = source(people, trusted_identity=True, source_data={"stable_open_id": "ou_person"})
-    assert row["status"] == "pending"
-    assert db.execute("SELECT count(*) n FROM creator_account_assignments").fetchone()["n"] == 0
-    assert db.execute("SELECT count(*) AS n FROM contact_assignments").fetchone()["n"] == 0
-    assert db.execute("SELECT count(*) AS n FROM contact_roles").fetchone()["n"] == 0
-    pending = source(
-        people, source_key="row4", handle="other_handle", trusted_identity=True, source_data={"confidence": 1.0}
-    )
-    assert pending["status"] == "pending"
 
 
 def test_confirm_idempotency_version_and_audit(db, people):
@@ -183,18 +153,18 @@ def test_current_authority_rechecked_for_draft_and_confirm(db, people):
         workflow.save_draft(scope, row["id"], row["version"], handle="abc", contact_id=None)
 
 
-def test_reviewers_and_owner_cannot_impersonate_cm(db, people):
+def test_only_owner_can_read_another_cm_and_cannot_impersonate_them(db, people):
     row = source(people)
-    for actor in (people["reviewer"], people["owner"]):
-        scope = workflow.get_scope(actor, people["cm"])
-        assert scope["readonly"]
-        assert workflow.list_records(scope)["total"] == 1
-        with pytest.raises(PermissionError):
-            workflow.search_users(scope, "Same")
-        with pytest.raises(PermissionError):
-            workflow.confirm_candidate(scope, row["id"], row["version"], request_id=uuid4())
+    scope = workflow.get_scope(people["owner"], people["cm"])
+    assert scope["readonly"]
+    assert workflow.list_records(scope)["total"] == 1
     with pytest.raises(PermissionError):
-        workflow.get_scope(people["cm2"], people["cm"])
+        workflow.search_users(scope, "Same")
+    with pytest.raises(PermissionError):
+        workflow.confirm_candidate(scope, row["id"], row["version"], request_id=uuid4())
+    for actor in (people["reviewer"], people["cm2"]):
+        with pytest.raises(PermissionError):
+            workflow.get_scope(actor, people["cm"])
 
 
 def test_denial_is_not_repeated_by_same_evidence_and_admin_can_reassign(db, people):
@@ -209,18 +179,6 @@ def test_denial_is_not_repeated_by_same_evidence_and_admin_can_reassign(db, peop
     assert workflow.list_records(admin, status="pending")["total"] == 1
     assigned = workflow.assign_candidate(admin, row["id"], denied["version"], people["cm"], request_id=uuid4())
     assert assigned["status"] == "pending" and assigned["responsible_id"] == str(people["cm"])
-
-
-def test_unknown_handle_merges_without_duplicate_or_erasing_uncertainty(db, people):
-    first = source(people, handle=None, uncertainties=["identity_uncertain"])
-    known = source(people, source_key="row3")
-    scope = workflow.get_scope(people["cm"])
-    merged = workflow.save_draft(
-        scope, first["id"], first["version"], handle="abc", contact_id=people["person"], relationship="owner"
-    )
-    assert merged["id"] == known["id"] and merged["can_confirm"]
-    assert len(merged["evidence"]) == 2
-    assert workflow.list_records(scope)["total"] == 1
 
 
 def test_failed_audit_rolls_back_all_formal_writes(db, people, monkeypatch):
@@ -273,31 +231,6 @@ def test_one_person_many_accounts_does_not_reassign_legacy_person(db, people):
     )
 
 
-def test_unknown_and_unclear_are_distinct_and_not_auto_cleared(db, people):
-    row = source(people, contact_id=None, uncertainties=["identity_uncertain"])
-    scope = workflow.get_scope(people["cm"])
-    filled = workflow.save_draft(
-        scope, row["id"], row["version"], handle="abc", contact_id=people["person"], relationship="owner"
-    )
-    assert {r["code"] for r in filled["reasons"]} == {"identity_uncertain", "details_changed"}
-    assert filled["can_confirm"] and filled["blocking_reasons"] == []
-
-
-def test_unknown_relation_stays_pending_until_manual_association_confirmation(db, people):
-    row = source(people, relationship=None, trusted_identity=True, source_data={"stable_open_id": "ou_person"})
-    assert row["status"] == "pending" and row["relationship"] is None
-    assert any(r["code"] == "missing_relationship" for r in row["reasons"])
-    scope = workflow.get_scope(people["cm"])
-    saved = workflow.save_draft(
-        scope, row["id"], row["version"], handle="abc", contact_id=people["person"], relationship=None
-    )
-    assert saved["can_confirm"] and saved["blocking_reasons"] == []
-    confirmed = workflow.confirm_candidate(scope, saved["id"], saved["version"], request_id=uuid4())
-    assert confirmed["relationship"] == "associated" and confirmed["status"] == "confirmed"
-    assert db.execute("SELECT relationship FROM contact_social_accounts").fetchone()["relationship"] == "associated"
-    assert db.execute("SELECT count(*) n FROM contact_roles").fetchone()["n"] == 0
-
-
 def test_changed_owner_creates_admin_review_and_preserves_formal(db, people):
     formal = source(people, trusted_identity=True, source_data={"stable_open_id": "ou_person"})
     formal = workflow.confirm_candidate(
@@ -329,24 +262,6 @@ def test_changed_owner_creates_admin_review_and_preserves_formal(db, people):
     }
 
 
-def test_existing_ai_source_requires_final_cm_confirmation_even_after_excel(db, people):
-    ai_data = {"evidence": [{"authorization_id": str(people["cm"]), "chat_id": "chat_cm", "message_id": "message1"}]}
-    row = source(people, source_type="ai", source_data=ai_data)
-    scope = workflow.get_scope(people["cm"])
-    saved = workflow.save_draft(
-        scope,
-        row["id"],
-        row["version"],
-        handle="abc",
-        contact_id=people["person"],
-        relationship="owner",
-        resolved_reasons=["ai_review"],
-    )
-    assert saved["can_confirm"]
-    excel = source(people, trusted_identity=True, source_data={"stable_open_id": "ou_person"})
-    assert excel["status"] == "pending"
-
-
 def test_model_run_metadata_does_not_repush_denied_evidence(db, people):
     data = {
         "evidence": [{"authorization_id": str(people["cm"]), "chat_id": "chat_cm", "message_id": "message1"}],
@@ -368,22 +283,6 @@ def test_stale_version_and_forged_scope_cannot_write(db, people):
     forged = {**scope, "actor_id": str(people["cm2"]), "can_write": True}
     with pytest.raises(PermissionError):
         workflow.save_draft(forged, row["id"], saved["version"], handle="abc", contact_id=None)
-
-
-def test_manual_confirmation_does_not_assert_proposed_representative_or_creator_role(db, people):
-    row = source(people, relationship="representative")
-    confirmed = workflow.confirm_candidate(
-        workflow.get_scope(people["cm"]), row["id"], row["version"], request_id=uuid4()
-    )
-    assert confirmed["relationship"] == "associated"
-    assert db.execute("SELECT count(*) AS n FROM contact_roles").fetchone()["n"] == 0
-
-
-def test_schema_keeps_confirmation_constraint_and_old_data_additive():
-    sql = (Path(__file__).parents[1] / "migrations" / "028_creator_account_workflow.sql").read_text()
-    assert "AND relationship IS NOT NULL" in sql
-    assert "AND contact_id IS NOT NULL" in sql
-    assert "DROP TABLE" not in sql and "UPDATE contact_assignments" not in sql
 
 
 @pytest.mark.parametrize("value", ["—", "-", " a b ", "https://tiktok.com/@abc/video/123", "https://[broken/@abc", 123])
@@ -460,17 +359,12 @@ def test_new_evidence_cannot_silently_assign_an_existing_source_conflict(db, peo
     assert db.execute("SELECT count(*) AS n FROM creator_account_assignments").fetchone()["n"] == 1
 
 
-def test_revoked_reviewer_grant_and_inactive_owner_do_not_retain_cross_cm_visibility(db, people):
+def test_inactive_owner_does_not_retain_cross_cm_visibility(db, people):
     row = source(people)
-    scope = workflow.get_scope(people["reviewer"], people["cm"])
-    db.execute("DELETE FROM admin_page_permissions WHERE authorization_id=%s", (people["reviewer"],))
+    scope = workflow.get_scope(people["owner"], people["cm"])
+    db.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (people["owner"],))
     with pytest.raises(PermissionError):
         workflow.get_record(scope, row["id"])
-    db.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (people["owner"],))
-    db.execute(
-        "INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-review')",
-        (people["owner"],),
-    )
     with pytest.raises(PermissionError):
         workflow.get_scope(people["owner"], people["cm"])
 

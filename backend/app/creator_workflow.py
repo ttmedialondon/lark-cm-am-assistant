@@ -5,15 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from contextlib import nullcontext
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
-from .creator_preparation import normalize_handle
 from .db import connection
 
-# Explicit pilot grants: existing review access is still required and can revoke them.
+# Explicit frontend pilot grants, independent of retired admin review pages.
 TEST_CM_ID = UUID("24d1ef13-3762-4359-ba11-d26c03cf1f7f")
 TEST_EDITOR_IDS = frozenset({
     UUID("9d5f4370-6463-4c3a-a2ed-67753a1cabc0"),
@@ -22,6 +22,13 @@ TEST_EDITOR_IDS = frozenset({
 CAP_POLICY_VERSION = "cap_v1"
 AUTO_CONFIRM_THRESHOLD = 0.95
 _UNSET = object()
+
+
+def normalize_handle(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = value.strip().lstrip("@").casefold()
+    return value if re.fullmatch(r"[\w.\-]{1,160}", value) else ""
 
 
 class WorkflowInputError(ValueError):
@@ -138,27 +145,20 @@ def _scope(conn: Any, actor_id: UUID, responsible_id: UUID | None, *, lock: bool
         "SELECT role, is_active FROM admin_roles WHERE authorization_id=%s" + suffix, (actor_id,)
     ).fetchone()
     owner = bool(role and role["role"] == "owner" and role["is_active"])
-    grants = {
-        r["permission"]
-        for r in conn.execute(
-            "SELECT permission FROM admin_page_permissions WHERE authorization_id=%s" + suffix, (actor_id,)
-        ).fetchall()
-    }
-    if role and role["role"] == "owner" and not owner:
-        grants = set()
     if target_id is None and not owner:
         target_id = actor_id
     target = users.get(target_id)
     if target_id and not target:
         raise LookupError("找不到该负责人。")
-    if target_id != actor_id and not owner and "creator-review" not in grants:
-        raise PermissionError("只能查看自己的达人名单。")
     own_list = bool(target_id == actor_id and actor["assignment_eligible"])
     test_editor = bool(
         actor_id in TEST_EDITOR_IDS and target_id == TEST_CM_ID
         and target and target["status"] == "active" and target["assignment_eligible"]
-        and (owner or "creator-review" in grants)
+        and (owner or actor_id != UUID("9d5f4370-6463-4c3a-a2ed-67753a1cabc0"))
+        and not (role and role["role"] == "owner" and not owner)
     )
+    if target_id != actor_id and not owner and not test_editor:
+        raise PermissionError("只能查看自己的达人名单。")
     can_write = own_list or test_editor
     return {
         "actor_id": str(actor_id),
@@ -194,7 +194,7 @@ def list_responsibles(actor_id: UUID) -> list[dict]:
 def _fresh(conn: Any, scope: dict, *, write: bool = False) -> dict:
     current = _scope(conn, _uuid(scope["actor_id"]), _uuid(scope.get("responsible_id"), optional=True), lock=write)
     if write and not current["can_write"]:
-        raise PermissionError("只有负责人本人或已授权的测试账号可以补资料和确认；普通评审权限不能代确认。")
+        raise PermissionError("只有负责人本人或已授权的测试账号可以补资料和确认。")
     return current
 
 

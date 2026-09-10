@@ -12,7 +12,7 @@
         {% for permission in permission_pages %}<label class="admin-users__permission-option"><input class="form-check-input" type="checkbox" name="permissions" value="{{ permission.key }}"{% if permission.key in permission_access.configured_permissions %} checked{% endif %}><span><span class="fw-medium">{{ permission.label }}</span><span class="admin-users__permission-description">{{ permission.description }}</span></span></label>{% endfor %}
       </div>
     </fieldset>
-    <p class="admin-users__sensitive-note">勾选后可查看该页面原有的数据范围，不限于本人数据。“消息内容”和“达人归属复核”涉及聊天记录，请按需开放。页面权限不包含修改业务数据或分配权限。</p>
+    <p class="admin-users__sensitive-note">勾选后可查看该页面原有的数据范围，不限于本人数据。“消息内容”涉及聊天记录，请按需开放。页面权限不包含修改业务数据或分配权限。</p>
     <div class="d-flex flex-wrap align-items-center gap-2"><button class="btn btn-sm btn-primary" type="submit">保存权限</button><span class="text-secondary small">全部不勾选 = 仅前台</span></div>
   </form>
 </details>

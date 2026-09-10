@@ -81,10 +81,10 @@ OAuth 只在首次 INSERT 成功时同事务登记 onboarding，已有授权 UPD
 
 维护脚本 `backend/scripts/backfill_identity_names.py` 默认只检查；显式 `--apply --owner-id …` 才写入，`--refresh-members` 可在已有权限内刷新群成员。实时资料不足时保留已有姓名，不扩大权限、不重跑达人 AI。请求前后检查授权与稳定 ID，失败不阻塞消息同步。
 
-## 7. 重置与旧快照
+## 7. 已移除的旧入口
 
-Remi 清理记录见 [2026-09-10 状态](../status/2026-09-10-reset-and-docs.md)。`creator_preparation.load_snapshot` 在同 CM 的最新快照之后存在相同或更晚的 `creator_roster_reset` 时隐藏旧快照，不回退更老名单；重置后新发布的有效来源才可重新出现。
+后台达人目录、归属复核、专用聊天详情和整理清单已下线，旧预览与快照读取代码、旧一次性交接/恢复脚本一并移除。当前只从 `/dashboard/creators` 管理 CAP / 非 CAP 账号，不再展示旧联系人归属工作台。
 
-`backend/scripts/reset_remi_creator_data.py` 是有固定负责人、数量和来源摘要护栏的一次性操作，不是通用清库接口，不可复用到下一批名单。清理不删除原始 Lark 消息、人口库、授权、Excel 原件或历史审计。本次文档整理不会执行该脚本。
+036 迁移只删除 `creators` / `creator-review` 页面权限、保存移除审计并收紧权限键约束，不删除候选、正式达人、人口库或消息表。两位明确测试者的 Remi 前台权限不再依赖旧后台权限。历史代码从 Git 恢复；Remi 此前的数据清理仍以 [历史记录](../status/2026-09-10-reset-and-docs.md) 为准，不重复执行。
 
 运行配置、发布、备份和恢复统一见 [部署手册](../runbooks/deploy-mvp.md)，不在这里复制命令。

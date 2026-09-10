@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
+from typing import Any
 from uuid import UUID
 
+from cryptography.exceptions import InvalidTag
+
 from . import creator_workflow as workflow
-from .admin_reporting import _format_time
+from .admin_reporting import _format_time, _message_type_label, _readable_body
 from .config import get_settings
-from .creator_review import _text_content
 from .crypto import message_body_cipher
 from .db import connection
 from .message_mentions import mention_names
@@ -16,18 +19,29 @@ from .message_mentions import mention_names
 NOTICE = "只显示这位 CM 当前有权查看、与该用户有关的已同步会话。私聊仅作辅助依据，不会自动确认归属。"
 
 
+def _text_content(
+    ciphertext: str | None, cipher: Any, message_type: str | None = "text", mentions=None, names=None
+) -> str:
+    if ciphertext is None:
+        return "（正文尚未同步）"
+    try:
+        text = _readable_body(cipher.decrypt(ciphertext), _message_type_label(message_type), mentions, names)
+    except (InvalidTag, UnicodeDecodeError, ValueError, TypeError):
+        return "（正文无法读取）"
+    text = re.sub(r"[\w.+\-]+@[\w.\-]+\.[A-Za-z]{2,}", "[邮箱已隐藏]", text)
+    text = re.sub(r"(?<!\w)\+?\d[\d ()\-]{6,}\d(?!\w)", "[电话号码已隐藏]", text)
+    return re.sub(r"\b(?:ou|on|cli)_[A-Za-z0-9]+\b", "[标识已隐藏]", text)
+
+
 def evidence(scope, candidate_id: UUID, chat_id: str | None = None, page: int = 1):
     page = max(1, min(page, 10000))
     with connection() as conn, conn.transaction():
-        # Hold the viewer's existing permission rows while reading. A concurrent
-        # revocation cannot leave a stale owner/reviewer grant in this response.
+        # Hold the viewer's authorization and owner role while reading so
+        # concurrent revocation cannot leave stale access in this response.
         actor_id = UUID(scope["actor_id"])
         conn.execute("SELECT id FROM authorizations WHERE id=%s FOR SHARE", (actor_id,)).fetchall()
         conn.execute(
             "SELECT authorization_id FROM admin_roles WHERE authorization_id=%s FOR SHARE", (actor_id,)
-        ).fetchall()
-        conn.execute(
-            "SELECT authorization_id FROM admin_page_permissions WHERE authorization_id=%s FOR SHARE", (actor_id,)
         ).fetchall()
         scope = workflow._fresh(conn, scope)
         row = workflow._candidate(conn, candidate_id, scope, lock=True)

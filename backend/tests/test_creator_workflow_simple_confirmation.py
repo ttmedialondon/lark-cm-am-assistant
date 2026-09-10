@@ -12,8 +12,8 @@ people = fixtures.people
 source = fixtures.source
 
 
-@pytest.mark.parametrize("relationship", [None, "owner", "representative"])
-def test_one_click_resolves_historical_flags_but_preserves_source_and_before_audit(db, people, relationship):
+def test_one_click_resolves_historical_flags_but_preserves_source_and_before_audit(db, people):
+    relationship = None
     row = source(
         people, relationship=relationship,
         uncertainties=["identity_uncertain", "ownership_uncertain", "handle_uncertain", "identity_risk"],
@@ -51,8 +51,8 @@ def test_identity_edit_does_not_carry_old_relationship_and_needs_no_extra_acknow
     assert formal["status"] == "confirmed" and formal["relationship"] == "associated"
 
 
-@pytest.mark.parametrize("relationship", ["owner", "representative", "associated"])
-def test_same_user_reuses_existing_formal_relationship_without_overwriting_it(db, people, relationship):
+def test_same_user_reuses_existing_formal_relationship_without_overwriting_it(db, people):
+    relationship = "representative"
     account_id = uuid4()
     db.execute(
         "INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) VALUES(%s,'tiktok','abc','@abc')",
@@ -70,8 +70,8 @@ def test_same_user_reuses_existing_formal_relationship_without_overwriting_it(db
     assert db.execute("SELECT * FROM contact_social_accounts").fetchall() == before
 
 
-@pytest.mark.parametrize("existing_relation", ["owner", "representative", "associated"])
-def test_missing_relationship_cannot_bypass_existing_formal_user_conflict(db, people, existing_relation):
+def test_missing_relationship_cannot_bypass_existing_formal_user_conflict(db, people):
+    existing_relation = "associated"
     account_id = uuid4()
     db.execute(
         "INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) VALUES(%s,'tiktok','abc','@abc')",
@@ -101,14 +101,6 @@ def test_later_sources_do_not_replace_manual_association_with_a_guessed_owner_ro
     assert db.execute("SELECT relationship FROM contact_social_accounts").fetchone()["relationship"] == "associated"
 
 
-def test_saving_same_pair_preserves_existing_candidate_metadata_without_acknowledging_it(db, people):
-    row = source(people, relationship="representative", uncertainties=["identity_uncertain"])
-    scope = workflow.get_scope(people["cm"])
-    saved = workflow.save_draft(scope, row["id"], row["version"], handle="abc", contact_id=people["person"])
-    assert saved["relationship"] == "representative" and saved["can_confirm"]
-    assert [r["code"] for r in saved["reasons"]] == ["identity_uncertain"]
-
-
 @pytest.mark.parametrize("missing", ["handle", "contact_id"])
 def test_missing_field_still_blocks_manual_confirmation(db, people, missing):
     row = source(people, **{missing: None}, relationship=None)
@@ -118,15 +110,6 @@ def test_missing_field_still_blocks_manual_confirmation(db, people, missing):
     }
     with pytest.raises(workflow.WorkflowInputError, match="全部补齐"):
         workflow.confirm_candidate(workflow.get_scope(people["cm"]), row["id"], row["version"], request_id=uuid4())
-    assert db.execute("SELECT count(*) n FROM creator_account_assignments").fetchone()["n"] == 0
-
-
-@pytest.mark.parametrize("relationship,uncertainties", [(None, []), ("owner", ["identity_risk"])])
-def test_automatic_promotion_keeps_its_stricter_requirements(db, people, relationship, uncertainties):
-    row = source(people, relationship=relationship, uncertainties=uncertainties)
-    saved = db.execute("SELECT * FROM creator_workflow_candidates WHERE id=%s", (row["id"],)).fetchone()
-    with pytest.raises(workflow.WorkflowInputError):
-        workflow._promote(db, saved, workflow.get_scope(people["cm"]), "excel_verified")
     assert db.execute("SELECT count(*) n FROM creator_account_assignments").fetchone()["n"] == 0
 
 

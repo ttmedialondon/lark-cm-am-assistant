@@ -28,14 +28,6 @@
         {% if offhours_summary_visible %}
         <section class="card mb-4 border-primary"><div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3"><div><h3 class="card-title mb-1">下班消息总结</h3><p class="text-secondary mb-0">Remi 已确认达人 · 看一晚发生了什么、进展怎样、哪些事情要先看。</p></div><a class="btn btn-primary" href="/dashboard/offhours-summary">查看消息总结</a></div></section>
         {% endif %}
-        {% if creator_setup_preview_enabled %}
-        <section class="card mb-4 border-primary" aria-labelledby="creator-setup-preview-title">
-          <div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3">
-            <div><div class="d-flex flex-wrap align-items-center gap-2 mb-1"><h3 class="card-title mb-0" id="creator-setup-preview-title">Remi 的达人账号核对</h3><span class="badge bg-blue-lt">真实数据 · 只读</span></div><p class="text-secondary mb-0">核对 Remi 的来源名单、联系人和相关会话；待补信息单独标明，不修改正式归属。</p></div>
-            <a class="btn btn-primary" href="/dashboard/creator-setup-preview">查看真实数据</a>
-          </div>
-        </section>
-        {% endif %}
         {% include "partials/stats.html" %}
         {% if not body_consent %}
         <div class="alert alert-info mt-4">提醒功能需要重新确认 Lark 授权，请 <a href="/auth/lark/start" class="alert-link">重新使用 Lark 授权</a>。</div>
@@ -44,35 +36,6 @@
         {% elif authorization.p2p_discovery_status == 'attention_required' %}
         <div class="alert alert-warning mt-4">部分提醒所需的授权需要重新确认，请 <a href="/auth/lark/start" class="alert-link">重新使用 Lark 授权</a>。</div>
         {% endif %}
-        {% if creator_features_enabled %}
-        <div class="card mt-4">
-          <div class="card-header"><div><h3 class="card-title mb-1">待我确认的达人候选</h3><div class="text-secondary small">AI 根据你与达人的互动线索生成建议；确认后将加入“我的达人”。</div></div></div>
-          {% if creator_workbench is defined and creator_workbench.pending_candidates %}
-          <div class="table-responsive"><table class="table table-vcenter card-table">
-            <thead><tr><th>达人</th><th>置信度</th><th>建议时间</th><th></th></tr></thead>
-            <tbody>{% for candidate in creator_workbench.pending_candidates %}<tr>
-              <td>{{ candidate.display_name }}</td>
-              <td><span class="badge bg-warning-lt">{{ candidate.confidence_label }}</span></td>
-              <td class="text-secondary">{{ candidate.suggested_at_label }}</td>
-              <td class="text-end"><form action="/dashboard/creator-candidates/{{ candidate.assessment_id }}/confirm" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-primary" type="submit">确认由我负责</button></form></td>
-            </tr>{% endfor %}</tbody>
-          </table></div>
-          {% else %}<div class="card-body text-secondary">暂无待确认达人。</div>{% endif %}
-        </div>
-        {% endif %}
-        <div class="card mt-4">
-          <div class="card-header"><h3 class="card-title">历史联系人归属</h3><a class="ms-auto" href="/dashboard/creators?status=confirmed">查看账号级正式名单</a></div>
-          {% if creator_workbench is defined and creator_workbench.confirmed_creators %}
-          <div class="table-responsive"><table class="table table-vcenter card-table">
-            <thead><tr><th>达人</th><th>状态</th><th>开始负责</th></tr></thead>
-            <tbody>{% for creator in creator_workbench.confirmed_creators %}<tr>
-              <td>{{ creator.display_name }}</td>
-              <td><span class="badge bg-success-lt">已确认</span></td>
-              <td class="text-secondary">{{ creator.started_at_label }}</td>
-            </tr>{% endfor %}</tbody>
-          </table></div>
-          {% else %}<div class="card-body text-secondary">暂无正式负责的达人。</div>{% endif %}
-        </div>
         <div class="card mt-4">
           <div class="card-body">
             <details>

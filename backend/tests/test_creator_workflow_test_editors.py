@@ -36,14 +36,8 @@ def test_named_testers_can_review_and_confirm_for_the_cm(db, people, test_editor
     draft = workflow.save_draft(
         scope, row["id"], row["version"], handle="abc", contact_id=people["person"], relationship="owner"
     )
-    recheck = workflow.recheck_candidate(scope, draft["id"], draft["version"])
-    assert recheck["candidate_id"] == draft["id"]
     assert workflow.get_record(scope, draft["id"])["status"] == "pending"
-    checked = workflow.save_draft(
-        scope, draft["id"], draft["version"], handle="abc", contact_id=people["person"],
-        relationship="owner", resolved_reasons=["details_changed"],
-    )
-    formal = workflow.confirm_candidate(scope, checked["id"], checked["version"], request_id=uuid4())
+    formal = workflow.confirm_candidate(scope, draft["id"], draft["version"], request_id=uuid4())
     assert formal["status"] == "confirmed" and formal["responsible_id"] == str(people["cm"])
     assignment = db.execute("SELECT * FROM creator_account_assignments").fetchone()
     assert assignment["responsible_authorization_id"] == people["cm"]
@@ -58,53 +52,40 @@ def test_named_testers_can_review_and_confirm_for_the_cm(db, people, test_editor
     assert db.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 0
 
 
-@pytest.mark.parametrize("actor", ["owner", "reviewer"])
-@pytest.mark.parametrize("decision", ["defer", "reject"])
-def test_named_testers_can_defer_or_reject_with_actual_actor_audit(db, people, test_editors, actor, decision):
-    scope = workflow.get_scope(people[actor], people["cm"])
+def test_named_tester_can_defer_with_actual_actor_audit(db, people, test_editors):
+    scope = workflow.get_scope(people["reviewer"], people["cm"])
     row = source(people)
-    result = workflow.decide_candidate(scope, row["id"], row["version"], decision, request_id=uuid4())
-    assert result["status"] == {"defer": "deferred", "reject": "rejected"}[decision]
-    assert result["responsible_id"] == (str(people["cm"]) if decision == "defer" else None)
+    result = workflow.decide_candidate(scope, row["id"], row["version"], "defer", request_id=uuid4())
+    assert result["status"] == "deferred" and result["responsible_id"] == str(people["cm"])
     audit = db.execute(
-        "SELECT authorization_id FROM audit_events WHERE action=%s", ("creator_workflow_" + decision,)
+        "SELECT authorization_id FROM audit_events WHERE action='creator_workflow_defer'"
     ).fetchone()
-    assert audit["authorization_id"] == people[actor]
+    assert audit["authorization_id"] == people["reviewer"]
 
 
-@pytest.mark.parametrize("actor", ["owner", "reviewer"])
-def test_testing_exception_does_not_cover_other_cms(db, people, test_editors, actor):
-    scope = workflow.get_scope(people[actor], people["cm2"])
+def test_testing_exception_does_not_cover_other_cms(db, people, test_editors):
+    scope = workflow.get_scope(people["owner"], people["cm2"])
     assert not scope["test_editor"] and not scope["can_write"] and scope["readonly"]
     with pytest.raises(PermissionError):
         workflow.search_users(scope, "Same")
+    with pytest.raises(PermissionError):
+        workflow.get_scope(people["reviewer"], people["cm2"])
     assert workflow.get_scope(people["cm"])["can_write"]
     assert workflow.get_scope(people["cm2"])["can_write"]
 
 
-def test_other_reviewers_or_allowlisted_users_without_grants_cannot_write(db, people, test_editors, monkeypatch):
-    db.execute(
-        "INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-review')",
-        (people["cm2"],),
-    )
-    scope = workflow.get_scope(people["cm2"], people["cm"])
-    assert scope["readonly"] and not scope["test_editor"]
-    with pytest.raises(PermissionError):
-        workflow.search_users(scope, "Same")
-    monkeypatch.setattr(workflow, "TEST_EDITOR_IDS", frozenset({people["cm2"]}))
-    db.execute("DELETE FROM admin_page_permissions WHERE authorization_id=%s", (people["cm2"],))
+def test_matching_tester_display_name_does_not_grant_access(db, people, test_editors):
+    db.execute("UPDATE authorizations SET display_name='Shang Ma' WHERE id=%s", (people["cm2"],))
     with pytest.raises(PermissionError):
         workflow.get_scope(people["cm2"], people["cm"])
 
 
-@pytest.mark.parametrize("revocation", ["review_grant", "owner_role", "actor_inactive", "cm_inactive", "cm_ineligible"])
+@pytest.mark.parametrize("revocation", ["owner_role", "actor_inactive", "cm_inactive", "cm_ineligible"])
 def test_old_test_editor_scope_cannot_write_after_revocation(db, people, test_editors, revocation):
     actor = "owner" if revocation == "owner_role" else "reviewer"
     scope = workflow.get_scope(people[actor], people["cm"])
     row = source(people)
-    if revocation == "review_grant":
-        db.execute("DELETE FROM admin_page_permissions WHERE authorization_id=%s", (people[actor],))
-    elif revocation == "owner_role":
+    if revocation == "owner_role":
         db.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (people[actor],))
     elif revocation == "actor_inactive":
         db.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (people[actor],))

@@ -154,10 +154,6 @@ def seeded(pg, monkeypatch):
             (ids[name], "ou_" + name, name, name == "cm", start - timedelta(days=10)),
         )
     pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (ids["owner"],))
-    for name in ("tester", "reviewer"):
-        pg.execute(
-            "INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-review')", (ids[name],)
-        )
     for name in ("cm", "person", "other"):
         pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)", (ids[name], name))
         pg.execute(
@@ -284,6 +280,8 @@ def test_acl_owner_remi_and_explicit_test_grant_not_arbitrary_roster_reviewer(pg
     with pytest.raises(PermissionError):
         ai.get_summary_view(pg, s.ids["reviewer"])
     pg.execute("DELETE FROM admin_page_permissions WHERE authorization_id=%s", (s.ids["tester"],))
+    assert len(ai.get_summary_view(pg, s.ids["tester"])["events"]) == 1
+    pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (s.ids["tester"],))
     with pytest.raises(PermissionError):
         ai.get_summary_view(pg, s.ids["tester"])
 

@@ -72,8 +72,7 @@ def test_initial_retry_http_requires_selected_cm_and_returns_service_permission_
     assert api.post(URL, headers=headers, json=payload).status_code == 403
 
 
-@pytest.mark.parametrize("review_permission", [False, True])
-def test_retry_service_rejects_non_owner_cross_cm_without_changing_onboarding(pg, initial, review_permission):
+def test_retry_service_rejects_non_owner_cross_cm_without_changing_onboarding(pg, initial):
     ids, _ = initial  # Includes the required onboarding.connection patch to this isolated database.
     outsider = uuid4()
     pg.execute(
@@ -81,10 +80,6 @@ def test_retry_service_rejects_non_owner_cross_cm_without_changing_onboarding(pg
         assignment_eligible,body_consent_at) VALUES(%s,'ou_outsider','Other CM','test',TRUE,NOW())""",
         (outsider,),
     )
-    if review_permission:
-        pg.execute(
-            "INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-review')", (outsider,)
-        )
     pg.execute("UPDATE creator_workflow_onboarding SET status='failed' WHERE authorization_id=%s", (ids["cm"],))
     before = onboarding.get_status(pg, ids["cm"])
     with pytest.raises(PermissionError, match="跨 CM 操作仅限系统主人"):

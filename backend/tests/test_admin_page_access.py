@@ -16,13 +16,12 @@ from app import (
     admin_reporting,
     contact_assessments,
     contact_assignments,
-    creator_review,
     main,
     organization_sync,
 )
 
 TARGET = "0a11485c-20d4-4c0c-83c8-1d43445d11b1"
-PAGES = ("overview", "users", "chats", "messages", "contacts", "creators", "creator-review", "ai", "jobs")
+PAGES = tuple(page["key"] for page in admin_permissions.PAGES)
 GET_ROUTES = (
     ("overview", "/admin"),
     ("users", "/admin/users"),
@@ -31,9 +30,6 @@ GET_ROUTES = (
     ("messages", "/admin/messages"),
     ("contacts", "/admin/contacts"),
     ("contacts", "/admin/contacts/ou_contact"),
-    ("creators", "/admin/creators"),
-    ("creator-review", "/admin/creator-review"),
-    ("creator-review", f"/admin/creator-review/{TARGET}?chat_id=oc_creator"),
     ("ai", "/admin/ai"),
     ("jobs", "/admin/jobs"),
 )
@@ -62,7 +58,7 @@ def data_fence(monkeypatch):
 
     for module in (
         admin, admin_permissions, admin_reporting, contact_assessments,
-        contact_assignments, creator_review, organization_sync,
+        contact_assignments, organization_sync,
     ):
         monkeypatch.setattr(module, "connection", forbidden_query)
 
@@ -97,19 +93,17 @@ def _client(monkeypatch, *, permissions=(), owner=False, status="active", contex
     return TestClient(app), actor, state
 
 
-@pytest.mark.parametrize("granted", PAGES)
 @pytest.mark.parametrize(("required", "path"), GET_ROUTES)
-def test_each_page_grant_is_independent(monkeypatch, data_fence, granted, required, path):
-    browser, _, _ = _client(monkeypatch, permissions={granted})
-    if granted == required:
-        with pytest.raises(_DataQueryReached):
-            browser.get(path, follow_redirects=False)
-    elif path == "/admin":
-        response = browser.get(path, follow_redirects=False)
-        assert response.status_code == 303
-        assert response.headers["location"] == f"/admin/{granted}"
-    else:
-        assert browser.get(path, follow_redirects=False).status_code == 403
+def test_each_route_checks_its_own_permission_before_reading(monkeypatch, data_fence, required, path):
+    browser, _, state = _client(monkeypatch, permissions={required})
+    with pytest.raises(_DataQueryReached):
+        browser.get(path, follow_redirects=False)
+    unrelated = "messages" if required != "messages" else "users"
+    state["permissions"] = frozenset({unrelated})
+    response = browser.get(path, follow_redirects=False)
+    assert response.status_code == (303 if path == "/admin" else 403)
+    if path == "/admin":
+        assert response.headers["location"] == f"/admin/{unrelated}"
 
 
 @pytest.mark.parametrize("path", [path for _, path in GET_ROUTES] + [ASSESSMENT_ROUTE])
@@ -139,11 +133,11 @@ def test_owner_has_every_read_entry_without_explicit_page_grants(monkeypatch, da
 
 
 def test_revocation_applies_to_the_next_request_in_the_same_session(monkeypatch, data_fence):
-    browser, _, state = _client(monkeypatch, permissions={"creator-review"})
+    browser, _, state = _client(monkeypatch, permissions={"messages"})
     with pytest.raises(_DataQueryReached):
-        browser.get("/admin/creator-review")
+        browser.get("/admin/messages")
     state["permissions"] = frozenset()
-    assert browser.get("/admin/creator-review").status_code == 403
+    assert browser.get("/admin/messages").status_code == 403
 
 
 @pytest.mark.parametrize("owner", [False, True])
@@ -152,29 +146,6 @@ def test_inactive_authorization_has_no_backend_access(monkeypatch, data_fence, o
     for _, path in GET_ROUTES:
         assert browser.get(path, follow_redirects=False).status_code == 403
 
-
-def test_creator_review_grant_allows_its_scoped_chat_not_global_messages(monkeypatch, data_fence):
-    contexts, reads, audits = [], [], []
-    browser, actor, _ = _client(monkeypatch, permissions={"creator-review"}, contexts=contexts)
-    contact_id = UUID(TARGET)
-    monkeypatch.setattr(creator_review, "detail", lambda _: {
-        "creator": {"id": contact_id},
-        "conversations": [{"chat_id": "oc_creator", "name": "Creator-related conversation"}],
-    })
-
-    def scoped_messages(*args):
-        reads.append(args)
-        return {"items": [{"content": "Scoped test message"}], "page": 1, "has_next": False}
-
-    monkeypatch.setattr(creator_review, "messages", scoped_messages)
-    monkeypatch.setattr(creator_review, "record_view", lambda *args: audits.append(args))
-    response = browser.get(f"/admin/creator-review/{TARGET}?chat_id=oc_creator")
-    assert response.status_code == 200
-    assert reads == [(contact_id, "oc_creator", 1)]
-    assert audits == [(actor["id"], contact_id, "oc_creator")]
-    assert contexts[-1][1]["content_page"]["items"][0]["content"] == "Scoped test message"
-    for path in ("/admin/messages", "/admin/contacts", "/admin/users"):
-        assert browser.get(path).status_code == 403
 
 
 def _page_menu_targets(html):
@@ -187,28 +158,6 @@ def _assert_no_navigation_role_labels(html):
     for label in ("系统主人", "全部权限", "已授权查看", "当前为只读访问", "权限设置及业务修改"):
         assert label not in html
 
-
-@pytest.mark.parametrize("granted", PAGES)
-def test_navigation_exposes_only_the_granted_page(granted):
-    environment = Environment(loader=FileSystemLoader(Path(admin.__file__).parent / "templates"), autoescape=True)
-    landing = "/admin" if granted == "overview" else f"/admin/{granted}"
-    html = environment.get_template("admin/_nav.html").render(
-        authorization={"display_name": "Page viewer"},
-        admin_role="member",
-        admin_role_label="已授权查看",
-        admin_permissions=frozenset({granted}),
-        permission_pages=admin_permissions.PAGES,
-        admin_landing_path=landing,
-        active_page=granted,
-    )
-    backend_links = {link for link in re.findall(r'href="([^"]+)"', html) if link.startswith("/admin")}
-    assert backend_links == {landing}
-    assert _page_menu_targets(html) == [landing]
-    _assert_no_navigation_role_labels(html)
-    if granted == "creator-review":
-        assert "Page viewer" not in html and "/dashboard" not in html
-    else:
-        assert "Page viewer" in html and "/dashboard" in html
 
 
 def test_owner_navigation_exposes_every_page():
@@ -229,8 +178,8 @@ def test_owner_navigation_exposes_every_page():
 
 
 @pytest.mark.parametrize("permissions", [
-    ("creator-review", "creators"),
-    ("creator-review", "overview", "users", "chats", "messages", "contacts", "ai", "jobs"),
+    ("users", "messages"),
+    ("ai", "jobs"),
 ])
 def test_navigation_keeps_exact_grants_when_switching_between_pages(permissions):
     environment = Environment(loader=FileSystemLoader(Path(admin.__file__).parent / "templates"), autoescape=True)
@@ -243,15 +192,13 @@ def test_navigation_keeps_exact_grants_when_switching_between_pages(permissions)
         )
         assert _page_menu_targets(html) == expected
         _assert_no_navigation_role_labels(html)
-        if active_page == "creator-review":
-            assert "Page viewer" not in html and "/dashboard" not in html
-        else:
-            assert "Page viewer" in html and "/dashboard" in html
+        assert "Page viewer" in html and "/dashboard" in html
+        assert "/admin/creators" not in html and "/admin/creator-review" not in html
 
 
 @pytest.mark.parametrize(("permissions", "owner", "expected"), [
     ((), False, set()),
-    (("creator-review",), False, {"/admin/creator-review"}),
+    (("messages",), False, {"/admin/messages"}),
     ((), True, {"/admin"}),
 ])
 def test_frontend_entry_uses_current_page_permissions(monkeypatch, permissions, owner, expected):
@@ -263,10 +210,6 @@ def test_frontend_entry_uses_current_page_permissions(monkeypatch, permissions, 
         "job": {"status": "succeeded"},
     })
     monkeypatch.setattr(main, "_admin_csrf_token", lambda _: "csrf")
-    monkeypatch.setattr(contact_assignments, "assignment_available", lambda: False)
-    monkeypatch.setattr(contact_assignments, "creator_workbench", lambda _: {
-        "pending_candidates": [], "confirmed_creators": [],
-    })
     response = TestClient(main.app).get("/dashboard")
     assert response.status_code == 200
     backend_links = {
@@ -275,7 +218,7 @@ def test_frontend_entry_uses_current_page_permissions(monkeypatch, permissions, 
     assert backend_links == expected
 
 
-@pytest.mark.parametrize("keys", [[], ["users", "creator-review"]])
+@pytest.mark.parametrize("keys", [[], ["users", "messages"]])
 def test_owner_saves_repeated_checkbox_values_and_can_clear_all(monkeypatch, data_fence, keys):
     saved = []
     browser, actor, _ = _client(monkeypatch, owner=True)
@@ -316,10 +259,6 @@ def test_invalid_permission_forms_never_reach_a_database_write(monkeypatch, data
     ("overview", "overview.html", {
         "metrics": [], "attention": [{"id": TARGET, "display_name": "Other person"}],
         "recent_jobs": [], "runtime": [],
-    }),
-    ("creators", "creators.html", {
-        "creators": [{"open_id": "ou_creator", "display_name": "Creator"}],
-        "assignment": "all", "creator_page": {},
     }),
     ("contacts", "contact_detail.html", {
         "contact": {"open_id": "ou_creator", "primary_role": "creator", "confirmed_role_labels": []},
@@ -383,8 +322,6 @@ def test_every_admin_route_is_in_the_access_matrix(monkeypatch):
         actual.update((method, path) for method in route.methods)
     expected = {("GET", path.split("?", 1)[0]) for _, path in GET_ROUTES}
     expected.add(("GET", ASSESSMENT_ROUTE))
-    # This owner-only roster has its own deny-before-query matrix.
-    expected.add(("GET", "/admin/creator-review/preparation"))
     expected.update(("POST", path) for path in POST_ROUTES)
     assert actual == expected
 

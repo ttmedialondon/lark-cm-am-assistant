@@ -49,44 +49,10 @@ def test_message_conversation_filter_values_are_bounded_and_allowlisted():
     assert admin_reporting.normalize_organization_status("unexpected") == "all"
     assert admin_reporting.normalize_organization_query("  TT   MEDIA ITALY  ") == "TT MEDIA ITALY"
     assert admin_reporting.normalize_organization_query("x" * 121) == "x" * 120
-    assert admin_reporting.normalize_creator_assignment_filter("pending") == "pending"
-    assert admin_reporting.normalize_creator_assignment_filter("unexpected") == "all"
-    assert admin_reporting.normalize_user_permission_filter("creator-review") == "creator-review"
+    assert admin_reporting.normalize_user_permission_filter("messages") == "messages"
+    assert admin_reporting.normalize_user_permission_filter("creator-review") == "all"
     assert admin_reporting.normalize_user_permission_filter("none") == "none"
     assert admin_reporting.normalize_user_permission_filter("unexpected") == "all"
-
-
-def test_creator_pending_filter_requires_the_latest_actionable_assignment_suggestion(monkeypatch):
-    calls = []
-
-    class Result:
-        def __init__(self, *, row=None, rows=None):
-            self.row = row
-            self.rows = rows or []
-
-        def fetchone(self):
-            return self.row
-
-        def fetchall(self):
-            return self.rows
-
-    class Connection:
-        def execute(self, query, params=None):
-            calls.append((query, params))
-            return Result(row={"total_count": 0}) if len(calls) == 1 else Result()
-
-    monkeypatch.setattr(admin_reporting, "connection", lambda: nullcontext(Connection()))
-
-    page = admin_reporting.creators(assignment="pending")
-
-    assert page["items"] == []
-    query, params = calls[0]
-    assert params == (0.7, "direct_evidence_v2", "pending", "pending")
-    assert "assessment.outcome = 'review_required'" in query
-    assert "latest_assessment.decision IN ('assign', 'needs_review')" in query
-    assert "latest_assessment.confidence >= %s::numeric" in query
-    assert "assessment.policy_version = %s" in query
-    assert "automatic_threshold" not in query
 
 
 def test_member_count_labels_preserve_pending_and_unavailable_states():
@@ -234,8 +200,8 @@ def _empty_reporting_database(monkeypatch, first_row):
 
 def test_personnel_permission_filter_binds_values_and_keeps_global_summary(monkeypatch):
     calls = _empty_reporting_database(monkeypatch, {"total": 7, "backend": 2, "owners": 1, "total_count": 0})
-    page = admin_reporting.users(99, "  Remi_%  ", "creator-review")
-    expected_filter = ("Remi_%", *(["creator-review"] * 5), sorted(admin_reporting.PAGE_KEYS), "creator-review")
+    page = admin_reporting.users(99, "  Remi_%  ", "messages")
+    expected_filter = ("Remi_%", *(["messages"] * 5), sorted(admin_reporting.PAGE_KEYS), "messages")
     assert calls[0][1] == expected_filter
     assert calls[1][1] == (*expected_filter, admin_reporting.LIST_PAGE_SIZE + 1, 0)
     assert "strpos(LOWER" in calls[0][0]
@@ -355,11 +321,8 @@ def test_message_page_decrypts_only_selected_hundred_then_displays_chronological
      ("merge_forward", "合并转发"), ("share_chat", "分享群聊"), ("share_user", "分享联系人"),
      (None, "其他消息"), ("unknown", "其他消息")],
 )
-def test_message_type_labels_share_the_existing_creator_mapping(message_type, label):
-    from app import creator_review
-
+def test_message_type_labels_match_the_rendered_body(message_type, label):
     assert admin_reporting._message_type_label(message_type) == label
-    assert creator_review._message_type_label is admin_reporting._message_type_label
     item = admin_reporting._decorate_message(
         {"message_type": message_type, "body_ciphertext": "synthetic"},
         SimpleNamespace(decrypt=lambda value: '{}'),

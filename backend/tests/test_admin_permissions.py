@@ -77,13 +77,13 @@ def test_inactive_owner_role_does_not_confer_owner_access(monkeypatch):
 
 
 def test_batch_load_is_single_query_and_only_allowlisted_pages_apply(monkeypatch):
-    conn = database(monkeypatch, [[account(permissions=["jobs", "creator-review", "unrecognized"])]])
+    conn = database(monkeypatch, [[account(permissions=["jobs", "creators", "creator-review", "unrecognized"])]])
     results = admin_permissions.users_access_data([OWNER, PERSON, PERSON])
     assert len(conn.calls) == 1
     assert conn.calls[0][1] == ([OWNER, PERSON],)
-    assert results[PERSON]["permissions"] == {"jobs", "creator-review"}
-    assert results[PERSON]["landing_path"] == "/admin/creator-review"
-    assert results[PERSON]["permission_labels"] == ["达人归属复核", "同步任务"]
+    assert results[PERSON]["permissions"] == {"jobs"}
+    assert results[PERSON]["landing_path"] == "/admin/jobs"
+    assert results[PERSON]["permission_labels"] == ["同步任务"]
     assert results[OWNER]["has_admin_access"] is False
     assert admin_permissions.users_access_data([]) == {}
     assert len(conn.calls) == 1
@@ -101,7 +101,7 @@ def write_rows(*, actor_status="active", actor_role="owner", actor_active=True, 
 
 
 @pytest.mark.parametrize(
-    "invalid", [["owner"], ["messages", "unknown"], [None], [123], ["jobs", "jobs"], ["jobs"] * 10]
+    "invalid", [["creators"], ["creator-review"], [None], ["jobs", "jobs"], ["jobs"] * 10]
 )
 def test_invalid_page_rejected_without_database_access(monkeypatch, invalid):
     conn = database(monkeypatch, [])
@@ -139,7 +139,7 @@ def test_missing_target_is_not_created(monkeypatch):
     assert len(conn.calls) == 2
 
 
-@pytest.mark.parametrize("requested", [[], ["creator-review", "jobs"]])
+@pytest.mark.parametrize("requested", [[], ["messages", "jobs"]])
 def test_replacement_locks_accounts_and_audits_exact_before_after(monkeypatch, requested):
     conn = database(monkeypatch, write_rows(before=["messages"]))
     admin_permissions.set_permissions(OWNER, PERSON, requested)
