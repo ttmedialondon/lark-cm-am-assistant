@@ -343,9 +343,13 @@ def load_person_evidence(conn, job, settings):
            WHERE ac.authorization_id=%s AND ac.chat_id=ANY(%s::text[]) ORDER BY ac.chat_id FOR SHARE OF ac,c""",
         (cm_id, chat_ids),
     ).fetchall()
-    where = " AND (m.chat_id,m.message_id) IN (SELECT * FROM unnest(%s::text[],%s::text[]))"
+    # Give PostgreSQL selective index predicates before the exact paired-ID
+    # guard; otherwise it may join the CM's entire history before filtering 30 rows.
+    where = (" AND (m.chat_id,m.message_id) IN (SELECT * FROM unnest(%s::text[],%s::text[]))"
+             " AND m.chat_id=ANY(%s::text[]) AND m.message_id=ANY(%s::text[])")
     ordered = sorted(keys)
-    args = (cm_id, job["window_end"], [k[0] for k in ordered], [k[1] for k in ordered])
+    frozen_chats, frozen_messages = [k[0] for k in ordered], [k[1] for k in ordered]
+    args = (cm_id, job["window_end"], frozen_chats, frozen_messages, frozen_chats, frozen_messages)
     preview = conn.execute(_ROWS + where, args).fetchall()
     identity_ids = sorted({r["sender_open_id"] for r in preview} | scope["open_ids"] |
                           {r["p2p_counterpart_open_id"] for r in preview if r["p2p_counterpart_open_id"]})
