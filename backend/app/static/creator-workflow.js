@@ -396,31 +396,32 @@
       if (!panel) return;
       panel.hidden = !result;
       if (!result) return;
-      const stopped = [initial?.status, result.status].some(status => ["failed", "partial", "cancelled"].includes(status));
-      const status = stopped ? "failed" : initial?.status || result.status;
-      const labels = {waiting_sync: "等待准备", queued: "扫描中", running: "扫描中", scanning: "扫描中", succeeded: initial ? "全部已完成" : "本批已完成", failed: "整体未完成"};
+      const status = initial?.status || result.status;
+      const stopped = ["failed", "partial", "cancelled"].includes(status);
+      const labels = {waiting_sync: "等待准备", queued: "扫描中", running: "扫描中", scanning: "扫描中", succeeded: initial ? "全部已完成" : "本轮已完成", failed: "整体未完成", partial: "整体未完成", cancelled: "已停止"};
       const messages = {
         waiting_sync: "等待同步与 AI 配置就绪后再开始；不会把没有数据当成没有达人。",
-        scanning: "正在分批检查当前授权下已同步的历史业务对话，不限最近消息。扫描完成前，名单只是部分结果。",
+        scanning: "正在分批检查剩余历史业务对话；个别消息段未成功，不会拦住后续扫描。扫描完成前，名单只是部分结果。",
         succeeded: "历史扫描已完成，请核对名单。无候选不代表不存在达人；未确定的 handle 和类型显示“—”。",
-        failed: "整体扫描未完成，后续会话未继续；已有结果已保留。刷新只读取状态，不会重试失败任务。",
+        failed: "本轮仍有未成功或未处理的消息段；已有结果已保留，可重试未完成项。刷新只读取状态，不会重新调用 AI。",
+        cancelled: "扫描已停止；已有结果已保留。请核对当前授权和可读范围，刷新不会恢复执行。",
       };
       $("cw-initial-status").textContent = labels[status] || "待核对";
-      $("cw-initial-message").textContent = stopped ? messages.failed : initial?.error_message || messages[status] || messages.scanning;
+      $("cw-initial-message").textContent = (["waiting_sync", "cancelled"].includes(status) && initial?.error_message) || messages[status] || (stopped ? messages.failed : messages.scanning);
       $("cw-initial-message").classList.toggle("cw-error", stopped);
-      $("cw-initial-counts").textContent = initial ? `会话检查与分批安排：${initial.checked_chats ?? 0} / ${initial.total_chats ?? 0} · 累计排队 ${initial.queued_chats ?? 0} 个消息段。这不是 AI 完成比例；本批处理期间，会话数可能保持不变。` : "下方为当前批次的消息段处理情况，不代表全部历史已处理。";
+      $("cw-initial-counts").textContent = initial ? `会话检查与分批安排：${initial.checked_chats ?? 0} / ${initial.total_chats ?? 0} · 已安排 ${initial.queued_chats ?? 0} 个消息段。下方累计本轮已安排的消息段，不是全部历史的完成比例。` : "下方累计本轮已安排的消息段，不代表全部历史已处理。";
       const countLabels = {succeeded: "成功", queued: "排队", running: "进行中", invalid: "校验未通过", failed: "执行异常", cancelled: "已取消"};
       const counts = Object.fromEntries(Object.keys(countLabels).map(key => [key, Math.max(0, Number(result.counts?.[key]) || 0)]));
       const total = Object.values(counts).reduce((sum, value) => sum + value, 0);
       const processed = counts.succeeded + counts.invalid + counts.failed + counts.cancelled;
       for (const key of Object.keys(countLabels)) $("cw-scan-" + key).textContent = counts[key];
       $("cw-batch-summary").hidden = total === 0;
-      $("cw-batch-label").textContent = `本批成功 ${counts.succeeded} / ${total} 段（${total ? Math.floor(counts.succeeded / total * 100) : 0}%）`;
+      $("cw-batch-label").textContent = `本轮已安排消息段：成功 ${counts.succeeded} / ${total} 段（${total ? Math.floor(counts.succeeded / total * 100) : 0}%）`;
       const progress = $("cw-batch-progress"); progress.max = total || 1; progress.value = counts.succeeded;
       progress.classList.toggle("cw-progress-incomplete", stopped || counts.invalid + counts.failed + counts.cancelled > 0);
-      $("cw-batch-processed").textContent = `本批已处理 ${processed} / ${total} 段 · 待处理 ${counts.queued + counts.running} 段。已处理包括未成功的结果，不等于全部历史扫描完成。`;
+      $("cw-batch-processed").textContent = `本轮已处理 ${processed} / ${total} 段 · 待处理 ${counts.queued + counts.running} 段。已处理包括未成功的结果，不等于全部历史扫描完成。`;
       const dispatch = result.dispatch;
-      $("cw-scan-dispatch").textContent = dispatch ? `本批正在执行 ${dispatch.running_count ?? "—"} 段 · 全系统 AI 队列共享最多 ${dispatch.max_concurrency ?? "—"} 个并行任务。${{ready: "队列正常。", paused: "队列已暂停，请管理员检查。", throttled: "队列限速等待中。"}[dispatch.status] || "队列状态待核对。"}这是应用并发上限，不是 OpenAI 账户配额。` : "并发状态暂未返回；无法据此判断 OpenAI 是否异常。";
+      $("cw-scan-dispatch").textContent = dispatch ? `本轮正在执行 ${dispatch.running_count ?? "—"} 段 · 全系统 AI 队列共享最多 ${dispatch.max_concurrency ?? "—"} 个并行任务。${{ready: "队列正常。", paused: "队列已暂停，请管理员检查。", throttled: "队列限速等待中。"}[dispatch.status] || "队列状态待核对。"}这是应用并发上限，不是 OpenAI 账户配额。` : "并发状态暂未返回；无法据此判断 OpenAI 是否异常。";
       const details = result.error_summary?.length ? result.error_summary : (result.errors || []).map(error => ({message: typeof error === "string" ? error : error.message || error.error}));
       const errorList = $("cw-scan-error-list"); errorList.replaceChildren();
       for (const group of details) {
@@ -428,7 +429,7 @@
         if (message.includes("AI 扫描未完成；未生成候选，请检查服务状态。")) message += " 历史记录未保留具体异常类型。";
         errorList.append(element("li", `${countLabels[group.status] || "历史提示"}${group.count == null ? "（未提供次数）" : ` · ${group.count} 段`}：${message}`));
       }
-      if (!details.length && counts.invalid + counts.failed + counts.cancelled > 0) errorList.append(element("li", "本批存在未成功的消息段，接口尚未提供具体错误分类。"));
+      if (!details.length && counts.invalid + counts.failed + counts.cancelled > 0) errorList.append(element("li", "本轮存在未成功的消息段，接口尚未提供具体错误分类。"));
       $("cw-scan-errors").hidden = errorList.children.length === 0;
       $("cw-initial-limit").textContent = `扫描本轮开始前已同步、当前授权可读的历史；每段 ${initial?.message_limit ?? 80} 条，相邻重叠 ${initial?.message_overlap ?? 20} 条。每条最多 ${initial?.message_char_limit ?? 1500} 字符；未同步消息、图片和附件内容不在本次范围内。`;
       if (initialRetry) { initialRetry.hidden = !["failed", "cancelled"].includes(initial?.status); initialRetry.disabled = running; }
@@ -458,8 +459,9 @@
         if (sequence !== aiLoading) return;
         const result = response.run;
         const initial = result?.onboarding;
-        const running = result && ["queued", "running"].includes(result.status);
-        const initialActive = initial && ["waiting_sync", "scanning"].includes(initial.status);
+        const cancelled = (initial?.status || result?.status) === "cancelled";
+        const running = !cancelled && result && ["queued", "running"].includes(result.status);
+        const initialActive = !cancelled && initial && ["waiting_sync", "scanning"].includes(initial.status);
         showInitial(initial, result, running);
         $("cw-initial-updated").textContent = `上次更新：${new Date().toLocaleTimeString("en-GB", {timeZone: "Europe/London"})}（英国时间）`;
         if (canScan) $("cw-ai-scan").disabled = Boolean(running || initialActive);

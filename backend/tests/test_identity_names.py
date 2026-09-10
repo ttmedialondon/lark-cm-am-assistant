@@ -181,6 +181,34 @@ def test_new_contact_and_new_member_keep_canonical_composite(pg, person):
     )
 
 
+def test_tenant_refresh_updates_changed_facts_without_rewriting_other_identities(pg, person):
+    pg.execute("UPDATE lark_identities SET tenant_key='company' WHERE open_id='ou_person'")
+    pg.execute(
+        """INSERT INTO lark_identities(open_id,tenant_key,identity_type) VALUES
+               ('ou_external','external','user'), ('ou_app',NULL,'app')"""
+    )
+    worker._refresh_tenant_classifications(pg, set())
+    before = {
+        row["open_id"]: row
+        for row in pg.execute("SELECT open_id,tenant_classification,ctid::text AS version FROM lark_identities")
+    }
+    assert before["ou_person"]["tenant_classification"] == "known_external"
+    assert before["ou_external"]["tenant_classification"] == "known_external"
+    assert before["ou_legacy"]["tenant_classification"] == "unresolved"
+    assert before["ou_app"]["tenant_classification"] == "internal"
+
+    worker._refresh_tenant_classifications(pg, {"company"})
+    after = {
+        row["open_id"]: row
+        for row in pg.execute("SELECT open_id,tenant_classification,ctid::text AS version FROM lark_identities")
+    }
+    assert after.pop("ou_person")["tenant_classification"] == "internal"
+    before.pop("ou_person")
+    assert after == before  # An UPDATE, even to the same value, creates a new tuple/lock.
+    role = pg.execute("SELECT role,status,is_primary FROM contact_roles WHERE contact_id=%s", (person[0],)).fetchone()
+    assert role == {"role": "internal_colleague", "status": "confirmed", "is_primary": True}
+
+
 def test_group_display_variant_cannot_override_authorized_profile(pg, person):
     update_identity_names(
         pg, "ou_person", name="Quanzhen Liang", en_name="Remi", en_name_present=True, authoritative=True

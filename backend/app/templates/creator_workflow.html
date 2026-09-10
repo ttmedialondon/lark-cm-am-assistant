@@ -23,7 +23,7 @@
         <p id="cw-batch-processed" class="cw-small"></p>
       </div>
       <p id="cw-scan-dispatch" class="cw-small"></p>
-      <div id="cw-scan-errors" class="cw-scan-errors" hidden><strong>本批未成功原因</strong><ul id="cw-scan-error-list"></ul><p class="cw-small">“执行异常”只表示该段未正常完成，不等于 OpenAI 服务故障；刷新不会重试或重新调用 AI。</p></div>
+      <div id="cw-scan-errors" class="cw-scan-errors" hidden><strong>本轮未成功原因</strong><ul id="cw-scan-error-list"></ul><p class="cw-small">“执行异常”只表示该段未正常完成，不等于 OpenAI 服务故障；刷新不会重试或重新调用 AI。</p></div>
       <p id="cw-initial-limit" class="cw-small"></p>
       <p id="cw-initial-updated" class="cw-small">尚未读取进度</p>
     </section>
@@ -46,5 +46,5 @@
 <dialog id="cw-import-dialog" class="cw-dialog" aria-labelledby="cw-import-title"><form id="cw-import-form"><div class="cw-dialog-heading"><h2 id="cw-import-title">{{ (scope.responsible_name ~ ' 的 CAP 名单') if scope.can_admin else '我的 CAP 名单' }}</h2><button class="btn btn-sm btn-outline-secondary" type="button" id="cw-import-close">关闭</button></div><p>Excel 只需要 handle 列，不用填写 CM 或本人／代表关系。先预检，再提交；与 AI 业务线索明确对应到用户的记录可直接入库；无法确定对应用户的记录保留待确认。</p><label class="form-label" for="cw-import-file">选择 CAP Excel 文件</label><input id="cw-import-file" name="file" type="file" class="form-control" accept=".xlsx" required><p class="cw-small">{% if scope.can_admin %}这份名单归当前选定的 {{ scope.responsible_name or 'CM' }}；请先核对上方负责人。{% else %}这份 CAP 名单只归你本人负责。{% endif %}上传不会扩大 Lark 读取权限。</p><button class="btn btn-primary" type="submit" id="cw-import-check"{% if not scope.responsible_id %} disabled{% endif %}>预检文件</button></form><div id="cw-import-feedback" class="cw-feedback" role="status" aria-live="polite" hidden></div><div id="cw-import-results"></div><button class="btn btn-primary" type="button" id="cw-import-commit" hidden>确认提交这份预检结果</button></dialog>
 {% endif %}
 <script id="creator-workflow-data" type="application/json">{{ {'scope': scope, 'csrf_token': csrf_token, 'data': creator_data, 'responsibles': responsibles|default([])}|tojson }}</script>
-<script src="/static/creator-workflow.js?v=20260911-progress" defer></script>
+<script src="/static/creator-workflow.js?v=20260911-continue" defer></script>
 {% endblock %}

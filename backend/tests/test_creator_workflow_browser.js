@@ -318,9 +318,8 @@ test("CAP Excel preflight precedes commit and the browser does not confirm AI ca
   assert.deepEqual(errors, []);
 });
 
-test("failed initial scan retries only on explicit authorized click and rejected consent changes remain stopped", async t => {
-  const onboarding = {status: "failed", total_chats: 1193, checked_chats: 100, queued_chats: 262,
-    error_message: "本批有失败，请手动重试。"};
+test("historical scan continues after a failed batch, retains errors, and retries only with current authorization", async t => {
+  const onboarding = {status: "scanning", total_chats: 1193, checked_chats: 100, queued_chats: 262};
   const run = {id: "run-1", status: "failed", candidate_count: 55,
     counts: {succeeded: 212, invalid: 48, failed: 2, queued: 0, running: 0, cancelled: 0},
     error_summary: [{status: "invalid", message: "候选未通过证据校验。", count: 48},
@@ -328,11 +327,12 @@ test("failed initial scan retries only on explicit authorized click and rejected
     dispatch: {max_concurrency: 3, running_count: 0, status: "ready"}};
   const {page, state, errors} = await fixture(t, {onboarding, run});
   const retry = page.getByRole("button", {name: "重试历史扫描", exact: true});
-  await retry.waitFor();
-  assert.equal(await page.locator("#cw-initial-status").textContent(), "整体未完成");
-  assert((await page.locator("#cw-initial-message").textContent()).includes("后续会话未继续；已有结果已保留"));
+  await page.locator("#cw-initial-status").getByText("扫描中", {exact: true}).waitFor();
+  assert(!(await retry.isVisible()));
+  assert(await page.getByRole("button", {name: "扫描历史业务对话", exact: true}).isDisabled());
+  assert((await page.locator("#cw-initial-message").textContent()).includes("不会拦住后续扫描"));
   assert((await page.locator("#cw-initial-counts").textContent()).includes("100 / 1193"));
-  assert((await page.locator("#cw-initial-counts").textContent()).includes("不是 AI 完成比例"));
+  assert((await page.locator("#cw-initial-counts").textContent()).includes("不是全部历史的完成比例"));
   assert.equal(await page.locator("#cw-batch-progress").getAttribute("value"), "212");
   assert.equal(await page.locator("#cw-batch-progress").getAttribute("max"), "262");
   assert((await page.locator("#cw-batch-label").textContent()).includes("80%"));
@@ -340,14 +340,37 @@ test("failed initial scan retries only on explicit authorized click and rejected
   assert(await page.getByText("校验未通过 · 48 段：候选未通过证据校验。", {exact: true}).isVisible());
   assert((await page.locator("#cw-scan-error-list").textContent()).includes("执行异常 · 2 段"));
   assert((await page.locator("#cw-scan-error-list").textContent()).includes("历史记录未保留具体异常类型"));
-  assert((await page.locator("#cw-scan-dispatch").textContent()).includes("本批正在执行 0 段"));
+  assert((await page.locator("#cw-scan-dispatch").textContent()).includes("本轮正在执行 0 段"));
   assert((await page.locator("#cw-scan-dispatch").textContent()).includes("全系统 AI 队列共享最多 3 个并行任务"));
+  state.run = {...run, status: "cancelled"};
+  await Promise.all([
+    page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/ai/status")),
+    page.getByRole("button", {name: "刷新进度", exact: true}).click(),
+  ]);
+  assert.equal(await page.locator("#cw-initial-status").textContent(), "扫描中");
+  assert(!(await retry.isVisible()));
+  // A cancelled message batch is not revoked CM authorization: keep polling the pass.
+  await page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/ai/status"), {timeout: 6500});
+  assert.equal(await page.locator("#cw-initial-status").textContent(), "扫描中");
+  state.run = run;
+  state.onboarding = {...onboarding, status: "failed", checked_chats: 1193,
+    error_message: "全部会话已检查，仍有 50 段未完成。"};
+  await page.getByRole("button", {name: "刷新进度", exact: true}).click();
+  await retry.waitFor();
+  assert.equal(await page.locator("#cw-initial-status").textContent(), "整体未完成");
+  assert((await page.locator("#cw-initial-message").textContent()).includes("本轮仍有未成功或未处理的消息段"));
+  assert(!(await page.locator("#cw-initial-message").textContent()).includes("后续会话未继续"));
+  assert((await page.locator("#cw-initial-counts").textContent()).includes("1193 / 1193"));
+  assert(await page.getByText("校验未通过 · 48 段：候选未通过证据校验。", {exact: true}).isVisible());
   if (process.env.CW_SCREENSHOT_DIR) await page.screenshot({path: path.join(process.env.CW_SCREENSHOT_DIR, "creator-workflow-progress-failed.png"), fullPage: true});
   assert.equal(state.calls.filter(call => call.method !== "GET").length, 0);
+  state.onboarding = {...state.onboarding, status: "cancelled", error_message: "正文授权已变化；历史扫描已停止。"};
+  await page.getByRole("button", {name: "刷新进度", exact: true}).click();
+  await page.locator("#cw-initial-status").getByText("已停止", {exact: true}).waitFor();
   state.initialRetryError = "正文授权已变化，旧首次筛选不可重放；请使用当前范围的手动扫描。";
   await retry.click();
   await page.locator("#cw-initial-message").getByText(state.initialRetryError, {exact: true}).waitFor();
-  assert.equal(state.onboarding.status, "failed");
+  assert.equal(state.onboarding.status, "cancelled");
   assert(!(await retry.isDisabled()));
   state.initialRetryError = null;
   await retry.click();

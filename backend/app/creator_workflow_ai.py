@@ -284,18 +284,21 @@ def scan_status(actor_id, responsible_id) -> dict | None:
                 if onboarding
                 else None
             )
+        # Keep earlier gaps visible as subsequent batches of this pass proceed.
+        pass_scope = (run["id"], run["onboarding_authorization_id"], run["window_start"], run["window_end"])
+        task_scope = """ FROM creator_workflow_ai_tasks t JOIN creator_workflow_ai_runs r ON r.id=t.run_id
+            WHERE (r.id=%s OR (r.onboarding_authorization_id=%s AND r.window_start=%s AND r.window_end=%s)) """
         counts = conn.execute(
-            """SELECT status, COUNT(*) AS count, SUM(candidate_count) AS candidate_count,
-                      COUNT(*) FILTER (WHERE status='running' AND lease_until>NOW()) AS leased_count
-               FROM creator_workflow_ai_tasks WHERE run_id = %s GROUP BY status""",
-            (run["id"],),
+            """SELECT t.status, COUNT(*) AS count, SUM(t.candidate_count) AS candidate_count,
+                      COUNT(*) FILTER (WHERE t.status='running' AND t.lease_until>NOW()) AS leased_count"""
+            + task_scope + " GROUP BY t.status",
+            pass_scope,
         ).fetchall()
         errors = conn.execute(
-            """SELECT status,error_message AS message,COUNT(*) AS count
-               FROM creator_workflow_ai_tasks WHERE run_id=%s
-                 AND status IN ('failed','invalid','cancelled')
-               GROUP BY status,error_message ORDER BY count DESC,status,error_message""",
-            (run["id"],),
+            "SELECT t.status,t.error_message AS message,COUNT(*) AS count" + task_scope
+            + """ AND t.status IN ('failed','invalid','cancelled')
+               GROUP BY t.status,t.error_message ORDER BY count DESC,t.status,t.error_message""",
+            pass_scope,
         ).fetchall()
         dispatch["running_count"] = sum(r["leased_count"] for r in counts)
     return {
@@ -345,6 +348,7 @@ def claim_next_creator_scan() -> dict | None:
                       r.window_start, r.window_end FROM creator_workflow_ai_tasks t
                JOIN creator_workflow_ai_runs r ON r.id = t.run_id
                WHERE t.status = 'queued' AND t.scheduled_at <= NOW()
+                 AND r.status IN ('queued','running')
                ORDER BY t.scheduled_at, t.created_at FOR UPDATE OF t SKIP LOCKED LIMIT 1"""
         ).fetchone()
         if not row:
@@ -412,14 +416,19 @@ def _load_evidence(conn, job, settings) -> dict:
         message_sql = message_sql.replace("    ORDER BY", "      AND m.message_id=ANY(%s::text[])\n    ORDER BY")
         message_args += (job["message_ids"],)
     message_args += (MAX_MESSAGES + 1,)
-    rows = conn.execute(message_sql, message_args).fetchall()
+    # Sync writes identities before messages. Preview senders without locking
+    # messages, then acquire the same order and re-read all protected evidence.
+    rows = conn.execute(message_sql.replace(' FOR SHARE OF m,o', ''), message_args).fetchall()
+    senders = sorted({r['sender_open_id'] for r in rows if r['sender_open_id']})
     conn.execute(
         "SELECT open_id FROM lark_identities WHERE open_id=ANY(%s::text[]) ORDER BY open_id FOR SHARE",
-        (sorted({r["sender_open_id"] for r in rows if r["sender_open_id"]}),),
+        (senders,),
     ).fetchall()
     # A profile/contact binding may have changed immediately before its lock.
     # Re-read the joined identity values while those rows are now stable.
     rows = conn.execute(message_sql, message_args).fetchall()
+    if sorted({r['sender_open_id'] for r in rows if r['sender_open_id']}) != senders:
+        raise ScanInputError("读取期间消息发送人发生变化；未使用未锁定的身份资料。")
     truncated = len(rows) > MAX_MESSAGES
     rows = rows[:MAX_MESSAGES]
     if not rows or _fingerprint(chat, rows) != job["input_fingerprint"]:
@@ -826,6 +835,122 @@ def _finish(job, status, error=None, *, retry_delay=None, response=None, model=N
         _refresh_run(conn, job["run_id"])
 
 
+def _save_scan_result(job, settings, config, evidence, candidates, response):
+    with connection() as conn, conn.transaction():
+        # Match ingestion's scope-first order before taking evidence locks.
+        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended('creator-workflow-write',0))")
+        conn.execute("SELECT id FROM authorizations WHERE id=%s FOR SHARE",
+                     (job["responsible_authorization_id"],)).fetchall()
+        conn.execute(
+            "SELECT chat_id FROM authorization_chats WHERE authorization_id=%s ORDER BY chat_id FOR SHARE",
+            (job["responsible_authorization_id"],),
+        ).fetchall()
+        task = conn.execute(
+            """SELECT status, attempts, lease_until > NOW() AS leased
+               FROM creator_workflow_ai_tasks WHERE id = %s FOR UPDATE""",
+            (job["id"],),
+        ).fetchone()
+        if not task or task["status"] != "running" or task["attempts"] != job["attempts"] or not task["leased"]:
+            return
+        if not _enabled(conn):
+            raise ScanInputError("达人候选 AI 已停用，未保存模型结果。")
+        current = _load_evidence(conn, job, settings)
+        if current["pack"] != evidence["pack"]:
+            raise ScanInputError("调用期间证据已变化；未保存模型结果。")
+        inserted_count = 0
+        for candidate in candidates:
+            labels = set(
+                candidate["creator_refs"]
+                + candidate["responsibility_refs"]
+                + candidate["handle_refs"]
+                + candidate["identity_refs"]
+                + candidate["type_refs"]
+            )
+            refs = [r for r in evidence["refs"] if r["label"] in labels]
+            identity = evidence["users"].get(candidate["user"], {})
+            # Free model prose can contain private chat excerpts. Persist only
+            # controlled gap labels and structural evidence, never raw quotes.
+            gaps = list(candidate["unknowns"])
+            if not candidate["responsible"]:
+                gaps.append("ownership_uncertain")
+            unknowns = ["ai_review", *gaps]
+            facts = _verified_facts(candidate, evidence)
+            handle = candidate["handle"] if (
+                facts["exact_handle_evidence"]
+                and facts["identity_confidence"] >= creator_workflow.AUTO_CONFIRM_THRESHOLD
+            ) else None
+            source = {
+                "evidence": refs,
+                "reason": "该用户与 CM 的实际达人业务对话；账号信息仅作辅助。",
+                "unknowns": gaps,
+                "handle_raw": candidate["handle"],
+                "alternative_handles": candidate["alternative_handles"],
+                "model": config["model"],
+                "run_id": str(job["run_id"]),
+                "policy_version": POLICY_VERSION,
+                "relationship_unknown": candidate["relationship"] == "unknown",
+                "responsibility_confirmed": candidate["responsible"] == "CM1",
+                **facts,
+                "input_truncated": evidence["pack"].get("input_truncated", False),
+            }
+            # Same evidence is idempotent across unchanged continuations. A
+            # new message/edited body is real new evidence, not a new account.
+            source_key = hashlib.sha256(
+                json.dumps(
+                    [
+                        BUSINESS_POLICY_VERSION,
+                        facts,
+                        gaps,
+                        str(job["responsible_authorization_id"]),
+                        candidate["handle"].strip().lstrip("@").casefold()
+                        if candidate["handle"]
+                        else str(identity.get("contact_id")),
+                        [(r["chat_id"], r["message_id"]) for r in refs],
+                        [m["text"] for m in evidence["pack"]["messages"] if m["ref"] in labels],
+                    ],
+                    ensure_ascii=False,
+                ).encode()
+            ).hexdigest()
+            if conn.execute(
+                "SELECT 1 FROM creator_workflow_sources WHERE source_type = 'ai' AND source_key = %s LIMIT 1",
+                (source_key,),
+            ).fetchone():
+                # Different model prose/run IDs are not fresh evidence and
+                # must not reopen a CM's denial or completed confirmation.
+                continue
+            creator_workflow.ingest_source(
+                job["requested_by_authorization_id"],
+                source_type="ai",
+                source_key=source_key,
+                source_data=source,
+                # Workflow may confirm the person relationship from verified
+                # dialogue. An unverified handle must never create an account link.
+                responsible_id=job["responsible_authorization_id"],
+                platform="tiktok",
+                handle=handle,
+                contact_id=identity.get("contact_id"),
+                creator_type=facts["creator_type"],
+                relationship=candidate["relationship"] if candidate["relationship"] != "unknown" else None,
+                uncertainties=unknowns,
+                trusted_identity=False,
+                conn=conn,
+            )
+            inserted_count += 1
+        conn.execute(
+            """UPDATE creator_workflow_ai_tasks SET status = 'succeeded', candidate_count = %s,
+                 model = %s, response_id = %s, usage = %s::jsonb, lease_until = NULL,
+                 error_message = NULL, finished_at = NOW() WHERE id = %s""",
+            (
+                inserted_count,
+                config["model"],
+                response.get("response_id"),
+                json.dumps(response.get("usage") or {}),
+                job["id"],
+            ),
+        )
+        _refresh_run(conn, job["run_id"])
+
+
 def run_claimed_creator_scan(job: Mapping[str, Any], settings: Settings) -> None:
     response = None
     stage = "准备消息"
@@ -875,111 +1000,14 @@ def run_claimed_creator_scan(job: Mapping[str, Any], settings: Settings) -> None
         stage = "校验 AI 结果"
         candidates = _validate(response["text"], evidence)
         stage = "保存结果"
-        with connection() as conn, conn.transaction():
-            task = conn.execute(
-                """SELECT status, attempts, lease_until > NOW() AS leased
-                   FROM creator_workflow_ai_tasks WHERE id = %s FOR UPDATE""",
-                (job["id"],),
-            ).fetchone()
-            if not task or task["status"] != "running" or task["attempts"] != job["attempts"] or not task["leased"]:
-                return
-            if not _enabled(conn):
-                raise ScanInputError("达人候选 AI 已停用，未保存模型结果。")
-            current = _load_evidence(conn, job, settings)
-            if current["pack"] != evidence["pack"]:
-                raise ScanInputError("调用期间证据已变化；未保存模型结果。")
-            inserted_count = 0
-            for candidate in candidates:
-                labels = set(
-                    candidate["creator_refs"]
-                    + candidate["responsibility_refs"]
-                    + candidate["handle_refs"]
-                    + candidate["identity_refs"]
-                    + candidate["type_refs"]
-                )
-                refs = [r for r in evidence["refs"] if r["label"] in labels]
-                identity = evidence["users"].get(candidate["user"], {})
-                # Free model prose can contain private chat excerpts. Persist only
-                # controlled gap labels and structural evidence, never raw quotes.
-                gaps = list(candidate["unknowns"])
-                if not candidate["responsible"]:
-                    gaps.append("ownership_uncertain")
-                unknowns = ["ai_review", *gaps]
-                facts = _verified_facts(candidate, evidence)
-                handle = candidate["handle"] if (
-                    facts["exact_handle_evidence"]
-                    and facts["identity_confidence"] >= creator_workflow.AUTO_CONFIRM_THRESHOLD
-                ) else None
-                source = {
-                    "evidence": refs,
-                    "reason": "该用户与 CM 的实际达人业务对话；账号信息仅作辅助。",
-                    "unknowns": gaps,
-                    "handle_raw": candidate["handle"],
-                    "alternative_handles": candidate["alternative_handles"],
-                    "model": config["model"],
-                    "run_id": str(job["run_id"]),
-                    "policy_version": POLICY_VERSION,
-                    "relationship_unknown": candidate["relationship"] == "unknown",
-                    "responsibility_confirmed": candidate["responsible"] == "CM1",
-                    **facts,
-                    "input_truncated": evidence["pack"].get("input_truncated", False),
-                }
-                # Same evidence is idempotent across unchanged continuations. A
-                # new message/edited body is real new evidence, not a new account.
-                source_key = hashlib.sha256(
-                    json.dumps(
-                        [
-                            BUSINESS_POLICY_VERSION,
-                            facts,
-                            gaps,
-                            str(job["responsible_authorization_id"]),
-                            candidate["handle"].strip().lstrip("@").casefold()
-                            if candidate["handle"]
-                            else str(identity.get("contact_id")),
-                            [(r["chat_id"], r["message_id"]) for r in refs],
-                            [m["text"] for m in evidence["pack"]["messages"] if m["ref"] in labels],
-                        ],
-                        ensure_ascii=False,
-                    ).encode()
-                ).hexdigest()
-                if conn.execute(
-                    "SELECT 1 FROM creator_workflow_sources WHERE source_type = 'ai' AND source_key = %s LIMIT 1",
-                    (source_key,),
-                ).fetchone():
-                    # Different model prose/run IDs are not fresh evidence and
-                    # must not reopen a CM's denial or completed confirmation.
-                    continue
-                creator_workflow.ingest_source(
-                    job["requested_by_authorization_id"],
-                    source_type="ai",
-                    source_key=source_key,
-                    source_data=source,
-                    # Workflow may confirm the person relationship from verified
-                    # dialogue. An unverified handle must never create an account link.
-                    responsible_id=job["responsible_authorization_id"],
-                    platform="tiktok",
-                    handle=handle,
-                    contact_id=identity.get("contact_id"),
-                    creator_type=facts["creator_type"],
-                    relationship=candidate["relationship"] if candidate["relationship"] != "unknown" else None,
-                    uncertainties=unknowns,
-                    trusted_identity=False,
-                    conn=conn,
-                )
-                inserted_count += 1
-            conn.execute(
-                """UPDATE creator_workflow_ai_tasks SET status = 'succeeded', candidate_count = %s,
-                     model = %s, response_id = %s, usage = %s::jsonb, lease_until = NULL,
-                     error_message = NULL, finished_at = NOW() WHERE id = %s""",
-                (
-                    inserted_count,
-                    config["model"],
-                    response.get("response_id"),
-                    json.dumps(response.get("usage") or {}),
-                    job["id"],
-                ),
-            )
-            _refresh_run(conn, job["run_id"])
+        # Retry only the rolled-back save transaction, never the paid model call.
+        for save_attempt in range(3):
+            try:
+                _save_scan_result(job, settings, config, evidence, candidates, response)
+                break
+            except (psycopg.errors.DeadlockDetected, psycopg.errors.SerializationFailure):
+                if save_attempt == 2:
+                    raise
     except (InvalidModelOutput, contact_assessments._ModelOutputError) as exc:
         message = {
             "unfinished response": "OpenAI 返回未完成，可能达到输出上限或被中断。",

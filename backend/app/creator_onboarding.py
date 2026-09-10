@@ -53,6 +53,32 @@ def _stop(conn, row, status, message):
     )
 
 
+def _activate_queued_retry(conn, row):
+    """Only one run per CM may be active; replay explicitly queued batches in order."""
+    if conn.execute(
+        """SELECT 1 FROM creator_workflow_ai_runs WHERE responsible_authorization_id=%s
+           AND status IN ('queued','running')""",
+        (row["authorization_id"],),
+    ).fetchone():
+        return True
+    run = conn.execute(
+        """SELECT r.id FROM creator_workflow_ai_runs r
+           WHERE r.onboarding_authorization_id=%s AND r.window_start=%s AND r.window_end=%s
+             AND EXISTS (SELECT 1 FROM creator_workflow_ai_tasks t
+                         WHERE t.run_id=r.id AND t.status='queued')
+           ORDER BY r.created_at,r.id LIMIT 1""",
+        (row["authorization_id"], row["window_start"], row["window_end"]),
+    ).fetchone()
+    if not run:
+        return False
+    ai._refresh_run(conn, run["id"])
+    conn.execute(
+        "UPDATE creator_workflow_onboarding SET run_id=%s WHERE authorization_id=%s",
+        (run["id"], row["authorization_id"]),
+    )
+    return True
+
+
 def advance_initial_scans():
     """Worker metadata tick; no model calls and no automatic retries of failures."""
     with connection() as conn, conn.transaction():
@@ -130,10 +156,14 @@ def advance_initial_scans():
                 ).fetchone()
                 if run and run["status"] in {"queued", "running"}:
                     continue
-                if not run or run["status"] != "succeeded":
-                    _stop(conn, row, "failed", "本批有失败或资料变化，首次筛选未完成；请手动重试，不会无限调用。")
+                if not run:
+                    _stop(conn, row, "failed", "扫描批次记录缺失；历史筛选已停止，请检查服务状态。")
                     continue
             try:
+                ai._authorize(conn, row.get("requested_by_authorization_id") or row["authorization_id"],
+                              row["authorization_id"])
+                if _activate_queued_retry(conn, row):
+                    continue
                 batch = ai.queue_initial_batch(conn, row)
             except (PermissionError, ai.ScanInputError):
                 _stop(conn, row, "cancelled", "请求人或 CM 的授权已变化；历史筛选已停止。")
@@ -141,10 +171,19 @@ def advance_initial_scans():
             if batch is None:  # A separately requested scan currently owns this CM.
                 continue
             if batch["checked"] == 0:
+                incomplete = conn.execute(
+                    """SELECT COUNT(*) AS n FROM creator_workflow_ai_tasks t
+                       JOIN creator_workflow_ai_runs r ON r.id=t.run_id
+                       WHERE r.onboarding_authorization_id=%s AND r.window_start=%s AND r.window_end=%s
+                         AND t.status IN ('failed','invalid','cancelled')""",
+                    (row["authorization_id"], row["window_start"], row["window_end"]),
+                ).fetchone()["n"]
                 conn.execute(
-                    """UPDATE creator_workflow_onboarding SET status='succeeded',finished_at=NOW(),
-                       next_check_at=NULL,error_message=NULL WHERE authorization_id=%s""",
-                    (row["authorization_id"],),
+                    """UPDATE creator_workflow_onboarding SET status=%s,finished_at=NOW(),
+                       next_check_at=NULL,error_message=%s WHERE authorization_id=%s""",
+                    ("failed" if incomplete else "succeeded",
+                     f"全部会话已检查，仍有 {incomplete} 段未完成；成功结果已保留，可手动重试未完成部分。"
+                     if incomplete else None, row["authorization_id"]),
                 )
                 continue
             conn.execute(
@@ -176,13 +215,15 @@ def retry_initial_scan(actor_id, responsible_id):
         consent = conn.execute("SELECT body_consent_at FROM authorizations WHERE id=%s", (responsible_id,)).fetchone()
         if row["consent_at"] and row["consent_at"] != consent["body_consent_at"]:
             raise ai.ScanInputError("正文授权已变化，旧首次筛选不可重放；请使用当前范围的手动扫描。")
-        if row["run_id"]:
-            conn.execute(
-                """UPDATE creator_workflow_ai_tasks SET status='queued',scheduled_at=NOW(),error_message=NULL
-                   WHERE run_id=%s AND status IN ('failed','invalid','cancelled')""",
-                (row["run_id"],),
-            )
-            ai._refresh_run(conn, row["run_id"])
+        conn.execute(
+            """UPDATE creator_workflow_ai_tasks t SET status='queued',scheduled_at=NOW(),
+               lease_until=NULL,finished_at=NULL,error_message=NULL
+               FROM creator_workflow_ai_runs r WHERE r.id=t.run_id
+                 AND r.onboarding_authorization_id=%s AND r.window_start=%s AND r.window_end=%s
+                 AND t.status IN ('failed','invalid','cancelled')""",
+            (responsible_id, row["window_start"], row["window_end"]),
+        )
+        _activate_queued_retry(conn, row)
         conn.execute(
             """UPDATE creator_workflow_onboarding SET status=%s,next_check_at=NOW(),finished_at=NULL,
                error_message=NULL WHERE authorization_id=%s""",

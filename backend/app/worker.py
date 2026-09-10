@@ -1461,6 +1461,8 @@ def _tenant_classification(
 def _refresh_tenant_classifications(conn: psycopg.Connection, internal_tenant_keys: set[str]) -> None:
     """Reclassify identities when a newly authorised tenant key is learned."""
 
+    # A page commit already holds sender/message locks. Do not also lock every
+    # unchanged identity and block unrelated AI evidence transactions.
     conn.execute(
         """
         UPDATE lark_identities
@@ -1470,8 +1472,14 @@ def _refresh_tenant_classifications(conn: psycopg.Connection, internal_tenant_ke
             WHEN tenant_key = ANY(%s) THEN 'internal'
             ELSE 'known_external'
         END
+        WHERE tenant_classification IS DISTINCT FROM CASE
+            WHEN identity_type <> 'user' THEN 'internal'
+            WHEN tenant_key IS NULL THEN 'unresolved'
+            WHEN tenant_key = ANY(%s) THEN 'internal'
+            ELSE 'known_external'
+        END
         """,
-        (list(internal_tenant_keys),),
+        (list(internal_tenant_keys), list(internal_tenant_keys)),
     )
     _ensure_internal_contact_roles(conn)
 

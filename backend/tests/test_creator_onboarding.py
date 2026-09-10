@@ -115,21 +115,82 @@ def test_revocation_cancels_first_scan_without_late_model_call_or_old_authorizat
     assert ai.claim_next_creator_scan() is None
 
 
-def test_first_scan_failure_stops_until_explicit_retry_without_resetting_attempt_fence(pg, initial, monkeypatch):
+def test_failed_batches_continue_and_explicit_retry_replays_only_incomplete_current_pass(pg, initial, monkeypatch):
     ids, settings = initial
+    for number in range(200):
+        chat = f"b{number:03d}"
+        pg.execute("INSERT INTO chats(chat_id,chat_mode) VALUES(%s,'group')", (chat,))
+        pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,%s)", (ids["cm"], chat))
+        if number in (0, 100):
+            pg.execute(
+                """INSERT INTO chat_messages
+                   (chat_id,message_id,sender_open_id,message_type,body_ciphertext,message_create_time)
+                   SELECT %s,message_id,sender_open_id,message_type,body_ciphertext,message_create_time
+                   FROM chat_messages WHERE chat_id='chat'""", (chat,),
+            )
+            pg.execute(
+                """INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+                   SELECT %s,%s,message_id FROM chat_messages WHERE chat_id='chat'""", (ids["cm"], chat),
+            )
     synced(pg, ids["cm"])
     tick(pg)
-    job = ai.claim_next_creator_scan()
     monkeypatch.setattr(ai.contact_assessments, "call_openai", lambda *_a, **_k: {"text": "invalid JSON"})
-    ai.run_claimed_creator_scan(job, settings)
+    failed = []
+    for checked in (200, 201):
+        job = ai.claim_next_creator_scan()
+        failed.append(job["id"])
+        ai.run_claimed_creator_scan(job, settings)
+        tick(pg)
+        status = onboarding.get_status(pg, ids["cm"])
+        assert status["status"] == "scanning" and status["checked_chats"] == checked
+        progress = ai.scan_status(ids["owner"], ids["cm"])
+        assert progress["counts"]["invalid"] == len(failed) and progress["counts"]["queued"] == 1
+    monkeypatch.setattr(ai.contact_assessments, "call_openai", lambda *_a, **_k: {"text": '{"candidates":[]}'})
+    success = ai.claim_next_creator_scan()
+    ai.run_claimed_creator_scan(success, settings)
+    succeeded = pg.execute("SELECT * FROM creator_workflow_ai_tasks WHERE id=%s", (success["id"],)).fetchone()
+    # A different historical pass must not be included in this retry or its final result.
+    old_run, old_task = uuid4(), uuid4()
+    pg.execute(
+        """INSERT INTO creator_workflow_ai_runs
+           (id,responsible_authorization_id,requested_by_authorization_id,status,history_days,chat_limit,
+            window_start,window_end,onboarding_authorization_id)
+           SELECT %s,responsible_authorization_id,requested_by_authorization_id,'failed',history_days,chat_limit,
+                  window_start,window_end-INTERVAL '1 second',onboarding_authorization_id
+           FROM creator_workflow_ai_runs WHERE id=%s""", (old_run, success["run_id"]),
+    )
+    pg.execute(
+        """INSERT INTO creator_workflow_ai_tasks(id,run_id,chat_id,input_fingerprint,status,attempts)
+           VALUES(%s,%s,'chat','old-pass','invalid',4)""", (old_task, old_run),
+    )
     tick(pg)
     assert onboarding.get_status(pg, ids["cm"])["status"] == "failed"
+    assert "2 段未完成" in onboarding.get_status(pg, ids["cm"])["error_message"]
+    progress = ai.scan_status(ids["owner"], ids["cm"])
+    assert progress["counts"] == {"invalid": 2, "succeeded": 1}
+    assert progress["error_summary"] == [{
+        "status": "invalid", "count": 2,
+        "message": "AI 未返回有效的结构化结果。本段未生成候选。",
+    }]
     tick(pg)
     assert ai.claim_next_creator_scan() is None
     result = onboarding.retry_initial_scan(ids["owner"], ids["cm"])
     assert result["status"] == "scanning"
-    retry = ai.claim_next_creator_scan()
-    assert retry["id"] == job["id"] and retry["attempts"] == job["attempts"] + 1
+    retried = []
+    for _ in range(2):
+        retry = ai.claim_next_creator_scan()
+        retried.append(retry["id"])
+        assert retry["attempts"] == 2
+        assert ai.claim_next_creator_scan() is None  # The other retry run is not active yet.
+        ai.run_claimed_creator_scan(retry, settings)
+        tick(pg)
+    assert set(retried) == set(failed)
+    assert onboarding.get_status(pg, ids["cm"])["status"] == "succeeded"
+    assert pg.execute("SELECT * FROM creator_workflow_ai_tasks WHERE id=%s", (success["id"],)).fetchone() == succeeded
+    assert pg.execute("SELECT status,attempts FROM creator_workflow_ai_tasks WHERE id=%s", (old_task,)).fetchone() == {
+        "status": "invalid", "attempts": 4,
+    }
+    assert ai.claim_next_creator_scan() is None
 
 
 def test_frozen_window_excludes_new_messages_and_non_normal_chats(pg, initial):

@@ -458,12 +458,14 @@ def test_rate_limit_has_a_finite_retry_budget(monkeypatch, run_harness, attempts
 def test_execution_failures_keep_safe_stage_without_replaying_model(monkeypatch, run_harness, caplog, failure_kind):
     h = run_harness
     secret = "private-chat-and-api-key"
+    failures = []
     failure = psycopg.errors.DeadlockDetected(secret)
     if failure_kind == "timeout":
         failure = ai.contact_assessments.ContactAssessmentInputError(secret)
         failure.__cause__ = ai.httpx.ReadTimeout(secret)
 
     def fail(*_args, **_kwargs):
+        failures.append(True)
         raise failure
 
     if failure_kind == "database":
@@ -475,10 +477,43 @@ def test_execution_failures_keep_safe_stage_without_replaying_model(monkeypatch,
     assert args[1] == "failed" and not h.ingested
     assert secret not in args[2] + caplog.text
     if failure_kind == "database":
+        assert len(failures) == 3
         assert "保存结果失败：数据库死锁" in args[2] and "OpenAI 已返回" in args[2]
         assert kwargs["response"]["response_id"] == "response" and len(h.model_calls) == 1
     else:
         assert "OpenAI 请求超时" in args[2] and kwargs["response"] is None
+
+
+def test_save_deadlock_retries_transaction_not_openai_and_rechecks_evidence(monkeypatch, run_harness):
+    h = run_harness
+    original = ai.creator_workflow.ingest_source
+    attempts = []
+
+    def once(*args, **kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise psycopg.errors.DeadlockDetected("not logged")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ai.creator_workflow, "ingest_source", once)
+    ai.run_claimed_creator_scan(h.job, h.settings)
+    assert len(attempts) == 2 and len(h.model_calls) == 1 and len(h.ingested) == 1
+    assert not h.finished
+
+    # A revoked source is not a transient DB conflict and must not be retried.
+    attempts.clear()
+    h.model_calls.clear()
+    h.ingested.clear()
+
+    def changed(*args, **kwargs):
+        if attempts:
+            raise PermissionError("revoked during retry")
+        return once(*args, **kwargs)
+
+    monkeypatch.setattr(ai.creator_workflow, "ingest_source", changed)
+    ai.run_claimed_creator_scan(h.job, h.settings)
+    assert len(h.model_calls) == 1 and len(attempts) == 1 and not h.ingested
+    assert h.finished[0][0][1] == "cancelled"
 
 
 def test_same_evidence_never_reopens_a_denied_source(monkeypatch, run_harness):
@@ -702,7 +737,19 @@ def test_real_queue_claim_model_candidate_and_unchanged_incremental(pg, real_sca
     assert ai.scan_status(ids["owner"], ids["cm"])["dispatch"] == {
         "max_concurrency": 3, "running_count": 1, "status": "ready",
     }
+    refresh_run = ai._refresh_run
+    save_attempts = []
+
+    def deadlock_after_insert(conn, run_id):
+        save_attempts.append(True)
+        if len(save_attempts) == 1:
+            raise psycopg.errors.DeadlockDetected("force rollback after candidate insertion")
+        refresh_run(conn, run_id)
+
+    monkeypatch.setattr(ai, "_refresh_run", deadlock_after_insert)
     ai.run_claimed_creator_scan(job, settings)
+    monkeypatch.setattr(ai, "_refresh_run", refresh_run)
+    assert len(save_attempts) == 2 and len(calls) == 1
     status = ai.scan_status(ids["owner"], ids["cm"])
     assert status["status"] == "succeeded", status
     assert status["candidate_count"] == 1 and status["counts"] == {"succeeded": 1}
