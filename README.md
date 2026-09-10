@@ -1,10 +1,10 @@
 # Lark CM/AM Assistant
 
-Internal system for authorised CM/AM Lark message sync and creator/account review. The next planned scope is auditable event-urgency classification, without reply suggestions or automatic replies.
+Internal system for authorised CM/AM Lark message sync and creator/account review. The next planned scope is an off-hours message summary for the next shift, organised by P0–P3 urgency, without reply suggestions or automatic replies.
 
 ## Current status
 
-- [Message risk priority v1.0](docs/product/message-risk-priority-v1.0.md) records the current P0–P3 business standard and classification-only scope; it overrides conflicting severity/reply requirements in the older PRD/TDD. Classification itself is not implemented yet.
+- [Off-hours message summary — plain-language requirements](docs/product/message-risk-priority-v1.0.md) is the current scope: summarise the CM's off-hours messages by event and P0–P3 urgency for review when work resumes, without real-time alerts, reply suggestions or automatic actions. 18:00–10:00 is an example, not an enabled schedule. The summary/classification feature is not implemented yet; this document overrides conflicting requirements in the older PRD/TDD.
 - `backend/` contains the deployed FastAPI service for authorised CM/AM conversation sync and the owner-only content console.
 - `docs/architecture/TDD_v2.0.md` defines the approved target architecture; it remains a technical-review draft until its P0 governance decisions are closed.
 - `docs/architecture/contact-identity-organization-model-v0.4.md` documents the deployed person, organization, role, and creator-owner model.
