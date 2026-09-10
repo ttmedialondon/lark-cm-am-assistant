@@ -17,6 +17,19 @@ def test_exact_tokens_current_names_repeated_and_legitimate_numeric_user():
     )
 
 
+def test_chinese_prose_can_touch_mentions_but_ascii_identifiers_cannot():
+    mentions = [mention(), mention("@_user_10", "ou_numeric", "user805550")]
+    assert resolve_mentions("请@_user_1帮忙，@_user_10确认。辛苦@_user_1", mentions, {"ou_cm": "Remi"}) == (
+        "请@Remi帮忙，@user805550确认。辛苦@Remi"
+    )
+    literal = "prefix@_user_1 @_user_1suffix @_user_1_more @@_user_1 @_user_100"
+    assert resolve_mentions(literal, mentions) == literal
+    # Keep Unicode whitespace as a URL separator, not part of a URL literal.
+    assert resolve_mentions("看https://example.test/@_user_1\u3000请@_user_1帮忙", mentions, {"ou_cm": "Remi"}) == (
+        "看https://example.test/@_user_1\u3000请@Remi帮忙"
+    )
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -24,6 +37,9 @@ def test_exact_tokens_current_names_repeated_and_legitimate_numeric_user():
         "https://example.test/?target=@_user_1",
         "www.example.test/@_user_1",
         "person@_user_1.example",
+        "联系person@_user_1.example",
+        "查看https://example.test/@_user_1?q=1",
+        "查看www.example.test/@_user_1",
         "@_user_1@example.test",
         "`@_user_1`",
         "```python\nprint('@_user_1')\n```",

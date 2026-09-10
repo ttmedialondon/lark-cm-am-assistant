@@ -6,13 +6,15 @@ import json
 import re
 
 _KEY = re.compile(r"@_user_\d+\Z")
-_TOKEN = re.compile(r"(?<![\w@])@_user_\d+(?![\w@])")
+# Lark placeholders can touch Chinese prose; only ASCII identifier characters
+# make them part of another token.
+_TOKEN = re.compile(r"(?<![\w@])@_user_\d+(?![\w@])", re.ASCII)
 # Message text may quote source code or contain URLs/email addresses. Those are
 # literal content, not a Lark mention to rewrite.
 _LITERAL = re.compile(
     r"```[\s\S]*?(?:```|\Z)|`[^`\n]*`|"
-    r"\b[a-z][a-z0-9+.-]*://[^\s<>]+|\b(?:www\.|mailto:)[^\s<>]+|"
-    r"[\w.!#$%&'*+/=?^`{|}~-]+@[\w.-]+",
+    r"(?a:\b)[a-z][a-z0-9+.-]*://[^\s<>]+|(?a:\b)(?:www\.|mailto:)[^\s<>]+|"
+    r"(?a:[\w.!#$%&'*+/=?^`{|}~-]+@[\w.-]+)",
     re.IGNORECASE,
 )
 
