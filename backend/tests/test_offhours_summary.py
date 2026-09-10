@@ -466,3 +466,21 @@ def test_failed_or_quota_model_is_never_success_or_routine(pg, seeded, monkeypat
     )
     ai.ai_dispatch.pause_for_quota()
     assert "配额" in " ".join(ai.get_summary_view(pg, s.ids["owner"])["run"]["gaps"])
+
+
+def test_network_failure_retries_are_bounded_not_cancelled_refresh_loop(pg, seeded, monkeypatch):
+    s = seeded
+    s.save()
+
+    def fail(*_a, **_k):
+        raise ai.contact_assessments.ContactAssessmentInputError("simulated timeout")
+
+    monkeypatch.setattr(ai.contact_assessments, "call_openai", fail)
+    for _ in range(ai.MAX_ATTEMPTS):
+        job = ai.claim_next_summary()
+        assert job
+        ai.run_claimed_summary(job, s.settings)
+        pg.execute("UPDATE offhours_summary_tasks SET scheduled_at=NOW()")
+    ai.schedule_if_due(pg, force=True)
+    assert ai.claim_next_summary() is None
+    assert pg.execute("SELECT status FROM offhours_summary_tasks WHERE is_current").fetchone()["status"] == "failed"

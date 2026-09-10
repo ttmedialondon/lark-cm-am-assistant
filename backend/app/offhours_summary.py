@@ -770,8 +770,20 @@ def run_claimed_summary(job, settings):
             "OpenAI 请求未完成；" + ("等待有限重试。" if retry else "请检查配置或服务状态。"),
             delay=delay,
         )
-    except (PermissionError, SummaryInputError, InvalidTag, ValueError, UnicodeDecodeError):
+    except contact_assessments.ContactAssessmentInputError:
+        # The reused transport converts network/time-out failures to this type.
+        # Treat them as bounded failures, not source changes that requeue forever.
+        retry = job["attempts"] < MAX_ATTEMPTS
+        _finish(
+            job,
+            "queued" if retry else "failed",
+            "OpenAI 网络请求未完成；" + ("等待有限重试。" if retry else "请检查连接后保存重试。"),
+            delay=30,
+        )
+    except (PermissionError, SummaryInputError):
         _finish(job, "cancelled", "授权、资料或配置已变化；本次结果未保存。")
+    except (InvalidTag, ValueError, UnicodeDecodeError):
+        _finish(job, "failed", "加密资料或配置无法读取，请检查配置后保存重试。")
     except Exception:
         LOGGER.warning("offhours summary failed; no user content logged")
         _finish(job, "failed", "消息总结未完成，请检查服务状态。")
@@ -781,8 +793,14 @@ def run_claimed_summary(job, settings):
             with connection() as conn, conn.transaction():
                 conn.execute(
                     """UPDATE ai_feature_configs SET last_tested_at=NOW(),last_test_status=%s
-                             WHERE feature=%s""",
-                    ("succeeded" if succeeded else "failed", FEATURE),
+                             WHERE feature=%s AND model=%s AND project_id=%s AND api_key_ciphertext=%s""",
+                    (
+                        "succeeded" if succeeded else "failed",
+                        FEATURE,
+                        cfg["model"],
+                        cfg["project_id"],
+                        cfg["api_key_ciphertext"],
+                    ),
                 )
 
 
