@@ -28,5 +28,5 @@
 <dialog id="cw-import-dialog" class="cw-dialog" aria-labelledby="cw-import-title"><form id="cw-import-form"><div class="cw-dialog-heading"><h2 id="cw-import-title">导入 Excel</h2><button class="btn btn-sm btn-outline-secondary" type="button" id="cw-import-close">关闭</button></div><p>先预检，再提交。只有资料齐全且已可靠确认的行会直接入库；其他可解析记录保留在待确认。</p><label class="form-label" for="cw-import-file">选择 Excel 文件</label><input id="cw-import-file" name="file" type="file" class="form-control" accept=".xlsx" required><p class="cw-small">普通 CM 只能导入自己负责的名单。上传内容不会更改你的 Lark 授权。</p><button class="btn btn-primary" type="submit" id="cw-import-check">预检文件</button></form><div id="cw-import-feedback" class="cw-feedback" role="status" aria-live="polite" hidden></div><div id="cw-import-results"></div><button class="btn btn-primary" type="button" id="cw-import-commit" hidden>确认提交这份预检结果</button></dialog>
 {% endif %}
 <script id="creator-workflow-data" type="application/json">{{ {'scope': scope, 'csrf_token': csrf_token, 'data': creator_data, 'responsibles': responsibles|default([])}|tojson }}</script>
-<script src="/static/creator-workflow.js?v=20260909-6" defer></script>
+<script src="/static/creator-workflow.js?v=names-mentions-1" defer></script>
 {% endblock %}

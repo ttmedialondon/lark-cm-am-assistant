@@ -11,6 +11,7 @@ from .config import get_settings
 from .creator_review import _text_content
 from .crypto import message_body_cipher
 from .db import connection
+from .message_mentions import mention_names
 
 NOTICE = "只显示这位 CM 当前有权查看、与该用户有关的已同步会话。私聊仅作辅助依据，不会自动确认归属。"
 
@@ -116,12 +117,13 @@ def evidence(scope, candidate_id: UUID, chat_id: str | None = None, page: int = 
         params = (chat_id, json.dumps([pair for pair in allowed if pair["chat_id"] == chat_id]))
         total = conn.execute("SELECT COUNT(*) AS total " + message_scope, params).fetchone()["total"]
         rows = conn.execute(
-            """SELECT m.message_id,m.message_type,m.message_create_time,m.body_ciphertext,
+            """SELECT m.message_id,m.message_type,m.message_create_time,m.body_ciphertext,m.mentions_json,
                (SELECT i.display_name FROM lark_identities i WHERE i.open_id=m.sender_open_id) AS sender_name """
             + message_scope
             + " ORDER BY m.message_create_time DESC NULLS LAST,m.message_id DESC LIMIT 30 OFFSET %s FOR SHARE OF m",
             (*params, (page - 1) * 30),
         ).fetchall()
+        names = mention_names(conn, rows)
         cipher = message_body_cipher(get_settings().token_encryption_key)
         messages = []
         for message in rows:
@@ -130,7 +132,8 @@ def evidence(scope, candidate_id: UUID, chat_id: str | None = None, page: int = 
                     "message_id": message["message_id"],
                     "time": _format_time(message["message_create_time"]),
                     "sender_name": message["sender_name"],
-                    "text": _text_content(message["body_ciphertext"], cipher, message["message_type"]),
+                    "text": _text_content(message["body_ciphertext"], cipher, message["message_type"],
+                                          message.get("mentions_json"), names),
                 }
             )
         result.update(messages=messages, pages=max(1, (total + 29) // 30))

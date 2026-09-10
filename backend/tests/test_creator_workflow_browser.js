@@ -268,6 +268,34 @@ test("confirm locks identity editing and late search results even after the list
   assert.deepEqual(errors, []);
 });
 
+test("same-version refresh updates clean user labels without replacing dirty or selected rows", async t => {
+  const item = {...candidate(), handle: "checked.handle", contact: {...contacts[0]}, reasons: []};
+  const {page, state, errors} = await fixture(t, {item});
+  const row = page.locator("#cw-rows tr");
+  async function refresh(name) {
+    state.items[0] = {...state.items[0], contact: {...state.items[0].contact, display_name: name}};
+    await Promise.all([
+      page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/data")),
+      page.getByRole("button", {name: "刷新列表", exact: true}).click(),
+    ]);
+  }
+  await refresh("Remi（Quanzhen Liang）");
+  assert.equal(await row.locator(".cw-user-name").textContent(), "Remi（Quanzhen Liang）");
+  await row.locator('input[type="checkbox"]').check();
+  await refresh("New Label While Selected");
+  assert.equal(await row.locator(".cw-user-name").textContent(), "Remi（Quanzhen Liang）");
+  assert(await row.locator('input[type="checkbox"]').isChecked());
+  await row.locator('input[type="checkbox"]').uncheck();
+  await row.getByRole("button", {name: "修改 handle", exact: true}).click();
+  await row.getByPlaceholder("填写 handle").fill("unsaved.handle");
+  await refresh("New Label While Dirty");
+  assert.equal(await row.locator(".cw-user-name").textContent(), "Remi（Quanzhen Liang）");
+  assert.equal(await row.getByPlaceholder("填写 handle").inputValue(), "unsaved.handle");
+  assert.equal(state.items[0].version, 1);
+  assert.equal(state.calls.filter(call => call.method !== "GET").length, 0);
+  assert.deepEqual(errors, []);
+});
+
 test("reviewer sees no writing, search or evidence-view controls", async t => {
   const {page, state, errors} = await fixture(t, {readonly: true});
   assert.equal(await page.getByPlaceholder("搜索我的 Lark 用户").count(), 0);

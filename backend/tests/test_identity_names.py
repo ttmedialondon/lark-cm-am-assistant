@@ -303,3 +303,91 @@ def test_expired_token_refresh_does_not_reactivate_a_concurrently_revoked_author
     row = pg.execute("SELECT status,access_token_ciphertext FROM authorizations WHERE id=%s", (auth_id,)).fetchone()
     assert row["status"] == "revoked"
     assert cipher.decrypt(row["access_token_ciphertext"]) == "old-access"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [None, "hidden_before", "hidden_after", "revoked", "token", "generation", "scope", "disabled", "closed", "p2p"],
+)
+def test_member_name_refresh_only_updates_known_users_in_still_authorized_chat(pg, person, monkeypatch, change):
+    auth_id = person[1]
+    key = b"x" * 32
+    cipher = TokenCipher(key)
+    pg.execute(
+        "UPDATE authorizations SET scopes=ARRAY['im:chat.members:read'],access_token_ciphertext=%s WHERE id=%s",
+        (cipher.encrypt("current-token"), auth_id),
+    )
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'chat_a')", (auth_id,))
+    pg.execute("INSERT INTO lark_identities(open_id,name,display_name) VALUES('ou_external','user123','user123')")
+    update_identity_names(
+        pg, "ou_person", name="Quanzhen Liang", en_name="Remi", en_name_present=True, authoritative=True
+    )
+    generation = pg.execute("SELECT sync_generation FROM authorization_chats WHERE chat_id='chat_a'").fetchone()[
+        "sync_generation"
+    ]
+    if change == "hidden_before":
+        pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='chat_a'")
+    monkeypatch.setattr(backfill, "connection", lambda: nullcontext(pg))
+    monkeypatch.setattr(backfill, "_authorization", worker._authorization)
+    monkeypatch.setattr(backfill, "_usable_access_token", lambda *_: "current-token")
+
+    class Client:
+        def list_chat_members(self, *_):
+            assert change != "hidden_before", "Hidden chats must not be read from Lark"
+            if change == "hidden_after":
+                pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='chat_a'")
+            elif change == "revoked":
+                pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (auth_id,))
+            elif change == "token":
+                pg.execute(
+                    "UPDATE authorizations SET access_token_ciphertext=%s WHERE id=%s",
+                    (cipher.encrypt("replaced-token"), auth_id),
+                )
+            elif change == "generation":
+                pg.execute("UPDATE authorization_chats SET sync_generation=sync_generation+1 WHERE chat_id='chat_a'")
+            elif change == "scope":
+                pg.execute("UPDATE authorizations SET scopes=ARRAY[]::text[] WHERE id=%s", (auth_id,))
+            elif change == "disabled":
+                pg.execute("UPDATE authorization_chats SET sync_enabled=FALSE WHERE chat_id='chat_a'")
+            elif change == "closed":
+                pg.execute("UPDATE chats SET chat_status='dissolved' WHERE chat_id='chat_a'")
+            elif change == "p2p":
+                pg.execute("UPDATE chats SET chat_mode='p2p' WHERE chat_id='chat_a'")
+            return {
+                "user_total": 3,
+                "users": [
+                    {"member_id": "ou_external", "name": "Current Name", "en_name": "English"},
+                    {"member_id": "ou_not_in_our_database", "name": "Do not import"},
+                    {"member_id": "ou_person", "name": "Conflicting group nickname", "en_name": ""},
+                ],
+            }
+
+    outcome = backfill.refresh_members(
+        {"authorization_id": auth_id, "chat_id": "chat_a", "sync_generation": generation},
+        Client(),
+        SimpleNamespace(token_encryption_key=key),
+    )
+    assert outcome["status"] == ("succeeded" if change is None else "authorization_changed")
+    name = pg.execute("SELECT display_name FROM lark_identities WHERE open_id='ou_external'").fetchone()["display_name"]
+    assert name == ("English（Current Name）" if change is None else "user123")
+    assert pg.execute("SELECT 1 FROM lark_identities WHERE open_id='ou_not_in_our_database'").fetchone() is None
+    profile = pg.execute("SELECT name,en_name,display_name FROM lark_identities WHERE open_id='ou_person'").fetchone()
+    assert profile == {"name": "Quanzhen Liang", "en_name": "Remi", "display_name": "Remi（Quanzhen Liang）"}
+
+
+@pytest.mark.parametrize("failures", [1, 3])
+def test_member_name_refresh_retries_transaction_conflicts_without_aborting_batch(monkeypatch, failures):
+    calls = []
+
+    def refresh(*_):
+        calls.append(1)
+        if len(calls) <= failures:
+            raise backfill.DeadlockDetected("simulated concurrent sync")
+        return {"status": "succeeded", "users": ["ou_known"]}
+
+    monkeypatch.setattr(backfill, "refresh_members", refresh)
+    result = backfill.refresh_members_safely({}, None, None)
+    assert len(calls) == min(failures + 1, 3)
+    assert result == (
+        {"status": "database_busy", "users": []} if failures == 3 else {"status": "succeeded", "users": ["ou_known"]}
+    )

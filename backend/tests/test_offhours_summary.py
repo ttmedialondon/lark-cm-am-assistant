@@ -484,3 +484,107 @@ def test_network_failure_retries_are_bounded_not_cancelled_refresh_loop(pg, seed
     ai.schedule_if_due(pg, force=True)
     assert ai.claim_next_summary() is None
     assert pg.execute("SELECT status FROM offhours_summary_tasks WHERE is_current").fetchone()["status"] == "failed"
+
+
+def _set_mentions(pg, seeded, mentions, text="Hi @_user_1, I haven’t heard from you"):
+    pg.execute(
+        "UPDATE chat_messages SET body_ciphertext=%s,mentions_json=%s::jsonb WHERE message_id='m1'",
+        (seeded.cipher.encrypt(json.dumps({"text": text})), json.dumps(mentions)),
+    )
+
+
+def test_mentions_ui_and_ai_share_resolved_text_and_id_based_targets_without_mutating_source(pg, seeded):
+    s = seeded
+    mentions = [
+        {"key": f"@_user_{n}", "id": "ou_" + who, "id_type": kind, "name": "Remi"}
+        for n, who, kind in (
+            (1, "cm", "open_id"), (2, "person", "open_id"), (3, "other", "open_id"), (4, "cm", "user_id")
+        )
+    ]
+    text = "Hi @_user_1, @_user_2, @_user_3, @_user_4: I haven’t heard from you"
+    _set_mentions(pg, s, mentions, text)
+    pg.execute("UPDATE lark_identities SET display_name='Remi（Quanzhen Liang）' WHERE open_id='ou_cm'")
+    original = pg.execute("SELECT body_ciphertext,mentions_json FROM chat_messages WHERE message_id='m1'").fetchone()
+    s.save()
+    job = ai.claim_next_summary()
+    data = ai._load_chat(pg, job, "chat", job["cutoff"], settings=s.settings)
+    message = data["pack"]["messages"][0]
+    assert message["text"] == "Hi @Remi（Quanzhen Liang）, @person, @other, @Remi: I haven’t heard from you"
+    assert [m["target"] for m in message["mentions"]] == ["CM", "U1", "other", "unknown"]
+    assert data["refs"][message["ref"]]["text"] == message["text"]
+    assert "ou_" not in json.dumps(data["pack"])
+    ai.run_claimed_summary(job, s.settings)
+    view = ai.get_summary_view(pg, s.ids["owner"])
+    assert view["events"][0]["evidence"][0]["text"] == s.calls[0]["messages"][0]["text"]
+    assert original == pg.execute(
+        "SELECT body_ciphertext,mentions_json FROM chat_messages WHERE message_id='m1'"
+    ).fetchone()
+
+
+def test_same_display_different_mention_identity_invalidates_only_affected_input(pg, seeded):
+    s = seeded
+    mentions = [{"key": "@_user_1", "id": "ou_other", "id_type": "open_id", "name": "Same"}]
+    pg.execute("UPDATE lark_identities SET display_name='Same' WHERE open_id='ou_other'")
+    pg.execute("INSERT INTO lark_identities(open_id,display_name) VALUES('ou_other2','Same')")
+    _set_mentions(pg, s, mentions)
+    s.save()
+    first = ai.claim_next_summary()
+    before = ai._load_chat(pg, first, "chat", first["cutoff"], settings=s.settings)
+    ai.run_claimed_summary(first, s.settings)
+    mentions[0]["id"] = "ou_other2"
+    _set_mentions(pg, s, mentions)
+    after = ai._load_chat(pg, first, "chat", first["cutoff"], settings=s.settings)
+    assert before["pack"] == after["pack"] and before["fingerprint"] != after["fingerprint"]
+    assert not ai.get_summary_view(pg, s.ids["owner"])["events"]
+    ai.schedule_if_due(pg, force=True)
+    assert ai.claim_next_summary()["input_fingerprint"] == after["fingerprint"]
+
+
+def test_unmentioned_name_changes_and_omitted_mentions_keep_previous_input_fingerprint(pg, seeded):
+    s = seeded
+    s.save()
+    job = ai.claim_next_summary()
+    before = ai._load_chat(pg, job, "chat", job["cutoff"], settings=s.settings)
+    assert before["fingerprint"] == ai._hash([before["pack"], before["users"]])
+    assert "mentions" not in before["pack"]["messages"][0]
+    pg.execute("UPDATE lark_identities SET display_name='unrelated changed' WHERE open_id='ou_other'")
+    pg.execute(
+        "UPDATE chat_messages SET mentions_json=%s::jsonb WHERE message_id='outside'",
+        (json.dumps([{"key": "@_user_1", "id": "ou_other", "id_type": "open_id", "name": "Other"}]),),
+    )
+    after = ai._load_chat(pg, job, "chat", job["cutoff"], settings=s.settings)
+    assert before["fingerprint"] == after["fingerprint"]
+
+
+def test_mention_display_update_invalidates_relevant_message_summary(pg, seeded):
+    s = seeded
+    _set_mentions(pg, s, [{"key": "@_user_1", "id": "ou_other", "id_type": "open_id", "name": "Old"}])
+    s.save()
+    job = ai.claim_next_summary()
+    before = ai._load_chat(pg, job, "chat", job["cutoff"], settings=s.settings)
+    pg.execute("UPDATE lark_identities SET display_name='New（原名）' WHERE open_id='ou_other'")
+    after = ai._load_chat(pg, job, "chat", job["cutoff"], settings=s.settings)
+    assert before["fingerprint"] != after["fingerprint"]
+    assert "@New（原名）" in after["pack"]["messages"][0]["text"]
+
+
+def test_rich_mentions_render_before_clipping_and_keep_credentials_redacted():
+    cipher = message_body_cipher(b"x" * 32)
+    mentions = [{"key": "@_user_1", "id": "ou_cm", "id_type": "open_id", "name": "Original"}]
+    row = {
+        "message_type": "post", "mentions_json": mentions,
+        "body_ciphertext": cipher.encrypt(json.dumps({"content": [[
+            {"tag": "text", "text": "Hello"}, {"tag": "at", "user_id": "ou_cm"},
+            {"tag": "a", "text": "link", "href": "https://example.test/?token=secret"},
+        ]]})),
+    }
+    text, incomplete = ai._body(row, cipher, {"ou_cm": "Remi（Original）"})
+    assert text == "Hello @Remi（Original） link https://example.test/?token=[redacted]" and not incomplete
+    row["body_ciphertext"] = cipher.encrypt(json.dumps({"content": [[{"tag": "at", "user_id": "ou_unknown"}]]}))
+    assert ai._body(row, cipher) == ("[未解析的@用户]", True)
+    row.update(message_type="text", body_ciphertext=cipher.encrypt(json.dumps({"text": "@_user_1" + "x" * 2000})))
+    # An identifier-like suffix is not a Lark placeholder boundary.
+    assert ai._body(row, cipher)[0].startswith("@_user_1x")
+    row["body_ciphertext"] = cipher.encrypt(json.dumps({"text": "@_user_1 " + "x" * 2000}))
+    text, incomplete = ai._body(row, cipher, {"ou_cm": "Remi（Original）"})
+    assert text.startswith("@Remi（Original） ") and len(text) == ai.MAX_BODY_CHARS and incomplete

@@ -21,6 +21,7 @@ from .config import get_settings
 from .creator_preparation import binding_matches, normalize_handle, normalize_query
 from .crypto import message_body_cipher
 from .db import connection
+from .message_mentions import mention_names
 
 PAGE_SIZE = 20
 MESSAGE_PAGE_SIZE = 30
@@ -150,7 +151,7 @@ _VISIBLE_MESSAGES_SQL = """
 """ + _CONVERSATION_SCOPE_SQL + """
           AND chat.chat_id = %s
     )
-    SELECT message.body_ciphertext, message.message_create_time, message.message_id,
+    SELECT message.body_ciphertext, message.message_create_time, message.message_id, message.mentions_json,
            message.message_type, message.sender_type, sender.display_name AS sender_name,
            sender.contact_id = (SELECT contact_id FROM scoped_chat LIMIT 1) AS sent_by_creator,
            EXISTS (
@@ -366,13 +367,15 @@ def detail(contact_id: UUID, *, responsible_id: UUID | None = None) -> dict[str,
     }
 
 
-def _text_content(ciphertext: str | None, cipher: Any, message_type: str | None = "text") -> str:
+def _text_content(
+    ciphertext: str | None, cipher: Any, message_type: str | None = "text", mentions=None, names=None
+) -> str:
     if ciphertext is None:
         return "（正文尚未同步）"
     try:
         # Reuse the existing plain-text renderer. It reads only the stored body;
         # no attachment fetches or follow-up reads of referenced conversations.
-        text = _readable_body(cipher.decrypt(ciphertext), _message_type_label(message_type))
+        text = _readable_body(cipher.decrypt(ciphertext), _message_type_label(message_type), mentions, names)
     except (InvalidTag, UnicodeDecodeError, ValueError, TypeError):
         return "（正文无法读取）"
     text = re.sub(r"[\w.+\-]+@[\w.\-]+\.[A-Za-z]{2,}", "[邮箱已隐藏]", text)
@@ -402,6 +405,7 @@ def messages(contact_id: UUID, chat_id: str, page: int = 1, *,
         rows = conn.execute(_VISIBLE_MESSAGES_SQL + """
             ORDER BY message_create_time DESC NULLS LAST, message_id DESC LIMIT %s OFFSET %s
         """, (*params, limit, offset)).fetchall()
+        names = mention_names(conn, rows[:MESSAGE_PAGE_SIZE])
     cipher = message_body_cipher(get_settings().token_encryption_key)
     items = [{"sender_label": _label(message["sender_name"] or (
                   row["display_name"] if message["sent_by_creator"] else row["responsible_name"]
@@ -409,7 +413,8 @@ def messages(contact_id: UUID, chat_id: str, page: int = 1, *,
               "sender_role_label": "达人" if message["sent_by_creator"] else "当前负责人"
               if message["sent_by_author"] else "其他参与者" if message["sender_type"] == "user" else "应用 / 系统",
               "created_at_label": _message_time(message["message_create_time"]),
-              "content": _text_content(message["body_ciphertext"], cipher, message["message_type"]),
+              "content": _text_content(message["body_ciphertext"], cipher, message["message_type"],
+                                       message.get("mentions_json"), names),
               "message_type_label": _message_type_label(message["message_type"]),
               "sent_by_author": message["sent_by_author"]} for message in rows[:MESSAGE_PAGE_SIZE]]
     return {**_page_result(items, page, MESSAGE_PAGE_SIZE, total_count=total), "notice": CONVERSATION_NOTICE}

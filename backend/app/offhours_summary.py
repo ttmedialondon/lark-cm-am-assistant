@@ -18,6 +18,7 @@ from .ai_feature_config import FeatureConfigInputError, api_key_cipher
 from .config import get_settings
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
+from .message_mentions import mention_names, mention_targets, resolve_mentions, rich_mention_text
 
 FEATURE = "offhours_summary"
 POLICY_VERSION = "offhours-v1"
@@ -231,7 +232,7 @@ _MESSAGE_SQL = """SELECT m.*,i.display_name AS sender_name,i.contact_id FROM cha
     ORDER BY m.message_create_time DESC,m.message_id DESC LIMIT %s FOR SHARE OF m,o"""
 
 
-def _body(row, cipher):
+def _body(row, cipher, names=None):
     if not row["body_ciphertext"] or row["message_type"] not in {"text", "post", "share_chat", "share_user"}:
         return "[附件或正文不可读取，需人工查看原消息]", True
     raw = cipher.decrypt(row["body_ciphertext"])
@@ -245,6 +246,9 @@ def _body(row, cipher):
 
         def fragments(item):
             if isinstance(item, dict):
+                if item.get("tag") == "at":
+                    yield rich_mention_text(item.get("user_id"), row.get("mentions_json"), names)
+                    return
                 for key, value in item.items():
                     if key in {"text", "href", "url", "title"} and isinstance(value, str):
                         yield value
@@ -255,8 +259,10 @@ def _body(row, cipher):
                     yield from fragments(value)
 
         text = " ".join(fragments(payload))
+    text = resolve_mentions(text, row.get("mentions_json"), names)
     text = re.sub(r"([?&](?:token|access_token|key|signature)=)[^&\s]+", r"\1[redacted]", text, flags=re.I)
-    return (text[:MAX_BODY_CHARS] or "[正文不可读取，需人工查看原消息]"), len(text) > MAX_BODY_CHARS or not text.strip()
+    incomplete = len(text) > MAX_BODY_CHARS or not text.strip() or "[未解析的@用户]" in text
+    return (text[:MAX_BODY_CHARS] or "[正文不可读取，需人工查看原消息]"), incomplete
 
 
 def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None):
@@ -307,12 +313,13 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None):
     speaker_labels = {openid: label for label, user in users.items() for openid in user["open_ids"]}
     selected = [*reversed(earlier[:MAX_CONTEXT]), *rows]
     selected = [r for r in selected if r["sender_open_id"] == cm["open_id"] or r["sender_open_id"] in speaker_labels]
+    names = mention_names(conn, selected)
     cipher = message_body_cipher((settings or get_settings()).token_encryption_key)
-    messages, refs = [], {}
+    messages, refs, mention_fingerprints = [], {}, {}
     incomplete = len(recent) > MAX_MESSAGES or len(earlier) > MAX_CONTEXT
     for row in selected:
         label = f"M{len(messages) + 1}"
-        body, unavailable = _body(row, cipher)
+        body, unavailable = _body(row, cipher, names)
         incomplete = incomplete or unavailable
         messages.append(
             {
@@ -329,6 +336,25 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None):
                 "message_id": row["message_id"],
             }
         )
+        targets = mention_targets(row.get("mentions_json"), names)
+        if targets:
+            # Labels come from explicit IDs, never from a person's display name.
+            # Unrelated mentioned people do not acquire a creator/CM role.
+            messages[-1]["mentions"] = [
+                {
+                    "key": item["key"],
+                    "name": item["name"],
+                    "target": "CM"
+                    if item["open_id"] == cm["open_id"]
+                    else speaker_labels.get(item["open_id"], "other" if item["open_id"] else "unknown"),
+                    "ambiguous": item["ambiguous"],
+                }
+                for item in targets
+            ]
+        if row.get("mentions_json"):
+            # Identity changes must invalidate summaries even when names match.
+            # Raw mention IDs remain server-side, outside the model/UI payload.
+            mention_fingerprints[label] = _hash(row["mentions_json"])
         refs[label] = {
             "message_id": row["message_id"],
             "chat_id": chat_id,
@@ -378,7 +404,7 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None):
         "pack": pack,
         "users": users,
         "refs": refs,
-        "fingerprint": _hash([pack, users]),
+        "fingerprint": _hash([pack, users, mention_fingerprints] if mention_fingerprints else [pack, users]),
         "incomplete": incomplete,
         "synced": watermark >= cutoff,
         "history_complete": complete,
@@ -529,6 +555,8 @@ _INSTRUCTIONS = """你是给 CM 上班时查看的下班消息总结助手。只
 更早消息仅作上下文，绝不能把窗外消息写成该时段新发生的事件；没有窗内相关消息则 events=[]。
 群中 CM 未指明对象的内容不能擅自归给某达人。一个人多个 handle 时，没有明确账号依据就 handle=null，
 不把同一事件复制到所有 handle。不能把引用、假设、第三方情况或已解决问题当作新危机。
+消息 mentions 的 target 由明确用户 ID 映射：CM 是负责人、U1 等对应 users、other 是其他被提及的人。
+unknown 或 ambiguous 表示无法核实对象；不能根据名字相似推断对象。被 @ 不代表发言人，也不改变达人归属。
 P0: 明确要求退出/unlink/terminate/leave agency，严重投诉、真实 escalate/report 威胁，威胁终止合作；
 付费合作/flat fee 未付款、金额错误或付款纠纷。不包括普通 affiliate commission；普通付款时间询问不是纠纷。
 P1: violation/warning/appeal、账号封禁/LIVE 权限异常、affiliate commission 异常；影响产出或销售的商品链接流量异常；

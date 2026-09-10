@@ -25,6 +25,7 @@ from .config import Settings, get_settings
 from .contact_taxonomy import AI_ROLE_CODES, MODEL_ROLE_CODES, ROLE_LABELS
 from .crypto import message_body_cipher
 from .db import connection
+from .message_mentions import mention_names
 
 LOGGER = logging.getLogger("lark_message_stats.contact_assessments")
 FEATURE = "contact_assessment"
@@ -289,6 +290,8 @@ def latest_contact_assessment(contact_id: UUID | str) -> dict[str, Any] | None:
 def assessment_detail(assessment_id: UUID | str) -> dict[str, Any] | None:
     """Return one review and only still-readable evidence text for the owner UI."""
 
+    from .admin_reporting import _readable_body as display_body
+
     assessment_id = _as_uuid(assessment_id, "判定")
     with connection() as conn:
         row = conn.execute(
@@ -324,7 +327,15 @@ def assessment_detail(assessment_id: UUID | str) -> dict[str, Any] | None:
                      AND access.is_visible AND access.sync_enabled
                      AND NOT message.is_deleted
                     THEN message.body_ciphertext
-                END AS body_ciphertext
+                END AS body_ciphertext,
+                CASE
+                    WHEN auth.status = 'active'
+                     AND auth.body_consent_at IS NOT NULL
+                     AND observation.observed_at >= auth.body_consent_at
+                     AND access.is_visible AND access.sync_enabled
+                     AND NOT message.is_deleted
+                    THEN message.mentions_json
+                END AS mentions_json
             FROM contact_assessment_refs reference
             JOIN authorization_message_observations observation
               ON observation.authorization_id = reference.authorization_id
@@ -350,11 +361,13 @@ def assessment_detail(assessment_id: UUID | str) -> dict[str, Any] | None:
                 (row["contact_id"],),
             ).fetchall()
         }
+        names = mention_names(conn, [item for item in refs if item.get("body_ciphertext")])
     cipher = message_body_cipher(get_settings().token_encryption_key)
     evidence: dict[str, dict[str, Any]] = {}
     for item in refs:
         raw_body = _decrypt_body(cipher, item.get("body_ciphertext"))
-        content = _readable_body(raw_body, item.get("message_type")) if raw_body else "（正文不再处于可读取授权范围内）"
+        content = (display_body(raw_body, item.get("message_type"), item.get("mentions_json"), names)
+                   if raw_body else "（正文不再处于可读取授权范围内）")
         evidence[item["label"]] = {
             "label": item["label"],
             "relation_label": {"anchor": "命中消息", "context": "会话上下文", "history": "近期发言"}[item["relation"]],

@@ -83,6 +83,9 @@
     if (current && current.version > item.version) item = current;
     const existing = drafts.get(item.id);
     if (!existing || (existing.version !== item.version && !existing.dirty && !selected.has(item.id))) drafts.set(item.id, newDraft(item));
+    else if (!existing.dirty && !busy.has(item.id) && !locked.has(item.id) && !selected.has(item.id)
+      && existing.version === item.version && existing.contact?.contact_id === item.contact?.contact_id
+      && existing.contact?.open_id === item.contact?.open_id) existing.contact = item.contact || null;
     return drafts.get(item.id);
   };
   function changed(draft) { draft.dirty = true; draft.revision++; draft.request = null; draft.confirmRequest = null; }

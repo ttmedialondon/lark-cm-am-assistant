@@ -27,6 +27,7 @@ from .contact_assignments import MANUAL_REVIEW_CONFIDENCE_FLOOR, POLICY_VERSION
 from .contact_taxonomy import CONTACT_ROLE_CODES, ORGANIZATION_KIND_LABELS, ROLE_LABELS, role_label
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
+from .message_mentions import mention_names, resolve_mentions, rich_mention_text
 
 LONDON_TIME_ZONE = ZoneInfo("Europe/London")
 LIST_PAGE_SIZE = 25
@@ -1367,8 +1368,9 @@ def message_page(
             (*filters, limit, offset),
         ).fetchall()
 
+        names = mention_names(conn, rows[:MESSAGE_PAGE_SIZE])
     cipher = message_body_cipher(get_settings().token_encryption_key)
-    items = [_decorate_message(row, cipher) for row in reversed(rows[:MESSAGE_PAGE_SIZE])]
+    items = [_decorate_message(row, cipher, names) for row in reversed(rows[:MESSAGE_PAGE_SIZE])]
     return {
         "metrics": {key: int(metrics[key] or 0) for key in metrics},
         **_page_result(items, page, MESSAGE_PAGE_SIZE, total_count=total_count),
@@ -1499,7 +1501,7 @@ def _decorate_message_conversation(row: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def _decorate_message(row: dict[str, Any], cipher: TokenCipher) -> dict[str, Any]:
+def _decorate_message(row: dict[str, Any], cipher: TokenCipher, names=None) -> dict[str, Any]:
     item = dict(row)
     item["chat_mode"] = item.get("chat_mode") or "group"
     item["chat_mode_label"] = _chat_mode_label(item["chat_mode"])
@@ -1518,7 +1520,7 @@ def _decorate_message(row: dict[str, Any], cipher: TokenCipher) -> dict[str, Any
     except (InvalidTag, UnicodeDecodeError, ValueError):
         item["content"] = "（正文无法读取）"
     else:
-        item["content"] = _readable_body(body, item.get("message_type"))
+        item["content"] = _readable_body(body, item.get("message_type"), item.get("mentions_json"), names)
     return item
 
 
@@ -1529,16 +1531,16 @@ def _message_type_label(message_type: str | None) -> str:
             }.get(message_type, "其他消息")
 
 
-def _readable_body(raw: str, message_type: str | None) -> str:
+def _readable_body(raw: str, message_type: str | None, mentions=None, names=None) -> str:
     """Show text and rich-text content without leaking raw JSON into the UI."""
 
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        return raw
-    texts = _body_text_values(parsed)
+        return resolve_mentions(raw, mentions, names)
+    texts = _body_text_values(parsed, mentions, names)
     if texts:
-        return "\n".join(texts)
+        return resolve_mentions("\n".join(texts), mentions, names)
     kind = message_type or "未知类型"
     return f"（{kind} 消息没有可展示的文本）"
 
@@ -1551,11 +1553,14 @@ def _conversation_name(name: Any, chat_mode: str, chat_id: Any) -> str:
     return "未命名群聊"
 
 
-def _body_text_values(value: Any) -> list[str]:
+def _body_text_values(value: Any, mentions=None, names=None) -> list[str]:
     texts: list[str] = []
 
     def collect(current: Any) -> None:
         if isinstance(current, dict):
+            if current.get("tag") == "at":
+                texts.append(rich_mention_text(current.get("user_id"), mentions, names))
+                return
             title = current.get("title")
             if isinstance(title, str) and title and isinstance(current.get("content"), list):
                 texts.append(title)
