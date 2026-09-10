@@ -121,7 +121,16 @@ def binding_matches(item: dict[str, Any], row: dict[str, Any] | None, responsibl
 
 def load_snapshot(conn: Any) -> dict[str, Any] | None:
     row = conn.execute("""
-        SELECT metadata FROM audit_events WHERE action = %s ORDER BY created_at DESC, id DESC LIMIT 1
+        SELECT snapshot.metadata FROM (
+            SELECT metadata, created_at FROM audit_events
+            WHERE action = %s ORDER BY created_at DESC, id DESC LIMIT 1
+        ) snapshot
+        WHERE NOT EXISTS (
+            SELECT 1 FROM audit_events reset
+            WHERE reset.action = 'creator_roster_reset'
+              AND reset.metadata->>'responsible_id' = snapshot.metadata#>>'{payload,responsible_id}'
+              AND reset.created_at >= snapshot.created_at
+        )
     """, (ACTION,)).fetchone()
     if not row:
         return None

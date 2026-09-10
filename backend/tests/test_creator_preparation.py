@@ -4,16 +4,18 @@ import json
 from contextlib import nullcontext
 from copy import deepcopy
 from datetime import timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from test_admin_page_access import PAGES, _client
 from test_creator_review import ASSIGNMENT, CONTACT, NOW, OWNER, Connection, documented_row
+from test_creator_workflow import db as workflow_db
 
 from app import creator_preparation, creator_review
 from scripts import prepare_creator_handoff
 
 PATH = "/admin/creator-review/preparation"
+db = workflow_db
 
 
 def preparation_item(*, handle="example.handle", issue="none", row=None):
@@ -163,6 +165,31 @@ def test_untrusted_snapshot_cannot_fall_back_to_older_or_query_formal_records(mo
     assert len(conn.calls) == 1
     assert conn.calls[0][1] == (creator_preparation.ACTION,)
     assert "ORDER BY created_at DESC, id DESC LIMIT 1" in conn.calls[0][0]
+
+
+@pytest.mark.parametrize("reset_owner,reset_offset,available", [
+    (None, None, True),
+    (OWNER, timedelta(seconds=1), False),
+    (OWNER, timedelta(0), False),
+    (UUID(int=99), timedelta(seconds=1), True),
+    (OWNER, timedelta(seconds=-1), True),
+])
+def test_reset_hides_only_older_or_same_time_snapshot_for_that_cm(db, reset_owner, reset_offset, available):
+    payload = preparation_payload()
+    envelope = {"payload": payload, "payload_sha256": creator_preparation.payload_digest(payload)}
+    db.execute(
+        "INSERT INTO audit_events(id,action,metadata,created_at) VALUES(%s,%s,%s::jsonb,%s)",
+        (uuid4(), creator_preparation.ACTION, json.dumps(envelope), NOW),
+    )
+    if reset_owner is not None:
+        db.execute(
+            "INSERT INTO audit_events(id,action,metadata,created_at) VALUES(%s,'creator_roster_reset',%s::jsonb,%s)",
+            (uuid4(), json.dumps({"responsible_id": str(reset_owner)}), NOW + reset_offset),
+        )
+    assert creator_preparation.load_snapshot(db) == (payload if available else None)
+    assert db.execute(
+        "SELECT metadata FROM audit_events WHERE action=%s", (creator_preparation.ACTION,)
+    ).fetchone()["metadata"] == envelope
 
 
 def test_preparation_get_is_read_only_and_keeps_candidate_handles_out_of_registry(monkeypatch):
