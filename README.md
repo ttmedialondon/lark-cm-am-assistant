@@ -1,28 +1,25 @@
 # Lark CM/AM Assistant
 
-Internal system for authorised CM/AM Lark message sync, creator/account review, and an owner-enabled off-hours message summary, organised by P0–P3 urgency, without reply suggestions or automatic replies.
+TT Media 内部助手：同步已授权的 Lark 聊天、维护达人与 CM 的关联、按 P0–P3 整理指定时段的消息。不自动发送消息，不生成回复建议。
 
-## Current status
+## 从哪里看
 
-- [Off-hours message summary — plain-language requirements](docs/product/message-risk-priority-v1.0.md) is the current scope. The first pilot uses Remi's confirmed accounts and a fixed London window (2026-09-09 18:00–2026-09-10 12:00). Owner save+enable at `/admin/ai` immediately queues analysis; results appear at `/dashboard/offhours-summary`. Disabled by default, no automatic daily schedule, real-time alerts, reply suggestions or automatic actions. This overrides conflicting requirements in the older PRD/TDD.
-- `backend/` contains the deployed FastAPI service for authorised CM/AM conversation sync and the owner-only content console.
-- `docs/architecture/TDD_v2.0.md` defines the approved target architecture; it remains a technical-review draft until its P0 governance decisions are closed.
-- `docs/architecture/contact-identity-organization-model-v0.4.md` documents the deployed person, organization, role, and creator-owner model.
-- No customer-facing or automatic message sending is included.
+- 产品和开发都从 [文档总入口](docs/README.md) 开始：当前只维护三份业务规则和一份技术说明。
+- [本地开发](backend/README.md) · [部署与回退](docs/runbooks/deploy-mvp.md) · [AI 协作约定](AGENTS.md)。
+- 2026-09-10 已按主人要求清空 Remi 的达人名单及相关派生结果，保留原始 Lark 数据；新逻辑待定。详见 [重置与文档整理记录](docs/status/2026-09-10-reset-and-docs.md)。文档整理没有重启识别或分析。
 
-## Repository layout
+## 代码在哪里
 
-- `backend/` — FastAPI, PostgreSQL migrations, worker, and backend tests.
-- `frontend/` — future React/TypeScript workbench.
-- `infra/` — Caddy, systemd and deployment assets; operational procedures live in `docs/runbooks/`.
-- `docs/` — product requirements, target architecture, current deployed baseline, ADRs, runbooks, and archived documents.
+| 目录 | 内容 |
+|---|---|
+| `backend/app/` | FastAPI 路由、业务逻辑、后台 worker |
+| `backend/app/templates/`、`backend/app/static/` | 当前正式界面：Jinja2、HTMX、Tabler 和原生 JavaScript |
+| `backend/migrations/`、`backend/tests/` | SQL 迁移和测试 |
+| `infra/` | Caddy 与 systemd 配置 |
+| `docs/` | 当前规则、工程手册、明确标注日期的历史记录 |
 
-## Engineering rules
+当前不是独立 React 工作台；早期 React、实时告警、回复建议和知识库大方案不作为本轮待办。
 
-1. GitHub is the sole source of truth; production servers deploy a reviewed release and are never edited directly.
-2. Secrets, tokens, customer messages, production exports, and backups must never be committed.
-3. Message bodies are collected only after the revised OAuth agreement, encrypted at rest, and excluded from logs. Content views enforce live owner or explicit feature-scoped reviewer/CM access and are audited. Roster editing does not grant message access. AI never sends Lark messages; analysis uses owner-configured, evidence-bound features.
+## 工程底线
 
-## Getting started
-
-The backend baseline documents its local setup in [backend/README.md](backend/README.md). The frontend will be scaffolded in a separate pull request after the Phase 0 architecture decisions are recorded in `docs/adr/`.
+GitHub 是代码发布源，不直接修改生产应用文件。密钥、令牌、生产消息、原始导入文件和备份不得提交；消息正文加密保存，权限及审计在服务端检查。关联某个用户不增加聊天访问权。

@@ -1,18 +1,20 @@
 # Lark CM/AM Assistant 部署手册
 
-本手册部署 Lark OAuth、授权用户可见的群聊/私聊、加密消息正文和 owner 专用消息管理台。不保存附件二进制或成员名单。
+本手册用于应用代码或数据库变更的发布。当前系统同步授权范围内的群聊/私聊、加密正文和最新成员快照，后台按页面权限开放；不保存附件二进制。业务与权限边界见 [文档总入口](../README.md)。
+
+纯文档更新只提交并推送 Git，不执行下方安装、迁移、停机或重启步骤，也不重新开启任何 AI 功能。正文采集权限已有效的用户，不因普通发布重复 OAuth。
 
 ## 先决条件
 
 - Hetzner 主机已有 PostgreSQL、Caddy、`larkstats` 系统用户、`/etc/lark-message-stats/app.env` 和 Python 虚拟环境。
 - 仓库位于 `/opt/lark-message-stats`，虚拟环境位于 `/opt/lark-message-stats/venv`。
 - `app.env` 不进入 Git，且权限保持为 `root:larkstats` / `0640`。
-- Lark 应用已启用消息同步所需的用户权限：`offline_access`、`im:chat:read`、`im:message:readonly`。`im:chat.members:read` 仅在需要展示成员总数时额外启用。
+- Lark 应用已启用消息同步所需的用户权限：`offline_access`、`im:chat:read`、`im:message:readonly`、`im:chat.members:read`。最后一项用于成员资料与快照，不只是展示人数。
 - Lark OAuth 回调地址为 `https://larkbot.ttapp.help/auth/lark/callback`；服务器公网出口 IP 已在应用白名单中。
 
 ## 发布步骤
 
-在服务器上执行。命令不会打印 App Secret、OAuth Token 或消息正文。`005_message_bodies_and_p2p.sql` 为现有规范化表增加正文加密与 P2P 状态字段，因此发布前必须短暂停止 Web/Worker 并完成数据库备份。
+在服务器上执行。命令不会打印 App Secret、OAuth Token 或消息正文。先核对待发布差异和迁移，准备代码、依赖及服务配置，再停止 Web/Worker、验证数据库备份、应用迁移并启动；不要为了文档清理运行这些步骤。
 
 ```bash
 cd /opt/lark-message-stats
@@ -45,7 +47,7 @@ sudo systemctl --no-pager --full status lark-message-stats-web.service lark-mess
 curl --fail --silent --show-error https://larkbot.ttapp.help/healthz
 ```
 
-在第一次启用成员人数功能时，`app.env` 的 `LARK_OAUTH_SCOPES` 还必须包含 `im:chat.members:read`；保留既有 scope，不要覆盖 App Secret 或加密密钥。正文与 P2P 已用当前 `im:message:readonly` 完成真实 user-token 预检，不需要为了本版本替换为更宽泛的 scope。
+首次接入成员快照时，`app.env` 的 `LARK_OAUTH_SCOPES` 必须包含 `im:chat.members:read`，应用权限发布后由缺少该 scope 的用户重新授权。保留既有 scope，不要覆盖 App Secret 或加密密钥；不为普通发布扩大权限。
 
 预期健康检查返回 `{"status":"ok","database":"ok",...}`。若服务未启动，先查看不含消息正文的 systemd 日志：
 
@@ -55,9 +57,9 @@ sudo journalctl -u lark-message-stats-web.service -u lark-message-stats-worker.s
 
 ## Lark 权限与验收
 
-1. 已有 CM/AM 必须打开 `https://larkbot.ttapp.help/` 并重新完成 OAuth；这是正文和 P2P 采集的明确授权边界。
+1. 仅持旧统计授权或缺少必需 scope 的 CM/AM，需要打开 `https://larkbot.ttapp.help/` 完成新的 OAuth；这是正文和 P2P 采集的明确授权边界。
 2. 回到“消息提醒中心”，确认显示接入状态和最近检查时间；个人页不展示会话或消息统计。
-3. 若管理员启用成员人数功能，需在 Lark 开发者后台发布 `im:chat.members:read`，并让测试用户重新 OAuth；该数据仅用于内部管理台，不会阻塞消息同步。
+3. 核对 `im:chat.members:read` 与成员刷新状态；成员接口缺失或失败应显示缺口，不把它混成正文同步失败。
 4. owner 重新登录后进入 `https://larkbot.ttapp.help/admin/messages`，选择 CM/AM 和会话，确认仅在新版授权后的回填完成后出现正文。不要在终端、日志或 Git 中输出正文。
 
 ## 回退原则
