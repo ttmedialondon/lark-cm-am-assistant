@@ -8,7 +8,7 @@
 <div class="page creator-review creator-setup-preview">
   <header class="navbar"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media 消息提醒</a><div class="csp-header-user"><span>查看人：{{ authorization.display_name or '当前用户' }}</span><a href="/dashboard">返回前台</a></div></div></header>
   <main class="container-xl csp-main" id="creator-setup-preview">
-    <header class="csp-heading"><div><h1>Remi 的达人账号核对 <span class="csp-readonly-badge">真实数据 · 只读</span></h1><p>数据负责人：{{ preview_data.responsible_name or 'Remi · Quanzhen Liang' }}。你正在核对她的账号、联系人及候选会话，不会将账号转到自己名下。</p></div><a class="btn btn-outline-primary" href="#account-list">查看账号清单</a></header>
+    <header class="csp-heading"><div><h1>Remi 的达人账号核对 <span class="csp-readonly-badge">真实数据 · 只读</span></h1><p>数据负责人：{{ preview_data.responsible_name or 'Remi' }}。你正在核对她的账号、联系人及候选会话，不会将账号转到自己名下。</p></div><a class="btn btn-outline-primary" href="#account-list">查看账号清单</a></header>
     <div class="csp-notice"><strong>本页仅展示服务器真实数据，不会修改正式名单。</strong> 当前正式联系人归属不等于 CM 已逐个确认账号或会话；本页不提供认领、勾选保存或入库操作。</div>
     {% if preview_data.available %}
     {% set summary = preview_data.summary %}

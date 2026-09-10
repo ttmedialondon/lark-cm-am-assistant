@@ -26,6 +26,7 @@ from . import (
 from .config import Settings, get_settings
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
+from .identity_names import format_display_name, update_identity_names
 from .lark_api import LarkApiError, LarkClient, TokenBundle
 from .lark_sync_admission import LarkSyncAdmission
 
@@ -82,7 +83,7 @@ class MemberSnapshotMeasurement:
     count_status: str
     snapshot_status: str
     checked_at: datetime | None
-    members: tuple[dict[str, str | None], ...] = ()
+    members: tuple[dict[str, Any], ...] = ()
     retry_after_seconds: int | None = None
 
 
@@ -397,6 +398,7 @@ def _prepare_job(job: SyncJob, settings: Settings, client: LarkClient) -> None:
             _finish_job(current, "cancelled", "Authorization is no longer active.")
             return
         access_token = _usable_access_token(current.authorization_id, authorization, client, settings)
+        _refresh_profile_name(current, authorization, access_token, client, settings)
         discovered = _discover_chats(current, authorization, access_token, client, settings, chat_type="group")
         if authorization.get("body_consent_at") and authorization.get("p2p_discovery_status") not in {
             "unavailable",
@@ -903,13 +905,13 @@ def _usable_access_token(
     with connection() as conn, conn.transaction():
         row = conn.execute(
             """
-            SELECT access_token_ciphertext, refresh_token_ciphertext,
+            SELECT status, access_token_ciphertext, refresh_token_ciphertext,
                    access_token_expires_at, refresh_token_expires_at
             FROM authorizations WHERE id = %s FOR UPDATE
             """,
             (authorization_id,),
         ).fetchone()
-        if not row or not row["refresh_token_ciphertext"]:
+        if not row or row["status"] != "active" or not row["refresh_token_ciphertext"]:
             raise ReauthorizationRequired
         if row["access_token_expires_at"] and row["access_token_expires_at"] > now + timedelta(minutes=2):
             return cipher.decrypt(row["access_token_ciphertext"])
@@ -942,6 +944,52 @@ def _store_refreshed_tokens(
             authorization_id,
         ),
     )
+
+
+def _refresh_profile_name(
+    job: SyncJob, authorization: dict[str, Any], access_token: str, client: LarkClient, settings: Settings
+) -> None:
+    """One optional name refresh per discovery job; failure never revokes sync."""
+    try:
+        snapshot = _authorization(job.authorization_id)
+        if not snapshot or snapshot["status"] != "active" or snapshot["open_id"] != authorization["open_id"]:
+            return
+        if TokenCipher(settings.token_encryption_key).decrypt(snapshot["access_token_ciphertext"]) != access_token:
+            return
+        profile = client.user_info(access_token)
+        if profile.open_id != snapshot["open_id"]:
+            return
+        with connection() as conn, conn.transaction():
+            current = conn.execute(
+                """SELECT open_id,status,access_token_ciphertext FROM authorizations WHERE id=%s FOR UPDATE""",
+                (job.authorization_id,),
+            ).fetchone()
+            if (
+                not current
+                or current["status"] != "active"
+                or current["open_id"] != profile.open_id
+                or current["access_token_ciphertext"] != snapshot["access_token_ciphertext"]
+            ):
+                return
+            _assert_discovery_current(conn, job)
+            label = _upsert_lark_identity(
+                conn,
+                profile.open_id,
+                display_name=profile.name,
+                en_name=profile.en_name,
+                en_name_present=profile.en_name_present,
+                authoritative=True,
+            )
+            if label:
+                conn.execute(
+                    """UPDATE authorizations SET display_name=%s
+                             WHERE id=%s AND display_name IS DISTINCT FROM %s""",
+                    (label, job.authorization_id, label),
+                )
+    except Exception:
+        # This optional profile refresh must not change the authorization state
+        # or log provider payloads. The existing IM sync remains authoritative.
+        LOGGER.info("optional profile-name refresh unavailable; message sync continues")
 
 
 def _discover_chats(
@@ -1214,7 +1262,7 @@ def _p2p_counterpart_open_id(counterpart_id: str | None, counterpart_type: str |
 def _read_member_snapshot(client: LarkClient, access_token: str, chat_id: str) -> MemberSnapshotMeasurement:
     checked_at = datetime.now(UTC)
     page_token: str | None = None
-    members: list[dict[str, str | None]] = []
+    members: list[dict[str, Any]] = []
     reported_total: int | None = None
     partial = False
     try:
@@ -1255,11 +1303,11 @@ def _read_member_snapshot(client: LarkClient, access_token: str, chat_id: str) -
     )
 
 
-def _member_records(data: dict[str, Any]) -> list[dict[str, str | None]]:
+def _member_records(data: dict[str, Any]) -> list[dict[str, Any]]:
     raw = data.get("users")
     if not isinstance(raw, list):
         raw = data.get("items")
-    records: list[dict[str, str | None]] = []
+    records: list[dict[str, Any]] = []
     for member in raw if isinstance(raw, list) else []:
         if not isinstance(member, dict):
             continue
@@ -1270,7 +1318,10 @@ def _member_records(data: dict[str, Any]) -> list[dict[str, str | None]]:
             {
                 "open_id": open_id,
                 "tenant_key": _text(member.get("tenant_key")),
-                "display_name": _text(member.get("name")) or _text(member.get("en_name")),
+                "name": _text(member.get("name")),
+                "en_name": _text(member.get("en_name")),
+                "en_name_present": "en_name" in member,
+                "display_name": format_display_name(_text(member.get("name")), _text(member.get("en_name"))),
                 "member_type": _text(member.get("member_type")) or "user",
             }
         )
@@ -1285,14 +1336,23 @@ def _store_member_snapshot(
     seen_at: datetime,
     internal_tenant_keys: set[str],
 ) -> None:
+    # OAuth-owned profiles have a separate verified refresh path. A group API's
+    # display variant must not replace their original/English profile fields.
+    authorized = {row["open_id"] for row in conn.execute(
+        "SELECT open_id FROM authorizations WHERE open_id=ANY(%s::text[])",
+        ([member["open_id"] for member in measurement.members],),
+    ).fetchall()}
     for member in measurement.members:
         open_id = member["open_id"]
         assert open_id is not None
-        _upsert_lark_identity(
+        label = _upsert_lark_identity(
             conn,
             open_id,
             tenant_key=member["tenant_key"],
-            display_name=member["display_name"],
+            display_name=member.get("name"),
+            en_name=member.get("en_name"),
+            en_name_present=bool(member.get("en_name_present")),
+            authoritative=open_id not in authorized,
             identity_type=member["member_type"] or "user",
             seen_at=seen_at,
         )
@@ -1305,7 +1365,7 @@ def _store_member_snapshot(
                 internal_tenant_keys=internal_tenant_keys,
             ),
             identity_type=member["member_type"] or "user",
-            display_name=member["display_name"],
+            display_name=label,
             seen_at=seen_at,
         )
         conn.execute(
@@ -1325,7 +1385,7 @@ def _store_member_snapshot(
                 chat_id,
                 open_id,
                 member["tenant_key"],
-                member["display_name"],
+                label,
                 member["member_type"] or "user",
                 seen_at,
                 seen_at,
@@ -1342,7 +1402,10 @@ def _upsert_lark_identity(
     display_name: str | None = None,
     identity_type: str = "user",
     seen_at: datetime | None = None,
-) -> None:
+    en_name: str | None = None,
+    en_name_present: bool = False,
+    authoritative: bool = False,
+) -> str | None:
     observed_at = seen_at or datetime.now(UTC)
     conn.execute(
         """
@@ -1351,11 +1414,13 @@ def _upsert_lark_identity(
         ) VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (open_id) DO UPDATE SET
             tenant_key = COALESCE(EXCLUDED.tenant_key, lark_identities.tenant_key),
-            display_name = COALESCE(EXCLUDED.display_name, lark_identities.display_name),
             identity_type = COALESCE(EXCLUDED.identity_type, lark_identities.identity_type),
             last_seen_at = EXCLUDED.last_seen_at
         """,
         (open_id, tenant_key, display_name, identity_type, observed_at, observed_at),
+    )
+    return update_identity_names(
+        conn, open_id, name=display_name, en_name=en_name, en_name_present=en_name_present, authoritative=authoritative
     )
 
 
@@ -1486,21 +1551,21 @@ def _ensure_contact_for_identity(
             """,
             (
                 contact_id,
-                display_name or identity["display_name"],
+                identity["display_name"] or display_name,
                 seen_at or datetime.now(UTC),
                 seen_at or datetime.now(UTC),
             ),
         )
         conn.execute("UPDATE lark_identities SET contact_id = %s WHERE open_id = %s", (contact_id, open_id))
         return
-    if display_name:
+    if identity["display_name"] or display_name:
         conn.execute(
             """
             UPDATE contacts
             SET display_name = COALESCE(display_name, %s), updated_at = NOW()
             WHERE id = %s
             """,
-            (display_name, contact_id),
+            (identity["display_name"] or display_name, contact_id),
         )
 
 

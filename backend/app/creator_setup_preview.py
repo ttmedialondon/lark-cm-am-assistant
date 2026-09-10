@@ -34,7 +34,7 @@ def data() -> dict:
     summary.update({issue: sum(item["issue"] == issue for item in accounts)
                     for issue in ("unresolved", "alias_missing", "identity_risk")})
     return {
-        "available": roster["available"], "responsible_name": "Remi · Quanzhen Liang",
+        "available": roster["available"], "responsible_name": roster.get("responsible_name") or "Remi",
         "responsible_id": str(REMI_ID), "source_filename": roster.get("source_filename", ""),
         "prepared_at_label": roster.get("prepared_at_label", ""), "summary": summary, "accounts": accounts,
     }

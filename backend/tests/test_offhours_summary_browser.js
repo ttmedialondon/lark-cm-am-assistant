@@ -43,6 +43,20 @@ async function fixture(t, data = report()) {
   return {page, state, errors};
 }
 
+test("bilingual user labels are displayed literally in scope and evidence", async t => {
+  const label = "Remi（Quanzhen Liang）";
+  const data = report({responsible: {id: "remi-id", name: label}, events: [event("P2", {
+    lark_user_name: "Sample Creator",
+    evidence: [{message_id: "message-1", chat_id: "chat-1", text: "Checked.",
+      created_at: "2026-09-09T20:00:00Z", sender_name: label}],
+  })]});
+  const {page, errors} = await fixture(t, data);
+  assert((await page.locator("#oh-scope").textContent()).includes(label));
+  await page.getByText("查看相关原文（1）").click();
+  assert((await page.locator(".oh-evidence").textContent()).includes(label));
+  assert.deepEqual(errors, []);
+});
+
 test("grades are sorted, gaps stay separate, and filters/search/evidence work without writes", async t => {
   const {page, state, errors} = await fixture(t);
   assert.deepEqual(await page.locator(".oh-event .oh-priority").allTextContents(), ["P0", "P1", "P2", "P3", "待核实"]);

@@ -3,6 +3,7 @@
 import io
 import zipfile
 from contextlib import nullcontext
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -120,12 +121,39 @@ def test_search_never_calls_global_directory(client, monkeypatch):
 
 @pytest.fixture
 def real_import(db, people, monkeypatch):
-    db.execute(
-        (__import__("pathlib").Path(__file__).parents[1] / "migrations/030_creator_workflow_imports.sql").read_text()
-    )
+    migrations = Path(__file__).parents[1] / "migrations"
+    db.execute((migrations / "030_creator_workflow_imports.sql").read_text())
+    db.execute((migrations / "033_identity_names.sql").read_text())
     monkeypatch.setattr(imports, "connection", lambda: nullcontext(db))
     monkeypatch.setattr(evidence, "connection", lambda: nullcontext(db))
     return workflow.get_scope(people["cm"])
+
+
+def test_bilingual_cm_names_remain_excel_aliases_and_collisions_stay_pending(db, people, real_import):
+    db.execute(
+        "UPDATE authorizations SET display_name='Remi（Quanzhen Liang）' WHERE id=%s", (people["cm"],)
+    )
+    db.execute(
+        """INSERT INTO lark_identities(open_id,name,en_name,display_name)
+        VALUES('ou_cm','Quanzhen Liang','Remi','Remi（Quanzhen Liang）')"""
+    )
+    aliases = imports._aliases(db)
+    for name in ("remi", "quanzhen liang", "remi（quanzhen liang）", str(people["cm"])):
+        assert aliases[name] == {str(people["cm"])}
+    rows = imports.resolve_rows(db, real_import, [
+        {"handle": "creator_" + str(index), "cm": name}
+        for index, name in enumerate(("Remi", "Quanzhen Liang", "Remi（Quanzhen Liang）"))
+    ])
+    assert all(row["responsible_id"] == str(people["cm"]) for row in rows)
+
+    db.execute(
+        "INSERT INTO lark_identities(open_id,name,en_name) VALUES('ou_cm2','Another Person','Remi')"
+    )
+    assert imports._aliases(db)["remi"] == {str(people["cm"]), str(people["cm2"])}
+    owner_scope = workflow.get_scope(people["owner"], people["cm"])
+    row = imports.resolve_rows(db, owner_scope, [{"handle": "uncertain", "cm": "Remi"}])[0]
+    assert row["responsible_id"] is None
+    assert "ownership_uncertain" in row["reasons"]
 
 
 def test_real_import_preflight_complete_direct_and_partial_pending(db, people, real_import):

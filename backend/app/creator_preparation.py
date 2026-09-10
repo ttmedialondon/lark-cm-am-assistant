@@ -156,6 +156,8 @@ def roster(responsible_id: UUID | None = None) -> dict[str, Any]:
         facts_by_contact = {str(row["id"]): creator_review._evidence(row) for row in rows}
         current_handles = {h for facts in facts_by_contact.values() for h in facts["handles"]}
         owner_rows = [row for row in rows if str(row["responsible_id"]) == payload["responsible_id"]]
+        if owner_rows:
+            result["responsible_name"] = owner_rows[0].get("responsible_name") or result["responsible_name"]
         owner_handles = {h for row in owner_rows for h in facts_by_contact[str(row["id"])]["handles"]}
         result["formal_summary"] = {
             "formal_people": len(owner_rows), "formal_handles": len(owner_handles),

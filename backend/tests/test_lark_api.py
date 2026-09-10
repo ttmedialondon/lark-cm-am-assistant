@@ -37,6 +37,26 @@ def test_authorization_url_uses_oauth_client_id_and_pkce() -> None:
     assert "scope=offline_access+im%3Achat%3Aread" in url
 
 
+@pytest.mark.parametrize(
+    "fields,expected",
+    [
+        ({"name": "Quanzhen Liang", "en_name": "Remi"}, "Remi（Quanzhen Liang）"),
+        ({"name": "Shang Ma", "en_name": "Shang Ma"}, "Shang Ma"),
+        ({"name": " Shuxuan Li ", "en_name": "shuxuan li"}, "shuxuan li"),
+        ({"en_name": "Remi"}, "Remi"),
+        ({"name": "Quanzhen Liang"}, "Quanzhen Liang"),
+    ],
+)
+def test_user_profile_preserves_both_names(monkeypatch, fields, expected) -> None:
+    client = LarkClient(settings())
+    monkeypatch.setattr(client, "_request", lambda *args, **kwargs: {"open_id": "ou_person", **fields})
+    profile = client.user_info("user-token")
+    assert profile.display_name == expected
+    assert profile.en_name_present == ("en_name" in fields)
+    assert profile.name == ((fields.get("name") or "").strip() or None)
+    assert profile.en_name == fields.get("en_name")
+
+
 def test_chat_member_list_requests_a_paginated_user_roster(monkeypatch) -> None:
     client = LarkClient(settings())
     captured = {}

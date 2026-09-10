@@ -32,6 +32,7 @@ from .admin_reporting import sync_summary
 from .config import get_settings
 from .crypto import TokenCipher
 from .db import connection, database_is_ready
+from .identity_names import update_identity_names
 from .lark_api import LarkApiError, LarkClient
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -183,7 +184,7 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 authorization_id,
                 profile.open_id,
                 profile.union_id,
-                profile.name,
+                profile.display_name,
                 profile.avatar_url,
                 cipher.encrypt(tokens.access_token),
                 cipher.encrypt(tokens.refresh_token) if tokens.refresh_token else None,
@@ -202,10 +203,17 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
             INSERT INTO lark_identities (open_id, display_name, first_seen_at, last_seen_at)
             VALUES (%s, %s, NOW(), NOW())
             ON CONFLICT (open_id) DO UPDATE SET
-                display_name = COALESCE(EXCLUDED.display_name, lark_identities.display_name),
                 last_seen_at = EXCLUDED.last_seen_at
             """,
             (profile.open_id, profile.name),
+        )
+        profile_label = update_identity_names(
+            conn, profile.open_id, name=profile.name, en_name=profile.en_name,
+            en_name_present=profile.en_name_present, authoritative=True,
+        )
+        conn.execute(
+            "UPDATE authorizations SET display_name=%s WHERE id=%s AND display_name IS DISTINCT FROM %s",
+            (profile_label, authorization_id, profile_label),
         )
         # A re-authorization is the explicit opportunity to retry unreadable
         # conversations and collect content under the revised agreement.

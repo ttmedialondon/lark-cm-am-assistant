@@ -194,6 +194,18 @@ def test_preparation_get_is_read_only_and_keeps_candidate_handles_out_of_registr
     assert all("body_ciphertext" not in sql for sql, _ in conn.calls)
 
 
+def test_live_names_overlay_display_without_rewriting_historical_snapshot(monkeypatch):
+    payload = preparation_payload()
+    original = deepcopy(payload)
+    row = {**documented_row(), "responsible_name": "Remi（Quanzhen Liang）", "display_name": "Lami（Lamide Oj）"}
+    conn = bind_preparation(monkeypatch, payload, row)
+    result = creator_preparation.roster()
+    assert result["responsible_name"] == row["responsible_name"]
+    assert result["items"][0]["display_name"] == row["display_name"]
+    assert payload == original
+    assert len(conn.calls) == 2
+
+
 @pytest.mark.parametrize("change", [
     {"assignment_id": UUID(int=99)}, {"responsible_id": UUID(int=99)},
     {"role_updated_at": NOW + timedelta(seconds=1)}, {"role_source": "manual_p2p_confirmed"},

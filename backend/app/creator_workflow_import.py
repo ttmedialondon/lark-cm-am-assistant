@@ -93,11 +93,14 @@ def parse_workbook(content: bytes, filename: str) -> list[dict]:
 
 
 def _aliases(conn):
-    rows = conn.execute("""SELECT id,display_name FROM authorizations
-        WHERE status='active' AND assignment_eligible""").fetchall()
+    rows = conn.execute("""SELECT auth.id,auth.display_name,identity.name,identity.en_name
+        FROM authorizations auth LEFT JOIN lark_identities identity ON identity.open_id=auth.open_id
+        WHERE auth.status='active' AND auth.assignment_eligible""").fetchall()
     names = {}
     for row in rows:
-        names.setdefault((row["display_name"] or "").strip().casefold(), set()).add(str(row["id"]))
+        for value in (row["display_name"], row["name"], row["en_name"]):
+            if value and value.strip():
+                names.setdefault(value.strip().casefold(), set()).add(str(row["id"]))
         names.setdefault(str(row["id"]), set()).add(str(row["id"]))
     for row in conn.execute("""SELECT alias,responsible_id FROM creator_workflow_cm_aliases alias
         JOIN authorizations auth ON auth.id=alias.responsible_id

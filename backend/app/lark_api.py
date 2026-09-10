@@ -11,6 +11,7 @@ from urllib.parse import quote, urlencode
 import httpx
 
 from .config import Settings
+from .identity_names import format_display_name
 from .lark_sync_admission import LarkSyncAdmission
 
 
@@ -62,6 +63,12 @@ class LarkProfile:
     union_id: str | None
     name: str | None
     avatar_url: str | None
+    en_name: str | None = None
+    en_name_present: bool = False
+
+    @property
+    def display_name(self) -> str | None:
+        return format_display_name(self.name, self.en_name)
 
 
 class LarkClient:
@@ -122,8 +129,10 @@ class LarkClient:
         return LarkProfile(
             open_id=open_id,
             union_id=_string(data.get("union_id")),
-            name=_string(data.get("name")) or _string(data.get("en_name")),
+            name=_string(data.get("name")),
             avatar_url=_string(data.get("avatar_url")),
+            en_name=_string(data.get("en_name")),
+            en_name_present="en_name" in data,
         )
 
     def list_chats(

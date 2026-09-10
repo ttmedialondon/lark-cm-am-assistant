@@ -1,0 +1,305 @@
+from __future__ import annotations
+
+import os
+from contextlib import nullcontext
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from uuid import uuid4
+
+import psycopg
+import pytest
+from psycopg.rows import dict_row
+
+from app import worker
+from app.crypto import TokenCipher
+from app.identity_names import format_display_name, update_identity_names
+from app.lark_api import LarkApiError, LarkProfile
+from scripts import backfill_identity_names as backfill
+
+
+@pytest.mark.parametrize(
+    ("name", "english", "expected"),
+    [
+        ("Quanzhen Liang", "Remi", "Remi（Quanzhen Liang）"),
+        ("  Alex   Smith ", "alex smith", "alex smith"),
+        ("Ａlex", "Alex", "Alex（Ａlex）"),
+        ("张三", None, "张三"),
+        (None, "Alice", "Alice"),
+        ("", "  ", None),
+        (None, None, None),
+        ("Remi（Quanzhen Liang）", None, "Remi（Quanzhen Liang）"),
+    ],
+)
+def test_display_format(name, english, expected):
+    assert format_display_name(name, english) == expected
+
+
+def test_member_records_keep_sources_and_distinguish_missing_english():
+    values = worker._member_records(
+        {
+            "items": [
+                {"member_id": "ou_a", "name": "Quanzhen Liang", "en_name": "Remi"},
+                {"member_id": "ou_b", "name": "No English"},
+                {"member_id": "ou_c", "name": "Cleared English", "en_name": ""},
+            ]
+        }
+    )
+    assert values[0]["name"] == "Quanzhen Liang" and values[0]["en_name"] == "Remi"
+    assert values[0]["display_name"] == "Remi（Quanzhen Liang）"
+    assert not values[1]["en_name_present"]
+    assert values[2]["en_name_present"] and values[2]["en_name"] is None
+
+
+@pytest.fixture
+def pg(monkeypatch):
+    dsn = os.environ.get("IDENTITY_NAMES_TEST_DATABASE_URL")
+    if not dsn:
+        pytest.skip("Set IDENTITY_NAMES_TEST_DATABASE_URL for isolated PostgreSQL checks")
+    with psycopg.connect(dsn, row_factory=dict_row) as conn:
+        schema = "test_identity_names_" + uuid4().hex
+        conn.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(psycopg.sql.Identifier(schema)))
+        conn.execute(psycopg.sql.SQL("SET LOCAL search_path TO {}").format(psycopg.sql.Identifier(schema)))
+        for path in sorted((Path(__file__).parents[1] / "migrations").glob("*.sql")):
+            if int(path.name[:3]) < 33:
+                conn.execute(path.read_text())
+        conn.execute("INSERT INTO lark_identities(open_id,display_name) VALUES('ou_legacy','Old Raw Name')")
+        conn.execute((Path(__file__).parents[1] / "migrations/033_identity_names.sql").read_text())
+        monkeypatch.setattr(worker, "connection", lambda: nullcontext(conn))
+        try:
+            yield conn
+        finally:
+            conn.rollback()
+
+
+@pytest.fixture
+def person(pg):
+    contact_id, authorization_id = uuid4(), uuid4()
+    pg.execute("INSERT INTO contacts(id,display_name,entity_type) VALUES(%s,'Old Name','person')", (contact_id,))
+    pg.execute(
+        """INSERT INTO lark_identities(open_id,contact_id,name,display_name)
+               VALUES('ou_person',%s,'Quanzhen Liang','Old Name')""",
+        (contact_id,),
+    )
+    pg.execute(
+        """INSERT INTO authorizations(id,open_id,display_name,access_token_ciphertext)
+               VALUES(%s,'ou_person','Verified Old Profile','test')""",
+        (authorization_id,),
+    )
+    for chat_id in ("chat_a", "chat_b"):
+        pg.execute("INSERT INTO chats(chat_id) VALUES(%s)", (chat_id,))
+        pg.execute(
+            """INSERT INTO chat_members(chat_id,open_id,display_name)
+                   VALUES(%s,'ou_person','Old Member Name')""",
+            (chat_id,),
+        )
+    return contact_id, authorization_id
+
+
+def test_migration_preserves_legacy_raw_name_without_inventing_english(pg):
+    row = pg.execute("SELECT name,en_name,display_name FROM lark_identities WHERE open_id='ou_legacy'").fetchone()
+    assert row == {"name": "Old Raw Name", "en_name": None, "display_name": "Old Raw Name"}
+
+
+def test_authoritative_update_propagates_unambiguous_labels_but_not_authorization(pg, person):
+    contact_id, _ = person
+    label = update_identity_names(
+        pg, "ou_person", name="Quanzhen Liang", en_name="Remi", en_name_present=True, authoritative=True
+    )
+    assert label == "Remi（Quanzhen Liang）"
+    assert (
+        pg.execute("SELECT display_name FROM contacts WHERE id=%s", (contact_id,)).fetchone()["display_name"] == label
+    )
+    assert {r["display_name"] for r in pg.execute("SELECT display_name FROM chat_members").fetchall()} == {label}
+    assert pg.execute("SELECT display_name FROM authorizations").fetchone()["display_name"] == "Verified Old Profile"
+    # Repair a downstream stale cache even though the canonical identity is unchanged.
+    pg.execute("UPDATE contacts SET display_name='Stale' WHERE id=%s", (contact_id,))
+    update_identity_names(pg, "ou_person")
+    assert (
+        pg.execute("SELECT display_name FROM contacts WHERE id=%s", (contact_id,)).fetchone()["display_name"] == label
+    )
+
+
+def test_old_message_cannot_revert_known_profile_name_and_omitted_english_is_preserved(pg, person):
+    update_identity_names(
+        pg, "ou_person", name="Quanzhen Liang", en_name="Remi", en_name_present=True, authoritative=True
+    )
+    worker._upsert_lark_identity(pg, "ou_person", display_name="Old Message Nickname")
+    worker._upsert_lark_identity(pg, "ou_person", display_name="Quanzhen Liang", authoritative=True)
+    row = pg.execute("SELECT name,en_name,display_name FROM lark_identities WHERE open_id='ou_person'").fetchone()
+    assert row == {"name": "Quanzhen Liang", "en_name": "Remi", "display_name": "Remi（Quanzhen Liang）"}
+    assert (
+        update_identity_names(pg, "ou_person", en_name="", en_name_present=True, authoritative=True) == "Quanzhen Liang"
+    )
+
+
+def test_english_only_is_not_copied_into_original_field(pg):
+    worker._upsert_lark_identity(pg, "ou_english", en_name="English Only", en_name_present=True, authoritative=True)
+    row = pg.execute("SELECT name,en_name,display_name FROM lark_identities WHERE open_id='ou_english'").fetchone()
+    assert row == {"name": None, "en_name": "English Only", "display_name": "English Only"}
+    assert update_identity_names(pg, "ou_english", en_name="", en_name_present=True, authoritative=True) is None
+
+
+def test_multi_identity_contact_label_is_preserved(pg, person):
+    contact_id, _ = person
+    pg.execute(
+        "INSERT INTO lark_identities(open_id,contact_id,name) VALUES('ou_other',%s,'Another Profile')", (contact_id,)
+    )
+    label = update_identity_names(
+        pg, "ou_person", name="Quanzhen Liang", en_name="Remi", en_name_present=True, authoritative=True
+    )
+    assert label == "Remi（Quanzhen Liang）"
+    assert (
+        pg.execute("SELECT display_name FROM contacts WHERE id=%s", (contact_id,)).fetchone()["display_name"]
+        == "Old Name"
+    )
+
+
+def test_new_contact_and_new_member_keep_canonical_composite(pg, person):
+    now = datetime.now(UTC)
+    members = worker._member_records({"items": [{"member_id": "ou_new", "name": "张三", "en_name": "Alice"}]})
+    measurement = worker.MemberSnapshotMeasurement(1, "succeeded", "succeeded", now, tuple(members))
+    worker._store_member_snapshot(pg, person[1], "chat_a", measurement, now, set())
+    row = pg.execute("""SELECT i.name,i.en_name,i.display_name,c.display_name AS contact_name,
+                   m.display_name AS member_name FROM lark_identities i JOIN contacts c ON c.id=i.contact_id
+                   JOIN chat_members m USING(open_id) WHERE i.open_id='ou_new'""").fetchone()
+    assert row == {
+        "name": "张三",
+        "en_name": "Alice",
+        "display_name": "Alice（张三）",
+        "contact_name": "Alice（张三）",
+        "member_name": "Alice（张三）",
+    }
+    worker._ensure_contact_for_identity(
+        pg, "ou_new", tenant_classification="unresolved", identity_type="user", display_name="张三"
+    )
+    assert (
+        pg.execute(
+            "SELECT display_name FROM contacts WHERE id=(SELECT contact_id FROM lark_identities WHERE open_id='ou_new')"
+        ).fetchone()["display_name"]
+        == "Alice（张三）"
+    )
+
+
+def test_group_display_variant_cannot_override_authorized_profile(pg, person):
+    update_identity_names(
+        pg, "ou_person", name="Quanzhen Liang", en_name="Remi", en_name_present=True, authoritative=True
+    )
+    members = worker._member_records({"items": [{"member_id": "ou_person", "name": "Remi", "en_name": ""}]})
+    now = datetime.now(UTC)
+    measurement = worker.MemberSnapshotMeasurement(1, "succeeded", "succeeded", now, tuple(members))
+    worker._store_member_snapshot(pg, person[1], "chat_a", measurement, now, set())
+    row = pg.execute("SELECT name,en_name,display_name FROM lark_identities WHERE open_id='ou_person'").fetchone()
+    assert row == {"name": "Quanzhen Liang", "en_name": "Remi", "display_name": "Remi（Quanzhen Liang）"}
+
+
+@pytest.mark.parametrize("change", [None, "revoked", "token", "identity", "job", "api"])
+def test_optional_profile_refresh_fences_writes_and_never_breaks_authorization(pg, person, change):
+    _, auth_id = person
+    key = b"x" * 32
+    cipher = TokenCipher(key)
+    pg.execute(
+        "UPDATE authorizations SET access_token_ciphertext=%s WHERE id=%s", (cipher.encrypt("test-access"), auth_id)
+    )
+    job = worker.SyncJob(uuid4(), auth_id, "incremental", 1, "running", 1)
+    pg.execute(
+        """INSERT INTO sync_jobs(id,authorization_id,mode,status,discovery_status,discovery_generation,scheduled_at)
+               VALUES(%s,%s,'incremental','running','running',1,NOW())""",
+        (job.id, auth_id),
+    )
+    authorization = worker._authorization(auth_id)
+
+    class Client:
+        def user_info(self, _token):
+            if change == "api":
+                raise LarkApiError(403, 99991679, "simulated denied")
+            if change == "revoked":
+                pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (auth_id,))
+            if change == "token":
+                pg.execute(
+                    "UPDATE authorizations SET access_token_ciphertext=%s WHERE id=%s",
+                    (cipher.encrypt("new-token"), auth_id),
+                )
+            if change == "job":
+                pg.execute("UPDATE sync_jobs SET discovery_generation=2 WHERE id=%s", (job.id,))
+            return LarkProfile(
+                open_id="ou_mismatch" if change == "identity" else "ou_person",
+                union_id=None,
+                name="Quanzhen Liang",
+                en_name="Remi",
+                en_name_present=True,
+                avatar_url=None,
+            )
+
+    worker._refresh_profile_name(job, authorization, "test-access", Client(), SimpleNamespace(token_encryption_key=key))
+    auth = pg.execute("SELECT display_name,status FROM authorizations WHERE id=%s", (auth_id,)).fetchone()
+    assert auth["display_name"] == ("Remi（Quanzhen Liang）" if change is None else "Verified Old Profile")
+    assert auth["status"] == ("revoked" if change == "revoked" else "active")
+
+
+@pytest.mark.parametrize("change", [None, "identity", "token", "revoked"])
+def test_backfill_profile_reuses_verified_profile_and_fences_changed_authorization(pg, person, monkeypatch, change):
+    auth_id = person[1]
+    cipher = TokenCipher(b"x" * 32)
+    pg.execute(
+        "UPDATE authorizations SET access_token_ciphertext=%s WHERE id=%s", (cipher.encrypt("test-token"), auth_id)
+    )
+    monkeypatch.setattr(backfill, "connection", lambda: nullcontext(pg))
+    monkeypatch.setattr(backfill, "_authorization", worker._authorization)
+    monkeypatch.setattr(backfill, "_usable_access_token", lambda *_: "test-token")
+
+    class Client:
+        def user_info(self, _token):
+            if change == "token":
+                pg.execute(
+                    "UPDATE authorizations SET access_token_ciphertext=%s WHERE id=%s",
+                    (cipher.encrypt("new-token"), auth_id),
+                )
+            elif change == "revoked":
+                pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (auth_id,))
+            return LarkProfile(
+                open_id="ou_wrong" if change == "identity" else "ou_person",
+                union_id=None,
+                name="Quanzhen Liang",
+                en_name="Remi",
+                en_name_present=True,
+                avatar_url=None,
+            )
+
+    status = backfill.refresh_profile(auth_id, Client(), SimpleNamespace(token_encryption_key=b"x" * 32))
+    assert status == ({None: "refreshed", "identity": "identity_mismatch"}.get(change, "authorization_changed"))
+    expected = "Remi（Quanzhen Liang）" if change is None else "Verified Old Profile"
+    assert (
+        pg.execute("SELECT display_name FROM authorizations WHERE id=%s", (auth_id,)).fetchone()["display_name"]
+        == expected
+    )
+
+
+def test_expired_token_refresh_does_not_reactivate_a_concurrently_revoked_authorization(pg, person):
+    auth_id = person[1]
+    key = b"x" * 32
+    cipher = TokenCipher(key)
+    expired = datetime.now(UTC) - timedelta(hours=1)
+    pg.execute(
+        """UPDATE authorizations SET access_token_ciphertext=%s,refresh_token_ciphertext=%s,
+               access_token_expires_at=%s,refresh_token_expires_at=%s WHERE id=%s""",
+        (
+            cipher.encrypt("old-access"),
+            cipher.encrypt("old-refresh"),
+            expired,
+            datetime.now(UTC) + timedelta(days=1),
+            auth_id,
+        ),
+    )
+    stale = worker._authorization(auth_id)
+    pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (auth_id,))
+
+    class Client:
+        def refresh_token(self, _token):
+            pytest.fail("A revoked authorization must not call refresh or reactivate")
+
+    with pytest.raises(worker.ReauthorizationRequired):
+        worker._usable_access_token(auth_id, stale, Client(), SimpleNamespace(token_encryption_key=key))
+    row = pg.execute("SELECT status,access_token_ciphertext FROM authorizations WHERE id=%s", (auth_id,)).fetchone()
+    assert row["status"] == "revoked"
+    assert cipher.decrypt(row["access_token_ciphertext"]) == "old-access"
