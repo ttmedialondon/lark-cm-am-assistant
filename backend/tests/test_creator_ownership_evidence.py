@@ -126,6 +126,42 @@ def test_group_co_presence_unknown_mentions_and_broadcast_do_not_create_direct_p
     assert "OTHERS_BODY_SECRET" not in json.dumps(weak["pack"])
     pg.execute("ROLLBACK TO SAVEPOINT weak_turns")
     pg.execute("RELEASE SAVEPOINT weak_turns")
+    pg.execute("SAVEPOINT split_turns")
+    pg.execute("INSERT INTO chats(chat_id,chat_mode) VALUES('split','group')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'split')", (ids["cm"],))
+    moment = datetime(2026, 1, 1, tzinfo=UTC)
+    add("creator", "Can you help with this request?", chat="split", when=moment)
+    anchor = add("cm", "@_user_1", chat="split", when=moment + timedelta(seconds=30), mentions=[
+        {"key": "@_user_1", "id": "ou_creator", "id_type": "open_id", "name": "Alice Creator"},
+    ])
+    tail = add("cm", "I can apply for LE subsidies.", chat="split", when=moment + timedelta(seconds=50))
+    split = evidence.build_evidence(ids["creator"], ids["cm"], settings)
+    assert split["eligible"] and split["stats"]["strong_pair"]
+    tail_ref = next(r["label"] for r in split["refs"] if r["message_id"] == tail)
+    anchor_ref = next(r["label"] for r in split["refs"] if r["message_id"] == anchor)
+    assert next(m for m in split["pack"]["messages"] if m["ref"] == tail_ref)["continuation_of_ref"] == anchor_ref
+    # No inheriting an address across another participant, beyond two minutes, or to a different target.
+    pg.execute("SAVEPOINT interrupted_tail")
+    add("other", "A separate discussion", chat="split", when=moment + timedelta(seconds=40))
+    assert not evidence.build_evidence(ids["creator"], ids["cm"], settings)["eligible"]
+    pg.execute("ROLLBACK TO SAVEPOINT interrupted_tail")
+    pg.execute("RELEASE SAVEPOINT interrupted_tail")
+    for sql, params in (
+        ("UPDATE chat_messages SET message_create_time=%s WHERE message_id=%s",
+         (moment + timedelta(minutes=3), tail)),
+        ("UPDATE chat_messages SET mentions_json=%s WHERE message_id=%s",
+         (Jsonb([{"key": "@_user_1", "id": "ou_other", "id_type": "open_id", "name": "Other"}]), anchor)),
+        ("UPDATE chat_messages SET mentions_json=%s WHERE message_id=%s",
+         (Jsonb([{"key": "@_user_1", "id": "ou_other", "id_type": "open_id", "name": "Other"}]), tail)),
+    ):
+        pg.execute("SAVEPOINT changed_tail")
+        pg.execute(sql, params)
+        assert not evidence.build_evidence(ids["creator"], ids["cm"], settings)["eligible"]
+        pg.execute("ROLLBACK TO SAVEPOINT changed_tail")
+        pg.execute("RELEASE SAVEPOINT changed_tail")
+    assert all(evidence.BUSINESS.search(word) for word in ("subsidy", "subsidies", "LE", "FS", "GMV", "flash sale"))
+    pg.execute("ROLLBACK TO SAVEPOINT split_turns")
+    pg.execute("RELEASE SAVEPOINT split_turns")
     # Explicit reply to the actual creator changes the evidence, not the display name.
     add("cm", "I will arrange the requested sample for you", chat="group", parent=u)
     result = evidence.build_evidence(ids["creator"], ids["cm"], settings)
@@ -179,6 +215,16 @@ def test_historical_negative_latest_and_oldest_turns_survive_bounded_selection(p
     same = evidence.build_evidence(ids["creator"], ids["cm"], settings)
     assert same["fingerprint"] == result["fingerprint"]
     assert "history_handoff" in result["stats"]["selection_tags"]
+
+    # An oversized later handover must not leave only the old positive business exchanges eligible.
+    oversized_handoff = "I am no longer responsible for you. " + "Complete handover details. " * 900
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id=%s",
+               (message_body_cipher(settings.token_encryption_key).encrypt(json.dumps({"text": oversized_handoff})),
+                handoff))
+    blocked = evidence.build_evidence(ids["creator"], ids["cm"], settings)
+    assert not blocked["eligible"] and blocked["reason_code"] == "material_over_limit"
+    assert blocked["stats"]["selection_limited"] and blocked["refs"] == []
+    assert blocked["pack"]["messages"] == []
 
 
 def test_model_verdicts_cannot_borrow_uncited_global_flags_or_invent_counter_evidence():

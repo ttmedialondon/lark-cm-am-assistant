@@ -273,7 +273,7 @@ def test_existing_owner_wins_before_dispatch_and_before_confirmation(pg, pilot):
     assert ownership.start_run(pilot.ids["owner"], new_run) == 0 and len(pilot.calls) == 1
 
 
-def test_changed_evidence_and_superseded_batches_cannot_start_or_confirm(pg, pilot):
+def test_changed_evidence_and_superseded_batches_cannot_pay_or_confirm(pg, pilot):
     old = _prepared(pilot)
     # A completed pilot can retain ready people, while a later preview owns this CM's active batch.
     pg.execute("UPDATE creator_ownership_runs SET status='completed' WHERE id=%s", (old,))
@@ -293,6 +293,23 @@ def test_changed_evidence_and_superseded_batches_cannot_start_or_confirm(pg, pil
     with pytest.raises(ValueError):
         ownership.confirm_tasks(pilot.ids["owner"], current, [task["id"]])
     assert len(pilot.calls) == 1 and not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
+
+    # The start button only checks frozen quotes. New, unquoted history is still
+    # rejected in the worker before an API request, not inside a slow batch POST.
+    fresh = _prepared(pilot)
+    pg.execute(
+        "INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,"
+        "body_ciphertext,message_create_time) VALUES('chat_creator','new_handover','ou_cm','user','text',%s,NOW())",
+        (message_body_cipher(pilot.settings.token_encryption_key).encrypt(
+            '{"text":"I am no longer your manager; another CM has taken over."}'),),
+    )
+    pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+               "VALUES(%s,'chat_creator','new_handover')", (pilot.ids["cm"],))
+    assert ownership.start_run(pilot.ids["owner"], fresh) == 1
+    _run_all(pilot)
+    stale = _task(pg, fresh, pilot.ids["creator"])
+    assert stale["status"] == "invalid" and stale["api_requests"] == 0
+    assert stale["reason_code"] == "authorization_changed" and len(pilot.calls) == 1
 
 
 def test_concurrent_start_dispatch_and_pause_have_no_lock_cycle_or_duplicate_requests(pg, pilot, monkeypatch):

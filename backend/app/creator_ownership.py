@@ -23,7 +23,7 @@ LOGGER = logging.getLogger(__name__)
 REASONS = {
     "no_readable_messages": "无可读材料",
     "no_readable_material": "无可读材料",
-    "no_direct_exchange": "未找到直接交流",
+    "no_direct_exchange": "未找到可用的双向交流",
     "no_business_content": "缺少业务内容",
     "no_substantive_messages": "缺少业务内容",
     "insufficient_exchange": "双方材料不足",
@@ -287,7 +287,10 @@ def prepare_next_preview(settings):
                 refs = material["refs"]
                 from .creator_ownership_evidence import revalidate_refs
 
-                if not revalidate_refs(conn, refs, job["contact_id"], job["cm_authorization_id"], settings):
+                # Freeze valid quotes now; a new historical message between preparation
+                # and dispatch is caught by the worker's full source-hash check.
+                if not revalidate_refs(conn, refs, job["contact_id"], job["cm_authorization_id"], settings,
+                                       check_history=False):
                     raise ValueError("材料已变化")
                 for ref in refs:
                     conn.execute(
@@ -400,7 +403,9 @@ def start_run(actor_id, run_id, limit=20):
             if limit and queued >= limit:
                 break
             reason = _eligible_now(conn, task)
-            if not reason and not _valid_material(conn, task, settings):
+            # Starting only queues work. Full related-history validation stays in
+            # the worker immediately before payment, not in a minutes-long POST.
+            if not reason and not _valid_material(conn, task, settings, check_history=False):
                 reason = "authorization_changed"
             if not reason and task["config_fingerprint"] not in (None, config_fp):
                 reason = "configuration_changed"

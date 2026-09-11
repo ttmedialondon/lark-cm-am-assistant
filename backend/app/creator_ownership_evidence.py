@@ -17,11 +17,12 @@ from .db import connection
 from .message_mentions import mention_targets, resolve_mentions, rich_mention_text
 
 MAX_SEGMENTS, MAX_MESSAGES, MAX_BODY_CHARS = 6, 40, 16_000
-SELECTION_VERSION = "ownership-evidence-v1"
+SELECTION_VERSION = "ownership-evidence-v2"
 BUSINESS = re.compile(
     r"\b(?:sample\w*|voucher\w*|campaign\w*|commission\w*|product\w*|sku|brand\w*|"
     r"live|livestream\w*|video\w*|boost\w*|affiliate\w*|collaborat\w*|agency|"
-    r"payment\w*|invoice\w*|violation\w*|appeal\w*|account|manager|cm)\b"
+    r"payment\w*|invoice\w*|violation\w*|appeal\w*|account|manager|cm|"
+    r"subsid(?:y|ies)|le|fs|gmv|flash\s+sale)\b"
     r"|达人|直播|视频|样品|补样|佣金|机构|签约|推品|投流|带货|选品|负责|交接|接手",
     re.I,
 )
@@ -211,27 +212,44 @@ def _segments(items):
         for index, item in enumerate(rows):
             row = item["row"]
             before = rows[index - 1] if index else None
+            target = {"CM1"} if item["speaker"] == "U1" else {"U1"}
+            continuation = bool(
+                row["chat_mode"] != "p2p" and before and before["row"]["sender_open_id"] == row["sender_open_id"]
+                and before["mentions"] == target and not item["mentions"] and not row.get("parent_id")
+                and row.get("previous_message_id") == before["row"]["message_id"]
+                and timedelta(0) <= item["time"] - before["time"] <= timedelta(minutes=2)
+            )
+            anchor = before if continuation else None
+            if anchor:
+                item["continuation_of"] = anchor["row"]["message_id"]
             parent = lookup.get(row.get("parent_id"))
+            if anchor:
+                parent = lookup.get(anchor["row"].get("parent_id"))
+                before = rows[index - 2] if index >= 2 else None
             counterpart = parent if parent and parent["speaker"] != item["speaker"] else before
             opposite = counterpart and counterpart["speaker"] != item["speaker"]
             within = opposite and abs(item["time"] - counterpart["time"]) <= timedelta(days=7)
-            addressed = item["mentions"] == ({"CM1"} if item["speaker"] == "U1" else {"U1"})
+            addressed = item["mentions"] == target or continuation
             private = row["chat_mode"] == "p2p" and item["private"]
             business = item["business"] or bool(counterpart and counterpart["business"])
-            strong = bool(opposite and business and (
+            meaningful_pair = bool(item["substantive"] and counterpart and counterpart["substantive"])
+            strong = bool(opposite and meaningful_pair and business and (
                 (private and within) or (parent is counterpart) or (addressed and within)
             ))
             # A group adjacency alone is not interaction: require uninterrupted turns,
             # a specific shared topic beyond a generic business word, and a response cue.
             shared = _tokens(item["text"]) & _tokens(counterpart["text"]) if within else set()
             topic = {token for token in shared if not BUSINESS.fullmatch(token)}
-            weak = bool(not private and within and business and topic and RESPONSE.search(item["text"])
+            weak = bool(not private and meaningful_pair and within and business and topic
+                        and RESPONSE.search(item["text"])
                         and row.get("previous_message_id") == counterpart["row"]["message_id"])
             direct_explicit = bool(item["explicit"] and (private or addressed or (opposite and parent is counterpart)))
             direct_negative = bool(item["negative"] and (private or addressed or (opposite and parent is counterpart)))
             if not (strong or weak or direct_explicit or direct_negative):
                 continue
             selected = [counterpart, item] if (strong or weak) else [item]
+            if anchor:
+                selected.insert(-1, anchor)
             selected = list({r["row"]["message_id"]: r for r in selected}.values())
             # Include a short immediately following pair turn so an answer/correction isn't severed.
             for extra in rows[index + 1:index + 3]:
@@ -268,6 +286,9 @@ def _select(segments):
         size = sum(len(r["text"]) for r in additions)
         if (len(selected) >= MAX_SEGMENTS or message_count + len(additions) > MAX_MESSAGES
                 or chars + size > MAX_BODY_CHARS):
+            if segment["negative_signal"]:
+                # Never send old positive evidence while hiding a known handover/termination behind a budget.
+                return [], True
             omitted = True
             continue
         # Keep whole messages/exchanges; do not crop out a sentence that may reverse the conclusion.
@@ -300,6 +321,7 @@ def _pack(items, aliases, cm_id, history_count, source_hash):
             "relation": "private" if item["private"] else "group",
             "parent_ref": labels.get((row["chat_id"], row.get("parent_id"))),
             "root_ref": labels.get((row["chat_id"], row.get("root_id"))),
+            "continuation_of_ref": labels.get((row["chat_id"], item.get("continuation_of"))),
             "mentions": [{"target": aliases.get(t["open_id"], "other" if t["open_id"] else "unknown"),
                           "ambiguous": t["ambiguous"]} for t in mention_targets(row.get("mentions_json"))],
         })
@@ -357,9 +379,13 @@ def build_evidence(contact_id, cm_authorization_id, settings):
                 continue
             readable += 1
             text = _text(raw, row, aliases, names)
-            if not _substantive(text):
+            meaningful = _substantive(text)
+            targets = {aliases.get(t["open_id"], "other" if t["open_id"] else "unknown")
+                       for t in mention_targets(row.get("mentions_json"))}
+            target = {"CM1"} if aliases[row["sender_open_id"]] == "U1" else {"U1"}
+            if not meaningful and targets != target:
                 continue
-            substantive += 1
+            substantive += int(meaningful)
             if BROADCAST.search(text):
                 continue
             items.append({
@@ -368,8 +394,7 @@ def build_evidence(contact_id, cm_authorization_id, settings):
                 "private": row["chat_mode"] == "p2p" and row["p2p_counterpart_open_id"] in subject_ids,
                 "business": bool(BUSINESS.search(text)), "explicit": bool(RESPONSIBILITY.search(text)),
                 "negative": bool(NEGATIVE.search(text)),
-                "mentions": {aliases.get(t["open_id"], "other" if t["open_id"] else "unknown")
-                             for t in mention_targets(row.get("mentions_json"))},
+                "substantive": meaningful, "mentions": targets,
                 "body_sha256": hashlib.sha256(raw.encode()).hexdigest(),
             })
     pack, refs, stats = _pack(items, aliases, cm_authorization_id, readable, source_hash)
@@ -377,10 +402,10 @@ def build_evidence(contact_id, cm_authorization_id, settings):
         reason = "eligible"
     elif not readable:
         reason = "no_readable_material"
-    elif not substantive or not any(r["business"] for r in items):
-        reason = "no_business_content"
     elif stats["selection_limited"]:
         reason = "material_over_limit"
+    elif not substantive or not any(r["business"] for r in items):
+        reason = "no_business_content"
     elif len({r["speaker"] for r in items}) < 2:
         reason = "insufficient_two_way_material"
     else:
