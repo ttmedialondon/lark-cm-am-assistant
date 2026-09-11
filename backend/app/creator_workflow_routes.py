@@ -80,9 +80,13 @@ def create_router(*, current_authorization, render_template, csrf_token):
 
     def listing(request, scope):
         params = request.query_params
+        default_status = "confirmed" if scope["responsible_id"] else "pending"
+        status = params.get("status", default_status)
+        if status == "all":
+            status = default_status
         return workflow.list_records(
             scope,
-            status=params.get("status", "all"),
+            status=status,
             source=params.get("source", ""),
             reason=params.get("reason", ""),
             query=params.get("q", params.get("query", "")),
@@ -253,6 +257,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
                     contact_id=payload["contact_id"],
                     relationship=payload.get("relationship"),
                     creator_type=payload.get("creator_type", workflow._UNSET),
+                    handle_verified=payload.get("handle_verified") is True,
                     resolved_reasons=payload.get("resolved_reasons", []),
                     request_id=request_id,
                 )

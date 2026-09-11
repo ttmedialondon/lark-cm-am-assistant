@@ -1,6 +1,6 @@
 # 系统技术说明
 
-本文记录已实现的后端、人员模型、姓名机制与后台。业务以 [达人名单](../product/creator-management.md)、[消息总结](../product/message-summary.md)、[后台权限](../product/admin-access.md) 为准。2026-09-11 用户要求清空达人数据并重新设计：AI 确认身份与归属、handle 和用户齐全才入库；这套新门槛尚未开发，当前代码中的“handle 可空”不是新需求，扫描及总结保持关闭。
+本文记录后端、人员模型、姓名机制与后台。业务以 [达人名单](../product/creator-management.md)、[消息总结](../product/message-summary.md)、[后台权限](../product/admin-access.md) 为准。2026-09-11 改为三阶段依次判断身份、CM 归属和 handle，统一完整资料入库门槛；扫描及总结保持关闭。
 
 ## 1. 实际架构
 
@@ -29,9 +29,9 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 | `organizations`、`organization_tenants`、`contact_organization_links` | 组织及可验证租户/人员关系；租户相同不等于达人、员工或负责人 |
 | `social_accounts`、`contact_social_accounts` | 平台账号及关联用户；一个用户可以关联多个 handle |
 | `creator_workflow_candidates`、`creator_workflow_sources`、`creator_workflow_requests` | 待确认线索、来源和请求幂等记录 |
-| `creator_account_assignments` | 用户与 CM 的正式归属；账号可以为空，是名单与总结取数依据 |
+| `creator_account_assignments` | 用户与 CM 的正式归属；有效归属的账号不可为空，是名单与总结取数依据 |
 | `contact_assignments` | 旧联系人级负责人关系；不能代替账号级确认，也不能认领一个 handle 就转走同人的其他 handle |
-| `creator_workflow_ai_runs`、`creator_workflow_ai_tasks` | 按人 AI 核对、冻结消息引用与输入指纹、预览模式及硬预算；旧会话任务只留历史 |
+| `creator_workflow_ai_runs`、`creator_workflow_ai_tasks` | 同人三阶段任务、每阶段冻结引用及输入指纹、初始指纹去重、阶段结果、总预算与共享重试 |
 | `creator_workflow_onboarding` | 新授权同步就绪检查，不自动调用 AI；旧游标只留历史 |
 | `offhours_summary_settings`、`offhours_summary_runs`、`offhours_summary_tasks` | 指定总结时段、执行版本和会话结果 |
 | `admin_roles`、`admin_page_permissions`、`audit_events` | 主人身份、逐页权限、必要的查看/修改审计 |
@@ -59,21 +59,19 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 
 ## 5. AI 与确认
 
-**实现差距（2026-09-11）：** 以下是已部署代码能力，不能当作新入库规则。041 迁移已清空达人派生记录并关闭四项相关 AI 配置，保留模型/密钥及源数据。后续需把 `_promote`、`_maybe_auto_confirm`、`confirm_candidate` 等入口统一接到三条件门槛；人工确认不能清除疑点后直接绕过 AI，正式账号不能继续为空。定向 handle 补查、明确否定/不确定区分及前端分区也是待开发项。详见业务文档制作计划。
+`creator-stages-v1` / `person_staged_v1` 复用现有任务表，不新增队列服务。每人一个任务，`stage` 在 identity → ownership → handle 顺序推进；`stage_results` 保存受控结论、分数及冻结引用，不存模型原话。明确否定与信息不足分开，只有 pass 才在服务器本地准备下一阶段材料。
 
-`ai_dispatch` 为 AI 功能共用最多 3 个有效并发槽，与 Lark 请求限流是不同机制。任务、租约、输入指纹、有限重试及配额暂停持久化；结果写入前重验当前配置、授权、任务版本及证据。
+`creator_targeting.build_preflight` 遍历当前有效授权内已同步历史，只选外部用户本人的业务发言，不要求 CM 沟通。`build_stage_evidence` 在第二步才核对真实私聊对端、明确回复/@和双方片段；第三步只取本人账号线索，Excel 线索与消息引用分离，不用 X 引用证明本人身份。脱敏保留精确账号/主页链接，其他成员的聊天不整包发送。
 
-AI 调用复用现有 OpenAI 配置与结构化输出。服务端验证本人和 CM 的双向业务原话、真实私聊对端或群回复/@；仅同群、昵称或 handle 文本不构成负责关系。短摘引只在内存核验，来源只存引用、类型、评分和校验标记，不存正文、模型自由理由或 prompt。
+`ai_dispatch` 共享最多 3 个有效并发槽；同人的阶段串行，不同人并行。每批最多30人，每阶段最多3组对话、30条、16,000字符，单条1,500字符。总尝试最多4次，`stage_attempts` / `retry_count` 确保仅一个跨阶段共享重试；领取后的调用前校验失败也占尝试，不将计数当作账单。`initial_fingerprint` 不随阶段改变，重新准备不能为同 CM / 同人开新预算。新证据可复用原任务补查未通过阶段，原通过项须仍有效；无新材料不重复送审。补查预检标记 `resumed` 和 `preflight_revision`，须明确启动，不因刷新调用。批次 `started_at` 记录开始或恢复时间，状态优先当前活动批次，避免旧批重试被新空预检遮住。
 
-`business_v2` 的高置信门槛保留，但新按人核对首批强制 `preview_only`：高分也只进入待确认，不自动入库，不给正式记录补写账号/类型。CM Excel 补充 CAP 声明和账号来源；类型未知保持 NULL。账号必须另有本人精确账号证据才作为已核实账号。旧来源版本不能触发新自动门槛；采用最新 AI 判断，不挑历史最高分。新 AI 结果拒绝用户和 handle 双空，历史双空记录保留来源但不展示在名单。
+每次调用和保存均重验当前及所有前置已通过阶段的授权、作者、原文内容和输入指纹；配置变化或暂停后不能写入在途结果。只对当前阶段失败做有限重试；保存事务冲突最多重试3次且不重发模型请求。沿用 OpenAI Responses 结构化输出和既有配置，不换模型；明确启动才付费调用，不做 OCR / 附件读取。
 
-人工确认需明确 CM 和选定 Lark 用户，handle / 类型不必齐全。037 允许正式归属的账号为空；补缺失账号或类型仍经过事务、版本、幂等和冲突检查，不更换已确认用户/CM或已有账号。消息总结 LEFT JOIN 可选账号，只给模型实际已知 handles，没有 handle 的已确认用户仍参与总结。
+`_admission_gate` 是 `_promote`、自动及人工确认的统一门槛：新版本 AI 两项有效通过、用户及 CM 一致、准确非空 handle 有 AI 本人证据或 CM 显式核实、无冲突。依据纳入三个阶段完整上下文（最多90条），revision 包括解密正文 hash；正文改变即失效，同正文重新加密不会误判。列表仅在单次读取内缓存共享引用的权限和正文 revision，写入仍重新检查，下次读取不复用旧缓存。旧 business_v2 或人工清疑点均不能绕过。CAP 允许 NULL。
 
-OAuth 只在首次 INSERT 成功时登记同步就绪检查；旧账号重登不登记。worker 不再自动生成全历史 AI 队列，旧消息段任务取消且不能被 claim。明确准备核对时，服务器遍历当前有效授权内已同步历史，以 CM + contact 为单位挑选两人直接业务片段；群中其他成员不打包。消息引用和输入指纹冻结，预览、调用前、保存前重新核对授权、作者、原文变化与删除状态，不扩大范围。
+`handle_verification` 只能由服务器根据明确的手工核实动作写入；客户端不能提交整段核实 JSON。换人/换 CM 更新 `ai_invalidated_at`，切回旧值也不能重用失效结论；改账号只重核账号，不打断前两步。CM 已核实账号且前两项 AI 通过时结束任务，不再发送第三步，阶段来源记为 CM 而非伪造 AI 分数。人工退回、换人/换 CM 取消旧扫描，保存前还校验冻结的候选关键字段，禁止另建行绕过退回。正式关键资料纠错先结束旧 assignment，后续重新通过才恢复。043 同时约束正式 candidate 与有效 assignment 的账号非空，并将不符合新规则的旧正式归属退出；041 的清库不会重复执行。
 
-每批最多30人，每人最多3组对话、30条、整个输入包16,000字符，每条最多1,500字符。模型只接收 CM1 / U1 等代号；常见电话、邮箱等做遮盖，原始身份映射留服务器，不承诺自由文本完全匿名。沿用现有持久任务、租约和3路共享并发，无新队列服务。每人最多2次调用尝试（含重试），预算不足或判断不清交人工，不自动扩展；数据库保存最多3次复用已返回结果。按人显示进度；刷新页面不会启动扫描，暂停后过期租约不能写入结果。不做 OCR / 附件读取。
-
-旧 `contact_assessment`、`contact_assignment` 已停用；新 `creator_workflow` 和 `offhours_summary` 是独立配置。清空某位 CM 的数据不等于关闭全部 AI 配置。总结输入、输出、限额及缺口见消息总结文档；本期不回复、不发通知、不代办业务。
+前端默认正式名单，待处理与不纳入分开；批次异常不当作业务否定，也不混入达人总数。OAuth 只登记本地同步就绪检查，不调用 AI。旧联系人识别/关联及当前达人扫描、消息总结均保持关闭；不回复、不发通知、不代办业务。
 
 ## 6. 姓名和 @
 
@@ -87,7 +85,7 @@ OAuth 只在首次 INSERT 成功时登记同步就绪检查；旧账号重登不
 
 ## 7. 已移除的旧入口
 
-后台达人目录、归属复核、专用聊天详情和整理清单已下线，旧预览与快照读取代码、旧一次性交接/恢复脚本一并移除。当前只从 `/dashboard/creators` 管理达人及可选账号，不再展示旧联系人归属工作台。
+后台达人目录、归属复核、专用聊天详情和整理清单已下线，旧预览与快照读取代码、旧一次性交接/恢复脚本一并移除。当前只从 `/dashboard/creators` 管理达人及必填账号，不再展示旧联系人归属工作台。
 
 036 迁移只删除 `creators` / `creator-review` 页面权限、保存移除审计并收紧权限键约束，不删除候选、正式达人、人口库或消息表。两位明确测试者的 Remi 前台权限不再依赖旧后台权限。历史代码从 Git 恢复；Remi 此前的数据清理仍以 [历史记录](../status/2026-09-10-reset-and-docs.md) 为准，不重复执行。
 

@@ -35,6 +35,12 @@ def test_targeted_routes_use_query_scope_and_frozen_preflight_id(client, monkeyp
         ("pause_scan", (actor["id"], str(target)), {}),
         ("preflight_details", (actor["id"], str(target), preflight_id), {}),
     ]
+    monkeypatch.setattr(workflow, "list_records", lambda _scope, **kwargs: kwargs)
+    listing = api.get(f"/dashboard/creators/data?responsible_id={target}")
+    assert listing.json()["status"] == "confirmed"
+    assert api.get(f"/dashboard/creators/data?responsible_id={target}&status=all").json()["status"] == "confirmed"
+    waiting = api.get(f"/dashboard/creators/data?responsible_id={target}&status=pending&reason=ownership")
+    assert waiting.json()["status"] == "pending" and waiting.json()["reason"] == "ownership"
 
 
 def test_targeted_writes_reject_csrf_origin_and_invalid_ids_before_service(client, monkeypatch):

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import psycopg
@@ -13,6 +15,7 @@ import pytest
 from psycopg.rows import dict_row
 
 from app import creator_workflow as workflow
+from app.crypto import message_body_cipher
 
 
 @pytest.fixture
@@ -26,9 +29,10 @@ def db(monkeypatch):
         conn.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(psycopg.sql.Identifier(schema)))
         conn.execute(psycopg.sql.SQL("SET LOCAL search_path TO {}").format(psycopg.sql.Identifier(schema)))
         for path in sorted((Path(__file__).parents[1] / "migrations").glob("*.sql")):
-            if int(path.name[:3]) <= 28 or int(path.name[:3]) in (31, 34, 37):
+            if int(path.name[:3]) <= 29 or int(path.name[:3]) in (31, 34, 35, 37, 38, 40, 42, 43):
                 conn.execute(path.read_text())
         monkeypatch.setattr(workflow, "connection", lambda: nullcontext(conn))
+        monkeypatch.setattr(workflow, "get_settings", lambda: SimpleNamespace(token_encryption_key=b"x" * 32))
         try:
             yield conn
         finally:
@@ -64,8 +68,8 @@ def people(db):
         )
         db.execute(
             "INSERT INTO chat_messages(chat_id,message_id,sender_open_id,body_ciphertext) "
-            "VALUES(%s,'message1',%s,'encrypted')",
-            ("chat_" + cm, "ou_" + role),
+            "VALUES(%s,'message1',%s,%s)",
+            ("chat_" + cm, "ou_" + role, message_body_cipher(b"x" * 32).encrypt("Creator business evidence")),
         )
         db.execute(
             "INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
@@ -88,6 +92,29 @@ def source(people, **extra):
     }
     data.update(extra)
     return workflow.ingest_source(people["cm"], **data)
+
+
+def approve(people, row, *, cm="cm", stage_changes=None):
+    """A validated server AI result, without exercising the independent model runner."""
+    with workflow.connection() as conn:
+        refs = [{"authorization_id": str(people[cm]), "chat_id": "chat_" + cm, "message_id": "message1"}]
+        data = {"staged_policy_version": workflow.STAGED_POLICY_VERSION, "preview_only": False,
+                "stages": {key: {"verdict": "pass", "confidence": .98}
+                           for key in ("identity", "ownership", "handle")},
+                "creator_confidence": .98, "cm_confidence": .98, "identity_confidence": .98,
+                "direct_creator_evidence": True, "direct_cm_evidence": True,
+                "verified_business_dialogue": True, "exact_handle_evidence": True,
+                "proposed_cm_id": str(people[cm]), "proposed_contact_id": row["contact_id"],
+                "proposed_handle": row["handle"], "proposed_platform": "tiktok", "evidence": refs,
+                "evidence_revision": workflow._evidence_revision(conn, refs)}
+        data["stages"].update(stage_changes or {})
+        conn.execute(
+            """INSERT INTO creator_workflow_sources(id,candidate_id,source_type,source_key,source_data,
+               fingerprint,submitted_by_authorization_id,created_at)
+               VALUES(%s,%s,'ai',%s,%s::jsonb,%s,%s,clock_timestamp())""",
+            (uuid4(), row["id"], "approved:" + str(uuid4()), json.dumps(data), str(uuid4()), people[cm]),
+        )
+    return workflow.get_record(workflow.get_scope(people[cm]), row["id"])
 
 
 def test_retiring_admin_pages_removes_only_their_grants_and_keeps_creator_data(db, people):
@@ -119,8 +146,8 @@ def test_search_scopes_ids_and_selection_is_only_a_draft(db, people):
     filled = workflow.save_draft(
         scope, row["id"], row["version"], handle="abc", contact_id=people["person"], relationship="owner"
     )
-    assert filled["status"] == "pending" and filled["can_confirm"]
-    assert [r["code"] for r in filled["reasons"]] == ["details_changed"]
+    assert filled["status"] == "pending" and not filled["can_confirm"]
+    assert "identity_ai_required" in {r["code"] for r in filled["reasons"]}
     assert db.execute("SELECT count(*) AS n FROM creator_account_assignments").fetchone()["n"] == 0
     cleared = workflow.save_draft(scope, filled["id"], filled["version"], handle="abc", contact_id=None)
     assert cleared["contact"] is None and not cleared["can_confirm"]
@@ -128,7 +155,7 @@ def test_search_scopes_ids_and_selection_is_only_a_draft(db, people):
 
 def test_confirm_idempotency_version_and_audit(db, people):
     scope = workflow.get_scope(people["cm"])
-    row = source(people)
+    row = approve(people, source(people))
     request_id = uuid4()
     confirmed = workflow.confirm_candidate(scope, row["id"], row["version"], request_id=request_id)
     assert workflow.confirm_candidate(scope, row["id"], row["version"], request_id=request_id) == confirmed
@@ -182,7 +209,7 @@ def test_denial_is_not_repeated_by_same_evidence_and_admin_can_reassign(db, peop
 
 
 def test_failed_audit_rolls_back_all_formal_writes(db, people, monkeypatch):
-    row = source(people)
+    row = approve(people, source(people))
     scope = workflow.get_scope(people["cm"])
 
     def fail(*args, **kwargs):
@@ -220,7 +247,7 @@ def test_one_person_many_accounts_does_not_reassign_legacy_person(db, people):
         "INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) VALUES(%s,%s,%s,'manual')",
         (legacy_id, people["person"], people["cm2"]),
     )
-    row = source(people, trusted_identity=True, source_data={"stable_open_id": "ou_person"})
+    row = approve(people, source(people, trusted_identity=True, source_data={"stable_open_id": "ou_person"}))
     row = workflow.confirm_candidate(workflow.get_scope(people["cm"]), row["id"], row["version"], request_id=uuid4())
     assert row["status"] == "confirmed"
     assert (
@@ -232,7 +259,7 @@ def test_one_person_many_accounts_does_not_reassign_legacy_person(db, people):
 
 
 def test_changed_owner_creates_admin_review_and_preserves_formal(db, people):
-    formal = source(people, trusted_identity=True, source_data={"stable_open_id": "ou_person"})
+    formal = approve(people, source(people, trusted_identity=True, source_data={"stable_open_id": "ou_person"}))
     formal = workflow.confirm_candidate(
         workflow.get_scope(people["cm"]), formal["id"], formal["version"], request_id=uuid4()
     )
@@ -259,6 +286,7 @@ def test_changed_owner_creates_admin_review_and_preserves_formal(db, people):
         "pending": 1,
         "confirmed": 0,
         "deferred": 0,
+        "excluded": 0,
     }
 
 
@@ -288,10 +316,11 @@ def test_preview_never_promotes_or_changes_formal_and_empty_ai_results_stay_off_
     assert row["status"] == "pending"
     assert not db.execute("SELECT 1 FROM creator_account_assignments").fetchone()
     scope = workflow.get_scope(people["cm"])
-    formal = workflow.confirm_candidate(scope, row["id"], row["version"], request_id=uuid4())
-    source(people, source_type="ai", source_key="preview:later", source_data=data, handle="abc")
-    unchanged = workflow.get_record(scope, formal["id"])
-    assert unchanged["status"] == "confirmed" and unchanged["handle"] is None and unchanged["creator_type"] is None
+    with pytest.raises(workflow.WorkflowInputError):
+        workflow.confirm_candidate(scope, row["id"], row["version"], request_id=uuid4())
+    source(people, source_type="ai", source_key="preview:later", source_data=data, handle="abc", creator_type=None)
+    unchanged = workflow.get_record(scope, row["id"])
+    assert unchanged["status"] == "pending" and not unchanged["can_confirm"]
     # Retain legacy audit/source records without presenting an anonymous "creator".
     old_id = uuid4()
     db.execute("INSERT INTO creator_workflow_candidates(id,responsible_authorization_id) VALUES(%s,%s)",
@@ -319,7 +348,7 @@ def test_placeholder_and_nonhandle_input_never_become_a_handle(value):
 
 @pytest.mark.parametrize("same_request", [False, True])
 def test_two_real_connections_cannot_confirm_twice(db, people, monkeypatch, same_request):
-    row = source(people)
+    row = approve(people, source(people))
     scope = workflow.get_scope(people["cm"])
     schema = db.execute("SELECT current_schema() AS name").fetchone()["name"]
     db.commit()
@@ -367,7 +396,7 @@ def test_new_evidence_after_denial_stays_with_admin_until_explicit_reassignment(
 
 
 def test_new_evidence_cannot_silently_assign_an_existing_source_conflict(db, people):
-    row = source(people, trusted_identity=True, source_data={"stable_open_id": "ou_person"})
+    row = approve(people, source(people, trusted_identity=True, source_data={"stable_open_id": "ou_person"}))
     workflow.confirm_candidate(workflow.get_scope(people["cm"]), row["id"], row["version"], request_id=uuid4())
     for n in (1, 2, 3):
         row = workflow.ingest_source(
@@ -425,6 +454,18 @@ def test_batch_contacts_are_not_truncated_at_search_limit_and_load_only_once(db,
         FROM contacts WHERE display_name LIKE 'Bulk person %%'""",
         (people["cm"],),
     )
+    # Three stages can cite the same authorized message repeatedly, across rows
+    # and older sources. One list request checks each distinct reference once.
+    db.execute(
+        """INSERT INTO creator_workflow_sources(id,candidate_id,source_type,source_key,fingerprint,source_data)
+        SELECT gen_random_uuid(),candidate.id,'ai',candidate.id::text||':'||n,n::text,
+          jsonb_build_object('evidence',jsonb_build_array(jsonb_build_object(
+            'authorization_id',%s::text,'chat_id','chat_cm','message_id','message1')),
+            'staged_policy_version',%s::text,'preview_only',FALSE,
+            'proposed_contact_id',candidate.contact_id::text,'proposed_cm_id',%s::text)
+        FROM creator_workflow_candidates candidate CROSS JOIN generate_series(1,3) n""",
+        (str(people["cm"]), workflow.STAGED_POLICY_VERSION, str(people["cm"])),
+    )
     calls = []
 
     class Counted:
@@ -441,6 +482,8 @@ def test_batch_contacts_are_not_truncated_at_search_limit_and_load_only_once(db,
     )
     assert sum("WITH scoped_authorization AS MATERIALIZED" in query for query in calls) == 1
     assert sum("FROM creator_workflow_sources" in query for query in calls) == 1
+    assert sum("SELECT observation.chat_id, observation.message_id" in query for query in calls) == 1
+    assert sum("SELECT m.message_update_time,m.sender_open_id" in query for query in calls) == 1
 
 
 def test_union_search_preserves_every_scope_guard(db, people):

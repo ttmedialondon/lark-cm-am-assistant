@@ -37,6 +37,7 @@ def test_named_testers_can_review_and_confirm_for_the_cm(db, people, test_editor
         scope, row["id"], row["version"], handle="abc", contact_id=people["person"], relationship="owner"
     )
     assert workflow.get_record(scope, draft["id"])["status"] == "pending"
+    draft = workflow_fixtures.approve(people, draft)
     formal = workflow.confirm_candidate(scope, draft["id"], draft["version"], request_id=uuid4())
     assert formal["status"] == "confirmed" and formal["responsible_id"] == str(people["cm"])
     assignment = db.execute("SELECT * FROM creator_account_assignments").fetchone()

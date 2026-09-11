@@ -8,22 +8,33 @@ const {spawnSync} = require("node:child_process");
 const {chromium} = require("playwright");
 const backend = path.resolve(__dirname, "..");
 const candidate = () => ({id: "candidate-1", version: 1, platform: "tiktok", handle: null, status: "pending", creator_type: "cap",
+  stages: {identity: {verdict: "pass"}, ownership: {verdict: "pass"}, handle: {verdict: "unknown"}}, handle_verified: false,
   sources: ["excel", "ai"], contact: null, relationship: null, reasons: [
     {code: "missing_handle", label: "请补充达人 handle", resolvable: false},
     {code: "missing_user", label: "请选择对应 Lark 用户", resolvable: false},
     {code: "ai_review", label: "AI 推荐待核对", resolvable: true}],
   evidence: [{source_type: "excel", source_data: {filename: "private-source.xlsx", reason: "Private source detail"}}]});
 const contacts = [1, 2].map(id => ({contact_id: `user-${id}`, open_id: `open-${id}`, display_name: "Same Name", identity_hint: `稳定身份 ${id}`}));
-const rows = items => ({items, summary: {total: items.length, pending: items.filter(i => i.status !== "confirmed").length,
-  confirmed: items.filter(i => i.status === "confirmed").length}, total: items.length, page: 1, pages: 1});
-async function fixture(t, {readonly = false, owner = false, testEditor = false, actorName = "Tester", item = candidate(), onboarding = null, run = null} = {}) {
+function gated(item) {
+  const processing_stage = item.stages.identity.verdict !== "pass" ? "identity" : item.stages.ownership.verdict !== "pass" ? "ownership"
+    : !item.handle || !item.handle_verified ? "handle" : "ready";
+  const blocking_reasons = item.contact ? [] : [{code: "missing_user", label: "请选择对应用户"}];
+  if (processing_stage !== "ready") blocking_reasons.push({code: processing_stage === "handle" ? item.handle ? "handle_verification_required" : "missing_handle" : `${processing_stage}_unverified`, label: "尚未通过入库条件"});
+  return {...item, processing_stage, blocking_reasons, can_confirm: !blocking_reasons.length};
+}
+const rows = (items, status = "pending") => {
+  const filtered = items.filter(item => status === "pending" ? item.status !== "confirmed" : item.status === status).map(gated);
+  return {items: filtered, status, summary: {total: items.length, pending: items.filter(i => i.status !== "confirmed").length,
+    confirmed: items.filter(i => i.status === "confirmed").length}, total: filtered.length, page: 1, pages: 1};
+};
+async function fixture(t, {readonly = false, owner = false, testEditor = false, actorName = "Tester", item = candidate(), onboarding = null, run = null, status = "pending"} = {}) {
   const scope = {responsible_id: "cm-remi", responsible_name: "Remi", readonly, can_write: !readonly,
     can_admin: owner, can_import: (!readonly && !testEditor) || owner,
     can_scan: (!readonly && !testEditor) || owner, test_editor: testEditor};
   const state = {items: [item], calls: [], holdSave: null, holdConfirm: null, onboarding, run};
   const rendered = spawnSync(path.join(backend, ".venv/bin/python"), ["-c",
     "import json,sys; from jinja2 import Environment,FileSystemLoader,select_autoescape; data=json.load(sys.stdin); print(Environment(loader=FileSystemLoader('app/templates'),autoescape=select_autoescape()).get_template('creator_workflow.html').render(**data))"],
-    {cwd: backend, input: JSON.stringify({scope, authorization: {display_name: actorName}, csrf_token: "test-csrf", creator_data: rows(state.items), responsibles: [{id: "cm-other", display_name: "Other CM"}]}), encoding: "utf8"});
+    {cwd: backend, input: JSON.stringify({scope, authorization: {display_name: actorName}, csrf_token: "test-csrf", creator_data: rows(state.items, status), responsibles: [{id: "cm-other", display_name: "Other CM"}]}), encoding: "utf8"});
   assert.equal(rendered.status, 0, rendered.stderr);
   const browser = await chromium.launch({headless: true, channel: "chrome"}); t.after(() => browser.close());
   const page = await browser.newPage({viewport: {width: 1400, height: 1000}});
@@ -41,7 +52,7 @@ async function fixture(t, {readonly = false, owner = false, testEditor = false, 
     state.calls.push({url, method: request.method(), body: request.postData(), headers: request.headers()});
     assert.equal(url.searchParams.get("responsible_id"), "cm-remi");
     const json = body => route.fulfill({json: body});
-    if (url.pathname.endsWith("/data")) return json(rows(state.items));
+    if (url.pathname.endsWith("/data")) return json(rows(state.items, url.searchParams.get("status") || "confirmed"));
     if (url.pathname.endsWith("/users")) {
       if (url.searchParams.get("q") === "fail") return route.fulfill({status: 500, json: {detail: "搜索暂不可用"}});
       if (url.searchParams.get("q") === "slow") await new Promise(resolve => { state.releaseSearch = resolve; });
@@ -49,18 +60,21 @@ async function fixture(t, {readonly = false, owner = false, testEditor = false, 
     }
     if (url.pathname.endsWith("/draft")) {
       const body = request.postDataJSON(); assert.equal(request.headers()["x-csrf-token"], "test-csrf");
-      assert.deepEqual(Object.keys(body).sort(), ["contact_id", "creator_type", "handle", "request_id", "version"]);
+      assert.deepEqual(Object.keys(body).sort(), ["contact_id", "creator_type", "handle", "handle_verified", "request_id", "version"]);
       if (state.holdSave) await state.holdSave();
       if (state.saveError) return route.fulfill({status: state.saveError.status, json: {detail: state.saveError.message}});
       assert.equal(body.version, state.items[0].version);
       const identityChanged = body.handle !== state.items[0].handle || body.contact_id !== (state.items[0].contact?.contact_id || null);
+      const userChanged = body.contact_id !== (state.items[0].contact?.contact_id || null);
       state.items[0] = {...state.items[0], handle: body.handle, contact: contacts.find(c => c.contact_id === body.contact_id) || null,
-        creator_type: body.creator_type,
+        creator_type: body.creator_type, handle_verified: body.handle_verified,
+        stages: userChanged ? {identity: {verdict: "unknown"}, ownership: {verdict: "unknown"}, handle: {verdict: "unknown"}} : state.items[0].stages,
+        status: identityChanged ? "pending" : state.items[0].status,
         version: state.items[0].version + 1,
         reasons: state.items[0].reasons.filter(r => !(r.code === "missing_handle" && body.handle) && !(r.code === "missing_user" && body.contact_id))};
       if (identityChanged) state.items[0].reasons = [...state.items[0].reasons.filter(r => r.code !== "details_changed"),
         {code: "details_changed", label: "资料已修改，请重新核对账号、用户及关系", resolvable: true}];
-      return json(state.items[0]);
+      return json(gated(state.items[0]));
     }
     if (url.pathname.endsWith("/confirm")) {
       const body = request.postDataJSON(); assert.equal(request.headers()["x-csrf-token"], "test-csrf");
@@ -68,6 +82,7 @@ async function fixture(t, {readonly = false, owner = false, testEditor = false, 
       if (state.holdConfirm) await state.holdConfirm();
       if (state.confirmError) return route.fulfill({status: state.confirmError.status, json: {detail: state.confirmError.message}});
       assert(state.items[0].contact?.contact_id);
+      assert(gated(state.items[0]).can_confirm);
       state.items[0] = {...state.items[0], status: "confirmed", reasons: [], version: state.items[0].version + 1};
       return json(state.items[0]);
     }
@@ -82,20 +97,21 @@ async function fixture(t, {readonly = false, owner = false, testEditor = false, 
     if (url.pathname.endsWith("/ai/preflight")) {
       assert.equal(request.headers()["x-csrf-token"], "test-csrf");
       assert.equal(typeof request.postDataJSON().request_id, "string");
-      state.run = {id: "run-1", preflight_id: "run-1", targeted: true, preview_only: true, status: "ready",
-        total_people: 3, message_count: 20, char_count: 2000, request_count: 0, request_limit: 6,
+      state.run = state.nextPreflight || {id: "run-1", preflight_id: "run-1", targeted: true, status: "ready",
+        total_people: 3, message_count: 20, char_count: 2000, request_count: 0, request_limit: 12,
+        stages: {identity: {queued: 3}, ownership: {}, handle: {}},
         counts: {queued: 3}, outcomes: {}, dispatch: {max_concurrency: 3, running_count: 0, status: "ready"}};
       return json(state.run);
     }
     if (url.pathname.endsWith("/ai/preflight/run-1")) {
-      return json({...state.run, local_pending: [{display_name: "Local only user", reason: "只有同群发言，尚不能确定业务关系"}], people: [{name: "Preview user", message_count: 2, chat_count: 1,
+      return json({...state.run, local_pending: [{display_name: "Local only user", reason: "本人发言不足，暂不送审"}], people: state.previewPeople || [{name: "Preview user", current_stage: "identity", message_count: 2, chat_count: 1,
         messages: [{ref: "M1", user: "U1", text: "Please send a sample. [email hidden]"},
-          {ref: "M2", user: "CM1", text: "<script>not executable</script> I can arrange the sample."}]}]});
+          {ref: "M2", user: "U1", text: "<script>not executable</script> My video is ready."}]}]});
     }
     if (url.pathname.endsWith("/ai/scan")) {
       assert.equal(request.headers()["x-csrf-token"], "test-csrf");
       assert.equal(request.postDataJSON().preflight_id, "run-1");
-      state.run = {...state.run, status: "running", counts: {running: 3}, request_count: 3,
+      state.run = {...state.run, status: "running", counts: {running: 3}, request_count: Math.max(3, state.run.request_count || 0),
         dispatch: {...state.run.dispatch, running_count: 3}};
       return json(state.run);
     }
@@ -116,12 +132,12 @@ async function fixture(t, {readonly = false, owner = false, testEditor = false, 
   const initialStatus = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/ai/status"));
   await page.goto("http://localhost/dashboard/creators");
   await initialStatus;
-  await page.locator("#cw-rows tr").waitFor();
+  if (rows(state.items, status).items.length) await page.locator("#cw-rows tr").waitFor();
   if (process.env.CW_SCREENSHOT_DIR) await page.screenshot({path: path.join(process.env.CW_SCREENSHOT_DIR, `creator-workflow-${readonly ? owner ? "owner" : "review" : "cm"}.png`), fullPage: true});
   return {page, state, errors};
 }
 
-test("missing values require a real user selection and complete edits confirm in one action", async t => {
+test("user and handle edits cannot bypass either AI gate; explicit account verification is required", async t => {
   const {page, state, errors} = await fixture(t);
   const row = page.locator("#cw-rows tr");
   assert.equal(await row.locator(".cw-handle").textContent(), "—");
@@ -139,15 +155,27 @@ test("missing values require a real user selection and complete edits confirm in
   assert(await confirm.isDisabled());
   await row.locator(".cw-search-results button").nth(1).click();
   assert((await row.locator(".cw-user").textContent()).includes("稳定身份 2"));
-  assert(!(await confirm.isDisabled()));
+  assert(await confirm.isDisabled());
   assert.equal(state.calls.filter(c => c.method === "POST").length, 0);
   await row.getByRole("button", {name: "填写 handle", exact: true}).click();
   await row.getByPlaceholder("填写 handle").fill("correct.handle");
-  assert(!(await confirm.isDisabled()));
+  assert(await confirm.isDisabled());
+  await row.getByLabel("我已核实 handle 属于当前 Lark 用户", {exact: true}).check();
+  assert(await confirm.isDisabled(), "selecting a new user cannot reuse another user's AI verdicts");
   assert.equal(await row.getByLabel("这位用户与账号的关系").count(), 0);
   assert.equal(await row.locator("[data-review], [data-acknowledgement]").count(), 0);
+  await row.getByRole("button", {name: "保存草稿", exact: true}).click();
+  await page.getByText(/草稿已保存，仍在待处理/).first().waitFor();
+  assert(await confirm.isDisabled());
+  assert.equal(state.calls.filter(call => call.url.pathname.endsWith("/confirm")).length, 0);
+  state.items[0].stages = candidate().stages;
+  state.items[0].version++;
+  await page.getByRole("button", {name: "刷新列表", exact: true}).click();
+  await confirm.waitFor({state: "visible"});
   await confirm.click();
-  await row.getByText("已确认入库", {exact: true}).waitFor();
+  await page.locator("#cw-feedback").getByText("已确认入库。", {exact: true}).waitFor();
+  assert.equal(await page.locator("#cw-rows tr").count(), 0);
+  assert.equal(await page.locator("#cw-confirmed").textContent(), "1");
   assert.equal(state.items[0].contact.contact_id, "user-2");
   assert.equal(state.items[0].handle, "correct.handle");
   assert.deepEqual(state.calls.filter(c => c.method === "POST").map(c => c.url.pathname),
@@ -183,6 +211,7 @@ test("a failed save prevents confirmation and retry preserves the same request i
   const row = page.locator("#cw-rows tr");
   await row.getByRole("button", {name: "修改 handle", exact: true}).click();
   await row.getByPlaceholder("填写 handle").fill("saved.handle");
+  await row.getByLabel("我已核实 handle 属于当前 Lark 用户", {exact: true}).check();
   await row.getByRole("button", {name: "确认入库", exact: true}).click();
   await row.getByText("保存暂不可用", {exact: true}).waitFor();
   assert.equal(await row.getByPlaceholder("填写 handle").inputValue(), "saved.handle");
@@ -191,7 +220,7 @@ test("a failed save prevents confirmation and retry preserves the same request i
   assert.equal(state.calls.filter(c => c.url.pathname.endsWith("/confirm")).length, 0);
   state.saveError = null;
   await row.getByRole("button", {name: "确认入库", exact: true}).click();
-  await row.getByText("已确认入库", {exact: true}).waitFor();
+  await page.locator("#cw-feedback").getByText("已确认入库。", {exact: true}).waitFor();
   const saves = state.calls.filter(c => c.url.pathname.endsWith("/draft"));
   assert.equal(saves.length, 2);
   assert.equal(JSON.parse(saves[0].body).request_id, JSON.parse(saves[1].body).request_id);
@@ -200,7 +229,7 @@ test("a failed save prevents confirmation and retry preserves the same request i
 });
 
 test("confirm locks identity editing and late search results even after the list refreshes", async t => {
-  const item = {...candidate(), handle: "checked.handle", contact: contacts[0], relationship: "owner", reasons: []};
+  const item = {...candidate(), handle: "checked.handle", handle_verified: true, contact: contacts[0], relationship: "owner", reasons: []};
   const {page, state, errors} = await fixture(t, {item});
   let release; state.holdConfirm = () => new Promise(resolve => { release = resolve; });
   const row = page.locator("#cw-rows tr");
@@ -236,7 +265,7 @@ test("confirm locks identity editing and late search results even after the list
   ]);
   await assertLocked();
   release();
-  await row.getByText("已确认入库", {exact: true}).waitFor();
+  await page.locator("#cw-feedback").getByText("已确认入库。", {exact: true}).waitFor();
   assert.equal(state.items[0].contact.contact_id, "user-1");
   assert.equal(state.items[0].handle, "checked.handle");
   assert.equal(state.items[0].relationship, "owner");
@@ -262,50 +291,58 @@ test("reviewer sees no writing, search or evidence-view controls", async t => {
   assert.deepEqual(errors, []);
 });
 
-test("known user confirms without handle or type and only missing details can be added later", async t => {
+test("official and pending rosters are separate; handle is mandatory, CAP optional, user correction invalidates admission", async t => {
   const item = {...candidate(), sources: ["ai"], handle: null, contact: contacts[0], creator_type: null};
-  const {page, state, errors} = await fixture(t, {item});
+  const {page, state, errors} = await fixture(t, {item, status: "confirmed"});
+  assert.equal(await page.locator("#cw-rows tr").count(), 0);
+  assert.equal(await page.locator("#cw-confirmed").textContent(), "0");
+  assert.equal(await page.locator("#cw-pending").textContent(), "1");
+  assert.equal(await page.locator("#cw-total").count(), 0);
+  await page.locator("#cw-show-pending").click();
   const row = page.locator("#cw-rows tr"), type = row.getByLabel("达人类型", {exact: true});
   const confirm = row.getByRole("button", {name: "确认入库", exact: true});
   assert.equal(await type.inputValue(), "");
   assert.equal(await type.locator("option:checked").textContent(), "—（未确定）");
+  assert(await confirm.isDisabled());
+  await row.getByRole("button", {name: "填写 handle", exact: true}).click();
+  await row.getByPlaceholder("填写 handle").fill("verified.handle");
+  assert(await confirm.isDisabled());
+  await row.getByLabel("我已核实 handle 属于当前 Lark 用户", {exact: true}).check();
   assert(!(await confirm.isDisabled()));
   await confirm.click();
-  await row.getByText("已确认入库", {exact: true}).waitFor();
+  await page.locator("#cw-feedback").getByText("已确认入库。", {exact: true}).waitFor();
   assert.equal(state.items[0].creator_type, null);
-  assert.equal(state.items[0].handle, null);
-  assert.equal(await row.locator(".cw-handle").textContent(), "—");
-  for (const name of ["更换用户", "清除", "确认入库"]) assert.equal(await row.getByRole("button", {name, exact: true}).count(), 0);
-  assert(await row.getByRole("checkbox").isDisabled());
-  await row.getByRole("button", {name: "填写 handle", exact: true}).click();
-  await row.getByPlaceholder("填写 handle").fill("later.handle");
-  await type.selectOption("non_cap");
-  await row.getByRole("button", {name: "保存补充", exact: true}).click();
-  await page.getByText("补充资料已保存，正式归属未变。", {exact: true}).first().waitFor();
-  assert.equal(state.items[0].handle, "later.handle");
-  assert.equal(state.items[0].contact.contact_id, "user-1");
-  assert.equal(state.items[0].status, "confirmed");
-  assert.equal(state.items[0].creator_type, "non_cap");
-  assert.equal(await row.locator(".cw-type").textContent(), "非 CAP");
-  assert.equal(await row.getByRole("button", {name: "修改 handle", exact: true}).count(), 0);
-  assert.equal(await row.getByLabel("达人类型", {exact: true}).count(), 0);
-  assert.deepEqual(state.calls.filter(c => c.method === "POST").map(c => c.url.pathname),
-    ["/dashboard/creators/candidate-1/confirm", "/dashboard/creators/candidate-1/draft"]);
+  assert.equal(await page.locator("#cw-rows tr").count(), 0);
+  await page.locator("#cw-show-confirmed").click();
+  await row.getByText("已确认入库", {exact: true}).waitFor();
+  await row.getByRole("button", {name: "更换用户", exact: true}).click();
+  await row.getByPlaceholder("搜索我的 Lark 用户").fill("Same");
+  await row.locator(".cw-search-results button").nth(1).click();
+  assert(!(await row.getByLabel("我已核实 handle 属于当前 Lark 用户", {exact: true}).isChecked()));
+  await row.getByRole("button", {name: "保存修改", exact: true}).click();
+  await page.getByText(/草稿已保存，仍在待处理/).first().waitFor();
+  assert.equal(state.items[0].status, "pending");
+  assert.equal(state.items[0].contact.contact_id, "user-2");
+  assert.equal(await page.locator("#cw-confirmed").textContent(), "0");
+  await page.locator("#cw-show-pending").click();
+  await row.getByText("身份待判断", {exact: true}).waitFor();
+  assert(await confirm.isDisabled());
   assert.deepEqual(errors, []);
 });
 
-test("bulk confirmation requires a selected user, not handle or creator type", async t => {
-  for (const missing of [null, "user"]) {
+test("bulk confirmation uses the same complete account and AI gates", async t => {
+  for (const missing of [null, "ownership"]) {
     const complete = missing === null;
     await t.test(complete ? "complete record confirms" : `missing ${missing} stays pending`, async sub => {
-      const item = {...candidate(), handle: null, contact: missing === "user" ? null : contacts[0], creator_type: null};
+      const item = {...candidate(), handle: "verified.handle", handle_verified: true, contact: contacts[0], creator_type: null};
+      if (missing) item.stages.ownership.verdict = "unknown";
       const {page, state, errors} = await fixture(sub, {item});
       const row = page.locator("#cw-rows tr");
       await row.getByRole("checkbox", {name: /用于批量确认/}).check();
       await page.locator("#cw-confirm-selected").click();
       await page.locator("#cw-batch-results div").waitFor();
-      if (complete) await row.getByText("已确认入库", {exact: true}).waitFor();
-      else await page.locator("#cw-batch-results").getByText(/对应用户/).waitFor();
+      if (complete) await page.locator("#cw-batch-results").getByText(/已确认入库/).waitFor();
+      else await page.locator("#cw-batch-results").getByText(/归属判断尚未通过/).waitFor();
       assert.equal(state.items[0].status, complete ? "confirmed" : "pending");
       assert.equal(state.calls.filter(c => c.url.pathname.endsWith("/confirm")).length, complete ? 1 : 0);
       assert.deepEqual(errors, []);
@@ -341,8 +378,10 @@ test("targeted preflight shows bounded excerpts before starting and pause never 
   await page.locator("#cw-initial-status").getByText("准备完成 · 尚未发送", {exact: true}).waitFor();
   assert.equal(state.calls.filter(call => call.url.pathname.endsWith("/ai/scan")).length, 0);
   assert(await page.getByRole("button", {name: "取消本批准备", exact: true}).isVisible());
-  assert((await page.locator("#cw-initial-counts").textContent()).includes("本批 3 人"));
-  assert((await page.locator("#cw-initial-counts").textContent()).includes("0 / 6 次"));
+  assert((await page.locator("#cw-initial-counts").textContent()).includes("本批检查 3 人"));
+  assert((await page.locator("#cw-initial-counts").textContent()).includes("0 / 上限 12 次"));
+  assert((await page.locator("#cw-initial-counts").textContent()).includes("本次预检片段"));
+  assert((await page.locator("#cw-initial-counts").textContent()).includes("不等于付费请求数"));
   await page.getByRole("button", {name: "查看本批送审内容", exact: true}).click();
   const preview = page.locator(".cw-person-preview").filter({has: page.locator("summary", {hasText: "Preview user"})});
   await preview.locator("summary").getByText(/Preview user/).waitFor();
@@ -351,18 +390,21 @@ test("targeted preflight shows bounded excerpts before starting and pause never 
   assert.equal(await preview.locator("script").count(), 0);
   assert((await preview.textContent()).includes("<script>not executable</script>"));
   await page.getByText("仅有本地线索（未发送 AI） · 1 人", {exact: true}).click();
-  assert(await page.getByText("Local only user：只有同群发言，尚不能确定业务关系", {exact: true}).isVisible());
+  assert(await page.getByText("Local only user：本人发言不足，暂不送审", {exact: true}).isVisible());
   await page.getByRole("button", {name: "开始 AI 核对（最多 30 人）", exact: true}).click();
   await page.locator("#cw-initial-status").getByText("核对中", {exact: true}).waitFor();
   assert(await page.getByRole("button", {name: "准备核对", exact: true}).isDisabled());
   assert((await page.locator("#cw-scan-dispatch").textContent()).includes("本批正在核对 3 人"));
-  assert((await page.locator("#cw-initial-limit").textContent()).includes("本批不自动入库"));
+  assert((await page.locator("#cw-initial-limit").textContent()).includes("3 个阶段 + 1 次共享重试"));
+  assert((await page.locator("#cw-initial-message").textContent()).includes("自动入库"));
   assert.equal(await page.locator("#cw-batch-progress").getAttribute("max"), "3");
-  state.run = {...state.run, counts: {succeeded: 1, invalid: 1, running: 1}, outcomes: {uncertain: 1},
+  state.run = {...state.run, counts: {succeeded: 1, invalid: 1, running: 1}, outcomes: {identity_unknown: 1},
+    stages: {identity: {succeeded: 1, invalid: 1}, ownership: {running: 1}, handle: {}},
     error_summary: [{status: "invalid", count: 1, message: "候选未通过证据校验。"}]};
   await page.getByRole("button", {name: "刷新进度", exact: true}).click();
   await page.getByText("证据未通过 · 1 人：候选未通过证据校验。", {exact: true}).waitFor();
-  assert((await page.locator("#cw-scan-outcomes").textContent()).includes("信息不足 1 人"));
+  assert((await page.locator("#cw-scan-outcomes").textContent()).includes("待处理 1 人"));
+  assert((await page.locator("#cw-scan-stages").textContent()).includes("身份 2 人 → 归属 1 人 → handle 0 人"));
   await page.getByRole("button", {name: "暂停", exact: true}).click();
   await page.locator("#cw-initial-status").getByText("已停止", {exact: true}).waitFor();
   assert(!(await page.getByRole("button", {name: "暂停", exact: true}).isVisible()));
@@ -379,6 +421,33 @@ test("targeted preflight shows bounded excerpts before starting and pause never 
   state.run = {...state.run, status: "failed", retryable_people: 0};
   await page.getByRole("button", {name: "刷新进度", exact: true}).click();
   assert(!(await page.locator("#cw-ai-start").isVisible()));
+  state.nextPreflight = {...state.run, status: "ready", resumed: true, prepared_people: 1, request_count: 6,
+    request_limit: 12, preflight_json: {preflight_revision: "new-material-2"},
+    stages: {identity: {succeeded: 1}, ownership: {queued: 1}, handle: {failed: 1}}};
+  state.previewPeople = [
+    {name: "Resumed user", current_stage: "ownership", request_count: 2, request_limit: 4, message_count: 99, chat_count: 99,
+      messages: [{ref: "M1", chat: "C1", user: "U1", text: "My sample has arrived."}]},
+    {name: "Budget used user", current_stage: "handle", request_count: 4, request_limit: 4, budget_exhausted: true, messages: []},
+  ];
+  await page.getByRole("button", {name: "准备核对", exact: true}).click();
+  await page.getByRole("button", {name: "开始本次续核（沿用预算）", exact: true}).waitFor();
+  assert((await page.locator("#cw-initial-counts").textContent()).includes("本次续核准备 1 人（沿用原批次）"));
+  assert((await page.locator("#cw-initial-counts").textContent()).includes("已用尝试 6 / 上限 12 次"));
+  assert(!(await page.locator("#cw-preflight-content").isVisible()), "same-run preparation invalidates old preview");
+  await page.getByRole("button", {name: "查看本批送审内容", exact: true}).click();
+  await page.locator("summary").getByText("Resumed user · 判断归属 · 1 条消息 · 1 个会话", {exact: true}).click();
+  assert(await page.getByText("My sample has arrived.", {exact: true}).isVisible());
+  await page.locator("summary").getByText(/Budget used user/).click();
+  assert(await page.getByText(/额度已用完，不再自动补跑；缺项记录仍保留待处理/).isVisible());
+  assert.equal(await page.locator("summary").getByText(/Preview user/).count(), 0);
+  await page.getByRole("button", {name: "刷新进度", exact: true}).click();
+  assert.equal(state.calls.filter(call => call.url.pathname.endsWith("/ai/scan")).length, 2);
+  await page.getByRole("button", {name: "开始本次续核（沿用预算）", exact: true}).click();
+  await page.locator("#cw-initial-status").getByText("核对中", {exact: true}).waitFor();
+  const lastStart = state.calls.filter(call => call.url.pathname.endsWith("/ai/scan")).at(-1);
+  assert.equal(JSON.parse(lastStart.body).preflight_id, "run-1");
+  assert.equal(JSON.parse(lastStart.body).retry_failed, false);
+  assert.equal(state.run.request_count, 6, "starting a resumed preview does not clear attempts");
   assert.equal(state.items[0].status, "pending");
   assert.deepEqual(errors, []);
 });

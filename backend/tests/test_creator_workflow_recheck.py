@@ -65,6 +65,7 @@ def test_recheck_requires_current_cm_pending_record_and_version(db, people):
     with pytest.raises(workflow.WorkflowInputError, match="刚刚发生"):
         workflow.recheck_candidate(scope, row["id"], row["version"] + 1)
     formal = source(people, source_key="formal", trusted_identity=True, source_data={"stable_open_id": "ou_person"})
+    formal = fixtures.approve(people, formal)
     formal = workflow.confirm_candidate(scope, formal["id"], formal["version"], request_id=uuid4())
     with pytest.raises(workflow.WorkflowInputError, match="只有待确认"):
         workflow.recheck_candidate(scope, formal["id"], formal["version"])
@@ -86,7 +87,10 @@ def test_recheck_reports_conflict_without_exposing_out_of_scope_user(db, people)
         (uuid4(), people["other"], people["cm2"]),
     )
     result = workflow.recheck_candidate(workflow.get_scope(people["cm"]), row["id"], row["version"])
-    assert {r["code"] for r in result["reasons"]} == {"ownership_conflict", "identity_conflict"}
+    assert {r["code"] for r in result["reasons"]} == {
+        "ownership_conflict", "identity_conflict", "identity_ai_required", "ownership_ai_required",
+        "handle_verification_required",
+    }
     assert result["items"] == [] and "不能直接入库" in result["notice"]
     assert str(people["other"]) not in str(result) and "ou_other" not in str(result)
 
