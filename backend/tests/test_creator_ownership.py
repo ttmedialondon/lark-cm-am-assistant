@@ -107,6 +107,7 @@ def pilot(pg, monkeypatch):
         payload = kwargs["json"]
         assert payload["store"] is False and payload["model"] == "test-model"
         assert payload["text"]["format"]["strict"] is True
+        assert payload["instructions"] == ownership._INSTRUCTIONS
         pack = json.loads(payload["input"])
         calls.append(pack)
         for callback in after_request:
@@ -197,7 +198,7 @@ def test_preview_responses_confirm_without_handle_preserves_existing_data(pg, pi
     assert _snapshot(pg, protected) == before
 
 
-def test_cross_run_cache_and_page_refresh_do_not_repeat_paid_analysis(pg, pilot):
+def test_cross_run_cache_and_page_refresh_do_not_repeat_paid_analysis(pg, pilot, monkeypatch):
     first = _prepared(pilot)
     ownership.start_run(pilot.ids["owner"], first)
     _run_all(pilot)
@@ -211,7 +212,28 @@ def test_cross_run_cache_and_page_refresh_do_not_repeat_paid_analysis(pg, pilot)
         assert data["counts"]["reused"] == 1 and data["usage"]["requests"] == 0
     assert ownership.start_run(pilot.ids["owner"], second) == 0
     assert ownership.claim_next_ownership() is None and len(pilot.calls) == 1
-    assert ownership.confirm_tasks(pilot.ids["owner"], second, [current["id"]]) == 1
+
+    # A rules revision must preserve history but cannot reuse or confirm the earlier verdict.
+    monkeypatch.setattr(ownership, "POLICY_VERSION", ownership.POLICY_VERSION + "-next")
+    old = _snapshot(pg, ("creator_ownership_tasks",))
+    page = ownership.page_data(pilot.ids["cm"], second, include_private=True)
+    assert not page["run"]["can_start"] and all(not item["can_confirm"] for item in page["items"])
+    with pytest.raises(ValueError, match="规则"):
+        ownership.start_run(pilot.ids["owner"], second)
+    with pytest.raises(ValueError, match="规则"):
+        ownership.confirm_tasks(pilot.ids["owner"], second, [current["id"]])
+    assert _snapshot(pg, old) == old
+    third = _prepared(pilot)
+    revised = _task(pg, third, pilot.ids["creator"])
+    assert revised["status"] == "ready" and revised["reused_from"] is None and revised["result_ciphertext"] is None
+    assert revised["fingerprint"] == current["fingerprint"] and revised["api_requests"] == 0
+    assert ownership.start_run(pilot.ids["owner"], third) == 1
+    assert ownership.start_run(pilot.ids["owner"], third) == 0
+    _run_all(pilot)
+    assert len(pilot.calls) == 2 and _task(pg, third, pilot.ids["creator"])["api_requests"] == 1
+    assert _task(pg, second, pilot.ids["creator"]) == current
+    assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
+    assert ownership.confirm_tasks(pilot.ids["owner"], third, [revised["id"]]) == 1
 
 
 def test_pause_before_dispatch_and_owner_loss_during_response_are_safe(pg, pilot):

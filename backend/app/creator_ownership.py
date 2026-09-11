@@ -17,7 +17,7 @@ from .config import get_settings
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
 
-POLICY_VERSION = "creator-ownership-v1"
+POLICY_VERSION = "creator-ownership-v2"
 DEFAULT_CM_ID = UUID("24d1ef13-3762-4359-ba11-d26c03cf1f7f")
 LOGGER = logging.getLogger(__name__)
 REASONS = {
@@ -62,7 +62,7 @@ RUN_LABELS = {
     "preview": "等待开始",
     "running": "分析中",
     "paused": "已暂停",
-    "completed": "本轮分析完成",
+    "completed": "本次已选分析完成",
     "cancelled": "已取消",
 }
 
@@ -486,12 +486,32 @@ Do not infer ownership from shared groups, private-chat existence, names, handle
 one product/sample request, a one-off favour, silence, or missing history. Read each message's author,
 date, reply/mention relationship and full exchange. Weak/unknown linkage is not a direct reply.
 suggested requires confidence >=0.95, actual direct business responsibility with persistent follow-up
-or an explicit accepted responsibility/handover, and no unresolved contradiction or missing information.
+or an explicit accepted responsibility/handover, and no material unresolved contradiction or missing information.
+These are ALTERNATIVE grounds: repeated substantive business follow-through can establish ongoing_management
+without a formal appointment, the words 'my CM', or an explicit ownership declaration. Two exchanges alone
+are not sufficient if they only show isolated favours or temporary cover; assess the actual ongoing role.
 Single transaction or ambiguous historical collaboration -> uncertain, not suggested.
 Old evidence is not automatically expired, but old cooperation alone may not prove current responsibility.
 Consider the latest available messages and any handover, replacement, temporary assistance or termination.
+Distinguish CM1 temporarily covering ANOTHER CM (not proof of CM1's ongoing responsibility) from CM1
+taking leave and arranging a colleague's temporary cover. If CM1 later resumes substantive business
+follow-through, the earlier holiday cover is not an unresolved transfer; no formal post-leave reconfirmation
+is required. Resolve who is covering whom, when, and what the later exchanges show.
+Agency/CAP membership is distinct from CM1's operational responsibility; an agency exit or unlink request
+alone does not prove the non-CAP business relationship ended. Do not infer CAP status or completed unlinking;
+require evidence about the operational relationship before labelling responsibility ended.
+meta fields are local sampling/keyword hints, not factual verdicts. negative_signal does not establish a
+negative event. selection_limited and history_latest_at later than selected_latest_at describe bounded
+selection, not evidence of an unseen transfer, termination or conflict. Do not invent missing handovers or
+require formal responsibility confirmation solely because of those fields. Real unresolved ambiguity in
+the supplied exchanges still warrants uncertain; do not assume the source covers all possible history.
 not_related requires affirmative counter-evidence; absence of evidence -> uncertain. Never assign a different CM.
 Return a concise Chinese reason, supplied message refs only, and conflicts/missing_info arrays.
+For ongoing_management, evidence_refs must include BOTH U1 and CM1 messages of at least two complete,
+directly linked substantive business exchanges on different dates. Do not cite only CM1's replies or
+borrow an uncited exchange's support. For explicit_responsibility, cite CM1's actual direct responsibility
+statement and relevant acceptance/context. Cite material contradictions, not resolved historical cover,
+in counter_evidence_refs; explain resolved context briefly in the reason and include its supporting refs.
 responsibility_basis is ongoing_management, explicit_responsibility, temporary_help, transferred,
 ended, or unclear. counter_evidence_refs must directly support a negative decision.
 Do not quote private message text, reveal handles, phone/address/payment details in the reason.
@@ -970,6 +990,7 @@ def page_data(cm_id=None, run_id=None, query="", status="all", page=1, include_p
                     and row["outcome"] in ("suggested", "uncertain")
                     and row["review_status"] != "confirmed"
                     and row["category"] == "creator"
+                    and run["policy_version"] == POLICY_VERSION
                     and not _owned(conn, row["contact_id"])
                 )
                 items.append(
@@ -991,6 +1012,7 @@ def page_data(cm_id=None, run_id=None, query="", status="all", page=1, include_p
                         "can_confirm": can_confirm,
                         "can_defer": bool(
                             include_private
+                            and run["policy_version"] == POLICY_VERSION
                             and row["review_status"] != "confirmed"
                             and row["status"] in ("succeeded", "skipped", "failed", "invalid")
                         ),
@@ -1005,7 +1027,8 @@ def page_data(cm_id=None, run_id=None, query="", status="all", page=1, include_p
                 "status": run["status"],
                 "status_label": RUN_LABELS[run["status"]],
                 "can_start": bool(
-                    include_private and config and run["status"] in ("preview", "completed") and counts["ready"]
+                    include_private and config and run["policy_version"] == POLICY_VERSION
+                    and run["status"] in ("preview", "completed") and counts["ready"]
                 ),
                 "can_pause": bool(include_private and run["status"] == "running"),
                 "can_resume": bool(include_private and run["status"] == "paused"),
@@ -1026,7 +1049,9 @@ def page_data(cm_id=None, run_id=None, query="", status="all", page=1, include_p
             "total_count": total_count,
             "api_ready": bool(config),
             "api_message": (
-                "使用已配置的 OpenAI；预筛选和刷新不调用 AI。" if config else REASONS["configuration_missing"]
+                "判断规则已更新，请重新预筛选；本批旧结果仅供历史查看。"
+                if run and run["policy_version"] != POLICY_VERSION
+                else "使用已配置的 OpenAI；预筛选和刷新不调用 AI。" if config else REASONS["configuration_missing"]
             ),
         }
 

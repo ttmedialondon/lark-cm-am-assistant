@@ -256,7 +256,16 @@ def test_model_verdicts_cannot_borrow_uncited_global_flags_or_invent_counter_evi
                    counter_evidence_refs=["M4"]) == "not_related"
     pack["messages"] = [*items[:2], message("M5", "U1", "Can you arrange my voucher?", day=2, conversation="C4"),
                         message("M6", "CM1", "I will arrange your voucher.", day=2, conversation="C4")]
+    # The guard requires complete cited exchanges, not a formal title or reassuring sampling metadata.
+    pack["meta"].update(selection_limited=True, negative_signal=True,
+                        history_latest_at="2024-02-01T10:00:00+00:00", selected_latest_at=pack["messages"][-1]["time"])
+    assert outcome(evidence_refs=["M2", "M6"]) == "uncertain"
+    assert outcome(confidence=0.94, evidence_refs=["M1", "M2", "M5", "M6"]) == "uncertain"
     assert outcome(evidence_refs=["M6", "M5", "M2", "M1"]) == "suggested"
+    pack["messages"].append(message("M7", "U1", "I left the agency but still want campaign products.", day=3))
+    assert outcome(outcome="not_related", responsibility_basis="ended", evidence_refs=["M7"],
+                   counter_evidence_refs=["M7"]) == "uncertain"  # CAP departure alone does not end CM responsibility.
+    assert outcome(evidence_refs=["M1", "M2", "M5", "M6"], conflicts=["实际负责人不明确"]) == "uncertain"
     for item in pack["messages"]:
         item["relation"] = "group"
     assert outcome(evidence_refs=["M1", "M2", "M5", "M6"]) == "uncertain"  # Weak group adjacency is insufficient.
