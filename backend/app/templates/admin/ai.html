@@ -15,6 +15,7 @@
     {% endif %}
     {% if form_error %}<div class="alert alert-danger" role="alert">{{ form_error }}</div>{% endif %}
     {% if summary_saved %}<div class="alert alert-success" role="status">下班总结配置已保存。开启时会立即加入后台队列；实际进度、暂停或失败原因请在<a href="/dashboard/offhours-summary" class="alert-link">消息总结</a>查看。未开启时不会调用 AI。</div>{% endif %}
+    {% if identity_saved %}<div class="alert alert-success" role="status">全员身份识别配置已保存。开启后后台会检查在库人员；关闭后排队任务保留，在途任务取消。请在<a href="/admin/contacts" class="alert-link">人员目录</a>查看当前进度。</div>{% endif %}
     {% for feature in configs %}{% set config = feature.config %}
     <div class="card mb-4" id="{{ feature.id_suffix }}"><div class="card-header"><div><h3 class="card-title mb-1">{{ feature.title }}</h3><div class="text-secondary small">{{ feature.description }}</div></div></div>
       <div class="card-body">
@@ -24,6 +25,11 @@
           <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">已保存密钥</div><div class="h3 mb-0">{{ config.api_key_label }}</div></div></div></div>
           <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">最近 AI 调用</div><div class="h3 mb-0">{{ config.last_tested_at_label }}</div><div class="text-secondary small"><span class="badge bg-{{ config.last_test_badge }}-lt">{{ config.last_test_status_label }}</span></div></div></div></div>
         </div>
+        {% if feature.feature == 'contact_assessment' %}
+        <div class="alert alert-info">只判断身份：达人、其他机构负责人、同事、商家、字节官方、其他人员；不判断 CM 或 handle，不写入“我的达人”。每人最多选 16 条本人重要历史发言、合计 8,000 字符；不要求近期或与 CM 双向沟通。</div>
+        <div class="text-secondary small mb-3">本轮每位在库人员安排一次任务，不同人员最多 3 路并行，每人累计最多 2 次处理尝试。没有足够材料不调用 AI；低置信留待识别。人工已确认资料和已核实同事优先保留。关闭后队列保留，重新开启继续排队任务；被取消的在途任务可在人员详情按剩余预算继续。</div>
+        {% if 'contacts' in admin_permissions %}<div class="mb-3"><a href="/admin/contacts">查看全库识别进度 →</a></div>{% endif %}
+        {% endif %}
         {% if feature.feature == 'offhours_summary' %}
         <div class="alert alert-info">本轮范围固定为 Remi 已确认达人。英国时间，默认 2026-09-09 18:00 至 2026-09-10 12:00；提前开启会显示部分结果，已同步的新消息会补充到同一时段。不同会话并行处理，所有 AI 功能合计最多 3 个请求。只总结和分级，不回复。</div>
         <div class="d-flex flex-wrap justify-content-between gap-2 mb-3"><span class="text-secondary">{{ summary_settings.status_label }}</span><a href="/dashboard/offhours-summary">查看消息总结 →</a></div>
@@ -33,7 +39,7 @@
           <div class="col-md-3"><label class="form-label" for="ai-provider-{{ feature.id_suffix }}">提供商</label><input class="form-control" id="ai-provider-{{ feature.id_suffix }}" value="{{ config.provider_label }}" readonly></div>
           <div class="col-md-3"><label class="form-label" for="ai-project-id-{{ feature.id_suffix }}">Project ID</label><input class="form-control" id="ai-project-id-{{ feature.id_suffix }}" name="project_id" value="{{ config.project_id }}" maxlength="160" required autocomplete="off"></div>
           <div class="col-md-3"><label class="form-label" for="ai-model-{{ feature.id_suffix }}">模型</label><input class="form-control" id="ai-model-{{ feature.id_suffix }}" name="model" value="{{ config.model or 'gpt-5.6-luna' }}" maxlength="160" required autocomplete="off"></div>
-          {% if feature.feature in ['contact_assessment', 'contact_assignment'] %}<div class="col-md-3"><label class="form-label" for="ai-threshold-{{ feature.id_suffix }}">{% if feature.feature == 'contact_assignment' %}候选推送阈值{% else %}自动确认阈值{% endif %}</label><input class="form-control" id="ai-threshold-{{ feature.id_suffix }}" name="auto_confirm_threshold" type="number" value="{{ config.auto_confirm_threshold }}" min="0.90" max="1.00" step="0.01" required inputmode="decimal"><div class="form-hint">{% if feature.feature == 'contact_assignment' %}达到阈值的负责人候选会推送给本人确认。{% else %}阈值仅在全部安全门槛通过后生效。{% endif %}</div></div>{% elif feature.feature == 'creator_workflow' %}<div class="col-md-3"><label class="form-label">入库方式</label><div class="form-control-plaintext">达人身份与 CM 业务关系明确可入库；不确定的交 CM 确认</div></div>{% else %}<div class="col-md-3"><label class="form-label">AI 处理方式</label><div class="form-control-plaintext">直接总结并分级，不自动回复</div></div>{% endif %}
+          {% if feature.feature in ['contact_assessment', 'contact_assignment'] %}<div class="col-md-3"><label class="form-label" for="ai-threshold-{{ feature.id_suffix }}">{% if feature.feature == 'contact_assignment' %}候选推送阈值{% else %}自动分类阈值{% endif %}</label><input class="form-control" id="ai-threshold-{{ feature.id_suffix }}" name="auto_confirm_threshold" type="number" value="{{ [config.auto_confirm_threshold|float, 0.95]|max if feature.feature == 'contact_assessment' else config.auto_confirm_threshold }}" min="{{ '0.95' if feature.feature == 'contact_assessment' else '0.90' }}" max="1.00" step="0.01" required inputmode="decimal"><div class="form-hint">{% if feature.feature == 'contact_assignment' %}达到阈值的负责人候选会推送给本人确认。{% else %}至少 95%，且必须有明确的本人发言支持唯一类别。{% endif %}</div></div>{% elif feature.feature == 'creator_workflow' %}<div class="col-md-3"><label class="form-label">入库方式</label><div class="form-control-plaintext">达人身份与 CM 业务关系明确可入库；不确定的交 CM 确认</div></div>{% else %}<div class="col-md-3"><label class="form-label">AI 处理方式</label><div class="form-control-plaintext">直接总结并分级，不自动回复</div></div>{% endif %}
           {% if feature.feature == 'offhours_summary' %}
           <div class="col-md-4"><label class="form-label" for="summary-window-start">开始时间（英国时间）</label><input class="form-control" type="datetime-local" id="summary-window-start" name="window_start" value="{{ summary_settings.window_start_input }}" required></div>
           <div class="col-md-4"><label class="form-label" for="summary-window-end">结束时间（英国时间）</label><input class="form-control" type="datetime-local" id="summary-window-end" name="window_end" value="{{ summary_settings.window_end_input }}" required></div>
@@ -42,7 +48,7 @@
           {% endif %}
           <div class="col-md-8"><label class="form-label" for="ai-api-key-{{ feature.id_suffix }}">Service-account API key</label><input class="form-control" id="ai-api-key-{{ feature.id_suffix }}" name="api_key" type="password" maxlength="1024" autocomplete="new-password" spellcheck="false" placeholder="{{ '留空则保留 ' ~ config.api_key_label if config.key_configured else '首次配置时必填' }}"><div class="form-hint">填写新密钥即轮换；页面只显示最后 4 位。</div></div>
           <div class="col-md-4 d-flex align-items-end"><label class="form-check form-switch mb-2"><input class="form-check-input" type="checkbox" name="enabled" value="1" {% if config.enabled %}checked{% endif %}><span class="form-check-label">{{ feature.enabled_label }}</span></label></div>
-          <div class="col-12 d-flex justify-content-end"><button class="btn btn-primary" type="submit">{% if feature.feature == 'offhours_summary' %}保存配置（开启则立即执行）{% else %}保存配置{% if config.key_configured %} / 轮换密钥{% endif %}{% endif %}</button></div>
+          <div class="col-12 d-flex justify-content-end"><button class="btn btn-primary" type="submit">{% if feature.feature == 'contact_assessment' %}保存全员身份识别配置（开启则执行）{% elif feature.feature == 'offhours_summary' %}保存配置（开启则立即执行）{% else %}保存配置{% if config.key_configured %} / 轮换密钥{% endif %}{% endif %}</button></div>
         </form>{% else %}<p class="text-secondary mb-0">只读配置 · 模型：{{ config.model or '未配置' }}。修改配置和密钥仅限系统主人。</p>{% endif %}
       </div>
     </div>

@@ -40,6 +40,7 @@ POST_ROUTES = (
     "/admin/contacts/ou_contact/assignment",
     "/admin/contacts/ou_contact/assignment/handoff",
     "/admin/contacts/ou_contact/organization",
+    "/admin/contacts/ou_contact/assessments",
     f"{ASSESSMENT_ROUTE}/roles",
     f"{ASSESSMENT_ROUTE}/dismiss",
     "/admin/ai",

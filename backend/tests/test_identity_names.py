@@ -208,6 +208,43 @@ def test_tenant_refresh_updates_changed_facts_without_rewriting_other_identities
     role = pg.execute("SELECT role,status,is_primary FROM contact_roles WHERE contact_id=%s", (person[0],)).fetchone()
     assert role == {"role": "internal_colleague", "status": "confirmed", "is_primary": True}
 
+    # A business classification is distinct from the unchanged tenant fact:
+    # preserve manual source/status/primary, and replace only automatic guesses.
+    decisions = (
+        ("manual_primary", "merchant_contact", "confirmed", "ai_manual_confirmed", True),
+        ("manual_rejected", "internal_colleague", "rejected", "manual", False),
+        ("manual_secondary", "internal_colleague", "confirmed", "manual", False),
+        ("ai_colleague", "internal_colleague", "confirmed", "ai_auto_confirmed", True),
+        ("ai_merchant", "merchant_contact", "confirmed", "ai_auto_confirmed", True),
+    )
+    ids = {}
+    for name, category, status, source, primary in decisions:
+        contact_id = ids[name] = uuid4()
+        pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)", (contact_id, name))
+        pg.execute("INSERT INTO lark_identities(open_id,contact_id,identity_type,tenant_classification) "
+                   "VALUES(%s,%s,'user','internal')", ("ou_" + name, contact_id))
+        pg.execute("INSERT INTO contact_roles(contact_id,role,status,source,is_primary) VALUES(%s,%s,%s,%s,%s)",
+                   (contact_id, category, status, source, primary))
+    manual_sql = ("SELECT *,ctid::text AS version FROM contact_roles "
+                  "WHERE source IN ('manual','ai_manual_confirmed') ORDER BY contact_id,role")
+    identities_sql = "SELECT *,ctid::text AS version FROM lark_identities ORDER BY open_id"
+    roles_sql = "SELECT *,ctid::text AS version FROM contact_roles ORDER BY contact_id,role"
+    manual_before = pg.execute(manual_sql).fetchall()
+    identities_before = pg.execute(identities_sql).fetchall()
+    worker._ensure_internal_contact_roles(pg)
+    assert pg.execute(manual_sql).fetchall() == manual_before
+    assert pg.execute(identities_sql).fetchall() == identities_before
+    primary_roles = pg.execute(
+        "SELECT contact_id,role,source FROM contact_roles WHERE is_primary AND status='confirmed'")
+    primary_roles = {row["contact_id"]: (row["role"], row["source"]) for row in primary_roles}
+    assert primary_roles[ids["manual_primary"]] == ("merchant_contact", "ai_manual_confirmed")
+    assert ids["manual_rejected"] not in primary_roles and ids["manual_secondary"] not in primary_roles
+    for name in ("ai_colleague", "ai_merchant"):
+        assert primary_roles[ids[name]] == ("internal_colleague", "lark_internal_tenant")
+    before_repeat = pg.execute(roles_sql).fetchall()
+    worker._ensure_internal_contact_roles(pg)
+    assert pg.execute(roles_sql).fetchall() == before_repeat
+
 
 def test_group_display_variant_cannot_override_authorized_profile(pg, person):
     update_identity_names(

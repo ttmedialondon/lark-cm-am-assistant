@@ -1,3 +1,4 @@
+import json
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -5,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 from cryptography.exceptions import InvalidTag
+from test_creator_workflow_ai import pg as pg
 
 from app import admin_reporting
 
@@ -75,8 +77,8 @@ def test_contact_labels_do_not_imply_identity_or_ownership():
     )
     assert contact["display_name"] == "Ada"
     assert contact["tenant_classification_label"] == "外部成员"
-    assert contact["category_label"] == "合作机构对接人"
-    assert contact["confirmed_role_labels"] == ["合作机构对接人"]
+    assert contact["category_label"] == "其他机构负责人"
+    assert contact["confirmed_role_labels"] == ["其他机构负责人"]
     assert contact["organization_status_label"] == "已验证"
     assert contact["is_confirmed"] is True
 
@@ -88,6 +90,60 @@ def test_contact_labels_do_not_imply_identity_or_ownership():
     assert unnamed["category"] == "unclassified"
     assert unnamed["category_label"] == "待识别"
     assert unnamed["organization_status_label"] == "未解析"
+
+
+def test_people_directory_all_contacts_current_policy_priority_and_unfiltered_progress(pg, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(admin_reporting, "connection", lambda: nullcontext(pg))
+    cases = [
+        ("manual", "merchant_contact", "manual", "succeeded", "protected_manual", None),
+        ("internal", "internal_colleague", "lark_internal_tenant", "succeeded", "verified_internal", None),
+        ("old", "creator", "ai_auto_confirmed", "succeeded", "classified", 0.99),
+        ("low", "creator", "ai_auto_confirmed", "succeeded", "low_confidence", 0.99),
+        ("AI", "creator", "ai_auto_confirmed", "succeeded", "classified", 0.97),
+        ("orphan", None, None, "succeeded", "no_readable_messages", None),
+        ("failed", None, None, "invalid", None, None),
+        ("queued", None, None, "queued", None, None),
+    ]
+    for name, role, source, status, reason, confidence in cases:
+        contact_id = uuid4()
+        pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)", (contact_id, name))
+        if name != "orphan":
+            pg.execute("INSERT INTO lark_identities(open_id,contact_id,display_name,tenant_classification) "
+                       "VALUES(%s,%s,%s,%s)", ("ou_" + name, contact_id, name,
+                                              "internal" if name == "internal" else "unresolved"))
+        if role:
+            pg.execute("INSERT INTO contact_roles(contact_id,role,status,source,is_primary) "
+                       "VALUES(%s,%s,'confirmed',%s,TRUE)", (contact_id, role, source))
+        payload = {"reason_code": reason,
+                   "roles": [{"role": "insufficient" if name == "low" else role}] if role else []}
+        if confidence is not None:
+            payload["roles"][0]["confidence"] = confidence
+        pg.execute("INSERT INTO contact_assessments(id,contact_id,status,policy_version,result) "
+                   "VALUES(%s,%s,%s,%s,%s::jsonb)",
+                   (uuid4(), contact_id, status, "legacy" if name == "old" else admin_reporting.CONTACT_IDENTITY_POLICY,
+                    json.dumps(payload)))
+    directory = admin_reporting.contacts()
+    by_name = {row["display_name"]: row for row in directory["items"]}
+    assert directory["total_count"] == 8 and by_name["orphan"]["open_id"] is None
+    assert by_name["manual"]["category"] == "merchant_contact"
+    assert by_name["internal"]["classification_source_label"] == "已核实同事"
+    assert by_name["old"]["category"] == by_name["low"]["category"] == "unclassified"
+    for name in ("manual", "internal", "old", "low", "orphan"):
+        assert by_name[name]["identity_ai_confidence_label"] == "—"
+    assert by_name["AI"]["identity_ai_confidence_label"] == "97.0%"
+    assert by_name["queued"]["identity_ai_status_label"] == "已暂停，队列保留"
+    summary = directory["identity_summary"]
+    assert {key: summary[key] for key in ("total", "processed", "ai_results", "no_material", "exceptions",
+                                         "queued", "not_started")} == {
+        "total": 8, "processed": 5, "ai_results": 2, "no_material": 1, "exceptions": 1,
+        "queued": 1, "not_started": 1,
+    }
+    filtered = admin_reporting.contacts(category="creator", query=" AI ")
+    assert [row["display_name"] for row in filtered["items"]] == ["AI"]
+    assert filtered["identity_summary"] == summary and filtered["total_count"] == 1
+    detail = admin_reporting.contact_detail("ou_AI", include_conversations=False)
+    assert detail["contact"]["category"] == "creator"
+    assert detail["conversations"]["items"] == []
 
 
 def test_seconds_label_prefers_human_readable_units():

@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import json
+import sys
 from contextlib import nullcontext
 from uuid import uuid4
 
 import pytest
+import test_creator_workflow_ai as creator_tests
 
 from app import contact_assessments
+from app.crypto import message_body_cipher
+
+# Reuse the existing isolated PostgreSQL setup; no new service or live API.
+pg = creator_tests.pg
+real_scan = creator_tests.real_scan
 
 
 def _valid_result(*, evidence_ref: str = "M1") -> str:
@@ -50,9 +57,7 @@ def test_model_result_keeps_a_valid_role() -> None:
     )
 
     assert result == {
-        "roles": [
-            {"role": "creator", "confidence": 0.95, "basis": "self_declaration", "evidence_refs": ["M1"]}
-        ]
+        "roles": [{"role": "creator", "confidence": 0.95, "basis": "self_declaration", "evidence_refs": ["M1"]}]
     }
 
 
@@ -73,169 +78,6 @@ def test_evidence_uses_readable_text_not_lark_body_json() -> None:
         contact_assessments._readable_body('{"content":[[{"text":"hello"},{"text":" world"}]]}', "post")
         == "hello\n world"
     )
-
-
-def test_assessment_detail_marks_a_readable_evidence_item_available(monkeypatch) -> None:
-    assessment_id = uuid4()
-    contact_id = uuid4()
-
-    class Result:
-        def __init__(self, row=None, rows=None):
-            self.row = row
-            self.rows = rows or []
-
-        def fetchone(self):
-            return self.row
-
-        def fetchall(self):
-            return self.rows
-
-    class Connection:
-        def execute(self, query, _params=None):
-            if "FROM contact_assessments assessment" in query:
-                return Result(
-                    {
-                        "id": assessment_id,
-                        "contact_id": contact_id,
-                        "display_name": "Creator",
-                        "open_id": "ou_contact",
-                        "status": "succeeded",
-                        "model": "gpt-5.6-luna",
-                        "result": {"roles": []},
-                        "evidence_count": 3,
-                    }
-                )
-            if "FROM contact_assessment_refs" in query:
-                return Result(
-                    rows=[
-                        {
-                            "label": "M1",
-                            "relation": "anchor",
-                            "message_type": "post",
-                            "body_ciphertext": "sealed",
-                            "chat_name": "Creator group",
-                            "sender_display_name": "Creator",
-                            "message_create_time": None,
-                        },
-                        {
-                            "label": "M10",
-                            "relation": "context",
-                            "message_type": "post",
-                            "body_ciphertext": "sealed",
-                            "chat_name": "Creator group",
-                            "sender_display_name": "Creator",
-                            "message_create_time": None,
-                        },
-                        {
-                            "label": "M2",
-                            "relation": "history",
-                            "message_type": "post",
-                            "body_ciphertext": "sealed",
-                            "chat_name": "Creator group",
-                            "sender_display_name": "Creator",
-                            "message_create_time": None,
-                        },
-                    ]
-                )
-            return Result(rows=[])
-
-    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(Connection()))
-    monkeypatch.setattr(contact_assessments, "message_body_cipher", lambda _key: object())
-    monkeypatch.setattr(
-        contact_assessments, "get_settings", lambda: type("Settings", (), {"token_encryption_key": b"x"})()
-    )
-    monkeypatch.setattr(contact_assessments, "_decrypt_body", lambda _cipher, _body: '{"text":"readable"}')
-
-    detail = contact_assessments.assessment_detail(assessment_id)
-
-    assert detail is not None
-    assert [item["label"] for item in detail["evidence"]] == ["M1", "M2", "M10"]
-    assert detail["evidence"][0]["content"] == "readable"
-    assert all(item["available"] for item in detail["evidence"])
-    assert detail["can_confirm"] is True
-
-
-def test_confirmation_refuses_an_assessment_after_its_evidence_leaves_scope(monkeypatch) -> None:
-    assessment_id = uuid4()
-    actor_id = uuid4()
-    contact_id = uuid4()
-
-    class Connection:
-        def transaction(self):
-            return nullcontext()
-
-        def execute(self, *_args, **_kwargs):
-            raise AssertionError("no contact fact should be written")
-
-    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(Connection()))
-    monkeypatch.setattr(contact_assessments, "_feature_enabled_in", lambda _conn: True)
-    monkeypatch.setattr(
-        contact_assessments,
-        "_successful_assessment",
-        lambda *_args: {"contact_id": contact_id, "result": {"roles": [{"role": "creator"}]}},
-    )
-    monkeypatch.setattr(contact_assessments, "_refs_are_still_authorized_in", lambda *_args: False)
-
-    with pytest.raises(contact_assessments.ContactAssessmentInputError, match="当前授权范围"):
-        contact_assessments.confirm_assessment_role(actor_id, assessment_id, "creator")
-
-
-def test_confirmation_refuses_ai_roles_while_identity_feature_is_disabled(monkeypatch) -> None:
-    class Connection:
-        def transaction(self):
-            return nullcontext()
-
-    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(Connection()))
-    monkeypatch.setattr(contact_assessments, "_feature_enabled_in", lambda _conn: False)
-
-    with pytest.raises(contact_assessments.ContactAssessmentInputError, match="当前未启用"):
-        contact_assessments.confirm_assessment_role(uuid4(), uuid4(), "creator")
-
-
-def test_disabled_identity_feature_discards_an_in_flight_model_result(monkeypatch) -> None:
-    assessment_id = uuid4()
-    contact_id = uuid4()
-    finished = []
-
-    class Result:
-        def __init__(self, row=None):
-            self.row = row
-
-        def fetchone(self):
-            return self.row
-
-    class Connection:
-        def transaction(self):
-            return nullcontext()
-
-        def execute(self, query, _params=None):
-            if "FROM ai_feature_configs" in query:
-                return Result()
-            if "FROM contact_assessments" in query:
-                return Result(
-                    {"id": assessment_id, "contact_id": contact_id, "trigger": "automatic", "status": "running"}
-                )
-            raise AssertionError(f"unexpected query: {query}")
-
-    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(Connection()))
-    monkeypatch.setattr(
-        contact_assessments,
-        "_finish_in",
-        lambda *args, **kwargs: finished.append((args, kwargs)),
-    )
-
-    assert not contact_assessments._finish_with_decision(
-        assessment_id,
-        contact_id,
-        {"auto_confirm_threshold": 0.9},
-        model="gpt-5.6-luna",
-        result={"roles": [{"role": "creator", "confidence": 0.99}]},
-        evidence_strength={},
-        response_id="resp_test",
-        usage={"input_tokens": 1, "output_tokens": 1},
-    )
-    assert finished[0][0][2:4] == ("cancelled", "达人 AI 识别已停用；模型结果未写入联系人事实。")
-    assert finished[0][1]["outcome"] == "no_action"
 
 
 def test_responses_request_is_nonpersistent_and_uses_configured_model(monkeypatch) -> None:
@@ -286,8 +128,8 @@ def test_responses_request_is_nonpersistent_and_uses_configured_model(monkeypatc
     assert "reason" not in schema["properties"]["roles"]["items"]["properties"]
     evidence_refs = schema["properties"]["roles"]["items"]["properties"]["evidence_refs"]
     assert evidence_refs["minItems"] == 1
-    assert evidence_refs["maxItems"] == 12
-    assert schema["properties"]["roles"]["maxItems"] == 3
+    assert evidence_refs["maxItems"] == 16
+    assert schema["properties"]["roles"]["maxItems"] == 1
     assert "organization_candidates" not in schema["properties"]
     assert "account_relations" not in schema["properties"]
     assert result["usage"] == {"input_tokens": 12, "output_tokens": 8}
@@ -338,9 +180,7 @@ def test_responses_quota_429_is_not_treated_as_a_temporary_limit(monkeypatch) ->
     monkeypatch.setattr(contact_assessments.httpx, "post", lambda *_args, **_kwargs: Response())
 
     with pytest.raises(contact_assessments.OpenAIRequestError) as raised:
-        contact_assessments._call_openai(
-            {"model": "gpt-5.6-luna"}, "sk-test-only", {"messages": []}, uuid4()
-        )
+        contact_assessments._call_openai({"model": "gpt-5.6-luna"}, "sk-test-only", {"messages": []}, uuid4())
 
     assert raised.value.is_quota
 
@@ -373,448 +213,307 @@ def test_non_429_http_error_keeps_safe_telemetry_without_a_blind_retry(monkeypat
     monkeypatch.setattr(contact_assessments.httpx, "post", lambda *_args, **_kwargs: Response())
 
     with pytest.raises(contact_assessments.OpenAIRequestError) as raised:
-        contact_assessments._call_openai(
-            {"model": "gpt-5.6-luna"}, "sk-test-only", {"messages": []}, uuid4()
-        )
+        contact_assessments._call_openai({"model": "gpt-5.6-luna"}, "sk-test-only", {"messages": []}, uuid4())
 
     assert not raised.value.retryable
     assert raised.value.telemetry["openai_request_id"] == "req_server_error"
 
 
-def test_context_history_uses_the_anchor_authorization_only() -> None:
+@pytest.fixture
+def people(pg, real_scan, monkeypatch):
+    ids, settings = real_scan
+    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(pg))
+    monkeypatch.setattr(contact_assessments, "get_settings", lambda: settings)
+
+    def raise_error(*_args, **_kwargs):
+        raise sys.exception()
+
+    monkeypatch.setattr(contact_assessments.LOGGER, "warning", raise_error)
+    pg.execute("UPDATE ai_feature_configs SET enabled=(feature='contact_assessment')")
+    return ids, settings
+
+
+def _person(pg, name, *, role=None, source="manual"):
     contact_id = uuid4()
-    authorization_id = uuid4()
-
-    class Result:
-        @staticmethod
-        def fetchall():
-            return []
-
-    class Connection:
-        calls = []
-
-        def execute(self, query, params):
-            self.calls.append((" ".join(query.split()), params))
-            return Result()
-
-    conn = Connection()
-    contact_assessments._recent_subject_history(conn, contact_id, authorization_id)
-
-    query, params = conn.calls[0]
-    assert "observation.authorization_id = %s" in query
-    assert params == (contact_id, authorization_id, contact_assessments.MAX_SUBJECT_HISTORY_MESSAGES)
-    assert "LIMIT %s" in query
+    pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)", (contact_id, name))
+    pg.execute(
+        "INSERT INTO lark_identities(open_id,contact_id,display_name,tenant_classification) "
+        "VALUES(%s,%s,%s,'known_external')",
+        ("ou_" + name, contact_id, name),
+    )
+    if role:
+        pg.execute(
+            "INSERT INTO contact_roles(contact_id,role,status,source,is_primary) VALUES(%s,%s,'confirmed',%s,TRUE)",
+            (contact_id, role, source),
+        )
+    return contact_id
 
 
-def test_context_limits_are_balanced_and_group_name_is_not_repeated() -> None:
-    anchor = {
-        "authorization_id": uuid4(),
-        "chat_id": "oc_test",
-        "message_id": "om_anchor",
-        "message_create_time": "2026-09-02T10:00:00Z",
-        "chat_mode": "group",
-        "chat_name": "Creator campaign",
-        "external": True,
-        "p2p_counterpart_open_id": None,
-        "mentions_json": [],
-        "sender_tenant_classification": "known_external",
-        "message_type": "text",
-        "root_id": None,
-        "parent_id": None,
-        "thread_id": None,
-    }
-
-    class Result:
-        @staticmethod
-        def fetchall():
-            return []
-
-    class Connection:
-        calls = []
-
-        def execute(self, query, params):
-            self.calls.append((" ".join(query.split()), params))
-            return Result()
-
-    conn = Connection()
-    contact_assessments._conversation_context(conn, anchor)
-
-    before_query, before_params = conn.calls[0]
-    after_query, after_params = conn.calls[1]
-    assert "message.message_id < %s" in before_query
-    assert "message.message_id > %s" in after_query
-    assert before_params[-1] == after_params[-1] == contact_assessments.MAX_CONTEXT_MESSAGES_PER_SIDE
-
-    base_fragment = {"label": "M1", "speaker": "S1", "row": anchor, "text": "hello"}
-    anchor_payload = contact_assessments._model_fragment({**base_fragment, "relation": "anchor"}, set())
-    context_payload = contact_assessments._model_fragment({**base_fragment, "relation": "context"}, set())
-    assert anchor_payload["conversation"]["name"] == "Creator campaign"
-    assert "speaker_party" not in anchor_payload
-    assert "name" not in context_payload["conversation"]
+def _message(pg, settings, cm, message_id, speaker, text, *, days=0):
+    cipher = message_body_cipher(settings.token_encryption_key)
+    pg.execute(
+        "INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,body_ciphertext,message_create_time)"
+        " VALUES('chat',%s,%s,'text',%s,NOW()-(%s*INTERVAL '1 day'))",
+        (message_id, speaker, cipher.encrypt(json.dumps({"text": text})), days),
+    )
+    pg.execute(
+        "INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) VALUES(%s,'chat',%s)",
+        (cm, message_id),
+    )
 
 
-def test_group_interaction_is_strong_only_when_the_other_party_is_internal() -> None:
-    row = {
-        "sender_open_id": "ou_other",
-        "sender_tenant_classification": "known_external",
-        "reply_to_open_id": "ou_subject",
-        "p2p_counterpart_open_id": None,
-        "mentions_json": [],
-    }
-
-    assert not contact_assessments._fragment_strength(row, {"ou_subject"})["direct_relation"]
-    row["sender_tenant_classification"] = "internal"
-    assert contact_assessments._fragment_strength(row, {"ou_subject"})["direct_relation"]
-
-
-def test_saved_refs_record_the_single_source_authorization(monkeypatch) -> None:
-    assessment_id = uuid4()
-    source_authorization_id = uuid4()
-
-    class Result:
-        pass
-
-    class Connection:
-        def __init__(self):
-            self.calls = []
-
-        def transaction(self):
-            return nullcontext()
-
-        def execute(self, query, params=None):
-            self.calls.append((" ".join(query.split()), params))
-            return Result()
-
-    conn = Connection()
-    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(conn))
-    contact_assessments._save_refs(
-        assessment_id,
-        [
+def _response(role="creator", confidence=0.99, refs=("M1",)):
+    return {
+        "text": json.dumps(
             {
-                "label": "M1",
-                "authorization_id": source_authorization_id,
-                "chat_id": "oc_test",
-                "message_id": "om_test",
-                "relation": "anchor",
+                "roles": [
+                    {
+                        "role": role,
+                        "confidence": confidence,
+                        "basis": "self_declaration",
+                        "evidence_refs": list(refs),
+                    }
+                ]
             }
-        ],
-        42,
-        source_authorization_id,
-    )
-
-    update_params = next(params for query, params in conn.calls if "SET source_authorization_id" in query)
-    assert update_params == (source_authorization_id, 1, 42, assessment_id)
-
-
-def test_auto_decision_confirms_creator(monkeypatch) -> None:
-    confirmed: list[str] = []
-    monkeypatch.setattr(
-        contact_assessments,
-        "_auto_confirm_role",
-        lambda _conn, _contact_id, role: confirmed.append(role) or "confirmed",
-    )
-
-    outcome, review_status, roles = contact_assessments._apply_automatic_decision(
-        object(),
-        uuid4(),
-        {"roles": [{"role": "creator", "confidence": 0.9, "basis": "direct_interaction", "evidence_refs": ["M1"]}]},
-        0.9,
-        {"M1": {"direct_relation": True, "subject_speaker": True}},
-    )
-
-    assert (outcome, review_status, roles) == ("auto_confirmed", "not_required", ["creator"])
-    assert confirmed == ["creator"]
-
-
-def test_auto_decision_keeps_any_multiple_role_output_for_review(monkeypatch) -> None:
-    confirmed: list[str] = []
-    monkeypatch.setattr(
-        contact_assessments,
-        "_auto_confirm_role",
-        lambda _conn, _contact_id, role: confirmed.append(role) or "confirmed",
-    )
-
-    outcome, review_status, roles = contact_assessments._apply_automatic_decision(
-        object(),
-        uuid4(),
-        {
-            "roles": [
-                {"role": "creator", "confidence": 0.95, "basis": "direct_interaction", "evidence_refs": ["M1"]},
-                {"role": "partner_contact", "confidence": 0.20, "basis": "weak_context", "evidence_refs": ["M1"]},
-            ],
-        },
-        0.9,
-        {"M1": {"direct_relation": True, "subject_speaker": True}},
-    )
-
-    assert (outcome, review_status, roles) == ("review_required", "pending", [])
-    assert confirmed == []
-
-
-def test_auto_decision_keeps_a_role_below_ninety_percent_for_review(monkeypatch) -> None:
-    monkeypatch.setattr(
-        contact_assessments,
-        "_auto_confirm_role",
-        lambda *_args: pytest.fail("a role below 90% must not be automatically written"),
-    )
-
-    outcome, review_status, roles = contact_assessments._apply_automatic_decision(
-        object(),
-        uuid4(),
-        {"roles": [{"role": "creator", "confidence": 0.899, "basis": "direct_interaction", "evidence_refs": ["M1"]}]},
-        0.9,
-        {"M1": {"direct_relation": True, "subject_speaker": True}},
-    )
-
-    assert (outcome, review_status, roles) == ("review_required", "pending", [])
-
-
-def test_auto_decision_never_confirms_from_weak_group_context(monkeypatch) -> None:
-    monkeypatch.setattr(
-        contact_assessments,
-        "_auto_confirm_role",
-        lambda *_args: pytest.fail("weak context must not automatically write a category"),
-    )
-
-    outcome, review_status, roles = contact_assessments._apply_automatic_decision(
-        object(),
-        uuid4(),
-        {"roles": [{"role": "creator", "confidence": 0.99, "basis": "weak_context", "evidence_refs": ["M1"]}]},
-        0.9,
-        {"M1": {"direct_relation": False, "subject_speaker": False}},
-    )
-
-    assert (outcome, review_status, roles) == ("review_required", "pending", [])
-
-
-def test_auto_decision_sends_low_or_ambiguous_roles_to_review(monkeypatch) -> None:
-    monkeypatch.setattr(
-        contact_assessments,
-        "_auto_confirm_role",
-        lambda *_args: pytest.fail("ambiguous role must not be automatically written"),
-    )
-
-    outcome, review_status, roles = contact_assessments._apply_automatic_decision(
-        object(),
-        uuid4(),
-        {
-            "roles": [
-                {"role": "creator", "confidence": 0.99, "basis": "direct_interaction", "evidence_refs": ["M1"]},
-                {"role": "partner_contact", "confidence": 0.91, "basis": "direct_interaction", "evidence_refs": ["M1"]},
-            ],
-        },
-        0.9,
-        {"M1": {"direct_relation": True, "subject_speaker": True}},
-    )
-
-    assert (outcome, review_status, roles) == ("review_required", "pending", [])
-
-
-def test_run_skips_every_confirmed_contact_before_loading_ai_or_sending_content(monkeypatch) -> None:
-    assessment_id = uuid4()
-    contact_id = uuid4()
-    finished: list[tuple[object, ...]] = []
-
-    class Result:
-        @staticmethod
-        def fetchone():
-            return {"has_facts": True}
-
-    class Connection:
-        @staticmethod
-        def execute(query, _params):
-            assert "SELECT EXISTS" in query
-            return Result()
-
-    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(Connection()))
-    monkeypatch.setattr(
-        contact_assessments,
-        "_configured_openai",
-        lambda *_args: pytest.fail("confirmed contact must not load or call AI"),
-    )
-    monkeypatch.setattr(
-        contact_assessments,
-        "_finish",
-        lambda *args, **kwargs: finished.append((*args, kwargs)),
-    )
-
-    contact_assessments._run({"id": assessment_id, "contact_id": contact_id}, object())
-
-    assert finished == [
-        (
-            assessment_id,
-            "cancelled",
-            "联系人已有已确认身份事实；判定未运行。",
-            {"outcome": "no_action"},
-        )
-    ]
-
-
-def test_run_without_an_organization_reaches_ai(monkeypatch) -> None:
-    assessment_id = uuid4()
-    contact_id = uuid4()
-    called: list[object] = []
-
-    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(object()))
-    monkeypatch.setattr(contact_assessments, "_contact_has_confirmed_facts", lambda *_args: False)
-    monkeypatch.setattr(contact_assessments, "_configured_openai", lambda *_args: ({"model": "luna"}, "sk-test"))
-    monkeypatch.setattr(
-        contact_assessments,
-        "_build_evidence",
-        lambda *_args: {
-            "fragments": [{}],
-            "refs": [],
-            "char_count": 0,
-            "source_authorization_id": uuid4(),
-            "pack": {"subject": {"alias": "S1"}, "messages": []},
-            "labels": {"M1"},
-            "evidence_strength": {},
-        },
-    )
-    monkeypatch.setattr(contact_assessments, "_save_refs", lambda *_args: None)
-    monkeypatch.setattr(contact_assessments, "_refs_are_still_authorized", lambda *_args: True)
-    monkeypatch.setattr(contact_assessments, "_call_openai", lambda *_args: {"text": "{}", "usage": {}})
-    monkeypatch.setattr(contact_assessments, "_validate_model_result", lambda *_args: {"roles": []})
-    monkeypatch.setattr(
-        contact_assessments,
-        "_finish_with_decision",
-        lambda *_args, **_kwargs: called.append("decision") or True,
-    )
-    monkeypatch.setattr(contact_assessments, "_mark_feature_test", lambda result: called.append(result))
-
-    contact_assessments._run({"id": assessment_id, "contact_id": contact_id}, object())
-
-    assert called == ["decision", "succeeded"]
-
-
-def test_run_reschedules_a_temporary_429_and_throttles_both_queues(monkeypatch) -> None:
-    assessment_id = uuid4()
-    contact_id = uuid4()
-    throttles: list[float] = []
-    rescheduled: list[tuple[object, ...]] = []
-
-    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(object()))
-    monkeypatch.setattr(contact_assessments, "_contact_has_confirmed_facts", lambda *_args: False)
-    monkeypatch.setattr(contact_assessments, "_configured_openai", lambda *_args: ({"model": "luna"}, "sk-test"))
-    monkeypatch.setattr(
-        contact_assessments,
-        "_build_evidence",
-        lambda *_args: {
-            "fragments": [{}], "refs": [], "char_count": 0, "source_authorization_id": uuid4(),
-            "pack": {}, "labels": {"M1"}, "evidence_strength": {},
-        },
-    )
-    monkeypatch.setattr(contact_assessments, "_save_refs", lambda *_args: None)
-    monkeypatch.setattr(contact_assessments, "_refs_are_still_authorized", lambda *_args: True)
-    monkeypatch.setattr(
-        contact_assessments,
-        "_call_openai",
-        lambda *_args: (_ for _ in ()).throw(
-                contact_assessments.OpenAIRequestError(
-                    "limited", retry_after_seconds=7, retryable=True, telemetry={"openai_request_id": "req_1"}
-                )
         ),
+        "response_id": "test-only",
+        "usage": {"input_tokens": 20, "output_tokens": 10},
+    }
+
+
+def _job(pg, person):
+    pg.execute(
+        "UPDATE contact_assessments SET scheduled_at=NOW()+INTERVAL '1 hour' WHERE status='queued' AND contact_id<>%s",
+        (person,),
     )
-    monkeypatch.setattr(contact_assessments.ai_dispatch, "throttle", throttles.append)
-    monkeypatch.setattr(contact_assessments, "_reschedule", lambda *args, **kwargs: rescheduled.append((*args, kwargs)))
-    monkeypatch.setattr(contact_assessments, "_mark_feature_test", lambda *_args: None)
-    monkeypatch.setattr(contact_assessments.random, "uniform", lambda *_args: 0.5)
+    pg.execute("UPDATE contact_assessments SET scheduled_at=NOW() WHERE contact_id=%s", (person,))
+    return contact_assessments._claim_next()
 
-    contact_assessments._run({"id": assessment_id, "contact_id": contact_id, "attempts": 1}, object())
 
-    assert throttles == [7.5]
-    assert rescheduled == [
-        (
-            assessment_id,
-            7.5,
-            "OpenAI 请求暂时限速；将在约 8 秒后自动重试。",
-            {"telemetry": {"openai_request_id": "req_1"}},
+def test_all_people_once_own_history_only_six_classes_and_source_data_preserved(pg, people, monkeypatch):
+    ids, settings = people
+    pg.execute("DELETE FROM authorization_message_observations WHERE message_id='2'")
+    pg.execute("DELETE FROM chat_messages WHERE message_id='2'")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'chat')", (ids["owner"],))
+    pg.execute(
+        "INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) VALUES(%s,'chat','1')",
+        (ids["owner"],),
+    )
+    for index in range(25):
+        _message(
+            pg,
+            settings,
+            ids["cm"],
+            f"h{index}",
+            "ou_person",
+            f"I create my own LIVE videos for brands. person test@example.com +447777777777 item {index}",
+            days=index * 30,
         )
+    pg.execute(
+        "INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) VALUES(%s,%s,%s,'manual')",
+        (uuid4(), ids["person"], ids["cm"]),
+    )
+    before = {
+        table: pg.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"]
+        for table in ("contacts", "lark_identities", "chat_messages", "contact_assignments")
+    }
+    evidence = contact_assessments._build_evidence(ids["person"], settings)
+    assert len(evidence["refs"]) == 16 and evidence["char_count"] <= 8000
+    assert len({(r["chat_id"], r["message_id"]) for r in evidence["refs"]}) == 16
+    assert any(f["row"]["message_id"] == "h24" for f in evidence["fragments"])
+    sent = json.dumps(evidence["pack"])
+    assert "ou_person" not in sent and "test@example.com" not in sent and "+447777777777" not in sent
+    assert "chat_name" not in sent and "tenant_classification" not in sent
+    assert all(f["row"]["sender_open_id"] == "ou_person" for f in evidence["fragments"])
+    assert contact_assessments.queue_eligible_contact_assessments() == 3
+    pg.execute("UPDATE ai_feature_configs SET automatic_queue_checked_at='-infinity'")
+    assert contact_assessments.queue_eligible_contact_assessments() == 0
+    called = []
+    monkeypatch.setattr(contact_assessments, "_call_openai", lambda *_args: called.append(_args[2]) or _response())
+    job = _job(pg, ids["person"])
+    contact_assessments._run(job, settings)
+    row = pg.execute("SELECT * FROM contact_assessments WHERE id=%s", (job["id"],)).fetchone()
+    assert row["status"] == "succeeded" and row["outcome"] == "auto_confirmed"
+    assert row["result"]["reason_code"] == "classified" and row["evidence_count"] == 16
+    assert pg.execute("SELECT role,source FROM contact_roles WHERE contact_id=%s", (ids["person"],)).fetchone() == {
+        "role": "creator",
+        "source": "ai_auto_confirmed",
+    }
+    assert len(called) == 1
+    assert {table: pg.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"] for table in before} == before
+    assert contact_assessments.assessment_detail(job["id"])["can_confirm"]
+    contact_assessments.confirm_assessment_role(ids["owner"], job["id"], "creator")
+    # A superseded successful result is never a valid manual-confirmation link.
+    pg.execute(
+        "INSERT INTO contact_assessments(id,contact_id,policy_version,created_at) "
+        "VALUES(%s,%s,%s,NOW()+INTERVAL '1 second')",
+        (uuid4(), ids["person"], contact_assessments.POLICY_VERSION),
+    )
+    assert not contact_assessments.assessment_detail(job["id"])["can_confirm"]
+    with pytest.raises(contact_assessments.ContactAssessmentInputError):
+        contact_assessments.confirm_assessment_role(ids["owner"], job["id"], "creator")
+    for role in contact_assessments.FACT_ROLES:
+        assert contact_assessments._validate_model_result(_response(role)["text"], {"M1"})["roles"][0]["role"] == role
+    invalid = json.loads(_response()["text"])
+    invalid["raw_quote"] = "PII should never persist"
+    with pytest.raises(ValueError):
+        contact_assessments._validate_model_result(json.dumps(invalid), {"M1"})
+
+
+def test_no_material_manual_internal_and_low_confidence_do_not_invent_classification(pg, people, monkeypatch):
+    ids, settings = people
+    manual = _person(pg, "manual", role="merchant_contact")
+    hello = _person(pg, "hello")
+    _message(pg, settings, ids["cm"], "hello", "ou_hello", "Thanks! 👍")
+    pg.execute(
+        "INSERT INTO contact_roles(contact_id,role,status,source,is_primary) "
+        "VALUES(%s,'creator','confirmed','ai_auto_confirmed',TRUE)",
+        (ids["person"],),
+    )
+    contact_assessments.queue_eligible_contact_assessments()
+    called = []
+    monkeypatch.setattr(
+        contact_assessments, "_call_openai", lambda *_args: called.append(True) or _response(confidence=0.94)
+    )
+    for person, reason in (
+        (ids["cm"], "verified_internal"),
+        (manual, "protected_manual"),
+        (ids["other"], "no_readable_messages"),
+        (hello, "no_substantive_messages"),
+        (ids["person"], "low_confidence"),
+    ):
+        job = _job(pg, person)
+        contact_assessments._run(job, settings)
+        row = pg.execute("SELECT * FROM contact_assessments WHERE id=%s", (job["id"],)).fetchone()
+        assert row["status"] == "succeeded" and row["result"]["reason_code"] == reason
+    assert len(called) == 1
+    assert pg.execute("SELECT 1 FROM contact_roles WHERE contact_id=%s", (ids["person"],)).fetchone() is None
+    assert (
+        pg.execute("SELECT source FROM contact_roles WHERE contact_id=%s", (manual,)).fetchone()["source"] == "manual"
+    )
+    assert not any(
+        "confidence" in r
+        for r in pg.execute("SELECT result FROM contact_assessments WHERE contact_id=%s", (manual,)).fetchone()[
+            "result"
+        ]["roles"]
+    )
+    pg.execute("UPDATE ai_feature_configs SET automatic_queue_checked_at='-infinity'")
+    assert contact_assessments.queue_eligible_contact_assessments() == 0
+    # An explicit human rejection outranks directory membership, without changing tenant data.
+    pg.execute(
+        "INSERT INTO contact_roles(contact_id,role,status,source) VALUES(%s,'internal_colleague','rejected','manual')",
+        (ids["cm"],),
+    )
+    contact_assessments.requeue_contact_assessment(ids["cm"])
+    internal_job = _job(pg, ids["cm"])
+    contact_assessments._run(internal_job, settings)
+    protected = pg.execute("SELECT result FROM contact_assessments WHERE id=%s", (internal_job["id"],)).fetchone()[
+        "result"
     ]
-
-
-def test_run_pauses_the_shared_queue_for_a_quota_429(monkeypatch) -> None:
-    assessment_id = uuid4()
-    contact_id = uuid4()
-    paused: list[bool] = []
-    rescheduled: list[tuple[object, ...]] = []
-
-    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(object()))
-    monkeypatch.setattr(contact_assessments, "_contact_has_confirmed_facts", lambda *_args: False)
-    monkeypatch.setattr(contact_assessments, "_configured_openai", lambda *_args: ({"model": "luna"}, "sk-test"))
-    monkeypatch.setattr(
-        contact_assessments,
-        "_build_evidence",
-        lambda *_args: {
-            "fragments": [{}], "refs": [], "char_count": 0, "source_authorization_id": uuid4(),
-            "pack": {}, "labels": {"M1"}, "evidence_strength": {},
-        },
+    assert protected == {"roles": [], "reason_code": "protected_manual"}
+    # An obsolete automatic tenant primary must not collide with the current high-confidence AI class.
+    pg.execute(
+        "INSERT INTO contact_roles(contact_id,role,status,source,is_primary) "
+        "VALUES(%s,'internal_colleague','confirmed','lark_internal_tenant',TRUE)",
+        (ids["person"],),
     )
-    monkeypatch.setattr(contact_assessments, "_save_refs", lambda *_args: None)
-    monkeypatch.setattr(contact_assessments, "_refs_are_still_authorized", lambda *_args: True)
-    monkeypatch.setattr(
-        contact_assessments,
-        "_call_openai",
-        lambda *_args: (_ for _ in ()).throw(contact_assessments.OpenAIRequestError("quota", is_quota=True)),
-    )
-    monkeypatch.setattr(contact_assessments.ai_dispatch, "pause_for_quota", lambda: paused.append(True))
-    monkeypatch.setattr(contact_assessments, "_reschedule", lambda *args, **kwargs: rescheduled.append((*args, kwargs)))
-    monkeypatch.setattr(contact_assessments, "_mark_feature_test", lambda *_args: None)
-
-    contact_assessments._run({"id": assessment_id, "contact_id": contact_id}, object())
-
-    assert paused == [True]
-    assert rescheduled[0][:3] == (
-        assessment_id,
-        0,
-        "OpenAI 项目因配额或账单问题已暂停；请由所有者处理后恢复队列。",
+    contact_assessments.requeue_contact_assessment(ids["person"])
+    monkeypatch.setattr(contact_assessments, "_call_openai", lambda *_args: _response())
+    contact_assessments._run(_job(pg, ids["person"]), settings)
+    assert (
+        pg.execute("SELECT role FROM contact_roles WHERE contact_id=%s AND is_primary", (ids["person"],)).fetchone()[
+            "role"
+        ]
+        == "creator"
     )
 
 
-def test_run_rechecks_confirmation_immediately_before_the_model_call(monkeypatch) -> None:
-    assessment_id = uuid4()
-    contact_id = uuid4()
-    checks = iter((False, True))
-    finished: list[tuple[object, ...]] = []
+@pytest.mark.parametrize("change", ["body", "author", "scope", "partial_ref", "disable", "config"])
+def test_inflight_evidence_or_configuration_change_cannot_save_or_manually_confirm(pg, people, monkeypatch, change):
+    ids, settings = people
+    _message(pg, settings, ids["cm"], "extra", "ou_person", "I produce product videos for my followers.")
+    contact_assessments.queue_eligible_contact_assessments()
+    job = _job(pg, ids["person"])
 
-    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(object()))
-    monkeypatch.setattr(contact_assessments, "_contact_has_confirmed_facts", lambda *_args: next(checks))
-    monkeypatch.setattr(
-        contact_assessments,
-        "_configured_openai",
-        lambda _settings: ({"model": "gpt-5.6-luna"}, "sk-test"),
-    )
-    monkeypatch.setattr(
-        contact_assessments,
-        "_build_evidence",
-        lambda *_args: {
-            "fragments": [{}],
-            "refs": [],
-            "char_count": 0,
-            "source_authorization_id": uuid4(),
-            "pack": {},
-        },
-    )
-    monkeypatch.setattr(contact_assessments, "_save_refs", lambda *_args: None)
-    monkeypatch.setattr(contact_assessments, "_refs_are_still_authorized", lambda *_args: True)
-    monkeypatch.setattr(
-        contact_assessments,
-        "_call_openai",
-        lambda *_args: pytest.fail("a newly confirmed contact must not reach OpenAI"),
-    )
-    monkeypatch.setattr(
-        contact_assessments,
-        "_finish",
-        lambda *args, **kwargs: finished.append((*args, kwargs)),
-    )
+    def respond(*_args):
+        if change == "body":
+            pg.execute(
+                "UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='extra'",
+                (message_body_cipher(settings.token_encryption_key).encrypt('{"text":"changed"}'),),
+            )
+        elif change == "author":
+            pg.execute("UPDATE chat_messages SET sender_open_id='ou_other' WHERE message_id='extra'")
+        elif change == "scope":
+            pg.execute("UPDATE authorization_chats SET sync_enabled=FALSE")
+        elif change == "partial_ref":
+            pg.execute("DELETE FROM authorization_message_observations WHERE message_id='extra'")
+        elif change == "disable":
+            pg.execute("UPDATE ai_feature_configs SET enabled=FALSE WHERE feature='contact_assessment'")
+        else:
+            pg.execute("UPDATE ai_feature_configs SET model='changed' WHERE feature='contact_assessment'")
+        return _response()
 
-    contact_assessments._run({"id": assessment_id, "contact_id": contact_id}, object())
+    monkeypatch.setattr(contact_assessments, "_call_openai", respond)
+    contact_assessments._run(job, settings)
+    row = pg.execute("SELECT * FROM contact_assessments WHERE id=%s", (job["id"],)).fetchone()
+    assert row["status"] == "cancelled"
+    assert pg.execute("SELECT 1 FROM contact_roles WHERE contact_id=%s", (ids["person"],)).fetchone() is None
+    with pytest.raises(contact_assessments.ContactAssessmentInputError):
+        contact_assessments.confirm_assessment_role(ids["owner"], job["id"], "creator")
 
-    assert finished == [
-        (
-            assessment_id,
-            "cancelled",
-            "联系人已有已确认身份事实；未向模型发送消息内容。",
-            {"outcome": "no_action"},
-        )
-    ]
+
+def test_retry_budget_stale_claim_and_legacy_manual_link_are_fenced(pg, people, monkeypatch):
+    ids, settings = people
+    legacy = uuid4()
+    pg.execute(
+        "INSERT INTO contact_assessments(id,contact_id,status,result) VALUES(%s,%s,'succeeded',%s)",
+        (legacy, ids["person"], _response()["text"]),
+    )
+    with pytest.raises(contact_assessments.ContactAssessmentInputError):
+        contact_assessments.confirm_assessment_role(ids["owner"], legacy, "creator")
+    contact_assessments.queue_eligible_contact_assessments()
+    first = _job(pg, ids["person"])
+    attempts = []
+
+    def limited(*_args):
+        attempts.append(True)
+        raise contact_assessments.OpenAIRequestError("safe", retryable=True, retry_after_seconds=0)
+
+    monkeypatch.setattr(contact_assessments, "_call_openai", limited)
+    monkeypatch.setattr(contact_assessments.ai_dispatch, "throttle", lambda *_args: None)
+    contact_assessments._run(first, settings)
+    second = _job(pg, ids["person"])
+    assert second["id"] == first["id"] and second["attempts"] == 2
+    contact_assessments._run(first, settings)
+    assert len(attempts) == 1
+    contact_assessments._run(second, settings)
+    assert len(attempts) == 2
+    assert (
+        pg.execute("SELECT status FROM contact_assessments WHERE id=%s", (first["id"],)).fetchone()["status"]
+        == "failed"
+    )
+    with pytest.raises(contact_assessments.ContactAssessmentInputError, match="预算"):
+        contact_assessments.requeue_contact_assessment(ids["person"])
+    pg.execute("UPDATE ai_feature_configs SET automatic_queue_checked_at='-infinity'")
+    assert contact_assessments.queue_eligible_contact_assessments() == 0
+
+
+def test_local_save_deadlock_retry_never_repeats_the_paid_request(pg, people, monkeypatch):
+    ids, settings = people
+    contact_assessments.queue_eligible_contact_assessments()
+    job = _job(pg, ids["person"])
+    calls, saves = [], []
+    original = contact_assessments._finish_with_decision
+
+    def save(*args, **kwargs):
+        saves.append(True)
+        if len(saves) == 1:
+            raise contact_assessments.psycopg.errors.DeadlockDetected()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(contact_assessments, "_call_openai", lambda *_args: calls.append(True) or _response())
+    monkeypatch.setattr(contact_assessments, "_finish_with_decision", save)
+    contact_assessments._run(job, settings)
+    assert len(calls) == 1 and len(saves) == 2
+    row = pg.execute("SELECT status,attempts FROM contact_assessments WHERE id=%s", (job["id"],)).fetchone()
+    assert row == {"status": "succeeded", "attempts": 1}

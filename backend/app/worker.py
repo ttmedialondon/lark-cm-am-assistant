@@ -1485,37 +1485,58 @@ def _refresh_tenant_classifications(conn: psycopg.Connection, internal_tenant_ke
 
 
 def _ensure_internal_contact_roles(conn: psycopg.Connection) -> None:
-    """Make verified company membership deterministic, never a model decision."""
-
+    """Preserve manual decisions; trusted tenant membership outranks only AI roles."""
+    targets = conn.execute(
+        """
+        SELECT contact.id FROM contacts contact
+        WHERE EXISTS (
+            SELECT 1 FROM lark_identities identity WHERE identity.contact_id=contact.id
+              AND identity.identity_type='user' AND identity.tenant_classification='internal'
+        )
+          AND NOT EXISTS (
+            SELECT 1 FROM contact_roles role WHERE role.contact_id=contact.id AND role.role='internal_colleague'
+              AND role.source NOT IN ('ai_auto_confirmed','lark_internal_tenant')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM contact_roles role WHERE role.contact_id=contact.id AND role.role='internal_colleague'
+              AND role.status='confirmed' AND role.source='lark_internal_tenant'
+              AND role.is_primary=NOT EXISTS (
+                SELECT 1 FROM contact_roles protected WHERE protected.contact_id=contact.id
+                  AND protected.status='confirmed' AND protected.is_primary AND protected.role<>'internal_colleague'
+                  AND protected.source NOT IN ('ai_auto_confirmed','lark_internal_tenant')
+              )
+          )
+        ORDER BY contact.id FOR UPDATE OF contact SKIP LOCKED
+        """
+    ).fetchall()
+    if not targets:
+        return
+    contact_ids = [row["id"] for row in targets]
+    # Manual review locks the same contact. Skip a concurrent review instead of
+    # blocking message synchronization; the next metadata refresh will retry it.
     conn.execute(
         """
-        WITH internal_contacts AS (
-            SELECT DISTINCT contact_id
-            FROM lark_identities
-            WHERE identity_type = 'user'
-              AND tenant_classification = 'internal'
-              AND contact_id IS NOT NULL
-        )
         UPDATE contact_roles role
         SET is_primary = FALSE, updated_at = NOW()
         WHERE role.is_primary AND role.status = 'confirmed'
-          AND role.contact_id IN (SELECT contact_id FROM internal_contacts)
+          AND role.contact_id=ANY(%s::uuid[]) AND role.source='ai_auto_confirmed'
           AND role.role <> 'internal_colleague'
-        """
+        """, (contact_ids,),
     )
     conn.execute(
         """
         INSERT INTO contact_roles (contact_id, role, status, source, is_primary, reviewed_at)
-        SELECT DISTINCT identity.contact_id, 'internal_colleague', 'confirmed',
-               'lark_internal_tenant', TRUE, NOW()
-        FROM lark_identities identity
-        WHERE identity.identity_type = 'user'
-          AND identity.tenant_classification = 'internal'
-          AND identity.contact_id IS NOT NULL
+        SELECT contact_id,'internal_colleague','confirmed','lark_internal_tenant',
+               NOT EXISTS (SELECT 1 FROM contact_roles role WHERE role.contact_id=target.contact_id
+                 AND role.status='confirmed' AND role.is_primary AND role.role<>'internal_colleague'),NOW()
+        FROM unnest(%s::uuid[]) target(contact_id)
         ON CONFLICT (contact_id, role) DO UPDATE SET
-            status = 'confirmed', source = 'lark_internal_tenant', is_primary = TRUE,
+            status = 'confirmed', source = 'lark_internal_tenant', is_primary = EXCLUDED.is_primary,
             reviewed_at = EXCLUDED.reviewed_at, updated_at = NOW()
-        """
+        WHERE contact_roles.source IN ('ai_auto_confirmed','lark_internal_tenant')
+          AND (contact_roles.status,contact_roles.source,contact_roles.is_primary)
+            IS DISTINCT FROM ('confirmed','lark_internal_tenant',EXCLUDED.is_primary)
+        """, (contact_ids,),
     )
 
 

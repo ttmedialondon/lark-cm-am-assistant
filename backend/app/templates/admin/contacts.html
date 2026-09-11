@@ -4,44 +4,46 @@
 <div class="page admin-directory">
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl admin-directory__container">
-    <div class="alert alert-info d-flex flex-wrap align-items-center gap-2"><span>人员、组织、业务类别和达人负责人是独立事实。待识别不等于“其他人员”；组织名称仅在 Lark 关联组织、CRM 或人工来源验证后显示为已验证。</span><span class="badge bg-{{ organization_sync.status_badge }}-lt ms-auto">{{ organization_sync.status_label }}</span><span class="text-secondary small">{{ organization_sync.detail }}</span></div>
+    <div class="d-flex flex-wrap align-items-center gap-2 mb-3"><div class="me-auto"><h2 class="page-title">人员目录</h2><div class="text-secondary">按人员去重，只判断业务身份；不匹配 CM、handle，也不写入“我的达人”。</div></div>{% if admin_role == 'owner' %}<a class="btn btn-outline-primary" href="/admin/ai#contact-assessment">配置 / 开启 / 暂停识别</a>{% endif %}<a class="btn btn-outline-secondary" href="{{ refresh_url }}">刷新进度与列表</a></div>
+    {% set progress = identity_summary|default({}) %}
+    <section class="card mb-3" aria-label="本轮全员身份识别进度"><div class="card-body">
+      {% if not progress.enabled %}<div class="text-secondary mb-2">识别已暂停，队列保留。重新开启后排队任务继续；已取消的在途任务可在人员详情继续识别。</div>{% endif %}
+      <div class="d-flex flex-wrap gap-3 mb-2"><strong>全库 {{ progress.total|default(0) }} 人</strong><span>已处理 {{ progress.processed|default(0) }}</span><span>排队 {{ progress.queued|default(0) }}</span><span>{{ '分析中' if progress.enabled else '在途待收尾' }} {{ progress.running|default(0) }}</span><span>尚未安排 {{ progress.not_started|default(0) }}</span><span>已暂停 {{ progress.paused|default(0) }}</span></div>
+      <progress class="w-100" aria-label="本轮已处理人数" max="{{ progress.total or 1 }}" value="{{ progress.processed|default(0) }}"></progress>
+      <div class="d-flex flex-wrap gap-3 text-secondary small mt-2"><span>有 AI 结果 {{ progress.ai_results|default(0) }}（含低置信结果）</span><span>无足够材料 {{ progress.no_material|default(0) }}</span><span class="text-danger">异常 {{ progress.exceptions|default(0) }}</span></div>
+      <div class="text-secondary small mt-2">这是当前规则的全库进度，不受下方筛选影响。已处理包含保留人工 / 同事事实和无材料检查，不等于都调用过 AI。刷新只读取状态，不发起新分析。</div>
+    </div></section>
+    <div class="alert alert-info">人工已确认资料优先，其次是已核实的同事身份，再是本轮 AI 判断。AI 只看本人重要发言，置信度至少 95% 且类别唯一才归类；否则显示“待识别”，不默认归入“其他人员”。</div>
     <div class="card admin-directory__card">
-      <div class="card-header"><div><h3 class="card-title mb-1">人员目录</h3><div class="text-secondary small">按稳定 Lark 身份聚合。TT Media London 同事由内部租户事实确定；其他类别仅由已确认事实或证据充分的 AI 建议确定。</div></div></div>
       <div class="card-body border-bottom">
-        <div class="subheader mb-2">主类别</div><div class="btn-list">
-          <a class="btn btn-sm {% if category == 'all' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=all&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">全部</a>
-          <a class="btn btn-sm {% if category == 'unclassified' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=unclassified&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">待识别</a>
-          <a class="btn btn-sm {% if category == 'creator' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=creator&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">达人 / 内容创作者</a>
-          <a class="btn btn-sm {% if category == 'partner_contact' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=partner_contact&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">合作机构对接人</a>
-          <a class="btn btn-sm {% if category == 'merchant_contact' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=merchant_contact&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">商家 / 品牌方</a>
-          <a class="btn btn-sm {% if category == 'platform_contact' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=platform_contact&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">字节系平台官方</a>
-          <a class="btn btn-sm {% if category == 'internal_colleague' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=internal_colleague&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">TT Media 同事</a>
-          <a class="btn btn-sm {% if category == 'other_external_contact' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category=other_external_contact&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">其他已确认外部联系人</a>
+        <div class="subheader mb-2">类别 · 全库人数</div><div class="btn-list">
+          {% for filter in category_filters %}<a class="btn btn-sm {% if category == filter.value %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="{{ filter.url }}">{{ filter.label }} <span class="ms-1">{{ filter.count }}</span></a>{% endfor %}
         </div>
-        <div class="subheader mt-3 mb-2">组织状态</div><div class="btn-list">
-          <a class="btn btn-sm {% if organization_status == 'all' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category={{ category }}&amp;organization_status=all{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">全部</a>
-          <a class="btn btn-sm {% if organization_status == 'verified' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category={{ category }}&amp;organization_status=verified{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">已验证</a>
-          <a class="btn btn-sm {% if organization_status == 'candidate' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category={{ category }}&amp;organization_status=candidate{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">待核验</a>
-          <a class="btn btn-sm {% if organization_status == 'unresolved' %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="/admin/contacts?category={{ category }}&amp;organization_status=unresolved{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">未解析</a>
-        </div>
-        <form action="/admin/contacts" method="get" class="row g-2 align-items-end mt-3"><input type="hidden" name="category" value="{{ category }}"><input type="hidden" name="organization_status" value="{{ organization_status }}"><div class="col-sm-6 col-lg-4"><label class="form-label">按组织筛选</label><input class="form-control" type="search" name="organization_query" value="{{ organization_query }}" maxlength="120" placeholder="例如 TT MEDIA ITALY"></div><div class="col-auto"><button class="btn btn-outline-primary" type="submit">筛选</button>{% if organization_query %}<a class="btn btn-link" href="/admin/contacts?category={{ category }}&amp;organization_status={{ organization_status }}">清除</a>{% endif %}</div></form>
+        <form action="/admin/contacts" method="get" class="row g-2 align-items-end mt-3">
+          <input type="hidden" name="category" value="{{ category }}">
+          <div class="col-sm-6 col-lg-4"><label class="form-label" for="people-query">姓名</label><input id="people-query" class="form-control" type="search" name="q" value="{{ q }}" maxlength="120" placeholder="搜索在库人员姓名"></div>
+          <div class="col-sm-6 col-lg-4"><label class="form-label" for="people-organization">组织名称</label><input id="people-organization" class="form-control" type="search" name="organization_query" value="{{ organization_query }}" maxlength="120" placeholder="例如 TT MEDIA ITALY"></div>
+          <div class="col-sm-6 col-lg-2"><label class="form-label" for="people-organization-status">组织状态</label><select id="people-organization-status" name="organization_status" class="form-select">{% for value, label in [('all','全部'),('verified','已验证'),('candidate','待核验'),('unresolved','未解析')] %}<option value="{{ value }}" {% if organization_status == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div>
+          <div class="col-auto"><button class="btn btn-outline-primary" type="submit">筛选</button><a class="btn btn-link" href="/admin/contacts">清除筛选</a></div>
+        </form>
       </div>
       {% if contacts %}
       <div class="table-responsive admin-directory__table"><table class="table table-vcenter card-table">
-        <thead><tr><th>人员</th><th>主类别</th><th>所属组织</th><th>租户属性</th><th>会话</th><th>发送消息</th><th>最近活动</th><th></th></tr></thead>
+        <thead><tr><th>人员</th><th>类别 / 来源</th><th>本轮识别</th><th>AI 置信度</th><th>完成时间</th><th>所属组织</th><th>会话 / 本人消息</th><th></th></tr></thead>
         <tbody>{% for contact in contacts %}<tr>
-          <td><div class="fw-medium">{{ contact.display_name }}</div>{% if contact.lark_identity_count > 1 %}<div class="text-secondary small">{{ contact.lark_identity_count }} 个稳定 Lark 身份</div>{% endif %}</td>
-          <td><span class="badge bg-{{ contact.category_badge }}-lt">{{ contact.category_label }}</span>{% for label in contact.confirmed_role_labels[1:] %}<div class="text-secondary small mt-1">辅助：{{ label }}</div>{% endfor %}</td>
+          <td><div class="fw-medium">{{ contact.display_name }}</div><div class="text-secondary small">{{ contact.open_id or '—' }}</div>{% if contact.lark_identity_count > 1 %}<div class="text-secondary small">{{ contact.lark_identity_count }} 个 Lark 身份，合计为 1 人</div>{% endif %}</td>
+          <td><span class="badge bg-{{ contact.category_badge }}-lt">{{ contact.category_label }}</span><div class="text-secondary small mt-1">{{ contact.classification_source_label }}</div></td>
+          <td><span class="badge bg-{{ contact.identity_ai_badge }}-lt">{{ contact.identity_ai_status_label }}</span><div class="text-secondary small mt-1">{{ contact.identity_ai_reason_label }}</div></td>
+          <td>{{ contact.identity_ai_confidence_label }}</td><td class="text-secondary text-nowrap">{{ contact.identity_ai_finished_at_label }}</td>
           <td><div>{{ contact.organization_name }}</div><span class="badge bg-{{ contact.organization_status_badge }}-lt mt-1">{{ contact.organization_status_label }}</span></td>
-          <td><span class="badge bg-{{ contact.tenant_classification_badge }}-lt">{{ contact.tenant_classification_label }}</span></td>
-          <td>{{ contact.conversation_count }}</td><td>{{ contact.message_count }}</td>
-          <td class="text-secondary text-nowrap">{{ contact.last_seen_at_label }}</td>
-          <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="/admin/contacts/{{ contact.open_id }}?page={{ contact_page.page }}&amp;category={{ category }}&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}">查看</a></td>
+          <td>{{ contact.conversation_count }} / {{ contact.message_count }}</td>
+          <td class="text-end">{% if contact.open_id %}<a class="btn btn-sm btn-outline-primary" href="/admin/contacts/{{ contact.open_id }}?page={{ contact_page.page }}&amp;category={{ category }}&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}{% if name_query_param %}&amp;{{ name_query_param }}{% endif %}">查看</a>{% else %}<span class="text-secondary">—</span>{% endif %}</td>
         </tr>{% endfor %}</tbody>
       </table></div>
       {% with pager=contact_page %}{% include "admin/_pagination.html" %}{% endwith %}
-      {% else %}<div class="card-body text-secondary">当前筛选没有匹配人员。会话同步或关联组织同步完成后会自动更新。</div>{% endif %}
+      {% else %}<div class="card-body text-secondary">当前筛选没有匹配人员。</div>{% endif %}
     </div>
+    <div class="text-secondary small mt-3">组织是独立资料，不作为 AI 的身份判断依据。{{ organization_sync.status_label }}：{{ organization_sync.detail }}</div>
   </div></div></div>
 </div>
 {% endblock %}

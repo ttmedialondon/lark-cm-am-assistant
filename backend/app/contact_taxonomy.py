@@ -12,17 +12,17 @@ CONTACT_ROLE_CODES = frozenset(
         "other_external_contact",
     }
 )
-AI_ROLE_CODES = CONTACT_ROLE_CODES - {"internal_colleague"}
+AI_ROLE_CODES = CONTACT_ROLE_CODES
 MODEL_ROLE_CODES = AI_ROLE_CODES | {"insufficient"}
 
 ROLE_LABELS = {
-    "creator": "达人 / 内容创作者",
-    "partner_contact": "合作机构对接人",
-    "internal_colleague": "TT Media London 同事",
-    "merchant_contact": "商家 / 品牌方对接人",
-    "platform_contact": "字节系平台官方对接人",
-    "other_external_contact": "其他已确认外部联系人",
-    "insufficient": "信息不足",
+    "creator": "达人",
+    "partner_contact": "其他机构负责人",
+    "internal_colleague": "同事",
+    "merchant_contact": "商家",
+    "platform_contact": "字节官方",
+    "other_external_contact": "其他人员",
+    "insufficient": "待识别",
 }
 ROLE_ORDER = (
     "creator",

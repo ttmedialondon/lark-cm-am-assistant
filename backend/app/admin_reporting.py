@@ -23,6 +23,7 @@ from cryptography.exceptions import InvalidTag
 
 from .admin_permissions import PAGE_KEYS
 from .config import get_settings
+from .contact_assessments import POLICY_VERSION as CONTACT_IDENTITY_POLICY
 from .contact_taxonomy import CONTACT_ROLE_CODES, ORGANIZATION_KIND_LABELS, ROLE_LABELS, role_label
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
@@ -751,35 +752,37 @@ def jobs(page: int = 1) -> dict[str, Any]:
     return _page_result([_decorate_job(row) for row in rows], page, total_count=total_count)
 
 
-CONTACT_DIRECTORY_SQL = """
+CONTACT_DIRECTORY_SQL = f"""
     WITH directory AS (
         SELECT
             contact.id AS contact_id,
+            contact.created_at, contact.updated_at,
             COALESCE(contact.display_name, primary_identity.display_name) AS display_name,
             primary_identity.open_id,
             primary_identity.tenant_key,
             primary_identity.tenant_classification,
             identity_counts.lark_identity_count,
             identity_counts.last_seen_at,
-            conversations.conversation_count,
-            messages.message_count,
             primary_role.role AS primary_role,
+            primary_role.source AS classification_source,
+            COALESCE((SELECT enabled FROM ai_feature_configs WHERE feature='contact_assessment'),FALSE)
+                AS identity_ai_enabled,
+            assessment.status AS identity_ai_status,
+            assessment.result->>'reason_code' AS identity_ai_reason,
+            CASE WHEN assessment.result->'roles'->0->>'role' IN
+                ('creator','partner_contact','internal_colleague','merchant_contact',
+                 'platform_contact','other_external_contact')
+                AND assessment.result->>'reason_code' IN ('classified','low_confidence')
+                THEN assessment.result->'roles'->0->>'confidence' END AS identity_ai_confidence,
+            assessment.finished_at AS identity_ai_finished_at,
             COALESCE(primary_role.role, 'unclassified') AS category,
             COALESCE(organization.status, 'unresolved') AS organization_status,
             organization.canonical_name AS organization_name,
             organization.organization_kind,
-            ARRAY(
-                SELECT confirmed_role.role
-                FROM contact_roles confirmed_role
-                WHERE confirmed_role.contact_id = contact.id AND confirmed_role.status = 'confirmed'
-                ORDER BY confirmed_role.is_primary DESC,
-                    CASE confirmed_role.role
-                        WHEN 'creator' THEN 1 WHEN 'partner_contact' THEN 2 WHEN 'internal_colleague' THEN 3
-                        WHEN 'merchant_contact' THEN 4 WHEN 'platform_contact' THEN 5 ELSE 6
-                    END
-            ) AS confirmed_roles
+            CASE WHEN primary_role.role IS NULL THEN ARRAY[]::text[] ELSE ARRAY[primary_role.role] END
+                AS confirmed_roles
         FROM contacts contact
-        JOIN LATERAL (
+        LEFT JOIN LATERAL (
             SELECT identity.open_id, identity.display_name, identity.tenant_key, identity.tenant_classification
             FROM lark_identities identity
             WHERE identity.contact_id = contact.id AND identity.identity_type = 'user'
@@ -787,14 +790,25 @@ CONTACT_DIRECTORY_SQL = """
             LIMIT 1
         ) AS primary_identity ON TRUE
         LEFT JOIN LATERAL (
-            SELECT role.role
+            SELECT job.status, job.result, job.finished_at
+            FROM contact_assessments job
+            WHERE job.contact_id=contact.id AND job.policy_version='{CONTACT_IDENTITY_POLICY}'
+            ORDER BY job.created_at DESC,job.id DESC LIMIT 1
+        ) AS assessment ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT role.role,role.source
             FROM contact_roles role
-            WHERE role.contact_id = contact.id AND role.status = 'confirmed' AND role.is_primary
-            ORDER BY
-                CASE role.role
-                    WHEN 'creator' THEN 1 WHEN 'partner_contact' THEN 2 WHEN 'internal_colleague' THEN 3
-                    WHEN 'merchant_contact' THEN 4 WHEN 'platform_contact' THEN 5 ELSE 6
-                END
+            WHERE role.contact_id=contact.id AND role.status='confirmed'
+              AND (role.source NOT IN ('ai_auto_confirmed','lark_internal_tenant')
+                OR role.source='lark_internal_tenant' AND role.role='internal_colleague' AND EXISTS (
+                    SELECT 1 FROM lark_identities trusted WHERE trusted.contact_id=contact.id
+                      AND trusted.identity_type='user' AND trusted.tenant_classification='internal')
+                OR role.source='ai_auto_confirmed' AND role.is_primary AND assessment.status='succeeded'
+                  AND assessment.result->>'reason_code'='classified'
+                  AND assessment.result->'roles'->0->>'role'=role.role)
+            ORDER BY CASE WHEN role.source NOT IN ('ai_auto_confirmed','lark_internal_tenant') THEN 0
+                          WHEN role.source='lark_internal_tenant' THEN 1 ELSE 2 END,
+                role.is_primary DESC,role.reviewed_at DESC NULLS LAST,role.updated_at DESC,role.role
             LIMIT 1
         ) AS primary_role ON TRUE
         LEFT JOIN LATERAL (
@@ -806,36 +820,11 @@ CONTACT_DIRECTORY_SQL = """
                 link.last_seen_at DESC, organization.canonical_name
             LIMIT 1
         ) AS organization ON TRUE
-        JOIN LATERAL (
+        LEFT JOIN LATERAL (
             SELECT COUNT(*) AS lark_identity_count, MAX(identity.last_seen_at) AS last_seen_at
             FROM lark_identities identity
             WHERE identity.contact_id = contact.id AND identity.identity_type = 'user'
         ) AS identity_counts ON TRUE
-        JOIN LATERAL (
-            SELECT COUNT(*) AS conversation_count
-            FROM (
-                SELECT member.chat_id
-                FROM chat_members member
-                JOIN lark_identities identity ON identity.open_id = member.open_id
-                WHERE identity.contact_id = contact.id
-                UNION
-                SELECT message.chat_id
-                FROM chat_messages message
-                JOIN lark_identities identity ON identity.open_id = message.sender_open_id
-                WHERE identity.contact_id = contact.id
-                UNION
-                SELECT association.chat_id
-                FROM authorization_chats association
-                JOIN lark_identities identity ON identity.open_id = association.p2p_counterpart_open_id
-                WHERE association.is_visible AND identity.contact_id = contact.id
-            ) AS contact_conversations
-        ) AS conversations ON TRUE
-        JOIN LATERAL (
-            SELECT COUNT(*) AS message_count
-            FROM chat_messages message
-            JOIN lark_identities identity ON identity.open_id = message.sender_open_id
-            WHERE identity.contact_id = contact.id AND NOT message.is_deleted
-        ) AS messages ON TRUE
     )
 """
 
@@ -845,14 +834,20 @@ def contacts(
     category: str = "all",
     organization_status: str = "all",
     organization_query: str = "",
+    query: str = "",
 ) -> dict[str, Any]:
     """Return people filtered by category, organization state, and organization name."""
 
     category = normalize_contact_category(category)
     organization_status = normalize_organization_status(organization_status)
     organization_query = normalize_organization_query(organization_query)
-    filters = (category, category, organization_status, organization_status, organization_query, organization_query)
+    query = normalize_organization_query(query)
+    filters = (category, category, organization_status, organization_status, organization_query, organization_query,
+               query, query)
     with connection() as conn:
+        counts = conn.execute(f"""{CONTACT_DIRECTORY_SQL}
+            SELECT category,identity_ai_status,identity_ai_reason,identity_ai_enabled,COUNT(*) AS count FROM directory
+            GROUP BY category,identity_ai_status,identity_ai_reason,identity_ai_enabled""").fetchall()
         total_count = int(
             conn.execute(
                 f"""
@@ -871,6 +866,7 @@ def contacts(
                             AND POSITION(LOWER(%s) IN LOWER(organization_filter.canonical_name)) > 0
                       )
                   )
+                  AND (%s='' OR POSITION(LOWER(%s) IN LOWER(COALESCE(display_name,'')))>0)
                 """,
                 filters,
             ).fetchone()["total_count"]
@@ -894,12 +890,63 @@ def contacts(
                         AND POSITION(LOWER(%s) IN LOWER(organization_filter.canonical_name)) > 0
                   )
               )
+              AND (%s='' OR POSITION(LOWER(%s) IN LOWER(COALESCE(display_name,'')))>0)
             ORDER BY last_seen_at DESC NULLS LAST, LOWER(display_name), contact_id
             LIMIT %s OFFSET %s
             """,
             (*filters, limit, offset),
         ).fetchall()
-    return _page_result([_decorate_contact(row) for row in rows], page, total_count=total_count)
+        # Conversation/message counts are metadata, not model input. Count only this page's people.
+        ids = [row["contact_id"] for row in rows]
+        activity = conn.execute("""
+            WITH identities AS (SELECT contact_id,open_id FROM lark_identities WHERE contact_id=ANY(%s::uuid[])),
+            conversations AS (
+                SELECT identity.contact_id,member.chat_id FROM chat_members member
+                JOIN identities identity USING(open_id)
+                UNION SELECT identity.contact_id,message.chat_id FROM chat_messages message
+                JOIN identities identity ON identity.open_id=message.sender_open_id
+                UNION SELECT identity.contact_id,association.chat_id FROM authorization_chats association
+                JOIN identities identity ON identity.open_id=association.p2p_counterpart_open_id
+                WHERE association.is_visible
+            )
+            SELECT identity.contact_id,
+                (SELECT COUNT(*) FROM conversations c WHERE c.contact_id=identity.contact_id) AS conversation_count,
+                COUNT(message.message_id) FILTER(WHERE NOT message.is_deleted) AS message_count
+            FROM identities identity LEFT JOIN chat_messages message ON message.sender_open_id=identity.open_id
+            GROUP BY identity.contact_id
+            """, (ids,)).fetchall() if ids else []
+    activity_by_id = {row["contact_id"]: row for row in activity}
+    result = _page_result([_decorate_contact({**row, **activity_by_id.get(row["contact_id"], {})})
+                           for row in rows], page, total_count=total_count)
+    result["identity_summary"] = _identity_summary(counts)
+    return result
+
+
+def _identity_summary(rows: list[dict]) -> dict[str, Any]:
+    summary = {key: 0 for key in ("total", "queued", "running", "processed", "ai_results", "no_material",
+                                  "exceptions", "paused", "not_started")}
+    summary["categories"] = dict.fromkeys(("unclassified", *CONTACT_ROLE_CODES), 0)
+    summary["enabled"] = any(row.get("identity_ai_enabled") for row in rows)
+    for row in rows:
+        count = int(row["count"])
+        summary["total"] += count
+        summary["categories"][row["category"]] += count
+        status, reason = row["identity_ai_status"], row["identity_ai_reason"]
+        if status in {"queued", "running"}:
+            summary[status] += count
+        elif status == "succeeded":
+            summary["processed"] += count
+            if reason in {"classified", "low_confidence"}:
+                summary["ai_results"] += count
+            elif reason in {"no_readable_messages", "no_substantive_messages"}:
+                summary["no_material"] += count
+        elif status in {"failed", "invalid"}:
+            summary["exceptions"] += count
+        elif status == "cancelled":
+            summary["paused"] += count
+        else:
+            summary["not_started"] += count
+    return summary
 
 
 def organization_sync_status() -> dict[str, Any]:
@@ -928,42 +975,9 @@ def contact_detail(open_id: str, conversation_page: int = 1, *,
 
     with connection() as conn:
         contact = conn.execute(
-            """
-            SELECT
-                contact.id AS contact_id,
-                COALESCE(contact.display_name, identity.display_name) AS display_name,
-                identity.open_id,
-                identity.tenant_key,
-                identity.tenant_classification,
-                contact.created_at,
-                contact.updated_at,
-                primary_role.role AS primary_role,
-                ARRAY(
-                    SELECT confirmed_role.role
-                    FROM contact_roles confirmed_role
-                    WHERE confirmed_role.contact_id = contact.id AND confirmed_role.status = 'confirmed'
-                    ORDER BY confirmed_role.is_primary DESC,
-                        CASE confirmed_role.role
-                            WHEN 'creator' THEN 1 WHEN 'partner_contact' THEN 2 WHEN 'internal_colleague' THEN 3
-                            WHEN 'merchant_contact' THEN 4 WHEN 'platform_contact' THEN 5 ELSE 6
-                        END
-                ) AS confirmed_roles
-            FROM lark_identities identity
-            JOIN contacts contact ON contact.id = identity.contact_id
-            LEFT JOIN LATERAL (
-                SELECT role.role
-                FROM contact_roles role
-                WHERE role.contact_id = contact.id AND role.status = 'confirmed' AND role.is_primary
-                ORDER BY
-                    CASE role.role
-                        WHEN 'creator' THEN 1 WHEN 'partner_contact' THEN 2 WHEN 'internal_colleague' THEN 3
-                        WHEN 'merchant_contact' THEN 4 WHEN 'platform_contact' THEN 5 ELSE 6
-                    END
-                LIMIT 1
-            ) AS primary_role ON TRUE
-            WHERE identity.open_id = %s
-              AND identity.identity_type = 'user'
-            """,
+            f"""{CONTACT_DIRECTORY_SQL}
+            SELECT * FROM directory WHERE contact_id=(
+                SELECT contact_id FROM lark_identities WHERE open_id=%s AND identity_type='user')""",
             (open_id,),
         ).fetchone()
         if not contact:
@@ -1521,6 +1535,36 @@ def _decorate_contact(row: dict[str, Any]) -> dict[str, Any]:
         "unclassified": "secondary",
     }.get(category, "secondary")
     item["is_confirmed"] = category != "unclassified"
+    source = item.get("classification_source")
+    item["classification_source_label"] = (
+        "已核实同事" if source == "lark_internal_tenant" else
+        "AI" if source == "ai_auto_confirmed" else "人工 / 已确认资料" if source else "—"
+    )
+    status, reason = item.get("identity_ai_status"), item.get("identity_ai_reason")
+    item["identity_ai_reason_label"] = {
+        "classified": "本人发言支持明确类别",
+        "low_confidence": "置信度不足，保留待识别",
+        "no_readable_messages": "没有当前授权可读的本人消息",
+        "no_substantive_messages": "只有简短寒暄等信息，无法判断身份",
+        "verified_internal": "保留已核实的同事身份",
+        "protected_manual": "保留人工处理结果，不由 AI 覆盖",
+    }.get(reason, "")
+    item["identity_ai_status_label"] = {
+        "queued": "排队中", "running": "分析中", "succeeded": "已处理",
+        "failed": "分析异常", "invalid": "结果未通过校验", "cancelled": "已暂停",
+    }.get(status, "本轮未处理")
+    if not item.get("identity_ai_enabled") and status in {"queued", "running"}:
+        item["identity_ai_status_label"] = "已暂停，队列保留" if status == "queued" else "已暂停，等待在途任务收尾"
+    item["identity_ai_badge"] = {
+        "queued": "azure", "running": "primary", "succeeded": "success",
+        "failed": "danger", "invalid": "danger", "cancelled": "secondary",
+    }.get(status, "secondary")
+    try:
+        confidence = float(item.get("identity_ai_confidence"))
+    except (TypeError, ValueError):
+        confidence = -1
+    item["identity_ai_confidence_label"] = f"{confidence:.1%}" if 0 <= confidence <= 1 else "—"
+    item["identity_ai_finished_at_label"] = _format_time(item.get("identity_ai_finished_at"))
     item["organization_name"] = item.get("organization_name") or "未解析"
     item["organization_status"] = item.get("organization_status") or "unresolved"
     item["organization_status_label"], item["organization_status_badge"] = _organization_status(

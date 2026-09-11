@@ -1,6 +1,6 @@
 # 系统技术说明
 
-本文记录后端、人员模型、姓名机制与后台。业务以 [达人名单](../product/creator-management.md)、[消息总结](../product/message-summary.md)、[后台权限](../product/admin-access.md) 为准。2026-09-11 改为三阶段依次判断身份、CM 归属和 handle，统一完整资料入库门槛；扫描及总结保持关闭。
+本文记录后端、人员模型、姓名机制与后台。业务以 [人员身份与达人名单](../product/creator-management.md)、[消息总结](../product/message-summary.md)、[后台权限](../product/admin-access.md) 为准。2026-09-11 当前先运行全员六类身份识别，CM／handle 三阶段扫描及消息总结暂停，保留已有数据。
 
 ## 1. 实际架构
 
@@ -26,6 +26,7 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 | `authorization_chats`、`authorization_message_observations` | 哪位授权人可见哪个会话、观察到哪些消息，以及各自同步状态 |
 | `lark_identities`、`contacts`、`chat_members` | 稳定 Lark 身份、联系人与最新群成员快照；不能按显示姓名合并用户 |
 | `contact_roles` | 业务类别及主/辅助角色；未知保持待识别，不写成“其他” |
+| `contact_assessments`、`contact_assessment_refs` | 全员身份任务、规则版本、受控结论、本人消息引用与正文指纹；不是 CM 归属 |
 | `organizations`、`organization_tenants`、`contact_organization_links` | 组织及可验证租户/人员关系；租户相同不等于达人、员工或负责人 |
 | `social_accounts`、`contact_social_accounts` | 平台账号及关联用户；一个用户可以关联多个 handle |
 | `creator_workflow_candidates`、`creator_workflow_sources`、`creator_workflow_requests` | 待确认线索、来源和请求幂等记录 |
@@ -36,7 +37,7 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 | `offhours_summary_settings`、`offhours_summary_runs`、`offhours_summary_tasks` | 指定总结时段、执行版本和会话结果 |
 | `admin_roles`、`admin_page_permissions`、`audit_events` | 主人身份、逐页权限、必要的查看/修改审计 |
 
-现有人员类别为 creator、partner_contact、internal_colleague、merchant_contact、platform_contact、other_external_contact。内部同事依内部租户事实识别；外部人的角色、所属组织和负责人是独立事实。
+现有人员类别复用 creator、partner_contact、internal_colleague、merchant_contact、platform_contact、other_external_contact 六个代码。人工已确认身份优先于可信内部同事事实，后者优先于新 AI 类别；人员类别不改变原始租户事实或后台权限。角色、所属组织和负责人是独立事实。
 
 ## 3. 授权与正文边界
 
@@ -59,6 +60,16 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 
 ## 5. AI 与确认
 
+### 当前：全员六分类
+
+`people-identity-v1` 复用 `contact_assessments`，按 `contact_id` 跨 CM 去重，新规则自动给每人在库人员建立一次任务。无材料和受保护事实同样有处理状态，但不调用模型；已有此版本终态的任务不会因刷新或新一轮同步无限重排。旧任务保留历史并停止领取。044 只添加规则版本、引用正文指纹及索引、取消旧活动身份任务和关闭相关开关，不清空人员、消息或达人归属；发布后明确启用本轮身份扫描。
+
+在当前有效授权内读取本人全部历史，在服务器本地挑选重要且时间分散的少量片段，跨来源去重；不把他人群聊上下文、群名或 handle 当身份证明。引用冻结总数和正文 hash；请求前、保存前都重验每条来源的授权、可见范围、作者和正文，避免部分引用被级联删除后剩余引用误通过。结构化结果只含一种主要身份；分数不够或缺可靠本人引用则待识别。仅替换 AI 派生角色，不写账号和 CM 归属。
+
+全员队列与其他 AI 队列共享 3 个槽，每任务最多两次尝试；固定片段上限和保守阈值见产品文档。后台目录显示本规则结果与进度，旧 AI 类别不冒充新结论；人工及可信同事事实独立保留。API 密钥、模型和传输层复用现有配置。
+
+### 暂停保留：CM 归属与 handle 三阶段
+
 `creator-stages-v1` / `person_staged_v1` 复用现有任务表，不新增队列服务。每人一个任务，`stage` 在 identity → ownership → handle 顺序推进；`stage_results` 保存受控结论、分数及冻结引用，不存模型原话。明确否定与信息不足分开，只有 pass 才在服务器本地准备下一阶段材料。
 
 `creator_targeting.build_preflight` 遍历当前有效授权内已同步历史，只选外部用户本人的业务发言，不要求 CM 沟通。`build_stage_evidence` 在第二步才核对真实私聊对端、明确回复/@和双方片段；第三步只取本人账号线索，Excel 线索与消息引用分离，不用 X 引用证明本人身份。脱敏保留精确账号/主页链接，其他成员的聊天不整包发送。
@@ -71,7 +82,7 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 
 `handle_verification` 只能由服务器根据明确的手工核实动作写入；客户端不能提交整段核实 JSON。换人/换 CM 更新 `ai_invalidated_at`，切回旧值也不能重用失效结论；改账号只重核账号，不打断前两步。CM 已核实账号且前两项 AI 通过时结束任务，不再发送第三步，阶段来源记为 CM 而非伪造 AI 分数。人工退回、换人/换 CM 取消旧扫描，保存前还校验冻结的候选关键字段，禁止另建行绕过退回。正式关键资料纠错先结束旧 assignment，后续重新通过才恢复。043 同时约束正式 candidate 与有效 assignment 的账号非空，并将不符合新规则的旧正式归属退出；041 的清库不会重复执行。
 
-前端默认正式名单，待处理与不纳入分开；批次异常不当作业务否定，也不混入达人总数。OAuth 只登记本地同步就绪检查，不调用 AI。旧联系人识别/关联及当前达人扫描、消息总结均保持关闭；不回复、不发通知、不代办业务。
+前端默认正式名单，待处理与不纳入分开；批次异常不当作业务否定，也不混入达人总数。OAuth 只登记本地同步就绪检查，不直接调用达人 AI。当前仅启用新版全员身份识别，旧联系人归属、CM／handle 三阶段扫描和消息总结保持关闭；目录识别出达人不自动入库，不回复、不发通知、不代办业务。
 
 ## 6. 姓名和 @
 

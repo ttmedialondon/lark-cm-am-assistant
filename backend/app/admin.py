@@ -28,6 +28,7 @@ from . import (
     organization_sync,
 )
 from .config import get_settings
+from .contact_taxonomy import ROLE_LABELS, ROLE_ORDER
 from .db import connection
 
 
@@ -44,6 +45,11 @@ class TemplateRenderer(Protocol):
 CurrentAuthorization = Callable[[Request], dict[str, Any] | None]
 CsrfToken = Callable[[dict[str, Any]], str]
 AI_FEATURES = {
+    "contact_assessment": {
+        "title": "全员身份识别",
+        "description": "按在库人员本人的重要历史发言识别六类身份；置信度不足留待识别，不判断 CM 归属或 handle。",
+        "enabled_label": "开启全员身份识别",
+    },
     "offhours_summary": {
         "title": "下班消息总结（Remi 试用）",
         "description": "只整理 Remi 已确认达人的消息，合并事项并按 P0–P3 分级；不生成或发送回复。",
@@ -56,11 +62,6 @@ AI_FEATURES = {
             "三项通过且资料齐全才入库；缺项待处理。开启后仍须在前台明确启动批次。"
         ),
         "enabled_label": "启用达人业务识别",
-    },
-    "contact_assessment": {
-        "title": "联系人身份识别",
-        "description": "自动判断外部联系人的业务身份；高置信度结果才会确认身份。",
-        "enabled_label": "启用联系人判定",
     },
     "contact_assignment": {
         "title": "达人负责人匹配",
@@ -194,6 +195,7 @@ def create_admin_router(
         category: str,
         organization_status: str,
         organization_query: str,
+        q: str = "",
     ) -> str:
         query: dict[str, object] = {
             "page": page,
@@ -202,6 +204,8 @@ def create_admin_router(
         }
         if organization_query:
             query["organization_query"] = organization_query
+        if q:
+            query["q"] = q
         return urlencode(query)
 
     def owner_access(request: Request) -> tuple[dict[str, Any] | None, Response | None]:
@@ -246,6 +250,7 @@ def create_admin_router(
                 "ai_dispatch": dispatch_status,
                 "summary_settings": summary_settings,
                 "summary_saved": request.query_params.get("saved") == "offhours-summary",
+                "identity_saved": request.query_params.get("saved") == "people-identity",
                 # Retain this template-safe alias while external callers migrate to ``configs``.
                 "config": configs[0]["config"],
                 "form_error": error,
@@ -287,6 +292,7 @@ def create_admin_router(
                 {
                     **page_context(access_context, "contacts"),
                     "assessment": detail,
+                    "identity_policy": contact_assessments.POLICY_VERSION,
                     "route_open_id": open_id,
                     "source_page": source_page,
                     "source_category": source_category,
@@ -667,6 +673,7 @@ def create_admin_router(
         category: str = "all",
         organization_status: str = "all",
         organization_query: str = "",
+        q: str = "",
     ) -> Response:
         access_context, denied = access(request)
         if denied is not None:
@@ -675,7 +682,14 @@ def create_admin_router(
         category = admin_reporting.normalize_contact_category(category)
         organization_status = admin_reporting.normalize_organization_status(organization_status)
         organization_query = admin_reporting.normalize_organization_query(organization_query)
-        contact_page = admin_reporting.contacts(page, category, organization_status, organization_query)
+        q = admin_reporting.normalize_organization_query(q)
+        contact_page = admin_reporting.contacts(page, category, organization_status, organization_query, q)
+        filters = {"organization_status": organization_status}
+        if organization_query:
+            filters["organization_query"] = organization_query
+        if q:
+            filters["q"] = q
+        identity_summary = contact_page.get("identity_summary", {})
         response = render_template(
             request,
             "admin/contacts.html",
@@ -688,10 +702,21 @@ def create_admin_router(
                     category=category,
                     organization_status=organization_status,
                     organization_query=organization_query or None,
+                    q=q or None,
                 ),
                 "category": category,
                 "organization_status": organization_status,
                 "organization_query": organization_query,
+                "q": q,
+                "name_query_param": urlencode({"q": q}) if q else "",
+                "identity_summary": identity_summary,
+                "refresh_url": "/admin/contacts?" + urlencode({"category": category, "page": page, **filters}),
+                "category_filters": [{"value": code, "label": label,
+                                      "count": identity_summary.get("total", 0) if code == "all" else
+                                      identity_summary.get("categories", {}).get(code, 0),
+                                      "url": "/admin/contacts?" + urlencode({"category": code, **filters})}
+                                     for code, label in [("all", "全部"), ("unclassified", "待识别"),
+                                                         *((code, ROLE_LABELS[code]) for code in ROLE_ORDER)]],
                 "organization_query_param": urlencode({"organization_query": organization_query})
                 if organization_query
                 else "",
@@ -710,6 +735,7 @@ def create_admin_router(
         organization_status: str = "all",
         organization_query: str = "",
         conversations_page: int = 1,
+        q: str = "",
     ) -> Response:
         access_context, denied = access(request)
         if denied is not None:
@@ -718,6 +744,7 @@ def create_admin_router(
         category = admin_reporting.normalize_contact_category(category)
         organization_status = admin_reporting.normalize_organization_status(organization_status)
         organization_query = admin_reporting.normalize_organization_query(organization_query)
+        q = admin_reporting.normalize_organization_query(q)
         can_view_conversations = bool({"chats", "messages"} & access_context["admin_permissions"])
         is_owner = access_context["admin_role"] == "owner"
         detail = admin_reporting.contact_detail(open_id, conversations_page,
@@ -767,8 +794,10 @@ def create_admin_router(
                     category=category,
                     organization_status=organization_status,
                     organization_query=organization_query,
+                    q=q,
                 ),
                 "assessment": latest_assessment,
+                "identity_policy": contact_assessments.POLICY_VERSION,
                 "assessment_available": contact_assessments.assessment_available() if is_owner else False,
                 "can_view_conversations": can_view_conversations,
                 "is_creator": is_creator,
@@ -786,9 +815,42 @@ def create_admin_router(
                     category=category,
                     organization_status=organization_status,
                     organization_query=organization_query or None,
+                    q=q or None,
                 ),
             },
         )
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
+    @router.post("/admin/contacts/{open_id}/assessments")
+    async def admin_continue_contact_assessment(request: Request, open_id: str) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        form = await _form_fields(request)
+        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
+            response = render_template(request, "error.html", {
+                "title": "请求校验失败", "detail": "请返回人员详情页后重试。",
+            }, 400)
+        else:
+            with connection() as conn:
+                contact = conn.execute(
+                    "SELECT contact_id FROM lark_identities WHERE open_id=%s AND identity_type='user'",
+                    (open_id,),
+                ).fetchone()
+            if not contact:
+                response = render_template(request, "error.html", {
+                    "title": "未找到人员", "detail": "此 Lark 用户尚未关联在库人员。",
+                }, 404)
+            else:
+                try:
+                    contact_assessments.requeue_contact_assessment(contact["contact_id"])
+                    response = RedirectResponse(url=f"/admin/contacts/{open_id}", status_code=303)
+                except contact_assessments.ContactAssessmentInputError as exc:
+                    response = render_template(request, "error.html", {
+                        "title": "无法继续识别", "detail": str(exc),
+                    }, 400)
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 
@@ -1114,6 +1176,15 @@ def create_admin_router(
         if feature not in AI_FEATURES:
             return render_ai_config(request, access_context, error="未知的 AI 功能配置。", status_code=400)
         try:
+            threshold = form.get("auto_confirm_threshold", "0.95" if feature == "contact_assessment" else
+                                 str(ai_feature_config.DEFAULT_AUTO_CONFIRM_THRESHOLD))
+            if feature == "contact_assessment":
+                try:
+                    valid_threshold = 0.95 <= float(threshold) <= 1
+                except (TypeError, ValueError):
+                    valid_threshold = False
+                if not valid_threshold:
+                    raise ai_feature_config.FeatureConfigInputError("全员身份识别阈值必须为 0.95 到 1.00。")
             with connection() as conn, conn.transaction():
                 key_rotated = bool(form.get("api_key", "").strip())
                 ai_feature_config.save_feature_config(
@@ -1126,14 +1197,19 @@ def create_admin_router(
                     enabled=form.get("enabled") == "1",
                     api_key=form.get("api_key", ""),
                     updated_by_authorization_id=access_context["authorization"]["id"],
-                    auto_confirm_threshold=form.get(
-                        "auto_confirm_threshold", str(ai_feature_config.DEFAULT_AUTO_CONFIRM_THRESHOLD)
-                    ),
+                    auto_confirm_threshold=threshold,
                 )
                 if feature == offhours_summary.FEATURE:
                     offhours_summary.save_settings_and_enqueue(
                         conn, access_context["authorization"]["id"], form,
                     )
+                if feature == "contact_assessment" and form.get("enabled") != "1":
+                    conn.execute("""
+                        UPDATE contact_assessments SET status='cancelled',finished_at=NOW(),lease_until=NULL,
+                            outcome='no_action',review_status='not_required',
+                            error_message='已暂停；可在人员详情继续识别。'
+                        WHERE policy_version=%s AND status='running'
+                        """, (contact_assessments.POLICY_VERSION,))
                 conn.execute(
                     "INSERT INTO audit_events (id, authorization_id, action, metadata) VALUES (%s, %s, %s, %s::jsonb)",
                     (
@@ -1147,7 +1223,7 @@ def create_admin_router(
                                 "project_id": form.get("project_id", "").strip(),
                                 "model": form.get("model", "").strip(),
                                 "enabled": form.get("enabled") == "1",
-                                "auto_confirm_threshold": form.get("auto_confirm_threshold", "").strip(),
+                                "auto_confirm_threshold": threshold.strip(),
                                 "key_rotated": key_rotated,
                             }
                         ),
@@ -1155,11 +1231,11 @@ def create_admin_router(
                 )
         except ai_feature_config.FeatureConfigInputError as exc:
             return render_ai_config(request, access_context, error=str(exc), status_code=400)
-        response = RedirectResponse(
-            url=("/admin/ai?saved=offhours-summary#offhours-summary"
-                 if feature == offhours_summary.FEATURE else "/admin/ai"),
-            status_code=303,
+        saved_url = (
+            "/admin/ai?saved=offhours-summary#offhours-summary" if feature == offhours_summary.FEATURE else
+            "/admin/ai?saved=people-identity#contact-assessment" if feature == "contact_assessment" else "/admin/ai"
         )
+        response = RedirectResponse(url=saved_url, status_code=303)
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 

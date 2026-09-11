@@ -107,10 +107,11 @@ def test_owner_can_view_only_safe_ai_config_fields(monkeypatch):
     assert "api_key_ciphertext" not in contexts[-1][1]["config"]
     assert contexts[-1][1]["ai_dispatch"]["state"] == "paused"
     assert contexts[-1][1]["summary_settings"]["status_label"] == "未开启"
-    assert contexts[-1][1]["configs"][0]["feature"] == "offhours_summary"
+    assert contexts[-1][1]["configs"][0]["feature"] == "contact_assessment"
 
 
-def test_owner_post_passes_key_to_encrypted_store_without_rendering_it(monkeypatch):
+@pytest.mark.parametrize("enabled", ["1", ""])
+def test_owner_post_passes_key_to_encrypted_store_without_rendering_it(monkeypatch, enabled):
     owner_id = uuid4()
     saved = []
     connections = []
@@ -134,15 +135,15 @@ def test_owner_post_passes_key_to_encrypted_store_without_rendering_it(monkeypat
             "feature": "contact_assessment",
             "project_id": "proj_contact_assessment",
             "model": "gpt-5.6-luna",
-            "enabled": "1",
-            "auto_confirm_threshold": "0.90",
+            "enabled": enabled,
+            "auto_confirm_threshold": "0.95",
             "api_key": "sk-secret-never-rendered",
         },
         follow_redirects=False,
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/admin/ai"
+    assert response.headers["location"] == "/admin/ai?saved=people-identity#contact-assessment"
     assert response.headers["cache-control"] == "no-store, max-age=0"
     assert len(saved) == 1
     args, kwargs = saved[0]
@@ -151,15 +152,22 @@ def test_owner_post_passes_key_to_encrypted_store_without_rendering_it(monkeypat
         "provider": "openai",
         "project_id": "proj_contact_assessment",
         "model": "gpt-5.6-luna",
-        "enabled": True,
+        "enabled": enabled == "1",
         "api_key": "sk-secret-never-rendered",
         "updated_by_authorization_id": owner_id,
-        "auto_confirm_threshold": "0.90",
+        "auto_confirm_threshold": "0.95",
     }
     audit = connections[0].calls[-1][1]
     assert audit[2] == "ai_feature_config_updated"
     assert "sk-secret-never-rendered" not in audit[3]
     assert '"key_rotated": true' in audit[3]
+    cancellations = [(query, params) for query, params in connections[0].calls
+                     if "UPDATE contact_assessments" in query]
+    assert bool(cancellations) == (enabled != "1")
+    if cancellations:
+        assert "status='running'" in cancellations[0][0]
+        assert "attempts=" not in cancellations[0][0] and "result=" not in cancellations[0][0]
+        assert cancellations[0][1] == (admin.contact_assessments.POLICY_VERSION,)
 
 
 def test_owner_can_resume_the_shared_ai_queue(monkeypatch):

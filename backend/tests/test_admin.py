@@ -1,4 +1,5 @@
 from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -187,8 +188,8 @@ def test_people_directory_filters_category_and_keeps_it_in_pagination(monkeypatc
     monkeypatch.setattr(
         admin_reporting,
         "contacts",
-        lambda page, category, organization_status, organization_query: calls.append(
-            (page, category, organization_status, organization_query)
+        lambda page, category, organization_status, organization_query, q: calls.append(
+            (page, category, organization_status, organization_query, q)
         )
         or _page([], page=page, total_count=50, total_pages=2, page_size=25),
     )
@@ -199,15 +200,15 @@ def test_people_directory_filters_category_and_keeps_it_in_pagination(monkeypatc
     )
 
     response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get(
-        "/admin/contacts?page=2&category=creator&organization_status=verified&organization_query=TT+MEDIA+ITALY"
+        "/admin/contacts?page=2&category=creator&organization_status=verified&organization_query=TT+MEDIA+ITALY&q=Ada"
     )
 
     assert response.status_code == 200
-    assert calls == [(2, "creator", "verified", "TT MEDIA ITALY")]
+    assert calls == [(2, "creator", "verified", "TT MEDIA ITALY", "Ada")]
     assert contexts[-1][1]["category"] == "creator"
     assert contexts[-1][1]["organization_status"] == "verified"
     assert contexts[-1][1]["contact_page"]["previous_url"] == (
-        "/admin/contacts?category=creator&organization_status=verified&organization_query=TT+MEDIA+ITALY&page=1"
+        "/admin/contacts?category=creator&organization_status=verified&organization_query=TT+MEDIA+ITALY&q=Ada&page=1"
     )
 
 
@@ -401,6 +402,33 @@ def test_owner_confirmation_uses_only_suggested_form_values(monkeypatch):
         == f"/admin/contacts/ou_contact/assessments/{assessment_id}?page=4&category=all&organization_status=all"
     )
     assert confirmed == [(owner_id, assessment_id, "creator")]
+
+
+def test_owner_continues_only_path_contact_after_csrf_and_surfaces_budget_error(monkeypatch):
+    contact_id, owner_id = uuid4(), uuid4()
+    calls, contexts, continued = [], [], []
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _: "owner")
+
+    def execute(query, params):
+        calls.append((query, params))
+        return SimpleNamespace(fetchone=lambda: {"contact_id": contact_id})
+
+    monkeypatch.setattr(admin, "connection", lambda: nullcontext(SimpleNamespace(execute=execute)))
+    monkeypatch.setattr(contact_assessments, "requeue_contact_assessment", lambda value: continued.append(value))
+    browser = _client(lambda _: {"id": owner_id, "status": "active"}, contexts)
+    route = "/admin/contacts/ou_contact/assessments"
+    assert browser.post(route, data={"csrf_token": "wrong"}).status_code == 400
+    assert calls == [] and continued == []
+    result = browser.post(route, data={"csrf_token": "csrf", "contact_id": str(uuid4())}, follow_redirects=False)
+    assert result.status_code == 303 and result.headers["location"] == "/admin/contacts/ou_contact"
+    assert calls[0][1] == ("ou_contact",) and continued == [contact_id]
+
+    def exhausted(_contact_id):
+        raise contact_assessments.ContactAssessmentInputError("此人的两次识别预算已用完")
+
+    monkeypatch.setattr(contact_assessments, "requeue_contact_assessment", exhausted)
+    assert browser.post(route, data={"csrf_token": "csrf"}).status_code == 400
+    assert "预算已用完" in contexts[-1][1]["detail"]
 
 
 def test_owner_cannot_confirm_an_assessment_through_another_contact_path(monkeypatch):

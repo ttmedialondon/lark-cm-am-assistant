@@ -7,58 +7,6 @@ import pytest
 from app import contact_assessments, contact_assignments
 
 
-def test_automatic_queue_materializes_all_eligible_contacts_from_immutable_watermarks(monkeypatch) -> None:
-    calls: list[tuple[str, tuple[object, ...] | None]] = []
-
-    class Result:
-        def __init__(self, *, row=None, rows=None):
-            self.row = row
-            self.rows = rows or []
-
-        def fetchone(self):
-            return self.row
-
-        def fetchall(self):
-            return self.rows
-
-    class Connection:
-        def transaction(self):
-            return nullcontext()
-
-        def execute(self, query, params=None):
-            calls.append((query, params))
-            if "UPDATE ai_feature_configs" in query:
-                return Result(row={"feature": "contact_assessment"})
-            return Result(rows=[{"id": "one"}, {"id": "two"}])
-
-    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(Connection()))
-
-    assert contact_assessments.queue_eligible_contact_assessments() == 2
-
-    query, params = calls[-1]
-    assert calls[0][1] == ("contact_assessment", 60)
-    assert "automatic_queue_checked_at" in calls[0][0]
-    assert params == (3, 15)
-    assert "MAX(first_observed_at)" in query
-    assert "WHERE status = 'succeeded'" in query
-    assert "watermark.source_message_seen_at < eligible.source_message_seen_at" in query
-    assert "previous.outcome, '') <> 'review_required'" in query
-    assert "previous.review_status, '') <> 'ignored'" in query
-    assert "previous.source_message_seen_at IS NULL" in query
-    assert "COUNT(DISTINCT (fresh.chat_id, fresh.message_id))" in query
-    assert ") >= 5" in query
-    assert "retry_attempts AS" in query
-    assert "COALESCE(retry.attempt_count, 0) < %s" in query
-    assert "active.status IN ('queued', 'running')" in query
-    assert "contact_roles role" in query
-    assert "identity.tenant_classification <> 'internal'" in query
-    assert "FROM contact_organization_links link" not in query
-    assert "organization_sync_state" not in query
-    assert "queue_slots" not in query
-    assert "LIMIT (SELECT queue_limit FROM queue_slots)" not in query
-    assert "ON CONFLICT (contact_id) WHERE status IN ('queued', 'running')" in query
-
-
 def test_claim_refreshes_the_durable_queue_before_claiming(monkeypatch) -> None:
     calls: list[str] = []
 

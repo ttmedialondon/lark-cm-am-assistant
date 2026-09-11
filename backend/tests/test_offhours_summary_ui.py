@@ -44,15 +44,18 @@ def render_admin(role="owner"):
 
 def test_admin_summary_form_has_native_window_inputs_and_disabled_default_without_identity_threshold():
     html = render_admin()
-    first_form = re.search(r'<form action="/admin/ai".*?</form>', html, re.S).group(0)
-    assert 'name="feature" value="offhours_summary"' in first_form
-    assert 'name="csrf_token" value="fixture-csrf"' in first_form
-    assert 'type="datetime-local" id="summary-window-start" name="window_start" value="2026-09-09T18:00"' in first_form
-    assert 'type="datetime-local" id="summary-window-end" name="window_end" value="2026-09-10T12:00"' in first_form
-    assert 'name="auto_confirm_threshold"' not in first_form
-    assert 'name="enabled" value="1" checked' not in first_form
-    assert "保存配置（开启则立即执行）" in first_form
-    secret_field = re.search(r'<input[^>]*name="api_key"[^>]*>', first_form).group(0)
+    forms = re.findall(r'<form action="/admin/ai".*?</form>', html, re.S)
+    assert 'name="feature" value="contact_assessment"' in forms[0]
+    assert 'min="0.95"' in forms[0] and 'name="enabled" value="1" checked' not in forms[0]
+    summary_form = next(form for form in forms if 'name="feature" value="offhours_summary"' in form)
+    assert 'name="csrf_token" value="fixture-csrf"' in summary_form
+    assert ('type="datetime-local" id="summary-window-start" name="window_start" value="2026-09-09T18:00"'
+            in summary_form)
+    assert 'type="datetime-local" id="summary-window-end" name="window_end" value="2026-09-10T12:00"' in summary_form
+    assert 'name="auto_confirm_threshold"' not in summary_form
+    assert 'name="enabled" value="1" checked' not in summary_form
+    assert "保存配置（开启则立即执行）" in summary_form
+    secret_field = re.search(r'<input[^>]*name="api_key"[^>]*>', summary_form).group(0)
     assert 'type="password"' in secret_field
     assert ' value=' not in secret_field
 
