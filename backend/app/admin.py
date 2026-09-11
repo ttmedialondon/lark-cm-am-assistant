@@ -671,8 +671,6 @@ def create_admin_router(
         request: Request,
         page: int = 1,
         category: str = "all",
-        organization_status: str = "all",
-        organization_query: str = "",
         q: str = "",
     ) -> Response:
         access_context, denied = access(request)
@@ -680,15 +678,9 @@ def create_admin_router(
             return denied
         assert access_context is not None
         category = admin_reporting.normalize_contact_category(category)
-        organization_status = admin_reporting.normalize_organization_status(organization_status)
-        organization_query = admin_reporting.normalize_organization_query(organization_query)
         q = admin_reporting.normalize_organization_query(q)
-        contact_page = admin_reporting.contacts(page, category, organization_status, organization_query, q)
-        filters = {"organization_status": organization_status}
-        if organization_query:
-            filters["organization_query"] = organization_query
-        if q:
-            filters["q"] = q
+        contact_page = admin_reporting.contacts(page, category, "all", "", q)
+        filters = {"q": q} if q else {}
         identity_summary = contact_page.get("identity_summary", {})
         response = render_template(
             request,
@@ -700,13 +692,9 @@ def create_admin_router(
                     contact_page,
                     "/admin/contacts",
                     category=category,
-                    organization_status=organization_status,
-                    organization_query=organization_query or None,
                     q=q or None,
                 ),
                 "category": category,
-                "organization_status": organization_status,
-                "organization_query": organization_query,
                 "q": q,
                 "name_query_param": urlencode({"q": q}) if q else "",
                 "identity_summary": identity_summary,
@@ -717,10 +705,6 @@ def create_admin_router(
                                       "url": "/admin/contacts?" + urlencode({"category": code, **filters})}
                                      for code, label in [("all", "全部"), ("unclassified", "待识别"),
                                                          *((code, ROLE_LABELS[code]) for code in ROLE_ORDER)]],
-                "organization_query_param": urlencode({"organization_query": organization_query})
-                if organization_query
-                else "",
-                "organization_sync": admin_reporting.organization_sync_status(),
             },
         )
         response.headers["Cache-Control"] = "no-store, max-age=0"

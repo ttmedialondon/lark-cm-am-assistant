@@ -12,16 +12,14 @@
       <progress class="w-100" aria-label="本轮已处理人数" max="{{ progress.total or 1 }}" value="{{ progress.processed|default(0) }}"></progress>
     </div></section>
     <div class="card admin-directory__card">
-      <div class="card-body border-bottom">
-        <div class="subheader mb-2">类别 · 全库人数</div><div class="btn-list">
+      <div class="card-body border-bottom d-flex flex-wrap align-items-center gap-3">
+        <div class="btn-list mb-0" role="group" aria-label="类别筛选">
           {% for filter in category_filters %}<a class="btn btn-sm {% if category == filter.value %}btn-primary{% else %}btn-outline-secondary{% endif %}" href="{{ filter.url }}">{{ filter.label }} <span class="ms-1">{{ filter.count }}</span></a>{% endfor %}
         </div>
-        <form action="/admin/contacts" method="get" class="row g-2 align-items-end mt-3">
+        <form action="/admin/contacts" method="get" class="d-flex align-items-center gap-2 ms-xl-auto" role="search">
           <input type="hidden" name="category" value="{{ category }}">
-          <div class="col-sm-6 col-lg-4"><label class="form-label" for="people-query">姓名</label><input id="people-query" class="form-control" type="search" name="q" value="{{ q }}" maxlength="120" placeholder="搜索在库人员姓名"></div>
-          <div class="col-sm-6 col-lg-4"><label class="form-label" for="people-organization">组织名称</label><input id="people-organization" class="form-control" type="search" name="organization_query" value="{{ organization_query }}" maxlength="120" placeholder="例如 TT MEDIA ITALY"></div>
-          <div class="col-sm-6 col-lg-2"><label class="form-label" for="people-organization-status">组织状态</label><select id="people-organization-status" name="organization_status" class="form-select">{% for value, label in [('all','全部'),('verified','已验证'),('candidate','待核验'),('unresolved','未解析')] %}<option value="{{ value }}" {% if organization_status == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div>
-          <div class="col-auto"><button class="btn btn-outline-primary" type="submit">筛选</button><a class="btn btn-link" href="/admin/contacts">清除筛选</a></div>
+          <label class="visually-hidden" for="people-query">姓名</label><input id="people-query" class="form-control form-control-sm" type="search" name="q" value="{{ q }}" maxlength="120" size="16" placeholder="搜索姓名">
+          <button class="btn btn-sm btn-outline-primary" type="submit">搜索</button>{% if q %}<a class="btn btn-sm btn-link" href="/admin/contacts?category={{ category }}">清除</a>{% endif %}
         </form>
       </div>
       {% if contacts %}
@@ -32,13 +30,12 @@
           <td><span class="badge bg-{{ contact.category_badge }}-lt">{{ contact.category_label }}</span></td>
           <td>{{ contact.identity_ai_confidence_label }}</td><td class="text-secondary text-nowrap">{{ contact.identity_ai_finished_at_label }}</td>
           <td>{{ contact.conversation_count }} / {{ contact.message_count }}</td>
-          <td class="text-end">{% if contact.open_id %}<a class="btn btn-sm btn-outline-primary" href="/admin/contacts/{{ contact.open_id }}?page={{ contact_page.page }}&amp;category={{ category }}&amp;organization_status={{ organization_status }}{% if organization_query_param %}&amp;{{ organization_query_param }}{% endif %}{% if name_query_param %}&amp;{{ name_query_param }}{% endif %}">查看</a>{% else %}<span class="text-secondary">—</span>{% endif %}</td>
+          <td class="text-end">{% if contact.open_id %}<a class="btn btn-sm btn-outline-primary" href="/admin/contacts/{{ contact.open_id }}?page={{ contact_page.page }}&amp;category={{ category }}{% if name_query_param %}&amp;{{ name_query_param }}{% endif %}">查看</a>{% else %}<span class="text-secondary">—</span>{% endif %}</td>
         </tr>{% endfor %}</tbody>
       </table></div>
       {% with pager=contact_page %}{% include "admin/_pagination.html" %}{% endwith %}
       {% else %}<div class="card-body text-secondary">当前筛选没有匹配人员。</div>{% endif %}
     </div>
-    <div class="text-secondary small mt-3">组织是独立资料，不作为 AI 的身份判断依据。{{ organization_sync.status_label }}：{{ organization_sync.detail }}</div>
   </div></div></div>
 </div>
 {% endblock %}

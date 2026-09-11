@@ -180,7 +180,7 @@ def test_contact_directory_is_owner_only(monkeypatch):
     assert response.status_code == 403
 
 
-def test_people_directory_filters_category_and_keeps_it_in_pagination(monkeypatch):
+def test_people_directory_filters_name_and_category_without_legacy_organization_filters(monkeypatch):
     owner_id = uuid4()
     contexts = []
     calls = []
@@ -193,23 +193,18 @@ def test_people_directory_filters_category_and_keeps_it_in_pagination(monkeypatc
         )
         or _page([], page=page, total_count=50, total_pages=2, page_size=25),
     )
-    monkeypatch.setattr(
-        admin_reporting,
-        "organization_sync_status",
-        lambda: {"status": "pending", "status_label": "等待", "status_badge": "secondary", "detail": "等待"},
-    )
-
     response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get(
         "/admin/contacts?page=2&category=creator&organization_status=verified&organization_query=TT+MEDIA+ITALY&q=Ada"
     )
 
     assert response.status_code == 200
-    assert calls == [(2, "creator", "verified", "TT MEDIA ITALY", "Ada")]
+    assert calls == [(2, "creator", "all", "", "Ada")]
     assert contexts[-1][1]["category"] == "creator"
-    assert contexts[-1][1]["organization_status"] == "verified"
     assert contexts[-1][1]["contact_page"]["previous_url"] == (
-        "/admin/contacts?category=creator&organization_status=verified&organization_query=TT+MEDIA+ITALY&q=Ada&page=1"
+        "/admin/contacts?category=creator&q=Ada&page=1"
     )
+    assert contexts[-1][1]["refresh_url"] == "/admin/contacts?category=creator&page=2&q=Ada"
+    assert all("organization" not in item["url"] for item in contexts[-1][1]["category_filters"])
 
 
 def test_removed_ai_candidate_queue_is_not_routable():
