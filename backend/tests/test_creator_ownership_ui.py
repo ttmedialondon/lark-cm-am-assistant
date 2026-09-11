@@ -128,12 +128,18 @@ def test_private_evidence_rechecks_access_and_uses_no_store(monkeypatch):
     browser, actor = client(monkeypatch, owner=True)
     seen = []
     monkeypatch.setattr(creator_ownership, "task_evidence", lambda *args: seen.append(args) or {
-        "messages": [{"text": "Private conversation", "available": True}],
+        "cm_id": str(cm), "cm_name": "Remi", "display_name": "Creator",
+        "messages": [{"ref": "M12", "text": "Private conversation", "available": True},
+                     {"ref": "M2", "text": "Original U1 wording", "available": True}],
     })
     response = browser.get(f"{BASE}/tasks/{task}/evidence")
     assert response.status_code == 200
     assert seen == [(actor["id"], task)]
     assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert response.json()["cm_id"] == str(cm)
+    assert response.json()["cm_name"] == "Remi"
+    assert [message["ref"] for message in response.json()["messages"]] == ["M12", "M2"]
+    assert response.json()["messages"][1]["text"] == "Original U1 wording"
     for error, status in ((ValueError, 400), (LookupError, 404), (PermissionError, 403)):
         def reject(*_args, error=error, **_kwargs):
             raise error("无法读取")

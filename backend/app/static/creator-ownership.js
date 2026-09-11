@@ -22,6 +22,10 @@
     if (className) value.className = className;
     return value;
   }
+  function displayText(text, cmName, creatorName) {
+    const names = {CM1: cmName, U1: creatorName};
+    return String(text || "").replace(/(?<![A-Za-z0-9_])(CM1|U1)(?![A-Za-z0-9_])/g, token => names[token] || token);
+  }
   function notice(message, error = false) {
     el("notice").textContent = message;
     el("notice").className = message ? `alert alert-${error ? "danger" : "success"}` : "alert d-none";
@@ -95,6 +99,7 @@
     const run = data.run;
     const counts = data.counts || {};
     const usage = data.usage || {};
+    const cmName = data.cms?.find(cm => cm.id === data.selected_cm_id)?.name;
     const preparing = run?.status === "preparing";
     const prepared = Math.max(0, (counts.total || 0) - (counts.pending || 0) - (counts.preparing || 0));
     const exceptions = (counts.failed || 0) + (counts.invalid || 0) + (counts.cancelled || 0);
@@ -125,7 +130,7 @@
       parts.handle.textContent = item.handle || "—";
       parts.result.textContent = item.review_status === "confirmed" ? "已关联" : item.review_status === "deferred" ? "已暂缓" : item.result ? item.result_label : item.status_label || "待处理";
       parts.confidence.textContent = Number.isFinite(item.confidence) ? `${Math.round(item.confidence * 100)}%` : "—";
-      parts.reason.textContent = item.reason || "—";
+      parts.reason.textContent = displayText(item.reason, cmName, item.display_name) || "—";
       if (owner) {
         if (!item.can_confirm && !item.can_defer) selected.delete(item.id);
         parts.checkbox.checked = selected.has(item.id);
@@ -190,12 +195,14 @@
       if (version !== evidenceVersion) return;
       el("evidence-title").textContent = `${evidence.display_name || "达人"} · 相关对话`;
       el("evidence-body").replaceChildren();
-      if (evidence.summary) el("evidence-body").append(node("p", evidence.summary));
-      if (evidence.conflicts?.length) el("evidence-body").append(node("p", `冲突线索：${evidence.conflicts.join("；")}`, "text-warning"));
-      if (evidence.missing_info?.length) el("evidence-body").append(node("p", `还缺：${evidence.missing_info.join("；")}`, "text-secondary"));
+      const explain = text => displayText(text, evidence.cm_name, evidence.display_name);
+      if (evidence.summary) el("evidence-body").append(node("p", explain(evidence.summary)));
+      if (evidence.conflicts?.length) el("evidence-body").append(node("p", `冲突线索：${explain(evidence.conflicts.join("；"))}`, "text-warning"));
+      if (evidence.missing_info?.length) el("evidence-body").append(node("p", `还缺：${explain(evidence.missing_info.join("；"))}`, "text-secondary"));
       for (const message of evidence.messages || []) {
         const section = node("section", "", "border-top pt-3 mt-3");
-        section.append(node("div", [message.sender_name, message.time_label, message.chat_name].filter(Boolean).join(" · "), "small text-secondary mb-2"));
+        const ref = /^M[1-9][0-9]*$/.test(message.ref) ? `[${message.ref}]` : "";
+        section.append(node("div", [ref, message.sender_name, message.time_label, message.chat_name].filter(Boolean).join(" · "), "small text-secondary mb-2"));
         section.append(node("blockquote", message.available === false ? "当前无法读取这条消息。" : message.text || "—"));
         el("evidence-body").append(section);
       }

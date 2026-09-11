@@ -188,6 +188,8 @@ def test_preview_responses_confirm_without_handle_preserves_existing_data(pg, pi
     assert "持续业务" not in json.dumps(public, ensure_ascii=False)
     view = ownership.task_evidence(pilot.ids["owner"], task["id"])
     assert len(view["messages"]) == task["evidence_count"]
+    assert view["cm_id"] == str(pilot.ids["cm"]) and view["cm_name"]
+    assert [m["ref"] for m in view["messages"]] == [r["label"] for r in ownership._refs(pg, task)]
     assert all(m["chat_name"] == "Creator private conversation" for m in view["messages"])
     assert ownership.confirm_tasks(pilot.ids["owner"], run, [task["id"]]) == 1
     assert ownership.confirm_tasks(pilot.ids["owner"], run, [task["id"]]) == 0

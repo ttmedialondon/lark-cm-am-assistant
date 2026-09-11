@@ -1070,10 +1070,13 @@ def task_evidence(actor_id, task_id):
             raise LookupError("找不到该判断结果。")
         if not _valid_material(conn, task, settings):
             raise ValueError("相关材料已变化或不再可读，请重新预筛选。")
+        cm = _cm(conn, task["cm_authorization_id"])
+        if not cm:
+            raise ValueError("相关材料已变化或不再可读，请重新预筛选。")
         refs = _refs(conn, task)
         ref_order = {(ref["chat_id"], ref["message_id"]): int(ref["label"][1:]) for ref in refs}
         rows = conn.execute(
-            """SELECT m.*,i.display_name AS sender_name,c.name AS chat_name FROM creator_ownership_refs r
+            """SELECT m.*,r.label AS ref,i.display_name AS sender_name,c.name AS chat_name FROM creator_ownership_refs r
                JOIN chat_messages m ON m.chat_id=r.chat_id AND m.message_id=r.message_id
                JOIN chats c ON c.chat_id=m.chat_id LEFT JOIN lark_identities i ON i.open_id=m.sender_open_id
                WHERE r.task_id=%s""",
@@ -1090,6 +1093,7 @@ def task_evidence(actor_id, task_id):
             raw = message_body_cipher(settings.token_encryption_key).decrypt(row["body_ciphertext"])
             messages.append(
                 {
+                    "ref": row["ref"],
                     "sender_name": row["sender_name"] or "未命名用户",
                     "time_label": admin_reporting._message_time(row["message_create_time"]),
                     "chat_name": row["chat_name"] or "会话",
@@ -1100,6 +1104,8 @@ def task_evidence(actor_id, task_id):
         result = json.loads(_cipher(settings).decrypt(task["result_ciphertext"])) if task["result_ciphertext"] else {}
         _audit(conn, actor_id, "evidence_viewed", {"task_id": str(task_id), "cm_id": str(task["cm_authorization_id"])})
         return {
+            "cm_id": str(cm["id"]),
+            "cm_name": cm["display_name"] or "所选负责人",
             "display_name": task["display_name"],
             "summary": result.get("reason") or REASONS.get(task["reason_code"], "相关对话"),
             "messages": messages,
