@@ -1,6 +1,6 @@
 # 系统技术说明
 
-本文记录后端、人员模型、姓名机制与后台。业务以 [人员身份与达人名单](../product/creator-management.md)、[消息总结](../product/message-summary.md)、[后台权限](../product/admin-access.md) 为准。2026-09-11 保留全员六类身份识别，旧 CM／handle 工程已移除，消息总结维持关闭，已有数据保留。
+本文记录后端、人员模型、姓名机制与后台。业务以 [人员身份与达人名单](../product/creator-management.md)、[消息总结](../product/message-summary.md)、[后台权限](../product/admin-access.md) 为准。2026-09-11 保留全员六类身份识别，新增独立第二步归属判断；旧三阶段工程不恢复，消息总结维持关闭，已有数据保留。
 
 ## 1. 实际架构
 
@@ -31,7 +31,8 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 | `social_accounts`、`contact_social_accounts` | 平台账号及关联用户；一个用户可以关联多个 handle |
 | `creator_workflow_candidates`、`creator_workflow_sources`、`creator_workflow_requests` | 保留的旧线索、来源和请求历史；无现行写入入口 |
 | `creator_account_assignments` | 用户与 CM 的正式归属；有效归属的账号不可为空，是名单与总结取数依据 |
-| `contact_assignments` | 旧联系人级负责人关系；不能代替账号级确认，也不能认领一个 handle 就转走同人的其他 handle |
+| `contact_assignments` | 人级负责人；第二步仅人工确认后写入，通过 `ownership_task_id` 引用新结果。旧 assessment 外键保留历史兼容；不代替账号级名单 |
+| `creator_ownership_runs`、`creator_ownership_tasks`、`creator_ownership_refs` | 第二步 CM 批次、人×CM任务/受控结论、授权绑定且冻结的消息引用；输入与派生说明加密，原文仍来自原存储 |
 | `creator_workflow_ai_runs`、`creator_workflow_ai_tasks`、`creator_workflow_onboarding` | 旧扫描结果、引用与接入记录，仅保留历史，未完成项已取消 |
 | `offhours_summary_settings`、`offhours_summary_runs`、`offhours_summary_tasks` | 指定总结时段、执行版本和会话结果 |
 | `admin_roles`、`admin_page_permissions`、`audit_events` | 主人身份、逐页权限、必要的查看/修改审计 |
@@ -73,7 +74,17 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 
 046 只停用两项旧开关、取消未完成的旧任务并记录审计；不删除表、名单、账号、归属、分类、消息、授权或历史结果。旧 migration 原样保留，不能为清理工程重放早期清库。保留的旧表属于历史数据，不代表相关功能仍可开启。
 
-新版身份识别的消息解析和脱敏已移入自身模块，取样、截取和判断规则不变；消息总结保留原审计行为，不再导入旧工程。新归属规则与入库方式待用户确认，本次不实现替代流程。
+新版身份识别的消息解析和脱敏已移入自身模块，取样、截取和判断规则不变；消息总结保留原审计行为，不再导入旧工程。
+
+### 新增：第二步人级归属判断
+
+`creator-ownership-v1` 的资格复用人员目录有效主类别 SQL，排除当前人级及账号级归属。证据只能来自所选 CM 的有效正文观察，不可直接套用第一步跨授权取材。当地历史筛选由单独一个线程处理；预筛选不调 OpenAI。
+
+每个 CM 同时一个开放批次，每批每人一条任务。明确开始后才排队；共用现有三槽并发、限流和配置，三队列简单轮转，不新增 Redis/向量库。`FOR UPDATE SKIP LOCKED`、租约及两次尝试上限控制执行；中断的付费请求不自动重放。暂停与派发登记按同一批次锁串行，已经登记的请求可收尾。
+
+材料加密保存、引用冻结总数及顺序、正文/关系/相关来源签名保存；各敏感节点重验。相同人、CM、规则、配置及材料的成功结果复用，但实际请求/token只记在原执行任务。任务与人工确认独立，确认事务锁人并检查旧账号及人级归属，数据库仍保证一人一个当前主负责人。
+
+047 只增加新任务/引用结构及人级关联的新结果外键，不清空或回填旧数据、不更改第一步结果/凭据/权限/总结设置。临时页位于现有 AI 权限下，所有 POST 和原文证据仍仅主人。
 
 ## 6. 姓名和 @
 

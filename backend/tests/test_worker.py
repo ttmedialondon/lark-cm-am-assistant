@@ -1,4 +1,5 @@
 from collections import Counter
+from concurrent.futures import Future as TaskFuture
 from contextlib import nullcontext
 from types import SimpleNamespace
 from uuid import UUID
@@ -172,10 +173,10 @@ def test_full_ai_slots_do_not_attempt_another_claim(monkeypatch) -> None:
         lambda *_args: pytest.fail("a full AI pool must not claim another task"),
     )
 
-    assert worker._fill_ai_slots(object(), object(), {Future(), Future(), Future()}, False) is False
+    assert worker._fill_ai_slots(object(), object(), {Future(), Future(), Future()}, 2) == 2
 
 
-def test_dispatch_uses_at_most_three_slots_and_alternates_queues(monkeypatch) -> None:
+def test_dispatch_uses_at_most_three_slots_and_fairly_rotates_queues(monkeypatch) -> None:
     submitted: list[tuple[object, object]] = []
 
     class Future:
@@ -188,18 +189,23 @@ def test_dispatch_uses_at_most_three_slots_and_alternates_queues(monkeypatch) ->
             return Future()
 
     assessment_jobs = iter(({"id": "identity-1"}, {"id": "identity-2"}))
-    summary_jobs = iter(({"id": "summary-1"},))
+    summary_jobs = iter(({"id": "summary-1"}, {"id": "summary-2"}))
+    ownership_jobs = iter(({"id": "ownership-1"}, {"id": "ownership-2"}))
     monkeypatch.setattr(worker.offhours_summary, "claim_next_summary", lambda: next(summary_jobs))
     monkeypatch.setattr(worker.contact_assessments, "claim_next_contact_assessment", lambda: next(assessment_jobs))
+    monkeypatch.setattr(worker.creator_ownership, "claim_next_ownership", lambda: next(ownership_jobs))
 
     futures = set()
-    submitted_one, preference = worker._dispatch_ai_turn(object(), Executor(), futures, False)
+    submitted_one, preference = worker._dispatch_ai_turn(object(), Executor(), futures, 0)
     submitted_two, preference = worker._dispatch_ai_turn(object(), Executor(), futures, preference)
     submitted_three, preference = worker._dispatch_ai_turn(object(), Executor(), futures, preference)
     submitted_four, _ = worker._dispatch_ai_turn(object(), Executor(), futures, preference)
 
     assert (submitted_one, submitted_two, submitted_three, submitted_four) == (True, True, True, False)
-    assert [job["id"] for _runner, job in submitted] == ["identity-1", "summary-1", "identity-2"]
+    assert [job["id"] for _runner, job in submitted] == ["identity-1", "summary-1", "ownership-1"]
+    futures.clear()
+    assert worker._fill_ai_slots(object(), Executor(), futures, preference) == 0
+    assert [job["id"] for _runner, job in submitted[3:]] == ["identity-2", "summary-2", "ownership-2"]
 
 
 def test_offhours_tasks_fill_three_parallel_slots_without_waiting(monkeypatch) -> None:
@@ -214,10 +220,47 @@ def test_offhours_tasks_fill_three_parallel_slots_without_waiting(monkeypatch) -
 
     monkeypatch.setattr(worker.offhours_summary, "claim_next_summary", lambda: next(jobs))
     monkeypatch.setattr(worker.contact_assessments, "claim_next_contact_assessment", lambda: None)
+    monkeypatch.setattr(worker.creator_ownership, "claim_next_ownership", lambda: None)
     futures = set()
-    worker._fill_ai_slots(object(), Executor(), futures, False)
+    worker._fill_ai_slots(object(), Executor(), futures, 0)
     assert submitted == [0, 1, 2]
     assert len(futures) == 3
+
+
+def test_ownership_preview_is_single_flight_and_backs_off_without_work(monkeypatch) -> None:
+    now = [10.0]
+    submitted = []
+    settings = SimpleNamespace(worker_idle_seconds=3)
+
+    class Executor:
+        def submit(self, runner, argument):
+            assert runner is worker.creator_ownership.prepare_next_preview
+            assert argument is settings
+            future = TaskFuture()
+            submitted.append(future)
+            return future
+
+    monkeypatch.setattr(worker.time, "monotonic", lambda: now[0])
+    executor = Executor()
+    future, next_check = worker._schedule_ownership_preview(settings, executor, None, 0)
+    assert future is submitted[0]
+    assert worker._schedule_ownership_preview(settings, executor, future, next_check) == (future, next_check)
+    assert len(submitted) == 1
+
+    future.set_result(True)
+    future, next_check = worker._schedule_ownership_preview(settings, executor, future, next_check)
+    assert future is submitted[1]
+    future.set_result(False)
+    future, next_check = worker._schedule_ownership_preview(settings, executor, future, next_check)
+    assert future is None and next_check == 13.0
+    assert worker._schedule_ownership_preview(settings, executor, future, next_check) == (None, 13.0)
+    assert len(submitted) == 2
+
+    now[0] = 13.0
+    future, next_check = worker._schedule_ownership_preview(settings, executor, future, next_check)
+    assert future is submitted[2]
+    future.set_exception(RuntimeError("preview failed"))
+    assert worker._schedule_ownership_preview(settings, executor, future, next_check) == (None, 16.0)
 
 
 def test_page_claim_uses_locked_conversation_cursor(monkeypatch) -> None:

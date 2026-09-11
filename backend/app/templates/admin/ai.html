@@ -16,6 +16,7 @@
     {% if form_error %}<div class="alert alert-danger" role="alert">{{ form_error }}</div>{% endif %}
     {% if summary_saved %}<div class="alert alert-success" role="status">下班总结配置已保存。开启时会立即加入后台队列；实际进度、暂停或失败原因请在<a href="/dashboard/offhours-summary" class="alert-link">消息总结</a>查看。未开启时不会调用 AI。</div>{% endif %}
     {% if identity_saved %}<div class="alert alert-success" role="status">全员身份识别配置已保存。开启后后台会检查在库人员；关闭后排队任务保留，在途任务取消。请在<a href="/admin/contacts" class="alert-link">人员目录</a>查看当前进度。</div>{% endif %}
+    <div class="card mb-4"><div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3"><div><h3 class="card-title mb-1">达人归属判断</h3><div class="text-secondary">从已识别、未归属的达人中，判断谁由选中的 CM 负责。</div></div><a class="btn btn-primary" href="/admin/ai/creator-ownership">进入归属判断</a></div></div>
     {% for feature in configs %}{% set config = feature.config %}
     <div class="card mb-4" id="{{ feature.id_suffix }}"><div class="card-header"><div><h3 class="card-title mb-1">{{ feature.title }}</h3><div class="text-secondary small">{{ feature.description }}</div></div></div>
       <div class="card-body">

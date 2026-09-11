@@ -15,7 +15,9 @@ from urllib.parse import parse_qs, urlencode
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Request
-from fastapi.responses import RedirectResponse, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, RedirectResponse, Response
+from starlette.concurrency import run_in_threadpool
 
 from . import (
     admin_permissions,
@@ -23,6 +25,7 @@ from . import (
     ai_dispatch,
     ai_feature_config,
     contact_assessments,
+    creator_ownership,
     offhours_summary,
     organization_sync,
 )
@@ -100,6 +103,7 @@ def create_admin_router(
             "/admin/chats": "chats", "/admin/messages": "messages", "/admin/contacts": "contacts",
             "/admin/contacts/{open_id}": "contacts",
             "/admin/ai": "ai", "/admin/jobs": "jobs",
+            "/admin/ai/creator-ownership": "ai", "/admin/ai/creator-ownership/data": "ai",
         }.get(route_path)
         if not acl["is_owner"]:
             if request.method == "GET" and route_path == "/admin" and "overview" not in acl["permissions"]:
@@ -591,6 +595,113 @@ def create_admin_router(
             return denied
         assert access_context is not None
         return render_ai_config(request, access_context)
+
+    def ownership_json(payload: dict[str, Any], status_code: int = 200) -> Response:
+        return JSONResponse(jsonable_encoder(payload), status_code=status_code, headers={
+            "Cache-Control": "no-store, max-age=0", "Referrer-Policy": "same-origin",
+        })
+
+    def ownership_error(exc: Exception) -> Response:
+        code = 403 if isinstance(exc, PermissionError) else 404 if isinstance(exc, LookupError) else 400
+        return ownership_json({"error": str(exc)}, code)
+
+    @router.get("/admin/ai/creator-ownership")
+    @router.get("/admin/ai/creator-ownership/data")
+    def admin_creator_ownership(
+        request: Request, cm_id: UUID | None = None, run_id: UUID | None = None,
+        q: str = "", status: str = "all", page: int = 1,
+    ) -> Response:
+        access_context, denied = access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        try:
+            data = creator_ownership.page_data(
+                cm_id=cm_id, run_id=run_id, query=q[:120], status=status, page=max(1, page),
+                include_private=access_context["admin_role"] == "owner",
+            )
+        except (ValueError, LookupError, PermissionError) as exc:
+            return ownership_error(exc)
+        if request.url.path.endswith("/data"):
+            return ownership_json(data)
+        return render_template(request, "admin/creator_ownership.html", {
+            **page_context(access_context, "ai"), "ownership": jsonable_encoder(data),
+            "ownership_query": q[:120], "ownership_status": status,
+        })
+
+    @router.post("/admin/ai/creator-ownership/preview")
+    async def admin_creator_ownership_preview(request: Request) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        form = await _form_fields(request)
+        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
+            return ownership_json({"error": "请求校验失败，请刷新页面后重试。"}, 400)
+        try:
+            cm_id = UUID(form.get("cm_id", ""))
+            run_id = await run_in_threadpool(
+                creator_ownership.create_preview, access_context["authorization"]["id"], cm_id,
+            )
+        except (ValueError, LookupError, PermissionError) as exc:
+            return ownership_error(exc)
+        return ownership_json({"run_id": run_id, "cm_id": cm_id})
+
+    @router.post("/admin/ai/creator-ownership/{run_id}/start")
+    @router.post("/admin/ai/creator-ownership/{run_id}/pause")
+    @router.post("/admin/ai/creator-ownership/{run_id}/resume")
+    @router.post("/admin/ai/creator-ownership/{run_id}/confirm")
+    @router.post("/admin/ai/creator-ownership/{run_id}/defer")
+    async def admin_creator_ownership_action(request: Request, run_id: UUID) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        form = await _form_fields(request)
+        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
+            return ownership_json({"error": "请求校验失败，请刷新页面后重试。"}, 400)
+        actor_id = access_context["authorization"]["id"]
+        action = request.url.path.rsplit("/", 1)[-1]
+        try:
+            count = None
+            if action == "start":
+                if form.get("limit") not in {"20", "all"}:
+                    raise ValueError("请选择先分析 20 人或分析剩余。")
+                await run_in_threadpool(
+                    creator_ownership.start_run, actor_id, run_id, limit=20 if form["limit"] == "20" else None,
+                )
+            elif action in {"pause", "resume"}:
+                await run_in_threadpool(
+                    creator_ownership.pause_run if action == "pause" else creator_ownership.resume_run,
+                    actor_id, run_id,
+                )
+            else:
+                values = form.get("task_ids", "").split(",")
+                if not 1 <= len(values) <= 100 or len(values) != len(set(values)):
+                    raise ValueError("请选择 1 至 100 位不重复的达人。")
+                try:
+                    task_ids = [UUID(value) for value in values]
+                except ValueError as exc:
+                    raise ValueError("所选记录无效，请刷新后重试。") from exc
+                count = await run_in_threadpool(
+                    creator_ownership.confirm_tasks if action == "confirm" else creator_ownership.defer_tasks,
+                    actor_id, run_id, task_ids,
+                )
+        except (ValueError, LookupError, PermissionError) as exc:
+            return ownership_error(exc)
+        return ownership_json({"run_id": run_id, "count": count})
+
+    @router.get("/admin/ai/creator-ownership/tasks/{task_id}/evidence")
+    def admin_creator_ownership_evidence(request: Request, task_id: UUID) -> Response:
+        access_context, denied = owner_access(request)
+        if denied is not None:
+            return denied
+        assert access_context is not None
+        try:
+            data = creator_ownership.task_evidence(access_context["authorization"]["id"], task_id)
+        except (ValueError, LookupError, PermissionError) as exc:
+            return ownership_error(exc)
+        return ownership_json(data)
 
     @router.get("/admin/contacts")
     def admin_contacts(

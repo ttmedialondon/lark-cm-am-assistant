@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}达人归属判断 · 管理台{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-ownership.css?v=20260911">{% endblock %}
+{% block body %}
+<div class="page" id="ownership-app" data-owner="{{ '1' if admin_role == 'owner' else '0' }}" data-csrf="{{ csrf_token }}">
+  {% include "admin/_nav.html" %}
+  <main class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
+    <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3"><div><h2 class="page-title">达人归属判断</h2><p class="text-secondary mb-0">先筛选，再判断；确认后才关联负责人。</p></div><a href="/admin/ai" class="btn btn-outline-secondary">返回 AI 功能</a></div>
+    <div id="ownership-notice" class="alert d-none" role="status"></div>
+    <section class="card mb-3" aria-label="选择负责人和分析批次"><div class="card-body">
+      <div class="d-flex flex-wrap align-items-end gap-2">
+        <div class="ownership-cm"><label class="form-label" for="ownership-cm">负责人</label><select class="form-select" id="ownership-cm"><option value="">暂无有效授权负责人</option></select></div>
+        {% if admin_role == 'owner' %}
+        <button type="button" class="btn btn-outline-primary" id="ownership-preview">预筛选 · 不调用 AI</button>
+        <button type="button" class="btn btn-primary" id="ownership-start">先分析 20 人</button>
+        <button type="button" class="btn btn-outline-primary" id="ownership-start-all">分析剩余</button>
+        <button type="button" class="btn btn-outline-warning" id="ownership-pause" hidden>暂停</button>
+        <button type="button" class="btn btn-primary" id="ownership-resume" hidden>继续本批次</button>
+        {% endif %}
+        <button type="button" class="btn btn-outline-secondary ms-md-auto" id="ownership-refresh">刷新状态</button>
+      </div>
+      <p class="text-secondary small mb-0 mt-2" id="ownership-api"></p>
+      {% if admin_role != 'owner' %}<p class="text-secondary small mb-0 mt-2">只读查看判断结果。</p>{% endif %}
+    </div></section>
+    <section class="card mb-3" aria-label="运行进度"><div class="card-body">
+      <p class="text-secondary small mb-2" id="ownership-scope"></p>
+      <div class="d-flex flex-wrap align-items-center gap-3"><strong id="ownership-run-status">尚未预筛选</strong><span class="text-secondary" id="ownership-progress"></span></div>
+      <progress id="ownership-progress-bar" class="w-100 mt-2" max="1" value="0" aria-label="本批次处理进度"></progress>
+      <div class="d-flex flex-wrap gap-3 small mt-2" id="ownership-usage"></div>
+      <p class="small text-secondary mb-0 mt-2" id="ownership-run-note"></p>
+    </div></section>
+    <section class="card" aria-label="达人判断结果">
+      <div class="card-header d-flex flex-wrap gap-2">
+        <h3 class="card-title me-auto">判断结果 <span class="text-secondary" id="ownership-total"></span></h3>
+        <label class="visually-hidden" for="ownership-status">判断结果筛选</label><select class="form-select w-auto" id="ownership-status">
+          {% for value, label in [('all','全部'),('ready','待分析'),('suggested','建议关联'),('uncertain','待确认'),('not_related','不建议关联'),('skipped','暂不分析'),('failed','分析异常'),('confirmed','已关联'),('deferred','已暂缓')] %}<option value="{{ value }}" {% if ownership_status == value %}selected{% endif %}>{{ label }}</option>{% endfor %}
+        </select>
+        <form id="ownership-search" class="d-flex gap-2" role="search"><label class="visually-hidden" for="ownership-query">搜索姓名或 handle</label><input id="ownership-query" class="form-control" type="search" maxlength="120" value="{{ ownership_query }}" placeholder="搜索姓名或 handle"><button class="btn btn-outline-secondary" type="submit">搜索</button></form>
+      </div>
+      {% if admin_role == 'owner' %}<div class="card-body py-2 border-bottom d-flex align-items-center gap-2"><label class="form-check mb-0 me-2"><input class="form-check-input" type="checkbox" id="ownership-select-all"><span class="form-check-label">全选本页可操作项</span></label><button class="btn btn-sm btn-primary" id="ownership-confirm" type="button" disabled>确认关联所选</button><button class="btn btn-sm btn-outline-secondary" id="ownership-defer" type="button" disabled>暂缓所选</button><span class="text-secondary small" id="ownership-selected"></span></div>{% endif %}
+      <div class="table-responsive"><table class="table table-vcenter card-table ownership-table"><thead><tr>{% if admin_role == 'owner' %}<th scope="col"><span class="visually-hidden">选择</span></th>{% endif %}<th scope="col">Lark 用户</th><th scope="col">已有 handle</th><th scope="col">判断结果</th><th scope="col">置信度</th><th scope="col">简短说明</th><th scope="col">操作</th></tr></thead><tbody id="ownership-rows"></tbody></table></div>
+      <div class="card-body text-secondary" id="ownership-empty">请选择负责人并预筛选。</div>
+      <div class="card-footer d-flex align-items-center justify-content-between"><span class="text-secondary" id="ownership-page-label"></span><div class="btn-list"><button class="btn btn-sm btn-outline-secondary" id="ownership-previous" type="button">上一页</button><button class="btn btn-sm btn-outline-secondary" id="ownership-next" type="button">下一页</button></div></div>
+    </section>
+    <noscript><div class="alert alert-warning mt-3">请开启浏览器 JavaScript 后查看和操作本页面。</div></noscript>
+  </div></div></main>
+  <dialog id="ownership-evidence" class="ownership-evidence" aria-labelledby="ownership-evidence-title"><div class="d-flex align-items-center gap-3 mb-3"><h3 class="mb-0 me-auto" id="ownership-evidence-title">相关对话</h3><button type="button" class="btn btn-sm btn-outline-secondary" id="ownership-evidence-close">关闭</button></div><div id="ownership-evidence-body"></div></dialog>
+</div>
+<script id="ownership-initial" type="application/json">{{ ownership|tojson }}</script>
+<script src="/static/creator-ownership.js?v=20260911" defer></script>
+{% endblock %}

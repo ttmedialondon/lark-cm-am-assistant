@@ -20,7 +20,7 @@ _QUOTA_PAUSE_MESSAGE = "OpenAI 项目因配额或账单问题已暂停；请处�
 
 
 def can_claim(conn: psycopg.Connection) -> bool:
-    """Atomically decide whether either AI queue may claim one more task."""
+    """Atomically decide whether any AI queue may claim one more task."""
 
     conn.execute("SELECT pg_advisory_xact_lock(%s)", (_ADMISSION_LOCK,))
     state = conn.execute(
@@ -42,6 +42,9 @@ def can_claim(conn: psycopg.Connection) -> bool:
             UNION ALL
             SELECT id FROM offhours_summary_tasks
             WHERE status = 'running' AND lease_until > NOW()
+            UNION ALL
+            SELECT id FROM creator_ownership_tasks
+            WHERE status = 'running' AND lease_until > NOW()
         ) AS active
         """
     ).fetchone()
@@ -49,7 +52,7 @@ def can_claim(conn: psycopg.Connection) -> bool:
 
 
 def throttle(delay_seconds: float) -> None:
-    """Temporarily hold both queues after a recoverable provider 429."""
+    """Temporarily hold all queues after a recoverable provider 429."""
 
     try:
         delay = float(delay_seconds)
@@ -73,7 +76,7 @@ def throttle(delay_seconds: float) -> None:
 
 
 def pause_for_quota() -> None:
-    """Stop both queues until an owner explicitly resumes them."""
+    """Stop all queues until an owner explicitly resumes them."""
 
     with connection() as conn, conn.transaction():
         conn.execute("SELECT pg_advisory_xact_lock(%s)", (_ADMISSION_LOCK,))

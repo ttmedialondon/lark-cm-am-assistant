@@ -18,6 +18,7 @@ import psycopg
 from . import (
     ai_dispatch,
     contact_assessments,
+    creator_ownership,
     identity_profiles,
     offhours_summary,
     organization_sync,
@@ -102,10 +103,13 @@ def run_forever() -> None:
     if not settings.app_secret_configured:
         LOGGER.warning("Lark App Secret is not configured; worker is waiting for administrator input")
 
-    prefer_summary = False
+    next_ai_queue = 0
     next_organization_check = 0.0
     ai_executor = ThreadPoolExecutor(max_workers=ai_dispatch.MAX_CONCURRENT_REQUESTS, thread_name_prefix="openai")
     ai_futures: set[Future[Any]] = set()
+    preview_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ownership-preview")
+    preview_future: Future[bool] | None = None
+    next_preview_check = 0.0
     avatar_executor = ThreadPoolExecutor(max_workers=identity_profiles.MAX_WORKERS, thread_name_prefix="lark-avatar")
     avatar_futures: set[Future[Any]] = set()
     # PostgreSQL owns the cross-process limit; this executor only provides the
@@ -135,7 +139,10 @@ def run_forever() -> None:
                 _reap_page_futures(page_futures, settings)
                 _reap_member_futures(member_futures)
                 _recover_expired_leases()
-                prefer_summary = _fill_ai_slots(settings, ai_executor, ai_futures, prefer_summary)
+                next_ai_queue = _fill_ai_slots(settings, ai_executor, ai_futures, next_ai_queue)
+                preview_future, next_preview_check = _schedule_ownership_preview(
+                    settings, preview_executor, preview_future, next_preview_check,
+                )
                 if settings.app_secret_configured and time.monotonic() >= next_organization_check:
                     _run_organization_sync(settings, client)
                     # The database keeps the real daily cadence. This local bound
@@ -155,7 +162,10 @@ def run_forever() -> None:
                     _fill_lark_slots(settings, client, lark_executor, page_futures)
                     _schedule_member_snapshot(settings, client, lark_executor, page_futures, member_futures)
                     identity_profiles.fill_slots(settings, client, avatar_executor, avatar_futures)
-                time.sleep(0.05 if page_futures or member_futures or avatar_futures else settings.worker_idle_seconds)
+                time.sleep(
+                    0.05 if page_futures or member_futures or avatar_futures or preview_future
+                    else settings.worker_idle_seconds
+                )
             except KeyboardInterrupt:
                 raise
             except Exception:  # Unexpected failures must not terminate the systemd worker loop.
@@ -164,6 +174,7 @@ def run_forever() -> None:
     finally:
         # Leases preserve in-flight work if systemd terminates us during a call.
         ai_executor.shutdown(wait=False, cancel_futures=False)
+        preview_executor.shutdown(wait=False, cancel_futures=False)
         lark_executor.shutdown(wait=False, cancel_futures=False)
         avatar_executor.shutdown(wait=False, cancel_futures=False)
         http_client.close()
@@ -182,27 +193,29 @@ def _dispatch_ai_turn(
     settings: Settings,
     executor: ThreadPoolExecutor,
     futures: set[Future[Any]],
-    prefer_summary: bool,
-) -> tuple[bool, bool]:
+    next_queue: int,
+) -> tuple[bool, int]:
     """Claim one fair AI task and submit it without blocking Lark sync."""
 
     if len(futures) >= ai_dispatch.MAX_CONCURRENT_REQUESTS:
-        return False, prefer_summary
+        return False, next_queue
     queues = (
         (
             contact_assessments.claim_next_contact_assessment,
             contact_assessments.run_claimed_contact_assessment,
-            True,
         ),
         (
             offhours_summary.claim_next_summary,
             offhours_summary.run_claimed_summary,
-            False,
+        ),
+        (
+            creator_ownership.claim_next_ownership,
+            creator_ownership.run_claimed_ownership,
         ),
     )
-    if prefer_summary:
-        queues = queues[::-1]
-    for claim, runner, next_preference in queues:
+    for offset in range(len(queues)):
+        index = (next_queue + offset) % len(queues)
+        claim, runner = queues[index]
         try:
             job = claim()
         except Exception:
@@ -211,23 +224,47 @@ def _dispatch_ai_turn(
         if not job:
             continue
         futures.add(executor.submit(runner, job, settings))
-        return True, next_preference
-    return False, prefer_summary
+        return True, (index + 1) % len(queues)
+    return False, next_queue
 
 
 def _fill_ai_slots(
     settings: Settings,
     executor: ThreadPoolExecutor,
     futures: set[Future[Any]],
-    prefer_summary: bool,
-) -> bool:
+    next_queue: int,
+) -> int:
     """Fill up to three AI slots before returning immediately to Lark sync."""
 
     while len(futures) < ai_dispatch.MAX_CONCURRENT_REQUESTS:
-        submitted, prefer_summary = _dispatch_ai_turn(settings, executor, futures, prefer_summary)
+        submitted, next_queue = _dispatch_ai_turn(settings, executor, futures, next_queue)
         if not submitted:
             break
-    return prefer_summary
+    return next_queue
+
+
+def _schedule_ownership_preview(
+    settings: Settings,
+    executor: ThreadPoolExecutor,
+    future: Future[bool] | None,
+    next_check: float,
+) -> tuple[Future[bool] | None, float]:
+    """Prepare one person's local evidence without using an OpenAI slot or blocking sync."""
+
+    if future is not None:
+        if not future.done():
+            return future, next_check
+        progressed = False
+        try:
+            progressed = future.result()
+        except Exception:
+            LOGGER.exception("ownership preview failed without exposing user data")
+        future = None
+        if not progressed:
+            next_check = time.monotonic() + max(settings.worker_idle_seconds, 1.0)
+    if time.monotonic() >= next_check:
+        future = executor.submit(creator_ownership.prepare_next_preview, settings)
+    return future, next_check
 
 
 def _reap_ai_futures(futures: set[Future[Any]]) -> None:

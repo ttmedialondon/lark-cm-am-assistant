@@ -1,0 +1,10 @@
+.ownership-cm { min-width: 240px; max-width: 100%; }
+.ownership-table { min-width: 850px; }
+.ownership-table td { vertical-align: top; }
+.ownership-table td:nth-last-child(2) { min-width: 240px; max-width: 370px; white-space: normal; overflow-wrap: anywhere; }
+.ownership-table .ownership-name { min-width: 180px; overflow-wrap: anywhere; }
+.ownership-table .ownership-actions { min-width: 150px; }
+.ownership-evidence { width: min(720px, calc(100vw - 24px)); max-height: 85vh; border: 1px solid var(--tblr-border-color); border-radius: 12px; padding: 24px; color: inherit; }
+.ownership-evidence::backdrop { background: rgb(15 23 42 / 35%); }
+.ownership-evidence blockquote { white-space: pre-wrap; overflow-wrap: anywhere; font-size: inherit; }
+#ownership-query { max-width: 210px; }

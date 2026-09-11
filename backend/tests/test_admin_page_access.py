@@ -15,6 +15,7 @@ from app import (
     admin_permissions,
     admin_reporting,
     contact_assessments,
+    creator_ownership,
     main,
     organization_sync,
 )
@@ -30,9 +31,13 @@ GET_ROUTES = (
     ("contacts", "/admin/contacts"),
     ("contacts", "/admin/contacts/ou_contact"),
     ("ai", "/admin/ai"),
+    ("ai", "/admin/ai/creator-ownership"),
+    ("ai", "/admin/ai/creator-ownership/data"),
     ("jobs", "/admin/jobs"),
 )
 ASSESSMENT_ROUTE = f"/admin/contacts/ou_contact/assessments/{TARGET}"
+OWNERSHIP_EVIDENCE_ROUTE = f"/admin/ai/creator-ownership/tasks/{TARGET}/evidence"
+PRIVATE_ROUTES = (ASSESSMENT_ROUTE, OWNERSHIP_EVIDENCE_ROUTE)
 POST_ROUTES = (
     f"/admin/users/{TARGET}/permissions",
     "/admin/contacts/ou_contact/organization",
@@ -41,6 +46,8 @@ POST_ROUTES = (
     f"{ASSESSMENT_ROUTE}/dismiss",
     "/admin/ai",
     "/admin/ai/resume",
+    "/admin/ai/creator-ownership/preview",
+    *(f"/admin/ai/creator-ownership/{TARGET}/{action}" for action in ("start", "pause", "resume", "confirm", "defer")),
 )
 
 
@@ -55,9 +62,10 @@ def data_fence(monkeypatch):
 
     for module in (
         admin, admin_permissions, admin_reporting, contact_assessments,
-        organization_sync,
+        organization_sync, creator_ownership,
     ):
         monkeypatch.setattr(module, "connection", forbidden_query)
+    monkeypatch.setattr(creator_ownership, "get_settings", lambda: None)
 
 
 def _client(monkeypatch, *, permissions=(), owner=False, status="active", contexts=None):
@@ -103,7 +111,7 @@ def test_each_route_checks_its_own_permission_before_reading(monkeypatch, data_f
         assert response.headers["location"] == f"/admin/{unrelated}"
 
 
-@pytest.mark.parametrize("path", [path for _, path in GET_ROUTES] + [ASSESSMENT_ROUTE])
+@pytest.mark.parametrize("path", [path for _, path in GET_ROUTES] + list(PRIVATE_ROUTES))
 def test_no_page_grants_means_no_backend_even_with_a_legacy_role(monkeypatch, data_fence, path):
     monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _: "operator")
     browser, _, _ = _client(monkeypatch)
@@ -119,10 +127,11 @@ def test_all_page_grants_still_cannot_mutate_or_grant_access(monkeypatch, data_f
 
 def test_contact_assessment_plaintext_remains_owner_only(monkeypatch, data_fence):
     browser, _, _ = _client(monkeypatch, permissions=PAGES)
-    assert browser.get(ASSESSMENT_ROUTE).status_code == 403
+    for path in PRIVATE_ROUTES:
+        assert browser.get(path).status_code == 403
 
 
-@pytest.mark.parametrize("path", [path for _, path in GET_ROUTES] + [ASSESSMENT_ROUTE])
+@pytest.mark.parametrize("path", [path for _, path in GET_ROUTES] + list(PRIVATE_ROUTES))
 def test_owner_has_every_read_entry_without_explicit_page_grants(monkeypatch, data_fence, path):
     browser, _, _ = _client(monkeypatch, owner=True)
     with pytest.raises(_DataQueryReached):
@@ -311,11 +320,11 @@ def test_every_admin_route_is_in_the_access_matrix(monkeypatch):
         if not route.path.startswith("/admin"):
             continue
         path = route.path.replace("{open_id}", "ou_contact")
-        for parameter in ("authorization_id", "contact_id", "assessment_id"):
+        for parameter in ("authorization_id", "contact_id", "assessment_id", "run_id", "task_id"):
             path = path.replace(f"{{{parameter}}}", TARGET)
         actual.update((method, path) for method in route.methods)
     expected = {("GET", path.split("?", 1)[0]) for _, path in GET_ROUTES}
-    expected.add(("GET", ASSESSMENT_ROUTE))
+    expected.update(("GET", path) for path in PRIVATE_ROUTES)
     expected.update(("POST", path) for path in POST_ROUTES)
     assert actual == expected
 
