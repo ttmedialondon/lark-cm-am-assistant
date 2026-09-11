@@ -10,10 +10,7 @@
       {% if not progress.enabled %}<div class="text-secondary mb-2">识别已暂停，队列保留。重新开启后排队任务继续；已取消的在途任务可在人员详情继续识别。</div>{% endif %}
       <div class="d-flex flex-wrap gap-3 mb-2"><strong>全库 {{ progress.total|default(0) }} 人</strong><span>已处理 {{ progress.processed|default(0) }}</span><span>排队 {{ progress.queued|default(0) }}</span><span>{{ '分析中' if progress.enabled else '在途待收尾' }} {{ progress.running|default(0) }}</span><span>尚未安排 {{ progress.not_started|default(0) }}</span><span>已暂停 {{ progress.paused|default(0) }}</span></div>
       <progress class="w-100" aria-label="本轮已处理人数" max="{{ progress.total or 1 }}" value="{{ progress.processed|default(0) }}"></progress>
-      <div class="d-flex flex-wrap gap-3 text-secondary small mt-2"><span>有 AI 结果 {{ progress.ai_results|default(0) }}（含低置信结果）</span><span>无足够材料 {{ progress.no_material|default(0) }}</span><span class="text-danger">异常 {{ progress.exceptions|default(0) }}</span></div>
-      <div class="text-secondary small mt-2">这是当前规则的全库进度，不受下方筛选影响。已处理包含保留人工 / 同事事实和无材料检查，不等于都调用过 AI。刷新只读取状态，不发起新分析。</div>
     </div></section>
-    <div class="alert alert-info">人工已确认资料优先，其次是已核实的同事身份，再是本轮 AI 判断。AI 只看本人重要发言，置信度至少 95% 且类别唯一才归类；否则显示“待识别”，不默认归入“其他人员”。</div>
     <div class="card admin-directory__card">
       <div class="card-body border-bottom">
         <div class="subheader mb-2">类别 · 全库人数</div><div class="btn-list">
