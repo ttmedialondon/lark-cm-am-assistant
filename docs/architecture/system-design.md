@@ -1,6 +1,6 @@
 # 系统技术说明
 
-本文记录后端、人员模型、姓名机制与后台。业务以 [人员身份与达人名单](../product/creator-management.md)、[消息总结](../product/message-summary.md)、[后台权限](../product/admin-access.md) 为准。2026-09-11 当前先运行全员六类身份识别，CM／handle 三阶段扫描及消息总结暂停，保留已有数据。
+本文记录后端、人员模型、姓名机制与后台。业务以 [人员身份与达人名单](../product/creator-management.md)、[消息总结](../product/message-summary.md)、[后台权限](../product/admin-access.md) 为准。2026-09-11 保留全员六类身份识别，旧 CM／handle 工程已移除，消息总结维持关闭，已有数据保留。
 
 ## 1. 实际架构
 
@@ -29,11 +29,10 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 | `contact_assessments`、`contact_assessment_refs` | 全员身份任务、规则版本、受控结论、本人消息引用与正文指纹；不是 CM 归属 |
 | `organizations`、`organization_tenants`、`contact_organization_links` | 组织及可验证租户/人员关系；租户相同不等于达人、员工或负责人 |
 | `social_accounts`、`contact_social_accounts` | 平台账号及关联用户；一个用户可以关联多个 handle |
-| `creator_workflow_candidates`、`creator_workflow_sources`、`creator_workflow_requests` | 待确认线索、来源和请求幂等记录 |
+| `creator_workflow_candidates`、`creator_workflow_sources`、`creator_workflow_requests` | 保留的旧线索、来源和请求历史；无现行写入入口 |
 | `creator_account_assignments` | 用户与 CM 的正式归属；有效归属的账号不可为空，是名单与总结取数依据 |
 | `contact_assignments` | 旧联系人级负责人关系；不能代替账号级确认，也不能认领一个 handle 就转走同人的其他 handle |
-| `creator_workflow_ai_runs`、`creator_workflow_ai_tasks` | 同人三阶段任务、每阶段冻结引用及输入指纹、初始指纹去重、阶段结果、总预算与共享重试 |
-| `creator_workflow_onboarding` | 新授权同步就绪检查，不自动调用 AI；旧游标只留历史 |
+| `creator_workflow_ai_runs`、`creator_workflow_ai_tasks`、`creator_workflow_onboarding` | 旧扫描结果、引用与接入记录，仅保留历史，未完成项已取消 |
 | `offhours_summary_settings`、`offhours_summary_runs`、`offhours_summary_tasks` | 指定总结时段、执行版本和会话结果 |
 | `admin_roles`、`admin_page_permissions`、`audit_events` | 主人身份、逐页权限、必要的查看/修改审计 |
 
@@ -46,7 +45,7 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 - 群和私聊共享底层存储；私聊对端身份记录在授权来源的会话关系上。P2P 发现结果单独标记，不可用不阻塞群聊同步。
 - 消息正文、OAuth 令牌、AI 密钥及派生总结使用各自加密域；正文、完整 prompt、密钥和令牌不进入普通日志或 Git。不保存附件二进制。
 - 最新群成员快照包含稳定 ID、姓名和可用租户信息，不保存成员历史版本；API 未返回某人不等于已离群。
-- 后台逐页权限、前台名单编辑、测试编辑和正文读取分别校验。每请求查询当前权限，不将权限缓存到登录会话。写操作有 CSRF、版本/冲突校验、事务和审计。
+- 后台逐页权限、主人修改权限和正文读取分别校验。每请求查询当前权限，不将权限缓存到登录会话。写操作有 CSRF、版本/冲突校验、事务和审计；旧前台名单编辑入口已删除。
 - 正文读取同时核对授权、同意、会话可见且启用、有效消息观察和删除状态；选用户或建立关联不新增权限。详细入口范围见后台权限文档。
 
 ## 4. 同步与并发
@@ -68,21 +67,13 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 
 全员队列与其他 AI 队列共享 3 个槽，每任务最多两次尝试；固定片段上限和保守阈值见产品文档。后台目录显示本规则结果与进度，旧 AI 类别不冒充新结论；人工及可信同事事实独立保留。API 密钥、模型和传输层复用现有配置。
 
-### 暂停保留：CM 归属与 handle 三阶段
+### 已移除：旧 CM 归属与三阶段工程
 
-`creator-stages-v1` / `person_staged_v1` 复用现有任务表，不新增队列服务。每人一个任务，`stage` 在 identity → ownership → handle 顺序推进；`stage_results` 保存受控结论、分数及冻结引用，不存模型原话。明确否定与信息不足分开，只有 pass 才在服务器本地准备下一阶段材料。
+旧 contact assignment、creator workflow 的扫描、取证、Excel 导入、确认、OAuth onboarding、前台路由及专属静态资源已删除；worker 不再调度旧队列，旧任务不再占用 AI 并发槽。当前可配置的 AI 功能只保留全员身份识别和指定时段消息总结，保留原有开关及凭据。
 
-`creator_targeting.build_preflight` 遍历当前有效授权内已同步历史，只选外部用户本人的业务发言，不要求 CM 沟通。`build_stage_evidence` 在第二步才核对真实私聊对端、明确回复/@和双方片段；第三步只取本人账号线索，Excel 线索与消息引用分离，不用 X 引用证明本人身份。脱敏保留精确账号/主页链接，其他成员的聊天不整包发送。
+046 只停用两项旧开关、取消未完成的旧任务并记录审计；不删除表、名单、账号、归属、分类、消息、授权或历史结果。旧 migration 原样保留，不能为清理工程重放早期清库。保留的旧表属于历史数据，不代表相关功能仍可开启。
 
-`ai_dispatch` 共享最多 3 个有效并发槽；同人的阶段串行，不同人并行。每批最多30人，每阶段最多3组对话、30条、16,000字符，单条1,500字符。总尝试最多4次，`stage_attempts` / `retry_count` 确保仅一个跨阶段共享重试；领取后的调用前校验失败也占尝试，不将计数当作账单。`initial_fingerprint` 不随阶段改变，重新准备不能为同 CM / 同人开新预算。新证据可复用原任务补查未通过阶段，原通过项须仍有效；无新材料不重复送审。补查预检标记 `resumed` 和 `preflight_revision`，须明确启动，不因刷新调用。批次 `started_at` 记录开始或恢复时间，状态优先当前活动批次，避免旧批重试被新空预检遮住。
-
-每次调用和保存均重验当前及所有前置已通过阶段的授权、作者、原文内容和输入指纹；配置变化或暂停后不能写入在途结果。只对当前阶段失败做有限重试；保存事务冲突最多重试3次且不重发模型请求。沿用 OpenAI Responses 结构化输出和既有配置，不换模型；明确启动才付费调用，不做 OCR / 附件读取。
-
-`_admission_gate` 是 `_promote`、自动及人工确认的统一门槛：新版本 AI 两项有效通过、用户及 CM 一致、准确非空 handle 有 AI 本人证据或 CM 显式核实、无冲突。依据纳入三个阶段完整上下文（最多90条），revision 包括解密正文 hash；正文改变即失效，同正文重新加密不会误判。列表仅在单次读取内缓存共享引用的权限和正文 revision，写入仍重新检查，下次读取不复用旧缓存。旧 business_v2 或人工清疑点均不能绕过。CAP 允许 NULL。
-
-`handle_verification` 只能由服务器根据明确的手工核实动作写入；客户端不能提交整段核实 JSON。换人/换 CM 更新 `ai_invalidated_at`，切回旧值也不能重用失效结论；改账号只重核账号，不打断前两步。CM 已核实账号且前两项 AI 通过时结束任务，不再发送第三步，阶段来源记为 CM 而非伪造 AI 分数。人工退回、换人/换 CM 取消旧扫描，保存前还校验冻结的候选关键字段，禁止另建行绕过退回。正式关键资料纠错先结束旧 assignment，后续重新通过才恢复。043 同时约束正式 candidate 与有效 assignment 的账号非空，并将不符合新规则的旧正式归属退出；041 的清库不会重复执行。
-
-前端默认正式名单，待处理与不纳入分开；批次异常不当作业务否定，也不混入达人总数。OAuth 只登记本地同步就绪检查，不直接调用达人 AI。当前仅启用新版全员身份识别，旧联系人归属、CM／handle 三阶段扫描和消息总结保持关闭；目录识别出达人不自动入库，不回复、不发通知、不代办业务。
+新版身份识别的消息解析和脱敏已移入自身模块，取样、截取和判断规则不变；消息总结保留原审计行为，不再导入旧工程。新归属规则与入库方式待用户确认，本次不实现替代流程。
 
 ## 6. 姓名和 @
 
@@ -112,8 +103,8 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 
 ## 7. 已移除的旧入口
 
-后台达人目录、归属复核、专用聊天详情和整理清单已下线，旧预览与快照读取代码、旧一次性交接/恢复脚本一并移除。当前只从 `/dashboard/creators` 管理达人及必填账号，不再展示旧联系人归属工作台。
+后台达人目录、归属复核、专用聊天详情和整理清单已下线。此次继续移除 `/dashboard/creators`、全部配套 API、旧 AI 配置入口、负责人资格编辑及联系人分配接口；旧地址不可再启动或修改名单。
 
-036 迁移只删除 `creators` / `creator-review` 页面权限、保存移除审计并收紧权限键约束，不删除候选、正式达人、人口库或消息表。两位明确测试者的 Remi 前台权限不再依赖旧后台权限。历史代码从 Git 恢复；Remi 此前的数据清理仍以 [历史记录](../status/2026-09-10-reset-and-docs.md) 为准，不重复执行。
+036 迁移处理的是早期页面权限；本次 046 不删除权限或业务数据。现有系统主人、后台页面授权与消息权限均保留。旧测试编辑工程随前台移除，新编辑规则待确定。历史代码从 Git 恢复；此前数据清理仅为 [历史记录](../status/2026-09-10-reset-and-docs.md)，不重复执行。
 
 运行配置、发布、备份和恢复统一见 [部署手册](../runbooks/deploy-mvp.md)，不在这里复制命令。

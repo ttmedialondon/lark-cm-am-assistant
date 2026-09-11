@@ -23,7 +23,6 @@ from . import (
     ai_dispatch,
     ai_feature_config,
     contact_assessments,
-    contact_assignments,
     offhours_summary,
     organization_sync,
 )
@@ -54,19 +53,6 @@ AI_FEATURES = {
         "title": "下班消息总结（Remi 试用）",
         "description": "只整理 Remi 已确认达人的消息，合并事项并按 P0–P3 分级；不生成或发送回复。",
         "enabled_label": "开启下班消息总结（保存后立即排队）",
-    },
-    "creator_workflow": {
-        "title": "达人三阶段识别",
-        "description": (
-            "先看本人历史发言判断达人，再判断与 CM 的负责关系，最后核实 handle。"
-            "三项通过且资料齐全才入库；缺项待处理。开启后仍须在前台明确启动批次。"
-        ),
-        "enabled_label": "启用达人业务识别",
-    },
-    "contact_assignment": {
-        "title": "达人负责人匹配",
-        "description": "只在达人尚无负责人时，根据直接互动生成一位 CM/AM 建议；由被建议人确认后生效。",
-        "enabled_label": "启用负责人匹配",
     },
 }
 
@@ -441,66 +427,6 @@ def create_admin_router(
             },
         )
 
-    @router.post("/admin/users/{authorization_id}/assignment-eligibility")
-    async def admin_set_assignment_eligibility(
-        request: Request, authorization_id: UUID, page: int = 1
-    ) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        form = await _form_fields(request)
-        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
-            return render_template(
-                request,
-                "error.html",
-                {"title": "请求校验失败", "detail": "请返回人员页面后重试。"},
-                400,
-            )
-        enabled = form.get("enabled") == "1"
-        with connection() as conn, conn.transaction():
-            if enabled:
-                # Match candidate confirmation's config -> authorization lock order.
-                conn.execute(
-                    "SELECT feature FROM ai_feature_configs WHERE feature = %s FOR UPDATE",
-                    (contact_assignments.FEATURE,),
-                ).fetchone()
-            user = conn.execute(
-                """
-                UPDATE authorizations
-                SET assignment_eligible = %s, updated_at = NOW()
-                WHERE id = %s
-                RETURNING id
-                """,
-                (enabled, authorization_id),
-            ).fetchone()
-            if not user:
-                return render_template(
-                    request,
-                    "error.html",
-                    {"title": "未找到授权用户", "detail": "该用户可能已经被删除。"},
-                    404,
-                )
-            if enabled:
-                conn.execute(
-                    """
-                    UPDATE ai_feature_configs
-                    SET automatic_queue_checked_at = '-infinity'::timestamptz, updated_at = NOW()
-                    WHERE feature = %s
-                    """,
-                    (contact_assignments.FEATURE,),
-                )
-            conn.execute(
-                "INSERT INTO audit_events (id, authorization_id, action, metadata) VALUES (%s, %s, %s, %s::jsonb)",
-                (
-                    uuid4(),
-                    access_context["authorization"]["id"],
-                    "contact_assignment_eligibility_updated",
-                    json.dumps({"target_authorization_id": str(authorization_id), "enabled": enabled}),
-                ),
-            )
-        return RedirectResponse(url=f"/admin/users/{authorization_id}?{urlencode({'page': page})}", status_code=303)
-
     @router.get("/admin/chats")
     def admin_chats(request: Request, page: int = 1) -> Response:
         access_context, denied = access(request)
@@ -741,25 +667,9 @@ def create_admin_router(
                 404,
             )
         conversations = detail["conversations"]
-        is_creator = detail["contact"].get("primary_role") == "creator"
         latest_assessment = (
             contact_assessments.latest_contact_assessment(detail["contact"]["contact_id"]) if is_owner else None
         )
-        assignment = contact_assignments.active_assignment(detail["contact"]["contact_id"]) if is_creator else None
-        assignment_assessment = (
-            contact_assignments.latest_contact_assignment_assessment(detail["contact"]["contact_id"])
-            if is_creator and is_owner
-            else None
-        )
-        assignees = (
-            contact_assignments.assignable_authorizations(detail["contact"]["contact_id"])
-            if is_creator and is_owner else []
-        )
-        assignment_choices = [
-            item
-            for item in assignees
-            if not assignment or item["id"] != assignment["responsible_authorization_id"]
-        ]
         response = render_template(
             request,
             "admin/contact_detail.html",
@@ -784,12 +694,6 @@ def create_admin_router(
                 "identity_policy": contact_assessments.POLICY_VERSION,
                 "assessment_available": contact_assessments.assessment_available() if is_owner else False,
                 "can_view_conversations": can_view_conversations,
-                "is_creator": is_creator,
-                "assignment": assignment,
-                "assignment_assessment": assignment_assessment,
-                "assignment_available": bool(is_creator and is_owner and contact_assignments.assignment_available()),
-                "assignees": assignees,
-                "assignment_choices": assignment_choices,
                 "conversations": conversations["items"],
                 "conversation_page": pagination(
                     conversations,
@@ -835,75 +739,6 @@ def create_admin_router(
                     response = render_template(request, "error.html", {
                         "title": "无法继续识别", "detail": str(exc),
                     }, 400)
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-        return response
-
-    @router.post("/admin/contacts/{open_id}/assignment")
-    @router.post("/admin/contacts/{open_id}/assignment/handoff")
-    async def admin_set_contact_assignment(
-        request: Request,
-        open_id: str,
-        page: int = 1,
-        category: str = "all",
-        organization_status: str = "all",
-        organization_query: str = "",
-    ) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        category = admin_reporting.normalize_contact_category(category)
-        organization_status = admin_reporting.normalize_organization_status(organization_status)
-        organization_query = admin_reporting.normalize_organization_query(organization_query)
-        form = await _form_fields(request)
-        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
-            response = render_template(
-                request,
-                "error.html",
-                {"title": "请求校验失败", "detail": "请返回达人详情页后重试。"},
-                400,
-            )
-            response.headers["Cache-Control"] = "no-store, max-age=0"
-            return response
-        with connection() as conn:
-            contact = conn.execute(
-                """
-                SELECT contact_id FROM lark_identities
-                WHERE open_id = %s AND identity_type = 'user'
-                """,
-                (open_id,),
-            ).fetchone()
-        if not contact:
-            response = render_template(
-                request,
-                "error.html",
-                {"title": "未找到达人", "detail": "该外部联系人尚未被同步。"},
-                404,
-            )
-            response.headers["Cache-Control"] = "no-store, max-age=0"
-            return response
-        try:
-            contact_assignments.manually_assign(
-                access_context["authorization"]["id"],
-                contact["contact_id"],
-                form.get("responsible_authorization_id", ""),
-            )
-        except contact_assignments.ContactAssignmentInputError as exc:
-            response = render_template(
-                request,
-                "error.html",
-                {"title": "无法更新负责人", "detail": str(exc)},
-                400,
-            )
-            response.headers["Cache-Control"] = "no-store, max-age=0"
-            return response
-        query = contact_query(
-            page=page,
-            category=category,
-            organization_status=organization_status,
-            organization_query=organization_query,
-        )
-        response = RedirectResponse(url=f"/admin/contacts/{open_id}?{query}", status_code=303)
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 

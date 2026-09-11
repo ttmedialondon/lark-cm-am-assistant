@@ -18,9 +18,6 @@ import psycopg
 from . import (
     ai_dispatch,
     contact_assessments,
-    contact_assignments,
-    creator_onboarding,
-    creator_workflow_ai,
     identity_profiles,
     offhours_summary,
     organization_sync,
@@ -105,7 +102,7 @@ def run_forever() -> None:
     if not settings.app_secret_configured:
         LOGGER.warning("Lark App Secret is not configured; worker is waiting for administrator input")
 
-    prefer_assignment = False
+    prefer_summary = False
     next_organization_check = 0.0
     ai_executor = ThreadPoolExecutor(max_workers=ai_dispatch.MAX_CONCURRENT_REQUESTS, thread_name_prefix="openai")
     ai_futures: set[Future[Any]] = set()
@@ -138,8 +135,7 @@ def run_forever() -> None:
                 _reap_page_futures(page_futures, settings)
                 _reap_member_futures(member_futures)
                 _recover_expired_leases()
-                creator_onboarding.advance_initial_scans()
-                prefer_assignment = _fill_ai_slots(settings, ai_executor, ai_futures, prefer_assignment)
+                prefer_summary = _fill_ai_slots(settings, ai_executor, ai_futures, prefer_summary)
                 if settings.app_secret_configured and time.monotonic() >= next_organization_check:
                     _run_organization_sync(settings, client)
                     # The database keeps the real daily cadence. This local bound
@@ -186,40 +182,26 @@ def _dispatch_ai_turn(
     settings: Settings,
     executor: ThreadPoolExecutor,
     futures: set[Future[Any]],
-    prefer_assignment: bool,
+    prefer_summary: bool,
 ) -> tuple[bool, bool]:
     """Claim one fair AI task and submit it without blocking Lark sync."""
 
     if len(futures) >= ai_dispatch.MAX_CONCURRENT_REQUESTS:
-        return False, prefer_assignment
+        return False, prefer_summary
     queues = (
         (
-            contact_assignments.claim_next_contact_assignment,
-            contact_assignments.run_claimed_contact_assignment,
-            False,
-        ),
-        (
-            contact_assessments.claim_next_contact_assessment,
-            contact_assessments.run_claimed_contact_assessment,
-            True,
-        ),
-    ) if prefer_assignment else (
-        (
             contact_assessments.claim_next_contact_assessment,
             contact_assessments.run_claimed_contact_assessment,
             True,
         ),
         (
-            contact_assignments.claim_next_contact_assignment,
-            contact_assignments.run_claimed_contact_assignment,
+            offhours_summary.claim_next_summary,
+            offhours_summary.run_claimed_summary,
             False,
         ),
     )
-    # The new candidate queue never enables either legacy identity/assignment feature.
-    queues = ((offhours_summary.claim_next_summary,
-               offhours_summary.run_claimed_summary, prefer_assignment),
-              (creator_workflow_ai.claim_next_creator_scan,
-               creator_workflow_ai.run_claimed_creator_scan, prefer_assignment),) + queues
+    if prefer_summary:
+        queues = queues[::-1]
     for claim, runner, next_preference in queues:
         try:
             job = claim()
@@ -230,22 +212,22 @@ def _dispatch_ai_turn(
             continue
         futures.add(executor.submit(runner, job, settings))
         return True, next_preference
-    return False, prefer_assignment
+    return False, prefer_summary
 
 
 def _fill_ai_slots(
     settings: Settings,
     executor: ThreadPoolExecutor,
     futures: set[Future[Any]],
-    prefer_assignment: bool,
+    prefer_summary: bool,
 ) -> bool:
     """Fill up to three AI slots before returning immediately to Lark sync."""
 
     while len(futures) < ai_dispatch.MAX_CONCURRENT_REQUESTS:
-        submitted, prefer_assignment = _dispatch_ai_turn(settings, executor, futures, prefer_assignment)
+        submitted, prefer_summary = _dispatch_ai_turn(settings, executor, futures, prefer_summary)
         if not submitted:
             break
-    return prefer_assignment
+    return prefer_summary
 
 
 def _reap_ai_futures(futures: set[Future[Any]]) -> None:

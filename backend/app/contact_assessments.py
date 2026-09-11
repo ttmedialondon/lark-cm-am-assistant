@@ -26,7 +26,7 @@ from .config import Settings, get_settings
 from .contact_taxonomy import AI_ROLE_CODES, MODEL_ROLE_CODES, ROLE_LABELS
 from .crypto import message_body_cipher
 from .db import connection
-from .message_mentions import mention_names
+from .message_mentions import mention_names, mention_targets, resolve_mentions, rich_mention_text
 
 LOGGER = logging.getLogger("lark_message_stats.contact_assessments")
 FEATURE = "contact_assessment"
@@ -789,11 +789,78 @@ _ROUTINE = re.compile(
     r"sounds good|got it|good morning|good night|cheers|你好|谢谢|好的|收到)[\s!.,?🙏👍❤️]*)+$",
     re.I,
 )
+_IDENTITY_CONTEXT_SIGNAL = re.compile(
+    r"\b(?:creator|influencer|affiliate|commission|campaign|voucher|sample|sku|"
+    r"live|livestream|video|boost|agency|promot\w*|collaborat\w*|tiktok|product|brand)\b"
+    r"|达人|直播|短视频|样品|补样|佣金|机构|签约|推品|投流|带货|选品",
+    re.I,
+)
+_EMAIL = re.compile(r"(?<![\w@])[\w.!#$%&'*+/=?^`{|}~-]+@[\w.-]+\.[A-Za-z]{2,}")
+_PHONE = re.compile(r"(?<![\w])\+?\d[\d ()-]{7,}\d(?![\w])")
+_ADDRESS = re.compile(
+    r"(?im)(?:\b(?:shipping|delivery|postal|home)?\s*address\s*[:：]|收货地址\s*[:：])[^\n]+"
+    r"|\b\d{1,5}\s+(?:[A-Za-z'-]+\s+){0,5}(?:street|road|avenue|lane|drive|close|way|st|rd)\b[^\n,;]*"
+    r"|\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b"
+)
+_ACCOUNT = re.compile(
+    r"https?://(?:www\.|m\.)?tiktok\.com/@[\w.\-]+[^\s<>\"']*"
+    r"|\b(?:handle|username|tiktok(?:\s+(?:handle|account))?)\s*(?:is\b|:|=)\s*@?[\w.\-]+"
+    r"|(?:账号|帐号|用户名)\s*(?:是|为|:|：|=)\s*@?[\w.\-]+"
+    r"|(?<![\w@])@[\w.\-]+", re.I,
+)
+
+
+def _identity_text(raw, row, subject_ids, known_names):
+    """Preserve the people-identity-v1 input while retiring the CM workflow."""
+    names = {
+        item["open_id"]: "U1" if item["open_id"] in subject_ids else "其他用户"
+        for item in mention_targets(row.get("mentions_json")) if item["open_id"]
+    }
+
+    def fragments(value):
+        if isinstance(value, dict):
+            if value.get("tag") == "at":
+                yield rich_mention_text(value.get("user_id"), row.get("mentions_json"), names)
+                return
+            for key, item in value.items():
+                if key in {"text", "href", "url", "title"} and isinstance(item, str):
+                    yield item
+                elif isinstance(item, dict | list):
+                    yield from fragments(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from fragments(item)
+
+    if row["message_type"] == "text":
+        text = _readable_body(raw, "text")
+    else:
+        try:
+            text = " ".join(fragments(json.loads(raw)))
+        except ValueError:
+            text = raw
+    text = resolve_mentions(text, row.get("mentions_json"), names)
+    text = re.sub(r"([?&](?:token|access_token|key|signature)=)[^&\s]+", r"\1[redacted]", text, flags=re.I)
+    text = _EMAIL.sub("[邮箱已隐藏]", text)
+    # Best-effort PII redaction keeps exact accounts intact; accounts are not identity evidence.
+    pieces, position = [], 0
+    for account in [*_ACCOUNT.finditer(text), None]:
+        end = account.start() if account else len(text)
+        piece = _ADDRESS.sub("[地址已隐藏]", _PHONE.sub("[电话/编号已隐藏]", text[position:end]))
+        for value, alias in known_names.items():
+            if value and len(value.strip()) > 2:
+                piece = re.sub(r"(?<!\w)" + re.escape(value) + r"(?!\w)", alias, piece, flags=re.I)
+        pieces.append(piece)
+        if account:
+            pieces.append(account.group())
+            position = account.end()
+    text = "".join(pieces)
+    signal = _IDENTITY_CONTEXT_SIGNAL.search(text)
+    # Keep the existing 1,500-character relocation threshold, then the identity 500-character cap.
+    start = max(0, signal.start() - 300) if signal and signal.start() >= 1500 else 0
+    return text[start:start + MAX_BODY_CHARS]
 
 
 def _build_evidence(contact_id: UUID, settings: Settings) -> dict[str, Any]:
-    from .creator_targeting import _text
-
     cipher = message_body_cipher(settings.token_encryption_key)
     with connection() as conn:
         identities = conn.execute(
@@ -836,7 +903,7 @@ def _build_evidence(contact_id: UUID, settings: Settings) -> dict[str, Any]:
             words = re.sub(r"https?://\S+|@[\w.\-]+", "", plain)
             if sum(ch.isalpha() for ch in words) < 4:
                 continue
-            body = _text(cipher, row, {"open_ids": set()}, target_ids, names, "identity")[:MAX_BODY_CHARS]
+            body = _identity_text(raw, row, target_ids, names)
             normalized = " ".join(body.casefold().split())
             if not body or normalized in seen_text:
                 continue

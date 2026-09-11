@@ -25,7 +25,7 @@ def test_shared_gate_rejects_when_three_valid_leases_are_running() -> None:
     assert not ai_dispatch.can_claim(Connection())
     combined_query = next(query for query in calls if "COUNT(*)" in query)
     assert "contact_assessments" in combined_query
-    assert "contact_assignment_assessments" in combined_query
-    assert "creator_workflow_ai_tasks" in combined_query
+    assert "contact_assignment_assessments" not in combined_query
+    assert "creator_workflow_ai_tasks" not in combined_query
     assert "offhours_summary_tasks" in combined_query
     assert "lease_until > NOW()" in combined_query

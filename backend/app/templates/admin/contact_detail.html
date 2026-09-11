@@ -27,24 +27,6 @@
       {% if assessment_available and (not assessment or (assessment.status not in ('queued','running') and assessment.reason_code not in ('classified','protected_manual','verified_internal'))) %}<div class="card-body border-top"><form action="/admin/contacts/{{ contact.open_id }}/assessments" method="post" class="d-flex flex-wrap align-items-center gap-3"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-outline-primary" type="submit">继续识别</button><span class="text-secondary small">仅继续此人的当前任务；每人累计最多 2 次处理尝试，不会重置预算。材料补齐后可继续，次数耗尽仍保留待识别。</span></form></div>{% endif %}
     </div>
     {% endif %}
-    {% if is_creator %}
-    <div class="card mb-4">
-      <div class="card-header"><div><h3 class="card-title mb-1">负责人（独立业务资料）</h3><div class="text-secondary small">以下是已有的负责人资料，与本次身份识别独立。身份分类不会新增、转移或确认任何负责人；交接仍由系统主人另行操作。</div></div></div>
-      <div class="card-body">
-        {% if assignment %}
-        <div class="d-flex flex-wrap align-items-center gap-2 mb-3"><strong>{{ assignment.responsible_name }}</strong><span class="badge bg-success-lt">当前负责人</span><span class="text-secondary small">{{ assignment.source_label }}{% if assignment.confidence_label != '—' %} · {{ assignment.confidence_label }}{% endif %} · 自 {{ assignment.started_at_label }}</span></div>
-        {% if assignment_choices and admin_role == 'owner' %}
-        <form action="/admin/contacts/{{ contact.open_id }}/assignment/handoff?{{ source_query }}" method="post" class="row g-2 align-items-end"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="col-md-7"><label class="form-label">人工交接给</label><select class="form-select" name="responsible_authorization_id" required><option value="">选择已接入 CM / AM</option>{% for assignee in assignment_choices %}<option value="{{ assignee.id }}">{{ assignee.display_name }}</option>{% endfor %}</select></div><div class="col-md-5"><button class="btn btn-outline-primary" type="submit">确认交接</button></div></form>
-        {% else %}<div class="text-secondary small">{% if admin_role == 'owner' %}目前没有其他已接入且可分配的 CM / AM。{% else %}只读查看；负责人交接由系统主人操作。{% endif %}</div>{% endif %}
-        {% else %}
-        {% if assignment_assessment %}<div class="mb-3"><span class="badge bg-{{ assignment_assessment.status_badge }}-lt">{{ assignment_assessment.status_label }}</span><span class="text-secondary small ms-2">{{ assignment_assessment.outcome_label }} · {{ assignment_assessment.created_at_label }}{% if assignment_assessment.candidate_name %} · 建议 {{ assignment_assessment.candidate_name }}（{{ assignment_assessment.confidence_label }}）{% endif %}</span>{% if assignment_assessment.error_label %}<div class="text-danger small mt-1">{{ assignment_assessment.error_label }}</div>{% endif %}</div>
-        {% elif assignment_available %}<div class="text-secondary small mb-3">系统会在发现 P2P、明确回复或 @ 关系后自动安排匹配。</div>
-        {% else %}<div class="text-secondary small mb-3">{% if admin_role == 'owner' %}负责人 AI 匹配尚未启用；仍可人工设置负责人。{% else %}暂无已确认负责人；由系统主人设置。{% endif %}</div>{% endif %}
-        {% if assignees and admin_role == 'owner' %}<form action="/admin/contacts/{{ contact.open_id }}/assignment?{{ source_query }}" method="post" class="row g-2 align-items-end"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="col-md-7"><label class="form-label">人工确认负责人</label><select class="form-select" name="responsible_authorization_id" required><option value="">选择已接入 CM / AM</option>{% for assignee in assignees %}<option value="{{ assignee.id }}">{{ assignee.display_name }}</option>{% endfor %}</select></div><div class="col-md-5"><button class="btn btn-primary" type="submit">确认负责人</button></div></form>{% elif admin_role == 'owner' %}<div class="text-secondary small">尚无已接入且可分配的 CM / AM。</div>{% endif %}
-        {% endif %}
-      </div>
-    </div>
-    {% endif %}
     <div class="card mb-4">
       <div class="card-header"><div><h3 class="card-title mb-1">所属组织</h3><div class="text-secondary small">“Lark 租户关联”仅说明稳定身份与该组织租户相关，不自动等同于员工、机构负责人或达人归属。</div></div></div>
       {% if organizations %}

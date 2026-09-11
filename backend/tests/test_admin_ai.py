@@ -91,6 +91,7 @@ def test_owner_can_view_only_safe_ai_config_fields(monkeypatch):
     monkeypatch.setattr(admin, "connection", _connection)
     monkeypatch.setattr(ai_feature_config, "get_feature_config", lambda *_args: {"api_key_ciphertext": "secret"})
     monkeypatch.setattr(ai_feature_config, "display_config", lambda _row: _config())
+    monkeypatch.setattr(ai_feature_config, "save_feature_config", lambda *a, **kw: pytest.fail("must not save"))
     monkeypatch.setattr(admin.offhours_summary, "get_settings_view", lambda _: {"status_label": "未开启"})
     monkeypatch.setattr(
         admin.ai_dispatch,
@@ -98,7 +99,8 @@ def test_owner_can_view_only_safe_ai_config_fields(monkeypatch):
         lambda _conn: {"state": "paused", "label": "AI 队列已暂停", "badge": "danger", "message": "safe"},
     )
 
-    response = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts).get("/admin/ai")
+    browser = _client(lambda _request: {"id": owner_id, "status": "active"}, contexts)
+    response = browser.get("/admin/ai")
 
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store, max-age=0"
@@ -107,7 +109,11 @@ def test_owner_can_view_only_safe_ai_config_fields(monkeypatch):
     assert "api_key_ciphertext" not in contexts[-1][1]["config"]
     assert contexts[-1][1]["ai_dispatch"]["state"] == "paused"
     assert contexts[-1][1]["summary_settings"]["status_label"] == "未开启"
-    assert contexts[-1][1]["configs"][0]["feature"] == "contact_assessment"
+    assert [item["feature"] for item in contexts[-1][1]["configs"]] == ["contact_assessment", "offhours_summary"]
+    for feature in ("contact_assignment", "creator_workflow"):
+        response = browser.post("/admin/ai", data={"csrf_token": "csrf", "feature": feature, "enabled": "1"})
+        assert response.status_code == 400
+        assert "未知的 AI 功能配置" in contexts[-1][1]["form_error"]
 
 
 @pytest.mark.parametrize("enabled", ["1", ""])

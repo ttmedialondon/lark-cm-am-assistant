@@ -21,8 +21,6 @@ from fastapi.templating import Jinja2Templates
 from . import (
     admin,
     admin_permissions,
-    creator_onboarding,
-    creator_workflow_routes,
     offhours_summary_routes,
 )
 from .admin_reporting import sync_summary
@@ -191,8 +189,6 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 scopes,
             ),
         ).fetchone()
-        if row["id"] == authorization_id:
-            creator_onboarding.register_initial_scan(conn, authorization_id)
         authorization_id = row["id"]
         # Page commits lock sync_jobs before authorization_chats. Preserve
         # that order here so OAuth reauthorization cannot deadlock with a
@@ -502,11 +498,6 @@ app.include_router(
         csrf_token=_admin_csrf_token,
     )
 )
-app.include_router(creator_workflow_routes.create_router(
-    current_authorization=_current_authorization,
-    render_template=_template,
-    csrf_token=_admin_csrf_token,
-))
 app.include_router(offhours_summary_routes.create_router(
     current_authorization=_current_authorization,
     render_template=_template,

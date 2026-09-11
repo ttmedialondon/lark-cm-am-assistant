@@ -6,7 +6,6 @@ from uuid import uuid4
 
 import pytest
 from cryptography.exceptions import InvalidTag
-from test_creator_workflow_ai import pg as pg
 
 from app import admin_reporting
 

@@ -19,7 +19,7 @@
         <div class="col-sm-6 col-lg-3"><div class="subheader">私聊目录</div><div class="h5 mb-1">{{ user.p2p_status_label }}</div><div class="text-secondary small">目录发现不等于私聊正文已回填</div></div>
       </div>
       {% if user.archived_conversation_count %}<div class="text-secondary small mt-3">已发现 {{ user.discovered_conversation_count }} 个会话；其中 {{ user.archived_conversation_count }} 个被 Lark 标为已归档/解散，因此不计划回填。</div>{% endif %}
-      <div class="d-flex flex-wrap gap-2 mt-3">{% if 'messages' in admin_permissions %}<a class="btn btn-sm btn-outline-primary" href="/admin/messages?user_id={{ user.id }}&amp;user_page={{ source_page }}">查看此人的会话</a>{% endif %}{% if admin_role == 'owner' %}<form action="/admin/users/{{ user.id }}/assignment-eligibility?page={{ source_page }}" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="enabled" value="{% if user.assignment_eligible %}0{% else %}1{% endif %}"><button class="btn btn-sm {% if user.assignment_eligible %}btn-outline-secondary{% else %}btn-outline-success{% endif %}" type="submit">{% if user.assignment_eligible %}移出负责人匹配{% else %}可担任负责人{% endif %}</button></form>{% endif %}<span class="badge bg-{{ user.assignment_eligible_badge }}-lt align-self-center">{{ user.assignment_eligible_label }}</span></div>
+      {% if 'messages' in admin_permissions %}<div class="mt-3"><a class="btn btn-sm btn-outline-primary" href="/admin/messages?user_id={{ user.id }}&amp;user_page={{ source_page }}">查看此人的会话</a></div>{% endif %}
     </div></div>
 
     <div class="card mb-4 admin-users__detail-access"><div class="card-header"><h3 class="card-title">后台访问权限</h3></div><div class="card-body">

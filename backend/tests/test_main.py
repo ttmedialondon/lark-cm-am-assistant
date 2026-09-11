@@ -28,7 +28,7 @@ def test_index_keeps_authenticated_users_on_the_dashboard(monkeypatch: pytest.Mo
     assert response.headers["location"] == "/dashboard"
 
 
-def test_dashboard_keeps_current_roster_and_removes_legacy_creator_controls() -> None:
+def test_dashboard_keeps_messages_and_removes_retired_creator_controls() -> None:
     rendered = main.templates.get_template("dashboard.html").render(
         authorization={"display_name": "CM", "p2p_discovery_status": "succeeded"},
         admin_role=None,
@@ -39,8 +39,8 @@ def test_dashboard_keeps_current_roster_and_removes_legacy_creator_controls() ->
         },
     )
     assert "消息提醒中心" in rendered and "权限与数据使用" in rendered
-    assert 'href="/dashboard/creators"' in rendered
-    for retired in ("creator-setup-preview", "creator-candidates", "待我确认的达人候选", "历史联系人归属"):
+    for retired in ("/dashboard/creators", "creator-setup-preview", "creator-candidates",
+                    "待我确认的达人候选", "历史联系人归属"):
         assert retired not in rendered
 
 
@@ -52,6 +52,11 @@ def test_dashboard_requires_login_and_retired_creator_endpoints_are_absent(monke
     assert response.headers["cache-control"] == "no-store, max-age=0"
     assert client.get("/dashboard/creator-setup-preview").status_code == 404
     assert client.post(f"/dashboard/creator-candidates/{uuid4()}/confirm").status_code == 404
+    for path in ("/dashboard/creators", "/dashboard/creators/data", "/dashboard/creators/users"):
+        assert client.get(path).status_code == 404
+    for path in ("/dashboard/creators/ai/scan", "/dashboard/creators/import/preview",
+                 f"/dashboard/creators/{uuid4()}/confirm"):
+        assert client.post(path).status_code == 404
 
 
 def test_named_frontend_testers_do_not_require_a_retired_admin_grant() -> None:

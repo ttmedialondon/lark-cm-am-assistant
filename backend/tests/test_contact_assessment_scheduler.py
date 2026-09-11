@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 
-import pytest
-
-from app import contact_assessments, contact_assignments
+from app import contact_assessments
 
 
 def test_claim_refreshes_the_durable_queue_before_claiming(monkeypatch) -> None:
@@ -31,8 +29,7 @@ def test_claim_returns_the_durable_job_for_an_ai_slot(monkeypatch) -> None:
     assert calls == ["expire", "available", "queue", "claim"]
 
 
-@pytest.mark.parametrize("module", (contact_assessments, contact_assignments))
-def test_both_ai_queues_stop_before_claiming_when_the_shared_gate_is_full(monkeypatch, module) -> None:
+def test_identity_queue_stops_before_claiming_when_the_shared_gate_is_full(monkeypatch) -> None:
     class Connection:
         def transaction(self):
             return nullcontext()
@@ -40,7 +37,7 @@ def test_both_ai_queues_stop_before_claiming_when_the_shared_gate_is_full(monkey
         def execute(self, *_args, **_kwargs):
             raise AssertionError("a full shared gate must prevent queue SQL")
 
-    monkeypatch.setattr(module, "connection", lambda: nullcontext(Connection()))
-    monkeypatch.setattr(module.ai_dispatch, "can_claim", lambda _conn: False)
+    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(Connection()))
+    monkeypatch.setattr(contact_assessments.ai_dispatch, "can_claim", lambda _conn: False)
 
-    assert module._claim_next() is None
+    assert contact_assessments._claim_next() is None

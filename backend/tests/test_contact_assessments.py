@@ -3,17 +3,14 @@ from __future__ import annotations
 import json
 import sys
 from contextlib import nullcontext
+from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-import test_creator_workflow_ai as creator_tests
 
 from app import contact_assessments
 from app.crypto import message_body_cipher
-
-# Reuse the existing isolated PostgreSQL setup; no new service or live API.
-pg = creator_tests.pg
-real_scan = creator_tests.real_scan
 
 
 def _valid_result(*, evidence_ref: str = "M1") -> str:
@@ -220,8 +217,35 @@ def test_non_429_http_error_keeps_safe_telemetry_without_a_blind_retry(monkeypat
 
 
 @pytest.fixture
-def people(pg, real_scan, monkeypatch):
-    ids, settings = real_scan
+def people(pg, monkeypatch):
+    ids = {name: uuid4() for name in ("cm", "owner", "person", "other")}
+    settings = SimpleNamespace(token_encryption_key=b"x" * 32)
+    for name in ("cm", "owner"):
+        pg.execute(
+            "INSERT INTO authorizations(id,open_id,display_name,access_token_ciphertext,body_consent_at) "
+            "VALUES(%s,%s,%s,'test',NOW()-INTERVAL '1 day')",
+            (ids[name], "ou_" + name, name),
+        )
+    pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (ids["owner"],))
+    for name in ("cm", "person", "other"):
+        pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)", (ids[name], name))
+        pg.execute(
+            "INSERT INTO lark_identities(open_id,contact_id,display_name,tenant_classification) VALUES(%s,%s,%s,%s)",
+            ("ou_" + name, ids[name], name, "internal" if name == "cm" else "known_external"),
+        )
+    pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('chat','Creator business','group')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'chat')", (ids["cm"],))
+    for number, name, text in (
+        (1, "person", "My creator account is @alice and I make LIVE videos for product campaigns."),
+        (2, "cm", "I am your CM and will manage your campaign"),
+    ):
+        _message(pg, settings, ids["cm"], str(number), "ou_" + name, text)
+    pg.execute("UPDATE chat_messages SET parent_id='1' WHERE message_id='2'")
+    key = contact_assessments.api_key_cipher(settings.token_encryption_key).encrypt("test-key-not-real")
+    pg.execute(
+        "INSERT INTO ai_feature_configs(feature,provider,project_id,model,enabled,api_key_ciphertext,key_suffix) "
+        "VALUES('contact_assessment','openai','test-project','existing-model',TRUE,%s,'real')", (key,),
+    )
     monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(contact_assessments, "get_settings", lambda: settings)
 
@@ -229,7 +253,6 @@ def people(pg, real_scan, monkeypatch):
         raise sys.exception()
 
     monkeypatch.setattr(contact_assessments.LOGGER, "warning", raise_error)
-    pg.execute("UPDATE ai_feature_configs SET enabled=(feature='contact_assessment')")
     return ids, settings
 
 
@@ -247,6 +270,58 @@ def _person(pg, name, *, role=None, source="manual"):
             (contact_id, role, source),
         )
     return contact_id
+
+
+def test_retiring_old_workflows_preserves_people_rosters_credentials_and_current_jobs(pg, people):
+    ids, _ = people
+    for feature in ("creator_workflow", "contact_assignment", "offhours_summary"):
+        pg.execute(
+            "INSERT INTO ai_feature_configs(feature,provider,project_id,model,enabled,api_key_ciphertext,key_suffix) "
+            "SELECT %s,provider,project_id,model,TRUE,api_key_ciphertext,key_suffix FROM ai_feature_configs "
+            "WHERE feature='contact_assessment'", (feature,),
+        )
+    run, task, history, current, candidate = (uuid4() for _ in range(5))
+    pg.execute(
+        "INSERT INTO creator_workflow_ai_runs(id,responsible_authorization_id,requested_by_authorization_id,"
+        "status,history_days,chat_limit,window_start,window_end) "
+        "VALUES(%s,%s,%s,'queued',30,30,NOW()-INTERVAL '1 day',NOW())", (run, ids["cm"], ids["owner"]),
+    )
+    for task_id, status in ((task, "running"), (history, "succeeded")):
+        pg.execute(
+            "INSERT INTO creator_workflow_ai_tasks(id,run_id,chat_id,input_fingerprint,initial_fingerprint,status) "
+            "VALUES(%s,%s,'chat',%s,%s,%s)", (task_id, run, str(task_id), str(task_id), status),
+        )
+    pg.execute("INSERT INTO creator_workflow_onboarding(authorization_id,status) VALUES(%s,'waiting_sync')",
+               (ids["cm"],))
+    pg.execute("INSERT INTO contact_assignment_assessments(id,contact_id,status) VALUES(%s,%s,'queued')",
+               (uuid4(), ids["person"]))
+    pg.execute("INSERT INTO contact_assessments(id,contact_id,status,policy_version) VALUES(%s,%s,'running',%s)",
+               (current, ids["person"], contact_assessments.POLICY_VERSION))
+    pg.execute("INSERT INTO creator_workflow_candidates(id,responsible_authorization_id,contact_id,"
+               "normalized_handle) VALUES(%s,%s,%s,'alice')", (candidate, ids["cm"], ids["person"]))
+    pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
+               "VALUES(%s,%s,%s,'manual')", (uuid4(), ids["person"], ids["cm"]))
+    protected = ("contacts", "lark_identities", "authorizations", "authorization_chats", "chat_messages",
+                 "authorization_message_observations", "contact_roles", "admin_roles", "admin_page_permissions",
+                 "creator_workflow_candidates", "contact_assignments", "contact_assessments")
+    before = {table: pg.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall() for table in protected}
+    key_sql = "SELECT feature,model,api_key_ciphertext,key_suffix FROM ai_feature_configs ORDER BY feature"
+    keys = pg.execute(key_sql).fetchall()
+    completed = pg.execute("SELECT * FROM creator_workflow_ai_tasks WHERE id=%s", (history,)).fetchone()
+    migration = Path(__file__).parents[1] / "migrations/046_retire_creator_workflows.sql"
+    pg.execute(migration.read_text())
+    pg.execute(migration.read_text())
+    assert all(pg.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall() == before[table] for table in protected)
+    assert pg.execute(key_sql).fetchall() == keys
+    assert pg.execute("SELECT * FROM creator_workflow_ai_tasks WHERE id=%s", (history,)).fetchone() == completed
+    assert pg.execute("SELECT status FROM creator_workflow_ai_tasks WHERE id=%s", (task,)).fetchone()[
+        "status"] == "cancelled"
+    assert pg.execute("SELECT status FROM contact_assignment_assessments").fetchone()["status"] == "cancelled"
+    assert pg.execute("SELECT status FROM creator_workflow_onboarding").fetchone()["status"] == "cancelled"
+    assert pg.execute("SELECT status FROM creator_workflow_ai_runs WHERE id=%s", (run,)).fetchone()[
+        "status"] == "cancelled"
+    assert {row["feature"] for row in pg.execute("SELECT feature FROM ai_feature_configs WHERE enabled")} == {
+        "contact_assessment", "offhours_summary"}
 
 
 def _message(pg, settings, cm, message_id, speaker, text, *, days=0):

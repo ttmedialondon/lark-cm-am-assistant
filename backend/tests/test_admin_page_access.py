@@ -15,7 +15,6 @@ from app import (
     admin_permissions,
     admin_reporting,
     contact_assessments,
-    contact_assignments,
     main,
     organization_sync,
 )
@@ -36,9 +35,6 @@ GET_ROUTES = (
 ASSESSMENT_ROUTE = f"/admin/contacts/ou_contact/assessments/{TARGET}"
 POST_ROUTES = (
     f"/admin/users/{TARGET}/permissions",
-    f"/admin/users/{TARGET}/assignment-eligibility",
-    "/admin/contacts/ou_contact/assignment",
-    "/admin/contacts/ou_contact/assignment/handoff",
     "/admin/contacts/ou_contact/organization",
     "/admin/contacts/ou_contact/assessments",
     f"{ASSESSMENT_ROUTE}/roles",
@@ -59,7 +55,7 @@ def data_fence(monkeypatch):
 
     for module in (
         admin, admin_permissions, admin_reporting, contact_assessments,
-        contact_assignments, organization_sync,
+        organization_sync,
     ):
         monkeypatch.setattr(module, "connection", forbidden_query)
 
@@ -264,9 +260,6 @@ def test_invalid_permission_forms_never_reach_a_database_write(monkeypatch, data
     ("contacts", "contact_detail.html", {
         "contact": {"open_id": "ou_creator", "primary_role": "creator", "confirmed_role_labels": []},
         "source_query": "", "assessment": {"status": "succeeded", "id": TARGET},
-        "is_creator": True, "assignment": None, "assignment_assessment": None,
-        "assignees": [{"id": TARGET, "display_name": "CM"}],
-        "assignment_choices": [{"id": TARGET, "display_name": "CM"}],
         "organizations": [], "identities": [], "conversations": [], "can_view_conversations": False,
     }),
     ("ai", "ai.html", {

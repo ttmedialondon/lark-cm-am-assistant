@@ -128,6 +128,21 @@ def test_first_time_enable_requires_a_key() -> None:
         )
 
 
+def test_blank_feature_key_can_be_enabled_on_real_postgres(pg):
+    owner = uuid4()
+    pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,%s,'test')",
+               (owner, "ou_" + owner.hex))
+    values = dict(provider="openai", project_id="proj_test", model="configured-model",
+                  updated_by_authorization_id=owner)
+    cipher = api_key_cipher(b"k" * 32)
+    save_feature_config(pg, cipher, "offhours_summary", **values, enabled=False, api_key="sk-test-only-1234")
+    columns = "api_key_ciphertext,key_updated_at,key_updated_by_authorization_id"
+    before = pg.execute(f"SELECT {columns} FROM ai_feature_configs WHERE feature='offhours_summary'").fetchone()
+    saved = save_feature_config(pg, cipher, "offhours_summary", **values, enabled=True, api_key="")
+    after = pg.execute(f"SELECT {columns} FROM ai_feature_configs WHERE feature='offhours_summary'").fetchone()
+    assert saved["enabled"] and saved["key_suffix"] == "1234" and after == before
+
+
 def test_auto_confirmation_never_allows_a_threshold_below_ninety_percent() -> None:
     with pytest.raises(FeatureConfigInputError, match="0.90"):
         save_feature_config(

@@ -188,11 +188,9 @@ def test_dispatch_uses_at_most_three_slots_and_alternates_queues(monkeypatch) ->
             return Future()
 
     assessment_jobs = iter(({"id": "identity-1"}, {"id": "identity-2"}))
-    assignment_jobs = iter(({"id": "assignment-1"},))
-    monkeypatch.setattr(worker.offhours_summary, "claim_next_summary", lambda: None)
-    monkeypatch.setattr(worker.creator_workflow_ai, "claim_next_creator_scan", lambda: None)
+    summary_jobs = iter(({"id": "summary-1"},))
+    monkeypatch.setattr(worker.offhours_summary, "claim_next_summary", lambda: next(summary_jobs))
     monkeypatch.setattr(worker.contact_assessments, "claim_next_contact_assessment", lambda: next(assessment_jobs))
-    monkeypatch.setattr(worker.contact_assignments, "claim_next_contact_assignment", lambda: next(assignment_jobs))
 
     futures = set()
     submitted_one, preference = worker._dispatch_ai_turn(object(), Executor(), futures, False)
@@ -201,7 +199,7 @@ def test_dispatch_uses_at_most_three_slots_and_alternates_queues(monkeypatch) ->
     submitted_four, _ = worker._dispatch_ai_turn(object(), Executor(), futures, preference)
 
     assert (submitted_one, submitted_two, submitted_three, submitted_four) == (True, True, True, False)
-    assert [job["id"] for _runner, job in submitted] == ["identity-1", "assignment-1", "identity-2"]
+    assert [job["id"] for _runner, job in submitted] == ["identity-1", "summary-1", "identity-2"]
 
 
 def test_offhours_tasks_fill_three_parallel_slots_without_waiting(monkeypatch) -> None:
@@ -215,6 +213,7 @@ def test_offhours_tasks_fill_three_parallel_slots_without_waiting(monkeypatch) -
             return object()
 
     monkeypatch.setattr(worker.offhours_summary, "claim_next_summary", lambda: next(jobs))
+    monkeypatch.setattr(worker.contact_assessments, "claim_next_contact_assessment", lambda: None)
     futures = set()
     worker._fill_ai_slots(object(), Executor(), futures, False)
     assert submitted == [0, 1, 2]

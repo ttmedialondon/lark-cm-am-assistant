@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from cryptography.exceptions import InvalidTag
 
-from . import ai_dispatch, contact_assessments, creator_workflow
+from . import ai_dispatch, contact_assessments
 from .ai_feature_config import FeatureConfigInputError, api_key_cipher
 from .config import get_settings
 from .crypto import TokenCipher, message_body_cipher
@@ -912,7 +912,9 @@ def get_summary_view(conn, actor_id):
     view["events"].sort(
         key=lambda event: ({"P0": 0, "P1": 1, "P2": 2, None: 3, "P3": 4}[event["priority"]], event["id"])
     )
-    creator_workflow._audit(
-        conn, UUID(str(actor_id)), "offhours_summary_read", {"run_id": row["id"], "event_count": len(view["events"])}
+    conn.execute(
+        "INSERT INTO audit_events(id, authorization_id, action, metadata) VALUES(%s,%s,%s,%s::jsonb)",
+        (uuid4(), UUID(str(actor_id)), "creator_workflow_offhours_summary_read",
+         json.dumps({"run_id": row["id"], "event_count": len(view["events"])}, default=str, ensure_ascii=False)),
     )
     return view
