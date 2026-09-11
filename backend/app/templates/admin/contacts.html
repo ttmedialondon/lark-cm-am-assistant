@@ -26,7 +26,7 @@
       <div class="table-responsive admin-directory__table"><table class="table table-vcenter card-table">
         <thead><tr><th>人员</th><th>类别</th><th>AI 置信度</th><th>完成时间</th><th>会话 / 本人消息</th><th></th></tr></thead>
         <tbody>{% for contact in contacts %}<tr>
-          <td><div class="fw-medium">{{ contact.display_name }}</div><div class="text-secondary small">{{ contact.open_id or '—' }}</div>{% if contact.lark_identity_count > 1 %}<div class="text-secondary small">{{ contact.lark_identity_count }} 个 Lark 身份，合计为 1 人</div>{% endif %}</td>
+          <td><div class="d-flex align-items-center gap-2"><span class="avatar avatar-sm rounded-circle flex-shrink-0 position-relative overflow-hidden" aria-hidden="true">{{ (contact.display_name or '?')[:1]|upper }}{% if contact.avatar_url %}<img data-contact-avatar="{{ contact.avatar_url }}" alt="" loading="lazy" referrerpolicy="no-referrer" width="32" height="32" class="position-absolute top-0 start-0 w-100 h-100" style="object-fit:cover;visibility:hidden">{% endif %}</span><div><div class="fw-medium">{{ contact.display_name }}</div><div class="text-secondary small">{{ contact.open_id or '—' }}</div>{% if contact.lark_identity_count > 1 %}<div class="text-secondary small">{{ contact.lark_identity_count }} 个 Lark 身份，合计为 1 人</div>{% endif %}</div></div></td>
           <td><span class="badge bg-{{ contact.category_badge }}-lt">{{ contact.category_label }}</span></td>
           <td>{{ contact.identity_ai_confidence_label }}</td><td class="text-secondary text-nowrap">{{ contact.identity_ai_finished_at_label }}</td>
           <td>{{ contact.conversation_count }} / {{ contact.message_count }}</td>
@@ -38,4 +38,5 @@
     </div>
   </div></div></div>
 </div>
+<script src="/static/contact-avatars.js?v=20260911" defer></script>
 {% endblock %}

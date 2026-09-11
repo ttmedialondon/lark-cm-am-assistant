@@ -41,7 +41,8 @@ def test_authorization_url_uses_oauth_client_id_and_pkce() -> None:
     "fields,expected",
     [
         ({"name": "Quanzhen Liang", "en_name": "Remi"}, "Remi（Quanzhen Liang）"),
-        ({"name": "Shang Ma", "en_name": "Shang Ma"}, "Shang Ma"),
+        ({"name": "Shang Ma", "en_name": "Shang Ma", "avatar_url": "https://s16-imfile-sg.feishucdn.com/a"},
+         "Shang Ma"),
         ({"name": " Shuxuan Li ", "en_name": "shuxuan li"}, "shuxuan li"),
         ({"en_name": "Remi"}, "Remi"),
         ({"name": "Quanzhen Liang"}, "Quanzhen Liang"),
@@ -55,6 +56,31 @@ def test_user_profile_preserves_both_names(monkeypatch, fields, expected) -> Non
     assert profile.en_name_present == ("en_name" in fields)
     assert profile.name == ((fields.get("name") or "").strip() or None)
     assert profile.en_name == fields.get("en_name")
+    assert profile.avatar_present == ("avatar_url" in fields)
+    assert profile.avatar_url == fields.get("avatar_url")
+
+
+def test_contact_profile_keeps_avatar_bound_to_requested_id_and_distinguishes_missing_fields(monkeypatch):
+    client = LarkClient(settings())
+    avatar = "https://s16-imfile-sg.feishucdn.com/static-resource/v1/avatar"
+    response = {"user": {"open_id": "ou_person", "name": "Same Name", "avatar": {"avatar_240": avatar}}}
+
+    def request(method, url, **kwargs):
+        assert method == "GET" and url.endswith("/contact/v3/users/ou_person")
+        assert kwargs == {"access_token": "user-token", "params": {"user_id_type": "open_id"}}
+        return response
+
+    monkeypatch.setattr(client, "_request", request)
+    profile = client.contact_user("user-token", "ou_person")
+    assert profile.open_id == "ou_person" and profile.avatar_url == avatar and profile.avatar_present
+    response["user"].pop("avatar")
+    assert not client.contact_user("user-token", "ou_person").avatar_present
+    response["user"]["avatar"] = {}
+    assert client.contact_user("user-token", "ou_person").avatar_present
+    assert client.contact_user("user-token", "ou_person").avatar_url is None
+    response["user"]["open_id"] = "ou_someone_with_same_name"
+    with pytest.raises(LarkApiError, match="identity did not match"):
+        client.contact_user("user-token", "ou_person")
 
 
 def test_chat_member_list_requests_a_paginated_user_roster(monkeypatch) -> None:

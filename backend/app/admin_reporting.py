@@ -27,6 +27,7 @@ from .contact_assessments import POLICY_VERSION as CONTACT_IDENTITY_POLICY
 from .contact_taxonomy import CONTACT_ROLE_CODES, ORGANIZATION_KIND_LABELS, ROLE_LABELS, role_label
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
+from .identity_profiles import safe_avatar_url
 from .message_mentions import mention_names, resolve_mentions, rich_mention_text
 
 LONDON_TIME_ZONE = ZoneInfo("Europe/London")
@@ -759,6 +760,8 @@ CONTACT_DIRECTORY_SQL = f"""
             contact.created_at, contact.updated_at,
             COALESCE(contact.display_name, primary_identity.display_name) AS display_name,
             primary_identity.open_id,
+            CASE WHEN primary_identity.avatar_status='unavailable' THEN NULL
+                 ELSE primary_identity.avatar_url END AS avatar_url,
             primary_identity.tenant_key,
             primary_identity.tenant_classification,
             identity_counts.lark_identity_count,
@@ -783,7 +786,8 @@ CONTACT_DIRECTORY_SQL = f"""
                 AS confirmed_roles
         FROM contacts contact
         LEFT JOIN LATERAL (
-            SELECT identity.open_id, identity.display_name, identity.tenant_key, identity.tenant_classification
+            SELECT identity.open_id, identity.display_name, identity.avatar_url, identity.avatar_status,
+                identity.tenant_key, identity.tenant_classification
             FROM lark_identities identity
             WHERE identity.contact_id = contact.id AND identity.identity_type = 'user'
             ORDER BY identity.last_seen_at DESC, identity.open_id
@@ -1519,6 +1523,7 @@ def _decorate_job(row: dict[str, Any]) -> dict[str, Any]:
 def _decorate_contact(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     item["display_name"] = item.get("display_name") or "Lark 参与者（姓名未返回）"
+    item["avatar_url"] = safe_avatar_url(item.get("avatar_url"))
     roles = item.get("confirmed_roles")
     roles = roles if isinstance(roles, list | tuple) else ()
     item["confirmed_role_labels"] = [ROLE_LABELS[role] for role in roles if role in ROLE_LABELS]

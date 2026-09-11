@@ -30,6 +30,7 @@ from .config import get_settings
 from .crypto import TokenCipher
 from .db import connection, database_is_ready
 from .identity_names import update_identity_names
+from .identity_profiles import safe_avatar_url, store_profile_avatar
 from .lark_api import LarkApiError, LarkClient
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -182,7 +183,7 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 profile.open_id,
                 profile.union_id,
                 profile.display_name,
-                profile.avatar_url,
+                safe_avatar_url(profile.avatar_url),
                 cipher.encrypt(tokens.access_token),
                 cipher.encrypt(tokens.refresh_token) if tokens.refresh_token else None,
                 token_expires_at,
@@ -210,6 +211,7 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
             conn, profile.open_id, name=profile.name, en_name=profile.en_name,
             en_name_present=profile.en_name_present, authoritative=True,
         )
+        store_profile_avatar(conn, profile.open_id, profile.avatar_url, avatar_present=profile.avatar_present)
         conn.execute(
             "UPDATE authorizations SET display_name=%s WHERE id=%s AND display_name IS DISTINCT FROM %s",
             (profile_label, authorization_id, profile_label),

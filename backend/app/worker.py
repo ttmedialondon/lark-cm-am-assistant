@@ -21,6 +21,7 @@ from . import (
     contact_assignments,
     creator_onboarding,
     creator_workflow_ai,
+    identity_profiles,
     offhours_summary,
     organization_sync,
 )
@@ -108,6 +109,8 @@ def run_forever() -> None:
     next_organization_check = 0.0
     ai_executor = ThreadPoolExecutor(max_workers=ai_dispatch.MAX_CONCURRENT_REQUESTS, thread_name_prefix="openai")
     ai_futures: set[Future[Any]] = set()
+    avatar_executor = ThreadPoolExecutor(max_workers=identity_profiles.MAX_WORKERS, thread_name_prefix="lark-avatar")
+    avatar_futures: set[Future[Any]] = set()
     # PostgreSQL owns the cross-process limit; this executor only provides the
     # local page fetches.  Writes remain on the main thread below.
     lark_executor = ThreadPoolExecutor(
@@ -155,7 +158,8 @@ def run_forever() -> None:
                     _finish_completed_jobs(page_futures)
                     _fill_lark_slots(settings, client, lark_executor, page_futures)
                     _schedule_member_snapshot(settings, client, lark_executor, page_futures, member_futures)
-                time.sleep(0.05 if page_futures or member_futures else settings.worker_idle_seconds)
+                    identity_profiles.fill_slots(settings, client, avatar_executor, avatar_futures)
+                time.sleep(0.05 if page_futures or member_futures or avatar_futures else settings.worker_idle_seconds)
             except KeyboardInterrupt:
                 raise
             except Exception:  # Unexpected failures must not terminate the systemd worker loop.
@@ -165,6 +169,7 @@ def run_forever() -> None:
         # Leases preserve in-flight work if systemd terminates us during a call.
         ai_executor.shutdown(wait=False, cancel_futures=False)
         lark_executor.shutdown(wait=False, cancel_futures=False)
+        avatar_executor.shutdown(wait=False, cancel_futures=False)
         http_client.close()
 
 
@@ -974,6 +979,9 @@ def _refresh_profile_name(
             ):
                 return
             _assert_discovery_current(conn, job)
+            identity_profiles.store_profile_avatar(
+                conn, profile.open_id, profile.avatar_url, avatar_present=profile.avatar_present,
+            )
             label = _upsert_lark_identity(
                 conn,
                 profile.open_id,

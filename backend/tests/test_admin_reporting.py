@@ -94,6 +94,7 @@ def test_contact_labels_do_not_imply_identity_or_ownership():
 
 def test_people_directory_all_contacts_current_policy_priority_and_unfiltered_progress(pg, monkeypatch):  # noqa: F811
     monkeypatch.setattr(admin_reporting, "connection", lambda: nullcontext(pg))
+    people = {}
     cases = [
         ("manual", "merchant_contact", "manual", "succeeded", "protected_manual", None),
         ("internal", "internal_colleague", "lark_internal_tenant", "succeeded", "verified_internal", None),
@@ -106,6 +107,7 @@ def test_people_directory_all_contacts_current_policy_priority_and_unfiltered_pr
     ]
     for name, role, source, status, reason, confidence in cases:
         contact_id = uuid4()
+        people[name] = contact_id
         pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)", (contact_id, name))
         if name != "orphan":
             pg.execute("INSERT INTO lark_identities(open_id,contact_id,display_name,tenant_classification) "
@@ -122,9 +124,20 @@ def test_people_directory_all_contacts_current_policy_priority_and_unfiltered_pr
                    "VALUES(%s,%s,%s,%s,%s::jsonb)",
                    (uuid4(), contact_id, status, "legacy" if name == "old" else admin_reporting.CONTACT_IDENTITY_POLICY,
                     json.dumps(payload)))
+    avatar_host = "https://s1-imfile.feishucdn.com/static-resource/v1/"
+    for name in ("manual", "AI"):
+        pg.execute("UPDATE lark_identities SET display_name='Same Lark name',avatar_url=%s WHERE open_id=%s",
+                   (avatar_host + name + ".png", "ou_" + name))
+    pg.execute("INSERT INTO lark_identities(open_id,contact_id,display_name,avatar_url,last_seen_at) "
+               "VALUES('ou_AI_old',%s,'Same Lark name',%s,NOW()-INTERVAL '1 day')",
+               (people["AI"], avatar_host + "old.png"))
     directory = admin_reporting.contacts()
     by_name = {row["display_name"]: row for row in directory["items"]}
     assert directory["total_count"] == 8 and by_name["orphan"]["open_id"] is None
+    assert by_name["orphan"]["avatar_url"] is None
+    assert by_name["manual"]["avatar_url"] == avatar_host + "manual.png"
+    assert by_name["AI"]["open_id"] == "ou_AI" and by_name["AI"]["avatar_url"] == avatar_host + "AI.png"
+    assert by_name["AI"]["lark_identity_count"] == 2
     assert by_name["manual"]["category"] == "merchant_contact"
     assert by_name["internal"]["classification_source_label"] == "已核实同事"
     assert by_name["old"]["category"] == by_name["low"]["category"] == "unclassified"
@@ -144,6 +157,13 @@ def test_people_directory_all_contacts_current_policy_priority_and_unfiltered_pr
     detail = admin_reporting.contact_detail("ou_AI", include_conversations=False)
     assert detail["contact"]["category"] == "creator"
     assert detail["conversations"]["items"] == []
+    pg.execute("UPDATE lark_identities SET avatar_status='unavailable' WHERE open_id='ou_AI'")
+    assert admin_reporting.contact_detail("ou_AI", include_conversations=False)["contact"]["avatar_url"] is None
+    pg.execute("UPDATE lark_identities SET avatar_status='failed' WHERE open_id='ou_AI'")
+    assert admin_reporting.contact_detail("ou_AI", include_conversations=False)["contact"]["avatar_url"] == (
+        avatar_host + "AI.png")
+    pg.execute("UPDATE lark_identities SET avatar_url=NULL WHERE open_id='ou_AI'")
+    assert admin_reporting.contact_detail("ou_AI", include_conversations=False)["contact"]["avatar_url"] is None
 
 
 def test_seconds_label_prefers_human_readable_units():

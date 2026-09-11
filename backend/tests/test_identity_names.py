@@ -11,7 +11,7 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from app import worker
+from app import identity_profiles, worker
 from app.crypto import TokenCipher
 from app.identity_names import format_display_name, update_identity_names
 from app.lark_api import LarkApiError, LarkProfile
@@ -65,6 +65,9 @@ def pg(monkeypatch):
                 conn.execute(path.read_text())
         conn.execute("INSERT INTO lark_identities(open_id,display_name) VALUES('ou_legacy','Old Raw Name')")
         conn.execute((Path(__file__).parents[1] / "migrations/033_identity_names.sql").read_text())
+        for path in sorted((Path(__file__).parents[1] / "migrations").glob("*.sql")):
+            if int(path.name[:3]) > 33:
+                conn.execute(path.read_text())
         monkeypatch.setattr(worker, "connection", lambda: nullcontext(conn))
         try:
             yield conn
@@ -293,13 +296,16 @@ def test_optional_profile_refresh_fences_writes_and_never_breaks_authorization(p
                 name="Quanzhen Liang",
                 en_name="Remi",
                 en_name_present=True,
-                avatar_url=None,
+                avatar_url="https://s16-imfile-sg.feishucdn.com/new-avatar",
+                avatar_present=True,
             )
 
     worker._refresh_profile_name(job, authorization, "test-access", Client(), SimpleNamespace(token_encryption_key=key))
     auth = pg.execute("SELECT display_name,status FROM authorizations WHERE id=%s", (auth_id,)).fetchone()
     assert auth["display_name"] == ("Remi（Quanzhen Liang）" if change is None else "Verified Old Profile")
     assert auth["status"] == ("revoked" if change == "revoked" else "active")
+    avatar = pg.execute("SELECT avatar_url FROM lark_identities WHERE open_id='ou_person'").fetchone()["avatar_url"]
+    assert avatar == ("https://s16-imfile-sg.feishucdn.com/new-avatar" if change is None else None)
 
 
 @pytest.mark.parametrize("change", [None, "identity", "token", "revoked"])
@@ -456,3 +462,159 @@ def test_member_name_refresh_retries_transaction_conflicts_without_aborting_batc
     assert result == (
         {"status": "database_busy", "users": []} if failures == 3 else {"status": "succeeded", "users": ["ou_known"]}
     )
+
+
+def test_avatar_cache_permission_backoff_visibility_and_late_response_guards(pg, person, monkeypatch):
+    """One real queue workflow covers cache safety and a whole denied-provider sweep."""
+    profiles = identity_profiles
+    key, own_id = b"x" * 32, person[1]
+    settings, cipher = SimpleNamespace(token_encryption_key=key), TokenCipher(key)
+    old_url, new_url = ("https://s16-imfile-sg.feishucdn.com/old", "https://s16-imfile-sg.feishucdn.com/new")
+    for bad in ("http://cdn.feishucdn.com/a", "https://cdn.feishucdn.com.evil/a", "https://127.0.0.1/a",
+                "https://u@cdn.feishucdn.com/a", "https://cdn.feishucdn.com:444/a", "javascript:alert(1)"):
+        assert profiles.safe_avatar_url(bad) is None
+    assert profiles.safe_avatar_url(old_url) == old_url
+    monkeypatch.setattr(profiles, "connection", lambda: nullcontext(pg))
+    # The avatar-only 1rps reservation must not slow the shared message request clock.
+    shared_clock = pg.execute("SELECT next_request_at FROM lark_sync_admission_state").fetchone()["next_request_at"]
+    profiles._wait_avatar_slot()
+    assert (pg.execute("SELECT next_request_at FROM lark_sync_admission_state").fetchone()["next_request_at"]
+            == shared_clock)
+    monkeypatch.setattr(profiles, "_wait_avatar_slot", lambda: None)
+    monkeypatch.setattr(profiles.LOGGER, "warning", lambda *_: pytest.fail("Unexpected avatar worker error"))
+    pg.execute("UPDATE authorizations SET access_token_ciphertext=%s,access_token_expires_at=NOW()+INTERVAL '1 hour',"
+               "body_consent_at=NOW()-INTERVAL '1 day' WHERE id=%s", (cipher.encrypt("own-token"), own_id))
+    other_cm = uuid4()
+    pg.execute("INSERT INTO lark_identities(open_id) VALUES('ou_cm2')")
+    pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext,access_token_expires_at,body_consent_at) "
+               "VALUES(%s,'ou_cm2',%s,NOW()+INTERVAL '1 hour',NOW()-INTERVAL '1 day')",
+               (other_cm, cipher.encrypt("cm2-token")))
+    # A login-only CM has no external visibility and must not prevent the bulk denied-source pass.
+    pg.execute("INSERT INTO lark_identities(open_id) VALUES('ou_self_only')")
+    pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext,access_token_expires_at) "
+               "VALUES(%s,'ou_self_only',%s,NOW()+INTERVAL '1 hour')", (uuid4(), cipher.encrypt("self-token")))
+    for cm in (own_id, other_cm):
+        pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'chat_a')", (cm,))
+    for index in range(4):
+        target = f"ou_external_{index}"
+        pg.execute("INSERT INTO lark_identities(open_id,avatar_url) VALUES(%s,%s)", (target, old_url))
+        pg.execute("INSERT INTO chat_messages(chat_id,message_id,sender_open_id) VALUES('chat_a',%s,%s)",
+                   (str(index), target))
+        for cm in (own_id, other_cm):
+            pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+                       "VALUES(%s,'chat_a',%s)", (cm, str(index)))
+    before = pg.execute("SELECT open_id,contact_id,name,en_name,display_name,last_seen_at FROM lark_identities "
+                        "ORDER BY open_id").fetchall()
+    calls = []
+
+    class Client:
+        mode = "denied"
+
+        def user_info(self, token):
+            calls.append(("self", token))
+            return LarkProfile({"own-token": "ou_person", "cm2-token": "ou_cm2", "self-token": "ou_self_only"}[token],
+                               None, None, new_url,
+                               avatar_present=True)
+
+        def contact_user(self, token, open_id):
+            calls.append(("contact", token))
+            if self.mode == "denied":
+                raise LarkApiError(400, 99991679, "scope not allowed")
+            if self.mode == "network":
+                raise LarkApiError(503, None, "network failure")
+            if self.mode == "other_reader" and token == self.first_token:
+                raise LarkApiError(400, 41050, "This CM cannot access this person")
+            if self.mode == "changed_scope":
+                pg.execute("UPDATE authorizations SET body_consent_at=NOW()")
+            if self.mode == "newer_cache":
+                profiles.store_profile_avatar(pg, open_id, new_url)
+            return LarkProfile(open_id, None, None, old_url, avatar_present=self.mode != "missing_field")
+
+    client = Client()
+    while job := profiles.claim_next():
+        profiles.run_claimed(job, client, settings)
+    # Both visible CMs get one probe; the first denied CM must not mask the untried one.
+    assert sorted(token for kind, token in calls if kind == "contact") == ["cm2-token", "own-token"]
+    assert len(calls) == 5
+    statuses = {r["open_id"]: r for r in pg.execute(
+        "SELECT open_id,avatar_status,avatar_url,avatar_retry_at>NOW() AS delayed FROM lark_identities")}
+    assert all(row["delayed"] for row in statuses.values())
+    assert statuses["ou_person"]["avatar_status"] == "succeeded"
+    assert statuses["ou_external_3"]["avatar_status"] == "unavailable"
+    assert statuses["ou_external_3"]["avatar_url"] == old_url  # Kept, but unavailable is hidden by the read model.
+    assert pg.execute("SELECT avatar_error_code FROM lark_identities WHERE open_id='ou_legacy'").fetchone()[
+        "avatar_error_code"] == "no_visible_authorization"
+    assert pg.execute("SELECT open_id,contact_id,name,en_name,display_name,last_seen_at FROM lark_identities "
+                      "ORDER BY open_id").fetchall() == before
+
+    target = "ou_external_0"
+
+    def due():
+        pg.execute("UPDATE lark_identities SET avatar_retry_at=NOW() WHERE open_id=%s", (target,))
+        return profiles.claim_next()
+
+    retry = due()
+    assert pg.execute("SELECT avatar_status FROM lark_identities WHERE open_id=%s", (target,)).fetchone()[
+        "avatar_status"] == "unavailable"  # A retry must not briefly reveal the old denied avatar.
+    profiles.run_claimed(retry, client, settings)
+    assert len(calls) == 5  # Same-day retry only observes the persisted provider cooldown.
+    pg.execute("UPDATE authorizations SET scopes=ARRAY['new-profile-scope'] WHERE id=%s", (own_id,))
+    client.mode = "good"
+    profiles.run_claimed(due(), client, settings)
+    assert pg.execute("SELECT avatar_status FROM lark_identities WHERE open_id=%s", (target,)).fetchone()[
+        "avatar_status"] == "succeeded"
+    assert profiles.claim_next() is None
+    # An otherwise working CM's per-person 41050 cannot hide another currently authorized reader.
+    pg.execute("UPDATE identity_profile_providers SET status='available',retry_at=NOW()")
+    client.mode = "other_reader"
+    client.first_token = cipher.decrypt(profiles._source(pg, target)["access_token_ciphertext"])
+    started = len(calls)
+    profiles.run_claimed(due(), client, settings)
+    assert len(calls) == started + 2 and len({token for _, token in calls[started:]}) == 2
+    assert pg.execute("SELECT avatar_status FROM lark_identities WHERE open_id=%s", (target,)).fetchone()[
+        "avatar_status"] == "succeeded"
+    # A restarted worker can reclaim an expired lease; the old worker must not send or overwrite it.
+    stale = due()
+    current = due()
+    started = len(calls)
+    profiles.run_claimed(stale, client, settings)
+    assert len(calls) == started
+    assert pg.execute("SELECT avatar_claim_id FROM lark_identities WHERE open_id=%s", (target,)).fetchone()[
+        "avatar_claim_id"] == current["avatar_claim_id"]
+    client.mode = "good"
+    profiles.run_claimed(current, client, settings)
+    client.mode = "newer_cache"
+    profiles.run_claimed(due(), client, settings)
+    assert (pg.execute("SELECT avatar_url FROM lark_identities WHERE open_id=%s", (target,)).fetchone()["avatar_url"]
+            == new_url)
+    client.mode = "network"
+    profiles.run_claimed(due(), client, settings)
+    row = pg.execute("SELECT avatar_url,avatar_status FROM lark_identities WHERE open_id=%s", (target,)).fetchone()
+    assert row == {"avatar_url": new_url, "avatar_status": "failed"}
+    pg.execute("UPDATE identity_profile_providers SET status='available'")
+    client.mode = "changed_scope"
+    profiles.run_claimed(due(), client, settings)
+    row = pg.execute("SELECT avatar_url,avatar_status FROM lark_identities WHERE open_id=%s", (target,)).fetchone()
+    assert row == {"avatar_url": new_url, "avatar_status": "unavailable"}
+    assert pg.execute("SELECT COUNT(*) AS n FROM authorizations WHERE status='active'").fetchone()["n"] == 3
+    # Local sources must be CM-specific and current: an old observation/foreign roster cannot grant access.
+    pg.execute("UPDATE authorization_message_observations SET observed_at=NOW()-INTERVAL '2 days'")
+    pg.execute("INSERT INTO chat_members(chat_id,open_id,member_type,last_observed_by_authorization_id) "
+               "VALUES('chat_a',%s,'user',%s)", (target, other_cm))
+    pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (other_cm,))
+    assert profiles._source(pg, target) is None
+    pg.execute("UPDATE authorization_chats SET p2p_counterpart_open_id=%s,p2p_counterpart_type='app'", (target,))
+    assert profiles._source(pg, target) is None
+    pg.execute("UPDATE chat_members SET last_observed_by_authorization_id=%s WHERE open_id=%s", (own_id, target))
+    assert profiles._source(pg, target)["id"] == own_id
+    pg.execute("UPDATE authorizations SET body_consent_at=NULL WHERE id=%s", (own_id,))
+    assert profiles._source(pg, target) is None
+    profiles.store_profile_avatar(pg, target, None, avatar_present=False)
+    assert (pg.execute("SELECT avatar_url FROM lark_identities WHERE open_id=%s", (target,)).fetchone()["avatar_url"]
+            == new_url)
+    assert not profiles.store_profile_avatar(pg, target, "https://attacker.invalid/image")
+    assert (pg.execute("SELECT avatar_url,avatar_status FROM lark_identities WHERE open_id=%s", (target,)).fetchone()
+            == {"avatar_url": new_url, "avatar_status": "unavailable"})
+    profiles.store_profile_avatar(pg, target, None, avatar_present=True)
+    assert (pg.execute("SELECT avatar_url FROM lark_identities WHERE open_id=%s", (target,)).fetchone()["avatar_url"]
+            is None)

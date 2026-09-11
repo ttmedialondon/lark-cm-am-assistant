@@ -65,6 +65,7 @@ class LarkProfile:
     avatar_url: str | None
     en_name: str | None = None
     en_name_present: bool = False
+    avatar_present: bool = False
 
     @property
     def display_name(self) -> str | None:
@@ -133,6 +134,36 @@ class LarkClient:
             avatar_url=_string(data.get("avatar_url")),
             en_name=_string(data.get("en_name")),
             en_name_present="en_name" in data,
+            avatar_present="avatar_url" in data,
+        )
+
+    def contact_user(self, access_token: str, open_id: str) -> LarkProfile:
+        """Fetch only a permitted user's profile; never associate by name."""
+        data = self._request(
+            "GET",
+            f"{self.settings.lark_api_base_url}/open-apis/contact/v3/users/{quote(open_id, safe='')}",
+            access_token=access_token,
+            params={"user_id_type": "open_id"},
+        )
+        user = data.get("user")
+        if not isinstance(user, dict) or user.get("open_id") != open_id:
+            raise LarkApiError(502, None, "Lark profile identity did not match the requested user")
+        avatar = user.get("avatar")
+        if avatar is not None and not isinstance(avatar, dict):
+            raise LarkApiError(502, None, "Lark profile avatar had an invalid format")
+        avatar_url = next(
+            (_string((avatar or {}).get(key)) for key in ("avatar_240", "avatar_72", "avatar_640", "avatar_origin")
+             if _string((avatar or {}).get(key))),
+            None,
+        )
+        return LarkProfile(
+            open_id=open_id,
+            union_id=_string(user.get("union_id")),
+            name=_string(user.get("name")),
+            en_name=_string(user.get("en_name")),
+            en_name_present="en_name" in user,
+            avatar_url=avatar_url,
+            avatar_present="avatar" in user,
         )
 
     def list_chats(
