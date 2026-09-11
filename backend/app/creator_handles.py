@@ -158,6 +158,7 @@ def _seed(conn, source):
     candidates = conn.execute(
         """SELECT t.* FROM creator_ownership_tasks t WHERE t.run_id=%s
         AND t.status='succeeded' AND t.outcome='suggested' AND t.confidence>=.95 AND t.policy_version=%s
+        AND NOT EXISTS (SELECT 1 FROM creator_handle_tasks h WHERE h.ownership_task_id=t.id)
         AND NOT EXISTS (SELECT 1 FROM creator_ownership_tasks n WHERE n.contact_id=t.contact_id
           AND n.cm_authorization_id=t.cm_authorization_id AND n.status='succeeded'
           AND (n.created_at,n.id)>(t.created_at,t.id))
@@ -206,6 +207,20 @@ def create_preview(actor_id, cm_id, ownership_run_id=None):
         if not source:
             raise ValueError("请先完成第二步达人归属判断。")
         run_id = _seed(conn, source)
+        run = conn.execute("SELECT * FROM creator_handle_runs WHERE id=%s FOR UPDATE", (run_id,)).fetchone()
+        if run["status"] in ("running", "paused"):
+            raise ValueError("请先完成当前批次；运行中不会替换正在使用的材料。")
+        # An explicit free preview may refresh changed extraction rules/history, but never replay a paid request.
+        count = conn.execute(
+            """UPDATE creator_handle_tasks SET status='pending',reason_code='',pack_ciphertext=NULL,
+            result_ciphertext=NULL,refs='[]',stats='{}',fingerprint=NULL,config_fingerprint=NULL,
+            outcome=NULL,confidence=NULL,reused_from=NULL,finished_at=NULL,updated_at=NOW()
+            WHERE run_id=%s AND api_requests=0 AND attempts<2 AND review_status='pending'
+            AND status IN ('ready','skipped','failed','invalid','succeeded')""",
+            (run_id,),
+        ).rowcount
+        if count:
+            conn.execute("UPDATE creator_handle_runs SET status='preparing',updated_at=NOW() WHERE id=%s", (run_id,))
         _audit(conn, actor_id, "preview", {"run_id": str(run_id), "cm_id": str(cm_id)})
         return run_id
 

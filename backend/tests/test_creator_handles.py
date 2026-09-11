@@ -108,6 +108,14 @@ def test_suggestions_preview_then_explicit_auto_admission_is_atomic_and_idempote
     run = pg.execute("SELECT auto_admit FROM creator_handle_runs WHERE id=%s", (case.run,)).fetchone()
     assert not run["auto_admit"]
     assert all("text" not in ref and "body" not in ref for ref in task["refs"])
+    assert handles.create_preview(pilot.ids["owner"], pilot.ids["cm"], case.source) == case.run
+    pending = _task(pg, case)
+    assert pending["status"] == "pending" and pending["pack_ciphertext"] is None and pending["refs"] == []
+    assert pending["fingerprint"] is None and pending["api_requests"] == 0 and not case.calls
+    _drain_preview(pilot.settings)
+    rebuilt = _task(pg, case)
+    assert rebuilt["id"] == task["id"] and rebuilt["status"] == "ready"
+    assert rebuilt["fingerprint"] == task["fingerprint"] and not case.calls
     with pytest.raises(ValueError):
         ownership.confirm_tasks(pilot.ids["owner"], case.source, [task["ownership_task_id"]])
     with pg.transaction(force_rollback=True):
@@ -130,9 +138,16 @@ def test_suggestions_preview_then_explicit_auto_admission_is_atomic_and_idempote
         assert _task(pg, case)["status"] == "ready" and not case.calls
     assert handles.start_run(pilot.ids["owner"], case.run) == 1
     assert handles.start_run(pilot.ids["owner"], case.run) == 0
+    with pytest.raises(ValueError, match="运行中"):
+        handles.create_preview(pilot.ids["owner"], pilot.ids["cm"], case.source)
+    assert _task(pg, case)["status"] == "queued" and not case.calls
     _drain_paid(pilot.settings)
     task = _task(pg, case)
     assert task["status"] == "succeeded" and task["outcome"] == "matched" and task["api_requests"] == 1
+    paid = _snapshot(pg, ("creator_handle_tasks",))
+    assert handles.create_preview(pilot.ids["owner"], pilot.ids["cm"], case.source) == case.run
+    _drain_preview(pilot.settings)
+    assert _snapshot(pg, paid) == paid and len(case.calls) == 1
     for _ in range(2):
         assert handles.page_data(pilot.ids["cm"])["items"][0]["can_confirm"]
     assert len(case.calls) == 1 and handles.start_run(pilot.ids["owner"], case.run) == 0

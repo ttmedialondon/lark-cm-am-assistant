@@ -46,19 +46,22 @@ def scope(pg, monkeypatch):
             )
     number = 0
 
-    def add(sender, text, *, chat="private", observer="cm", parent=None, mention=None, when=None):
+    def add(sender, text, *, chat="private", observer="cm", parent=None, mention=None, when=None, message_type="text"):
         nonlocal number
         number += 1
         message_id = f"m{number}"
         pg.execute(
             "INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,"
             "body_ciphertext,message_create_time,parent_id,mentions_json) "
-            "VALUES(%s,%s,%s,'user','text',%s,%s,%s,%s)",
+            "VALUES(%s,%s,%s,'user',%s,%s,%s,%s,%s)",
             (
                 chat,
                 message_id,
                 "ou_" + sender,
-                message_body_cipher(settings.token_encryption_key).encrypt(json.dumps({"text": text})),
+                message_type,
+                message_body_cipher(settings.token_encryption_key).encrypt(
+                    json.dumps(text if isinstance(text, dict) else {"text": text})
+                ),
                 when or datetime(2025, 1, 1, tzinfo=UTC) + timedelta(minutes=number),
                 parent,
                 Jsonb([{"key": "@_user_1", "id": "ou_" + mention, "id_type": "open_id"}] if mention else []),
@@ -117,17 +120,24 @@ def test_exact_normalization_and_group_patterns_reject_guessing():
     assert handles._name_handles("Team creator._123 & TT Media") == []
     assert handles._name_handles("creator._123 & Unknown Agency") == []
     assert handles._name_handles("creator._123 TT Media") == []
+    assert handles._clues("BrandForTest X TT please post a video") == []  # Titles are not a body pattern.
+    assert handles._clues("@_all @all @_user_1 @U1 @CM1") == []
+    for hashtag in ("#TikTokMadeMeBuyIt", "#SummerSale2026FashionDiscount"):
+        text = handles._body(hashtag, {"message_type": "text", "mentions_json": []}, {}, {})
+        assert "已提供广告授权码" not in text and not handles._OWN_ACTION.search(text)
 
 
 def test_self_account_keeps_exact_handle_and_current_scope_not_other_bodies(pg, scope, monkeypatch):
     ids, settings, add = scope
     first = add("creator", "My TikTok handle is @creator._123. Email private@example.com, phone +447123456789")
+    add("creator", "https://www.tiktok.com/@unverified_link", chat="group")
     add("creator", "My handle is @NOT_AUTHORIZED_SECRET", observer="owner")
     add("other", "PRIVATE_THIRD_PERSON_BODY my account is @someone_else", chat="group")
     material = handles.build_evidence(ids["creator"], ids["cm"], settings)
     assert material["eligible"]
     packed = json.dumps(material["pack"])
     assert "creator._123" in packed
+    assert "unverified_link" in material["pack"]["allowed_handles"]  # U1 links remain clues, not proof.
     assert not any(
         secret in packed
         for secret in (
@@ -188,12 +198,39 @@ def test_self_account_keeps_exact_handle_and_current_scope_not_other_bodies(pg, 
 
 def test_group_named_account_requires_actual_own_account_business_not_one_creator_or_at(pg, scope):
     ids, settings, add = scope
+    for _ in range(45):
+        add("cm", "@_all TOYBRAND offers for your next video and LIVE", chat="group")
+    add("cm", "BrandForTest X TT send a video for our promotion", chat="group")
+    add("cm", "My handle is @other_brand", chat="group")
+    add("cm", "@_user_1 Send your video ad code", chat="group", mention="other")
     cm = add("cm", "@_user_1 Can you send me your video ad code?", chat="group", mention="creator")
-    add("creator", "Here is my ad code: SPARKTEST", chat="group", parent=cm)
+    add("creator", "Sounds great I’ll get the ad code now..", chat="group", parent=cm)
+    add(
+        "creator",
+        {
+            "en_us": {"content": [[{"tag": "text", "text": "Here is my ad code: SPARKTEST123"}]]},
+            "zh_cn": {"content": [[{"tag": "text", "text": "Here is my ad code: SPARKTEST123"}]]},
+        },
+        chat="group",
+        message_type="post",
+    )
     material = handles.build_evidence(ids["creator"], ids["cm"], settings)
+    packed = json.dumps(material["pack"], ensure_ascii=False)
+    assert not any(s in packed for s in ("TOYBRAND", "BrandForTest", "other_brand", "SPARKTEST123"))
+    assert packed.count("[已提供广告授权码]") == 1
+    assert not material["stats"]["material_incomplete"] and material["stats"]["excluded_group_messages"] == 48
     assert not any(m["handles"] for m in material["pack"]["messages"])  # Only the title supplies the handle.
     assert (
         handles.validate_result(_result(material["pack"], basis="group_business_identity"), material["pack"])["outcome"]
+        == "matched"
+    )
+    promise_refs = [g["ref"] for g in material["pack"]["groups"]] + [
+        m["ref"] for m in material["pack"]["messages"] if "已提供广告授权码" not in m["text"]
+    ]
+    assert (
+        handles.validate_result(
+            _result(material["pack"], basis="group_business_identity", labels=promise_refs), material["pack"]
+        )["outcome"]
         == "matched"
     )
     title_only = [g["ref"] for g in material["pack"]["groups"]]
@@ -231,6 +268,10 @@ def test_group_named_account_requires_actual_own_account_business_not_one_creato
         handles.validate_result(_result(weak["pack"], basis="group_business_identity"), weak["pack"])["outcome"]
         == "review"
     )
+    add("cm", "Can you send your video ad code?", chat="group")
+    add("creator", "Here is my ad code: SPARKTEST456", chat="group")
+    paired = handles.build_evidence(ids["creator"], ids["cm"], settings)
+    assert len(paired["pack"]["messages"]) >= 2  # Same account-topic exchange can be reviewed without an @.
 
 
 def test_old_rename_and_over_limit_material_cannot_silently_produce_high_confidence(pg, scope):
