@@ -660,6 +660,132 @@ def advance_scan(pg):
     onboarding.advance_initial_scans()
 
 
+def test_creator_library_reset_clears_only_derived_creator_data_and_cannot_replay(pg, real_scan):
+    ids, _settings = real_scan
+    action = "creator_library_reset_complete_identity_20260911"
+    # The fixture applied this one-off migration to an empty schema; seed its pre-release state.
+    pg.execute("DELETE FROM audit_events WHERE action=%s", (action,))
+    run = start_scan(pg, ids["owner"], ids["cm"])
+    assert ai.claim_next_creator_scan() is not None
+    pg.execute(
+        "INSERT INTO creator_workflow_onboarding(authorization_id,status,run_id,next_check_at) "
+        "VALUES(%s,'scanning',%s,NOW())", (ids["cm"], run["id"]),
+    )
+    pg.execute("UPDATE creator_workflow_ai_runs SET onboarding_authorization_id=%s", (ids["cm"],))
+    account, shared, unrelated, confirmed, pending = (uuid4() for _ in range(5))
+    for account_id, handle in ((account, "old_creator"), (shared, "shared"), (unrelated, "merchant")):
+        pg.execute(
+            "INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) VALUES(%s,'tiktok',%s,%s)",
+            (account_id, handle, handle),
+        )
+    for contact_id, account_id, source in (
+        (ids["person"], account, "creator_workflow_ai_business_verified"),
+        (ids["person"], shared, "creator_workflow_cm_confirmation"),
+        (ids["person"], unrelated, "manual"),
+        (ids["other"], shared, "manual"),
+        (ids["other"], unrelated, "manual"),
+    ):
+        pg.execute(
+            "INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source) "
+            "VALUES(%s,%s,'associated','confirmed',%s)", (contact_id, account_id, source),
+        )
+    for candidate_id, account_id, handle, status in (
+        (confirmed, account, "old_creator", "confirmed"), (pending, shared, "shared", "pending"),
+    ):
+        pg.execute(
+            "INSERT INTO creator_workflow_candidates(id,normalized_handle,responsible_authorization_id,contact_id,"
+            "relationship,status,social_account_id) VALUES(%s,%s,%s,%s,'associated',%s,%s)",
+            (candidate_id, handle, ids["cm"], ids["person"], status, account_id),
+        )
+        pg.execute(
+            "INSERT INTO creator_workflow_sources(id,candidate_id,source_type,source_key,fingerprint) "
+            "VALUES(%s,%s,'ai',%s,'old')", (uuid4(), candidate_id, str(candidate_id)),
+        )
+    pg.execute(
+        "INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,contact_id,"
+        "relationship,source,candidate_id,created_by_authorization_id) "
+        "VALUES(%s,%s,%s,%s,'associated','ai_business_verified',%s,%s)",
+        (uuid4(), account, ids["cm"], ids["person"], confirmed, ids["owner"]),
+    )
+    pg.execute("INSERT INTO creator_workflow_requests VALUES(%s,%s,'old',%s,NOW())",
+               (ids["owner"], uuid4(), confirmed))
+    pg.execute("INSERT INTO creator_workflow_ai_chat_checks VALUES(%s,'chat',NOW())", (ids["cm"],))
+    pg.execute(
+        "INSERT INTO creator_workflow_import_batches(id,actor_id,responsible_id,filename,file_hash,rows) "
+        "VALUES(%s,%s,%s,'old.xlsx','old','[]')", (uuid4(), ids["owner"], ids["cm"]),
+    )
+    for person, role in (("person", "creator"), ("person", "partner_contact"), ("other", "merchant_contact")):
+        pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) VALUES(%s,%s,'confirmed','manual')",
+                   (ids[person], role))
+    for person, role in (("person", "creator"), ("other", "merchant_contact")):
+        assessment_id = uuid4()
+        pg.execute("INSERT INTO contact_assignment_assessments(id,contact_id) VALUES(%s,%s)",
+                   (assessment_id, ids[person]))
+        pg.execute(
+            "INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source,assessment_id) "
+            "VALUES(%s,%s,%s,'manual',%s)", (uuid4(), ids[person], ids["cm"], assessment_id),
+        )
+        pg.execute("INSERT INTO contact_assessments(id,contact_id,result) VALUES(%s,%s,%s::jsonb)",
+                   (uuid4(), ids[person], json.dumps({"roles": [{"role": role}]})))
+    pg.execute(
+        "INSERT INTO ai_feature_configs(feature,provider,project_id,model,enabled,api_key_ciphertext,key_suffix) "
+        "SELECT 'offhours_summary',provider,project_id,model,TRUE,api_key_ciphertext,key_suffix "
+        "FROM ai_feature_configs WHERE feature='creator_workflow'",
+    )
+    pg.execute("UPDATE ai_feature_configs SET enabled=TRUE")
+    summary = uuid4()
+    pg.execute(
+        "INSERT INTO offhours_summary_runs(id,requested_by_authorization_id,responsible_authorization_id,"
+        "window_start,window_end) VALUES(%s,%s,%s,NOW()-INTERVAL '1 day',NOW())",
+        (summary, ids["owner"], ids["cm"]),
+    )
+    pg.execute("INSERT INTO offhours_summary_settings(run_id,config_fingerprint,refresh_until) VALUES(%s,'old',NOW())",
+               (summary,))
+    pg.execute("INSERT INTO offhours_summary_tasks(id,run_id,chat_id,input_fingerprint,cutoff) "
+               "VALUES(%s,%s,'chat','old',NOW())", (uuid4(), summary))
+    pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'messages')",
+               (ids["cm"],))
+    protected = (
+        "contacts", "lark_identities", "chats", "chat_messages", "authorization_message_observations",
+        "authorizations", "authorization_chats", "admin_roles", "admin_page_permissions",
+    )
+    snapshot = {table: pg.execute(f"SELECT * FROM {table}").fetchall() for table in protected}
+    config_columns = "feature,provider,project_id,model,api_key_ciphertext,key_suffix"
+    config = pg.execute(f"SELECT {config_columns} FROM ai_feature_configs ORDER BY feature").fetchall()
+    migration = (Path(__file__).parents[1] / "migrations/041_reset_creator_library_complete_identity.sql").read_text()
+    pg.execute(migration)
+    for table in (
+        "creator_workflow_candidates", "creator_workflow_sources", "creator_account_assignments",
+        "creator_workflow_requests", "creator_workflow_import_batches", "creator_workflow_ai_runs",
+        "creator_workflow_ai_tasks", "creator_workflow_onboarding", "creator_workflow_ai_chat_checks",
+        "offhours_summary_settings", "offhours_summary_runs", "offhours_summary_tasks",
+    ):
+        assert pg.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"] == 0, table
+    assert all(pg.execute(f"SELECT * FROM {table}").fetchall() == rows for table, rows in snapshot.items())
+    assert {row["id"] for row in pg.execute("SELECT id FROM social_accounts")} == {shared, unrelated}
+    remaining_links = pg.execute("SELECT contact_id,social_account_id FROM contact_social_accounts").fetchall()
+    assert {(row["contact_id"], row["social_account_id"]) for row in remaining_links} == {
+        (ids["person"], unrelated), (ids["other"], shared), (ids["other"], unrelated),
+    }
+    assert {row["role"] for row in pg.execute("SELECT role FROM contact_roles")} == {
+        "partner_contact", "merchant_contact",
+    }
+    for table in ("contact_assignments", "contact_assignment_assessments", "contact_assessments"):
+        assert [row["contact_id"] for row in pg.execute(f"SELECT contact_id FROM {table}")] == [ids["other"]]
+    assert pg.execute(f"SELECT {config_columns} FROM ai_feature_configs ORDER BY feature").fetchall() == config
+    assert pg.execute("SELECT count(*) AS n FROM ai_feature_configs WHERE enabled").fetchone()["n"] == 0
+    assert ai.claim_next_creator_scan() is None
+    assert not onboarding.advance_initial_scans()
+    audit = pg.execute("SELECT metadata FROM audit_events WHERE action=%s", (action,)).fetchone()["metadata"]
+    assert audit["deleted"]["candidates"] == 2 and audit["deleted"]["social_accounts"] == 1
+    assert audit["deleted"]["social_links"] == 2 and audit["protected_counts"]["chat_messages"] == 2
+    # Replaying the migration must not erase a new roster or replace the original audit.
+    pg.execute("INSERT INTO creator_workflow_candidates(id,normalized_handle) VALUES(%s,'new_roster')", (uuid4(),))
+    pg.execute(migration)
+    assert pg.execute("SELECT count(*) AS n FROM creator_workflow_candidates").fetchone()["n"] == 1
+    assert pg.execute("SELECT count(*) AS n FROM audit_events WHERE action=%s", (action,)).fetchone()["n"] == 1
+
+
 def test_real_queue_claim_model_candidate_and_unchanged_incremental(pg, real_scan, monkeypatch):
     ids, settings = real_scan
     calls = []

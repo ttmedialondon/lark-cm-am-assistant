@@ -1,6 +1,6 @@
 # 系统技术说明
 
-本文合并后端设计、人员模型、姓名机制及后台实现说明。业务以 [达人名单](../product/creator-management.md)、[消息总结](../product/message-summary.md)、[后台权限](../product/admin-access.md) 为准；当前按本人业务对话判断达人和 CM，handle 可后补。
+本文记录已实现的后端、人员模型、姓名机制与后台。业务以 [达人名单](../product/creator-management.md)、[消息总结](../product/message-summary.md)、[后台权限](../product/admin-access.md) 为准。2026-09-11 用户要求清空达人数据并重新设计：AI 确认身份与归属、handle 和用户齐全才入库；这套新门槛尚未开发，当前代码中的“handle 可空”不是新需求，扫描及总结保持关闭。
 
 ## 1. 实际架构
 
@@ -58,6 +58,8 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 - 生产保持一个 worker 进程，内部线程池执行并发；不能单凭加进程就认为吞吐提高。
 
 ## 5. AI 与确认
+
+**实现差距（2026-09-11）：** 以下是已部署代码能力，不能当作新入库规则。041 迁移已清空达人派生记录并关闭四项相关 AI 配置，保留模型/密钥及源数据。后续需把 `_promote`、`_maybe_auto_confirm`、`confirm_candidate` 等入口统一接到三条件门槛；人工确认不能清除疑点后直接绕过 AI，正式账号不能继续为空。定向 handle 补查、明确否定/不确定区分及前端分区也是待开发项。详见业务文档制作计划。
 
 `ai_dispatch` 为 AI 功能共用最多 3 个有效并发槽，与 Lark 请求限流是不同机制。任务、租约、输入指纹、有限重试及配额暂停持久化；结果写入前重验当前配置、授权、任务版本及证据。
 
