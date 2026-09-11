@@ -98,7 +98,8 @@ def get_settings() -> Settings:
         oauth_scopes=tuple(
             scope
             for scope in os.environ.get(
-                "LARK_OAUTH_SCOPES", "offline_access im:chat:read im:message:readonly im:chat.members:read"
+                "LARK_OAUTH_SCOPES", "offline_access im:chat:read im:message:readonly im:chat.members:read "
+                "contact:contact.base:readonly contact:user.base:readonly"
             ).split()
             if scope
         ),

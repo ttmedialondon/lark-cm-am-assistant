@@ -509,6 +509,8 @@ def test_avatar_cache_permission_backoff_visibility_and_late_response_guards(pg,
 
     class Client:
         mode = "denied"
+        name = en_name = None
+        en_name_present = False
 
         def user_info(self, token):
             calls.append(("self", token))
@@ -528,7 +530,9 @@ def test_avatar_cache_permission_backoff_visibility_and_late_response_guards(pg,
                 pg.execute("UPDATE authorizations SET body_consent_at=NOW()")
             if self.mode == "newer_cache":
                 profiles.store_profile_avatar(pg, open_id, new_url)
-            return LarkProfile(open_id, None, None, old_url, avatar_present=self.mode != "missing_field")
+            return LarkProfile("ou_mismatch" if self.mode == "identity_mismatch" else open_id,
+                               None, self.name, old_url, en_name=self.en_name,
+                               en_name_present=self.en_name_present, avatar_present=self.mode != "missing_field")
 
     client = Client()
     while job := profiles.claim_next():
@@ -573,6 +577,43 @@ def test_avatar_cache_permission_backoff_visibility_and_late_response_guards(pg,
     assert len(calls) == started + 2 and len({token for _, token in calls[started:]}) == 2
     assert pg.execute("SELECT avatar_status FROM lark_identities WHERE open_id=%s", (target,)).fetchone()[
         "avatar_status"] == "succeeded"
+    # A verified contact profile supplies names even when the optional avatar field is absent.
+    contact_id = uuid4()
+    pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,'user123')", (contact_id,))
+    pg.execute("UPDATE lark_identities SET contact_id=%s WHERE open_id=%s", (contact_id, target))
+    own_labels = pg.execute("SELECT id,display_name FROM authorizations ORDER BY id").fetchall()
+    client.mode, client.name, client.en_name, client.en_name_present = "missing_field", "张三", "Alice", True
+    profiles.run_claimed(due(), client, settings)
+    names = pg.execute("SELECT name,en_name,display_name,avatar_status FROM lark_identities WHERE open_id=%s",
+                       (target,)).fetchone()
+    assert names == {"name": "张三", "en_name": "Alice", "display_name": "Alice（张三）",
+                     "avatar_status": "unavailable"}
+    assert pg.execute("SELECT display_name FROM contacts WHERE id=%s", (contact_id,)).fetchone()[
+        "display_name"] == "Alice（张三）"
+    assert pg.execute("SELECT id,display_name FROM authorizations ORDER BY id").fetchall() == own_labels
+    pg.execute("UPDATE identity_profile_providers SET status='available',retry_at=NOW()")
+    client.mode, client.name, client.en_name, client.en_name_present = "good", "张小三", None, False
+    profiles.run_claimed(due(), client, settings)
+    expected_name = "Alice（张小三）"
+    assert pg.execute("SELECT display_name FROM lark_identities WHERE open_id=%s", (target,)).fetchone()[
+        "display_name"] == expected_name  # An omitted English field must preserve the known English name.
+    # A revoked OAuth identity keeps its original name even when another CM can read its directory profile.
+    with pg.transaction(force_rollback=True):
+        pg.execute("INSERT INTO authorizations(id,open_id,display_name,access_token_ciphertext,status) "
+                   "VALUES(%s,%s,%s,'old-token','revoked')", (uuid4(), target, expected_name))
+        original = pg.execute("SELECT name,en_name,display_name FROM lark_identities WHERE open_id=%s",
+                              (target,)).fetchone()
+        client.name, client.en_name, client.en_name_present = "Other CM profile", "Do not replace OAuth", True
+        started = len(calls)
+        profiles.run_claimed(due(), client, settings)
+        assert len(calls) == started + 1 and calls[-1][0] == "contact"
+        assert pg.execute("SELECT name,en_name,display_name FROM lark_identities WHERE open_id=%s",
+                          (target,)).fetchone() == original
+        assert pg.execute("SELECT display_name FROM contacts WHERE id=%s", (contact_id,)).fetchone()[
+            "display_name"] == expected_name
+        assert pg.execute("SELECT display_name FROM authorizations WHERE open_id=%s", (target,)).fetchone()[
+            "display_name"] == expected_name
+    client.name, client.en_name, client.en_name_present = "张小三", None, False
     # A restarted worker can reclaim an expired lease; the old worker must not send or overwrite it.
     stale = due()
     current = due()
@@ -583,10 +624,15 @@ def test_avatar_cache_permission_backoff_visibility_and_late_response_guards(pg,
         "avatar_claim_id"] == current["avatar_claim_id"]
     client.mode = "good"
     profiles.run_claimed(current, client, settings)
+    client.name, client.en_name, client.en_name_present = "Must not overwrite", "Wrong profile", True
     client.mode = "newer_cache"
     profiles.run_claimed(due(), client, settings)
     assert (pg.execute("SELECT avatar_url FROM lark_identities WHERE open_id=%s", (target,)).fetchone()["avatar_url"]
             == new_url)
+    client.mode = "identity_mismatch"
+    profiles.run_claimed(due(), client, settings)
+    assert pg.execute("SELECT avatar_error_code FROM lark_identities WHERE open_id=%s", (target,)).fetchone()[
+        "avatar_error_code"] == "identity_mismatch"
     client.mode = "network"
     profiles.run_claimed(due(), client, settings)
     row = pg.execute("SELECT avatar_url,avatar_status FROM lark_identities WHERE open_id=%s", (target,)).fetchone()
@@ -596,6 +642,10 @@ def test_avatar_cache_permission_backoff_visibility_and_late_response_guards(pg,
     profiles.run_claimed(due(), client, settings)
     row = pg.execute("SELECT avatar_url,avatar_status FROM lark_identities WHERE open_id=%s", (target,)).fetchone()
     assert row == {"avatar_url": new_url, "avatar_status": "unavailable"}
+    assert pg.execute("SELECT display_name FROM lark_identities WHERE open_id=%s", (target,)).fetchone()[
+        "display_name"] == expected_name
+    assert pg.execute("SELECT display_name FROM contacts WHERE id=%s", (contact_id,)).fetchone()[
+        "display_name"] == expected_name
     assert pg.execute("SELECT COUNT(*) AS n FROM authorizations WHERE status='active'").fetchone()["n"] == 3
     # Local sources must be CM-specific and current: an old observation/foreign roster cannot grant access.
     pg.execute("UPDATE authorization_message_observations SET observed_at=NOW()-INTERVAL '2 days'")

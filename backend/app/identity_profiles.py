@@ -1,4 +1,4 @@
-"""Daily, low-priority avatar cache; permission failures never interrupt IM sync."""
+"""Daily, low-priority profile cache; permission failures never interrupt IM sync."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from .crypto import TokenCipher
 from .db import connection
+from .identity_names import update_identity_names
 from .lark_api import LarkApiError
 
 LOGGER = logging.getLogger("lark_message_stats.identity_profiles")
@@ -294,16 +295,24 @@ def _finish_response(job, source, profile=None, error=None, *, defer_unavailable
                 provider_denied = denied
         elif profile.open_id != job["open_id"]:
             _outcome(conn, job, "unavailable", "identity_mismatch")
-        elif not profile.avatar_present:
-            if not defer_unavailable:
-                _outcome(conn, job, "unavailable", "avatar_field_unavailable")
-            if not own:
-                _provider_result(conn, source, "unavailable", "avatar_field_unavailable", DAILY_SECONDS)
-                provider_denied = True
         else:
-            store_profile_avatar(conn, job["open_id"], profile.avatar_url)
-            if not own:
-                _provider_result(conn, source, "available", None, 0)
+            if not own and not conn.execute(
+                "SELECT 1 FROM authorizations WHERE open_id=%s", (job["open_id"],),
+            ).fetchone():
+                update_identity_names(
+                    conn, job["open_id"], name=profile.name, en_name=profile.en_name,
+                    en_name_present=profile.en_name_present, authoritative=True,
+                )
+            if not profile.avatar_present:
+                if not defer_unavailable:
+                    _outcome(conn, job, "unavailable", "avatar_field_unavailable")
+                if not own:
+                    _provider_result(conn, source, "unavailable", "avatar_field_unavailable", DAILY_SECONDS)
+                    provider_denied = True
+            else:
+                store_profile_avatar(conn, job["open_id"], profile.avatar_url)
+                if not own:
+                    _provider_result(conn, source, "available", None, 0)
     if provider_denied:
         _skip_denied_directory()
     return True

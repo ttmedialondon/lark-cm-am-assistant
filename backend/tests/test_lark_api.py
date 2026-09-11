@@ -27,7 +27,7 @@ def settings() -> Settings:
     )
 
 
-def test_authorization_url_uses_oauth_client_id_and_pkce() -> None:
+def test_authorization_url_uses_oauth_client_id_and_pkce(monkeypatch) -> None:
     url = LarkClient(settings()).authorization_url("state value", "challenge-value")
 
     assert "client_id=cli_test" in url
@@ -35,6 +35,20 @@ def test_authorization_url_uses_oauth_client_id_and_pkce() -> None:
     assert "code_challenge=challenge-value" in url
     assert "code_challenge_method=S256" in url
     assert "scope=offline_access+im%3Achat%3Aread" in url
+    from dataclasses import replace
+    from urllib.parse import parse_qs, urlsplit
+
+    profile_scopes = ("contact:contact.base:readonly", "contact:user.base:readonly")
+    config = replace(settings(), oauth_scopes=(*settings().oauth_scopes, *profile_scopes))
+    client = LarkClient(config)
+    requested = parse_qs(urlsplit(client.authorization_url("state", "challenge")).query)["scope"][0].split()
+    assert set(profile_scopes).issubset(requested)
+    requests = []
+    monkeypatch.setattr(client, "_token_request", lambda payload: requests.append(payload))
+    client.exchange_code("code", "verifier")
+    client.refresh_token("refresh-token")
+    assert requests[0]["scope"].split() == list(config.oauth_scopes)
+    assert "scope" not in requests[1]  # Renewal cannot silently request newly configured privileges.
 
 
 @pytest.mark.parametrize(

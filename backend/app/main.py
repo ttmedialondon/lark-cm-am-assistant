@@ -40,6 +40,7 @@ app.mount("/static", StaticFiles(directory=str(APP_ROOT / "static")), name="stat
 SESSION_COOKIE = "__Host-lark_message_stats"
 OAUTH_STATE_COOKIE = "__Host-lark_oauth_state"
 SESSION_DAYS = 30
+PROFILE_SCOPE_UPGRADE_REASON = "profile_scope_upgrade_required"
 LONDON_TIME_ZONE = ZoneInfo("Europe/London")
 REMI_TEST_OWNER_ID = uuid.UUID("9d5f4370-6463-4c3a-a2ed-67753a1cabc0")
 REMI_TEST_SHANG_MA_ID = uuid.UUID("1225b4a0-fbd8-431e-962e-25e66943a8a0")
@@ -125,7 +126,7 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
             """
             DELETE FROM oauth_states
             WHERE state_hash = %s AND expires_at > NOW()
-            RETURNING code_verifier_ciphertext
+            RETURNING code_verifier_ciphertext, created_at
             """,
             (_sha256(state),),
         ).fetchone()
@@ -148,8 +149,32 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
     authorization_id = uuid.uuid4()
     token_expires_at = _expiry(tokens.expires_in)
     refresh_expires_at = _expiry(tokens.refresh_expires_in) if tokens.refresh_expires_in else None
-    scopes = tokens.scope.split() if tokens.scope else list(settings.oauth_scopes)
+    # A requested scope is not a granted scope. Never activate a partial/unknown grant.
+    scopes = tokens.scope.split() if tokens.scope else []
+    if not set(settings.oauth_scopes).issubset(scopes):
+        return _template(
+            request, "error.html",
+            {"title": "授权范围不完整", "detail": "请重新授权并同意聊天和人员基本资料的读取权限。原有数据不会删除。"},
+            403,
+        )
     with connection() as conn, conn.transaction():
+        previous = conn.execute(
+            "SELECT id,status,last_error,body_consent_at FROM authorizations WHERE open_id=%s FOR UPDATE",
+            (profile.open_id,),
+        ).fetchone()
+        if previous and previous["status"] == "active" and conn.execute(
+            """SELECT 1 FROM audit_events WHERE authorization_id=%s
+               AND action='oauth_profile_permissions_upgraded' AND created_at>=%s LIMIT 1""",
+            (previous["id"], state_row["created_at"]),
+        ).fetchone():
+            return _template(
+                request, "error.html",
+                {"title": "权限已更新", "detail": "这个旧授权链接已失效，请返回网站首页登录。"}, 409,
+            )
+        profile_upgrade = bool(
+            previous and previous["status"] == "attention_required"
+            and previous["last_error"] == PROFILE_SCOPE_UPGRADE_REASON and previous["body_consent_at"]
+        )
         row = conn.execute(
             """
             INSERT INTO authorizations (
@@ -170,10 +195,10 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 scopes = EXCLUDED.scopes,
                 status = 'active',
                 last_error = NULL,
-                body_consent_at = NOW(),
-                p2p_discovery_status = 'pending',
-                p2p_last_checked_at = NULL,
-                p2p_last_error = NULL,
+                body_consent_at = CASE WHEN %s THEN authorizations.body_consent_at ELSE NOW() END,
+                p2p_discovery_status = CASE WHEN %s THEN authorizations.p2p_discovery_status ELSE 'pending' END,
+                p2p_last_checked_at = CASE WHEN %s THEN authorizations.p2p_last_checked_at ELSE NULL END,
+                p2p_last_error = CASE WHEN %s THEN authorizations.p2p_last_error ELSE NULL END,
                 updated_at = NOW()
             RETURNING id
             """,
@@ -188,21 +213,18 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 token_expires_at,
                 refresh_expires_at,
                 scopes,
+                profile_upgrade, profile_upgrade, profile_upgrade, profile_upgrade,
             ),
         ).fetchone()
         authorization_id = row["id"]
         # Page commits lock sync_jobs before authorization_chats. Preserve
         # that order here so OAuth reauthorization cannot deadlock with a
         # late page response.
-        _queue_job(conn, authorization_id, "backfill")
+        _queue_job(conn, authorization_id, "incremental" if profile_upgrade else "backfill")
         conn.execute(
-            """
-            INSERT INTO lark_identities (open_id, display_name, first_seen_at, last_seen_at)
-            VALUES (%s, %s, NOW(), NOW())
-            ON CONFLICT (open_id) DO UPDATE SET
-                last_seen_at = EXCLUDED.last_seen_at
-            """,
-            (profile.open_id, profile.name),
+            """INSERT INTO lark_identities (open_id, display_name, first_seen_at, last_seen_at)
+               VALUES (%s, %s, NOW(), NOW()) ON CONFLICT (open_id) DO UPDATE
+               SET last_seen_at = EXCLUDED.last_seen_at""", (profile.open_id, profile.name),
         )
         profile_label = update_identity_names(
             conn, profile.open_id, name=profile.name, en_name=profile.en_name,
@@ -213,30 +235,14 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
             "UPDATE authorizations SET display_name=%s WHERE id=%s AND display_name IS DISTINCT FROM %s",
             (profile_label, authorization_id, profile_label),
         )
-        # A re-authorization is the explicit opportunity to retry unreadable
-        # conversations and collect content under the revised agreement.
+        if not profile_upgrade:
+            _reset_chat_backfill(conn, authorization_id)
+        # A new consent is the opportunity to retry previously denied profile reads.
         conn.execute(
-            """
-            UPDATE authorization_chats
-            SET backfill_complete = FALSE, backfill_page_token = NULL,
-                backfill_window_start_at = NULL, backfill_window_end_at = NULL,
-                incremental_page_token = NULL, incremental_job_id = NULL,
-                incremental_window_start_at = NULL, incremental_window_end_at = NULL,
-                page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
-                page_claimed_at = NULL, page_lease_until = NULL,
-                page_retry_at = NULL,
-                member_snapshot_claim_id = NULL, member_snapshot_claimed_at = NULL,
-                member_snapshot_lease_until = NULL,
-                member_snapshot_retry_at = NULL,
-                sync_generation = sync_generation + 1,
-                sync_status = 'pending', last_error = NULL,
-                member_count_status = 'pending', member_count_checked_at = NULL,
-                member_snapshot_status = 'pending', member_snapshot_checked_at = NULL
-            WHERE authorization_id = %s
-            """,
-            (authorization_id,),
+            """UPDATE identity_profile_providers SET scopes=%s,status='pending',error_code=NULL,retry_at=NOW()
+               WHERE authorization_id=%s""", (scopes, authorization_id),
         )
-        _audit(conn, authorization_id, "oauth_authorized")
+        _audit(conn, authorization_id, "oauth_profile_permissions_upgraded" if profile_upgrade else "oauth_authorized")
 
         session_token = secrets.token_urlsafe(32)
         conn.execute(
@@ -259,6 +265,31 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
         path="/",
     )
     return response
+
+
+def _reset_chat_backfill(conn, authorization_id):
+    # Ordinary reauthorization remains a fresh content-consent boundary.
+    conn.execute(
+        """
+        UPDATE authorization_chats
+        SET backfill_complete = FALSE, backfill_page_token = NULL,
+            backfill_window_start_at = NULL, backfill_window_end_at = NULL,
+            incremental_page_token = NULL, incremental_job_id = NULL,
+            incremental_window_start_at = NULL, incremental_window_end_at = NULL,
+            page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
+            page_claimed_at = NULL, page_lease_until = NULL,
+            page_retry_at = NULL,
+            member_snapshot_claim_id = NULL, member_snapshot_claimed_at = NULL,
+            member_snapshot_lease_until = NULL,
+            member_snapshot_retry_at = NULL,
+            sync_generation = sync_generation + 1,
+            sync_status = 'pending', last_error = NULL,
+            member_count_status = 'pending', member_count_checked_at = NULL,
+            member_snapshot_status = 'pending', member_snapshot_checked_at = NULL
+        WHERE authorization_id = %s
+        """,
+        (authorization_id,),
+    )
 
 
 @app.get("/dashboard")

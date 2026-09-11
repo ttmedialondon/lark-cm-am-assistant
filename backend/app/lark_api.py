@@ -118,7 +118,6 @@ class LarkClient:
             "client_id": self.settings.lark_app_id,
             "client_secret": self.settings.lark_app_secret,
             "refresh_token": refresh_token,
-            "scope": " ".join(self.settings.oauth_scopes),
         }
         return self._token_request(payload)
 
