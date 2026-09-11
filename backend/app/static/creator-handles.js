@@ -48,9 +48,10 @@
     status.append(parts.status, parts.reason);
     const actions = node("td");
     const actionsList = node("div", "", "d-flex gap-1 flex-wrap");
-    for (const [action, text] of [["confirm", "确认入库"], ["defer", "暂缓"], ["evidence", "相关材料"]]) {
+    for (const [action, text] of [["confirm", "确认入库"], ["defer", "暂缓"], ["evidence", "相关材料"], ["recheck", "更新材料"]]) {
       const button = node("button", text, `btn btn-sm ${action === "confirm" ? "btn-primary" : "btn-outline-secondary"}`);
       button.type = "button"; parts[action] = button;
+      if (action === "recheck") button.title = "只更新材料，不调用 AI；材料未变化不会重测。更新后仍需点击“开始查找 handle”。";
       button.addEventListener("click", () => {
         if (action === "evidence") return showEvidence(item.id);
         const handles = [...options.querySelectorAll("input:checked")].map(box => box.value)
@@ -112,6 +113,7 @@
       parts.confirm.textContent = tab === "mine" ? "保存修改" : "确认入库";
       parts.defer.hidden = !item.can_defer; parts.defer.disabled = busy;
       parts.evidence.hidden = !item.has_evidence;
+      parts.recheck.hidden = !(data.can_manage && item.can_recheck); parts.recheck.disabled = busy;
     }
     page = data.page || 1;
     el("empty").hidden = !!data.items?.length;
@@ -143,6 +145,7 @@
         rows.get(taskId)?.row.remove(); rows.delete(taskId);
         notice(tab === "mine" ? "handle 已保存。" : "已确认入库，可在“我的达人”查看。");
       }
+      else if (path.endsWith("/recheck")) notice("已提交材料更新，本次未调用 AI；准备完成后再点击“开始查找 handle”。");
       else notice("已保存。");
       await refresh();
     } catch (error) { notice(error.message, true); }

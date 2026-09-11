@@ -125,11 +125,24 @@ def test_exact_normalization_and_group_patterns_reject_guessing():
     for hashtag in ("#TikTokMadeMeBuyIt", "#SummerSale2026FashionDiscount"):
         text = handles._body(hashtag, {"message_type": "text", "mentions_json": []}, {}, {})
         assert "已提供广告授权码" not in text and not handles._OWN_ACTION.search(text)
+    for intro in ("I'm Ava Stone (@ava._123)", "I am Ava Stone (@ava._123)", "I’m U1 (@ava._123)"):
+        assert handles._self_handles(intro) == {"ava._123"}
+    redacted = handles._body(
+        "I'm Ava Stone (@ava._123)", {"message_type": "text", "mentions_json": []}, {}, {"Ava Stone": "U1"}
+    )
+    assert handles._self_handles(redacted) == {"ava._123"}
+    for other in (
+        "I'm helping (@someone)",
+        "I am managing Ava Stone (@someone)",
+        "I'm Helping Someone (@someone)",
+        "I'm Ava Stone, managing (@someone)",
+    ):
+        assert not handles._self_handles(other)
 
 
 def test_self_account_keeps_exact_handle_and_current_scope_not_other_bodies(pg, scope, monkeypatch):
     ids, settings, add = scope
-    first = add("creator", "My TikTok handle is @creator._123. Email private@example.com, phone +447123456789")
+    first = add("creator", "I'm Ava Stone (@creator._123). Email private@example.com, phone +447123456789")
     add("creator", "https://www.tiktok.com/@unverified_link", chat="group")
     add("creator", "My handle is @NOT_AUTHORIZED_SECRET", observer="owner")
     add("other", "PRIVATE_THIRD_PERSON_BODY my account is @someone_else", chat="group")

@@ -77,11 +77,12 @@ def test_scan_and_auto_admit_are_owner_only_and_explicit_csrf_is_required(monkey
     calls = []
     for name in (
         "create_preview", "start_run", "pause_run", "resume_run", "set_auto_admit", "confirm_task", "defer_task",
+        "recheck_task",
     ):
         monkeypatch.setattr(creator_handles, name, lambda *args: calls.append(args) or run)
     actions = ["/creators/preview", *(f"/creators/runs/{run}/{name}" for name in (
         "start", "pause", "resume", "auto-admit",
-    ))]
+    )), f"/creators/tasks/{task}/recheck"]
     for path in actions:
         assert client.post(path, data={
             "csrf_token": "csrf", "cm_id": str(actor["id"]), "enabled": "1",
@@ -99,6 +100,16 @@ def test_scan_and_auto_admit_are_owner_only_and_explicit_csrf_is_required(monkey
         "csrf_token": "csrf", "enabled": "0",
     }).status_code == 200
     assert calls == [(admin["id"], run, False)]
+    assert owner.post(f"/creators/tasks/{task}/recheck", data={"csrf_token": "csrf"}).status_code == 200
+    assert calls == [(admin["id"], run, False), (admin["id"], task)]
+
+    def unchanged(*_args):
+        raise ValueError("材料未变化，不会重复付费。")
+
+    monkeypatch.setattr(creator_handles, "recheck_task", unchanged)
+    response = owner.post(f"/creators/tasks/{task}/recheck", data={"csrf_token": "csrf"})
+    assert response.status_code == 400 and "材料未变化" in response.json()["error"]
+    assert calls == [(admin["id"], run, False), (admin["id"], task)]
     revoked, _ = browser(monkeypatch, active=False)
     assert revoked.get("/creators").status_code == 403
     assert revoked.post(f"/creators/tasks/{task}/defer", data={"csrf_token": "csrf"}).status_code == 403

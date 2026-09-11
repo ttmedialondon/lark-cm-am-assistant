@@ -131,7 +131,10 @@ def _parent(conn, task, settings, *, full=True):
 
 
 def _decode(task, key, settings):
-    return json.loads(ownership._cipher(settings).decrypt(task[key])) if task.get(key) else {}
+    value = json.loads(ownership._cipher(settings).decrypt(task[key])) if task.get(key) else {}
+    if key == "result_ciphertext" and "checked" in value:
+        return value["checked"] or {}
+    return value
 
 
 def _valid_handle_material(task, settings, *, full=True):
@@ -369,6 +372,51 @@ def defer_task(actor_id, task_id):
             "UPDATE creator_handle_tasks SET review_status='deferred',updated_at=NOW() WHERE id=%s", (task["id"],)
         )
         _audit(conn, actor_id, "deferred", {"task_id": str(task["id"])})
+
+
+def recheck_task(actor_id, task_id):
+    """Explicit free refresh of changed material, retaining the paid attempt history."""
+    from .creator_handle_evidence import build_evidence
+
+    actor_id = ownership._uuid(actor_id)
+    settings = get_settings()
+    with connection() as conn, conn.transaction():
+        task, run = _task(conn, actor_id, task_id)
+        _access(conn, actor_id, task["cm_authorization_id"], manage=True)
+        if run["status"] not in ("preview", "completed") or run["auto_admit"]:
+            raise ValueError("请先完成当前批次并关闭自动入库，再更新材料。")
+        if (
+            task["review_status"] == "confirmed"
+            or task["status"] not in ("succeeded", "skipped", "failed", "invalid")
+            or task["attempts"] >= 2
+        ):
+            raise ValueError("该候选不能重测：已入库、仍在处理或已达到两次尝试上限。")
+        _parent(conn, task, settings)
+        material = build_evidence(task["contact_id"], task["cm_authorization_id"], settings)
+        if material["fingerprint"] == task["fingerprint"]:
+            raise ValueError("材料没有变化，不重复调用 AI；可以直接人工核对 handle。")
+        _audit(
+            conn,
+            actor_id,
+            "recheck_requested",
+            {
+                "task_id": str(task["id"]),
+                "previous_task_ciphertext": ownership._cipher(settings).encrypt(ownership._encode(task)),
+            },
+        )
+        conn.execute(
+            """UPDATE creator_handle_tasks SET status='pending',reason_code='',fingerprint=NULL,
+            config_fingerprint=NULL,pack_ciphertext=NULL,result_ciphertext=NULL,refs='[]',stats='{}',
+            outcome=NULL,confidence=NULL,reused_from=NULL,review_status='pending',selected_handles='{}',
+            reviewed_by=NULL,reviewed_at=NULL,lease_until=NULL,scheduled_at=NOW(),started_at=NULL,finished_at=NULL,
+            response_id=NULL,request_id=NULL,updated_at=NOW() WHERE id=%s""",
+            (task["id"],),
+        )
+        conn.execute(
+            "UPDATE creator_handle_runs SET status='preparing',finished_at=NULL,updated_at=NOW() WHERE id=%s",
+            (run["id"],),
+        )
+        return run["id"]
 
 
 def _auto_next(conn, settings):
@@ -623,6 +671,15 @@ def _finish(job, status, reason, settings, response=None, result=None):
         usage = (response or {}).get("usage", {})
         telemetry = (response or {}).get("telemetry", {})
         score = min((c["confidence"] for c in result["candidates"]), default=None) if result else None
+        stored_result = None
+        if response and response.get("text"):
+            try:
+                model_output = json.loads(response["text"])
+            except (ValueError, TypeError):
+                model_output = response["text"]
+            stored_result = {"model_output": model_output, "checked": result}
+        elif result:
+            stored_result = {"model_output": None, "checked": result}
         conn.execute(
             """UPDATE creator_handle_tasks SET status=%s,reason_code=%s,result_ciphertext=%s,outcome=%s,
             confidence=%s,response_id=COALESCE(%s,response_id),request_id=COALESCE(%s,request_id),
@@ -631,7 +688,7 @@ def _finish(job, status, reason, settings, response=None, result=None):
             (
                 status,
                 reason,
-                ownership._cipher(settings).encrypt(ownership._encode(result)) if result else None,
+                ownership._cipher(settings).encrypt(ownership._encode(stored_result)) if stored_result else None,
                 result["outcome"] if result else None,
                 score,
                 (response or {}).get("response_id"),
@@ -801,10 +858,13 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
                 handles = [
                     r["display_handle"]
                     for r in conn.execute(
-                        """SELECT s.display_handle FROM contact_social_accounts l
-                    JOIN social_accounts s ON s.id=l.social_account_id WHERE l.contact_id=%s AND l.status='confirmed'
-                    AND l.relationship='owner' ORDER BY s.normalized_handle""",
-                        (contact_id,),
+                        """SELECT s.display_handle FROM social_accounts s WHERE s.id IN (
+                            SELECT l.social_account_id FROM contact_social_accounts l
+                            WHERE l.contact_id=%s AND l.status='confirmed' AND l.relationship='owner'
+                            UNION SELECT a.social_account_id FROM creator_account_assignments a
+                            WHERE a.contact_id=%s AND a.responsible_authorization_id=%s AND a.ended_at IS NULL
+                        ) ORDER BY s.normalized_handle""",
+                        (contact_id, contact_id, cm_id),
                     ).fetchall()
                 ]
             status = row.get("status")
@@ -827,6 +887,15 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
                 reason = REASONS["parent_changed"]
             elif row.get("pack_ciphertext") and not readable:
                 reason = "匹配材料已变化，请重新核对；不会自动入库。"
+            elif tab != "candidates" and not row.get("handle_task_id") and not row.get("ownership_task_id"):
+                reason = "原有正式记录，本轮未改动。"
+            task_run = None
+            if owner and tab == "candidates" and row.get("run_id"):
+                task_run = (
+                    run
+                    if run and run["id"] == row["run_id"]
+                    else conn.execute("SELECT * FROM creator_handle_runs WHERE id=%s", (row["run_id"],)).fetchone()
+                )
             items.append(
                 {
                     "id": str(row.get("id") or row.get("assignment_id")),
@@ -848,6 +917,15 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
                     and valid_parent
                     and status in ("succeeded", "skipped", "failed", "invalid"),
                     "can_defer": tab == "candidates",
+                    "can_recheck": bool(
+                        task_run
+                        and task_run["status"] in ("preview", "completed")
+                        and not task_run["auto_admit"]
+                        and valid_parent
+                        and row["review_status"] != "confirmed"
+                        and status in ("succeeded", "skipped", "failed", "invalid")
+                        and row["attempts"] < 2
+                    ),
                     "has_evidence": readable,
                 }
             )

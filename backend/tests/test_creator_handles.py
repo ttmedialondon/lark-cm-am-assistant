@@ -77,7 +77,8 @@ def _case(pg, pilot, monkeypatch, *, clues=True, uncertain=False):
     run = handles.create_preview(pilot.ids["owner"], pilot.ids["cm"], source)
     _drain_preview(pilot.settings)
     assert len(pilot.calls) == before_preview
-    case = SimpleNamespace(run=run, source=source, creator=pilot.ids["creator"], calls=[], callbacks=[], score=.99)
+    case = SimpleNamespace(run=run, source=source, creator=pilot.ids["creator"], calls=[], callbacks=[], score=.99,
+                           outcome="matched")
 
     def handle_response(config, key, pack, contact_id, **kwargs):
         assert kwargs["instructions"] == evidence.INSTRUCTIONS
@@ -86,7 +87,7 @@ def _case(pg, pilot, monkeypatch, *, clues=True, uncertain=False):
         candidates = [{"handle": handle, "confidence": case.score, "basis": "self_declared",
                        "evidence_refs": [m["ref"] for m in pack["messages"] if handle in m["self_handles"]],
                        "conflicts": [], "missing_info": []} for handle in pack["allowed_handles"]]
-        result = {"outcome": "matched", "reason": "本人明确提供账号。", "candidates": candidates}
+        result = {"outcome": case.outcome, "reason": "本人明确提供账号。", "candidates": candidates}
         for callback in case.callbacks:
             callback()
         return {"text": json.dumps(result), "response_id": f"handle_response_{len(case.calls)}",
@@ -205,9 +206,65 @@ def test_low_confidence_and_changed_parent_permission_group_or_members_never_aut
     handles.set_auto_admit(pilot.ids["owner"], case.run, True)
     _drain_preview(pilot.settings)
     assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
+    with pytest.raises(PermissionError):
+        handles.recheck_task(pilot.ids["cm"], task["id"])
+    with pytest.raises(ValueError):
+        handles.recheck_task(pilot.ids["owner"], task["id"])
+    handles.set_auto_admit(pilot.ids["owner"], case.run, False)
+    before = _snapshot(pg, ("creator_handle_tasks", "audit_events"))
+    with pytest.raises(ValueError):
+        handles.recheck_task(pilot.ids["owner"], task["id"])  # Identical material cannot be billed again.
+    assert _snapshot(pg, before) == before
+    for status in ("running", "paused"):
+        with pg.transaction(force_rollback=True):
+            pg.execute("UPDATE creator_handle_runs SET status=%s WHERE id=%s", (status, case.run))
+            with pytest.raises(ValueError):
+                handles.recheck_task(pilot.ids["owner"], task["id"])
+    # A group-title change only affects handle evidence, leaving the real parent material valid.
+    pg.execute("UPDATE chats SET name='creator_one * Trutonic Media' WHERE chat_id='handle_group'")
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE creator_ownership_tasks SET outcome='uncertain' WHERE id=%s",
+                   (task["ownership_task_id"],))
+        with pytest.raises(ValueError):
+            handles.recheck_task(pilot.ids["owner"], task["id"])
+    assert handles.recheck_task(pilot.ids["owner"], task["id"]) == case.run
+    pending = _task(pg, case)
+    assert pending["status"] == "pending" and pending["result_ciphertext"] is None
+    for key in ("attempts", "api_requests", "input_tokens", "output_tokens"):
+        assert pending[key] == task[key]
+    event = pg.execute("SELECT action,metadata FROM audit_events WHERE metadata ? 'previous_task_ciphertext'")
+    event = event.fetchone()
+    assert event["action"] == "creator_handles_recheck_requested"
+    archived = json.loads(ownership._cipher(pilot.settings).decrypt(event["metadata"]["previous_task_ciphertext"]))
+    for key in ("pack_ciphertext", "result_ciphertext", "fingerprint", "attempts", "api_requests",
+                "input_tokens", "output_tokens"):
+        assert archived[key] == task[key]
+    assert archived["id"] == str(task["id"])
+    _drain_preview(pilot.settings)
+    assert len(case.calls) == 1 and _task(pg, case)["status"] == "ready"
+    assert _task(pg, case)["fingerprint"] != task["fingerprint"]
+    case.score, case.outcome = .99, "review"
+    assert handles.start_run(pilot.ids["owner"], case.run) == 1
+    assert handles.start_run(pilot.ids["owner"], case.run) == 0
+    _drain_paid(pilot.settings)
+    task = _task(pg, case)
+    stored = json.loads(ownership._cipher(pilot.settings).decrypt(task["result_ciphertext"]))
+    assert stored["model_output"]["outcome"] == stored["checked"]["outcome"] == task["outcome"] == "review"
+    assert all(c["confidence"] == .99 and not c["conflicts"] and not c["missing_info"]
+               for c in stored["checked"]["candidates"])
+    assert handles._decode(task, "result_ciphertext", pilot.settings) == stored["checked"]
+    assert (task["attempts"], task["api_requests"], task["input_tokens"], task["output_tokens"]) == (2, 2, 34, 18)
+    assert len(case.calls) == 2
+    pg.execute("UPDATE chats SET name='creator_one X TT' WHERE chat_id='handle_group'")
+    with pytest.raises(ValueError):
+        handles.recheck_task(pilot.ids["owner"], task["id"])
+    pg.execute("UPDATE chats SET name='creator_one * Trutonic Media' WHERE chat_id='handle_group'")
+    handles.set_auto_admit(pilot.ids["owner"], case.run, True)
+    _drain_preview(pilot.settings)
+    assert handles.start_run(pilot.ids["owner"], case.run) == 0 and len(case.calls) == 2
+    assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
     # Reuse the frozen real material to exercise sensitive admission after different facts change.
-    result = ownership._cipher(pilot.settings).decrypt(task["result_ciphertext"])
-    payload = json.loads(result)
+    payload = handles._decode(task, "result_ciphertext", pilot.settings)
     payload["outcome"] = "matched"
     for candidate in payload["candidates"]:
         candidate.update(confidence=.99, missing_info=[])
@@ -236,6 +293,11 @@ def test_low_confidence_and_changed_parent_permission_group_or_members_never_aut
 def test_existing_person_or_account_owners_are_not_overwritten_and_no_partial_accounts(pg, pilot, monkeypatch):
     case = _case(pg, pilot, monkeypatch, clues=False)
     task = _task(pg, case)
+    with pg.transaction(force_rollback=True):
+        pg.execute("DELETE FROM contact_social_accounts WHERE contact_id=%s", (pilot.ids["legacy"],))
+        legacy = handles.page_data(pilot.ids["owner"], tab="mine")["items"]
+        assert len(legacy) == 1 and legacy[0]["handles"] == ["legacy_account"]
+        assert legacy[0]["reason"] == "原有正式记录，本轮未改动。"
     for cm in (pilot.ids["cm"], pilot.ids["owner"]):
         with pg.transaction(force_rollback=True):
             pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
@@ -265,11 +327,24 @@ def test_revocation_during_response_and_parent_change_before_dispatch_are_safe(p
     assert not case.calls and _task(pg, case)["api_requests"] == 0
     assert _task(pg, case)["attempts"] == 0
     handles.resume_run(pilot.ids["owner"], case.run)
+    consent = pg.execute("SELECT body_consent_at FROM authorizations WHERE id=%s",
+                         (pilot.ids["cm"],)).fetchone()["body_consent_at"]
     case.callbacks.append(lambda: pg.execute("UPDATE authorizations SET body_consent_at=NULL WHERE id=%s",
                                              (pilot.ids["cm"],)))
     _drain_paid(pilot.settings)
     task = _task(pg, case)
-    assert task["status"] == "invalid" and task["result_ciphertext"] is None and task["api_requests"] == 1
+    assert task["status"] == "invalid" and task["api_requests"] == 1
+    archived = json.loads(ownership._cipher(pilot.settings).decrypt(task["result_ciphertext"]))
+    assert archived["model_output"]["outcome"] == "matched" and archived["checked"] is None
+    assert handles._decode(task, "result_ciphertext", pilot.settings) == {}
+    for operation in (lambda: handles.page_data(pilot.ids["cm"]),
+                      lambda: handles.task_evidence(pilot.ids["owner"], task["id"])):
+        with pytest.raises(PermissionError):
+            operation()
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE authorizations SET body_consent_at=%s WHERE id=%s", (consent, pilot.ids["cm"]))
+        item = handles.page_data(pilot.ids["cm"])["items"][0]
+        assert not item["handle_options"] and archived["model_output"]["reason"] not in item["reason"]
     assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
 
 

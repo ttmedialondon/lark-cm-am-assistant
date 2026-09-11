@@ -52,6 +52,10 @@ _OWN_BEFORE = re.compile(
     re.I,
 )
 _OWN_AFTER = re.compile(r"^\s*(?:is\s+my\s+(?:account|handle|username)|是我的(?:账号|帐号))", re.I)
+_INTRO_BEFORE = re.compile(
+    r"(?i:\bI(?:'m|’m|\s+am))\s+(?!(?i:helping|managing|representing|supporting|working)\b)"
+    r"(?:U1|[A-Z][A-Za-z’'-]+(?:\s+[A-Z][A-Za-z’'-]+){0,3})\s*\(\s*$"
+)
 _ACCOUNT_BUSINESS = re.compile(
     r"\b(?:spark\s*(?:ad|code)|ad\s*code|advertis\w*\s*code|video|live|livestream|"
     r"account\s*(?:issue|problem|blocked|ban)|go live|gmv)\b|广告码|授权码|视频|直播|账号(?:异常|封禁)",
@@ -242,6 +246,11 @@ def _self_handles(text):
             own_declaration
             or _OWN_BEFORE.search(text[max(0, start - 100) : start])
             or _OWN_AFTER.search(text[end : end + 80])
+            or (
+                _AT.fullmatch(text[start:end])
+                and _INTRO_BEFORE.search(text[max(0, start - 100) : start])
+                and re.match(r"\s*\)", text[end:])
+            )
         ):
             found.add(clue["handle"])
     return found

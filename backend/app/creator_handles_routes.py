@@ -93,9 +93,11 @@ def create_router(*, current_authorization, render_template, csrf_token):
 
     @router.post("/tasks/{task_id}/confirm")
     @router.post("/tasks/{task_id}/defer")
+    @router.post("/tasks/{task_id}/recheck")
     async def review(request: Request, task_id: UUID):
         try:
-            auth, form = await form_for(request)
+            recheck = request.url.path.endswith("/recheck")
+            auth, form = await form_for(request, owner=recheck)
             if request.url.path.endswith("/confirm"):
                 try:
                     handles = json.loads(form.get("handles", "[]"))
@@ -106,6 +108,8 @@ def create_router(*, current_authorization, render_template, csrf_token):
                 ):
                     raise ValueError("请填写 1 至 20 个 handle，每个单独一行。")
                 await run_in_threadpool(creator_handles.confirm_task, auth["id"], task_id, handles)
+            elif recheck:
+                await run_in_threadpool(creator_handles.recheck_task, auth["id"], task_id)
             else:
                 await run_in_threadpool(creator_handles.defer_task, auth["id"], task_id)
             return payload({"ok": True})
