@@ -1,6 +1,6 @@
 # 系统技术说明
 
-本文记录后端、人员模型、姓名机制与后台。业务以 [人员身份与达人名单](../product/creator-management.md)、[消息总结](../product/message-summary.md)、[后台权限](../product/admin-access.md) 为准。2026-09-11 保留全员六类身份识别，新增独立第二步归属判断；旧三阶段工程不恢复，消息总结维持关闭，已有数据保留。
+本文记录后端、人员模型、姓名机制与后台。业务以 [人员身份与达人名单](../product/creator-management.md)、[消息总结](../product/message-summary.md)、[后台权限](../product/admin-access.md) 为准。2026-09-11：第一步识别身份，第二步判断负责人，第三步核实账号再入库；旧工程不恢复，消息总结维持关闭，已有数据保留。
 
 ## 1. 实际架构
 
@@ -30,9 +30,10 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 | `organizations`、`organization_tenants`、`contact_organization_links` | 组织及可验证租户/人员关系；租户相同不等于达人、员工或负责人 |
 | `social_accounts`、`contact_social_accounts` | 平台账号及关联用户；一个用户可以关联多个 handle |
 | `creator_workflow_candidates`、`creator_workflow_sources`、`creator_workflow_requests` | 保留的旧线索、来源和请求历史；无现行写入入口 |
-| `creator_account_assignments` | 用户与 CM 的正式归属；有效归属的账号不可为空，是名单与总结取数依据 |
-| `contact_assignments` | 人级负责人；第二步仅人工确认后写入，通过 `ownership_task_id` 引用新结果。旧 assessment 外键保留历史兼容；不代替账号级名单 |
+| `creator_account_assignments` | 旧账号级正式归属，继续作为冲突和旧名单读取依据；新版不往旧名单表写入 |
+| `contact_assignments` | 人级负责人；第三步统一入库事务写入，引用 `ownership_task_id` 和 `handle_task_id`，与账号绑定同时完成 |
 | `creator_ownership_runs`、`creator_ownership_tasks`、`creator_ownership_refs` | 第二步 CM 批次、人×CM任务/受控结论、授权绑定且冻结的消息引用；输入与派生说明加密，原文仍来自原存储 |
+| `creator_handle_runs`、`creator_handle_tasks` | 第三步批次、自动开关、第二步建议对应的候选、加密账号材料/结果、冻结引用、真实用量及人工状态 |
 | `creator_workflow_ai_runs`、`creator_workflow_ai_tasks`、`creator_workflow_onboarding` | 旧扫描结果、引用与接入记录，仅保留历史，未完成项已取消 |
 | `offhours_summary_settings`、`offhours_summary_runs`、`offhours_summary_tasks` | 指定总结时段、执行版本和会话结果 |
 | `admin_roles`、`admin_page_permissions`、`audit_events` | 主人身份、逐页权限、必要的查看/修改审计 |
@@ -78,13 +79,25 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 
 ### 新增：第二步人级归属判断
 
-`creator-ownership-v1` 的资格复用人员目录有效主类别 SQL，排除当前人级及账号级归属。证据只能来自所选 CM 的有效正文观察，不可直接套用第一步跨授权取材。当地历史筛选由单独一个线程处理；预筛选不调 OpenAI。
+`creator-ownership-v2` 的资格复用人员目录有效主类别 SQL，排除当前人级及账号级归属。证据只能来自所选 CM 的有效正文观察，不可直接套用第一步跨授权取材。当地历史筛选由单独一个线程处理；预筛选不调 OpenAI。
 
-每个 CM 同时一个开放批次，每批每人一条任务。明确开始后才排队；共用现有三槽并发、限流和配置，三队列简单轮转，不新增 Redis/向量库。`FOR UPDATE SKIP LOCKED`、租约及两次尝试上限控制执行；中断的付费请求不自动重放。暂停与派发登记按同一批次锁串行，已经登记的请求可收尾。
+每个 CM 同时一个开放批次，每批每人一条任务。明确开始后才排队；共用现有三槽并发、限流和配置，四队列简单轮转，不新增 Redis/向量库。`FOR UPDATE SKIP LOCKED`、租约及两次尝试上限控制执行；中断的付费请求不自动重放。暂停与派发登记按同一批次锁串行，已经登记的请求可收尾。
 
-材料加密保存、引用冻结总数及顺序、正文/关系/相关来源签名保存；各敏感节点重验。相同人、CM、规则、配置及材料的成功结果复用，但实际请求/token只记在原执行任务。任务与人工确认独立，确认事务锁人并检查旧账号及人级归属，数据库仍保证一人一个当前主负责人。
+材料加密保存、引用冻结总数及顺序、正文/关系/相关来源签名保存；各敏感节点重验。相同人、CM、规则、配置及材料的成功结果复用，但实际请求/token只记在原执行任务。第二步只产出建议，旧直接确认边界拒绝写入；正式归属由第三步完成。
 
 047 只增加新任务/引用结构及人级关联的新结果外键，不清空或回填旧数据、不更改第一步结果/凭据/权限/总结设置。临时页位于现有 AI 权限下，所有 POST 和原文证据仍仅主人。
+
+### 新增：第三步账号核实与前台名单
+
+`creator-handles-v1` 只接当前第二步 `suggested` 且置信度至少 0.95 的结果，并排除已有负责人。候选绑定稳定联系人、CM 和第二步任务；它本身不构成正式归属。只有最新有效建议可操作，不能通过改用户继承旧证据。
+
+`creator_handle_evidence` 从该 CM 可读来源重新取材（第二步已脱敏的 handle 不能当原始来源），精确提取群名/账号线索，限制历史正文数量和字符数，使用固定 JSON Schema。服务器验证 handle 原文白名单、引用、本人账号绑定、群成员歧义与改名线索；分数高不能跳过这些检查。群成员只是最新观察快照，不能推断完整历史成员。
+
+免费准备复用原单线程，与第二步轮转；付费任务接入原全局三槽。批次默认 `auto_admit=false`，明确保存后才由 worker 自动处理合格结果，暂停批次不自动入库。自动和人工都走同一事务：按规范化账号排序加锁，再锁联系人，检查现有两类归属与账号绑定，写 `contact_social_accounts` 和 `contact_assignments`。一人多个账号不重复生成人级负责人；重放同一次确认不重复写入。AI 来源没有伪造的人类审核人，人工确认记录实际操作者。
+
+048 仅增加第三步批次/任务和关联外键，不清库、不迁移旧名单。前台 `/creators` 将新的人级正式关系和旧账号级名单按联系人合并展示；旧数据仍保持原样。消息总结暂不改接新名单，也不启动。
+
+前台 CM 只能操作自己的候选；主人可选择 CM 和控制扫描。页面轮询仅验证冻结引用、当前群名/成员及阅读范围，不扫描全部历史；派发、保存、打开材料与自动确认才做完整相关历史复核。失效来源的派生选项不展示。所有 POST 校验 CSRF、当前身份和数据范围，详情访问留审计，不增加后台权限。
 
 ## 6. 姓名和 @
 
@@ -116,6 +129,6 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 
 后台达人目录、归属复核、专用聊天详情和整理清单已下线。此次继续移除 `/dashboard/creators`、全部配套 API、旧 AI 配置入口、负责人资格编辑及联系人分配接口；旧地址不可再启动或修改名单。
 
-036 迁移处理的是早期页面权限；本次 046 不删除权限或业务数据。现有系统主人、后台页面授权与消息权限均保留。旧测试编辑工程随前台移除，新编辑规则待确定。历史代码从 Git 恢复；此前数据清理仅为 [历史记录](../status/2026-09-10-reset-and-docs.md)，不重复执行。
+036 迁移处理的是早期页面权限；046 不删除权限或业务数据。现有系统主人、后台页面授权与消息权限均保留。旧测试编辑工程随旧前台移除，新前台按上述 CM 自己与主人管理规则运行。历史代码从 Git 恢复；此前数据清理仅为 [历史记录](../status/2026-09-10-reset-and-docs.md)，不重复执行。
 
 运行配置、发布、备份和恢复统一见 [部署手册](../runbooks/deploy-mvp.md)，不在这里复制命令。

@@ -191,9 +191,12 @@ def test_dispatch_uses_at_most_three_slots_and_fairly_rotates_queues(monkeypatch
     assessment_jobs = iter(({"id": "identity-1"}, {"id": "identity-2"}))
     summary_jobs = iter(({"id": "summary-1"}, {"id": "summary-2"}))
     ownership_jobs = iter(({"id": "ownership-1"}, {"id": "ownership-2"}))
-    monkeypatch.setattr(worker.offhours_summary, "claim_next_summary", lambda: next(summary_jobs))
-    monkeypatch.setattr(worker.contact_assessments, "claim_next_contact_assessment", lambda: next(assessment_jobs))
-    monkeypatch.setattr(worker.creator_ownership, "claim_next_ownership", lambda: next(ownership_jobs))
+    handle_jobs = iter(({"id": "handle-1"}, {"id": "handle-2"}))
+    monkeypatch.setattr(worker.offhours_summary, "claim_next_summary", lambda: next(summary_jobs, None))
+    monkeypatch.setattr(worker.contact_assessments, "claim_next_contact_assessment",
+                        lambda: next(assessment_jobs, None))
+    monkeypatch.setattr(worker.creator_ownership, "claim_next_ownership", lambda: next(ownership_jobs, None))
+    monkeypatch.setattr(worker.creator_handles, "claim_next_handle", lambda: next(handle_jobs, None))
 
     futures = set()
     submitted_one, preference = worker._dispatch_ai_turn(object(), Executor(), futures, 0)
@@ -204,8 +207,12 @@ def test_dispatch_uses_at_most_three_slots_and_fairly_rotates_queues(monkeypatch
     assert (submitted_one, submitted_two, submitted_three, submitted_four) == (True, True, True, False)
     assert [job["id"] for _runner, job in submitted] == ["identity-1", "summary-1", "ownership-1"]
     futures.clear()
+    preference = worker._fill_ai_slots(object(), Executor(), futures, preference)
+    assert preference == 2
+    assert [job["id"] for _runner, job in submitted[3:]] == ["handle-1", "identity-2", "summary-2"]
+    futures.clear()
     assert worker._fill_ai_slots(object(), Executor(), futures, preference) == 0
-    assert [job["id"] for _runner, job in submitted[3:]] == ["identity-2", "summary-2", "ownership-2"]
+    assert [job["id"] for _runner, job in submitted[6:]] == ["ownership-2", "handle-2"]
 
 
 def test_offhours_tasks_fill_three_parallel_slots_without_waiting(monkeypatch) -> None:
@@ -221,46 +228,69 @@ def test_offhours_tasks_fill_three_parallel_slots_without_waiting(monkeypatch) -
     monkeypatch.setattr(worker.offhours_summary, "claim_next_summary", lambda: next(jobs))
     monkeypatch.setattr(worker.contact_assessments, "claim_next_contact_assessment", lambda: None)
     monkeypatch.setattr(worker.creator_ownership, "claim_next_ownership", lambda: None)
+    monkeypatch.setattr(worker.creator_handles, "claim_next_handle", lambda: None)
     futures = set()
     worker._fill_ai_slots(object(), Executor(), futures, 0)
     assert submitted == [0, 1, 2]
     assert len(futures) == 3
 
 
-def test_ownership_preview_is_single_flight_and_backs_off_without_work(monkeypatch) -> None:
+def test_creator_previews_are_fair_single_flight_and_back_off_without_work(monkeypatch) -> None:
     now = [10.0]
     submitted = []
+    prepared = []
     settings = SimpleNamespace(worker_idle_seconds=3)
+    ownership_jobs, handle_jobs = iter((True, False)), iter((True, False))
+
+    def prepare(name, jobs):
+        prepared.append(name)
+        return next(jobs, False)
 
     class Executor:
-        def submit(self, runner, argument):
-            assert runner is worker.creator_ownership.prepare_next_preview
+        def submit(self, runner, argument, next_queue):
+            assert runner is worker._prepare_creator_preview
             assert argument is settings
             future = TaskFuture()
-            submitted.append(future)
+            submitted.append((future, runner, next_queue))
             return future
 
     monkeypatch.setattr(worker.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(worker.creator_ownership, "prepare_next_preview",
+                        lambda _: prepare("ownership", ownership_jobs))
+    monkeypatch.setattr(worker.creator_handles, "prepare_next_preview",
+                        lambda _: prepare("handle", handle_jobs))
     executor = Executor()
-    future, next_check = worker._schedule_ownership_preview(settings, executor, None, 0)
-    assert future is submitted[0]
-    assert worker._schedule_ownership_preview(settings, executor, future, next_check) == (future, next_check)
-    assert len(submitted) == 1
+    future, next_check, queue = worker._schedule_creator_preview(settings, executor, None, 0, 0)
+    assert future is submitted[0][0]
+    assert worker._schedule_creator_preview(settings, executor, future, next_check, queue) == (
+        future, next_check, queue)
+    assert len(submitted) == 1 and not prepared
 
-    future.set_result(True)
-    future, next_check = worker._schedule_ownership_preview(settings, executor, future, next_check)
-    assert future is submitted[1]
-    future.set_result(False)
-    future, next_check = worker._schedule_ownership_preview(settings, executor, future, next_check)
+    for index in range(2):
+        task, runner, preference = submitted[index]
+        task.set_result(runner(settings, preference))
+        future, next_check, queue = worker._schedule_creator_preview(settings, executor, future, next_check, queue)
+        assert future is submitted[index+1][0]
+    assert prepared == ["ownership", "handle"]
+    task, runner, preference = submitted[2]
+    task.set_result(runner(settings, preference))
+    future, next_check, queue = worker._schedule_creator_preview(settings, executor, future, next_check, queue)
     assert future is None and next_check == 13.0
-    assert worker._schedule_ownership_preview(settings, executor, future, next_check) == (None, 13.0)
-    assert len(submitted) == 2
+    assert worker._schedule_creator_preview(settings, executor, future, next_check, queue) == (None, 13.0, queue)
+    assert len(submitted) == 3 and prepared == ["ownership", "handle", "ownership", "handle"]
 
     now[0] = 13.0
-    future, next_check = worker._schedule_ownership_preview(settings, executor, future, next_check)
-    assert future is submitted[2]
+    future, next_check, queue = worker._schedule_creator_preview(settings, executor, future, next_check, queue)
+    assert future is submitted[3][0]
     future.set_exception(RuntimeError("preview failed"))
-    assert worker._schedule_ownership_preview(settings, executor, future, next_check) == (None, 16.0)
+    assert worker._schedule_creator_preview(settings, executor, future, next_check, queue) == (None, 16.0, queue)
+
+    def failed(_):
+        raise RuntimeError("one preparation queue failed")
+
+    monkeypatch.setattr(worker.creator_ownership, "prepare_next_preview", failed)
+    monkeypatch.setattr(worker.creator_handles, "prepare_next_preview", lambda _: True)
+    assert worker._prepare_creator_preview(settings, 0) == (True, 0)
 
 
 def test_page_claim_uses_locked_conversation_cursor(monkeypatch) -> None:

@@ -664,6 +664,8 @@ def create_admin_router(
         action = request.url.path.rsplit("/", 1)[-1]
         try:
             count = None
+            if action == "confirm":
+                raise ValueError("请到前台候选核对 handle；第二步不能直接确认入库。")
             if action == "start":
                 if form.get("limit") not in {"20", "all"}:
                     raise ValueError("请选择先分析 20 人或分析剩余。")
@@ -684,8 +686,7 @@ def create_admin_router(
                 except ValueError as exc:
                     raise ValueError("所选记录无效，请刷新后重试。") from exc
                 count = await run_in_threadpool(
-                    creator_ownership.confirm_tasks if action == "confirm" else creator_ownership.defer_tasks,
-                    actor_id, run_id, task_ids,
+                    creator_ownership.defer_tasks, actor_id, run_id, task_ids,
                 )
         except (ValueError, LookupError, PermissionError) as exc:
             return ownership_error(exc)

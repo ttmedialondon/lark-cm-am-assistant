@@ -155,7 +155,7 @@ def _snapshot(pg, tables):
                              f"FROM {table} t").fetchone()["rows"] for table in tables}
 
 
-def test_preview_responses_confirm_without_handle_preserves_existing_data(pg, pilot):
+def test_preview_responses_cannot_bypass_handle_stage_preserves_existing_data(pg, pilot):
     protected = ("contact_roles", "contact_assessments", "authorizations", "chat_messages",
                  "authorization_message_observations", "creator_workflow_candidates", "creator_account_assignments",
                  "social_accounts", "contact_social_accounts", "offhours_summary_tasks", "ai_feature_configs")
@@ -180,7 +180,7 @@ def test_preview_responses_confirm_without_handle_preserves_existing_data(pg, pi
     for _ in range(2):
         data = ownership.page_data(pilot.ids["cm"], run, include_private=True)
         creator = next(item for item in data["items"] if item["id"] == str(task["id"]))
-        assert creator["can_confirm"] and creator["handle"] == "—"
+        assert not creator["can_confirm"] and creator["handle"] == "—"
     assert _snapshot(pg, readonly_before) == readonly_before
     assert len(pilot.calls) == 1
     public = ownership.page_data(pilot.ids["cm"], run, include_private=False)
@@ -191,12 +191,9 @@ def test_preview_responses_confirm_without_handle_preserves_existing_data(pg, pi
     assert view["cm_id"] == str(pilot.ids["cm"]) and view["cm_name"]
     assert [m["ref"] for m in view["messages"]] == [r["label"] for r in ownership._refs(pg, task)]
     assert all(m["chat_name"] == "Creator private conversation" for m in view["messages"])
-    assert ownership.confirm_tasks(pilot.ids["owner"], run, [task["id"]]) == 1
-    assert ownership.confirm_tasks(pilot.ids["owner"], run, [task["id"]]) == 0
-    assignment = pg.execute("SELECT * FROM contact_assignments").fetchone()
-    assert assignment["responsible_authorization_id"] == pilot.ids["cm"]
-    assert assignment["source"] == "manual" and assignment["ownership_task_id"] == task["id"]
-    assert assignment["assessment_id"] is None
+    with pytest.raises(ValueError, match="handle"):
+        ownership.confirm_tasks(pilot.ids["owner"], run, [task["id"]])
+    assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
     assert _snapshot(pg, protected) == before
 
 
@@ -222,7 +219,7 @@ def test_cross_run_cache_and_page_refresh_do_not_repeat_paid_analysis(pg, pilot,
     assert not page["run"]["can_start"] and all(not item["can_confirm"] for item in page["items"])
     with pytest.raises(ValueError, match="规则"):
         ownership.start_run(pilot.ids["owner"], second)
-    with pytest.raises(ValueError, match="规则"):
+    with pytest.raises(ValueError, match="handle"):
         ownership.confirm_tasks(pilot.ids["owner"], second, [current["id"]])
     assert _snapshot(pg, old) == old
     third = _prepared(pilot)
@@ -235,7 +232,8 @@ def test_cross_run_cache_and_page_refresh_do_not_repeat_paid_analysis(pg, pilot,
     assert len(pilot.calls) == 2 and _task(pg, third, pilot.ids["creator"])["api_requests"] == 1
     assert _task(pg, second, pilot.ids["creator"]) == current
     assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
-    assert ownership.confirm_tasks(pilot.ids["owner"], third, [revised["id"]]) == 1
+    with pytest.raises(ValueError, match="handle"):
+        ownership.confirm_tasks(pilot.ids["owner"], third, [revised["id"]])
 
 
 def test_pause_before_dispatch_and_owner_loss_during_response_are_safe(pg, pilot):
@@ -265,7 +263,7 @@ def test_pause_before_dispatch_and_owner_loss_during_response_are_safe(pg, pilot
                          (next_run,)).fetchone()
     assert invalid["status"] == "invalid" and invalid["reason_code"] == "authorization_changed"
     assert invalid["result_ciphertext"] is None
-    with pytest.raises(PermissionError):
+    with pytest.raises(ValueError, match="handle"):
         ownership.confirm_tasks(pilot.ids["owner"], run, [task["id"]])
     with pytest.raises(PermissionError):
         ownership.task_evidence(pilot.ids["owner"], task["id"])
@@ -288,7 +286,7 @@ def test_existing_owner_wins_before_dispatch_and_before_confirmation(pg, pilot):
     assert task["status"] == "succeeded" and len(pilot.calls) == 1
     assign(second)
     existing = _snapshot(pg, ("contact_assignments",))
-    with pytest.raises(ValueError, match="变化"):
+    with pytest.raises(ValueError, match="handle"):
         ownership.confirm_tasks(pilot.ids["owner"], run, [task["id"]])
     assert _snapshot(pg, existing) == existing
     new_run = _prepared(pilot)

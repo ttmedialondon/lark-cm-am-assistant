@@ -98,8 +98,15 @@ def test_owner_actions_require_csrf_valid_ids_and_explicit_paid_limit(monkeypatc
     monkeypatch.setattr(creator_ownership, "pause_run", lambda *args: writes.append(("pause", args)))
     monkeypatch.setattr(creator_ownership, "resume_run", lambda *args: writes.append(("resume", args)))
     browser, actor = client(monkeypatch, owner=True)
-    assert browser.get(BASE).status_code == 200
+    html = browser.get(BASE)
+    assert html.status_code == 200
+    assert 'id="ownership-confirm"' not in html.text
+    assert "查看前台候选" in html.text
     assert reads[-1]["include_private"] is True
+    assert not writes
+    bypass = browser.post(f"{BASE}/{run}/confirm", data={"csrf_token": "csrf", "task_ids": str(task)})
+    assert bypass.status_code == 400
+    assert "前台候选" in bypass.json()["error"]
     assert not writes
     for action in ("start", "pause", "resume", "confirm", "defer"):
         assert browser.post(f"{BASE}/{run}/{action}", data={"csrf_token": "wrong"}).status_code == 400
@@ -111,15 +118,15 @@ def test_owner_actions_require_csrf_valid_ids_and_explicit_paid_limit(monkeypatc
     assert browser.post(f"{BASE}/preview", data={"csrf_token": "csrf", "cm_id": str(cm)}).json()["run_id"] == str(run)
     for limit in ("20", "all"):
         assert browser.post(f"{BASE}/{run}/start", data={"csrf_token": "csrf", "limit": limit}).status_code == 200
-    for action in ("confirm", "defer"):
+    for action in ("defer",):
         result = browser.post(f"{BASE}/{run}/{action}", data={"csrf_token": "csrf", "task_ids": str(task)})
         assert result.json()["count"] == 1
     for action in ("pause", "resume"):
         assert browser.post(f"{BASE}/{run}/{action}", data={"csrf_token": "csrf"}).status_code == 200
     assert writes == [
         ("preview", (actor["id"], cm)), ("start", (actor["id"], run), 20),
-        ("start", (actor["id"], run), None), ("confirm", (actor["id"], run, [task])),
-        ("defer", (actor["id"], run, [task])), ("pause", (actor["id"], run)), ("resume", (actor["id"], run)),
+        ("start", (actor["id"], run), None), ("defer", (actor["id"], run, [task])),
+        ("pause", (actor["id"], run)), ("resume", (actor["id"], run)),
     ]
 
 

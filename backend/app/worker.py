@@ -18,6 +18,7 @@ import psycopg
 from . import (
     ai_dispatch,
     contact_assessments,
+    creator_handles,
     creator_ownership,
     identity_profiles,
     offhours_summary,
@@ -107,9 +108,10 @@ def run_forever() -> None:
     next_organization_check = 0.0
     ai_executor = ThreadPoolExecutor(max_workers=ai_dispatch.MAX_CONCURRENT_REQUESTS, thread_name_prefix="openai")
     ai_futures: set[Future[Any]] = set()
-    preview_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ownership-preview")
-    preview_future: Future[bool] | None = None
+    preview_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="creator-preview")
+    preview_future: Future[tuple[bool, int]] | None = None
     next_preview_check = 0.0
+    next_preview_queue = 0
     avatar_executor = ThreadPoolExecutor(max_workers=identity_profiles.MAX_WORKERS, thread_name_prefix="lark-avatar")
     avatar_futures: set[Future[Any]] = set()
     # PostgreSQL owns the cross-process limit; this executor only provides the
@@ -140,8 +142,8 @@ def run_forever() -> None:
                 _reap_member_futures(member_futures)
                 _recover_expired_leases()
                 next_ai_queue = _fill_ai_slots(settings, ai_executor, ai_futures, next_ai_queue)
-                preview_future, next_preview_check = _schedule_ownership_preview(
-                    settings, preview_executor, preview_future, next_preview_check,
+                preview_future, next_preview_check, next_preview_queue = _schedule_creator_preview(
+                    settings, preview_executor, preview_future, next_preview_check, next_preview_queue,
                 )
                 if settings.app_secret_configured and time.monotonic() >= next_organization_check:
                     _run_organization_sync(settings, client)
@@ -212,6 +214,10 @@ def _dispatch_ai_turn(
             creator_ownership.claim_next_ownership,
             creator_ownership.run_claimed_ownership,
         ),
+        (
+            creator_handles.claim_next_handle,
+            creator_handles.run_claimed_handle,
+        ),
     )
     for offset in range(len(queues)):
         index = (next_queue + offset) % len(queues)
@@ -243,28 +249,43 @@ def _fill_ai_slots(
     return next_queue
 
 
-def _schedule_ownership_preview(
+def _prepare_creator_preview(settings: Settings, next_queue: int) -> tuple[bool, int]:
+    """Give each local preparation queue a turn; an idle queue does not delay the other."""
+
+    queues = (creator_ownership.prepare_next_preview, creator_handles.prepare_next_preview)
+    for offset in range(len(queues)):
+        index = (next_queue + offset) % len(queues)
+        try:
+            if queues[index](settings):
+                return True, (index + 1) % len(queues)
+        except Exception:
+            LOGGER.exception("creator preview failed without exposing user data")
+    return False, next_queue
+
+
+def _schedule_creator_preview(
     settings: Settings,
     executor: ThreadPoolExecutor,
-    future: Future[bool] | None,
+    future: Future[tuple[bool, int]] | None,
     next_check: float,
-) -> tuple[Future[bool] | None, float]:
+    next_queue: int,
+) -> tuple[Future[tuple[bool, int]] | None, float, int]:
     """Prepare one person's local evidence without using an OpenAI slot or blocking sync."""
 
     if future is not None:
         if not future.done():
-            return future, next_check
+            return future, next_check, next_queue
         progressed = False
         try:
-            progressed = future.result()
+            progressed, next_queue = future.result()
         except Exception:
-            LOGGER.exception("ownership preview failed without exposing user data")
+            LOGGER.exception("creator preview failed without exposing user data")
         future = None
         if not progressed:
             next_check = time.monotonic() + max(settings.worker_idle_seconds, 1.0)
     if time.monotonic() >= next_check:
-        future = executor.submit(creator_ownership.prepare_next_preview, settings)
-    return future, next_check
+        future = executor.submit(_prepare_creator_preview, settings, next_queue)
+    return future, next_check, next_queue
 
 
 def _reap_ai_futures(futures: set[Future[Any]]) -> None:

@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}我的达人 · TT Media{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-ownership.css?v=20260911">{% endblock %}
+{% block body %}
+<div class="page" id="creators-app" data-csrf="{{ csrf_token }}" data-tab="{{ creator_tab }}">
+  <header class="navbar navbar-expand-md"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media</a><div class="navbar-nav flex-row gap-2"><a class="nav-link" href="/dashboard">消息提醒</a><span class="nav-link text-secondary">{{ authorization.display_name or 'CM' }}</span></div></div></header>
+  <main class="page-wrapper"><div class="page-body"><div class="container-xl">
+    <div class="d-flex align-items-center justify-content-between flex-wrap gap-3 mb-3"><div><h2 class="page-title">我的达人</h2><p class="text-secondary mb-0">核对 handle 后确认入库；Lark 用户有误时，请联系管理员重新判断归属。</p></div><button type="button" id="creators-refresh" class="btn btn-outline-secondary">刷新</button></div>
+    <div id="creators-notice" class="alert d-none" role="status"></div>
+    {% if creator_data.can_manage %}<section class="card mb-3" aria-label="Handle 分析管理"><div class="card-body">
+      <div class="d-flex flex-wrap gap-2 align-items-end"><div><label for="creators-cm" class="form-label">负责人</label><select id="creators-cm" class="form-select"><option value="">暂无可用负责人</option></select></div><button type="button" id="creators-preview" class="btn btn-outline-primary">同步候选 · 不调用 AI</button><button type="button" id="creators-start" class="btn btn-primary">开始查找 handle</button><button type="button" id="creators-pause" class="btn btn-outline-warning" hidden>暂停</button><button type="button" id="creators-resume" class="btn btn-primary" hidden>继续</button></div>
+      <div class="d-flex flex-wrap align-items-center gap-2 mt-3"><label class="form-check form-switch mb-0"><input id="creators-auto" type="checkbox" class="form-check-input"><span class="form-check-label">高可信 handle 自动入库</span></label><button type="button" id="creators-save-auto" class="btn btn-sm btn-outline-primary">保存开关</button><span class="text-secondary small">开启后，也会处理本批已完成且符合条件的结果。</span></div>
+    </div></section>{% endif %}
+    <div class="card mb-3"><div class="card-body py-3"><strong id="creators-run-status">暂无分析批次</strong><span class="text-secondary ms-2" id="creators-progress"></span><div class="text-secondary small mt-1" id="creators-usage"></div></div></div>
+    <section class="card"><div class="card-header d-flex align-items-center flex-wrap gap-3"><div class="btn-list me-auto" role="group" aria-label="达人列表"><button type="button" id="creators-candidates" class="btn">候选达人</button><button type="button" id="creators-mine" class="btn">我的达人</button></div><form id="creators-search" class="d-flex gap-2" role="search"><label class="visually-hidden" for="creators-query">姓名</label><input class="form-control" id="creators-query" type="search" value="{{ creator_query }}" maxlength="120" placeholder="搜索姓名"><button class="btn btn-outline-secondary" type="submit">搜索</button></form></div>
+      <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th scope="col">Lark 用户</th><th scope="col">达人 handle</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead><tbody id="creators-rows"></tbody></table></div>
+      <div class="card-body text-secondary" id="creators-empty">暂无候选达人。</div>
+      <div class="card-footer d-flex align-items-center justify-content-between"><span id="creators-page-label" class="text-secondary"></span><div class="btn-list"><button type="button" id="creators-previous" class="btn btn-sm btn-outline-secondary">上一页</button><button type="button" id="creators-next" class="btn btn-sm btn-outline-secondary">下一页</button></div></div>
+    </section>
+    <noscript><div class="alert alert-warning mt-3">请开启浏览器 JavaScript 后核对达人。</div></noscript>
+  </div></div></main>
+  <dialog id="creators-evidence" class="ownership-evidence" aria-labelledby="creators-evidence-title"><div class="d-flex align-items-center gap-3 mb-3"><h3 id="creators-evidence-title" class="mb-0 me-auto">相关材料</h3><button type="button" id="creators-evidence-close" class="btn btn-sm btn-outline-secondary">关闭</button></div><div id="creators-evidence-body"></div></dialog>
+</div>
+<script id="creators-initial" type="application/json">{{ creator_data|tojson }}</script>
+<script src="/static/creator-handles.js?v=20260911" defer></script>
+{% endblock %}

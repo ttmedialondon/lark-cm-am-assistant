@@ -809,38 +809,8 @@ def _review_tasks(conn, actor_id, run_id, task_ids):
 
 
 def confirm_tasks(actor_id, run_id, task_ids):
-    actor_id, run_id = _uuid(actor_id), _uuid(run_id)
-    settings = get_settings()
-    with connection() as conn, conn.transaction():
-        tasks = _review_tasks(conn, actor_id, run_id, task_ids)
-        count = 0
-        for task in tasks:
-            if task["review_status"] == "confirmed":
-                continue
-            if task["status"] != "succeeded" or task["outcome"] not in ("suggested", "uncertain"):
-                raise ValueError("只能确认已完成且建议关联或待确认的结果。")
-            conn.execute("SELECT id FROM contacts WHERE id=%s FOR UPDATE", (task["contact_id"],))
-            if _eligible_now(conn, task) or not _valid_material(conn, task, settings):
-                raise ValueError("人员、归属或原文已变化；未修改任何所选负责人，请重新核对。")
-            conn.execute(
-                """INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source,
-                         confidence,created_by_authorization_id,ownership_task_id)
-                   VALUES(%s,%s,%s,'manual',%s,%s,%s)""",
-                (uuid4(), task["contact_id"], task["cm_authorization_id"], task["confidence"], actor_id, task["id"]),
-            )
-            conn.execute(
-                """UPDATE creator_ownership_tasks SET review_status='confirmed',reviewed_by=%s,
-                         reviewed_at=NOW(),updated_at=NOW() WHERE id=%s""",
-                (actor_id, task["id"]),
-            )
-            count += 1
-        _audit(
-            conn,
-            actor_id,
-            "confirmed",
-            {"run_id": str(run_id), "task_ids": [str(t["id"]) for t in tasks], "count": count},
-        )
-        return count
+    # Kept only as a rejecting compatibility boundary for old callers.
+    raise ValueError("第二步仅产生归属建议，请到候选达人完成 handle 确认后入库。")
 
 
 def defer_tasks(actor_id, run_id, task_ids):
@@ -983,16 +953,7 @@ def page_data(cm_id=None, run_id=None, query="", status="all", page=1, include_p
                         result = json.loads(_cipher(settings).decrypt(row["result_ciphertext"]))
                     except (ValueError, TypeError):
                         pass
-                can_confirm = bool(
-                    include_private
-                    and material_valid
-                    and row["status"] == "succeeded"
-                    and row["outcome"] in ("suggested", "uncertain")
-                    and row["review_status"] != "confirmed"
-                    and row["category"] == "creator"
-                    and run["policy_version"] == POLICY_VERSION
-                    and not _owned(conn, row["contact_id"])
-                )
+                can_confirm = False
                 items.append(
                     {
                         "id": str(row["id"]),

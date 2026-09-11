@@ -39,12 +39,11 @@
   }
   function selection() {
     if (!owner) return;
-    const current = (data.items || []).filter(item => item.can_confirm || item.can_defer);
+    const current = (data.items || []).filter(item => item.can_defer);
     const chosen = current.filter(item => selected.has(item.id));
     el("select-all").checked = current.length > 0 && chosen.length === current.length;
     el("select-all").indeterminate = chosen.length > 0 && chosen.length < current.length;
     el("select-all").disabled = busy || !current.length;
-    el("confirm").disabled = busy || !chosen.length || chosen.some(item => !item.can_confirm);
     el("defer").disabled = busy || !chosen.length || chosen.some(item => !item.can_defer);
     el("selected").textContent = chosen.length ? `已选 ${chosen.length} 人` : "";
   }
@@ -84,8 +83,10 @@
     const actions = node("td", "", "ownership-actions");
     const list = node("div", "", "d-flex flex-wrap gap-1");
     if (owner) {
-      for (const [action, label] of [["confirm", "确认关联"], ["defer", "暂缓"], ["evidence", "相关对话"]]) {
-        parts[action] = node("button", label, `btn btn-sm ${action === "confirm" ? "btn-outline-primary" : "btn-outline-secondary"}`);
+      parts.candidate = node("a", "查看候选", "btn btn-sm btn-outline-primary");
+      list.append(parts.candidate);
+      for (const [action, label] of [["defer", "暂缓"], ["evidence", "相关对话"]]) {
+        parts[action] = node("button", label, "btn btn-sm btn-outline-secondary");
         parts[action].type = "button";
         parts[action].addEventListener("click", () => action === "evidence" ? showEvidence(item.id) : mutate(action, {task_ids: item.id}));
         list.append(parts[action]);
@@ -114,6 +115,7 @@
     el("api").textContent = data.api_message || "";
     el("cm").disabled = busy;
     if (owner) {
+      el("candidates").href = `/creators?cm_id=${encodeURIComponent(data.selected_cm_id || "")}`;
       el("preview").disabled = busy || !el("cm").value || ["preparing", "running", "paused"].includes(run?.status);
       for (const id of ["start", "start-all"]) el(id).disabled = busy || !run?.can_start || data.api_ready === false;
       el("pause").hidden = !run?.can_pause; el("pause").disabled = busy;
@@ -132,11 +134,12 @@
       parts.confidence.textContent = Number.isFinite(item.confidence) ? `${Math.round(item.confidence * 100)}%` : "—";
       parts.reason.textContent = displayText(item.reason, cmName, item.display_name) || "—";
       if (owner) {
-        if (!item.can_confirm && !item.can_defer) selected.delete(item.id);
+        if (!item.can_defer) selected.delete(item.id);
         parts.checkbox.checked = selected.has(item.id);
-        parts.checkbox.disabled = busy || (!item.can_confirm && !item.can_defer);
+        parts.checkbox.disabled = busy || !item.can_defer;
         parts.checkbox.setAttribute("aria-label", `选择 ${item.display_name || "达人"}`);
-        parts.confirm.disabled = busy || !item.can_confirm;
+        parts.candidate.hidden = item.result !== "suggested";
+        parts.candidate.href = `/creators?cm_id=${encodeURIComponent(data.selected_cm_id || "")}`;
         parts.defer.disabled = busy || !item.can_defer;
         parts.evidence.hidden = !item.has_evidence;
       }
@@ -180,7 +183,7 @@
       }));
       if (action === "preview") { data.run = {id: result.run_id}; page = 1; }
       selected.clear();
-      notice(action === "confirm" ? `已关联 ${result.count || 0} 人。` : action === "defer" ? `已暂缓 ${result.count || 0} 人。` : "已提交，正在更新状态。");
+      notice(action === "defer" ? `已暂缓 ${result.count || 0} 人。` : "已提交，正在更新状态。");
       await refresh();
     } catch (error) { notice(error.message, true); }
     finally { busy = false; render(); }
@@ -233,11 +236,10 @@
     el("start-all").addEventListener("click", () => mutate("start", {limit: "all"}));
     el("pause").addEventListener("click", () => mutate("pause"));
     el("resume").addEventListener("click", () => mutate("resume"));
-    el("confirm").addEventListener("click", () => mutate("confirm", {task_ids: [...selected].join(",")}));
     el("defer").addEventListener("click", () => mutate("defer", {task_ids: [...selected].join(",")}));
     el("select-all").addEventListener("change", () => {
       for (const item of data.items || []) {
-        if (el("select-all").checked && (item.can_confirm || item.can_defer)) selected.add(item.id); else selected.delete(item.id);
+        if (el("select-all").checked && item.can_defer) selected.add(item.id); else selected.delete(item.id);
       }
       render();
     });

@@ -21,6 +21,7 @@ from fastapi.templating import Jinja2Templates
 from . import (
     admin,
     admin_permissions,
+    creator_handles_routes,
     offhours_summary_routes,
 )
 from .admin_reporting import sync_summary
@@ -501,4 +502,7 @@ app.include_router(
 app.include_router(offhours_summary_routes.create_router(
     current_authorization=_current_authorization,
     render_template=_template,
+))
+app.include_router(creator_handles_routes.create_router(
+    current_authorization=_current_authorization, render_template=_template, csrf_token=_admin_csrf_token,
 ))
