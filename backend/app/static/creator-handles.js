@@ -46,6 +46,7 @@
     input.addEventListener("input", () => { parts.dirty = true; });
     editor.append(input); handleCell.append(editor);
     const status = node("td"); status.style.minWidth = "180px";
+    parts.statusCell = status;
     parts.status = node("div"); parts.reason = node("div", "", "small text-secondary mt-1");
     status.append(parts.status, parts.reason);
     const actions = node("td");
@@ -67,6 +68,7 @@
   }
   function render() {
     const run = data.run, counts = data.counts || {}, usage = data.usage || {};
+    el("status-column").hidden = tab !== "candidates";
     el("run-status").textContent = run?.status_label || "暂无分析批次";
     const prepared = Math.max(0, (counts.total || 0) - (counts.pending || 0) - (counts.preparing || 0));
     el("progress").textContent = run?.status === "preparing" ? `已整理 ${prepared} / ${counts.total || 0} 人` : run ? `待分析 ${counts.ready || 0} · 排队 ${counts.queued || 0} · 分析中 ${counts.running || 0}` : "";
@@ -113,6 +115,7 @@
         }
       }
       for (const checkbox of parts.options.querySelectorAll("input")) checkbox.disabled = busy || !item.can_confirm;
+      parts.statusCell.hidden = tab !== "candidates";
       parts.status.textContent = item.status_label || "待确认";
       parts.reason.textContent = displayText(item.reason, data.cms?.find(cm => cm.id === data.selected_cm_id)?.name, item.display_name);
       parts.confirm.hidden = !item.can_confirm; parts.confirm.disabled = busy;

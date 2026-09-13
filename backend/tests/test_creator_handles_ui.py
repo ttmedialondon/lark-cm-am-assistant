@@ -52,6 +52,8 @@ def test_cm_can_read_review_own_handles_without_admin_and_cannot_cross_scope(mon
     html = client.get("/creators")
     assert html.status_code == 200
     assert "候选达人" in html.text and "我的达人" in html.text
+    assert 'id="creators-status-column" hidden' not in html.text
+    assert 'id="creators-status-column" hidden' in client.get("/creators?tab=mine").text
     assert 'id="creators-preview"' not in html.text
     assert client.get("/creators/data").status_code == 200
     assert client.get(f"/creators/data?cm_id={foreign}").status_code == 403

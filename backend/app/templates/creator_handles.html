@@ -14,7 +14,7 @@
     </div></section>{% endif %}
     <div class="card mb-3"><div class="card-body py-3"><strong id="creators-run-status">暂无分析批次</strong><span class="text-secondary ms-2" id="creators-progress"></span><div class="text-secondary small mt-1" id="creators-usage"></div></div></div>
     <section class="card"><div class="card-header d-flex align-items-center flex-wrap gap-3"><div class="btn-list me-auto" role="group" aria-label="达人列表"><button type="button" id="creators-candidates" class="btn">候选达人</button><button type="button" id="creators-mine" class="btn">我的达人</button></div><form id="creators-search" class="d-flex gap-2" role="search"><label class="visually-hidden" for="creators-query">姓名</label><input class="form-control" id="creators-query" type="search" value="{{ creator_query }}" maxlength="120" placeholder="搜索姓名"><button class="btn btn-outline-secondary" type="submit">搜索</button></form></div>
-      <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th scope="col">Lark 用户</th><th scope="col">达人 handle</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead><tbody id="creators-rows"></tbody></table></div>
+      <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th scope="col">Lark 用户</th><th scope="col">达人 handle</th><th scope="col" id="creators-status-column"{% if creator_tab != 'candidates' %} hidden{% endif %}>状态</th><th scope="col">操作</th></tr></thead><tbody id="creators-rows"></tbody></table></div>
       <div class="card-body text-secondary" id="creators-empty">暂无候选达人。</div>
       <div class="card-footer d-flex align-items-center justify-content-between"><span id="creators-page-label" class="text-secondary"></span><div class="btn-list"><button type="button" id="creators-previous" class="btn btn-sm btn-outline-secondary">上一页</button><button type="button" id="creators-next" class="btn btn-sm btn-outline-secondary">下一页</button></div></div>
     </section>
@@ -23,5 +23,5 @@
   <dialog id="creators-evidence" class="ownership-evidence" aria-labelledby="creators-evidence-title"><div class="d-flex align-items-center gap-3 mb-3"><h3 id="creators-evidence-title" class="mb-0 me-auto">相关材料</h3><button type="button" id="creators-evidence-close" class="btn btn-sm btn-outline-secondary">关闭</button></div><div id="creators-evidence-body"></div></dialog>
 </div>
 <script id="creators-initial" type="application/json">{{ creator_data|tojson }}</script>
-<script src="/static/creator-handles.js?v=20260913-name-only" defer></script>
+<script src="/static/creator-handles.js?v=20260913-formal-columns" defer></script>
 {% endblock %}
