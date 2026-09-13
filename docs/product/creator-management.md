@@ -105,6 +105,10 @@
 
 前台入口 **我的达人**（`/creators`），分“候选达人”和“我的达人”。CM 只处理自己的候选；主人可以选择 CM、管理扫描和自动入库开关。无需给 CM 后台权限。
 
+点击候选、正式名单、后台达人目录或归属判断中的达人姓名，可在新标签页唤起 Lark 私聊；原有“查看”仍打开本站人员详情。链接只使用该行保存的用户 `open_id`，不按姓名、handle 猜人，缺少有效用户时不提供跳转。无需请求新权限，不调用发消息接口、不预填或发送消息，也不改变归属。
+
+**打开的是当前 Lark 登录账号与达人的私聊，不是所选 CM 的历史会话。** 例如 Shuxuan 查看 Remi 名单，点击后仍按 Shuxuan 当前的 Lark 账号打开。官方只保证打开当前用户可访问的已有会话，未聊过或无访问权限时不保证成功，也不自动代建会话；浏览器可能提示“打开 Lark”。[Lark 官方 AppLink](https://open.larksuite.com/document/common-capabilities/applink-protocol/supported-protocol/open-a-chat-page)
+
 ```text
 第二步建议关联 → 该 CM 的候选达人（还不是正式归属）
                        ↓ 本地挑选群名和相关历史片段

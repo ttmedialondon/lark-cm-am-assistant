@@ -13,6 +13,7 @@ from . import creator_ownership as ownership
 from .ai_feature_config import api_key_cipher
 from .config import get_settings
 from .db import connection
+from .lark_api import private_chat_url
 
 POLICY_VERSION = "creator-handles-v1"
 LOGGER = logging.getLogger(__name__)
@@ -838,7 +839,8 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
         for row in rows:
             contact_id = row.get("formal_contact_id") or row["contact_id"]
             identity = conn.execute(
-                "SELECT open_id FROM lark_identities WHERE contact_id=%s ORDER BY last_seen_at DESC LIMIT 1",
+                "SELECT open_id FROM lark_identities WHERE contact_id=%s AND identity_type='user' "
+                "ORDER BY last_seen_at DESC,open_id LIMIT 1",
                 (contact_id,),
             ).fetchone()
             valid_parent = False
@@ -901,6 +903,7 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
                     "id": str(row.get("id") or row.get("assignment_id")),
                     "display_name": row["display_name"],
                     "open_id": identity["open_id"] if identity else None,
+                    "private_chat_url": private_chat_url(identity["open_id"] if identity else None),
                     "handle_options": options,
                     "handles": handles,
                     "status_label": "已入库"

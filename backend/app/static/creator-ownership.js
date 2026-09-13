@@ -75,7 +75,8 @@
         image.src = url.href; avatar.append(image);
       }
     }
-    parts.name = node("div", item.display_name || "—", "fw-medium");
+    parts.name = node("a", item.display_name || "—", "fw-medium");
+    parts.name.target = "_blank"; parts.name.rel = "noopener noreferrer";
     personWrap.append(avatar, parts.name); person.append(personWrap); tr.append(person);
     for (const key of ["handle", "result", "confidence", "reason"]) {
       parts[key] = node("td"); tr.append(parts[key]);
@@ -129,6 +130,9 @@
       if (!rows.has(item.id)) rows.set(item.id, makeRow(item));
       const {parts} = rows.get(item.id);
       parts.name.textContent = item.display_name || "—";
+      if (item.private_chat_url) parts.name.href = item.private_chat_url;
+      else parts.name.removeAttribute("href");
+      parts.name.title = item.private_chat_url ? "在 Lark 中打开你与此人的私聊" : "缺少有效 Lark 用户，暂不能跳转";
       parts.handle.textContent = item.handle || "—";
       parts.result.textContent = item.review_status === "confirmed" ? "已关联" : item.review_status === "deferred" ? "已暂缓" : item.result ? item.result_label : item.status_label || "待处理";
       parts.confidence.textContent = Number.isFinite(item.confidence) ? `${Math.round(item.confidence * 100)}%` : "—";

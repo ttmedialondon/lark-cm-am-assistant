@@ -28,6 +28,7 @@ from .contact_taxonomy import CONTACT_ROLE_CODES, ORGANIZATION_KIND_LABELS, ROLE
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
 from .identity_profiles import safe_avatar_url
+from .lark_api import private_chat_url
 from .message_mentions import mention_names, resolve_mentions, rich_mention_text
 
 LONDON_TIME_ZONE = ZoneInfo("Europe/London")
@@ -1524,6 +1525,7 @@ def _decorate_contact(row: dict[str, Any]) -> dict[str, Any]:
     item["confirmed_role_labels"] = [ROLE_LABELS[role] for role in roles if role in ROLE_LABELS]
     category = item.get("category") or item.get("primary_role") or "unclassified"
     item["category"] = category
+    item["private_chat_url"] = private_chat_url(item.get("open_id")) if category == "creator" else None
     item["category_label"] = role_label(None if category == "unclassified" else category)
     item["category_badge"] = {
         "creator": "success",

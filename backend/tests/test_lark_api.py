@@ -4,7 +4,18 @@ import httpx
 import pytest
 
 from app.config import Settings
-from app.lark_api import LarkApiError, LarkClient
+from app.lark_api import LarkApiError, LarkClient, private_chat_url
+
+
+def test_private_chat_link_uses_only_stored_user_identity():
+    from urllib.parse import parse_qs, urlsplit
+
+    target = "ou_" + "a" * 32
+    url = urlsplit(private_chat_url(target))
+    assert (url.scheme, url.netloc, url.path) == ("https", "applink.larksuite.com", "/client/chat/open")
+    assert parse_qs(url.query) == {"openId": [target]}  # Never a CM chat ID, app ID or token.
+    for missing_or_invalid in (None, "", "user536353", "oc_group", "ou_x&openChatId=oc_other", "javascript:alert(1)"):
+        assert private_chat_url(missing_or_invalid) is None
 
 
 def settings() -> Settings:

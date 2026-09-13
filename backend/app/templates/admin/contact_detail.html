@@ -4,7 +4,7 @@
 <div class="page">
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
-    <div class="d-flex align-items-center mb-3"><div><div class="d-flex flex-wrap align-items-center gap-2"><h2 class="page-title mb-0">{{ contact.display_name }}</h2><span class="badge bg-{{ contact.category_badge }}-lt">{{ contact.category_label }}</span>{% for label in contact.confirmed_role_labels[1:] %}<span class="badge bg-secondary-lt">辅助：{{ label }}</span>{% endfor %}</div><div class="text-secondary">稳定 Lark 身份 · {{ contact.open_id }}</div></div><a class="btn btn-outline-secondary ms-auto" href="/admin/contacts?{{ source_query }}">返回人员目录</a></div>
+    <div class="d-flex align-items-center mb-3"><div><div class="d-flex flex-wrap align-items-center gap-2"><h2 class="page-title mb-0">{% if contact.private_chat_url %}<a href="{{ contact.private_chat_url }}" target="_blank" rel="noopener noreferrer" title="在 Lark 中打开你与此人的私聊">{{ contact.display_name }}</a>{% else %}{{ contact.display_name }}{% endif %}</h2><span class="badge bg-{{ contact.category_badge }}-lt">{{ contact.category_label }}</span>{% for label in contact.confirmed_role_labels[1:] %}<span class="badge bg-secondary-lt">辅助：{{ label }}</span>{% endfor %}</div><div class="text-secondary">稳定 Lark 身份 · {{ contact.open_id }}</div></div><a class="btn btn-outline-secondary ms-auto" href="/admin/contacts?{{ source_query }}">返回人员目录</a></div>
     <div class="alert alert-info">身份识别只使用此人本人的重要历史发言，不判断 CM 负责人或 handle。人工已确认资料、已核实的同事身份会保留；分类不等于进入“我的达人”。</div>
     <div class="card mb-4"><div class="card-body"><div class="row g-3">
       <div class="col-sm-6 col-lg-3"><div class="subheader">分类来源</div><div>{{ contact.classification_source_label or '—' }}</div></div>

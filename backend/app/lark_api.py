@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,6 +14,13 @@ import httpx
 from .config import Settings
 from .identity_names import format_display_name
 from .lark_sync_admission import LarkSyncAdmission
+
+
+def private_chat_url(open_id: str | None) -> str | None:
+    """Open the clicking user's Lark chat, never another CM's conversation."""
+    if not isinstance(open_id, str) or not re.fullmatch(r"ou_[A-Za-z0-9_-]{1,128}", open_id):
+        return None
+    return "https://applink.larksuite.com/client/chat/open?" + urlencode({"openId": open_id})
 
 
 class LarkApiError(RuntimeError):

@@ -16,6 +16,7 @@ from .ai_feature_config import api_key_cipher
 from .config import get_settings
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
+from .lark_api import private_chat_url
 
 POLICY_VERSION = "creator-ownership-v2"
 DEFAULT_CM_ID = UUID("24d1ef13-3762-4359-ba11-d26c03cf1f7f")
@@ -958,6 +959,7 @@ def page_data(cm_id=None, run_id=None, query="", status="all", page=1, include_p
                     {
                         "id": str(row["id"]),
                         "open_id": row["open_id"],
+                        "private_chat_url": private_chat_url(row["open_id"]),
                         "display_name": row["display_name"] or "未命名用户",
                         "avatar_url": row["avatar_url"],
                         "handle": row["handle"] or "—",
