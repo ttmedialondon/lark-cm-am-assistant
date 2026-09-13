@@ -33,8 +33,7 @@
     const person = node("td");
     const name = node("a", "", "fw-bold");
     name.target = "_blank"; name.rel = "noopener noreferrer";
-    const identity = node("div", "", "small text-secondary");
-    person.append(name, identity);
+    person.append(name);
     const handleCell = node("td"); handleCell.style.minWidth = "250px";
     const saved = node("div", "", "mb-2"); handleCell.append(saved);
     const editor = node("div");
@@ -43,7 +42,7 @@
     input.rows = 2; input.maxLength = 3200; input.placeholder = "填写 handle；多个账号每行一个";
     input.setAttribute("aria-label", `${item.display_name || "达人"} 的 handle`);
     input.value = (item.handles || []).join("\n");
-    const parts = {row, name, identity, saved, editor, options, input, dirty: false, optionsKey: ""};
+    const parts = {row, name, saved, editor, options, input, dirty: false, optionsKey: ""};
     input.addEventListener("input", () => { parts.dirty = true; });
     editor.append(input); handleCell.append(editor);
     const status = node("td"); status.style.minWidth = "180px";
@@ -93,7 +92,6 @@
       if (!rows.has(item.id)) rows.set(item.id, makeRow(item));
       const parts = rows.get(item.id);
       parts.name.textContent = item.display_name || "—";
-      parts.identity.textContent = item.open_id || "—";
       if (item.private_chat_url) parts.name.href = item.private_chat_url;
       else parts.name.removeAttribute("href");
       parts.name.title = item.private_chat_url ? "在 Lark 中打开你与此人的私聊" : "缺少有效 Lark 用户，暂不能跳转";
