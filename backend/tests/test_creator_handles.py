@@ -172,6 +172,13 @@ def test_cm_can_fill_missing_handles_but_not_cross_scope_or_bypass_input_checks(
     case = _case(pg, pilot, monkeypatch, clues=False)
     task = _task(pg, case)
     assert task["status"] == "skipped" and not case.calls
+    avatar = "https://s1-imfile.feishucdn.com/static-resource/v1/example.png"
+    for url, status, expected in ((None, "succeeded", None), (avatar, "succeeded", avatar),
+                                  (avatar, "unavailable", None), ("https://untrusted.example/avatar.png", "succeeded", None)):
+        with pg.transaction(force_rollback=True):
+            pg.execute("UPDATE lark_identities SET avatar_url=%s,avatar_status=%s WHERE open_id='ou_creator'",
+                       (url, status))
+            assert handles.page_data(pilot.ids["cm"])["items"][0]["avatar_url"] == expected
     outsider = uuid4()
     pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext,body_consent_at) "
                "VALUES(%s,'ou_outsider','test',NOW())", (outsider,))

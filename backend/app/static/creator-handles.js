@@ -31,9 +31,13 @@
   function makeRow(item) {
     const row = node("tr");
     const person = node("td");
+    const personWrap = node("div", "", "d-flex align-items-center gap-2");
+    const avatar = node("span", "", "avatar avatar-sm bg-blue-lt rounded-circle flex-shrink-0 position-relative overflow-hidden");
+    avatar.setAttribute("aria-hidden", "true");
+    const initial = node("span"); avatar.append(initial);
     const name = node("a", "", "fw-bold");
     name.target = "_blank"; name.rel = "noopener noreferrer";
-    person.append(name);
+    personWrap.append(avatar, name); person.append(personWrap);
     const handleCell = node("td"); handleCell.style.minWidth = "250px";
     const saved = node("div", "", "mb-2"); handleCell.append(saved);
     const editor = node("div");
@@ -42,7 +46,7 @@
     input.rows = 2; input.maxLength = 3200; input.placeholder = "填写 handle；多个账号每行一个";
     input.setAttribute("aria-label", `${item.display_name || "达人"} 的 handle`);
     input.value = (item.handles || []).join("\n");
-    const parts = {row, name, saved, editor, options, input, dirty: false, optionsKey: ""};
+    const parts = {row, name, avatar, initial, saved, editor, options, input, dirty: false, optionsKey: ""};
     input.addEventListener("input", () => { parts.dirty = true; });
     editor.append(input); handleCell.append(editor);
     const status = node("td"); status.style.minWidth = "180px";
@@ -94,6 +98,20 @@
       if (!rows.has(item.id)) rows.set(item.id, makeRow(item));
       const parts = rows.get(item.id);
       parts.name.textContent = item.display_name || "—";
+      parts.initial.textContent = Array.from((item.display_name || "").trim())[0]?.toUpperCase() || "?";
+      if (parts.avatarUrl !== item.avatar_url) {
+        parts.avatarUrl = item.avatar_url;
+        parts.avatar.querySelector("img")?.remove();
+        if (item.avatar_url) {
+          const image = node("img", "", "position-absolute top-0 start-0 w-100 h-100");
+          image.alt = ""; image.width = 32; image.height = 32;
+          image.loading = "lazy"; image.referrerPolicy = "no-referrer";
+          image.style.objectFit = "cover"; image.style.visibility = "hidden";
+          image.addEventListener("load", () => { image.style.visibility = "visible"; }, {once: true});
+          image.addEventListener("error", () => image.remove(), {once: true});
+          image.src = item.avatar_url; parts.avatar.append(image);
+        }
+      }
       if (item.private_chat_url) parts.name.href = item.private_chat_url;
       else parts.name.removeAttribute("href");
       parts.name.title = item.private_chat_url ? "在 Lark 中打开你与此人的私聊" : "缺少有效 Lark 用户，暂不能跳转";
