@@ -239,6 +239,48 @@ def test_paused_or_revoked_import_does_not_send_and_expired_paid_lease_does_not_
     assert row_for(pg, batch, "creator_one")["reason_code"] == "interrupted"
 
 
+def test_import_pages_and_user_search_only_expose_currently_accessible_identities(pg, pilot, monkeypatch):
+    prepare(pg, pilot, monkeypatch)
+    cm, contact = pilot.ids["cm"], pilot.ids["creator"]
+    batch = imports.preview_import(cm, cm, "roster.xlsx", workbook("roster_entry"))
+    imports.start_import(cm, batch["id"])
+    row = row_for(pg, batch, "roster_entry")
+    pg.execute("UPDATE creator_import_rows SET contact_id=%s WHERE id=%s", (contact, row["id"]))
+    pg.execute("UPDATE contacts SET creator_type='cap' WHERE id=%s", (contact,))
+    # The result limit applies after access checks, even with earlier inaccessible name matches.
+    pg.execute("INSERT INTO contacts(id,display_name) "
+               "SELECT gen_random_uuid(),'aaa creator ' || n FROM generate_series(1,21) n")
+
+    # Each original access path remains independently sufficient.
+    for access_path in ("private", "member", "observation"):
+        with pg.transaction(force_rollback=True):
+            if access_path != "private":
+                pg.execute("UPDATE authorization_chats SET p2p_counterpart_open_id=NULL")
+            if access_path != "observation":
+                pg.execute("UPDATE authorization_message_observations SET observed_at=NOW()-INTERVAL '2 days'")
+            if access_path == "member":
+                pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('chat_creator','ou_creator')")
+            assert imports._accessible(pg, cm, contact)
+            assert imports.search_users(cm, cm, "creator")[0]["id"] == str(contact)
+            page = imports.page_data(cm, cm, q="creator")
+            assert page["total"] == 1 and page["candidates"][0]["creator_type"] == "cap"
+
+    # A visible sender requires a readable observation after the CM's consent.
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE authorization_chats SET p2p_counterpart_open_id=NULL")
+        pg.execute("UPDATE authorization_message_observations SET observed_at=NOW()-INTERVAL '2 days'")
+        assert not imports._accessible(pg, cm, contact)
+    pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (cm,))
+    assert not imports._accessible(pg, cm, contact)
+    assert imports.search_users(cm, cm, "creator") == []
+    assert imports.page_data(cm, cm, q="creator")["total"] == 0
+    candidate = imports.page_data(cm, cm)["candidates"][0]
+    assert candidate["handle"] == "roster_entry" and candidate["contact_id"] is None
+    assert candidate["display_name"] == "—" and candidate["creator_type"] == "pending"
+    with pytest.raises(PermissionError):
+        imports.confirm_row(cm, row["id"], "roster_entry", contact)
+
+
 def test_import_workbook_rejects_unsafe_or_ambiguous_input():
     for name, content in (
         ("roster.xls", workbook("valid")),

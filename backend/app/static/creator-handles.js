@@ -8,7 +8,7 @@
   let tab = app.dataset.tab;
   let page = data.page || 1;
   let query = el("query").value.trim();
-  let busy = false, reading = false, version = 0, evidenceVersion = 0, autoDirty = false;
+  let busy = false, reading = false, refreshQueued = false, version = 0, evidenceVersion = 0, autoDirty = false;
   const rows = new Map();
   const importRows = new Map();
   let imports = {batches: [], candidates: [], total: 0}, importPage = 1, importPreview = null;
@@ -272,19 +272,29 @@
   }
   async function refresh(automatic = false) {
     if (automatic && (reading || busy || document.hidden || [...rows.values(), ...importRows.values()].some(row => row.dirty))) return;
+    if (reading) {
+      if (!automatic) { refreshQueued = true; version++; }
+      return;
+    }
     const token = ++version; reading = true;
     const params = new URLSearchParams({tab, q: query, page: String(page)});
     if (selectedCM()) params.set("cm_id", selectedCM());
     history.replaceState(null, "", `/creators?${params}`);
     try {
       const importParams = new URLSearchParams({cm_id: selectedCM(), q: query, page: String(importPage)});
-      const [next, nextImports] = await Promise.all([
+      const results = await Promise.allSettled([
         fetch(`/creators/data?${params}`, {cache: "no-store"}).then(read),
         selectedCM() ? fetch(`/creators/imports/data?${importParams}`, {cache: "no-store"}).then(read) : Promise.resolve({batches: [], candidates: [], total: 0}),
       ]);
+      const failure = results.find(result => result.status === "rejected");
+      if (failure) throw failure.reason;
+      const [next, nextImports] = results.map(result => result.value);
       if (token === version) { data = next; imports = nextImports; render(); }
     } catch (error) { if (token === version) notice(error.message, true); }
-    finally { if (token === version) reading = false; }
+    finally {
+      reading = false;
+      if (refreshQueued) { refreshQueued = false; void refresh(); }
+    }
   }
   async function mutate(path, fields = {}) {
     if (busy) return;
@@ -297,22 +307,25 @@
         if (path.startsWith("/imports/rows/")) {
           const rowId = path.split("/")[3];
           importRows.get(rowId)?.row.remove(); importRows.delete(rowId);
+          imports.candidates = imports.candidates.filter(item => item.id !== rowId);
           notice("已确认入库，可在“我的达人”查看并设置 CAP 属性。");
         } else {
           const taskId = path.split("/")[2];
           rows.get(taskId)?.row.remove(); rows.delete(taskId);
+          if (tab === "candidates") data.items = data.items.filter(item => item.id !== taskId);
           notice(tab === "mine" ? "handle 已保存。" : "已确认入库，可在“我的达人”查看。");
         }
       }
       else if (path.startsWith("/imports/rows/") && path.endsWith("/defer")) {
         const rowId = path.split("/")[3];
         importRows.get(rowId)?.row.remove(); importRows.delete(rowId);
+        imports.candidates = imports.candidates.filter(item => item.id !== rowId);
         notice("已暂缓，尚未确认的修改不会入库。");
       }
       else if (path.endsWith("/recheck")) notice("已提交材料更新，本次未调用 AI；准备完成后再点击“开始查找 handle”。");
       else if (path.endsWith("/type")) notice("达人 CAP 属性已保存。");
       else notice("已保存。");
-      await refresh();
+      void refresh();
     } catch (error) { notice(error.message, true); }
     finally { busy = false; render(); }
   }
@@ -338,7 +351,7 @@
       preview.append(list);
       if ((importPreview.rows || []).length > 100) preview.append(node("p", "这里只展示前 100 行，确认后会处理全部有效 handle。", "small text-secondary mt-2"));
       preview.hidden = false;
-      await refresh();
+      void refresh();
     } catch (error) { importMessage(error.message, true); }
     finally { busy = false; render(); }
   }
@@ -350,7 +363,7 @@
       importPreview = null; el("import-dialog").close();
       tab = "candidates"; importPage = 1; clearImportRows();
       notice("已提交匹配。账号与用户关系确定且无冲突的直接入库，不确定的会出现在 Excel 待确认中。");
-      await refresh();
+      void refresh();
     } catch (error) { importMessage(error.message, true); }
     finally { busy = false; render(); }
   }

@@ -81,23 +81,32 @@ def _row(conn, actor, row_id):
 
 # Contacts are selectable only through the target CM's currently readable conversations.
 _ACCESSIBLE = """
-    SELECT DISTINCT i.contact_id FROM lark_identities i
+    SELECT 1 FROM lark_identities i
     JOIN authorizations a ON a.id=%s AND a.status='active' AND a.body_consent_at IS NOT NULL
-    JOIN authorization_chats ac ON ac.authorization_id=a.id AND ac.is_visible AND ac.sync_enabled
-    JOIN chats ch ON ch.chat_id=ac.chat_id AND COALESCE(ch.chat_status,'normal')='normal'
-    WHERE i.identity_type='user' AND i.contact_id IS NOT NULL AND i.open_id<>a.open_id AND (
-        ac.p2p_counterpart_open_id=i.open_id
-        OR EXISTS (SELECT 1 FROM chat_members m WHERE m.chat_id=ac.chat_id AND m.open_id=i.open_id)
-        OR EXISTS (SELECT 1 FROM authorization_message_observations o JOIN chat_messages m
-            ON m.chat_id=o.chat_id AND m.message_id=o.message_id
-            WHERE o.authorization_id=a.id AND o.chat_id=ac.chat_id AND o.observed_at>=a.body_consent_at
-            AND NOT m.is_deleted AND m.body_ciphertext IS NOT NULL AND m.sender_open_id=i.open_id))
+    WHERE i.identity_type='user' AND i.contact_id=c.id AND i.open_id<>a.open_id AND (
+        EXISTS (SELECT 1 FROM authorization_chats ac JOIN chats ch ON ch.chat_id=ac.chat_id
+            WHERE ac.authorization_id=a.id AND ac.is_visible AND ac.sync_enabled
+            AND COALESCE(ch.chat_status,'normal')='normal' AND ac.p2p_counterpart_open_id=i.open_id)
+        OR EXISTS (SELECT 1 FROM chat_members m
+            JOIN authorization_chats ac ON ac.chat_id=m.chat_id AND ac.authorization_id=a.id
+            JOIN chats ch ON ch.chat_id=ac.chat_id
+            WHERE m.open_id=i.open_id AND ac.is_visible AND ac.sync_enabled
+            AND COALESCE(ch.chat_status,'normal')='normal')
+        OR EXISTS (SELECT 1 FROM chat_messages m JOIN authorization_message_observations o
+            ON o.chat_id=m.chat_id AND o.message_id=m.message_id AND o.authorization_id=a.id
+            JOIN authorization_chats ac ON ac.chat_id=o.chat_id AND ac.authorization_id=a.id
+            JOIN chats ch ON ch.chat_id=ac.chat_id
+            WHERE m.sender_open_id=i.open_id AND o.observed_at>=a.body_consent_at
+            AND NOT m.is_deleted AND m.body_ciphertext IS NOT NULL
+            AND ac.is_visible AND ac.sync_enabled AND COALESCE(ch.chat_status,'normal')='normal'))
 """
 
 
 def _accessible(conn, cm_id, contact_id):
     return bool(
-        conn.execute("SELECT 1 FROM (" + _ACCESSIBLE + ") visible WHERE contact_id=%s", (cm_id, contact_id)).fetchone()
+        conn.execute(
+            "SELECT 1 FROM contacts c WHERE c.id=%s AND EXISTS (" + _ACCESSIBLE + ")", (contact_id, cm_id)
+        ).fetchone()
     )
 
 
@@ -108,7 +117,15 @@ def search_users(actor_id, cm_id, q):
     with connection() as conn:
         cm_id, _ = creator_handles._access(conn, actor_id, cm_id)
         rows = conn.execute(
-            """SELECT c.id,COALESCE(NULLIF(c.display_name,''),'未命名用户') display_name,
+            """WITH named AS MATERIALIZED (
+                SELECT c.id,COALESCE(NULLIF(c.display_name,''),'未命名用户') display_name FROM contacts c
+                WHERE POSITION(lower(%s) IN lower(COALESCE(c.display_name,'')))>0
+                OR EXISTS (SELECT 1 FROM lark_identities i WHERE i.contact_id=c.id
+                    AND POSITION(lower(%s) IN lower(COALESCE(i.display_name,'')))>0)
+                ORDER BY display_name,c.id
+            ), visible AS MATERIALIZED (
+                SELECT c.* FROM named c WHERE EXISTS (""" + _ACCESSIBLE + """) LIMIT 20
+            ) SELECT c.id,c.display_name,
             (SELECT COALESCE(NULLIF(ch.name,''),'相关会话') FROM authorization_chats ac
                 JOIN chats ch ON ch.chat_id=ac.chat_id
                 WHERE ac.authorization_id=%s AND ac.is_visible AND ac.sync_enabled
@@ -117,14 +134,8 @@ def search_users(actor_id, cm_id, q):
                         ac.p2p_counterpart_open_id=i.open_id OR EXISTS (
                             SELECT 1 FROM chat_members m WHERE m.chat_id=ac.chat_id AND m.open_id=i.open_id)))
                 ORDER BY ch.chat_mode DESC,ch.chat_id LIMIT 1) context_label
-            FROM contacts c JOIN ("""
-            + _ACCESSIBLE
-            + """) visible ON visible.contact_id=c.id
-            WHERE POSITION(lower(%s) IN lower(COALESCE(c.display_name,'')))>0
-            OR EXISTS (SELECT 1 FROM lark_identities i WHERE i.contact_id=c.id
-                AND POSITION(lower(%s) IN lower(COALESCE(i.display_name,'')))>0)
-            ORDER BY display_name,c.id LIMIT 20""",
-            (cm_id, cm_id, q, q),
+            FROM visible c ORDER BY display_name,c.id""",
+            (q, q, cm_id, cm_id),
         ).fetchall()
         return [
             {"id": str(r["id"]), "display_name": r["display_name"], "context_label": r["context_label"] or "有历史交流"}
@@ -751,31 +762,41 @@ def page_data(actor_id, cm_id, q="", page=1):
                     "can_resume": batch["status"] == "paused",
                 }
             )
-        base = (
-            """FROM creator_import_rows r JOIN creator_import_batches b ON b.id=r.batch_id
-            LEFT JOIN contacts c ON c.id=r.contact_id AND c.id IN ("""
-            + _ACCESSIBLE
-            + """)
+        base = """FROM creator_import_rows r JOIN creator_import_batches b ON b.id=r.batch_id
             WHERE r.cm_authorization_id=%s AND b.policy_version=%s
-            AND b.status<>'preview' AND r.review_status<>'confirmed'
-            AND (%s='' OR POSITION(lower(%s) IN lower(r.handle))>0
-                OR POSITION(lower(%s) IN lower(COALESCE(c.display_name,'')))>0)"""
-        )
-        params = (cm_id, cm_id, POLICY_VERSION, q, q, q)
+            AND b.status<>'preview' AND r.review_status<>'confirmed'"""
+        params = (cm_id, POLICY_VERSION)
+        if q:
+            base += """ AND (POSITION(lower(%s) IN lower(r.handle))>0 OR EXISTS (
+                SELECT 1 FROM contacts c WHERE c.id=r.contact_id
+                AND POSITION(lower(%s) IN lower(COALESCE(c.display_name,'')))>0
+                AND EXISTS (""" + _ACCESSIBLE + ")))"
+            params += (q, q, cm_id)
         total = conn.execute("SELECT count(*) n " + base, params).fetchone()["n"]
+        # Paginate before checking identity access; a refresh must never enumerate all CM-visible users.
         rows = conn.execute(
-            "SELECT r.*,c.display_name,c.id accessible_contact_id,c.creator_type "
+            "WITH page_rows AS MATERIALIZED (SELECT r.* "
             + base
-            + " ORDER BY r.created_at DESC,r.id LIMIT 25 OFFSET %s",
+            + " ORDER BY r.created_at DESC,r.id LIMIT 25 OFFSET %s) "
+            "SELECT r.*,c.display_name,c.creator_type FROM page_rows r "
+            "LEFT JOIN contacts c ON c.id=r.contact_id "
+            "ORDER BY r.created_at DESC,r.id",
             (*params, (page - 1) * 25),
         ).fetchall()
+        contact_ids = list({r["contact_id"] for r in rows if r["contact_id"]})
+        visible_ids = {
+            r["id"] for r in conn.execute(
+                "SELECT c.id FROM contacts c WHERE c.id=ANY(%s::uuid[]) AND EXISTS (" + _ACCESSIBLE + ")",
+                (contact_ids, cm_id),
+            ).fetchall()
+        } if contact_ids else set()
         candidates = [
             {
                 "id": str(r["id"]),
                 "handle": r["handle"],
-                "contact_id": str(r["accessible_contact_id"]) if r["accessible_contact_id"] else None,
-                "display_name": r["display_name"] or "—",
-                "creator_type": r["creator_type"] or "pending",
+                "contact_id": str(r["contact_id"]) if r["contact_id"] in visible_ids else None,
+                "display_name": (r["display_name"] or "—") if r["contact_id"] in visible_ids else "—",
+                "creator_type": (r["creator_type"] or "pending") if r["contact_id"] in visible_ids else "pending",
                 "source": "Excel",
                 "status_label": "暂缓" if r["review_status"] == "deferred" else STATUS_LABELS[r["status"]],
                 "reason": REASONS.get(r["reason_code"], "材料不足，请核对对应用户" if r["status"] == "skipped" else ""),
