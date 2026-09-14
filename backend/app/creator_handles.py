@@ -809,7 +809,7 @@ def _mixed_candidates(conn, cm_id, ai_rows, settings, query):
 
     # Combine scoped metadata; check cited account evidence for overlapping handles, never all chat history.
     imported = conn.execute(
-        """SELECT r.*,c.display_name,c.creator_type FROM creator_import_rows r
+        """SELECT r.*,c.display_name,c.creator_type,b.creator_type batch_creator_type FROM creator_import_rows r
         JOIN creator_import_batches b ON b.id=r.batch_id LEFT JOIN contacts c ON c.id=r.contact_id
         WHERE r.cm_authorization_id=%s AND b.policy_version=%s AND b.status<>'preview'
         AND r.review_status<>'confirmed' ORDER BY r.created_at DESC,r.id""",

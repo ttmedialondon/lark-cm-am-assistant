@@ -11,6 +11,7 @@
   let busy = false, reading = false, refreshQueued = false, version = 0, evidenceVersion = 0, autoDirty = false;
   const rows = new Map();
   let importPreview = null;
+  const creatorTypeLabel = value => ({cap: "CAP", non_cap: "非 CAP", pending: "待定"})[value] || "待定";
   const rowKey = item => `${item.kind || "ai"}:${item.id}`;
   const node = (tag, text = "", classes = "") => {
     const item = document.createElement(tag); item.textContent = text; item.className = classes; return item;
@@ -40,7 +41,8 @@
     handleCell.style.minWidth = "200px"; userCell.style.minWidth = "240px";
     const handle = node("input", "", "form-control"); handle.maxLength = 160;
     handle.setAttribute("aria-label", "达人 handle"); handle.placeholder = "—";
-    handleCell.append(handle);
+    const creatorType = node("div", "", "small text-secondary mt-1");
+    handleCell.append(handle, creatorType);
     const searchLine = node("div", "", "d-flex gap-1");
     const user = node("input", "", "form-control"); user.maxLength = 120; user.placeholder = "— 搜索对应用户";
     user.setAttribute("aria-label", "搜索当前负责人可访问的用户");
@@ -54,7 +56,7 @@
     actionsList.append(confirm, defer); actions.append(actionsList);
     const source = node("td", "", "text-nowrap"), typeCell = node("td"); typeCell.hidden = true;
     row.append(handleCell, source, userCell, typeCell, statusCell, actions);
-    const parts = {row, source, handle, user, search, choices, status, reason, confirm, defer, contactId: "", dirty: false, searchVersion: 0};
+    const parts = {row, source, handle, creatorType, user, search, choices, status, reason, confirm, defer, contactId: "", dirty: false, searchVersion: 0};
     const check = () => { confirm.disabled = busy || !parts.canConfirm || !handle.value.trim() || !parts.contactId; };
     handle.addEventListener("input", () => { parts.dirty = true; check(); });
     user.addEventListener("input", () => { parts.dirty = true; parts.contactId = ""; parts.searchVersion++; choices.replaceChildren(); check(); });
@@ -86,7 +88,7 @@
   }
   function renderImports() {
     el("import-open").disabled = busy || !selectedCM();
-    for (const key of ["file", "check", "confirm", "close"]) el(`import-${key}`).disabled = busy;
+    for (const key of ["file", "type", "check", "confirm", "close"]) el(`import-${key}`).disabled = busy;
     el("import-confirm").hidden = !importPreview || importPreview.status !== "preview" || !(importPreview.counts?.valid > 0);
     const batches = data.import_batches || [];
     el("import-batches").hidden = !batches.length;
@@ -94,7 +96,7 @@
     for (const batch of batches) {
       const line = node("div", "", "d-flex flex-wrap align-items-center gap-2 mb-2");
       const label = node("div", "", "me-auto");
-      label.append(node("strong", batch.filename || "Excel 名单"), node("span", ` · ${batch.status_label || batch.status}`, "text-secondary"));
+      label.append(node("strong", batch.filename || "Excel 名单"), node("span", ` · ${creatorTypeLabel(batch.creator_type)} · ${batch.status_label || batch.status}`, "text-secondary"));
       const counts = batch.counts || {};
       label.append(node("div", `已入库 ${counts.confirmed || 0}（含已存在 ${counts.existing || 0}）· 待核对 ${counts.review || 0} · 待整理 ${counts.pending || 0} · 排队 ${counts.queued || 0} · 分析中 ${counts.running || 0}${counts.failed ? ` · 异常 ${counts.failed}` : ""}`, "small text-secondary"));
       if (batch.error) label.append(node("div", batch.error, "small text-danger"));
@@ -114,6 +116,7 @@
       parts.contactId = item.contact_id || "";
     }
     parts.canConfirm = !!item.can_confirm;
+    parts.creatorType.textContent = `CAP 属性：${creatorTypeLabel(item.creator_type)}`;
     parts.status.textContent = item.status_label || "待确认"; parts.reason.textContent = item.reason || "";
     parts.handle.disabled = busy || !parts.canConfirm; parts.user.disabled = busy || !parts.canConfirm;
     parts.search.disabled = busy || !parts.canConfirm;
@@ -298,7 +301,7 @@
         data.items = data.items.filter(item => rowKey(item) !== key);
       }
       if (path.endsWith("/confirm")) {
-        notice(tab === "mine" ? "handle 已保存。" : "已确认入库，可在“我的达人”查看并设置 CAP 属性。");
+        notice(tab === "mine" ? "handle 已保存。" : "已确认入库，可在“我的达人”查看账号和 CAP 属性。");
       }
       else if (path.endsWith("/defer")) {
         notice("已暂缓，尚未确认的修改不会入库。");
@@ -318,13 +321,14 @@
     busy = true; importPreview = null; render(); importMessage("正在检查表格，本次不调用 AI…");
     el("import-preview").hidden = true;
     try {
-      importPreview = await read(await fetch(`/creators/imports/preview?${new URLSearchParams({cm_id: selectedCM()})}`, {
+      importPreview = await read(await fetch(`/creators/imports/preview?${new URLSearchParams({cm_id: selectedCM(), creator_type: el("import-type").value})}`, {
         method: "POST", headers: {"Content-Type": "application/octet-stream", "X-CSRF-Token": app.dataset.csrf, "X-Filename": encodeURIComponent(file.name)}, body: file,
       }));
       const counts = importPreview.counts || {};
       const nextStep = importPreview.status !== "preview" ? "这份表已导入，不会重复启动，请查看页面上的导入进度。" : counts.valid ? "请核对后开始匹配。" : "请修改表格后重新上传。";
       importMessage(`有效 handle ${counts.valid || 0} · 重复 ${counts.duplicates || 0} · 无效 ${counts.invalid || 0}。${nextStep}`);
       const preview = el("import-preview"); preview.replaceChildren();
+      preview.append(node("p", `负责人：${selectedCMName()} · CAP 属性：${creatorTypeLabel(importPreview.creator_type)}。名单已确认达人身份，AI 匹配账号对应用户。`, "small"));
       const list = node("div", "", "border rounded p-2"); list.style.maxHeight = "240px"; list.style.overflowY = "auto";
       for (const item of (importPreview.rows || []).slice(0, 100)) {
         list.append(node("div", `第 ${item.row_number} 行 · ${item.handle || "—"}${item.error ? ` · ${item.error}` : ""}`, `small py-1 ${item.error ? "text-danger" : ""}`));
@@ -343,7 +347,7 @@
       await read(await fetch(`/creators/imports/${importPreview.id}/start`, {method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: new URLSearchParams({csrf_token: app.dataset.csrf})}));
       importPreview = null; el("import-dialog").close();
       tab = "candidates"; page = 1; clearRows();
-      notice("已提交匹配。账号与用户关系确定且无冲突的直接入库，其余与 AI 结果一起显示在候选达人中，并标注来源。");
+      notice("已提交匹配。名单已确认达人身份，AI 匹配账号对应用户；关系可靠且无冲突的按名单 CAP 属性入库。未找到对应用户的保留 handle、用户留空，其余留待核对。");
       void refresh();
     } catch (error) { importMessage(error.message, true); }
     finally { busy = false; render(); }
@@ -376,12 +380,14 @@
   el("evidence-close").addEventListener("click", () => el("evidence").close());
   el("evidence").addEventListener("close", () => { evidenceVersion++; el("evidence-body").replaceChildren(); });
   el("import-open").addEventListener("click", () => {
-    importPreview = null; el("import-file").value = ""; el("import-preview").hidden = true;
+    importPreview = null; el("import-file").value = ""; el("import-type").value = "cap"; el("import-preview").hidden = true;
     el("import-cm").textContent = selectedCMName(); importMessage(""); render(); el("import-dialog").showModal();
   });
   el("import-close").addEventListener("click", () => el("import-dialog").close());
   el("import-dialog").addEventListener("cancel", event => { if (busy) event.preventDefault(); });
-  el("import-file").addEventListener("change", () => { importPreview = null; el("import-preview").hidden = true; importMessage(""); render(); });
+  for (const key of ["file", "type"]) el(`import-${key}`).addEventListener("change", () => {
+    importPreview = null; el("import-preview").hidden = true; importMessage(""); render();
+  });
   el("import-check").addEventListener("click", checkImport);
   el("import-confirm").addEventListener("click", startImport);
   if (data.can_manage) {

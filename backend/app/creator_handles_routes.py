@@ -138,7 +138,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
             return error(exc)
 
     @router.post("/imports/preview")
-    async def import_preview(request: Request, cm_id: UUID):
+    async def import_preview(request: Request, cm_id: UUID, creator_type: str = "cap"):
         try:
             auth = actor(request)
             if not _csrf_matches({"csrf_token": request.headers.get("X-CSRF-Token", "")}, csrf_token(auth)):
@@ -156,6 +156,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
             filename = unquote(request.headers.get("X-Filename", "")[:512])
             result = await run_in_threadpool(
                 creator_imports.preview_import, auth["id"], cm_id, filename, bytes(content),
+                creator_type=creator_type,
             )
             return payload(result)
         except (ValueError, LookupError, PermissionError) as exc:
