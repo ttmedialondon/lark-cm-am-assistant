@@ -316,7 +316,7 @@ def validate_result(raw, pack):
         raise ValueError("invalid import matching result")
     users = {u["ref"]: u for u in pack["users"]}
     refs = {r["ref"]: r for r in [*pack["groups"], *pack["messages"]]}
-    strong, seen = [], set()
+    strong, seen, blockers = [], set(), []
     handle = pack["imported_handle"]
     for candidate in result["candidates"]:
         if not isinstance(candidate, dict) or set(candidate) != {
@@ -375,15 +375,31 @@ def validate_result(raw, pack):
                     and not pack["meta"]["material_incomplete"] and not pack["meta"]["account_change_signal"]
                     and not (set(pack["meta"].get("account_claimant_refs", [])) - {user_ref})
                     and account_strong)
+        blockers.extend(code for code, failed in (
+            ("confidence_below_threshold", candidate["confidence"] < 0.95),
+            ("creator_identity_unconfirmed", not creator or not candidate["is_creator"]),
+            ("account_evidence_insufficient", not account_strong),
+            ("missing_info", bool(candidate["missing_info"])),
+            ("conflict", bool(candidate["conflicts"])),
+            ("material_incomplete", pack["meta"]["material_incomplete"]),
+            ("account_change_signal", pack["meta"]["account_change_signal"]),
+            ("competing_claimants", bool(set(pack["meta"].get("account_claimant_refs", [])) - {user_ref})),
+        ) if failed)
         candidate["creator_confirmed"] = creator
         if accepted:
             strong.append(candidate)
     candidates = result["candidates"]
     chosen = candidates[0] if len(candidates) == 1 else None
     matched = result["outcome"] == "matched" and len(strong) == 1 and len(candidates) == 1
+    if not candidates:
+        blockers.append("user_not_found")
+    elif len(candidates) > 1:
+        blockers.append("multiple_users")
+    if candidates and result["outcome"] != "matched":
+        blockers.append("ai_review")
     return {"outcome": "matched" if matched else "review" if candidates else "not_found",
             "user_ref": chosen["user_ref"] if chosen else None,
             "confidence": chosen["confidence"] if chosen else 0,
             "creator_confirmed": bool(chosen and chosen["creator_confirmed"]),
             "reason": result["reason"] if matched or not candidates else "账号与对应用户仍需人工核对。",
-            "handles": [handle], "candidates": candidates}
+            "handles": [handle], "candidates": candidates, "admission_blockers": list(dict.fromkeys(blockers))}

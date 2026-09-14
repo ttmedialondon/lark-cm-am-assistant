@@ -128,7 +128,8 @@ def test_excel_auto_manual_and_repeated_import_preserve_people_and_creator_type(
         pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (pilot.ids["creator"],)).fetchone()["creator_type"]
         == "pending"
     )
-    assert imports._pack(matched, pilot.settings, "result_ciphertext")["checked"]["creator_confirmed"] is True
+    checked = imports._pack(matched, pilot.settings, "result_ciphertext")["checked"]
+    assert checked["creator_confirmed"] is True and checked["admission_blockers"] == []
     assert not pg.execute("SELECT 1 FROM contact_roles WHERE contact_id=%s", (pilot.ids["creator"],)).fetchone()
     formal = creator_handles.page_data(pilot.ids["owner"], cm_id=pilot.ids["cm"], tab="mine")
     assert formal["total_count"] == 1 and formal["items"][0]["handles"] == ["creator_one"]
@@ -223,6 +224,57 @@ def test_import_scope_conflict_and_manual_edit_block_stale_ai_results(pg, pilot,
         len(calls) == 1
         and not pg.execute("SELECT 1 FROM social_accounts WHERE normalized_handle='creator_one'").fetchone()
     )
+
+
+def test_import_explains_unmet_admission_checks_without_changing_matching(pg, pilot, monkeypatch):
+    calls, _ = prepare(pg, pilot, monkeypatch)
+    original = contact_assessments.call_openai
+
+    def context_only(*args, **kwargs):
+        response = original(*args, **kwargs)
+        result = json.loads(response["text"])
+        result["candidates"][0]["basis"] = "context_only"
+        response["text"] = json.dumps(result)
+        return response
+
+    monkeypatch.setattr(contact_assessments, "call_openai", context_only)
+    batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "roster.xlsx", workbook("creator_one"))
+    imports.start_import(pilot.ids["cm"], batch["id"])
+    drain(pilot)
+    row = row_for(pg, batch, "creator_one")
+    stored = imports._pack(row, pilot.settings, "result_ciphertext")
+    assert row["outcome"] == "review" and row["review_status"] == "pending" and float(row["confidence"]) == .99
+    assert stored["checked"]["admission_blockers"] == ["account_evidence_insufficient"]
+    assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
+    monkeypatch.setattr(
+        imports.creator_import_evidence, "build_evidence", lambda *_: pytest.fail("GET rescanned history")
+    )
+    item = imports.page_data(pilot.ids["cm"], pilot.ids["cm"])["candidates"][0]
+    assert item["status_label"] == "AI 已分析，待核对" and item["confidence"] == .99
+    assert "99%" in item["reason"] and "直接关系未通过证据校验" in item["reason"]
+    # The same explanation works for results saved before blocker codes were introduced.
+    del stored["checked"]["admission_blockers"]
+    pg.execute("UPDATE creator_import_rows SET result_ciphertext=%s WHERE id=%s", (
+        imports.ownership._cipher(pilot.settings).encrypt(imports.ownership._encode(stored)), row["id"],
+    ))
+    assert imports.page_data(pilot.ids["cm"], pilot.ids["cm"])["candidates"][0]["reason"] == item["reason"]
+
+    # Existing frozen responses can explain the same gates without another provider call or history read.
+    pack = imports._pack(row, pilot.settings)
+    result = json.loads(stored["response"]["text"])
+    candidate = result["candidates"][0]
+    candidate.update(basis="self_declared", confidence=.94)
+    validate = imports.creator_import_evidence.validate_result
+    checked = validate(json.dumps(result), pack)
+    assert checked["outcome"] == "review" and checked["admission_blockers"] == ["confidence_below_threshold"]
+    candidate["confidence"] = .99
+    result["outcome"] = "review"
+    checked = validate(json.dumps(result), pack)
+    assert checked["outcome"] == "review" and checked["admission_blockers"] == ["ai_review"]
+    result["outcome"] = "matched"
+    checked = validate(json.dumps(result), pack)
+    assert checked["outcome"] == "matched" and checked["admission_blockers"] == []
+    assert len(calls) == 1
 
 
 def test_paused_or_revoked_import_does_not_send_and_expired_paid_lease_does_not_retry(pg, pilot, monkeypatch):
@@ -320,6 +372,8 @@ def test_existing_ai_accounts_merge_into_excel_without_new_requests(pg, pilot, m
     assert row["review_status"] == ("confirmed" if score >= .95 else "pending")
     if score < .95:
         assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
+        item = imports.page_data(pilot.ids["cm"], pilot.ids["cm"])["candidates"][0]
+        assert "94%" in item["reason"] and "未达到 95%" in item["reason"]
         imports.confirm_row(pilot.ids["cm"], row["id"], row["handle"], case.creator)
         unchanged = row_for(pg, batch, "creator_one")
         assert unchanged["confidence"] == row["confidence"]

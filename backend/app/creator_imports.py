@@ -22,7 +22,7 @@ POLICY_VERSION = "creator-import-v1"
 LOGGER = logging.getLogger(__name__)
 REASONS = {
     "existing": "已有相同账号和负责人，已复用正式关联",
-    "classified": "AI 匹配完成",
+    "classified": "AI 已分析，仍需核对账号与用户",
     "manual_confirmed": "已确认入库",
     "no_match": "未找到对应用户，请搜索并确认",
     "insufficient_material": "材料不足，请手动确认",
@@ -47,6 +47,19 @@ STATUS_LABELS = {
     "invalid": "待确认",
 }
 BATCH_LABELS = {"preview": "等待开始", "running": "匹配中", "paused": "已暂停", "completed": "匹配完成"}
+ADMISSION_REASONS = {
+    "confidence_below_threshold": "账号归属置信度未达到 95%",
+    "creator_identity_unconfirmed": "达人身份尚未可靠确认",
+    "account_evidence_insufficient": "账号与用户的直接关系未通过证据校验",
+    "missing_info": "账号归属仍有待补充的核验信息",
+    "conflict": "AI 发现尚未解决的冲突",
+    "material_incomplete": "相关材料超过本次取材上限，覆盖不完整",
+    "account_change_signal": "存在改名或账号变更线索",
+    "competing_claimants": "有其他用户认领同一账号",
+    "multiple_users": "存在多个可能用户，尚未唯一确定",
+    "user_not_found": "尚未找到具体的 Lark 用户",
+    "ai_review": "AI 仍建议人工核对",
+}
 
 
 def source_labels(row):
@@ -889,7 +902,57 @@ def batch_summaries(conn, cm_id):
     return decorated
 
 
+def _review_reason(conn, row, settings, visible):
+    if row["contact_id"] and not visible:
+        return "对应用户当前不可访问，请重新选择可访问的 Lark 用户。"
+    if row["reason_code"] != "classified":
+        return REASONS.get(row["reason_code"], "材料不足，请核对对应用户" if row["status"] == "skipped" else "")
+    codes = []
+    # Read stored analysis only. A list refresh must not rebuild evidence or call AI.
+    reused = (row.get("stats") or {}).get("reused_handle_task_id")
+    if reused:
+        from .creator_handle_evidence import _strong
+
+        task = conn.execute(
+            "SELECT * FROM creator_handle_tasks WHERE id=%s AND cm_authorization_id=%s",
+            (ownership._uuid(reused), row["cm_authorization_id"]),
+        ).fetchone()
+        if task:
+            result = creator_handles._decode(task, "result_ciphertext", settings)
+            pack = creator_handles._decode(task, "pack_ciphertext", settings)
+            candidate = next((c for c in result.get("candidates", []) if c["handle"] == row["handle"]), None)
+            if candidate:
+                refs = {r["ref"]: r for r in [*pack.get("groups", []), *pack.get("messages", [])]}
+                cited = [refs[ref] for ref in candidate["evidence_refs"] if ref in refs]
+                conditions = {
+                    "confidence_below_threshold": candidate["confidence"] < 0.95,
+                    "creator_identity_unconfirmed": not ownership._creator(conn, row["contact_id"]),
+                    "account_evidence_insufficient": not _strong(candidate, pack, cited),
+                    "missing_info": bool(candidate["missing_info"]),
+                    "conflict": bool(candidate["conflicts"]),
+                    "material_incomplete": pack.get("meta", {}).get("material_incomplete"),
+                    "account_change_signal": pack.get("meta", {}).get("account_change_signal"),
+                }
+                codes = [code for code, blocked in conditions.items() if blocked]
+    elif row.get("result_ciphertext") and row.get("pack_ciphertext"):
+        stored = _pack(row, settings, "result_ciphertext")
+        checked = stored.get("checked") or {}
+        codes = checked.get("admission_blockers")
+        if codes is None and (stored.get("response") or {}).get("text"):
+            checked = creator_import_evidence.validate_result(
+                stored["response"]["text"], _pack(row, settings)
+            )
+            codes = checked["admission_blockers"]
+    explanations = [ADMISSION_REASONS[code] for code in (codes or []) if code in ADMISSION_REASONS]
+    if not explanations:
+        explanations = [REASONS["classified"]]
+    if row["contact_id"] and row["confidence"] is not None:
+        explanations.insert(0, f"AI 账号归属评分 {float(row['confidence']) * 100:g}%（入库门槛 95%）")
+    return "；".join(explanations)
+
+
 def candidate_items(conn, cm_id, rows):
+    settings = creator_handles.get_settings()
     contact_ids = list({r["contact_id"] for r in rows if r["contact_id"]})
     visible_ids = {
         r["id"] for r in conn.execute(
@@ -907,8 +970,11 @@ def candidate_items(conn, cm_id, rows):
             "kind": "import",
             "sources": source_labels(r),
             "source": " + ".join(source_labels(r)),
-            "status_label": "暂缓" if r["review_status"] == "deferred" else STATUS_LABELS[r["status"]],
-            "reason": REASONS.get(r["reason_code"], "材料不足，请核对对应用户" if r["status"] == "skipped" else ""),
+            "status_label": "暂缓" if r["review_status"] == "deferred"
+            else "AI 已分析，待核对" if r["reason_code"] == "classified" else STATUS_LABELS[r["status"]],
+            "reason": _review_reason(conn, r, settings, r["contact_id"] in visible_ids),
+            "confidence": float(r["confidence"])
+            if r["confidence"] is not None and r["contact_id"] in visible_ids else None,
             "can_confirm": True,
             "can_defer": r["review_status"] != "deferred",
         }
