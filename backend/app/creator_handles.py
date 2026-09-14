@@ -796,7 +796,7 @@ def run_claimed_handle(job, settings):
 
 
 def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
-    """Current library: Excel CAP candidates and manually confirmed people."""
+    """Current library: Excel CAP candidates and confirmed people."""
     from . import creator_imports
 
     query = str(query or "").strip()[:120]
@@ -838,6 +838,17 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
             page = min(page,pages)
             people = conn.execute("SELECT c.id,c.display_name,c.creator_type " + formal_base
                                   + " ORDER BY c.display_name,c.id LIMIT 25 OFFSET %s", [*args,(page-1)*25]).fetchall()
+            imports_by_person = {person["id"]: [] for person in people}
+            for row in conn.execute(
+                """SELECT r.id,r.contact_id,r.handle,r.api_requests,r.stats,
+                    r.pack_ciphertext IS NOT NULL AS has_evidence
+                    FROM creator_import_rows r JOIN creator_import_batches b ON b.id=r.batch_id
+                    WHERE r.contact_id=ANY(%s::uuid[]) AND r.cm_authorization_id=%s
+                    AND r.review_status='confirmed' AND b.policy_version=%s
+                    ORDER BY r.created_at DESC,r.id DESC""",
+                (list(imports_by_person), cm_id, creator_imports.POLICY_VERSION),
+            ).fetchall():
+                imports_by_person[row["contact_id"]].append(row)
             items = []
             for person in people:
                 identity = conn.execute(
@@ -853,12 +864,14 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
                         WHERE contact_id=%s AND responsible_authorization_id=%s AND ended_at IS NULL
                     ) ORDER BY s.normalized_handle""", (person["id"],person["id"],cm_id),
                 ).fetchall()
-                has_excel = conn.execute(
-                    """SELECT 1 FROM creator_import_rows r JOIN creator_import_batches b ON b.id=r.batch_id
-                    WHERE r.contact_id=%s AND r.cm_authorization_id=%s AND r.review_status='confirmed'
-                    AND b.policy_version=%s LIMIT 1""", (person["id"],cm_id,creator_imports.POLICY_VERSION),
-                ).fetchone()
-                sources = ["Excel"] if has_excel else ["手动"]
+                import_rows = imports_by_person[person["id"]]
+                sources = list(dict.fromkeys(
+                    label for row in import_rows for label in creator_imports.source_labels(row)
+                )) or ["手动"]
+                evidence_rows = {}
+                for row in import_rows:
+                    if row["has_evidence"]:
+                        evidence_rows.setdefault(row["handle"], {"id": str(row["id"]), "handle": row["handle"]})
                 items.append({
                     "id": str(person["id"]), "kind": "confirmed", "contact_id": str(person["id"]),
                     "display_name": person["display_name"] or "未命名用户", "creator_type": "cap",
@@ -867,6 +880,7 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
                     "private_chat_url": private_chat_url(identity["open_id"] if identity else None),
                     "handles": [r["display_handle"] for r in accounts],
                     "sources": sources, "source": " + ".join(sources),
+                    "evidence_rows": list(evidence_rows.values()),
                     "status_label": "已入库", "can_confirm": False, "can_defer": False,
                 })
         return {

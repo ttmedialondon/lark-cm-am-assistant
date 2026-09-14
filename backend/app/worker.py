@@ -19,6 +19,7 @@ from . import (
     ai_dispatch,
     contact_assessments,
     creator_handles,
+    creator_imports,
     creator_ownership,
     identity_profiles,
     offhours_summary,
@@ -218,6 +219,7 @@ def _dispatch_ai_turn(
             creator_handles.claim_next_handle,
             creator_handles.run_claimed_handle,
         ),
+        (creator_imports.claim_next_import, creator_imports.run_claimed_import),
     )
     for offset in range(len(queues)):
         index = (next_queue + offset) % len(queues)
@@ -252,7 +254,8 @@ def _fill_ai_slots(
 def _prepare_creator_preview(settings: Settings, next_queue: int) -> tuple[bool, int]:
     """Give each local preparation queue a turn; an idle queue does not delay the other."""
 
-    queues = (creator_ownership.prepare_next_preview, creator_handles.prepare_next_preview)
+    queues = (creator_ownership.prepare_next_preview, creator_handles.prepare_next_preview,
+              creator_imports.prepare_next_import)
     for offset in range(len(queues)):
         index = (next_queue + offset) % len(queues)
         try:

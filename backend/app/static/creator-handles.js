@@ -8,7 +8,7 @@
   let tab = app.dataset.tab;
   let page = data.page || 1;
   let query = el("query").value.trim();
-  let busy = false, reading = false, refreshQueued = false, version = 0;
+  let busy = false, reading = false, refreshQueued = false, version = 0, evidenceVersion = 0;
   const rows = new Map();
   let importPreview = null;
   const rowKey = item => `${item.kind || "person"}:${item.id}`;
@@ -37,22 +37,30 @@
     const handle = node("input", "", "form-control"); handle.maxLength = 160;
     handle.setAttribute("aria-label", "达人 handle"); handle.placeholder = "—";
     const creatorType = node("div", "", "small text-secondary mt-1");
-    handleCell.append(handle, creatorType);
+    const groups = node("div", "", "small text-secondary mt-1");
+    handleCell.append(handle, creatorType, groups);
     const searchLine = node("div", "", "d-flex gap-1");
     const user = node("input", "", "form-control"); user.maxLength = 120; user.placeholder = "— 搜索对应用户";
     user.setAttribute("aria-label", "搜索当前负责人可访问的用户");
     const search = node("button", "搜索", "btn btn-sm btn-outline-secondary"); search.type = "button";
     const choices = node("div", "", "d-flex flex-column gap-1 mt-1"); choices.setAttribute("aria-live", "polite");
     searchLine.append(user, search); userCell.append(searchLine, choices);
-    const status = node("div"), reason = node("div", "", "small text-secondary mt-1"); statusCell.append(status, reason);
+    const phase = node("div", "", "fw-semibold"), status = node("div"), reason = node("div", "", "small text-secondary mt-1");
+    const editNote = node("div", "账号或用户已修改，原 AI 判断不适用于本次修改；确认时重新核验。", "small text-warning mt-1");
+    editNote.hidden = true; statusCell.append(phase, status, reason, editNote);
     const actions = node("td"), actionsList = node("div", "", "d-flex gap-1 flex-wrap");
     const confirm = node("button", "确认入库", "btn btn-sm btn-primary"); confirm.type = "button";
     const defer = node("button", "暂缓", "btn btn-sm btn-outline-secondary"); defer.type = "button";
-    actionsList.append(confirm, defer); actions.append(actionsList);
+    const evidence = node("button", "查看证据链", "btn btn-sm btn-outline-secondary"); evidence.type = "button";
+    evidence.addEventListener("click", () => showEvidence(item.id, parts.dirty));
+    actionsList.append(confirm, defer, evidence); actions.append(actionsList);
     const source = node("td", "", "text-nowrap"), typeCell = node("td"); typeCell.hidden = true;
     row.append(handleCell, source, userCell, typeCell, statusCell, actions);
-    const parts = {row, source, handle, creatorType, user, search, choices, status, reason, confirm, defer, contactId: "", dirty: false, searchVersion: 0};
-    const check = () => { confirm.disabled = busy || !parts.canConfirm || !handle.value.trim() || !parts.contactId; };
+    const parts = {row, source, handle, creatorType, groups, user, search, choices, phase, status, reason, editNote, confirm, defer, evidence, contactId: "", dirty: false, searchVersion: 0};
+    const check = () => {
+      confirm.disabled = busy || !parts.canConfirm || !handle.value.trim() || !parts.contactId;
+      editNote.hidden = !parts.dirty;
+    };
     handle.addEventListener("input", () => { parts.dirty = true; check(); });
     user.addEventListener("input", () => { parts.dirty = true; parts.contactId = ""; parts.searchVersion++; choices.replaceChildren(); check(); });
     search.addEventListener("click", async () => {
@@ -91,15 +99,16 @@
     for (const batch of batches) {
       const line = node("div", "", "d-flex flex-wrap align-items-center gap-2 mb-2");
       const label = node("div", "", "me-auto");
-      label.append(node("strong", batch.filename || "Excel 名单"), node("span", ` · CAP · ${batch.status === "preview" ? "待导入" : "已导入"}`, "text-secondary"));
+      label.append(node("strong", batch.filename || "Excel 名单"), node("span", ` · CAP · ${batch.status_label || batch.status}`, "text-secondary"));
       const counts = batch.counts || {};
-      label.append(node("div", batch.status === "preview" ? `有效 handle ${counts.valid || 0}` : `已入库 ${counts.confirmed || 0} · 待确认 ${counts.review || 0}`, "small text-secondary"));
+      label.append(node("div", batch.status === "preview" ? `有效 handle ${counts.valid || 0}` : `已入库 ${counts.confirmed || 0} · 待核对 ${counts.review || 0} · 待处理 ${(counts.pending || 0) + (counts.queued || 0)} · 分析中 ${(counts.preparing || 0) + (counts.running || 0)}${counts.failed ? ` · 异常 ${counts.failed}` : ""}`, "small text-secondary"));
       if (batch.error) label.append(node("div", batch.error, "small text-danger"));
       line.append(label);
-      if (batch.can_start) {
-        const button = node("button", "确认导入", "btn btn-sm btn-outline-primary");
+      for (const [action, text] of [["start", "确认导入"], ["pause", "暂停"], ["resume", "继续"], ["recheck", "重新检查未确认"]]) {
+        if (!batch[`can_${action}`]) continue;
+        const button = node("button", text, "btn btn-sm btn-outline-primary");
         button.type = "button"; button.disabled = busy;
-        button.addEventListener("click", () => mutate(`/imports/${batch.id}/start`)); line.append(button);
+        button.addEventListener("click", () => mutate(`/imports/${batch.id}/${action}`)); line.append(button);
       }
       el("import-batch-list").append(line);
     }
@@ -111,12 +120,16 @@
     }
     parts.canConfirm = !!item.can_confirm;
     parts.creatorType.textContent = "CAP 属性：CAP";
+    parts.groups.textContent = item.group_names?.length ? `群：${item.group_names.join("、")}` : "群：—";
+    parts.phase.textContent = item.phase_label || "";
     parts.status.textContent = item.status_label || "待确认"; parts.reason.textContent = item.reason || "";
+    parts.editNote.hidden = !parts.dirty;
     parts.handle.disabled = busy || !parts.canConfirm; parts.user.disabled = busy || !parts.canConfirm;
     parts.search.disabled = busy || !parts.canConfirm;
     parts.confirm.hidden = !parts.canConfirm;
     parts.confirm.disabled = busy || !parts.canConfirm || !parts.handle.value.trim() || !parts.contactId;
     parts.defer.hidden = !item.can_defer; parts.defer.disabled = busy;
+    parts.evidence.hidden = !item.has_evidence; parts.evidence.disabled = busy;
     for (const choice of parts.choices.querySelectorAll("button")) choice.disabled = busy;
   }
   function makeRow(item) {
@@ -133,8 +146,9 @@
     const saved = node("div", "", "mb-2"); handleCell.append(saved);
     const source = node("td", "", "text-nowrap");
     const typeCell = node("td", "CAP"), statusCell = node("td");
-    const parts = {row, source, name, avatar, initial, saved, typeCell, statusCell};
-    row.append(handleCell, source, person, typeCell, statusCell, node("td", "—", "text-secondary"));
+    const actions = node("td");
+    const parts = {row, source, name, avatar, initial, saved, typeCell, statusCell, actions};
+    row.append(handleCell, source, person, typeCell, statusCell, actions);
     return parts;
   }
   function render() {
@@ -181,6 +195,14 @@
       if (!item.handles?.length) parts.saved.textContent = "—";
       parts.typeCell.hidden = tab !== "mine";
       parts.statusCell.hidden = tab !== "candidates";
+      parts.actions.replaceChildren();
+      for (const evidenceRow of item.evidence_rows || []) {
+        const button = node("button", `@${evidenceRow.handle} · 查看证据链`, "btn btn-sm btn-outline-secondary d-block mb-1");
+        button.type = "button"; button.disabled = busy;
+        button.addEventListener("click", () => showEvidence(evidenceRow.id));
+        parts.actions.append(button);
+      }
+      if (!parts.actions.childElementCount) parts.actions.textContent = "—";
     }
     page = data.page || 1;
     el("empty").hidden = !!data.items?.length;
@@ -189,7 +211,8 @@
     el("previous").disabled = busy || page <= 1; el("next").disabled = busy || page >= (data.total_pages || 1);
     renderImports();
   }
-  async function refresh() {
+  async function refresh(automatic = false) {
+    if (automatic && (reading || busy || document.hidden || [...rows.values()].some(row => row.dirty) || el("import-dialog").open)) return;
     if (reading) {
       refreshQueued = true; version++;
       return;
@@ -200,7 +223,7 @@
     history.replaceState(null, "", `/creators?${params}`);
     try {
       const next = await read(await fetch(`/creators/data?${params}`, {cache: "no-store"}));
-      if (token === version) { data = next; render(); }
+      if (token === version && !(automatic && [...rows.values()].some(row => row.dirty))) { data = next; render(); }
     } catch (error) { if (token === version) notice(error.message, true); }
     finally {
       reading = false;
@@ -225,8 +248,11 @@
       }
       else if (path.endsWith("/start")) {
         tab = "candidates"; page = 1; clearRows();
-        notice("名单已导入。请选择对应的 Lark 用户后确认入库；暂不清楚的账号可以暂缓。");
+        notice("名单已导入，系统正在找群、找人。确定且无冲突的自动入库，其余保留待核对。");
       }
+      else if (path.endsWith("/recheck")) notice("未确认的账号已重新排队，可在候选行查看进度和证据链。");
+      else if (path.endsWith("/pause")) notice("已暂停，已发出的请求完成后不再开始下一步。");
+      else if (path.endsWith("/resume")) notice("已继续匹配，可在候选行查看进度。");
       else notice("已保存。");
       void refresh();
     } catch (error) { notice(error.message, true); }
@@ -247,7 +273,7 @@
       const nextStep = importPreview.status !== "preview" ? "这份表已导入，请查看导入记录及候选达人。" : counts.valid ? "请核对后确认导入。" : "请修改表格后重新上传。";
       importMessage(`有效 handle ${counts.valid || 0} · 重复 ${counts.duplicates || 0} · 无效 ${counts.invalid || 0}。${nextStep}`);
       const preview = el("import-preview"); preview.replaceChildren();
-      preview.append(node("p", `负责人：${selectedCMName()} · CAP 属性：CAP · 来源：Excel。确认导入后生成待确认账号，由负责人选择用户、确认入库。`, "small"));
+      preview.append(node("p", `负责人：${selectedCMName()} · CAP 属性：CAP。确认导入后，系统自动找群、找人并检查冲突；确定的入库，其余待核对。`, "small"));
       const list = node("div", "", "border rounded p-2"); list.style.maxHeight = "240px"; list.style.overflowY = "auto";
       for (const item of (importPreview.rows || []).slice(0, 100)) {
         list.append(node("div", `第 ${item.row_number} 行 · ${item.handle || "—"}${item.error ? ` · ${item.error}` : ""}`, `small py-1 ${item.error ? "text-danger" : ""}`));
@@ -266,16 +292,92 @@
       await read(await fetch(`/creators/imports/${importPreview.id}/start`, {method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: new URLSearchParams({csrf_token: app.dataset.csrf})}));
       importPreview = null; el("import-dialog").close();
       tab = "candidates"; page = 1; clearRows();
-      notice("名单已导入。请选择对应的 Lark 用户后确认入库；暂不清楚的账号可以暂缓。");
+      notice("名单已导入，系统正在找群、找人。确定且无冲突的自动入库，其余保留待核对。");
       void refresh();
     } catch (error) { importMessage(error.message, true); }
     finally { busy = false; render(); }
+  }
+  async function showEvidence(rowId, edited = false) {
+    const token = ++evidenceVersion, scope = selectedCM(), body = el("evidence-body");
+    el("evidence-title").textContent = "证据链"; body.textContent = "正在读取…";
+    if (!el("evidence").open) el("evidence").showModal();
+    try {
+      const evidence = await read(await fetch(`/creators/imports/rows/${rowId}/evidence`, {cache: "no-store"}));
+      if (token !== evidenceVersion || scope !== selectedCM()) return;
+      el("evidence-title").textContent = `${evidence.handle || "账号"} · 证据链`;
+      body.replaceChildren();
+      const confidence = value => Number.isFinite(value) ? `置信度 ${Math.round(value * 100)}%` : "";
+      const section = title => {
+        const part = node("section", "", "border-top pt-3 mt-3");
+        part.append(node("h4", title)); body.append(part); return part;
+      };
+      const list = (parent, values, classes = "") => {
+        if (!values?.length) return;
+        const ul = node("ul", "", classes);
+        for (const value of values) ul.append(node("li", value));
+        parent.append(ul);
+      };
+      body.append(node("p", [evidence.source, evidence.phase_label, evidence.status_label].filter(Boolean).join(" · "), "text-secondary"));
+      if (edited) body.append(node("p", "以下是已保存的证据。当前账号或用户的修改尚未提交，原 AI 判断不适用于修改后的内容。", "alert alert-warning"));
+      list(body, evidence.warnings, "text-warning");
+      const groups = section("1. 对应群与相关材料");
+      if (evidence.group_decision) {
+        const decision = evidence.group_decision;
+        groups.append(node("p", ["AI 找群判断", confidence(decision.confidence)].filter(Boolean).join(" · "), "fw-semibold"));
+        groups.append(node("p", decision.reason || "等待 AI 判断对应群。"));
+        if (decision.evidence_refs?.length) groups.append(node("p", `依据：${decision.evidence_refs.join("、")}`, "small text-secondary"));
+      }
+      for (const group of evidence.groups || []) {
+        const detail = node("details", "", "border rounded p-3 mb-2"); detail.open = !!group.selected;
+        const selection = group.selected === true ? "已选中" : group.selected === false ? "未选中" : "待判断";
+        detail.append(node("summary", [group.ref, group.name || "未命名群", selection, confidence(group.confidence)].filter(Boolean).join(" · "), "fw-semibold"));
+        detail.append(node("p", group.reason || "尚无选群判断。", "mt-2 mb-2"));
+        const members = node("details", "", "mt-3"); members.open = (group.members || []).length <= 8;
+        members.append(node("summary", `群成员 · ${(group.members || []).length} 人`, "fw-semibold"));
+        if (group.members?.length) {
+          const wrap = node("div", "", "table-responsive mt-2"); wrap.style.maxHeight = "320px"; wrap.style.overflowY = "auto";
+          const table = node("table", "", "table table-sm table-vcenter");
+          const head = node("thead"), header = node("tr"), rows = node("tbody");
+          for (const text of ["用户", "已知分类", "本次处理", "依据"]) {
+            const th = node("th", text); th.scope = "col"; header.append(th);
+          }
+          head.append(header); table.append(head, rows);
+          for (const member of group.members) {
+            const row = node("tr");
+            for (const text of [[member.ref, member.display_name || "未命名用户"].filter(Boolean).join(" · "), member.classification || "待定", member.status_label || "—", member.reason || "—"]) row.append(node("td", text));
+            rows.append(row);
+          }
+          wrap.append(table); members.append(wrap);
+        } else members.append(node("p", "本群成员信息尚不可用。", "text-secondary mt-2"));
+        detail.append(members);
+        const messages = node("details", "", "mt-3"); messages.open = (group.messages || []).length <= 3;
+        messages.append(node("summary", `相关发言 · ${(group.messages || []).length} 条`, "fw-semibold"));
+        for (const message of group.messages || []) {
+          const quote = node("div", "", "border-top mt-2 pt-2");
+          quote.append(node("p", [message.ref, message.sender_name, message.time_label].filter(Boolean).join(" · "), "small text-secondary mb-1"));
+          quote.append(node("blockquote", message.available === false ? "这条材料当前不可读取。" : message.text || "—"));
+          messages.append(quote);
+        }
+        if (!group.messages?.length) messages.append(node("p", "本次没有可展示的相关发言。", "text-secondary mt-2"));
+        detail.append(messages); groups.append(detail);
+      }
+      if (!evidence.groups?.length) groups.append(node("p", "暂无可展示的候选群，具体原因见下方结论。", "text-secondary"));
+      const person = evidence.person || {}, personSection = section("2. 用户判断");
+      personSection.append(node("p", [`用户：${person.display_name || "—"}`, confidence(person.confidence)].filter(Boolean).join(" · "), "fw-semibold"));
+      personSection.append(node("p", person.reason || "尚未确定具体用户。"));
+      if (person.evidence_refs?.length) personSection.append(node("p", `依据：${person.evidence_refs.join("、")}`, "small text-secondary"));
+      const conclusion = section("3. 当前结论");
+      conclusion.append(node("p", evidence.reason || "尚未完成匹配。"));
+      list(conclusion, evidence.conflicts, "text-danger");
+    } catch (error) { if (token === evidenceVersion) body.textContent = error.message; }
   }
   for (const key of ["candidates", "mine"]) el(key).addEventListener("click", () => { tab = key; page = 1; clearRows(); refresh(); });
   el("search").addEventListener("submit", event => { event.preventDefault(); query = el("query").value.trim(); page = 1; clearRows(); refresh(); });
   el("refresh").addEventListener("click", () => refresh());
   el("previous").addEventListener("click", () => { page--; clearRows(); refresh(); });
   el("next").addEventListener("click", () => { page++; clearRows(); refresh(); });
+  el("evidence-close").addEventListener("click", () => el("evidence").close());
+  el("evidence").addEventListener("close", () => { evidenceVersion++; el("evidence-body").replaceChildren(); });
   el("import-open").addEventListener("click", () => {
     importPreview = null; el("import-file").value = ""; el("import-preview").hidden = true;
     el("import-cm").textContent = selectedCMName(); importMessage(""); render(); el("import-dialog").showModal();
@@ -298,4 +400,7 @@
     });
   }
   render();
+  setInterval(() => {
+    if (data.import_batches?.some(batch => batch.status === "running")) void refresh(true);
+  }, 5000);
 })();

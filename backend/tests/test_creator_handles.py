@@ -51,6 +51,7 @@ def _case(pg, pilot, monkeypatch, *, clues=True, uncertain=False):
     for module in (handles, evidence, creator_imports):
         monkeypatch.setattr(module, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(handles, "get_settings", lambda: pilot.settings)
+    monkeypatch.setattr(creator_imports, "get_settings", lambda: pilot.settings)
     if clues:
         text = "My TikTok account is @creator_one. My TikTok account is @creator_two. Can you arrange my sample?"
         pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='creator_7_question'",

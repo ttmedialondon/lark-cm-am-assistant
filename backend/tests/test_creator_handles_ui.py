@@ -83,9 +83,9 @@ def test_cm_can_read_review_own_handles_without_admin_and_cannot_cross_scope(mon
     assert not any(len(call) == 4 and call[-1] == "non_cap" for call in calls)
 
 
-def test_retired_ai_and_type_actions_cannot_run_but_still_require_active_auth_and_csrf(monkeypatch):
+def test_retired_handle_ai_and_type_actions_still_require_active_auth_and_csrf(monkeypatch):
     client, actor = browser(monkeypatch)
-    run, task, batch = uuid4(), uuid4(), uuid4()
+    run, task = uuid4(), uuid4()
     calls = []
     for name in (
         "create_preview", "start_run", "pause_run", "resume_run", "set_auto_admit", "confirm_task", "defer_task",
@@ -94,8 +94,7 @@ def test_retired_ai_and_type_actions_cannot_run_but_still_require_active_auth_an
         monkeypatch.setattr(creator_handles, name, lambda *args: calls.append(args) or run)
     actions = ["/creators/preview", *(f"/creators/runs/{run}/{name}" for name in (
         "start", "pause", "resume", "auto-admit",
-    )), f"/creators/tasks/{task}/recheck", f"/creators/people/{task}/type",
-        f"/creators/imports/{batch}/pause", f"/creators/imports/{batch}/resume"]
+    )), f"/creators/tasks/{task}/recheck", f"/creators/people/{task}/type"]
     for path in actions:
         assert client.post(path, data={
             "csrf_token": "csrf", "cm_id": str(actor["id"]), "enabled": "1",
@@ -156,3 +155,30 @@ def test_excel_upload_is_bounded_scoped_and_requires_explicit_start_and_confirma
     assert client.post(confirm, data={"csrf_token": "csrf", "handle": "example", "contact_id": str(person),
                                       "actor_id": str(foreign)}).status_code == 200
     assert calls[-1] == ("confirm", actor["id"], row, "example", person)
+    for action, name in (("pause", "pause_import"), ("resume", "resume_import"), ("recheck", "recheck_batch")):
+        def scoped(actor_id, batch_id, *, action=action):
+            if batch_id != batch:
+                raise PermissionError("只能操作自己的导入批次。")
+            calls.append((action, actor_id, batch_id))
+
+        monkeypatch.setattr(creator_imports, name, scoped)
+        action_url = f"/creators/imports/{batch}/{action}"
+        assert client.post(action_url).status_code == 400
+        assert client.post(action_url, data={"csrf_token": "csrf", "actor_id": str(foreign)}).status_code == 200
+        assert calls[-1] == (action, actor["id"], batch)
+        assert client.post(f"/creators/imports/{foreign}/{action}", data={"csrf_token": "csrf"}).status_code == 403
+
+    def evidence(actor_id, row_id):
+        assert actor_id == actor["id"]
+        if row_id != row:
+            raise PermissionError("不能读取其他 CM 的材料。")
+        return {"handle": "example", "stages": [{"stage": "group", "messages": []}]}
+
+    monkeypatch.setattr(creator_imports, "row_evidence", evidence)
+    material = client.get(f"/creators/imports/rows/{row}/evidence")
+    assert material.status_code == 200 and material.json()["stages"][0]["stage"] == "group"
+    assert material.headers["cache-control"] == "no-store, max-age=0"
+    assert client.get(f"/creators/imports/rows/{foreign}/evidence").status_code == 403
+    revoked, _ = browser(monkeypatch, active=False)
+    assert revoked.get(f"/creators/imports/rows/{row}/evidence").status_code == 403
+    assert revoked.post(f"/creators/imports/{batch}/recheck", data={"csrf_token": "csrf"}).status_code == 403

@@ -65,13 +65,11 @@ def create_router(*, current_authorization, render_template, csrf_token):
     @router.post("/runs/{run_id}/resume")
     @router.post("/runs/{run_id}/auto-admit")
     @router.post("/tasks/{task_id}/recheck")
-    @router.post("/imports/{batch_id}/pause")
-    @router.post("/imports/{batch_id}/resume")
     @router.post("/people/{contact_id}/type")
     async def retired_action(request: Request):
         try:
             await form_for(request)
-            return payload({"error": "当前仅支持 CAP 名单导入和人工确认，此操作已停用。"}, 410)
+            return payload({"error": "此操作已停用，请通过 Excel CAP 名单匹配和核对。"}, 410)
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
 
@@ -148,11 +146,28 @@ def create_router(*, current_authorization, render_template, csrf_token):
             return error(exc)
 
     @router.post("/imports/{batch_id}/start")
-    async def import_start(request: Request, batch_id: UUID):
+    @router.post("/imports/{batch_id}/pause")
+    @router.post("/imports/{batch_id}/resume")
+    @router.post("/imports/{batch_id}/recheck")
+    async def import_action(request: Request, batch_id: UUID):
         try:
             auth, _form = await form_for(request)
-            await run_in_threadpool(creator_imports.start_import, auth["id"], batch_id)
+            actions = {
+                "start": creator_imports.start_import,
+                "pause": creator_imports.pause_import,
+                "resume": creator_imports.resume_import,
+                "recheck": creator_imports.recheck_batch,
+            }
+            await run_in_threadpool(actions[request.url.path.rsplit("/", 1)[-1]], auth["id"], batch_id)
             return payload({"ok": True})
+        except (ValueError, LookupError, PermissionError) as exc:
+            return error(exc)
+
+    @router.get("/imports/rows/{row_id}/evidence")
+    def import_evidence(request: Request, row_id: UUID):
+        try:
+            auth = actor(request)
+            return payload(creator_imports.row_evidence(auth["id"], row_id))
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
 
