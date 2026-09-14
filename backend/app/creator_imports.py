@@ -687,7 +687,7 @@ def row_evidence(actor_id, row_id):
         cm = conn.execute(
             "SELECT display_name FROM authorizations WHERE id=%s", (batch["cm_authorization_id"],)
         ).fetchone()
-        selected = _selected_chat(chain, decisions) if decisions.get("group", {}).get("outcome") == "matched" else None
+        selected = _selected_chats(chain, decisions) if decisions.get("group", {}).get("outcome") == "matched" else []
         classifications = {
             "creator": "达人",
             "unclassified": "未分类",
@@ -714,7 +714,9 @@ def row_evidence(actor_id, row_id):
             decision = decisions.get(stage, {})
             phase = "找群" if stage == "group" else "找人"
             ai_outcome = decision.get("outcome")
-            if (decision.get("response") or {}).get("text"):
+            # Historical decisions retain the rules under which they were admitted.
+            if (pack.get("policy_version") == creator_import_evidence.POLICY_VERSION
+                    and (decision.get("response") or {}).get("text")):
                 validator = (
                     creator_import_evidence.group_validate
                     if stage == "group"
@@ -771,7 +773,7 @@ def row_evidence(actor_id, row_id):
                     {
                         "ref": prefix(group["ref"]),
                         "name": ref["display_name"],
-                        "selected": ref["chat_id"] == selected,
+                        "selected": ref["chat_id"] in selected,
                         "confidence": None,
                         "reason": "",
                         "members": [],
@@ -942,15 +944,18 @@ def recheck_batch(actor_id, batch_id, row_ids=None):
         return {"id": str(batch["id"]), "queued": len(rows)}
 
 
-def _selected_chat(chain, results):
-    return creator_import_evidence.resolve_group(chain["group"]["refs"], results["group"].get("group_ref"))
+def _selected_chats(chain, results):
+    decision = results["group"]
+    # Previously admitted evidence used a single group_ref; keep it readable.
+    refs = decision.get("group_refs", [decision["group_ref"]] if decision.get("group_ref") else [])
+    return creator_import_evidence.resolve_groups(chain["group"]["refs"], refs)
 
 
 def _build_material(conn, settings, row, stage, chain, results):
     if stage == "group":
         return creator_import_evidence.build_group_evidence(conn, settings, row["cm_authorization_id"], row["handle"])
     return creator_import_evidence.build_person_evidence(
-        conn, settings, row["cm_authorization_id"], row["handle"], _selected_chat(chain, results)
+        conn, settings, row["cm_authorization_id"], row["handle"], _selected_chats(chain, results)
     )
 
 

@@ -63,20 +63,20 @@ def prepare(pg, pilot, monkeypatch):
     def respond(_config, _key, pack, _row_id, **kwargs):
         stage = pack["stage"]
         assert kwargs["output_format"]["strict"]
-        assert kwargs["output_format"]["name"] == f"creator_import_{stage}_v4"
+        assert kwargs["output_format"]["name"] == f"creator_import_{stage}_v5"
         calls.append(pack)
         if stage == "group":
-            group = next((g for g in pack["groups"] if pack["imported_handle"] in g["name"].casefold()), None)
-            result = {"outcome": "matched" if group else "not_found", "group_ref": group["ref"] if group else None,
-                      "confidence": .99 if group else 0, "reason": "根据群资料核对当前账号。",
-                      "evidence_refs": [group["ref"]] if group else []}
+            groups = [g["ref"] for g in pack["groups"] if pack["imported_handle"] in g["name"].casefold()]
+            result = {"outcome": "matched" if groups else "not_found", "group_refs": groups,
+                      "confidence": .99 if groups else 0, "reason": "根据群资料核对当前账号。",
+                      "evidence_refs": groups}
         else:
             people = [u for u in pack["users"] if u["eligible"]]
             own = {u["ref"]: [m["ref"] for m in pack["messages"]
                               if m["speaker"] == u["ref"] and pack["imported_handle"] in m["text"]] for u in people}
             target = next((u for u in people if own[u["ref"]] or u.get("existing_handle_owner")), None)
             target = target or (people[0] if len(people) == 1 else None)
-            refs = (own[target["ref"]] or [pack["groups"][0]["ref"], target["ref"]]) if target else []
+            refs = (own[target["ref"]] or [*(g["ref"] for g in pack["groups"]), target["ref"]]) if target else []
             result = {"outcome": "matched" if target else "review", "user_ref": target["ref"] if target else None,
                       "confidence": .99 if target else .5, "reason": "结合 CAP 名单、成员和账号发言核对用户。",
                       "evidence_refs": refs, "conflicts": [], "candidates": [
@@ -344,7 +344,7 @@ def test_shared_group_identifies_each_handle_person_and_preserves_the_evidence_c
         assert all(chain[phase]["pack"]["imported_handle"] == handle and chain[phase]["refs"]
                    and chain[phase]["fingerprint"] for phase in ("group", "person"))
         assert len([u for u in chain["person"]["pack"]["users"] if u["eligible"]]) == 2
-        assert judgments["group"]["group_ref"] and judgments["person"]["user_ref"]
+        assert judgments["group"]["group_refs"] and judgments["person"]["user_ref"]
         assert imports.source_labels(row) == ["Excel", "AI"]
         formal = next(item for item in creator_handles.page_data(cm, tab="mine")["items"]
                       if item["contact_id"] == str(contact))
@@ -435,6 +435,49 @@ def test_silent_unique_person_still_needs_both_ai_thresholds_and_recheck_keeps_u
     assert len(calls) == call_count + 1 and row_for(pg, mixed, "retry")["api_requests"] == retry["api_requests"] + 1
     assert pg.execute("SELECT * FROM creator_import_rows WHERE batch_id=%s AND id<>%s ORDER BY id",
                       (mixed["id"], retry["id"])).fetchall() == preserved
+
+
+def test_multiple_groups_merge_the_same_person_without_hiding_other_people_or_partial_rosters(pg, pilot, monkeypatch):
+    calls, _ = prepare(pg, pilot, monkeypatch)
+    cm, creator = pilot.ids["cm"], pilot.ids["creator"]
+    pilot.person("other")
+    pg.execute("INSERT INTO lark_identities(open_id,contact_id,display_name) VALUES('ou_creator_alias',%s,'creator')",
+               (creator,))
+    for chat, handle, member in (
+        ("jodine_first", "jodine_xx", "creator"),
+        ("jodine_second", "jodine_xx", "creator_alias"),
+        ("different_first", "different_people", "creator"),
+        ("different_second", "different_people", "other"),
+        ("partial_first", "partial_roster", "silent"),
+        ("partial_second", "partial_roster", "silent"),
+    ):
+        group(pg, pilot, chat, handle, member)
+    pg.execute("UPDATE chats SET name='TikTok x TT Media | @jodine_xx' WHERE chat_id='jodine_first'")
+    pg.execute("UPDATE chats SET name='❤️ jodine_xx X TT Media' WHERE chat_id='jodine_second'")
+    pg.execute("UPDATE authorization_chats SET member_snapshot_status='partial' WHERE chat_id='partial_second'")
+    batch = imports.preview_import(cm, cm, "multi-group.xlsx",
+                                   workbook("jodine_xx", "different_people", "partial_roster"))
+    imports.start_import(cm, batch["id"])
+    drain(pilot)
+
+    matched = row_for(pg, batch, "jodine_xx")
+    assert matched["review_status"] == "confirmed" and matched["contact_id"] == creator
+    material = imports._decode(matched, pilot.settings)["person"]
+    assert len(material["pack"]["groups"]) == 2 and not material["pack"]["messages"]
+    users = [u for u in material["pack"]["users"] if u["eligible"]]
+    assert len(users) == 1
+    assert all(g["member_refs"] == [users[0]["ref"]] for g in material["pack"]["groups"])
+    assert set(next(r["open_ids"] for r in material["refs"] if r["label"] == users[0]["ref"])) == {
+        "ou_creator", "ou_creator_alias"}
+    displayed = imports.row_evidence(cm, matched["id"])
+    assert len(displayed["groups"]) == 2 and all(g["selected"] for g in displayed["groups"])
+    assert all(len(g["members"]) == 2 for g in displayed["groups"])
+    for handle, count in (("different_people", 2), ("partial_roster", 1)):
+        row = row_for(pg, batch, handle)
+        assert row["review_status"] == "pending" and row["contact_id"] is None
+        assert row["reason_code"] == "person_uncertain"
+        assert row["stats"]["person_candidate_count"] == count and row["api_requests"] == 2
+    assert len(calls) == 6 and pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 1
 
 
 def test_two_person_stages_for_one_creator_do_not_drop_paid_results_after_classification(pg, pilot, monkeypatch):
@@ -788,16 +831,20 @@ def test_group_person_refs_do_not_cross_people_groups_or_current_access(pg, pilo
     first_group = next(r["label"] for r in found["refs"] if r.get("chat_id") == "first_group" and r["kind"] == "group")
     second_group = next(r["label"] for r in found["refs"]
                         if r.get("chat_id") == "second_group" and r["kind"] == "group")
-    response = {"outcome": "matched", "group_ref": first_group, "confidence": .99,
+    response = {"outcome": "matched", "group_refs": [first_group], "confidence": .99,
                 "reason": "群名和原文包含目标账号。", "evidence_refs": [first_group]}
     assert evidence.group_validate(json.dumps(response), found["pack"])["outcome"] == "matched"
-    forged = {**response, "group_ref": "G999"}
+    selected_both = {**response, "group_refs": [first_group, second_group]}
+    assert evidence.group_validate(json.dumps(selected_both), found["pack"])["outcome"] == "review"
+    assert evidence.group_validate(json.dumps({**selected_both, "evidence_refs": [first_group, second_group]}),
+                                   found["pack"])["outcome"] == "matched"
+    forged = {**response, "group_refs": ["G999"]}
     with pytest.raises(ValueError):
         evidence.group_validate(json.dumps(forged), found["pack"])
     wrong_group = next(m["ref"] for m in found["pack"]["messages"] if m["group_ref"] == second_group)
     with pytest.raises(ValueError):
         evidence.group_validate(json.dumps({**response, "evidence_refs": [wrong_group]}), found["pack"])
-    material = evidence.build_person_evidence(pg, pilot.settings, cm, "target_account", "first_group")
+    material = evidence.build_person_evidence(pg, pilot.settings, cm, "target_account", ["first_group"])
     pack = material["pack"]
     target = next(r["label"] for r in material["refs"] if r.get("contact_id") == str(pilot.ids["creator"]))
     peer = next(r["label"] for r in material["refs"] if r.get("contact_id") == str(other))
@@ -816,7 +863,7 @@ def test_group_person_refs_do_not_cross_people_groups_or_current_access(pg, pilo
         with pytest.raises(ValueError):
             evidence.person_validate(json.dumps({**response, "evidence_refs": [invalid_ref]}), pack)
     with pg.transaction(force_rollback=True):
-        sole = evidence.build_person_evidence(pg, pilot.settings, cm, "target_account", "second_group")
+        sole = evidence.build_person_evidence(pg, pilot.settings, cm, "target_account", ["second_group"])
         user = next(u["ref"] for u in sole["pack"]["users"] if u["eligible"])
         group_ref = sole["pack"]["groups"][0]["ref"]
         inferred = {"outcome": "matched", "user_ref": user, "confidence": .99,
@@ -825,15 +872,15 @@ def test_group_person_refs_do_not_cross_people_groups_or_current_access(pg, pilo
                         "reason": "基于 CAP 名单和完整群成员。", "evidence_refs": [group_ref, user]}]}
         assert evidence.person_validate(json.dumps(inferred), sole["pack"])["outcome"] == "matched"
         pg.execute("UPDATE authorization_chats SET member_snapshot_status='partial' WHERE chat_id='second_group'")
-        partial = evidence.build_person_evidence(pg, pilot.settings, cm, "target_account", "second_group")
+        partial = evidence.build_person_evidence(pg, pilot.settings, cm, "target_account", ["second_group"])
         assert evidence.person_validate(json.dumps(inferred), partial["pack"])["outcome"] == "review"
     with pg.transaction(force_rollback=True):
         pg.execute("DELETE FROM contact_roles WHERE contact_id=%s", (pilot.ids["creator"],))
-        unknown = evidence.build_person_evidence(pg, pilot.settings, cm, "target_account", "first_group")
+        unknown = evidence.build_person_evidence(pg, pilot.settings, cm, "target_account", ["first_group"])
         assert next(u for u in unknown["pack"]["users"] if u["ref"] == target)["known_category"] == "unclassified"
         pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) "
                    "VALUES(%s,'creator','confirmed','manual')", (pilot.ids["creator"],))
-        classified = evidence.build_person_evidence(pg, pilot.settings, cm, "target_account", "first_group")
+        classified = evidence.build_person_evidence(pg, pilot.settings, cm, "target_account", ["first_group"])
         assert unknown["fingerprint"] == classified["fingerprint"]
         assert evidence.validate_evidence(pg, pilot.settings, cm, "target_account", unknown["pack"],
                                           unknown["refs"], unknown["fingerprint"])
@@ -857,7 +904,7 @@ def test_group_person_refs_do_not_cross_people_groups_or_current_access(pg, pilo
         chosen = recalled["pack"]["groups"][0]["ref"]
         clue = next(m["ref"] for m in recalled["pack"]["messages"]
                     if m["group_ref"] == chosen and "target_account" in m["text"])
-        decision = {"outcome": "matched", "group_ref": chosen, "confidence": .99,
+        decision = {"outcome": "matched", "group_refs": [chosen], "confidence": .99,
                     "reason": "改名后的群仍有可访问的账号发言。", "evidence_refs": [chosen, clue]}
         assert evidence.group_validate(json.dumps(decision), recalled["pack"])["outcome"] == "matched"
         assert evidence.group_validate(json.dumps({**decision, "evidence_refs": [chosen]}),
@@ -870,7 +917,7 @@ def test_group_person_refs_do_not_cross_people_groups_or_current_access(pg, pilo
             assert truncated["stats"]["history_search_truncated"]
             chosen = truncated["pack"]["groups"][0]["ref"]
             clue = next(m["ref"] for m in truncated["pack"]["messages"] if "target_account" in m["text"])
-            limited = {**decision, "group_ref": chosen, "evidence_refs": [chosen, clue]}
+            limited = {**decision, "group_refs": [chosen], "evidence_refs": [chosen, clue]}
             assert evidence.group_validate(json.dumps(limited), truncated["pack"])["outcome"] == "review"
         pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (cm,))
         assert not evidence.build_group_evidence(pg, pilot.settings, cm, "target_account")["pack"]["groups"]
