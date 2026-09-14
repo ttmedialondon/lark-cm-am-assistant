@@ -27,6 +27,8 @@ REASONS = {
     "no_creator": "对应群内未识别到达人，用户留空待核对",
     "multiple_creators": "对应群内有多位达人，用户留空待核对",
     "group_not_found": "未找到 handle 对应群，用户留空待核对",
+    "group_uncertain": "找到相似群，但尚未确定对应关系，用户留空待核对",
+    "material_limit": "相关群或待识别人员较多，本次未完成核对，用户留空",
     "no_readable_material": "当前没有可访问的对应群，用户留空待核对",
     "manual_confirmed": "已确认入库",
     "no_match": "未找到对应用户，请搜索并确认",
@@ -55,7 +57,7 @@ BATCH_LABELS = {"preview": "等待开始", "running": "匹配中", "paused": "�
 
 
 def source_labels(row):
-    """Credit AI only when a valid identity result contributed to the match."""
+    """Credit AI when valid group or identity analysis contributed to the result."""
     stats = row.get("stats") or {}
     ai = stats.get("ai_matched_handle") if "ai_matched_handle" in stats else (
         row.get("result_ciphertext") is not None
@@ -544,7 +546,8 @@ def _refresh_known_result(conn, row, settings, *, response=None):
 def _apply_result(conn, row, result, settings, *, response=None, response_evidence=None):
     """One admission path for existing classifications, cached results and fresh identity AI."""
     contact_id = creator_import_evidence.resolve_contact(row["refs"], result.get("user_ref"))
-    stats = {"ai_matched_handle": result["ai_used"], "creator_count": result["creator_count"]}
+    stats = {"ai_matched_handle": result["ai_used"], "creator_count": result["creator_count"],
+             "matched_group_count": result["matched_group_count"], "group_match_kind": result["group_match_kind"]}
     conn.execute(
         """UPDATE creator_import_rows SET status='succeeded',reason_code=%s,result_ciphertext=%s,
         contact_id=%s,confidence=%s,outcome=%s,stats=stats||%s::jsonb,lease_until=NULL,updated_at=NOW() WHERE id=%s""",
@@ -779,7 +782,7 @@ def run_claimed_import(job, settings):
             job["id"],
             instructions=creator_import_evidence.INSTRUCTIONS,
             output_format=creator_import_evidence.output_format(),
-            max_output_tokens=2200,
+            max_output_tokens=4000,
         )
         result = creator_import_evidence.validate_result(response["text"], pack)
         _finish(job, "succeeded", "classified", settings, response, result)

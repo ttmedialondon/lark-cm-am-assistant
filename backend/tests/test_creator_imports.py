@@ -61,15 +61,22 @@ def prepare(pg, pilot, monkeypatch, *, unknown=True, matching_group=True):
 
     def response(_config, _key, pack, _row_id, **kwargs):
         assert kwargs["output_format"]["strict"]
-        assert kwargs["output_format"]["name"] == "creator_import_people_v1"
+        assert kwargs["output_format"]["name"] == "creator_import_groups_people_v2"
         assert "ou_creator" not in json.dumps(pack)
         calls.append(pack)
-        result = {"people": []}
+        result = {"groups": [{
+            "group_ref": group["ref"], "match": "matched", "confidence": .99,
+            "basis": "explicit_handle", "evidence_refs": [group["ref"], *[
+                m["ref"] for m in pack["messages"] if m["group_ref"] == group["ref"]
+                and pack["imported_handle"] in m["text"]
+            ]],
+        } for group in pack["groups"]], "people": []}
         for user in pack["users"]:
             own = [m["ref"] for m in pack["messages"] if m["speaker"] == user["ref"]]
+            known = user["known_category"] == "creator"
             result["people"].append({
-                "user_ref": user["ref"], "role": "creator" if own else "insufficient",
-                "confidence": .99 if own else 0, "basis": "self_declaration" if own else "weak_context",
+                "user_ref": user["ref"], "role": "creator" if own or known else "insufficient",
+                "confidence": .99 if own or known else 0, "basis": "self_declaration" if own else "weak_context",
                 "evidence_refs": own,
             })
         for callback in callbacks:
@@ -206,14 +213,14 @@ def test_all_matching_groups_count_creators_before_admission_and_ignore_nonmembe
     # An unrelated classified creator cannot affect a different handle's single-member group.
     group(pg, pilot, "single_group", "single_handle", "creator")
     batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "groups.xlsx",
-                                   workbook("creator_one", "single_handle", "missing_handle"))
+                                   workbook("creator_one", "single_handle", "unrelated_zebra"))
     imports.start_import(pilot.ids["cm"], batch["id"])
     drain(pilot)
     ambiguous = row_for(pg, batch, "creator_one")
     assert ambiguous["contact_id"] is None and ambiguous["review_status"] == "pending"
     assert ambiguous["stats"]["creator_count"] == 2
     assert row_for(pg, batch, "single_handle")["review_status"] == "confirmed"
-    missing = row_for(pg, batch, "missing_handle")
+    missing = row_for(pg, batch, "unrelated_zebra")
     assert missing["contact_id"] is None and missing["review_status"] == "pending"
     assert not calls
     for item in imports.page_data(pilot.ids["cm"], pilot.ids["cm"])["candidates"]:
@@ -398,3 +405,94 @@ def test_import_workbook_rejects_unsafe_or_ambiguous_input():
             imports.parse_xlsx(name, content)
     parsed = imports.parse_xlsx("roster.xlsx", workbook("handle", "https://www.tiktok.com/@Account.One", "account.one"))
     assert parsed["counts"] == {"valid": 1, "duplicates": 1, "invalid": 0}
+
+
+def test_parentheses_and_plus_group_names_import_all_five_handles_without_ai(pg, pilot, monkeypatch):
+    calls, _ = prepare(pg, pilot, monkeypatch, unknown=False, matching_group=False)
+    named = {
+        "aquanails": "❤️ aquanailsbypatrycja (patrycjanails) X TT Media",
+        "bex": "❤️bex_mumof3 + bexmays X TT media",
+        "katie": "❤️katievictoriaftm (katiesshopfinds) & TT Media",
+        "charlotte": "❤️(shopwithcharlotte) X TT Media (WA contact",
+    }
+    for chat, name in named.items():
+        group(pg, pilot, chat, "placeholder", "creator")
+        pg.execute("UPDATE chats SET name=%s WHERE chat_id=%s", (name, chat))
+    # Dissolved historical copies contain a different creator and must not affect today's count.
+    pilot.person("another")
+    for chat, name in {
+        "old_bex": "bex_mumof3 X TT Media",
+        "old_charlotte": "Charlottescrunchymama (shopwithcharlotte) X TT Media",
+    }.items():
+        group(pg, pilot, chat, "placeholder", "another")
+        pg.execute("UPDATE chats SET name=%s,chat_status='dissolved' WHERE chat_id=%s", (name, chat))
+    wanted = ["aquanailsbypatrycja", "patrycjanails", "bex_mumof3", "katievictoriaftm", "shopwithcharlotte"]
+    batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "five.xlsx", workbook(*wanted))
+    imports.start_import(pilot.ids["cm"], batch["id"])
+    drain(pilot)
+    for handle in wanted:
+        row = row_for(pg, batch, handle)
+        assert row["review_status"] == "confirmed" and row["contact_id"] == pilot.ids["creator"]
+        assert row["api_requests"] == 0
+    assert not calls
+
+
+def test_similar_group_and_unknown_creator_are_resolved_in_one_ai_call(pg, pilot, monkeypatch):
+    calls, _ = prepare(pg, pilot, monkeypatch)
+    pg.execute("UPDATE chats SET name='creatr_one X TT Media' WHERE chat_id='chat_creator'")
+    # The CM establishes the group correspondence; the unknown person's separate activity identifies them.
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='creator_7_answer'", (
+        message_body_cipher(pilot.settings.token_encryption_key).encrypt(json.dumps({
+            "text": "This group is for @creator_one. Welcome to your creator group."
+        })),
+    ))
+    pilot.person("another")
+    group(pg, pilot, "unrelated_candidate", "creator_onee", "another")
+    original = contact_assessments.call_openai
+
+    def jointly_match(*args, **kwargs):
+        response = original(*args, **kwargs)
+        result, pack = json.loads(response["text"]), args[2]
+        selected = next(g["ref"] for g in pack["groups"] if "creatr_one" in g["name"])
+        assert len(result["groups"]) == 2
+        for found in result["groups"]:
+            if found["group_ref"] != selected:
+                found.update(match="unrelated", basis="context_only", evidence_refs=[found["group_ref"]])
+        response["text"] = json.dumps(result)
+        return response
+
+    monkeypatch.setattr(contact_assessments, "call_openai", jointly_match)
+    batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "similar.xlsx", workbook("creator_one"))
+    imports.start_import(pilot.ids["cm"], batch["id"])
+    drain(pilot)
+    row = row_for(pg, batch, "creator_one")
+    assert len(calls) == 1 and row["api_requests"] == 1
+    assert row["review_status"] == "confirmed" and row["contact_id"] == pilot.ids["creator"]
+    checked = imports._pack(row, pilot.settings, "result_ciphertext")["checked"]
+    assert checked["creator_count"] == 1 and checked["matched_group_count"] == 1
+    assert imports.source_labels(row) == ["Excel", "AI"]
+
+
+@pytest.mark.parametrize("match", ["uncertain", "unrelated"])
+def test_similar_group_known_creator_requires_ai_group_confirmation(pg, pilot, monkeypatch, match):
+    calls, _ = prepare(pg, pilot, monkeypatch, unknown=False)
+    pg.execute("UPDATE chats SET name='creator_onee X TT Media' WHERE chat_id='chat_creator'")
+    pg.execute("UPDATE chat_messages SET body_ciphertext=NULL")
+    original = contact_assessments.call_openai
+
+    def unresolved(*args, **kwargs):
+        response = original(*args, **kwargs)
+        result = json.loads(response["text"])
+        for found in result["groups"]:
+            found.update(match=match, basis="context_only", evidence_refs=[found["group_ref"]])
+        response["text"] = json.dumps(result)
+        return response
+
+    monkeypatch.setattr(contact_assessments, "call_openai", unresolved)
+    batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "uncertain.xlsx", workbook("creator_one"))
+    imports.start_import(pilot.ids["cm"], batch["id"])
+    drain(pilot)
+    row = row_for(pg, batch, "creator_one")
+    assert len(calls) == 1 and row["api_requests"] == 1
+    assert row["review_status"] == "pending" and row["contact_id"] is None
+    assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()

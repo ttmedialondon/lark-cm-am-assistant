@@ -330,7 +330,10 @@ def test_import_group_identity_evidence_preserves_scope_and_rechecks_changes(pg,
     packed = json.dumps(material["pack"])
     assert "HIDDEN_IMPORT_SECRET" not in packed and "ou_creator" not in packed and str(ids["creator"]) not in packed
     assert imports.resolve_contact(material["refs"], "U1") == str(ids["creator"])
-    result = {"people": [{"user_ref": "U1", "role": "creator", "confidence": .99,
+    result = {"groups": [{"group_ref": g["ref"], "match": "matched", "confidence": 1,
+                          "basis": "explicit_handle", "evidence_refs": [g["ref"]]}
+                         for g in material["pack"]["groups"]],
+              "people": [{"user_ref": "U1", "role": "creator", "confidence": .99,
                           "basis": "self_declaration", "evidence_refs": [material["pack"]["messages"][0]["ref"]]}]}
     assert imports.validate_result(json.dumps(result), material["pack"])["outcome"] == "matched"
     result["people"][0]["user_ref"] = "U999"
@@ -379,3 +382,77 @@ def test_import_group_identity_evidence_preserves_scope_and_rechecks_changes(pg,
     multiple = imports.build_evidence(pg, settings, ids["cm"], "creator._123")
     assert multiple["stats"]["groups"] == 2 and multiple["checked"]["creator_count"] == 2
     assert not multiple["eligible"] and multiple["checked"]["user_ref"] is None
+
+    # Every exact group is authoritative input; an AI response cannot drop a second creator's group.
+    forced = {"groups": [{"group_ref": g["ref"], "match": "matched", "confidence": 1,
+                          "basis": "explicit_handle", "evidence_refs": [g["ref"]]}
+                         for g in multiple["pack"]["groups"]],
+              "people": [{"user_ref": u["ref"], "role": "creator", "confidence": 1,
+                          "basis": "weak_context", "evidence_refs": []} for u in multiple["pack"]["users"]]}
+    forced["groups"].pop()
+    with pytest.raises(ValueError):
+        imports.validate_result(json.dumps(forced), multiple["pack"])
+
+
+def test_import_exact_handle_boundaries_preserve_dots_and_underscores(pg, scope):
+    from app import creator_import_evidence as imports
+
+    ids, settings, _ = scope
+    pg.execute("INSERT INTO contact_roles(contact_id,role,status,source,is_primary) "
+               "VALUES(%s,'creator','confirmed','manual',TRUE)", (ids["creator"],))
+    for index, name in enumerate((
+        "prefixcreator._123 X TT", "creator._123suffix X TT", "creator_123 X TT", "creator.123 X TT",
+    )):
+        chat = f"lookalike_{index}"
+        pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES(%s,%s,'group')", (chat, name))
+        pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,%s)", (ids["cm"], chat))
+        pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES(%s,'ou_creator')", (chat,))
+    material = imports.build_evidence(pg, settings, ids["cm"], "@Creator._123")
+    assert material["checked"]["outcome"] == "matched" and len(material["pack"]["groups"]) == 1
+    assert material["pack"]["groups"][0]["match_kind"] == "exact"
+    pg.execute("UPDATE chats SET name='unrelated project' WHERE chat_id='group'")
+    similar = imports.build_evidence(pg, settings, ids["cm"], "creator._123")
+    assert similar["pack"]["groups"] and all(g["match_kind"] == "similar" for g in similar["pack"]["groups"])
+    assert similar["eligible"] and similar["checked"] is None
+
+
+def test_joint_group_validation_rejects_forged_and_cross_group_evidence(pg, scope):
+    from copy import deepcopy
+
+    from app import creator_import_evidence as imports
+
+    ids, settings, add = scope
+    pg.execute("UPDATE chats SET name='creatr._123 X TT' WHERE chat_id='group'")
+    pg.execute("INSERT INTO chats(chat_id,chat_mode,name) VALUES('second','group','creator._12 X TT')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'second')", (ids["cm"],))
+    pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('second','ou_creator')")
+    for chat in ("group", "second"):
+        add("creator", "This is the group for @creator._123. I create my own videos and stream live.", chat=chat)
+    material = imports.build_evidence(pg, settings, ids["cm"], "creator._123")
+    pack = material["pack"]
+    assert material["eligible"] and len(pack["groups"]) == 2 and len(pack["users"]) == 1
+    by_group = {g["ref"]: [m["ref"] for m in pack["messages"] if m["group_ref"] == g["ref"]]
+                for g in pack["groups"]}
+    result = {"groups": [{"group_ref": g["ref"], "match": "matched", "confidence": .99,
+                          "basis": "explicit_handle", "evidence_refs": [g["ref"], *by_group[g["ref"]]]}
+                         for g in pack["groups"]],
+              "people": [{"user_ref": pack["users"][0]["ref"], "role": "creator", "confidence": .99,
+                          "basis": "self_declaration", "evidence_refs": [m["ref"] for m in pack["messages"]]}]}
+    checked = imports.validate_result(json.dumps(result), pack)
+    assert checked["creator_count"] == 1 and checked["matched_group_count"] == 2
+    assert checked["outcome"] == "matched"
+    forged = deepcopy(result)
+    forged["groups"][0]["group_ref"] = "G999"
+    with pytest.raises(ValueError):
+        imports.validate_result(json.dumps(forged), pack)
+    cross = deepcopy(result)
+    cross["groups"][0]["evidence_refs"] = by_group[result["groups"][1]["group_ref"]]
+    with pytest.raises(ValueError):
+        imports.validate_result(json.dumps(cross), pack)
+    uncertain = deepcopy(result)
+    uncertain["groups"][1].update(match="uncertain", basis="context_only")
+    checked = imports.validate_result(json.dumps(uncertain), pack)
+    assert checked["user_ref"] is None and checked["reason_code"] == "group_uncertain"
+    uncertain["groups"][1].update(match="unrelated", confidence=.2)
+    checked = imports.validate_result(json.dumps(uncertain), pack)
+    assert checked["user_ref"] is None and checked["reason_code"] == "group_uncertain"
