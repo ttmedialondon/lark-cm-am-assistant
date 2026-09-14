@@ -459,6 +459,30 @@ def defer_row(actor_id, row_id):
         return {"id": str(row["id"]), "status": "deferred"}
 
 
+def recheck_row(actor_id, row_id):
+    """Explicitly retry a completed row after correcting its evidence or matching rules."""
+    with connection() as conn, conn.transaction():
+        row, batch = _row(conn, actor_id, row_id)
+        if batch["status"] != "completed" or row["review_status"] != "pending":
+            raise ValueError("只能重新匹配已完成批次中尚未确认的账号。")
+        _audit(conn, ownership._uuid(actor_id), "reanalysis_requested", {
+            "row_id": str(row["id"]), "handle": row["handle"],
+            "previous": {key: row[key] for key in (
+                "pack_ciphertext", "result_ciphertext", "refs", "fingerprint", "stats", "request_id", "response_id",
+            )},
+        })
+        conn.execute(
+            """UPDATE creator_import_rows SET status='pending',reason_code='',outcome=NULL,contact_id=NULL,
+            pack_ciphertext=NULL,result_ciphertext=NULL,refs='[]',fingerprint=NULL,config_fingerprint=NULL,
+            confidence=NULL,stats='{"force_reanalysis":true}',attempts=0,lease_until=NULL,
+            scheduled_at=NOW(),updated_at=NOW() WHERE id=%s""", (row["id"],),
+        )
+        conn.execute(
+            "UPDATE creator_import_batches SET status='running',updated_at=NOW() WHERE id=%s", (batch["id"],),
+        )
+        return {"id": str(row["id"]), "status": "pending"}
+
+
 def _existing(conn, row):
     found = conn.execute(
         """SELECT DISTINCT s.id,l.contact_id,(
@@ -784,7 +808,8 @@ def prepare_next_import(settings):
                 _admit(conn, row, row["uploaded_by"], row["handle"], contact_id, automatic=True, existing=True)
                 _settle(conn, row["batch_id"])
                 return True
-            if _reuse_handle_results(conn, row, settings):
+            force_reanalysis = row["stats"].get("force_reanalysis", False)
+            if not force_reanalysis and _reuse_handle_results(conn, row, settings):
                 _settle(conn, row["batch_id"])
                 return True
             material = creator_import_evidence.build_evidence(
@@ -814,7 +839,7 @@ def prepare_next_import(settings):
                     row["id"],
                 ),
             )
-            if status == "queued":
+            if status == "queued" and not force_reanalysis:
                 cached = conn.execute(
                     """SELECT result_ciphertext FROM creator_import_rows
                     WHERE cm_authorization_id=%s AND handle=%s AND status='succeeded' AND result_ciphertext IS NOT NULL

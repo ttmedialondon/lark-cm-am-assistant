@@ -331,6 +331,7 @@ def test_import_explains_unmet_admission_checks_without_changing_matching(pg, pi
     assert row["outcome"] == "review" and row["review_status"] == "pending" and float(row["confidence"]) == .99
     assert stored["checked"]["admission_blockers"] == ["account_evidence_insufficient"]
     assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
+    build = imports.creator_import_evidence.build_evidence
     monkeypatch.setattr(
         imports.creator_import_evidence, "build_evidence", lambda *_: pytest.fail("GET rescanned history")
     )
@@ -360,6 +361,22 @@ def test_import_explains_unmet_admission_checks_without_changing_matching(pg, pi
     checked = validate(json.dumps(result), pack)
     assert checked["outcome"] == "matched" and checked["admission_blockers"] == []
     assert len(calls) == 1
+    # An explicit correction retries just this row, preserving the original encrypted analysis.
+    monkeypatch.setattr(imports.creator_import_evidence, "build_evidence", build)
+    monkeypatch.setattr(contact_assessments, "call_openai", original)
+    imports.recheck_row(pilot.ids["cm"], row["id"])
+    with pytest.raises(ValueError):
+        imports.recheck_row(pilot.ids["cm"], row["id"])
+    drain(pilot)
+    current = row_for(pg, batch, "creator_one")
+    assert current["review_status"] == "confirmed" and current["api_requests"] == 2 and len(calls) == 2
+    audit = pg.execute(
+        "SELECT metadata FROM audit_events WHERE action='creator_import_reanalysis_requested'"
+    ).fetchone()
+    assert audit["metadata"]["previous"]["pack_ciphertext"] == row["pack_ciphertext"]
+    assert audit["metadata"]["previous"]["result_ciphertext"]
+    with pytest.raises(ValueError):
+        imports.recheck_row(pilot.ids["cm"], row["id"])
 
 
 def test_paused_or_revoked_import_does_not_send_and_expired_paid_lease_does_not_retry(pg, pilot, monkeypatch):
@@ -589,6 +606,65 @@ def test_confirmed_creator_roster_requires_person_link_not_a_second_creator_clas
         weak["messages"][1].update(text=text, handles=[c["handle"] for c in evidence.handles._clues(text)])
         assert "account_evidence_insufficient" in check(weak)["admission_blockers"]
 
+    # A direct delivery can be just the redacted code. Its request identifies the
+    # account, and the cited messages already identify the group without a G citation.
+    delivery = deepcopy(pack)
+    delivery["messages"][0].update(
+        text="Love, these videos are performing well, could you share the ad codes for me? "
+             "https://www.tiktok.com/@creator_one", handles=["creator_one"],
+    )
+    delivery["messages"][1].update(text="Sure the first one is: [已提供广告授权码]", previous_ref="M1")
+    messages_only = deepcopy(result)
+    messages_only["candidates"][0]["evidence_refs"] = ["M1", "M4"]
+    assert check(delivery, messages_only)["outcome"] == "matched"
+    orphan = deepcopy(delivery)
+    orphan["messages"][1]["previous_ref"] = None
+    assert "account_evidence_insufficient" in check(orphan, messages_only)["admission_blockers"]
+    forwarded = deepcopy(delivery)
+    forwarded["messages"][1]["text"] = "Forwarded their code: [已提供广告授权码]"
+    assert "account_evidence_insufficient" in check(forwarded, messages_only)["admission_blockers"]
+
+    # Another operator may request the code, but the exact account link and directed
+    # reply must identify the recipient; that operator is not another possible owner.
+    operator = deepcopy(delivery)
+    operator["users"].append({"ref": "U2", "known_category": "unclassified", "category_source": None})
+    operator["messages"][0].update(
+        speaker="U2", text="Hi darling, could you share the ads code for this video? we'll boost for you "
+        "www.tiktok.com/@creator_one/video/123456789", mentions=[{"target": "U1", "ambiguous": False}],
+    )
+    operator["messages"][1]["text"] = "[已提供广告授权码]"
+    assert check(operator, messages_only)["outcome"] == "matched"
+    excluded_operator = deepcopy(messages_only)
+    excluded_operator["candidates"].append({
+        "user_ref": "U2", "confidence": .01, "is_creator": False, "creator_confidence": .01,
+        "basis": "context_only", "evidence_refs": ["M1"],
+        "conflicts": ["这是向达人索取广告码的运营，不是该账号本人。"], "missing_info": ["没有本人账号证据。"],
+    })
+    selected = check(operator, excluded_operator)
+    assert selected["outcome"] == "matched" and selected["user_ref"] == "U1" and not selected["admission_blockers"]
+    excluded_operator["candidates"][1].update(is_creator=True, confidence=.8)
+    assert "multiple_users" in check(operator, excluded_operator)["admission_blockers"]
+    operator["messages"][0]["mentions"][0]["ambiguous"] = True
+    assert "account_evidence_insufficient" in check(operator, messages_only)["admission_blockers"]
+
+    # A named account plus the person's explicit operation of that account and the
+    # CM's directed acknowledgement is stronger than a voucher request on its own.
+    operating = deepcopy(pack)
+    operating["messages"][0].update(
+        speaker="U1", text="Are any vouchers available on creator_one please? "
+        "I am trying to scale this account, and will focus more on spotlight there.", handles=["creator_one"],
+    )
+    operating["messages"][1].update(
+        speaker="CM1", text="Hiya, we will try to apply voucher for creator_one next week for you.xx",
+        handles=["creator_one"], mentions=[{"target": "U1", "ambiguous": False}], previous_ref="M1",
+    )
+    assert check(operating, messages_only)["outcome"] == "matched"
+    declaration = deepcopy(messages_only)
+    declaration["candidates"][0]["basis"] = "self_declared"
+    assert check(operating, declaration)["outcome"] == "matched"
+    operating["messages"][0]["text"] = "Are any vouchers available on creator_one please?"
+    assert "account_evidence_insufficient" in check(operating, messages_only)["admission_blockers"]
+
     # Once ownership is explicit, no creative-activity statement or identity score is needed.
     own = deepcopy(pack)
     own["messages"][1]["text"] = (
@@ -617,3 +693,53 @@ def test_confirmed_creator_roster_requires_person_link_not_a_second_creator_clas
     uncertain = deepcopy(result)
     uncertain["candidates"][0]["confidence"] = .94
     assert check(response=uncertain)["admission_blockers"] == ["confidence_below_threshold"]
+
+
+def test_cap_retrieval_keeps_plain_handle_exchange_before_newer_generic_business(pg, pilot):
+    from datetime import UTC, datetime, timedelta
+
+    from app import creator_import_evidence as evidence
+
+    handle = "creator.one_1"
+    question = ("thanks a lot. are any vouchers available on creator.one_1 please? "
+                "i am trying to scale this account, and will focus more on spotlight there")
+    answer = "Hiya, we will try to apply voucher for creator.one_1 next week for you.xx"
+    pg.execute("UPDATE chats SET name=%s,chat_mode='group' WHERE chat_id='chat_creator'", (
+        handle + " & TT Media",
+    ))
+    cipher = message_body_cipher(pilot.settings.token_encryption_key)
+    for message_id, text in (("creator_0_question", question), ("creator_0_answer", answer)):
+        pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id=%s", (
+            cipher.encrypt(json.dumps({"text": text})), message_id,
+        ))
+    for index in range(64):
+        message_id = "newer_generic_" + str(index)
+        pg.execute(
+            "INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,"
+            "body_ciphertext,message_create_time) VALUES('chat_creator',%s,'ou_creator','user','text',%s,%s)",
+            (message_id, cipher.encrypt(json.dumps({"text": "I will post my new video for this campaign."})),
+             datetime(2025, 1, 1, tzinfo=UTC) + timedelta(days=index)),
+        )
+        pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+                   "VALUES(%s,'chat_creator',%s)", (pilot.ids["cm"], message_id))
+    cap = evidence.build_evidence(pg, pilot.settings, pilot.ids["cm"], handle, creator_type="cap")
+    legacy = evidence.build_evidence(pg, pilot.settings, pilot.ids["cm"], handle)
+    assert cap["stats"]["material_incomplete"] and cap["stats"]["messages"] <= 48
+    picked = {m["text"]: m for m in cap["pack"]["messages"]}
+    assert question in picked and answer in picked
+    assert picked[question]["handles"] == [handle] and picked[answer]["handles"] == [handle]
+    assert picked[question]["self_handles"] == []  # Account activity is not a self-ownership declaration.
+    assert question not in {m["text"] for m in legacy["pack"]["messages"]}
+    assert "roster" not in legacy["pack"]
+    for text in ("creator.one_1", "CREATOR.ONE_1.", "@creator.one_1", "账号：creator.one_1，"):
+        assert evidence._mentions_target(text, handle)
+    for text in ("xcreator.one_1", "creator.one_12", "creator.one_1_alt", "creator.one_1.second"):
+        assert not evidence._mentions_target(text, handle)
+
+    # Without an account-named group, plain mentions must still locate the readable conversation.
+    pg.execute("UPDATE chats SET name='Creator discussion' WHERE chat_id='chat_creator'")
+    cap = evidence.build_evidence(pg, pilot.settings, pilot.ids["cm"], handle, creator_type="cap")
+    legacy = evidence.build_evidence(pg, pilot.settings, pilot.ids["cm"], handle)
+    assert cap["eligible"] and cap["stats"]["retrieval"] == "message_or_similar"
+    assert question in {m["text"] for m in cap["pack"]["messages"]}
+    assert not legacy["eligible"]

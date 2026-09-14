@@ -44,11 +44,37 @@ _ACCOUNT_TASKS = tuple(re.compile(pattern, re.I) for pattern in (
     r"\b(?:live|livestream|gmv)\b|直播",
     r"\baccount\s*(?:issue|problem|blocked|ban)\b|账号(?:异常|封禁)",
 ))
+_AD_CODE_REQUEST = re.compile(
+    r"\b(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?|(?:please|pls)\s+)"
+    r"(?:send|share|provide|check|generate|fetch|reply)\b.*?"
+    r"\b(?:spark\s*(?:ad\s*)?codes?|ads?\s*codes?|advertising\s*codes?)\b|"
+    r"(?:请|麻烦).{0,30}(?:发|提供|检查|生成).{0,30}(?:广告码|授权码)", re.I | re.S,
+)
+_ACCOUNT_LINK = re.compile(r"(?<![\w./])(?:https?://)?(?:www\.|m\.)?tiktok\.com/@([A-Za-z0-9._]+)", re.I)
+_PROXY_CODE = re.compile(
+    r"\b(?:forward(?:ed|ing)?|on behalf of|representing|his|her|their)\b|代发|转发|达人|他(?:的|们)|她(?:的|们)",
+    re.I,
+)
+_ACCOUNT_CONTEXT = re.compile(r"\b(?:my|our|this)\s+(?:tiktok\s+)?account\b|我(?:们)?的账号|这个账号", re.I)
+
+
+def _mentions_target(text, handle):
+    """Find only the supplied exact handle, including plain text and sentence-ending full stops."""
+    return bool(re.search(r"(?<![A-Za-z0-9_.])" + re.escape(handle)
+                          + r"(?=\.*(?:[^A-Za-z0-9_.]|$))", text, re.I))
+_ACCOUNT_OPERATING = re.compile(
+    r"\b(?:I(?:['’]m|\s+am)|we(?:['’]re|\s+are))\s+(?:(?:trying|planning)\s+to\s+)?"
+    r"(?:scal(?:e|ing)|grow(?:ing)?)\s+(?:this|my|our)\s+(?:tiktok\s+)?account\b", re.I,
+)
+_ACCOUNT_SUPPORT = re.compile(
+    r"\b(?:vouchers?|coupons?|commissions?|(?:ad|spark)\s*codes?|videos?|livestreams?|lives?)\b|券|佣金|广告码|直播",
+    re.I,
+)
 
 
 def _target_account_change(text, handle):
     # A coupon checked on "another account" or a size called 小号 is not an account change.
-    return any(_ACCOUNT_CHANGE.search(part) and handle in {c["handle"] for c in handles._clues(part)}
+    return any(_ACCOUNT_CHANGE.search(part) and _mentions_target(part, handle)
                for part in re.split(r"[.!?。！？]\s+|\n+", text))
 
 
@@ -117,7 +143,7 @@ def with_roster(pack, creator_type, *, account_change_signal=None, account_claim
                          for m in pack["messages"]]}
 
 
-def _select_chats(conn, settings, cm_id, handle, chats):
+def _select_chats(conn, settings, cm_id, handle, chats, *, creator_confirmed=False):
     clues = {c["chat_id"]: handles._name_handles(c["name"] or "") for c in chats if c["chat_mode"] != "p2p"}
     exact = [c["chat_id"] for c in chats if handle in clues.get(c["chat_id"], [])]
     if exact:
@@ -132,7 +158,9 @@ def _select_chats(conn, settings, cm_id, handle, chats):
     cipher = message_body_cipher(settings.token_encryption_key)
     hits = []
     for row in rows:
-        if handle in {clue["handle"] for clue in handles._clues(_text(row, cipher, {}, {}))}:
+        text = _text(row, cipher, {}, {})
+        if (_mentions_target(text, handle) if creator_confirmed
+                else handle in {clue["handle"] for clue in handles._clues(text)}):
             hits.append(row["chat_id"])
     selected = list(dict.fromkeys([*hits, *similar]))
     return selected[:MAX_CHATS], incomplete or len(selected) > MAX_CHATS, rows, "message_or_similar"
@@ -152,7 +180,9 @@ def build_evidence(conn, settings, cm_id, handle, *, creator_type="pending"):
     if not cm:
         return {"eligible": False, "reason_code": "no_readable_material", "pack": {}, "refs": [],
                 "fingerprint": ownership._hash([POLICY_VERSION, str(cm_id), handle, "no_scope"]), "stats": {}}
-    chat_ids, incomplete, _, retrieval = _select_chats(conn, settings, cm_id, handle, chats)
+    chat_ids, incomplete, _, retrieval = _select_chats(
+        conn, settings, cm_id, handle, chats, creator_confirmed=creator_confirmed,
+    )
     rows = _read_rows(conn, cm_id, chat_ids) if chat_ids else []
     incomplete = incomplete or len(rows) > LOCAL_SEARCH_MESSAGES
     rows = rows[:LOCAL_SEARCH_MESSAGES]
@@ -191,7 +221,8 @@ def build_evidence(conn, settings, cm_id, handle, *, creator_type="pending"):
             scored[by_open[row["sender_open_id"]]] += (
                 100 if handle in (_self_handles(text, creator_confirmed=True) if creator_confirmed
                                   else handles._self_handles(text)) else 10 if handle in
-                {c["handle"] for c in handles._clues(text)} else 2 if ownership.BUSINESS.search(text) else 1
+                {c["handle"] for c in handles._clues(text)} else 10 if creator_confirmed
+                and _mentions_target(text, handle) else 2 if ownership.BUSINESS.search(text) else 1
             )
     candidates = sorted(scored, key=lambda cid: (-scored[cid], cid))
     incomplete = incomplete or len(candidates) > MAX_USERS
@@ -200,8 +231,11 @@ def build_evidence(conn, settings, cm_id, handle, *, creator_type="pending"):
     aliases = {openid: labels[cid] for openid, cid in by_open.items() if cid in labels}
     aliases[cm["open_id"]] = "CM1"
     names = {i[key]: aliases[i["open_id"]] for i in identities if i["open_id"] in aliases
-             for key in ("display_name", "name", "en_name") if i[key]}
-    if cm["display_name"]:
+             for key in ("display_name", "name", "en_name") if i[key]
+             and not (creator_confirmed and re.search(r"(?<!\w)" + re.escape(i[key]) + r"(?!\w)", handle, re.I))}
+    if cm["display_name"] and not (creator_confirmed and re.search(
+        r"(?<!\w)" + re.escape(cm["display_name"]) + r"(?!\w)", handle, re.I,
+    )):
         names[cm["display_name"]] = "CM1"
     # A private exchange can resolve an ambiguous group; it is supporting material, never a requirement.
     related_private = [c["chat_id"] for c in chats if c["chat_mode"] == "p2p"
@@ -246,8 +280,11 @@ def build_evidence(conn, settings, cm_id, handle, *, creator_type="pending"):
         text = _text(row, cipher, aliases, names)
         if not text:
             continue
+        mentioned_handles = {c["handle"] for c in handles._clues(text)}
+        if creator_confirmed and _mentions_target(text, handle):
+            mentioned_handles.add(handle)
         items.append({"row": row, "text": text, "speaker": aliases[row["sender_open_id"]],
-                      "handles": sorted({c["handle"] for c in handles._clues(text)}),
+                      "handles": sorted(mentioned_handles),
                       "self_handles": sorted(_self_handles(text, creator_confirmed=creator_confirmed)),
                       "time": row["message_create_time"] or row["first_observed_at"],
                       "change": (_target_account_change(text, handle) if creator_confirmed
@@ -259,8 +296,15 @@ def build_evidence(conn, settings, cm_id, handle, *, creator_type="pending"):
     seeds = [i for i in items if handle in i["handles"] or i["change"]
              or (i["speaker"] != "CM1" and
                  (ownership.BUSINESS.search(i["text"]) or handles._ACCOUNT_BUSINESS.search(i["text"])))]
-    seeds.sort(key=lambda i: (not i["change"], handle not in i["self_handles"], handle not in i["handles"],
-                             -i["time"].timestamp(), i["row"]["message_id"]))
+    if creator_confirmed:
+        # Account-specific exchanges outrank newer generic campaign chatter. This is
+        # retrieval priority only: "this account" never becomes an ownership declaration.
+        seeds.sort(key=lambda i: (not i["change"], handle not in i["self_handles"],
+                                 not (handle in i["handles"] and _ACCOUNT_CONTEXT.search(i["text"])),
+                                 handle not in i["handles"], -i["time"].timestamp(), i["row"]["message_id"]))
+    else:
+        seeds.sort(key=lambda i: (not i["change"], handle not in i["self_handles"], handle not in i["handles"],
+                                 -i["time"].timestamp(), i["row"]["message_id"]))
     for seed in seeds:
         near = by_chat[seed["row"]["chat_id"]]
         index = near.index(seed)
@@ -364,6 +408,8 @@ account confidence >=0.95, strong cited account-person evidence and no unresolve
 creator identity requirement only when roster.creator_confirmed is absent.
 Otherwise review; no plausible person means not_found. Return concise Chinese reason/conflicts/missing_info,
 without quotes, private names or contact details. Missing evidence is allowed; never fill gaps with guesses.
+Only include plausible account owners in candidates, not staff or proxies you have ruled out.
+Their lack of ownership is an exclusion, not a conflict concerning the actual owner's account.
 """
 
 
@@ -388,26 +434,52 @@ def _roster_account_strong(candidate, pack, cited):
     """The roster supplies creator status, but cannot supply a person's account ownership."""
     handle, user_ref = pack["imported_handle"], candidate["user_ref"]
     own = [m for m in cited if m.get("speaker") == user_ref]
-    if candidate["basis"] == "self_declared":
-        return any(handle in m.get("self_handles", []) for m in own)
-    if candidate["basis"] != "group_business_identity":
+    if candidate["basis"] == "context_only":
         return False
-    for group in cited:
-        if group.get("handles") != [handle] or "speaker" in group:
+    if any(handle in m.get("self_handles", []) for m in own):
+        return True
+    group_refs = {m.get("group_ref") for m in cited} | {m["ref"] for m in cited if "speaker" not in m}
+    for group in pack["groups"]:
+        if group["ref"] not in group_refs or group.get("handles") != [handle]:
             continue
-        cm_messages = [m for m in cited if m.get("group_ref") == group["ref"]
-                       and m.get("speaker") == "CM1" and handles._ACCOUNT_BUSINESS.search(m.get("text", ""))]
+        requests = [m for m in cited if m.get("group_ref") == group["ref"]
+                    and m.get("speaker") not in {None, user_ref}]
         for subject in own:
             text = subject.get("text", "")
-            if (subject.get("group_ref") != group["ref"] or not _ACCOUNT_ACTION.search(text)
-                    or not handles._ACCOUNT_BUSINESS.search(text)
+            if (subject.get("group_ref") != group["ref"]
                     or (subject.get("handles") and handle not in subject["handles"])):
                 continue
-            for cm in cm_messages:
-                reply = subject.get("parent_ref") == cm["ref"] or cm.get("parent_ref") == subject["ref"]
-                within = abs(datetime.fromisoformat(subject["time"]) - datetime.fromisoformat(cm["time"]))
-                same_task = any(pattern.search(text) and pattern.search(cm["text"]) for pattern in _ACCOUNT_TASKS)
-                directed = any(t["target"] == user_ref and not t["ambiguous"] for t in cm.get("mentions", []))
+            for request in requests:
+                direct_reply = subject.get("parent_ref") == request["ref"]
+                elapsed = datetime.fromisoformat(subject["time"]) - datetime.fromisoformat(request["time"])
+                directed = any(t["target"] == user_ref and not t["ambiguous"] for t in request.get("mentions", []))
+                adjacent = (subject.get("previous_ref") == request["ref"]
+                            and not subject.get("parent_outside_pack") and not subject.get("parent_ref"))
+                if (request["speaker"] == "CM1" and subject.get("handles") == [handle]
+                        and request.get("handles") == [handle] and _ACCOUNT_OPERATING.search(text)
+                        and not _PROXY_CODE.search(text) and _ACCOUNT_SUPPORT.search(request["text"])
+                        and abs(elapsed) <= timedelta(days=2)
+                        and (directed or direct_reply or request.get("parent_ref") == subject["ref"]
+                             or (request.get("previous_ref") == subject["ref"]
+                                 and not request.get("parent_ref") and not request.get("parent_outside_pack")))
+                        and not any(t["ambiguous"] or t["target"] != user_ref for t in request.get("mentions", []))):
+                    return True
+                # Actual code delivery answers a specific account request; an isolated code
+                # or a third-party report does not establish ownership.
+                if ("[已提供广告授权码]" in text and not _PROXY_CODE.search(text)
+                        and request.get("handles") == [handle] and _AD_CODE_REQUEST.search(request["text"])
+                        and not any(t["ambiguous"] or t["target"] != user_ref for t in request.get("mentions", []))
+                        and (direct_reply or adjacent) and timedelta(0) <= elapsed <= timedelta(days=2)
+                        and (request["speaker"] == "CM1" or (directed or direct_reply) and any(
+                            m[1].casefold().rstrip(".") == handle for m in _ACCOUNT_LINK.finditer(request["text"])))):
+                    return True
+                if (request["speaker"] != "CM1" or not _ACCOUNT_ACTION.search(text)
+                        or not handles._ACCOUNT_BUSINESS.search(text)
+                        or not handles._ACCOUNT_BUSINESS.search(request["text"])):
+                    continue
+                reply = direct_reply or request.get("parent_ref") == subject["ref"]
+                within = abs(elapsed)
+                same_task = any(pattern.search(text) and pattern.search(request["text"]) for pattern in _ACCOUNT_TASKS)
                 if reply or (within <= timedelta(days=2) and (directed or same_task)):
                     return True
     return False
@@ -422,7 +494,7 @@ def validate_result(raw, pack):
         raise ValueError("invalid import matching result")
     users = {u["ref"]: u for u in pack["users"]}
     refs = {r["ref"]: r for r in [*pack["groups"], *pack["messages"]]}
-    strong, seen, blockers = [], set(), []
+    strong, seen, candidate_blockers = [], set(), {}
     handle = pack["imported_handle"]
     roster = pack.get("roster", {})
     creator_roster = roster.get("creator_confirmed") is True and roster.get("creator_type") in {"cap", "non_cap"}
@@ -487,7 +559,7 @@ def validate_result(raw, pack):
                     and not material_incomplete and not pack["meta"]["account_change_signal"]
                     and not (set(pack["meta"].get("account_claimant_refs", [])) - {user_ref})
                     and account_strong)
-        blockers.extend(code for code, failed in (
+        candidate_blockers[user_ref] = [code for code, failed in (
             ("confidence_below_threshold", candidate["confidence"] < 0.95),
             ("creator_identity_unconfirmed", not creator),
             ("account_evidence_insufficient", not account_strong),
@@ -496,13 +568,20 @@ def validate_result(raw, pack):
             ("material_incomplete", material_incomplete),
             ("account_change_signal", pack["meta"]["account_change_signal"]),
             ("competing_claimants", bool(set(pack["meta"].get("account_claimant_refs", [])) - {user_ref})),
-        ) if failed)
+        ) if failed]
         candidate["creator_confirmed"] = creator and (account_strong or not creator_roster)
         if accepted:
             strong.append(candidate)
     candidates = result["candidates"]
+    if creator_roster:
+        # Some earlier responses also listed people they explicitly ruled out. A low-score,
+        # context-only non-creator is not a second owner; retain the raw response for the audit.
+        candidates = [c for c in candidates if not (
+            c["basis"] == "context_only" and not c["is_creator"] and c["confidence"] < 0.5
+        )]
+    blockers = [code for c in candidates for code in candidate_blockers[c["user_ref"]]]
     chosen = candidates[0] if len(candidates) == 1 else None
-    matched = result["outcome"] == "matched" and len(strong) == 1 and len(candidates) == 1
+    matched = result["outcome"] == "matched" and chosen is not None and chosen in strong
     if not candidates:
         blockers.append("user_not_found")
     elif len(candidates) > 1:
