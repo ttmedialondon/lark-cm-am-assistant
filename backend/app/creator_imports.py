@@ -713,6 +713,7 @@ def row_evidence(actor_id, row_id):
             pack, refs = material["pack"], {r["label"]: r for r in material["refs"]}
             decision = decisions.get(stage, {})
             phase = "找群" if stage == "group" else "找人"
+            ai_outcome = decision.get("outcome")
             if (decision.get("response") or {}).get("text"):
                 validator = (
                     creator_import_evidence.group_validate
@@ -720,6 +721,8 @@ def row_evidence(actor_id, row_id):
                     else (creator_import_evidence.person_validate)
                 )
                 try:
+                    raw_decision = json.loads(decision["response"]["text"])
+                    ai_outcome = raw_decision.get("outcome") if isinstance(raw_decision, dict) else None
                     decision = {**decision, **validator(decision["response"]["text"], pack)}
                 except (ValueError, TypeError, KeyError):
                     result["warnings"].append(phase + "：AI 输出格式或引用未通过校验。")
@@ -727,6 +730,10 @@ def row_evidence(actor_id, row_id):
             decision_label = {"matched": "对应关系通过", "review": "对应关系待定", "not_found": "未找到对应对象"}.get(
                 decision.get("outcome"), "等待判断"
             )
+            if ai_outcome == "matched" and decision.get("outcome") != "matched":
+                decision_label = "AI 建议匹配，证据校验未通过"
+            if decision.get("invalidated"):
+                decision_label = "AI 结果已失效"
 
             def prefix(label, phase=phase):
                 return phase + " " + label
