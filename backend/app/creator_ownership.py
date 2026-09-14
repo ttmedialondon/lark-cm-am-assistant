@@ -864,9 +864,9 @@ def page_data(cm_id=None, run_id=None, query="", status="all", page=1, include_p
                 raise LookupError("找不到该负责人的批次。")
         elif selected:
             run = conn.execute(
-                """SELECT * FROM creator_ownership_runs WHERE cm_authorization_id=%s
+                """SELECT * FROM creator_ownership_runs WHERE cm_authorization_id=%s AND policy_version=%s
                    ORDER BY created_at DESC,id DESC LIMIT 1""",
-                (selected,),
+                (selected, POLICY_VERSION),
             ).fetchone()
         counts = dict.fromkeys(
             (

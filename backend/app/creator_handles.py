@@ -931,8 +931,8 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
             if owner or r["id"] == cm_id
         ]
         run = conn.execute(
-            "SELECT * FROM creator_handle_runs WHERE cm_authorization_id=%s ORDER BY created_at DESC,id DESC LIMIT 1",
-            (cm_id,),
+            "SELECT * FROM creator_handle_runs WHERE cm_authorization_id=%s AND policy_version=%s "
+            "ORDER BY created_at DESC,id DESC LIMIT 1", (cm_id, POLICY_VERSION),
         ).fetchone()
         counts = {key: 0 for key in (*TASK_LABELS, "total", "completed", "candidates", "confirmed")}
         usage = {"api_requests": 0, "input_tokens": 0, "output_tokens": 0}
