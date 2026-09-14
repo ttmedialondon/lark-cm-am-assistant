@@ -795,7 +795,7 @@ def run_claimed_handle(job, settings):
         _finish(job, "failed", "provider_error", settings, response)
 
 
-def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
+def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
     """Current library: Excel CAP candidates and confirmed people."""
     from . import creator_imports
 

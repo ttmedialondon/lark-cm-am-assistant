@@ -53,10 +53,15 @@ def test_cm_can_read_review_own_handles_without_admin_and_cannot_cross_scope(mon
     assert html.status_code == 200
     assert "候选达人" in html.text and "我的达人" in html.text
     assert "导入 CAP 达人账号名单" in html.text and "整份名单的属性固定为 CAP" in html.text
-    assert 'id="creators-type-column" hidden' in html.text
-    assert 'id="creators-type-column" hidden' not in client.get("/creators?tab=mine").text
-    assert 'id="creators-status-column" hidden' not in html.text
-    assert 'id="creators-status-column" hidden' in client.get("/creators?tab=mine").text
+    assert 'data-tab="mine"' in html.text
+    assert 'id="creators-type-column" hidden' not in html.text
+    assert 'id="creators-status-column" hidden' in html.text
+    candidates = client.get("/creators?tab=candidates").text
+    assert 'data-tab="candidates"' in candidates
+    assert 'id="creators-type-column" hidden' in candidates
+    assert 'id="creators-status-column" hidden' not in candidates
+    assert '<th scope="col">来源</th>' not in html.text + candidates
+    assert html.text.index('id="creators-mine"') < html.text.index('id="creators-candidates"')
     assert 'id="creators-preview"' not in html.text
     assert client.get("/creators/data").status_code == 200
     assert client.get(f"/creators/data?cm_id={foreign}").status_code == 403

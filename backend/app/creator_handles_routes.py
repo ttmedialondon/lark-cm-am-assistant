@@ -44,11 +44,12 @@ def create_router(*, current_authorization, render_template, csrf_token):
 
     @router.get("")
     @router.get("/data")
-    def page(request: Request, cm_id: UUID | None = None, tab: str = "candidates", q: str = "", page: int = 1):
+    def page(request: Request, cm_id: UUID | None = None, tab: str = "mine", q: str = "", page: int = 1):
         if request.url.path == "/creators" and not current_authorization(request):
             return secure(RedirectResponse("/", status_code=303))
         try:
             auth = actor(request)
+            tab = "candidates" if tab == "candidates" else "mine"
             data = creator_handles.page_data(auth["id"], cm_id=cm_id, tab=tab, query=q[:120], page=max(1, page))
             if request.url.path.endswith("/data"):
                 return payload(data)

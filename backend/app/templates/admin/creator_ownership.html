@@ -5,7 +5,7 @@
 <div class="page" id="ownership-app" data-owner="{{ '1' if admin_role == 'owner' else '0' }}" data-csrf="{{ csrf_token }}">
   {% include "admin/_nav.html" %}
   <main class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
-    <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3"><div><h2 class="page-title">达人归属判断</h2><p class="text-secondary mb-0">这里只判断归属；建议关联的达人，核对 handle 后才进入“我的达人”。</p></div><div class="btn-list">{% if admin_role == 'owner' %}<a href="/creators" id="ownership-candidates" class="btn btn-primary">查看前台候选</a>{% endif %}<a href="/admin/ai" class="btn btn-outline-secondary">返回 AI 功能</a></div></div>
+    <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3"><div><h2 class="page-title">达人归属判断</h2><p class="text-secondary mb-0">这里只判断归属；建议关联的达人，核对 handle 后才进入“我的达人”。</p></div><div class="btn-list">{% if admin_role == 'owner' %}<a href="/creators?tab=candidates" id="ownership-candidates" class="btn btn-primary">查看前台候选</a>{% endif %}<a href="/admin/ai" class="btn btn-outline-secondary">返回 AI 功能</a></div></div>
     <div id="ownership-notice" class="alert d-none" role="status"></div>
     <section class="card mb-3" aria-label="选择负责人和分析批次"><div class="card-body">
       <div class="d-flex flex-wrap align-items-end gap-2">
@@ -47,5 +47,5 @@
   <dialog id="ownership-evidence" class="ownership-evidence" aria-labelledby="ownership-evidence-title"><div class="d-flex align-items-center gap-3 mb-3"><h3 class="mb-0 me-auto" id="ownership-evidence-title">相关对话</h3><button type="button" class="btn btn-sm btn-outline-secondary" id="ownership-evidence-close">关闭</button></div><div id="ownership-evidence-body"></div></dialog>
 </div>
 <script id="ownership-initial" type="application/json">{{ ownership|tojson }}</script>
-<script src="/static/creator-ownership.js?v=20260913-chat" defer></script>
+<script src="/static/creator-ownership.js?v=20260914-mine-default" defer></script>
 {% endblock %}

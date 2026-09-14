@@ -54,9 +54,9 @@
     const evidence = node("button", "查看证据链", "btn btn-sm btn-outline-secondary"); evidence.type = "button";
     evidence.addEventListener("click", () => showEvidence(item.id, parts.dirty));
     actionsList.append(confirm, defer, evidence); actions.append(actionsList);
-    const source = node("td", "", "text-nowrap"), typeCell = node("td"); typeCell.hidden = true;
-    row.append(handleCell, source, userCell, typeCell, statusCell, actions);
-    const parts = {row, source, handle, creatorType, groups, user, search, choices, phase, status, reason, editNote, confirm, defer, evidence, contactId: "", dirty: false, searchVersion: 0};
+    const typeCell = node("td"); typeCell.hidden = true;
+    row.append(handleCell, userCell, typeCell, statusCell, actions);
+    const parts = {row, handle, creatorType, groups, user, search, choices, phase, status, reason, editNote, confirm, defer, evidence, contactId: "", dirty: false, searchVersion: 0};
     const check = () => {
       confirm.disabled = busy || !parts.canConfirm || !handle.value.trim() || !parts.contactId;
       editNote.hidden = !parts.dirty;
@@ -144,18 +144,17 @@
     personWrap.append(avatar, name); person.append(personWrap);
     const handleCell = node("td"); handleCell.style.minWidth = "250px";
     const saved = node("div", "", "mb-2"); handleCell.append(saved);
-    const source = node("td", "", "text-nowrap");
     const typeCell = node("td", "CAP"), statusCell = node("td");
     const actions = node("td");
-    const parts = {row, source, name, avatar, initial, saved, typeCell, statusCell, actions};
-    row.append(handleCell, source, person, typeCell, statusCell, actions);
+    const parts = {row, name, avatar, initial, saved, typeCell, statusCell, actions};
+    row.append(handleCell, person, typeCell, statusCell, actions);
     return parts;
   }
   function render() {
     el("status-column").hidden = tab !== "candidates";
     el("type-column").hidden = tab !== "mine";
     if (data.can_manage) el("cm").disabled = busy;
-    for (const key of ["candidates", "mine"]) {
+    for (const key of ["mine", "candidates"]) {
       el(key).className = `btn ${key === tab ? "btn-primary" : "btn-outline-secondary"}`;
       el(key).setAttribute("aria-pressed", String(key === tab));
       el(key).disabled = busy;
@@ -167,7 +166,6 @@
       if (!rows.has(key)) rows.set(key, item.kind === "import" ? makeImportRow(item) : makeRow(item));
       const parts = rows.get(key);
       if (el("rows").children[index] !== parts.row) el("rows").insertBefore(parts.row, el("rows").children[index] || null);
-      parts.source.textContent = item.source || (item.sources || []).join(" + ") || "—";
       if (item.kind === "import") { renderImportRow(item, parts); continue; }
       parts.name.textContent = item.display_name || "—";
       parts.initial.textContent = Array.from((item.display_name || "").trim())[0]?.toUpperCase() || "?";
@@ -247,7 +245,7 @@
         notice("已暂缓，尚未确认的修改不会入库。");
       }
       else if (path.endsWith("/start")) {
-        tab = "candidates"; page = 1; clearRows();
+        page = 1; clearRows();
         notice("名单已导入，系统正在找群、找人。确定且无冲突的自动入库，其余保留待核对。");
       }
       else if (path.endsWith("/recheck")) notice("未确认的账号已重新排队，可在候选行查看进度和证据链。");
@@ -291,7 +289,7 @@
     try {
       await read(await fetch(`/creators/imports/${importPreview.id}/start`, {method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: new URLSearchParams({csrf_token: app.dataset.csrf})}));
       importPreview = null; el("import-dialog").close();
-      tab = "candidates"; page = 1; clearRows();
+      page = 1; clearRows();
       notice("名单已导入，系统正在找群、找人。确定且无冲突的自动入库，其余保留待核对。");
       void refresh();
     } catch (error) { importMessage(error.message, true); }
@@ -317,7 +315,7 @@
         for (const value of values) ul.append(node("li", value));
         parent.append(ul);
       };
-      body.append(node("p", [evidence.source, evidence.phase_label, evidence.status_label].filter(Boolean).join(" · "), "text-secondary"));
+      body.append(node("p", [evidence.phase_label, evidence.status_label].filter(Boolean).join(" · "), "text-secondary"));
       if (edited) body.append(node("p", "以下是已保存的证据。当前账号或用户的修改尚未提交，原 AI 判断不适用于修改后的内容。", "alert alert-warning"));
       list(body, evidence.warnings, "text-warning");
       const groups = section("1. 对应群与相关材料");
@@ -373,7 +371,7 @@
       list(conclusion, evidence.conflicts, "text-danger");
     } catch (error) { if (token === evidenceVersion) body.textContent = error.message; }
   }
-  for (const key of ["candidates", "mine"]) el(key).addEventListener("click", () => { tab = key; page = 1; clearRows(); refresh(); });
+  for (const key of ["mine", "candidates"]) el(key).addEventListener("click", () => { tab = key; page = 1; clearRows(); refresh(); });
   el("search").addEventListener("submit", event => { event.preventDefault(); query = el("query").value.trim(); page = 1; clearRows(); refresh(); });
   el("refresh").addEventListener("click", () => refresh());
   el("previous").addEventListener("click", () => { page--; clearRows(); refresh(); });

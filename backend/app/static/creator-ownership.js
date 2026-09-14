@@ -116,7 +116,7 @@
     el("api").textContent = data.api_message || "";
     el("cm").disabled = busy;
     if (owner) {
-      el("candidates").href = `/creators?cm_id=${encodeURIComponent(data.selected_cm_id || "")}`;
+      el("candidates").href = `/creators?tab=candidates&cm_id=${encodeURIComponent(data.selected_cm_id || "")}`;
       el("preview").disabled = busy || !el("cm").value || ["preparing", "running", "paused"].includes(run?.status);
       for (const id of ["start", "start-all"]) el(id).disabled = busy || !run?.can_start || data.api_ready === false;
       el("pause").hidden = !run?.can_pause; el("pause").disabled = busy;
@@ -143,7 +143,7 @@
         parts.checkbox.disabled = busy || !item.can_defer;
         parts.checkbox.setAttribute("aria-label", `选择 ${item.display_name || "达人"}`);
         parts.candidate.hidden = item.result !== "suggested";
-        parts.candidate.href = `/creators?cm_id=${encodeURIComponent(data.selected_cm_id || "")}`;
+        parts.candidate.href = `/creators?tab=candidates&cm_id=${encodeURIComponent(data.selected_cm_id || "")}`;
         parts.defer.disabled = busy || !item.can_defer;
         parts.evidence.hidden = !item.has_evidence;
       }
