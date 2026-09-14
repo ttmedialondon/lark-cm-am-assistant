@@ -461,7 +461,11 @@ no group is supported (including an empty candidate list). For matched cite ever
 supporting messages from that particular group. Each selected group must be independently supported;
 messages from one group cannot prove another group's correspondence. A direct exact group name may be
 sufficient without messages; a merely similar name needs supporting M evidence. Explain your decision
-briefly in Chinese using reference labels, never personal names or copied private text. Return JSON only.
+briefly in Chinese using reference labels, never personal names or copied private text.
+For matched, evidence_refs must contain only selected groups and their messages; discuss rejected
+candidates in reason without adding their refs to evidence_refs. For review/not_found, group_refs must
+be []. If the pack has no groups or messages, evidence_refs must also be []; never invent example refs.
+Return JSON only.
 """
 
 PERSON_INSTRUCTIONS = """Identify the specific Lark user corresponding to imported_handle across ALL
