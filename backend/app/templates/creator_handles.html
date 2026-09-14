@@ -5,7 +5,7 @@
 <div class="page" id="creators-app" data-csrf="{{ csrf_token }}" data-tab="{{ creator_tab }}">
   <header class="navbar navbar-expand-md"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media</a><div class="navbar-nav flex-row gap-2"><a class="nav-link" href="/dashboard">消息提醒</a><span class="nav-link text-secondary">{{ authorization.display_name or 'CM' }}</span></div></div></header>
   <main class="page-wrapper"><div class="page-body"><div class="container-xl">
-    <div class="d-flex align-items-center justify-content-between flex-wrap gap-3 mb-3"><div><h2 class="page-title">我的达人</h2><p class="text-secondary mb-0">导入 handle 名单，或核对 AI 找到的候选达人。</p></div><div class="btn-list"><button type="button" id="creators-import-open" class="btn btn-primary">Excel 导入</button><button type="button" id="creators-refresh" class="btn btn-outline-secondary">刷新</button></div></div>
+    <div class="d-flex align-items-center justify-content-between flex-wrap gap-3 mb-3"><div><h2 class="page-title">我的达人</h2><p class="text-secondary mb-0">Excel 名单与 AI 识别结果统一核对，来源显示 Excel、AI 或 Excel + AI。</p></div><div class="btn-list"><button type="button" id="creators-import-open" class="btn btn-primary">Excel 导入</button><button type="button" id="creators-refresh" class="btn btn-outline-secondary">刷新</button></div></div>
     <p class="text-secondary small">点击达人姓名可打开 Lark 私聊；请使用正确的 Lark 登录账号，只能打开该账号可访问的会话。</p>
     <div id="creators-notice" class="alert d-none" role="status"></div>
     {% if creator_data.can_manage %}<section class="card mb-3" aria-label="Handle 分析管理"><div class="card-body">
@@ -14,13 +14,8 @@
     </div></section>{% endif %}
     <div class="card mb-3"><div class="card-body py-3"><strong id="creators-run-status">暂无分析批次</strong><span class="text-secondary ms-2" id="creators-progress"></span><div class="text-secondary small mt-1" id="creators-usage"></div></div></div>
     <section class="card mb-3" id="creators-import-batches" hidden aria-label="Excel 导入进度"><div class="card-header"><h3 class="card-title">Excel 导入</h3></div><div id="creators-import-batch-list" class="card-body"></div></section>
-    <section class="card"><div class="card-header d-flex align-items-center flex-wrap gap-3"><div class="btn-list me-auto" role="group" aria-label="达人列表"><button type="button" id="creators-candidates" class="btn">候选达人</button><button type="button" id="creators-mine" class="btn">我的达人</button></div><form id="creators-search" class="d-flex gap-2" role="search"><label class="visually-hidden" for="creators-query">姓名</label><input class="form-control" id="creators-query" type="search" value="{{ creator_query }}" maxlength="120" placeholder="搜索姓名"><button class="btn btn-outline-secondary" type="submit">搜索</button></form></div>
-      <section id="creators-import-candidates" hidden aria-label="Excel 待确认达人">
-        <div class="card-body pb-2"><h3 class="card-title">Excel 待确认</h3><p class="text-secondary small mb-0">核对 handle 和对应 Lark 用户后确认入库，负责人已由整份名单指定。修改账号或用户后会重新检查冲突。</p></div>
-        <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th scope="col">达人 handle</th><th scope="col">来源</th><th scope="col">对应用户</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead><tbody id="creators-import-rows"></tbody></table></div>
-        <div class="card-body py-2 d-flex align-items-center justify-content-between border-bottom"><span id="creators-import-page-label" class="text-secondary small"></span><div class="btn-list"><button type="button" id="creators-import-previous" class="btn btn-sm btn-outline-secondary">上一页</button><button type="button" id="creators-import-next" class="btn btn-sm btn-outline-secondary">下一页</button></div></div>
-      </section>
-      <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th scope="col">Lark 用户</th><th scope="col">达人 handle</th><th scope="col" id="creators-type-column"{% if creator_tab != 'mine' %} hidden{% endif %}>CAP 属性</th><th scope="col" id="creators-status-column"{% if creator_tab != 'candidates' %} hidden{% endif %}>状态</th><th scope="col">操作</th></tr></thead><tbody id="creators-rows"></tbody></table></div>
+    <section class="card"><div class="card-header d-flex align-items-center flex-wrap gap-3"><div class="btn-list me-auto" role="group" aria-label="达人列表"><button type="button" id="creators-candidates" class="btn">候选达人</button><button type="button" id="creators-mine" class="btn">我的达人</button></div><form id="creators-search" class="d-flex gap-2" role="search"><label class="visually-hidden" for="creators-query">姓名或 handle</label><input class="form-control" id="creators-query" type="search" value="{{ creator_query }}" maxlength="120" placeholder="搜索姓名或 handle"><button class="btn btn-outline-secondary" type="submit">搜索</button></form></div>
+      <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th scope="col">达人 handle</th><th scope="col">来源</th><th scope="col">Lark 用户</th><th scope="col" id="creators-type-column"{% if creator_tab != 'mine' %} hidden{% endif %}>CAP 属性</th><th scope="col" id="creators-status-column"{% if creator_tab != 'candidates' %} hidden{% endif %}>状态</th><th scope="col">操作</th></tr></thead><tbody id="creators-rows"></tbody></table></div>
       <div class="card-body text-secondary" id="creators-empty">暂无候选达人。</div>
       <div class="card-footer d-flex align-items-center justify-content-between"><span id="creators-page-label" class="text-secondary"></span><div class="btn-list"><button type="button" id="creators-previous" class="btn btn-sm btn-outline-secondary">上一页</button><button type="button" id="creators-next" class="btn btn-sm btn-outline-secondary">下一页</button></div></div>
     </section>
@@ -38,5 +33,5 @@
   </dialog>
 </div>
 <script id="creators-initial" type="application/json">{{ creator_data|tojson }}</script>
-<script src="/static/creator-handles.js?v=20260914-import-performance" defer></script>
+<script src="/static/creator-handles.js?v=20260914-unified-sources" defer></script>
 {% endblock %}

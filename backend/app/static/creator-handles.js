@@ -10,8 +10,8 @@
   let query = el("query").value.trim();
   let busy = false, reading = false, refreshQueued = false, version = 0, evidenceVersion = 0, autoDirty = false;
   const rows = new Map();
-  const importRows = new Map();
-  let imports = {batches: [], candidates: [], total: 0}, importPage = 1, importPreview = null;
+  let importPreview = null;
+  const rowKey = item => `${item.kind || "ai"}:${item.id}`;
   const node = (tag, text = "", classes = "") => {
     const item = document.createElement(tag); item.textContent = text; item.className = classes; return item;
   };
@@ -30,8 +30,7 @@
   }
   function selectedCM() { return el("cm")?.value || data.selected_cm_id || ""; }
   function selectedCMName() { return data.cms?.find(cm => cm.id === selectedCM())?.name || "我"; }
-  function clearRows() { rows.clear(); el("rows").replaceChildren(); }
-  function clearImportRows() { for (const row of importRows.values()) row.searchVersion++; importRows.clear(); el("import-rows").replaceChildren(); }
+  function clearRows() { for (const row of rows.values()) row.searchVersion++; rows.clear(); el("rows").replaceChildren(); }
   function importMessage(text, error = false) {
     el("import-message").textContent = text;
     el("import-message").className = `small mt-3 ${error ? "text-danger" : "text-secondary"}`;
@@ -53,8 +52,9 @@
     const confirm = node("button", "确认入库", "btn btn-sm btn-primary"); confirm.type = "button";
     const defer = node("button", "暂缓", "btn btn-sm btn-outline-secondary"); defer.type = "button";
     actionsList.append(confirm, defer); actions.append(actionsList);
-    row.append(handleCell, node("td", "Excel"), userCell, statusCell, actions); el("import-rows").append(row);
-    const parts = {row, handle, user, search, choices, status, reason, confirm, defer, contactId: "", dirty: false, searchVersion: 0};
+    const source = node("td", "", "text-nowrap"), typeCell = node("td"); typeCell.hidden = true;
+    row.append(handleCell, source, userCell, typeCell, statusCell, actions);
+    const parts = {row, source, handle, user, search, choices, status, reason, confirm, defer, contactId: "", dirty: false, searchVersion: 0};
     const check = () => { confirm.disabled = busy || !parts.canConfirm || !handle.value.trim() || !parts.contactId; };
     handle.addEventListener("input", () => { parts.dirty = true; check(); });
     user.addEventListener("input", () => { parts.dirty = true; parts.contactId = ""; parts.searchVersion++; choices.replaceChildren(); check(); });
@@ -88,7 +88,7 @@
     el("import-open").disabled = busy || !selectedCM();
     for (const key of ["file", "check", "confirm", "close"]) el(`import-${key}`).disabled = busy;
     el("import-confirm").hidden = !importPreview || importPreview.status !== "preview" || !(importPreview.counts?.valid > 0);
-    const batches = imports.batches || [];
+    const batches = data.import_batches || [];
     el("import-batches").hidden = !batches.length;
     el("import-batch-list").replaceChildren();
     for (const batch of batches) {
@@ -107,29 +107,20 @@
       }
       el("import-batch-list").append(line);
     }
-    el("import-candidates").hidden = tab !== "candidates" || !(imports.total > 0);
-    const ids = new Set((imports.candidates || []).map(item => item.id));
-    for (const [id, parts] of importRows) if (!ids.has(id)) { parts.searchVersion++; parts.row.remove(); importRows.delete(id); }
-    for (const item of imports.candidates || []) {
-      if (!importRows.has(item.id)) importRows.set(item.id, makeImportRow(item));
-      const parts = importRows.get(item.id);
-      if (!parts.dirty) {
-        parts.handle.value = item.handle || ""; parts.user.value = item.contact_id ? item.display_name || "" : "";
-        parts.contactId = item.contact_id || "";
-      }
-      parts.canConfirm = !!item.can_confirm;
-      parts.status.textContent = item.status_label || "待确认"; parts.reason.textContent = item.reason || "";
-      parts.handle.disabled = busy || !parts.canConfirm; parts.user.disabled = busy || !parts.canConfirm;
-      parts.search.disabled = busy || !parts.canConfirm;
-      parts.confirm.hidden = !parts.canConfirm;
-      parts.confirm.disabled = busy || !parts.canConfirm || !parts.handle.value.trim() || !parts.contactId;
-      parts.defer.hidden = !item.can_defer; parts.defer.disabled = busy;
-      for (const choice of parts.choices.querySelectorAll("button")) choice.disabled = busy;
+  }
+  function renderImportRow(item, parts) {
+    if (!parts.dirty) {
+      parts.handle.value = item.handle || ""; parts.user.value = item.contact_id ? item.display_name || "" : "";
+      parts.contactId = item.contact_id || "";
     }
-    importPage = imports.page || 1;
-    const pages = Math.max(1, imports.total_pages || Math.ceil((imports.total || 0) / 25));
-    el("import-page-label").textContent = `共 ${imports.total || 0} 个 handle · 第 ${importPage} / ${pages} 页`;
-    el("import-previous").disabled = busy || importPage <= 1; el("import-next").disabled = busy || importPage >= pages;
+    parts.canConfirm = !!item.can_confirm;
+    parts.status.textContent = item.status_label || "待确认"; parts.reason.textContent = item.reason || "";
+    parts.handle.disabled = busy || !parts.canConfirm; parts.user.disabled = busy || !parts.canConfirm;
+    parts.search.disabled = busy || !parts.canConfirm;
+    parts.confirm.hidden = !parts.canConfirm;
+    parts.confirm.disabled = busy || !parts.canConfirm || !parts.handle.value.trim() || !parts.contactId;
+    parts.defer.hidden = !item.can_defer; parts.defer.disabled = busy;
+    for (const choice of parts.choices.querySelectorAll("button")) choice.disabled = busy;
   }
   function makeRow(item) {
     const row = node("tr");
@@ -149,7 +140,8 @@
     input.rows = 2; input.maxLength = 3200; input.placeholder = "填写 handle；多个账号每行一个";
     input.setAttribute("aria-label", `${item.display_name || "达人"} 的 handle`);
     input.value = (item.handles || []).join("\n");
-    const parts = {row, name, avatar, initial, saved, editor, options, input, dirty: false, optionsKey: ""};
+    const source = node("td", "", "text-nowrap");
+    const parts = {row, source, name, avatar, initial, saved, editor, options, input, dirty: false, optionsKey: ""};
     input.addEventListener("input", () => { parts.dirty = true; });
     editor.append(input); handleCell.append(editor);
     const typeCell = node("td"), creatorType = node("select", "", "form-select");
@@ -179,7 +171,7 @@
       });
       actionsList.append(button);
     }
-    actions.append(actionsList); row.append(person, handleCell, typeCell, status, actions); el("rows").append(row);
+    actions.append(actionsList); row.append(handleCell, source, person, typeCell, status, actions);
     return parts;
   }
   function render() {
@@ -205,11 +197,15 @@
       el(key).setAttribute("aria-pressed", String(key === tab));
       el(key).disabled = busy;
     }
-    const ids = new Set((data.items || []).map(item => item.id));
-    for (const [id, parts] of rows) if (!ids.has(id)) { parts.row.remove(); rows.delete(id); }
-    for (const item of data.items || []) {
-      if (!rows.has(item.id)) rows.set(item.id, makeRow(item));
-      const parts = rows.get(item.id);
+    const ids = new Set((data.items || []).map(rowKey));
+    for (const [id, parts] of rows) if (!ids.has(id)) { parts.searchVersion++; parts.row.remove(); rows.delete(id); }
+    for (const [index, item] of (data.items || []).entries()) {
+      const key = rowKey(item);
+      if (!rows.has(key)) rows.set(key, item.kind === "import" ? makeImportRow(item) : makeRow(item));
+      const parts = rows.get(key);
+      if (el("rows").children[index] !== parts.row) el("rows").insertBefore(parts.row, el("rows").children[index] || null);
+      parts.source.textContent = item.source || (item.sources || []).join(" + ") || "—";
+      if (item.kind === "import") { renderImportRow(item, parts); continue; }
       parts.name.textContent = item.display_name || "—";
       parts.initial.textContent = Array.from((item.display_name || "").trim())[0]?.toUpperCase() || "?";
       if (parts.avatarUrl !== item.avatar_url) {
@@ -266,12 +262,12 @@
     page = data.page || 1;
     el("empty").hidden = !!data.items?.length;
     el("empty").textContent = tab === "mine" ? "还没有已入库的达人。" : "暂无候选达人。";
-    el("page-label").textContent = `共 ${data.total_count || 0} 人 · 第 ${page} / ${Math.max(1, data.total_pages || 0)} 页`;
+    el("page-label").textContent = `共 ${data.total_count || 0} ${tab === "mine" ? "人" : "条"} · 第 ${page} / ${Math.max(1, data.total_pages || 0)} 页`;
     el("previous").disabled = busy || page <= 1; el("next").disabled = busy || page >= (data.total_pages || 1);
     renderImports();
   }
   async function refresh(automatic = false) {
-    if (automatic && (reading || busy || document.hidden || [...rows.values(), ...importRows.values()].some(row => row.dirty))) return;
+    if (automatic && (reading || busy || document.hidden || [...rows.values()].some(row => row.dirty))) return;
     if (reading) {
       if (!automatic) { refreshQueued = true; version++; }
       return;
@@ -281,15 +277,8 @@
     if (selectedCM()) params.set("cm_id", selectedCM());
     history.replaceState(null, "", `/creators?${params}`);
     try {
-      const importParams = new URLSearchParams({cm_id: selectedCM(), q: query, page: String(importPage)});
-      const results = await Promise.allSettled([
-        fetch(`/creators/data?${params}`, {cache: "no-store"}).then(read),
-        selectedCM() ? fetch(`/creators/imports/data?${importParams}`, {cache: "no-store"}).then(read) : Promise.resolve({batches: [], candidates: [], total: 0}),
-      ]);
-      const failure = results.find(result => result.status === "rejected");
-      if (failure) throw failure.reason;
-      const [next, nextImports] = results.map(result => result.value);
-      if (token === version) { data = next; imports = nextImports; render(); }
+      const next = await read(await fetch(`/creators/data?${params}`, {cache: "no-store"}));
+      if (token === version) { data = next; render(); }
     } catch (error) { if (token === version) notice(error.message, true); }
     finally {
       reading = false;
@@ -303,23 +292,15 @@
       await read(await fetch(`/creators${path}`, {method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"},
         body: new URLSearchParams({csrf_token: app.dataset.csrf, ...fields})}));
       if (path.endsWith("auto-admit")) autoDirty = false;
-      if (path.endsWith("/confirm")) {
-        if (path.startsWith("/imports/rows/")) {
-          const rowId = path.split("/")[3];
-          importRows.get(rowId)?.row.remove(); importRows.delete(rowId);
-          imports.candidates = imports.candidates.filter(item => item.id !== rowId);
-          notice("已确认入库，可在“我的达人”查看并设置 CAP 属性。");
-        } else {
-          const taskId = path.split("/")[2];
-          rows.get(taskId)?.row.remove(); rows.delete(taskId);
-          if (tab === "candidates") data.items = data.items.filter(item => item.id !== taskId);
-          notice(tab === "mine" ? "handle 已保存。" : "已确认入库，可在“我的达人”查看。");
-        }
+      if (tab === "candidates" && (path.endsWith("/confirm") || path.endsWith("/defer"))) {
+        const isImport = path.startsWith("/imports/rows/");
+        const key = `${isImport ? "import" : "ai"}:${path.split("/")[isImport ? 3 : 2]}`;
+        data.items = data.items.filter(item => rowKey(item) !== key);
       }
-      else if (path.startsWith("/imports/rows/") && path.endsWith("/defer")) {
-        const rowId = path.split("/")[3];
-        importRows.get(rowId)?.row.remove(); importRows.delete(rowId);
-        imports.candidates = imports.candidates.filter(item => item.id !== rowId);
+      if (path.endsWith("/confirm")) {
+        notice(tab === "mine" ? "handle 已保存。" : "已确认入库，可在“我的达人”查看并设置 CAP 属性。");
+      }
+      else if (path.endsWith("/defer")) {
         notice("已暂缓，尚未确认的修改不会入库。");
       }
       else if (path.endsWith("/recheck")) notice("已提交材料更新，本次未调用 AI；准备完成后再点击“开始查找 handle”。");
@@ -361,8 +342,8 @@
     try {
       await read(await fetch(`/creators/imports/${importPreview.id}/start`, {method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: new URLSearchParams({csrf_token: app.dataset.csrf})}));
       importPreview = null; el("import-dialog").close();
-      tab = "candidates"; importPage = 1; clearImportRows();
-      notice("已提交匹配。账号与用户关系确定且无冲突的直接入库，不确定的会出现在 Excel 待确认中。");
+      tab = "candidates"; page = 1; clearRows();
+      notice("已提交匹配。账号与用户关系确定且无冲突的直接入库，其余与 AI 结果一起显示在候选达人中，并标注来源。");
       void refresh();
     } catch (error) { importMessage(error.message, true); }
     finally { busy = false; render(); }
@@ -388,7 +369,7 @@
     } catch (error) { if (token === evidenceVersion) el("evidence-body").textContent = error.message; }
   }
   for (const key of ["candidates", "mine"]) el(key).addEventListener("click", () => { tab = key; page = 1; clearRows(); refresh(); });
-  el("search").addEventListener("submit", event => { event.preventDefault(); query = el("query").value.trim(); page = 1; importPage = 1; clearRows(); clearImportRows(); refresh(); });
+  el("search").addEventListener("submit", event => { event.preventDefault(); query = el("query").value.trim(); page = 1; clearRows(); refresh(); });
   el("refresh").addEventListener("click", () => refresh());
   el("previous").addEventListener("click", () => { page--; clearRows(); refresh(); });
   el("next").addEventListener("click", () => { page++; clearRows(); refresh(); });
@@ -403,16 +384,13 @@
   el("import-file").addEventListener("change", () => { importPreview = null; el("import-preview").hidden = true; importMessage(""); render(); });
   el("import-check").addEventListener("click", checkImport);
   el("import-confirm").addEventListener("click", startImport);
-  el("import-previous").addEventListener("click", () => { importPage--; clearImportRows(); refresh(); });
-  el("import-next").addEventListener("click", () => { importPage++; clearImportRows(); refresh(); });
   if (data.can_manage) {
     if (data.cms?.length) {
       el("cm").replaceChildren(...data.cms.map(cm => { const option = node("option", cm.name); option.value = cm.id; return option; }));
       el("cm").value = data.selected_cm_id;
     }
     el("cm").addEventListener("change", () => {
-      data = {...data, run: null, items: [], page: 1, total_count: 0, total_pages: 0};
-      imports = {batches: [], candidates: [], total: 0}; importPage = 1; clearImportRows();
+      data = {...data, run: null, items: [], import_batches: [], page: 1, total_count: 0, total_pages: 0};
       page = 1; autoDirty = false; clearRows(); render(); refresh();
     });
     el("preview").addEventListener("click", () => mutate("/preview", {cm_id: selectedCM()}));

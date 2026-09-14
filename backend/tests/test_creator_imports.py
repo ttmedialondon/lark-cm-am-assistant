@@ -119,6 +119,9 @@ def test_excel_auto_manual_and_repeated_import_preserve_people_and_creator_type(
     assert matched["review_status"] == "confirmed" and matched["contact_id"] == pilot.ids["creator"]
     assert matched["api_requests"] == 1 and len(calls) == 1
     assert missing["contact_id"] is None and missing["api_requests"] == 0
+    assert imports.source_labels(matched) == ["Excel", "AI"]
+    assert imports.source_labels({**matched, "stats": {}}) == ["Excel", "AI"]
+    assert imports.source_labels(missing) == ["Excel"]
     assert pg.execute("SELECT count(*) n FROM contacts").fetchone()["n"] == before_people
     assert (
         pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (pilot.ids["creator"],)).fetchone()["creator_type"]
@@ -214,6 +217,7 @@ def test_import_scope_conflict_and_manual_edit_block_stale_ai_results(pg, pilot,
     assert current["confidence"] is None and current["refs"] == []
     assert current["pack_ciphertext"] is None and current["result_ciphertext"] is None
     assert current["fingerprint"] is None and current["config_fingerprint"] is None
+    assert imports.source_labels(current) == ["Excel"]
     assert (
         len(calls) == 1
         and not pg.execute("SELECT 1 FROM social_accounts WHERE normalized_handle='creator_one'").fetchone()
@@ -292,3 +296,97 @@ def test_import_workbook_rejects_unsafe_or_ambiguous_input():
             imports.parse_xlsx(name, content)
     parsed = imports.parse_xlsx("roster.xlsx", workbook("handle", "https://www.tiktok.com/@Account.One", "account.one"))
     assert parsed["counts"] == {"valid": 1, "duplicates": 1, "invalid": 0}
+
+
+@pytest.mark.parametrize("score", [.94, .99])
+def test_existing_ai_accounts_merge_into_excel_without_new_requests(pg, pilot, monkeypatch, score):
+    from test_creator_handles import _case, _drain_paid, _task
+
+    monkeypatch.setattr(imports, "connection", lambda: nullcontext(pg))
+    case = _case(pg, pilot, monkeypatch)
+    case.score = score
+    creator_handles.start_run(pilot.ids["owner"], case.run)
+    _drain_paid(pilot.settings)
+    task = _task(pg, case)
+    assert len(case.calls) == 1 and task["review_status"] == "pending"
+    batch = imports.preview_import(pilot.ids["owner"], pilot.ids["cm"], "roster.xlsx", workbook("creator_one"))
+    imports.start_import(pilot.ids["owner"], batch["id"])
+    drain(pilot)
+    row = row_for(pg, batch, "creator_one")
+    assert row["contact_id"] == case.creator and imports.source_labels(row) == ["Excel", "AI"]
+    assert row["stats"]["reused_handle_task_id"] == str(task["id"])
+    assert row["api_requests"] == 0 and len(case.calls) == 1
+    assert row["review_status"] == ("confirmed" if score >= .95 else "pending")
+    if score < .95:
+        assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
+        imports.confirm_row(pilot.ids["cm"], row["id"], row["handle"], case.creator)
+        unchanged = row_for(pg, batch, "creator_one")
+        assert unchanged["confidence"] == row["confidence"]
+        assert imports.source_labels(unchanged) == ["Excel", "AI"]
+    assert pg.execute("""SELECT status FROM contact_social_accounts l JOIN social_accounts s
+        ON s.id=l.social_account_id WHERE s.normalized_handle='creator_one'""").fetchone()["status"] == "confirmed"
+    assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 1
+    # Losing the source scope removes reuse eligibility even though the AI result still exists.
+    pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (pilot.ids["cm"],))
+    hidden = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "hidden.xlsx", workbook("creator_two"))
+    imports.start_import(pilot.ids["cm"], hidden["id"])
+    drain(pilot)
+    hidden_row = row_for(pg, hidden, "creator_two")
+    assert hidden_row["contact_id"] is None and imports.source_labels(hidden_row) == ["Excel"]
+    assert hidden_row["api_requests"] == 0 and len(case.calls) == 1
+
+
+def test_existing_ai_multiple_people_for_one_handle_remains_one_conflicted_excel_candidate(pg, pilot, monkeypatch):
+    from test_creator_handles import _case, _drain_paid
+
+    monkeypatch.setattr(imports, "connection", lambda: nullcontext(pg))
+    pilot.person("another", pairs=2)
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='another_1_question'", (
+        message_body_cipher(pilot.settings.token_encryption_key).encrypt(
+            json.dumps({"text": "My TikTok account is @creator_one. Can you arrange my sample?"})),
+    ))
+    case = _case(pg, pilot, monkeypatch)
+    creator_handles.start_run(pilot.ids["owner"], case.run)
+    _drain_paid(pilot.settings)
+    assert len(case.calls) == 2
+    batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "roster.xlsx", workbook("creator_one"))
+    imports.start_import(pilot.ids["cm"], batch["id"])
+    drain(pilot)
+    row = row_for(pg, batch, "creator_one")
+    assert row["outcome"] == "conflict" and row["review_status"] == "pending" and row["contact_id"] is None
+    assert imports.source_labels(row) == ["Excel", "AI"] and len(row["stats"]["reused_handle_task_ids"]) == 2
+    assert row["api_requests"] == 0 and len(case.calls) == 2
+    assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
+
+
+def test_excel_admits_a_strong_handle_even_when_another_ai_handle_needs_review(pg, pilot, monkeypatch):
+    from test_creator_handles import _case, _drain_paid, _task
+
+    monkeypatch.setattr(imports, "connection", lambda: nullcontext(pg))
+    case = _case(pg, pilot, monkeypatch)
+    original = contact_assessments.call_openai
+
+    def mixed_scores(*args, **kwargs):
+        response = original(*args, **kwargs)
+        result = json.loads(response["text"])
+        for candidate in result["candidates"]:
+            candidate["confidence"] = .99 if candidate["handle"] == "creator_one" else .8
+        response["text"] = json.dumps(result)
+        return response
+
+    monkeypatch.setattr(contact_assessments, "call_openai", mixed_scores)
+    creator_handles.start_run(pilot.ids["owner"], case.run)
+    _drain_paid(pilot.settings)
+    assert _task(pg, case)["outcome"] == "review" and len(case.calls) == 1
+    batch = imports.preview_import(
+        pilot.ids["cm"], pilot.ids["cm"], "roster.xlsx", workbook("creator_one", "creator_two")
+    )
+    imports.start_import(pilot.ids["cm"], batch["id"])
+    drain(pilot)
+    strong, weak = row_for(pg, batch, "creator_one"), row_for(pg, batch, "creator_two")
+    assert strong["review_status"] == "confirmed" and weak["review_status"] == "pending"
+    assert strong["contact_id"] == weak["contact_id"] == case.creator
+    assert imports.source_labels(strong) == imports.source_labels(weak) == ["Excel", "AI"]
+    assert strong["api_requests"] == weak["api_requests"] == 0 and len(case.calls) == 1
+    formal = creator_handles.page_data(pilot.ids["cm"], tab="mine")
+    assert formal["total_count"] == 1 and formal["items"][0]["handles"] == ["creator_one"]

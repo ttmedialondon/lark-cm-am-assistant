@@ -75,6 +75,9 @@ def _case(pg, pilot, monkeypatch, *, clues=True, uncertain=False):
     _run_all(pilot)
     before_preview = len(pilot.calls)
     run = handles.create_preview(pilot.ids["owner"], pilot.ids["cm"], source)
+    assert pg.execute("SELECT auto_admit FROM creator_handle_runs WHERE id=%s", (run,)).fetchone()["auto_admit"]
+    # Most cases below exercise manual review; an owner may explicitly pause automatic admission.
+    handles.set_auto_admit(pilot.ids["owner"], run, False)
     _drain_preview(pilot.settings)
     assert len(pilot.calls) == before_preview
     case = SimpleNamespace(run=run, source=source, creator=pilot.ids["creator"], calls=[], callbacks=[], score=.99,
@@ -329,9 +332,14 @@ def test_existing_person_or_account_owners_are_not_overwritten_and_no_partial_ac
             pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
                        "VALUES(%s,%s,%s,'manual')", (uuid4(), case.creator, cm))
             before = _snapshot(pg, ("contact_assignments", "social_accounts", "contact_social_accounts"))
-            with pytest.raises(ValueError, match="冲突"):
+            if cm == pilot.ids["cm"]:
                 handles.confirm_task(pilot.ids["cm"], task["id"], ["new_handle"])
-            assert _snapshot(pg, before) == before
+                assert _snapshot(pg, ("contact_assignments",))["contact_assignments"] == before["contact_assignments"]
+                assert handles.page_data(cm, cm_id=cm, tab="mine")["items"][0]["handles"] == ["new_handle"]
+            else:
+                with pytest.raises(ValueError, match="冲突"):
+                    handles.confirm_task(pilot.ids["cm"], task["id"], ["new_handle"])
+                assert _snapshot(pg, before) == before
     before = _snapshot(pg, ("contact_assignments", "social_accounts", "contact_social_accounts",
                             "creator_account_assignments"))
     with pytest.raises(ValueError, match="冲突"):
@@ -511,3 +519,58 @@ def test_preparation_and_expiry_lock_run_before_task(pg, pilot, monkeypatch):
     assert first_locked_table() == "creator_handle_runs"
     assert _task(pg, case)["status"] == "failed"
     assert not case.calls
+
+
+def test_mixed_sources_share_pagination_and_one_person_keeps_all_confirmed_handles(pg, pilot, monkeypatch):
+    from test_creator_imports import workbook
+
+    from app import creator_imports as imports
+
+    monkeypatch.setattr(imports, "connection", lambda: nullcontext(pg))
+    case = _case(pg, pilot, monkeypatch)
+    case.score, case.outcome = .94, "review"
+    handles.start_run(pilot.ids["owner"], case.run)
+    _drain_paid(pilot.settings)
+    paid = len(case.calls)
+    cm = pilot.ids["cm"]
+    batch = imports.preview_import(
+        cm, cm, "mixed.xlsx", workbook("creator_one", *(f"unmatched_{n}" for n in range(26)))
+    )
+    imports.start_import(cm, batch["id"])
+    for _ in range(27):
+        assert imports.prepare_next_import(pilot.settings)
+        current = pg.execute(
+            "SELECT status FROM creator_import_rows WHERE batch_id=%s AND handle='creator_one'", (batch["id"],)
+        ).fetchone()
+        if current["status"] != "pending":
+            break
+    page = handles.page_data(cm, cm_id=cm)
+    following = handles.page_data(cm, cm_id=cm, page=2)
+    assert page["total_count"] == 28 and page["total_pages"] == 2
+    assert len(page["items"]) == 25 and len(following["items"]) == 3
+    items = page["items"] + following["items"]
+    assert len({(r["kind"], r["id"]) for r in items}) == 28
+    assert {tuple(r["sources"]) for r in items} == {("Excel",), ("AI",), ("Excel", "AI")}
+    merged = handles.page_data(cm, cm_id=cm, query="creator_one")["items"]
+    assert len(merged) == 1 and merged[0]["source"] == "Excel + AI"
+    assert merged[0]["contact_id"] == str(case.creator)
+    extra = handles.page_data(cm, cm_id=cm, query="creator_two")["items"]
+    assert len(extra) == 1 and extra[0]["kind"] == "ai"
+    assert [r["handle"] for r in extra[0]["handle_options"]] == ["creator_two"]
+    pg.execute("UPDATE contacts SET creator_type='cap' WHERE id=%s", (case.creator,))
+    imports.confirm_row(cm, merged[0]["id"], "creator_one", case.creator)
+    with pg.transaction(force_rollback=True):
+        # A later AI match to an already formal Excel account must still contribute its source.
+        pg.execute("UPDATE creator_import_rows SET stats='{}',result_ciphertext=NULL,confidence=NULL "
+                   "WHERE id=%s", (merged[0]["id"],))
+        assert handles.page_data(cm, cm_id=cm, tab="mine")["items"][0]["source"] == "Excel + AI"
+    # The remaining AI account belongs to the same person, and remains actionable after Excel admission.
+    extra = handles.page_data(cm, cm_id=cm, query="creator_two")["items"]
+    assert len(extra) == 1 and extra[0]["can_confirm"]
+    handles.confirm_task(cm, extra[0]["id"], ["creator_two"])
+    formal = handles.page_data(cm, cm_id=cm, tab="mine")["items"]
+    assert len(formal) == 1 and formal[0]["creator_type"] == "cap"
+    assert set(formal[0]["handles"]) == {"creator_one", "creator_two"}
+    assert formal[0]["source"] == "Excel + AI"
+    assert handles.page_data(cm, cm_id=cm)["total_count"] == 26
+    assert len(case.calls) == paid

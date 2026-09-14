@@ -177,7 +177,7 @@ def _seed(conn, source):
         run_id = uuid4()
         conn.execute(
             """INSERT INTO creator_handle_runs(id,ownership_run_id,cm_authorization_id,requested_by,
-            policy_version,status) VALUES(%s,%s,%s,%s,%s,'preparing')""",
+            policy_version,status,auto_admit) VALUES(%s,%s,%s,%s,%s,'preparing',TRUE)""",
             (run_id, source["id"], source["cm_authorization_id"], source["requested_by"], POLICY_VERSION),
         )
     else:
@@ -248,9 +248,10 @@ def _settle(conn, run_id):
 def _conflict(conn, task, handles):
     if conn.execute(
         """SELECT 1 FROM contact_assignments WHERE contact_id=%s AND ended_at IS NULL
-        AND (responsible_authorization_id<>%s OR handle_task_id IS DISTINCT FROM %s)
-        UNION ALL SELECT 1 FROM creator_account_assignments WHERE contact_id=%s AND ended_at IS NULL LIMIT 1""",
-        (task["contact_id"], task["cm_authorization_id"], task["id"], task["contact_id"]),
+        AND responsible_authorization_id<>%s
+        UNION ALL SELECT 1 FROM creator_account_assignments WHERE contact_id=%s AND ended_at IS NULL
+        AND responsible_authorization_id<>%s LIMIT 1""",
+        (task["contact_id"], task["cm_authorization_id"], task["contact_id"], task["cm_authorization_id"]),
     ).fetchone():
         return True
     return bool(
@@ -326,12 +327,15 @@ def _admit(conn, task, handles, actor, settings, *, automatic=False):
         conn.execute(
             """INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source,
             reviewed_by_authorization_id,reviewed_at,handle_task_id) VALUES(%s,%s,'owner','confirmed',%s,%s,NOW(),%s)
-            ON CONFLICT(contact_id,social_account_id,relationship) DO NOTHING""",
+            ON CONFLICT(contact_id,social_account_id,relationship) DO UPDATE SET
+            handle_task_id=COALESCE(contact_social_accounts.handle_task_id,EXCLUDED.handle_task_id)
+            WHERE contact_social_accounts.status='confirmed'""",
             (task["contact_id"], account["id"], source, None if automatic else actor, task["id"]),
         )
     conn.execute(
         """INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source,confidence,
-        created_by_authorization_id,ownership_task_id,handle_task_id) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+        created_by_authorization_id,ownership_task_id,handle_task_id) SELECT %s,%s,%s,%s,%s,%s,%s,%s
+        WHERE NOT EXISTS (SELECT 1 FROM contact_assignments WHERE contact_id=%s AND ended_at IS NULL)""",
         (
             uuid4(),
             task["contact_id"],
@@ -341,6 +345,7 @@ def _admit(conn, task, handles, actor, settings, *, automatic=False):
             None if automatic else actor,
             task["ownership_task_id"],
             task["id"],
+            task["contact_id"],
         ),
     )
     conn.execute(
@@ -768,6 +773,15 @@ def run_claimed_handle(job, settings):
         )
         result = validate_result(response["text"], pack)
         _finish(job, "succeeded", "classified", settings, response, result)
+        # A later AI answer can complete an earlier Excel candidate without another paid request.
+        try:
+            from .creator_imports import reconcile_handle_results
+
+            reconcile_handle_results(
+                settings, job["cm_authorization_id"], handles=[c["handle"] for c in result["candidates"]]
+            )
+        except Exception:
+            LOGGER.warning("Excel reconciliation deferred after handle result task=%s", job["id"])
     except contact_assessments.OpenAIRequestError as exc:
         if exc.is_quota:
             ai_dispatch.pause_for_quota()
@@ -790,7 +804,130 @@ def run_claimed_handle(job, settings):
         _finish(job, "failed", "provider_error", settings, response)
 
 
+def _mixed_candidates(conn, cm_id, ai_rows, settings, query):
+    from . import creator_imports
+
+    # Combine scoped metadata; check cited account evidence for overlapping handles, never all chat history.
+    imported = conn.execute(
+        """SELECT r.*,c.display_name,c.creator_type FROM creator_import_rows r
+        JOIN creator_import_batches b ON b.id=r.batch_id LEFT JOIN contacts c ON c.id=r.contact_id
+        WHERE r.cm_authorization_id=%s AND b.policy_version=%s AND b.status<>'preview'
+        AND r.review_status<>'confirmed' ORDER BY r.created_at DESC,r.id""",
+        (cm_id, creator_imports.POLICY_VERSION),
+    ).fetchall()
+    formal = {}
+    for account in conn.execute(
+        """SELECT l.contact_id,s.normalized_handle FROM contact_social_accounts l
+        JOIN social_accounts s ON s.id=l.social_account_id WHERE l.status='confirmed'
+        AND l.relationship='owner' AND s.platform='tiktok' AND (
+            EXISTS (SELECT 1 FROM contact_assignments a WHERE a.contact_id=l.contact_id
+                AND a.responsible_authorization_id=%s AND a.ended_at IS NULL)
+            OR EXISTS (SELECT 1 FROM creator_account_assignments a WHERE a.contact_id=l.contact_id
+                AND a.social_account_id=s.id AND a.responsible_authorization_id=%s AND a.ended_at IS NULL))""",
+        (cm_id, cm_id),
+    ).fetchall():
+        formal.setdefault(account["contact_id"], set()).add(account["normalized_handle"].lower())
+    combined, by_contact, seen = [], {}, set()
+    for row in imported:
+        if row["handle"] in formal.get(row["contact_id"], set()) and row["outcome"] != "conflict":
+            continue
+        key = (row["handle"], row["contact_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        row["kind"] = "import"
+        combined.append(row)
+        if row["contact_id"]:
+            by_contact.setdefault(row["contact_id"], []).append(row)
+    for row in ai_rows:
+        row["kind"] = "ai"
+        result = _decode(row, "result_ciphertext", settings)
+        options = {c["handle"] for c in result.get("candidates", [])}
+        saved = formal.get(row["contact_id"], set())
+        if saved and options <= saved and row.get("outcome") != "conflict":
+            continue
+        options -= saved
+        matches = by_contact.get(row["contact_id"], [])
+        covered = {r["handle"] for r in matches}
+        mergeable = False
+        if options & covered and row.get("outcome") != "conflict":
+            try:
+                _parent(conn, row, settings, full=False)
+                mergeable = _valid_handle_material(row, settings, full=False)
+            except (ValueError, PermissionError):
+                pass
+        if mergeable:
+            for item in matches:
+                if item["handle"] in options:
+                    item["merged_ai_task"] = row
+        if mergeable and options <= covered:
+            continue
+        row["candidate_handles"] = options - covered if mergeable else options
+        combined.append(row)
+    if query:
+        needle = query.casefold()
+        filtered = []
+        for row in combined:
+            if row["kind"] == "import":
+                if needle in row["handle"].casefold() or (
+                    needle in (row["display_name"] or "").casefold()
+                    and row["contact_id"] and creator_imports._accessible(conn, cm_id, row["contact_id"])
+                ):
+                    filtered.append(row)
+            elif needle in (row["display_name"] or "").casefold():
+                filtered.append(row)
+            elif any(needle in handle.casefold() for handle in row["candidate_handles"]):
+                try:
+                    _parent(conn, row, settings, full=False)
+                    if _valid_handle_material(row, settings, full=False):
+                        filtered.append(row)
+                except (ValueError, PermissionError):
+                    pass
+        combined = filtered
+    return sorted(combined, key=lambda r: (
+        (r.get("handle") or min(r.get("candidate_handles") or {r["display_name"] or ""})).casefold(),
+        str(r["id"]),
+    ))
+
+
+def _formal_sources(conn, cm_id, contact_id, handles, settings):
+    from . import creator_imports
+
+    rows = conn.execute(
+        """SELECT r.contact_id,r.stats,r.result_ciphertext,r.outcome,r.confidence FROM creator_import_rows r
+        JOIN creator_import_batches b ON b.id=r.batch_id WHERE r.cm_authorization_id=%s
+        AND r.handle=ANY(%s::text[]) AND b.status<>'preview' AND b.policy_version=%s""",
+        (cm_id, [h.lower() for h in handles], creator_imports.POLICY_VERSION),
+    ).fetchall()
+    sources = {"Excel"} if rows else set()
+    if any(row["contact_id"] == contact_id and "AI" in creator_imports.source_labels(row) for row in rows):
+        sources.add("AI")
+    if conn.execute(
+        """SELECT 1 FROM creator_handle_tasks WHERE cm_authorization_id=%s AND contact_id=%s
+        AND review_status='confirmed' AND policy_version=%s LIMIT 1""", (cm_id, contact_id, POLICY_VERSION)
+    ).fetchone():
+        sources.add("AI")
+    if "AI" not in sources:
+        for task in conn.execute(
+            """SELECT * FROM creator_handle_tasks WHERE cm_authorization_id=%s AND contact_id=%s
+            AND status='succeeded' AND policy_version=%s ORDER BY created_at DESC,id DESC""",
+            (cm_id, contact_id, POLICY_VERSION),
+        ).fetchall():
+            result = _decode(task, "result_ciphertext", settings)
+            if not {c["handle"] for c in result.get("candidates", [])} & set(handles):
+                continue
+            if (
+                creator_imports._accessible(conn, cm_id, contact_id)
+                and _valid_handle_material(task, settings, full=False)
+            ):
+                sources.add("AI")
+                break
+    return [label for label in ("Excel", "AI") if label in sources] or ["手动"]
+
+
 def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
+    from . import creator_imports
+
     settings = get_settings()
     with connection() as conn:
         cm_id, owner = _access(conn, actor_id, cm_id)
@@ -828,10 +965,10 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
               AND n.cm_authorization_id=p.cm_authorization_id AND n.status='succeeded'
               AND (n.created_at,n.id)>(p.created_at,p.id))
             AND NOT EXISTS (SELECT 1 FROM contact_assignments a
-              WHERE a.contact_id=t.contact_id AND a.ended_at IS NULL)
+              WHERE a.contact_id=t.contact_id AND a.ended_at IS NULL AND a.responsible_authorization_id<>%s)
             AND NOT EXISTS (SELECT 1 FROM creator_account_assignments a
-              WHERE a.contact_id=t.contact_id AND a.ended_at IS NULL)"""
-        candidate_args = [cm_id, POLICY_VERSION, ownership.POLICY_VERSION]
+              WHERE a.contact_id=t.contact_id AND a.ended_at IS NULL AND a.responsible_authorization_id<>%s)"""
+        candidate_args = [cm_id, POLICY_VERSION, ownership.POLICY_VERSION, cm_id, cm_id]
         # Preserve previously confirmed account-level records, without duplicating people.
         formal_base = """FROM (SELECT DISTINCT ON(contact_id) * FROM (
             SELECT id,contact_id,handle_task_id,0 AS priority FROM contact_assignments
@@ -850,23 +987,49 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
         if tab not in ("candidates", "confirmed", "mine"):
             tab = "candidates"
         if tab == "candidates":
-            base, args = candidate_base, candidate_args.copy()
-            columns = "t.*,c.display_name,c.creator_type"
+            ai_rows = conn.execute(
+                "SELECT t.*,c.display_name,c.creator_type " + candidate_base, candidate_args
+            ).fetchall()
+            all_rows = _mixed_candidates(conn, cm_id, ai_rows, settings, query)
+            total = len(all_rows)
+            counts["candidates"] = total
+            pages = max(1, (total + 24) // 25)
+            page = min(page, pages)
+            rows = all_rows[(page - 1) * 25:page * 25]
         else:
             base, args = formal_base, formal_args.copy()
             columns = "t.*,a.id AS assignment_id,a.contact_id AS formal_contact_id,c.display_name,c.creator_type"
-        if query:
-            base += " AND c.display_name ILIKE %s"
-            args.append("%" + query + "%")
-        total = conn.execute("SELECT count(*) n " + base, args).fetchone()["n"]
-        pages = max(1, (total + 24) // 25)
-        page = min(page, pages)
-        rows = conn.execute(
-            "SELECT " + columns + " " + base + " ORDER BY c.display_name,c.id LIMIT 25 OFFSET %s",
-            [*args, (page - 1) * 25],
-        ).fetchall()
+            if query:
+                base += " AND (c.display_name ILIKE %s OR EXISTS (SELECT 1 FROM contact_social_accounts l " \
+                    "JOIN social_accounts s ON s.id=l.social_account_id WHERE l.contact_id=c.id " \
+                    "AND l.status='confirmed' AND l.relationship='owner' AND s.normalized_handle ILIKE %s))"
+                args.extend(["%" + query + "%"] * 2)
+            total = conn.execute("SELECT count(*) n " + base, args).fetchone()["n"]
+            pages = max(1, (total + 24) // 25)
+            page = min(page, pages)
+            rows = conn.execute(
+                "SELECT " + columns + " " + base + " ORDER BY c.display_name,c.id LIMIT 25 OFFSET %s",
+                [*args, (page - 1) * 25],
+            ).fetchall()
+        import_items = {
+            item["id"]: item for item in creator_imports.candidate_items(
+                conn, cm_id, [r for r in rows if r.get("kind") == "import"]
+            )
+        }
         items = []
         for row in rows:
+            if row.get("kind") == "import":
+                item = import_items[str(row["id"])]
+                merged = row.get("merged_ai_task")
+                if merged and item["contact_id"]:
+                    try:
+                        _parent(conn, merged, settings, full=False)
+                        item["sources"] = ["Excel", "AI"]
+                        item["source"] = "Excel + AI"
+                    except (ValueError, PermissionError):
+                        pass
+                items.append(item)
+                continue
             contact_id = row.get("formal_contact_id") or row["contact_id"]
             identity = conn.execute(
                 "SELECT open_id,CASE WHEN avatar_status='unavailable' THEN NULL ELSE avatar_url END AS avatar_url "
@@ -886,6 +1049,8 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
             readable = valid_parent and _valid_handle_material(row, settings, full=False)
             result = _decode(row, "result_ciphertext", settings) if readable else {}
             options = [{"handle": c["handle"], "confidence": c["confidence"]} for c in result.get("candidates", [])]
+            if tab == "candidates":
+                options = [option for option in options if option["handle"] in row["candidate_handles"]]
             handles = row.get("selected_handles") or []
             if tab != "candidates":
                 accounts = conn.execute(
@@ -931,6 +1096,9 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
             items.append(
                 {
                     "id": str(row.get("id") or row.get("assignment_id")),
+                    "kind": "ai",
+                    "sources": ["AI"] if tab == "candidates"
+                    else _formal_sources(conn, cm_id, contact_id, handles, settings),
                     "contact_id": str(contact_id),
                     "display_name": row["display_name"],
                     "open_id": identity["open_id"] if identity else None,
@@ -965,6 +1133,8 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
                     "has_evidence": readable,
                 }
             )
+        for item in items:
+            item["source"] = " + ".join(item["sources"])
         return {
             "cms": cms,
             "selected_cm_id": str(cm_id),
@@ -982,6 +1152,7 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
             },
             "counts": counts,
             "usage": usage,
+            "import_batches": creator_imports.batch_summaries(conn, cm_id),
             "items": items,
             "total_count": total,
             "total_pages": pages,

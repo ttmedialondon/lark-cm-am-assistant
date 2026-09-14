@@ -49,6 +49,16 @@ STATUS_LABELS = {
 BATCH_LABELS = {"preview": "等待开始", "running": "匹配中", "paused": "已暂停", "completed": "匹配完成"}
 
 
+def source_labels(row):
+    """A paid request alone is not an AI account-person suggestion."""
+    ai = (row.get("stats") or {}).get("ai_matched_handle") or (
+        row.get("result_ciphertext") is not None
+        and row.get("outcome") in {"matched", "review", "conflict"}
+        and row.get("confidence") is not None
+    )
+    return ["Excel", "AI"] if ai else ["Excel"]
+
+
 def _audit(conn, actor, action, data):
     conn.execute(
         "INSERT INTO audit_events(id,authorization_id,action,metadata) VALUES(%s,%s,%s,%s)",
@@ -195,6 +205,9 @@ def _admit(conn, row, actor, handle, contact_id, *, automatic=False, score=None,
     contact_id = ownership._uuid(contact_id)
     if not handle:
         raise ValueError("请填写正确的 handle。")
+    retain_ai = automatic or (
+        row["handle"] == handle and row["contact_id"] == contact_id and "AI" in source_labels(row)
+    )
     if row["review_status"] == "confirmed":
         if row["handle"] == handle and row["contact_id"] == contact_id:
             return
@@ -280,13 +293,13 @@ def _admit(conn, row, actor, handle, contact_id, *, automatic=False, score=None,
             contact_id,
             "existing" if existing else "classified" if automatic else "manual_confirmed",
             None if automatic else actor,
-            automatic,
-            automatic,
-            automatic,
-            automatic,
-            automatic,
-            automatic,
-            automatic,
+            retain_ai,
+            retain_ai,
+            retain_ai,
+            retain_ai,
+            retain_ai,
+            retain_ai,
+            retain_ai,
             row["id"],
         ),
     )
@@ -442,6 +455,106 @@ def _valid(conn, row, settings):
     )
 
 
+def _reuse_handle_results(conn, row, settings):
+    """Reuse current account evidence; the spreadsheet already supplies the CM."""
+    from .creator_handle_evidence import validate_result
+
+    tasks = conn.execute(
+        """SELECT t.* FROM creator_handle_tasks t WHERE t.cm_authorization_id=%s
+        AND t.policy_version=%s AND t.status='succeeded' AND t.review_status<>'deferred'
+        AND t.result_ciphertext IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM creator_handle_tasks n WHERE n.cm_authorization_id=t.cm_authorization_id
+            AND n.contact_id=t.contact_id AND n.status='succeeded'
+            AND (n.created_at,n.id)>(t.created_at,t.id)) ORDER BY t.contact_id""",
+        (row["cm_authorization_id"], creator_handles.POLICY_VERSION),
+    ).fetchall()
+    matches = []
+    for task in tasks:
+        result = creator_handles._decode(task, "result_ciphertext", settings)
+        if not any(c.get("handle") == row["handle"] for c in result.get("candidates", [])):
+            continue
+        if not _accessible(conn, row["cm_authorization_id"], task["contact_id"]):
+            continue
+        if not creator_handles._valid_handle_material(task, settings):
+            continue
+        result = validate_result(
+            ownership._encode(result), creator_handles._decode(task, "pack_ciphertext", settings)
+        )
+        candidate = next(c for c in result["candidates"] if c["handle"] == row["handle"])
+        matches.append((task, result, candidate))
+    if not matches:
+        return False
+    contact_id = matches[0][0]["contact_id"] if len(matches) == 1 else None
+    conflict = len(matches) > 1 or bool(contact_id and _conflict(conn, row, contact_id, row["handle"]))
+    # An earlier reverse match proposing somebody else must not silently disappear.
+    if row.get("contact_id") and row["contact_id"] != contact_id and row.get("result_ciphertext"):
+        if _valid(conn, row, settings):
+            conflict, contact_id = True, None
+    task, _, candidate = matches[0]
+    matched = (
+        not conflict and candidate["confidence"] >= 0.95
+        and not candidate["conflicts"] and not candidate["missing_info"]
+        and ownership._creator(conn, contact_id)
+    )
+    stats = {"ai_matched_handle": True, "reused_handle_task_ids": [str(t["id"]) for t, _, _ in matches]}
+    if len(matches) == 1:
+        stats["reused_handle_task_id"] = str(task["id"])
+    conn.execute(
+        """UPDATE creator_import_rows SET status='succeeded',reason_code=%s,contact_id=%s,
+        outcome=%s,confidence=%s,stats=%s,lease_until=NULL,updated_at=NOW() WHERE id=%s""",
+        (
+            "account_conflict" if conflict else "classified", contact_id,
+            "conflict" if conflict else "matched" if matched else "review",
+            candidate["confidence"] if len(matches) == 1 else None, Jsonb(stats), row["id"],
+        ),
+    )
+    if matched:
+        try:
+            with conn.transaction():
+                _admit(
+                    conn, row, row["uploaded_by"], row["handle"], contact_id,
+                    automatic=True, score=candidate["confidence"],
+                )
+        except (ValueError, PermissionError):
+            conn.execute(
+                "UPDATE creator_import_rows SET outcome='conflict',reason_code='account_conflict' WHERE id=%s",
+                (row["id"],),
+            )
+    return True
+
+
+def reconcile_handle_results(settings, cm_id, *, handles=None, limit=100):
+    """Free reconciliation of finished imports with existing AI results, never a paid retry."""
+    count = 0
+    with connection() as conn:
+        rows = conn.execute(
+            """SELECT r.id,r.batch_id FROM creator_import_rows r JOIN creator_import_batches b ON b.id=r.batch_id
+            WHERE r.cm_authorization_id=%s AND b.policy_version=%s AND b.status<>'preview'
+            AND r.review_status='pending' AND r.status IN ('succeeded','skipped','failed','invalid')"""
+            + (" AND r.handle=ANY(%s::text[])" if handles is not None else "")
+            + " ORDER BY r.created_at,r.id LIMIT %s",
+            (ownership._uuid(cm_id), POLICY_VERSION, *([handles] if handles is not None else []), limit),
+        ).fetchall()
+    for candidate in rows:
+        with connection() as conn, conn.transaction():
+            batch = conn.execute(
+                "SELECT * FROM creator_import_batches WHERE id=%s FOR UPDATE", (candidate["batch_id"],)
+            ).fetchone()
+            if not batch:
+                continue
+            row = conn.execute(
+                """SELECT r.*,b.uploaded_by FROM creator_import_rows r
+                JOIN creator_import_batches b ON b.id=r.batch_id WHERE r.id=%s
+                AND r.review_status='pending' AND r.status IN ('succeeded','skipped','failed','invalid')
+                FOR UPDATE OF r""", (candidate["id"],)
+            ).fetchone()
+            if row:
+                creator_handles._access(conn, row["uploaded_by"], row["cm_authorization_id"])
+                count += bool(_reuse_handle_results(conn, row, settings))
+                _settle(conn, row["batch_id"])
+    return count
+
+
 def prepare_next_import(settings):
     # One free-material worker serializes batches; paid calls still share the global parallel queue.
     with connection() as conn, conn.transaction():
@@ -469,6 +582,9 @@ def prepare_next_import(settings):
             contact_id = _existing(conn, row)
             if contact_id:
                 _admit(conn, row, row["uploaded_by"], row["handle"], contact_id, automatic=True, existing=True)
+                _settle(conn, row["batch_id"])
+                return True
+            if _reuse_handle_results(conn, row, settings):
                 _settle(conn, row["batch_id"])
                 return True
             material = creator_import_evidence.build_evidence(conn, settings, row["cm_authorization_id"], row["handle"])
@@ -514,19 +630,28 @@ def prepare_next_import(settings):
                     contact_id = creator_import_evidence.resolve_contact(material["refs"], result.get("user_ref"))
                     conn.execute(
                         """UPDATE creator_import_rows SET status='succeeded',reason_code='classified',
-                        result_ciphertext=%s,contact_id=%s,confidence=%s,outcome=%s WHERE id=%s""",
-                        (cached["result_ciphertext"], contact_id, result["confidence"], result["outcome"], row["id"]),
+                        result_ciphertext=%s,contact_id=%s,confidence=%s,outcome=%s,
+                        stats=stats||%s::jsonb WHERE id=%s""",
+                        (cached["result_ciphertext"], contact_id, result["confidence"], result["outcome"],
+                         Jsonb({"ai_matched_handle": bool(result["candidates"])}), row["id"]),
                     )
                     if result["outcome"] == "matched" and result["confidence"] >= 0.95 and result["creator_confirmed"]:
-                        _admit(
-                            conn,
-                            row,
-                            row["uploaded_by"],
-                            row["handle"],
-                            contact_id,
-                            automatic=True,
-                            score=result["confidence"],
-                        )
+                        try:
+                            with conn.transaction():
+                                _admit(
+                                    conn,
+                                    row,
+                                    row["uploaded_by"],
+                                    row["handle"],
+                                    contact_id,
+                                    automatic=True,
+                                    score=result["confidence"],
+                                )
+                        except (ValueError, PermissionError):
+                            conn.execute(
+                                """UPDATE creator_import_rows SET outcome='conflict',reason_code='account_conflict'
+                                WHERE id=%s""", (row["id"],),
+                            )
         except (ValueError, PermissionError) as exc:
             conn.execute("ROLLBACK TO SAVEPOINT import_prepare")
             reason = (
@@ -619,7 +744,7 @@ def _finish(job, status, reason, settings, response=None, result=None):
         conn.execute(
             """UPDATE creator_import_rows SET status=%s,reason_code=%s,result_ciphertext=%s,
             outcome=%s,contact_id=%s,confidence=%s,input_tokens=input_tokens+%s,output_tokens=output_tokens+%s,
-            response_id=%s,request_id=%s,lease_until=NULL,updated_at=NOW() WHERE id=%s""",
+            response_id=%s,request_id=%s,stats=stats||%s::jsonb,lease_until=NULL,updated_at=NOW() WHERE id=%s""",
             (
                 status,
                 reason,
@@ -633,6 +758,7 @@ def _finish(job, status, reason, settings, response=None, result=None):
                 usage.get("output_tokens") or 0,
                 (response or {}).get("response_id"),
                 (response or {}).get("telemetry", {}).get("openai_request_id"),
+                Jsonb({"ai_matched_handle": bool(result and result["candidates"])}),
                 row["id"],
             ),
         )
@@ -716,52 +842,85 @@ def run_claimed_import(job, settings):
         _finish(job, "failed", "provider_error", settings, response)
 
 
+def batch_summaries(conn, cm_id):
+    batches = conn.execute(
+        """SELECT * FROM creator_import_batches WHERE cm_authorization_id=%s
+        AND policy_version=%s ORDER BY created_at DESC,id DESC LIMIT 10""",
+        (cm_id, POLICY_VERSION),
+    ).fetchall()
+    decorated = []
+    for batch in batches:
+        counts = {
+            **batch["counts"],
+            "confirmed": 0,
+            "existing": 0,
+            "review": 0,
+            "queued": 0,
+            "running": 0,
+            "failed": 0,
+            "pending": 0,
+        }
+        for group in conn.execute(
+            """SELECT status,review_status,reason_code,count(*) n FROM creator_import_rows
+            WHERE batch_id=%s GROUP BY status,review_status,reason_code""",
+            (batch["id"],),
+        ).fetchall():
+            if group["review_status"] == "confirmed":
+                counts["confirmed"] += group["n"]
+                counts["existing"] += group["n"] if group["reason_code"] == "existing" else 0
+            elif group["status"] in ("succeeded", "skipped", "invalid", "failed"):
+                counts["review"] += group["n"]
+                counts["failed"] += group["n"] if group["status"] == "failed" else 0
+            else:
+                counts[group["status"] if group["status"] in counts else "pending"] += group["n"]
+        decorated.append(
+            {
+                "id": str(batch["id"]),
+                "filename": batch["filename"],
+                "status": batch["status"],
+                "status_label": BATCH_LABELS[batch["status"]],
+                "counts": counts,
+                "can_start": batch["status"] == "preview" and bool(counts["valid"]),
+                "can_pause": batch["status"] == "running",
+                "can_resume": batch["status"] == "paused",
+            }
+        )
+    return decorated
+
+
+def candidate_items(conn, cm_id, rows):
+    contact_ids = list({r["contact_id"] for r in rows if r["contact_id"]})
+    visible_ids = {
+        r["id"] for r in conn.execute(
+            "SELECT c.id FROM contacts c WHERE c.id=ANY(%s::uuid[]) AND EXISTS (" + _ACCESSIBLE + ")",
+            (contact_ids, cm_id),
+        ).fetchall()
+    } if contact_ids else set()
+    candidates = [
+        {
+            "id": str(r["id"]),
+            "handle": r["handle"],
+            "contact_id": str(r["contact_id"]) if r["contact_id"] in visible_ids else None,
+            "display_name": (r["display_name"] or "—") if r["contact_id"] in visible_ids else "—",
+            "creator_type": (r["creator_type"] or "pending") if r["contact_id"] in visible_ids else "pending",
+            "kind": "import",
+            "sources": source_labels(r),
+            "source": " + ".join(source_labels(r)),
+            "status_label": "暂缓" if r["review_status"] == "deferred" else STATUS_LABELS[r["status"]],
+            "reason": REASONS.get(r["reason_code"], "材料不足，请核对对应用户" if r["status"] == "skipped" else ""),
+            "can_confirm": True,
+            "can_defer": r["review_status"] != "deferred",
+        }
+        for r in rows
+    ]
+    return candidates
+
+
 def page_data(actor_id, cm_id, q="", page=1):
     q, page = str(q or "").strip()[:120], max(1, min(int(page), 10000))
     with connection() as conn:
         cm_id, _ = creator_handles._access(conn, actor_id, cm_id)
-        batches = conn.execute(
-            """SELECT * FROM creator_import_batches WHERE cm_authorization_id=%s
-            AND policy_version=%s ORDER BY created_at DESC,id DESC LIMIT 10""",
-            (cm_id, POLICY_VERSION),
-        ).fetchall()
-        decorated = []
-        for batch in batches:
-            counts = {
-                **batch["counts"],
-                "confirmed": 0,
-                "existing": 0,
-                "review": 0,
-                "queued": 0,
-                "running": 0,
-                "failed": 0,
-                "pending": 0,
-            }
-            for group in conn.execute(
-                """SELECT status,review_status,reason_code,count(*) n FROM creator_import_rows
-                WHERE batch_id=%s GROUP BY status,review_status,reason_code""",
-                (batch["id"],),
-            ).fetchall():
-                if group["review_status"] == "confirmed":
-                    counts["confirmed"] += group["n"]
-                    counts["existing"] += group["n"] if group["reason_code"] == "existing" else 0
-                elif group["status"] in ("succeeded", "skipped", "invalid", "failed"):
-                    counts["review"] += group["n"]
-                    counts["failed"] += group["n"] if group["status"] == "failed" else 0
-                else:
-                    counts[group["status"] if group["status"] in counts else "pending"] += group["n"]
-            decorated.append(
-                {
-                    "id": str(batch["id"]),
-                    "filename": batch["filename"],
-                    "status": batch["status"],
-                    "status_label": BATCH_LABELS[batch["status"]],
-                    "counts": counts,
-                    "can_start": batch["status"] == "preview" and bool(counts["valid"]),
-                    "can_pause": batch["status"] == "running",
-                    "can_resume": batch["status"] == "paused",
-                }
-            )
+        decorated = batch_summaries(conn, cm_id)
         base = """FROM creator_import_rows r JOIN creator_import_batches b ON b.id=r.batch_id
             WHERE r.cm_authorization_id=%s AND b.policy_version=%s
             AND b.status<>'preview' AND r.review_status<>'confirmed'"""
@@ -783,28 +942,7 @@ def page_data(actor_id, cm_id, q="", page=1):
             "ORDER BY r.created_at DESC,r.id",
             (*params, (page - 1) * 25),
         ).fetchall()
-        contact_ids = list({r["contact_id"] for r in rows if r["contact_id"]})
-        visible_ids = {
-            r["id"] for r in conn.execute(
-                "SELECT c.id FROM contacts c WHERE c.id=ANY(%s::uuid[]) AND EXISTS (" + _ACCESSIBLE + ")",
-                (contact_ids, cm_id),
-            ).fetchall()
-        } if contact_ids else set()
-        candidates = [
-            {
-                "id": str(r["id"]),
-                "handle": r["handle"],
-                "contact_id": str(r["contact_id"]) if r["contact_id"] in visible_ids else None,
-                "display_name": (r["display_name"] or "—") if r["contact_id"] in visible_ids else "—",
-                "creator_type": (r["creator_type"] or "pending") if r["contact_id"] in visible_ids else "pending",
-                "source": "Excel",
-                "status_label": "暂缓" if r["review_status"] == "deferred" else STATUS_LABELS[r["status"]],
-                "reason": REASONS.get(r["reason_code"], "材料不足，请核对对应用户" if r["status"] == "skipped" else ""),
-                "can_confirm": True,
-                "can_defer": r["review_status"] != "deferred",
-            }
-            for r in rows
-        ]
+        candidates = candidate_items(conn, cm_id, rows)
         return {
             "batches": decorated,
             "candidates": candidates,
