@@ -61,7 +61,7 @@ def source_labels(row):
 def _audit(conn, actor, action, data):
     conn.execute(
         "INSERT INTO audit_events(id,authorization_id,action,metadata) VALUES(%s,%s,%s,%s)",
-        (uuid4(), actor, "creator_import_" + action, Jsonb(data)),
+        (uuid4(), actor, "creator_import_" + action, Jsonb(json.loads(ownership._encode(data)))),
     )
 
 
@@ -524,6 +524,8 @@ def batch_summaries(conn, cm_id):
 def _review_reason(row, visible):
     if row["contact_id"] and not visible:
         return "对应用户当前不可访问，请重新选择可访问的 Lark 用户。"
+    if row["status"] in {"pending", "preparing", "queued", "running"}:
+        return "系统正在找群、找人；证据充分且无冲突时会自动入库。"
     return REASONS.get(row["reason_code"], REASONS["manual_review"])
 
 
@@ -711,19 +713,42 @@ def row_evidence(actor_id, row_id):
             pack, refs = material["pack"], {r["label"]: r for r in material["refs"]}
             decision = decisions.get(stage, {})
             phase = "找群" if stage == "group" else "找人"
+            if (decision.get("response") or {}).get("text"):
+                validator = (
+                    creator_import_evidence.group_validate
+                    if stage == "group"
+                    else (creator_import_evidence.person_validate)
+                )
+                try:
+                    decision = {**decision, **validator(decision["response"]["text"], pack)}
+                except (ValueError, TypeError, KeyError):
+                    result["warnings"].append(phase + "：AI 输出格式或引用未通过校验。")
+            result["warnings"].extend(phase + "：" + note for note in decision.get("blocking_reasons", []))
+            decision_label = {"matched": "对应关系通过", "review": "对应关系待定", "not_found": "未找到对应对象"}.get(
+                decision.get("outcome"), "等待判断"
+            )
 
             def prefix(label, phase=phase):
                 return phase + " " + label
 
             def explain(value, phase=phase):
-                return re.sub(r"\b([GUMX]\d+)\b", lambda match: phase + " " + match[0], value or "")
+                return re.sub(
+                    r"(?<![A-Za-z0-9_])([GUMX]\d+)(?![A-Za-z0-9_])", lambda match: phase + " " + match[0], value or ""
+                )
 
             if stage == "group":
                 result["group_decision"] = {
+                    "status_label": decision_label,
                     "confidence": decision.get("confidence"),
                     "reason": explain(decision.get("reason")),
                     "evidence_refs": [prefix(ref) for ref in decision.get("evidence_refs", [])],
                 }
+                if "history_search_messages" in material["stats"]:
+                    result["group_decision"]["search_summary"] = (
+                        f"历史线索补查：{material['stats']['history_search_messages']:,} 条可读群消息，"
+                        f"命中 {material['stats']['history_matching_groups']} 个群，"
+                        f"本次提供 {len(pack['groups'])} 个群。"
+                    )
             users = {u["ref"]: u for u in pack["users"]}
             names = {
                 ref: item.get("display_name") or ref
@@ -751,6 +776,8 @@ def row_evidence(actor_id, row_id):
                     item["reason"] = explain(decision.get("reason")) or (
                         "群名包含完整 handle，等待 AI 判断。"
                         if group["match_kind"] == "exact"
+                        else "历史发言提及此 handle，需要 AI 核对是否为对应群。"
+                        if group["match_kind"] == "history"
                         else "群名有相似拼写，需结合线索判断。"
                     )
                 if stage == "person":
@@ -793,12 +820,13 @@ def row_evidence(actor_id, row_id):
                                 "ref": prefix(message["ref"]),
                                 "sender_name": names.get(message["speaker"], message["speaker"]),
                                 "time_label": message.get("sent_at") or "",
-                                "text": message["text"],
+                                "text": ("【节选】" if message.get("excerpted") else "") + message["text"],
                                 "available": True,
                             }
                         )
             if stage == "person":
                 result["person"] = {
+                    "status_label": decision_label,
                     "display_name": names.get(decision.get("user_ref"), "—"),
                     "confidence": decision.get("confidence"),
                     "reason": explain(decision.get("reason")) or "等待 AI 定位用户。",
@@ -806,7 +834,8 @@ def row_evidence(actor_id, row_id):
                 }
                 result["conflicts"].extend(explain(conflict) for conflict in decision.get("conflicts", []))
             for key, warning in (
-                ("group_candidates_truncated", "相似群超过取材上限，尚未完整比较。"),
+                ("group_candidates_truncated", "群搜索或候选范围未完整覆盖，本次线索需人工核对。"),
+                ("history_search_truncated", "群历史检索达到本次上限，更早的消息尚未完整检查。"),
                 ("users_truncated", "可选用户超过取材上限。"),
                 ("history_truncated", "历史消息超过取材上限，仅检查最近的部分记录。"),
                 ("messages_omitted", "AI 仅接收关键发言；未发送完整聊天记录。"),
@@ -880,13 +909,16 @@ def resume_import(actor_id, batch_id):
         return {"id": str(batch["id"])}
 
 
-def recheck_batch(actor_id, batch_id):
+def recheck_batch(actor_id, batch_id, row_ids=None):
     with connection() as conn, conn.transaction():
         batch = _batch(conn, actor_id, batch_id)
         if batch["status"] not in ("completed", "paused"):
             raise ValueError("请先等待本批结束或暂停，再重新检查。")
+        selected_ids = [ownership._uuid(row_id) for row_id in row_ids] if row_ids is not None else None
         rows = conn.execute(
-            "SELECT * FROM creator_import_rows WHERE batch_id=%s AND review_status='pending' FOR UPDATE", (batch["id"],)
+            """SELECT * FROM creator_import_rows WHERE batch_id=%s AND review_status='pending'
+               AND (%s::uuid[] IS NULL OR id=ANY(%s::uuid[])) FOR UPDATE""",
+            (batch["id"], selected_ids, selected_ids),
         ).fetchall()
         for row in rows:
             _invalidate_chain(conn, row, ownership._uuid(actor_id))

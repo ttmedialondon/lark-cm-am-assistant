@@ -306,7 +306,7 @@
       if (token !== evidenceVersion || scope !== selectedCM()) return;
       el("evidence-title").textContent = `${evidence.handle || "账号"} · 证据链`;
       body.replaceChildren();
-      const confidence = value => Number.isFinite(value) ? `置信度 ${Math.round(value * 100)}%` : "";
+      const confidence = (value, label = "置信度") => Number.isFinite(value) ? `${label} ${Math.round(value * 100)}%` : "";
       const section = title => {
         const part = node("section", "", "border-top pt-3 mt-3");
         part.append(node("h4", title)); body.append(part); return part;
@@ -323,8 +323,9 @@
       const groups = section("1. 对应群与相关材料");
       if (evidence.group_decision) {
         const decision = evidence.group_decision;
-        groups.append(node("p", ["AI 找群判断", confidence(decision.confidence)].filter(Boolean).join(" · "), "fw-semibold"));
+        groups.append(node("p", ["AI 找群判断", decision.status_label, confidence(decision.confidence, "对此结论的置信度")].filter(Boolean).join(" · "), "fw-semibold"));
         groups.append(node("p", decision.reason || "等待 AI 判断对应群。"));
+        if (decision.search_summary) groups.append(node("p", decision.search_summary, "small text-secondary"));
         if (decision.evidence_refs?.length) groups.append(node("p", `依据：${decision.evidence_refs.join("、")}`, "small text-secondary"));
       }
       for (const group of evidence.groups || []) {
@@ -363,7 +364,8 @@
       }
       if (!evidence.groups?.length) groups.append(node("p", "暂无可展示的候选群，具体原因见下方结论。", "text-secondary"));
       const person = evidence.person || {}, personSection = section("2. 用户判断");
-      personSection.append(node("p", [`用户：${person.display_name || "—"}`, confidence(person.confidence)].filter(Boolean).join(" · "), "fw-semibold"));
+      personSection.append(node("p", ["AI 找人判断", person.status_label, confidence(person.confidence, "对此结论的置信度")].filter(Boolean).join(" · "), "fw-semibold"));
+      personSection.append(node("p", `用户：${person.display_name || "—"}`));
       personSection.append(node("p", person.reason || "尚未确定具体用户。"));
       if (person.evidence_refs?.length) personSection.append(node("p", `依据：${person.evidence_refs.join("、")}`, "small text-secondary"));
       const conclusion = section("3. 当前结论");

@@ -6,6 +6,7 @@ import json
 import re
 from collections import defaultdict
 from difflib import SequenceMatcher
+from uuid import uuid4
 
 from . import admin_reporting
 from . import contact_assessments as people
@@ -17,6 +18,7 @@ from .message_mentions import mention_targets
 POLICY_VERSION = "creator-import-group-person-v4"
 MAX_GROUPS, MAX_USERS, MAX_MESSAGES, MAX_CHARS = 8, 80, 48, 20_000
 LOCAL_SEARCH_MESSAGES = 20_000
+HISTORY_SEARCH_MESSAGES = 200_000
 _TOKEN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._]{0,63}")
 _OUTCOMES = {"matched", "review", "not_found"}
 
@@ -57,12 +59,51 @@ def _candidate_groups(chats, handle):
     return ranked[:MAX_GROUPS], len(ranked) > MAX_GROUPS
 
 
-def _population(conn, cm, chats, handle, stage):
+def _history_groups(conn, settings, cm, chats, handle):
+    """Only a recall fallback: mentions rank candidates but never establish group ownership."""
+    counts, samples = defaultdict(int), defaultdict(list)
+    scanned, truncated = 0, False
+    cipher = message_body_cipher(settings.token_encryption_key)
+    if chats:
+        with conn.cursor(name='import_history_' + uuid4().hex) as cursor:
+            cursor.itersize = 1000
+            cursor.execute(
+                'SELECT ' + ownership._COLUMNS + ' ' + ownership._READABLE
+                + " AND m.chat_id=ANY(%s::text[]) AND m.message_type IN ('text','post') "
+                'ORDER BY m.message_create_time DESC NULLS LAST,m.chat_id,m.message_id LIMIT %s',
+                (cm['id'], [chat['chat_id'] for chat in chats], HISTORY_SEARCH_MESSAGES + 1))
+            for row in cursor:
+                if scanned >= HISTORY_SEARCH_MESSAGES:
+                    truncated = True
+                    break
+                scanned += 1
+                raw = people._decrypt_body(cipher, row['body_ciphertext'])
+                if raw is None or not _mentions_handle(raw, handle):
+                    continue
+                if not _mentions_handle(handles._body(raw, row, {}, {}), handle):
+                    continue
+                counts[row['chat_id']] += 1
+                if len(samples[row['chat_id']]) < 4:
+                    samples[row['chat_id']].append(row)
+    ranked = sorted((chat for chat in chats if chat['chat_id'] in counts),
+                    key=lambda chat: (-counts[chat['chat_id']], chat['chat_id']))
+    selected = [{**chat, 'match_kind': 'history', 'similarity': None,
+                 'history_mentions': counts[chat['chat_id']]} for chat in ranked[:MAX_GROUPS]]
+    return selected, truncated or len(ranked) > MAX_GROUPS, {
+        'history_search_messages': scanned, 'history_matching_groups': len(ranked),
+        'history_search_truncated': truncated,
+    }, [row for chat in selected for row in samples[chat['chat_id']]]
+
+
+def _population(conn, cm, chats, handle, stage, selected_rows=None):
     chat_ids = [chat['chat_id'] for chat in chats]
     members, observed = handles._members(conn, cm_id=cm['id'], chat_ids=chat_ids,
                                         aliases={cm['open_id']: 'CM1'}) if chats else ([], [])
     if stage == 'group':
         members = []  # Choosing a group does not depend on its changing silent-member roster.
+        if selected_rows is not None:
+            speakers = {(r['chat_id'], r['sender_open_id']) for r in selected_rows}
+            observed = [r for r in observed if (r['chat_id'], r['open_id']) in speakers]
     presence = defaultdict(set)
     for source, rows in (('member', members), ('observed', observed)):
         for row in rows:
@@ -145,8 +186,8 @@ def _population(conn, cm, chats, handle, stage):
             'users': users, 'refs': refs}
 
 
-def _messages(conn, settings, cm, chats, population, handle, stage):
-    rows = conn.execute(
+def _messages(conn, settings, cm, chats, population, handle, stage, selected_rows=None):
+    rows = selected_rows if selected_rows is not None else conn.execute(
         'SELECT ' + ownership._COLUMNS + ' ' + ownership._READABLE
         + ' AND m.chat_id=ANY(%s::text[]) '
         'ORDER BY m.message_create_time DESC NULLS LAST,m.chat_id,m.message_id LIMIT %s',
@@ -163,8 +204,16 @@ def _messages(conn, settings, cm, chats, population, handle, stage):
         if raw is None or row['message_type'] not in {'text', 'post'}:
             continue
         text = handles._body(raw, row, aliases, population['names']).strip()
+        if selected_rows is not None and not _mentions_handle(text, handle):
+            # A person's first name can also be a component of a bare dotted handle.
+            text = handles._body(raw, row, aliases, {}).strip()
         if not text or people._ROUTINE.fullmatch(text) or '消息没有可展示的文本' in text:
             continue
+        excerpted = selected_rows is not None and len(text) > 1600
+        if excerpted:
+            match = re.search(re.escape(handle), text, re.I)
+            start = max(0, match.start() - 500) if match else 0
+            text = ('…' if start else '') + text[start:start + 1600] + '…'
         speaker = aliases.get(row['sender_open_id'], 'other')
         targets = {aliases[t['open_id']] for t in mention_targets(row.get('mentions_json'))
                    if not t['ambiguous'] and t['open_id'] in aliases}
@@ -179,7 +228,7 @@ def _messages(conn, settings, cm, chats, population, handle, stage):
         item = {'row': row, 'text': text, 'speaker': speaker, 'target_refs': sorted(targets),
                 'speaker_is_staff': row['sender_open_id'] in population['staff'],
                 'score': (int(mentions_handle), int(change), len(people._IMPORTANT.findall(text))),
-                'critical': mentions_handle or change}
+                'critical': mentions_handle or change, 'excerpted': excerpted}
         items.append(item)
         if mentions_handle or change or ownership.BUSINESS.search(text):
             by_group[row['chat_id']].append(item)
@@ -212,6 +261,7 @@ def _messages(conn, settings, cm, chats, population, handle, stage):
         messages.append({'ref': label, 'group_ref': group_labels[row['chat_id']], 'speaker': item['speaker'],
                          'text': item['text'], 'target_refs': item['target_refs'],
                          'speaker_is_staff': item['speaker_is_staff'],
+                         **({'excerpted': True} if item['excerpted'] else {}),
                          'sent_at': str(row['message_create_time']) if row['message_create_time'] else None})
         refs.append({'kind': 'message', 'label': label, 'chat_id': row['chat_id'],
                      'message_id': row['message_id'], 'sender_open_id': row['sender_open_id'],
@@ -231,17 +281,21 @@ def _build(conn, settings, cm_id, handle, stage, selected_chat_id=None):
     cm, inventory = _scope(conn, cm_id)
     if cm:
         cm = {**cm, 'id': str(cm_id)}
+    search_stats, selected_rows = {}, None
     if stage == 'group':
         chats, truncated = _candidate_groups(inventory, handle)
+        if cm and not chats:
+            chats, truncated, search_stats, selected_rows = _history_groups(conn, settings, cm, inventory, handle)
     else:
         chats = [{**c, 'match_kind': 'ai_selected', 'similarity': None}
                  for c in inventory if c['chat_id'] == selected_chat_id]
         truncated = False
-    population = _population(conn, cm, chats, handle, stage) if cm else {
+    population = _population(conn, cm, chats, handle, stage, selected_rows) if cm else {
         'users': [], 'refs': [], 'members': [], 'observed': [], 'identities': [], 'directory': [],
         'aliases': {}, 'names': {}, 'staff': set(), 'target_names': {}}
     messages, message_refs, stats, history = _messages(
-        conn, settings, cm, chats, population, handle, stage) if cm else ([], [], {}, [])
+        conn, settings, cm, chats, population, handle, stage, selected_rows) if cm else ([], [], {}, [])
+    stats.update(search_stats)
     groups, refs = [], list(population['refs'])
     all_members = [*population['members'], *population['observed']]
     unresolved = {u['ref'] for u in population['users'] if u['exclusion_reason'] == 'missing_contact'}
@@ -253,6 +307,7 @@ def _build(conn, settings, cm_id, handle, stage, selected_chat_id=None):
         name = handles._body(chat['name'] or '', {'message_type': 'text', 'mentions_json': []}, {}, {},
                              group_name=True)
         groups.append({'ref': label, 'name': name, 'match_kind': chat['match_kind'],
+                       **({'history_mentions': chat['history_mentions']} if chat['match_kind'] == 'history' else {}),
                        'member_refs': member_refs, 'unresolved_member_refs': sorted(set(member_refs) & unresolved),
                        'member_snapshot_status': chat['member_snapshot_status'], 'member_count': chat['member_count']})
         refs.append({'kind': 'group', 'label': label, 'chat_id': chat['chat_id'], 'display_name': chat['name'],
@@ -297,7 +352,8 @@ def _build(conn, settings, cm_id, handle, stage, selected_chat_id=None):
 
 
 def _stable_pack(pack):
-    return {**pack, 'meta': {k: v for k, v in pack['meta'].items() if k != 'accessible_groups'}, 'users': [
+    return {**pack, 'meta': {k: v for k, v in pack['meta'].items()
+                           if k not in {'accessible_groups', 'history_search_messages'}}, 'users': [
         {**u, 'known_category': 'possible_creator', 'category_source': None}
         if u.get('eligible') and u.get('known_category') in {'creator', 'unclassified'} else u
         for u in pack['users']]}
@@ -390,6 +446,11 @@ group may serve several handles and people. Exact name matches are candidates, n
 you must still decide. Prefer a clearly corresponding complete handle in the name. A similar spelling
 needs a clear alias/rename or conversational connection, not just a high similarity or a forwarded link.
 A merchant broadcasting many creator links does not make the group belong to every mentioned creator.
+match_kind=history means the name search had no candidate and an exact handle mention recalled this group.
+history_mentions is a retrieval count only, never ownership evidence. These groups can be unrelated merchant,
+campaign or broadcast groups. Judge the quoted context; do not promote the most-mentioned group automatically.
+An excerpted message is a bounded fragment, not its complete conversation. If omitted context prevents a
+reliable correspondence, return review. A truncated history search/candidate list cannot support auto-selection.
 Choose one group only when confident >=0.95 and explain the correspondence with G/M references.
 Do not force a choice between equally plausible groups. Return review for ambiguity or incomplete
 support, not_found when no group is supported (including an empty candidate list). For matched cite
@@ -426,13 +487,15 @@ could belong to more than one person, return review and user_ref=null. List unre
 or account conflicts in conflicts. For matched, choose exactly one target with confidence >=0.95 and cite
 G/U/M evidence; multi-person decisions need targeted M or existing_handle_owner U, not only group presence.
 No suitable user => not_found; uncertainty => review. Explanations use labels, not personal names or copied
-private text. Return JSON only.
+private text. Every evidence_refs entry must be one exact supplied label, never a range such as
+M29-M33 or several labels joined in one string. Cite only the strongest individual references. Return JSON only.
 """
 
 
 def _output_format(stage):
     ref = 'group_ref' if stage == 'group' else 'user_ref'
-    references = {'type': 'array', 'maxItems': 16, 'items': {'type': 'string'}}
+    references = {'type': 'array', 'maxItems': 16,
+                  'items': {'type': 'string', 'pattern': '^[GUMX][1-9][0-9]*$'}}
     properties = {'outcome': {'type': 'string', 'enum': sorted(_OUTCOMES)},
                   ref: {'type': ['string', 'null']}, 'confidence': {'type': 'number', 'minimum': 0, 'maximum': 1},
                   'reason': {'type': 'string', 'maxLength': 600}, 'evidence_refs': references}
@@ -492,6 +555,7 @@ def group_validate(raw, pack):
     cited = _refs(result['evidence_refs'], groups.keys() | messages.keys())
     selected = result['group_ref']
     reason = 'group_not_found' if result['outcome'] == 'not_found' else 'group_uncertain'
+    blockers = []
     if result['outcome'] == 'matched':
         if selected not in groups or not cited:
             raise ValueError('invalid import selected group')
@@ -500,11 +564,18 @@ def group_validate(raw, pack):
         direct_name = groups[selected]['match_kind'] == 'exact'
         supported = (selected in cited and (direct_name or any(ref in messages for ref in cited))
                      and not pack['meta'].get('group_candidates_truncated'))
+        if groups[selected]['match_kind'] == 'history':
+            supported = supported and any(ref in messages and _mentions_handle(
+                messages[ref]['text'], pack['imported_handle']) for ref in cited)
         if result['confidence'] >= 0.95 and supported:
             reason = 'group_matched'
         else:
+            if result['confidence'] < 0.95:
+                blockers.append('群对应关系评分低于 95% 入库门槛。')
+            if not supported:
+                blockers.append('选群引用或候选覆盖未通过校验，不能仅凭 AI 分数确认。')
             result.update(outcome='review', group_ref=None)
-    return {**result, 'reason_code': reason}
+    return {**result, 'reason_code': reason, 'blocking_reasons': blockers}
 
 
 def person_validate(raw, pack):
@@ -536,6 +607,7 @@ def person_validate(raw, pack):
         if candidate['assessment'] == 'target':
             targets.append(candidate['user_ref'])
     reason = 'person_not_found' if result['outcome'] == 'not_found' else 'person_uncertain'
+    blockers = []
     if result['outcome'] == 'matched':
         selected = result['user_ref']
         if selected not in eligible or not result['evidence_refs']:
@@ -552,5 +624,13 @@ def person_validate(raw, pack):
         if result['confidence'] >= 0.95 and targets == [selected] and not result['conflicts'] and (direct or singleton):
             reason = 'person_matched'
         else:
+            if result['confidence'] < 0.95:
+                blockers.append('用户对应关系评分低于 95% 入库门槛。')
+            if targets != [selected]:
+                blockers.append('AI 候选人判断没有一致指向唯一用户。')
+            if result['conflicts']:
+                blockers.append('AI 仍记录了未解决的账号或人员冲突。')
+            if not (direct or singleton):
+                blockers.append('引用未具体定位所选用户，也未形成完整且唯一的群成员依据。')
             result.update(outcome='review', user_ref=None)
-    return {**result, 'reason_code': reason, 'person_candidate_count': len(eligible)}
+    return {**result, 'reason_code': reason, 'person_candidate_count': len(eligible), 'blocking_reasons': blockers}

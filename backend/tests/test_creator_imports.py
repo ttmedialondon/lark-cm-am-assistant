@@ -229,8 +229,14 @@ def test_manual_import_scope_identity_account_and_type_conflicts_are_atomic(pg, 
                 )
             assert not pg.execute("SELECT 1 FROM contact_social_accounts WHERE import_row_id=%s",
                                   (row["id"],)).fetchone()
+    pg.execute("UPDATE creator_import_rows SET contact_id=%s,pack_ciphertext=%s WHERE id=%s",
+               (creator, creator_ownership._cipher(pilot.settings).encrypt("{}"), row["id"]))
     imports.confirm_row(cm, row["id"], "corrected_handle", creator)
     assert row_for(pg, batch, "corrected_handle")["review_status"] == "confirmed"
+    prior = pg.execute("SELECT metadata->'previous' previous FROM audit_events "
+                       "WHERE action='creator_import_evidence_invalidated' AND metadata->>'row_id'=%s",
+                       (str(row["id"]),)).fetchone()["previous"]
+    assert prior["contact_id"] == str(creator) and prior["handle"] == "creator_one"
     with pytest.raises(ValueError):
         imports.confirm_row(cm, row["id"], "other_handle", creator)
     with pg.transaction(force_rollback=True):
@@ -408,6 +414,27 @@ def test_silent_unique_person_still_needs_both_ai_thresholds_and_recheck_keeps_u
         assert previous["pack_ciphertext"] == prior["pack_ciphertext"]
         assert previous["result_ciphertext"] == prior["result_ciphertext"]
         assert previous["refs"] == prior["refs"]
+    mixed = imports.preview_import(cm, cm, "selective.xlsx", workbook("retry", "no_group", "deferred", "confirmed"))
+    imports.start_import(cm, mixed["id"])
+    imports.confirm_row(cm, row_for(pg, mixed, "confirmed")["id"], "confirmed", pilot.ids["creator"])
+    imports.defer_row(cm, row_for(pg, mixed, "deferred")["id"])
+    drain(pilot)
+    retry = row_for(pg, mixed, "retry")
+    preserved = pg.execute("SELECT * FROM creator_import_rows WHERE batch_id=%s AND id<>%s ORDER BY id",
+                           (mixed["id"], retry["id"])).fetchall()
+    before = _snapshot(pg, ("creator_import_batches", "creator_import_rows"))
+    assert imports.recheck_batch(cm, mixed["id"], row_ids=[])["queued"] == 0
+    assert _snapshot(pg, before) == before
+    selected = [retry["id"], *(r["id"] for r in preserved if r["review_status"] != "pending")]
+    assert imports.recheck_batch(cm, mixed["id"], row_ids=selected)["queued"] == 1
+    queued = row_for(pg, mixed, "retry")
+    assert queued["status"] == "pending" and queued["api_requests"] == retry["api_requests"]
+    assert queued["stats"]["analysis_generation"] == retry["stats"].get("analysis_generation", 0) + 1
+    call_count = len(calls)
+    drain(pilot)
+    assert len(calls) == call_count + 1 and row_for(pg, mixed, "retry")["api_requests"] == retry["api_requests"] + 1
+    assert pg.execute("SELECT * FROM creator_import_rows WHERE batch_id=%s AND id<>%s ORDER BY id",
+                      (mixed["id"], retry["id"])).fetchall() == preserved
 
 
 def test_two_person_stages_for_one_creator_do_not_drop_paid_results_after_classification(pg, pilot, monkeypatch):
@@ -785,8 +812,9 @@ def test_group_person_refs_do_not_cross_people_groups_or_current_access(pg, pilo
     wrong_person = deepcopy(response)
     wrong_person["evidence_refs"] = [unrelated]
     assert evidence.person_validate(json.dumps(wrong_person), pack)["outcome"] == "review"
-    with pytest.raises(ValueError):
-        evidence.person_validate(json.dumps({**response, "evidence_refs": ["M999"]}), pack)
+    for invalid_ref in ("M999", "M29-M33"):
+        with pytest.raises(ValueError):
+            evidence.person_validate(json.dumps({**response, "evidence_refs": [invalid_ref]}), pack)
     with pg.transaction(force_rollback=True):
         sole = evidence.build_person_evidence(pg, pilot.settings, cm, "target_account", "second_group")
         user = next(u["ref"] for u in sole["pack"]["users"] if u["eligible"])
@@ -818,6 +846,38 @@ def test_group_person_refs_do_not_cross_people_groups_or_current_access(pg, pilo
                    (message_body_cipher(pilot.settings.token_encryption_key).encrypt("Changed account evidence"),
                     referenced))
         assert not evidence.validate_references(pg, pilot.settings, cm, material)
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE chats SET name='Campaign lounge' WHERE chat_id IN ('first_group','second_group')")
+        recalled = evidence.build_group_evidence(pg, pilot.settings, cm, "target_account")
+        assert recalled["eligible"] and len(recalled["pack"]["groups"]) == 2
+        assert all(g["match_kind"] == "history" for g in recalled["pack"]["groups"])
+        assert any("target_account" in m["text"] for m in recalled["pack"]["messages"])
+        assert not evidence.build_group_evidence(pg, pilot.settings, pilot.ids["owner"], "target_account")[
+            "pack"]["groups"]
+        chosen = recalled["pack"]["groups"][0]["ref"]
+        clue = next(m["ref"] for m in recalled["pack"]["messages"]
+                    if m["group_ref"] == chosen and "target_account" in m["text"])
+        decision = {"outcome": "matched", "group_ref": chosen, "confidence": .99,
+                    "reason": "改名后的群仍有可访问的账号发言。", "evidence_refs": [chosen, clue]}
+        assert evidence.group_validate(json.dumps(decision), recalled["pack"])["outcome"] == "matched"
+        assert evidence.group_validate(json.dumps({**decision, "evidence_refs": [chosen]}),
+                                       recalled["pack"])["outcome"] == "review"
+        pg.execute("UPDATE chat_messages SET message_create_time=NOW()+INTERVAL '1 day' "
+                   "WHERE chat_id='first_group' AND sender_open_id='ou_creator'")
+        with monkeypatch.context() as scoped_patch:
+            scoped_patch.setattr(evidence, "HISTORY_SEARCH_MESSAGES", 1)
+            truncated = evidence.build_group_evidence(pg, pilot.settings, cm, "target_account")
+            assert truncated["stats"]["history_search_truncated"]
+            chosen = truncated["pack"]["groups"][0]["ref"]
+            clue = next(m["ref"] for m in truncated["pack"]["messages"] if "target_account" in m["text"])
+            limited = {**decision, "group_ref": chosen, "evidence_refs": [chosen, clue]}
+            assert evidence.group_validate(json.dumps(limited), truncated["pack"])["outcome"] == "review"
+        pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (cm,))
+        assert not evidence.build_group_evidence(pg, pilot.settings, cm, "target_account")["pack"]["groups"]
+        pg.execute("UPDATE authorization_chats SET is_visible=TRUE WHERE authorization_id=%s", (cm,))
+        pg.execute("UPDATE authorizations SET body_consent_at=NULL WHERE id=%s", (cm,))
+        revoked = evidence.build_group_evidence(pg, pilot.settings, cm, "target_account")
+        assert not revoked["eligible"] and not revoked["pack"]["groups"]
     with pg.transaction(force_rollback=True):
         pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (cm,))
         assert not evidence.validate_evidence(pg, pilot.settings, cm, "target_account", material["pack"],
