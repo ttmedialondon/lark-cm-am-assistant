@@ -13,6 +13,7 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
+from app import creator_import_evidence, creator_imports, creator_ownership
 from app import offhours_summary as ai
 from app.ai_feature_config import save_feature_config
 from app.crypto import message_body_cipher
@@ -117,7 +118,7 @@ def pg(monkeypatch):
         conn.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(psycopg.sql.Identifier(schema)))
         conn.execute(psycopg.sql.SQL("SET LOCAL search_path TO {}").format(psycopg.sql.Identifier(schema)))
         for path in sorted((Path(__file__).parents[1] / "migrations").glob("*.sql")):
-            if int(path.name[:3]) <= 32 or int(path.name[:3]) in (34, 37, 47, 48, 49, 50):
+            if int(path.name[:3]) <= 51:
                 conn.execute(path.read_text())
         monkeypatch.setattr(ai, "connection", lambda: nullcontext(conn))
         monkeypatch.setattr(ai.ai_dispatch, "connection", lambda: nullcontext(conn))
@@ -394,6 +395,148 @@ def test_group_reply_to_older_creator_is_context_but_cannot_prove_silence(pg, se
     refs = [m["ref"] for m in evidence["pack"]["messages"]]
     result = ai._validate(json.dumps({"events": [sample_event(evidence_refs=refs)]}), evidence)
     assert result[0]["priority"] == "P2"
+
+
+def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg, seeded, monkeypatch):
+    s = seeded
+    pg.execute(
+        """INSERT INTO lark_identities(open_id,contact_id,display_name,tenant_classification)
+           VALUES('ou_person_alias',%s,'Alice second identity','known_external')""", (s.ids["person"],),
+    )
+    groups = {
+        "group_named": ("❤️ alice X TT Media", "ou_person", True, True),
+        "group_renamed": ("September collaborations", "ou_person_alias", True, True),
+        "group_ai": ("Her weekly releases", None, True, True),
+        "group_unrelated": ("Another creator X TT Media", "ou_other", True, True),
+        "group_hidden": ("alice samples", "ou_person", False, True),
+        "group_quiet": ("alice archive", "ou_person", True, False),
+    }
+    for chat, (name, member, visible, in_window) in groups.items():
+        pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES(%s,%s,'group')", (chat, name))
+        pg.execute(
+            """INSERT INTO authorization_chats(authorization_id,chat_id,is_visible,
+                   backfill_complete,backfill_window_start_at,last_incremental_at,sync_status)
+                   VALUES(%s,%s,%s,TRUE,%s,%s,'succeeded')""",
+            (s.ids["cm"], chat, visible, s.start - timedelta(days=9), s.end),
+        )
+        if member:
+            pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES(%s,%s)", (chat, member))
+        pg.execute(
+            """INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,
+                   body_ciphertext,message_create_time) VALUES(%s,%s,'ou_cm','text',%s,%s)""",
+            (chat, chat + "_message", s.cipher.encrypt(json.dumps({"text": f"Sample update in {chat}"})),
+             s.start + timedelta(hours=1) if in_window else s.start - timedelta(hours=1)),
+        )
+        pg.execute(
+            """INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+                   VALUES(%s,%s,%s)""", (s.ids["cm"], chat, chat + "_message"),
+        )
+    pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('group_named','ou_cm')")
+    pg.execute(
+        """UPDATE authorization_chats SET member_snapshot_status='succeeded',member_count=2,
+               member_count_status='succeeded' WHERE chat_id='group_named'""",
+    )
+
+    # This admitted AI chain connects a second group without requiring a cached
+    # creator member or creator-authored message in that particular group.
+    hashes = creator_import_evidence.ownership
+    cm = pg.execute("SELECT * FROM authorizations WHERE id=%s", (s.ids["cm"],)).fetchone()
+    scope = {"scope_fingerprint": hashes._hash([str(s.ids["cm"]), cm["open_id"], cm["body_consent_at"]])}
+    group_refs = [
+        {"kind": "group", "label": f"G{i + 1}", "chat_id": chat, "name_hash": hashes._hash(groups[chat][0])}
+        for i, chat in enumerate(("group_named", "group_ai"))
+    ]
+    identities = pg.execute(
+        """SELECT open_id,contact_id,display_name,name,en_name,identity_type,tenant_classification
+           FROM lark_identities WHERE open_id='ou_person' ORDER BY open_id""",
+    ).fetchall()
+    person_ref = {"kind": "person", "label": "U1", "contact_id": str(s.ids["person"]),
+                  "open_ids": ["ou_person"], "identity_hash": hashes._hash(identities)}
+    chain = {"group": {"refs": group_refs, "stats": scope},
+             "person": {"refs": [*group_refs, person_ref], "stats": scope}}
+    decisions = {
+        "group": {"outcome": "matched", "confidence": .99, "group_refs": ["G1", "G2"]},
+        "person": {"outcome": "matched", "confidence": .99, "user_ref": "U1", "conflicts": []},
+    }
+    batch_id, row_id = uuid4(), uuid4()
+    pg.execute(
+        """INSERT INTO creator_import_batches(id,cm_authorization_id,uploaded_by,filename,
+               file_fingerprint,policy_version,status,creator_type)
+               VALUES(%s,%s,%s,'scope.xlsx','scope',%s,'completed','cap')""",
+        (batch_id, s.ids["cm"], s.ids["owner"], creator_imports.POLICY_VERSION),
+    )
+    cipher = creator_ownership._cipher(s.settings)
+    pg.execute(
+        """INSERT INTO creator_import_rows(id,batch_id,cm_authorization_id,row_number,original_handle,
+               handle,contact_id,status,review_status,outcome,pack_ciphertext,result_ciphertext)
+               VALUES(%s,%s,%s,1,'alice','alice',%s,'succeeded','confirmed','matched',%s,%s)""",
+        (row_id, batch_id, s.ids["cm"], s.ids["person"],
+         cipher.encrypt(json.dumps(chain)), cipher.encrypt(json.dumps(decisions))),
+    )
+    pg.execute("UPDATE contact_social_accounts SET import_row_id=%s WHERE social_account_id=%s", (row_id, s.account))
+
+    def model(_cfg, _key, input_pack, _cm, **_kwargs):
+        s.calls.append(input_pack)
+        assert len(input_pack["users"]) == 1
+        assert input_pack["users"]["U1"]["handles"] == ["@alice"]
+        if input_pack["chat_name"] == groups["group_ai"][0]:
+            assert input_pack["unique_group_user"] is None
+            return {"text": json.dumps({"events": []}), "usage": {"input_tokens": 1}}
+        if not input_pack["is_private"]:
+            assert input_pack["unique_group_user"] == "U1"
+        message = next(m for m in input_pack["messages"] if m["in_window"])
+        return {"text": json.dumps({"events": [sample_event(evidence_refs=[message["ref"]])]}),
+                "usage": {"input_tokens": 1}}
+
+    monkeypatch.setattr(ai.contact_assessments, "call_openai", model)
+    assert s.save()["queued"] == 4
+    tasks = pg.execute("SELECT chat_id FROM offhours_summary_tasks WHERE is_current").fetchall()
+    assert {r["chat_id"] for r in tasks} == {"chat", "group_named", "group_renamed", "group_ai"}
+    while job := ai.claim_next_summary():
+        if job["chat_id"] == "group_renamed":
+            before = len(s.calls)
+            pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='group_renamed'")
+            ai.run_claimed_summary(job, s.settings)
+            assert len(s.calls) == before
+        else:
+            evidence = ai._load_chat(pg, job, job["chat_id"], job["cutoff"], settings=s.settings)
+            assert len(evidence["users"]) == 1
+            assert set(evidence["users"]["U1"]["open_ids"]) == {"ou_person", "ou_person_alias"}
+            ai.run_claimed_summary(job, s.settings)
+    assert len(s.calls) == 3
+    assert any(p["is_private"] for p in s.calls)
+    assert {p["chat_name"] for p in s.calls if not p["is_private"]} == {
+        groups["group_named"][0], groups["group_ai"][0],
+    }
+    view = ai.get_summary_view(pg, s.ids["owner"])
+    assert len(view["events"]) == 2 and view["run"]["counts"]["completed"] == 3
+    assert not any("group_hidden" in json.dumps(p) or "group_unrelated" in json.dumps(p) for p in s.calls)
+
+    # A second, unassigned creator still prevents a uniqueness inference. The
+    # conversation remains relevant, but CM-only text needs an explicit target.
+    pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('group_named','ou_other')")
+    pg.execute("UPDATE authorization_chats SET member_count=3 WHERE chat_id='group_named'")
+    run = pg.execute(
+        "SELECT r.* FROM offhours_summary_runs r JOIN offhours_summary_settings s ON s.run_id=r.id"
+    ).fetchone()
+    related = ai._related_chats(pg, ai._roster(pg), settings=s.settings)
+    assert "group_named" in {r["chat_id"] for r in related}
+    evidence = ai._load_chat(pg, run, "group_named", s.end, settings=s.settings)
+    assert evidence["pack"]["unique_group_user"] is None
+    event = sample_event(evidence_refs=[next(m["ref"] for m in evidence["pack"]["messages"] if m["in_window"])])
+    with pytest.raises(ai.InvalidModelOutput):
+        ai._validate(json.dumps({"events": [event]}), evidence)
+    pg.execute(
+        """UPDATE chat_messages SET body_ciphertext=%s,mentions_json=%s::jsonb
+               WHERE message_id='group_named_message'""",
+        (s.cipher.encrypt(json.dumps({"text": "@_user_1, your sample has shipped"})),
+         json.dumps([{"key": "@_user_1", "id": "ou_person", "id_type": "open_id", "name": "Alice"}])),
+    )
+    targeted = ai._load_chat(pg, run, "group_named", s.end, settings=s.settings)
+    assert ai._validate(json.dumps({"events": [event]}), targeted)[0]["priority"] == "P2"
+    pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='group_ai'")
+    view = ai.get_summary_view(pg, s.ids["owner"])
+    assert not any(ref["chat_id"] == "group_ai" for event in view["events"] for ref in event["evidence"])
 
 
 def test_current_acl_hides_already_generated_results(pg, seeded):

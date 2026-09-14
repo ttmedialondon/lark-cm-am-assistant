@@ -1,11 +1,11 @@
 {% extends "base.html" %}
-{% block title %}下班消息总结 · TT Media{% endblock %}
+{% block title %}达人消息总结 · TT Media{% endblock %}
 {% block extra_head %}<link rel="stylesheet" href="/static/offhours-summary.css?v=20260910-1">{% endblock %}
 {% block body %}
 <div class="page oh-page">
   <header class="navbar"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media 消息提醒</a><div class="oh-nav"><span>{{ authorization.display_name or '当前用户' }}</span><a href="/dashboard">返回前台</a></div></div></header>
   <main class="container-xl oh-main" id="offhours-summary">
-    <header class="oh-heading"><div><span class="oh-eyebrow">下班后发生了什么</span><h1>下班消息总结</h1><p>按事情整理消息，先看紧急的，再看需要跟进的。</p></div><div class="oh-actions">{% if summary_data.can_manage %}<a class="btn btn-outline-secondary" href="/admin/ai#offhours-summary">分析设置</a>{% endif %}<button class="btn btn-outline-primary" id="oh-refresh" type="button">刷新结果</button></div></header>
+    <header class="oh-heading"><div><span class="oh-eyebrow">所选时段发生了什么</span><h1>达人消息总结</h1><p>按事情整理消息，先看紧急的，再看需要跟进的。</p></div><div class="oh-actions">{% if summary_data.can_manage %}<a class="btn btn-outline-secondary" href="/admin/ai#offhours-summary">分析设置</a>{% endif %}<button class="btn btn-outline-primary" id="oh-refresh" type="button">刷新结果</button></div></header>
     <section class="oh-context" aria-label="总结范围"><div><span>当前范围</span><strong id="oh-scope">Remi · 已确认达人</strong></div><div><span>消息时段 · 英国时间</span><strong id="oh-window">—</strong></div><div><span>分析方式</span><strong>AI 归纳 · 人工处理</strong></div></section>
     <div id="oh-feedback" class="oh-banner oh-warning" role="alert" hidden></div>
     <section id="oh-status" class="oh-banner" aria-live="polite"><div><strong id="oh-status-title">正在读取总结</strong><p id="oh-status-description">请稍候。</p></div><span id="oh-updated" class="oh-small"></span></section>
@@ -27,5 +27,5 @@
   </main>
 </div>
 <script id="offhours-summary-data" type="application/json">{{ summary_data|tojson }}</script>
-<script src="/static/offhours-summary.js?v=20260910-1" defer></script>
+<script src="/static/offhours-summary.js?v=20260914-2" defer></script>
 {% endblock %}
