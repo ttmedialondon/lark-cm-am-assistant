@@ -1,19 +1,23 @@
-"""Single-CM CAP rosters bind the unique identified creator across all matching groups."""
+"""CAP Excel candidates and scoped manual confirmation, with no matching or paid work."""
 
 import json
-from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from io import BytesIO
 from pathlib import Path
+from threading import Barrier
 from uuid import uuid4
 from xml.sax.saxutils import escape
 from zipfile import ZipFile
 
+import psycopg
 import pytest
+from psycopg.rows import dict_row
+from test_creator_ownership import _snapshot
 from test_creator_ownership import pilot as parent_pilot
 
 from app import admin_reporting, contact_assessments, creator_handles, creator_ownership
 from app import creator_imports as imports
-from app.crypto import message_body_cipher
 
 pilot = parent_pilot
 
@@ -45,76 +49,12 @@ def group(pg, pilot, chat, handle, *members):
                    (chat, "ou_" + name))
 
 
-def prepare(pg, pilot, monkeypatch, *, unknown=True, matching_group=True, peers=False):
+def prepare(pg, pilot, monkeypatch):
     monkeypatch.setattr(imports, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(creator_handles, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(creator_handles, "get_settings", lambda: pilot.settings)
-    if matching_group:
-        group(pg, pilot, "chat_creator", "creator_one", "creator")
-    if unknown:
-        pg.execute("DELETE FROM contact_roles WHERE contact_id=%s", (pilot.ids["creator"],))
-    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='creator_7_question'", (
-        message_body_cipher(pilot.settings.token_encryption_key).encrypt(json.dumps({
-            "text": "I create my own videos and go live with the campaign products."
-        })),
-    ))
-    if peers:
-        peer = pilot.person("peer")
-        pg.execute("DELETE FROM contact_roles WHERE contact_id=%s", (peer,))
-        pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('chat_creator','ou_peer')")
-        pg.execute("INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,"
-                   "body_ciphertext,message_create_time) VALUES('chat_creator','peer_role','ou_peer','user','text',"
-                   "%s,NOW())", (message_body_cipher(pilot.settings.token_encryption_key).encrypt(json.dumps({
-                       "text": "I represent the seller brand and handle product inventory for our store."
-                   })),))
-        pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
-                   "VALUES(%s,'chat_creator','peer_role')", (pilot.ids["cm"],))
-    calls, callbacks = [], []
-
-    def response(_config, _key, pack, _row_id, **kwargs):
-        assert kwargs["output_format"]["strict"]
-        assert kwargs["output_format"]["name"] == "creator_import_groups_people_v3"
-        assert "ou_creator" not in json.dumps(pack)
-        calls.append(pack)
-        result = {"groups": [{
-            "group_ref": group["ref"], "match": "matched", "confidence": .99,
-            "basis": "explicit_handle", "evidence_refs": [group["ref"], *[
-                m["ref"] for m in pack["messages"] if m["group_ref"] == group["ref"]
-                and pack["imported_handle"] in m["text"]
-            ]],
-        } for group in pack["groups"]], "people": []}
-        for user in pack["users"]:
-            own = [m["ref"] for m in pack["messages"] if m["speaker"] == user["ref"]]
-            known = user["known_category"] == "creator"
-            merchant = any(m["ref"] in own and "represent the seller brand" in m["text"] for m in pack["messages"])
-            result["people"].append({
-                "user_ref": user["ref"],
-                "role": "merchant_contact" if merchant else "creator" if own or known else "insufficient",
-                "confidence": .99 if own or known else 0, "basis": "self_declaration" if own else "weak_context",
-                "evidence_refs": own,
-            })
-        for callback in callbacks:
-            callback()
-        return {"text": json.dumps(result), "response_id": "synthetic-response",
-                "usage": {"input_tokens": 12, "output_tokens": 8},
-                "telemetry": {"openai_request_id": "synthetic-request"}}
-
-    monkeypatch.setattr(contact_assessments, "call_openai", response)
-    return calls, callbacks
-
-
-def drain(pilot):
-    for _ in range(20):
-        if not imports.prepare_next_import(pilot.settings):
-            break
-    else:
-        pytest.fail("import preparation did not settle")
-    for _ in range(20):
-        job = imports.claim_next_import()
-        if not job:
-            return
-        imports.run_claimed_import(job, pilot.settings)
-    pytest.fail("import queue did not settle")
+    monkeypatch.setattr(contact_assessments, "call_openai",
+                        lambda *_a, **_kw: pytest.fail("Excel import and manual confirmation must not call AI"))
 
 
 def row_for(pg, batch, handle):
@@ -123,253 +63,193 @@ def row_for(pg, batch, handle):
     ).fetchone()
 
 
-def test_excel_ai_identity_manual_and_repeated_import_preserve_people_and_creator_type(pg, pilot, monkeypatch):
-    calls, _ = prepare(pg, pilot, monkeypatch, peers=True)
-    data = workbook("handle", "@Creator_One", "creator_one", "not_found", "legacy_account", "bad handle")
-    batch = imports.preview_import(pilot.ids["owner"], pilot.ids["cm"], "roster.xlsx", data)
+def test_cap_excel_preview_start_manual_confirmation_and_replays_preserve_people(pg, pilot, monkeypatch):
+    prepare(pg, pilot, monkeypatch)
+    cm, owner, creator = pilot.ids["cm"], pilot.ids["owner"], pilot.ids["creator"]
+    group(pg, pilot, "chat_creator", "beauty.one_12", "creator")
+    before_people = pg.execute("SELECT id,display_name FROM contacts ORDER BY id").fetchall()
+    data = workbook("handle", " @Beauty.One_12 ", "beauty.one_12", "second_02", "missing", "bad handle")
+    batch = imports.preview_import(owner, cm, "roster.xlsx", data)
     assert batch["counts"] == {"valid": 3, "duplicates": 1, "invalid": 1}
     saved = pg.execute("SELECT * FROM creator_import_batches WHERE id=%s", (batch["id"],)).fetchone()
-    assert saved["uploaded_by"] == pilot.ids["owner"] and saved["cm_authorization_id"] == pilot.ids["cm"]
-    assert saved["creator_type"] == "cap"
-    assert imports.preview_import(pilot.ids["owner"], pilot.ids["cm"], "roster.xlsx", data)["id"] == batch["id"]
-    assert not imports.prepare_next_import(pilot.settings) and not calls
-    before_people = pg.execute("SELECT count(*) n FROM contacts").fetchone()["n"]
-    imports.start_import(pilot.ids["owner"], batch["id"])
-    imports.start_import(pilot.ids["cm"], batch["id"])
-    drain(pilot)
-    matched, missing = row_for(pg, batch, "creator_one"), row_for(pg, batch, "not_found")
-    assert matched["review_status"] == "confirmed" and matched["contact_id"] == pilot.ids["creator"]
-    assert matched["api_requests"] == 1 and len(calls) == 1
-    assert missing["contact_id"] is None and missing["api_requests"] == 0
-    assert imports.source_labels(matched) == ["Excel", "AI"] and imports.source_labels(missing) == ["Excel"]
-    assert pg.execute("SELECT count(*) n FROM contacts").fetchone()["n"] == before_people
-    role = pg.execute("SELECT * FROM contact_roles WHERE contact_id=%s", (pilot.ids["creator"],)).fetchone()
-    assert role["role"] == "creator" and role["status"] == "confirmed"
-    assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (pilot.ids["creator"],)).fetchone()[
-        "creator_type"] == "cap"
-    assert row_for(pg, batch, "legacy_account")["reason_code"] == "account_conflict"
-    assert not pg.execute("SELECT 1 FROM creator_ownership_tasks").fetchone()
-    candidate = next(r for r in imports.page_data(pilot.ids["cm"], pilot.ids["cm"])["candidates"]
-                     if r["id"] == str(missing["id"]))
-    assert candidate["display_name"] == "—" and candidate["creator_type"] == "cap"
-    imports.confirm_row(pilot.ids["cm"], missing["id"], "creator_second", pilot.ids["creator"])
-    imports.confirm_row(pilot.ids["cm"], missing["id"], "creator_second", pilot.ids["creator"])
+    assert saved["uploaded_by"] == owner and saved["cm_authorization_id"] == cm and saved["creator_type"] == "cap"
+    assert not pg.execute("SELECT 1 FROM creator_import_rows").fetchone()
+    assert imports.preview_import(owner, cm, "roster.xlsx", data)["id"] == batch["id"]
+    for invalid_type in ("non_cap", "pending"):
+        with pytest.raises(ValueError):
+            imports.preview_import(owner, cm, "wrong.xlsx", data, creator_type=invalid_type)
+    imports.start_import(owner, batch["id"])
+    imports.start_import(cm, batch["id"])
+    rows = pg.execute("SELECT * FROM creator_import_rows ORDER BY handle").fetchall()
+    assert len(rows) == 3 and all(r["contact_id"] is None and r["review_status"] == "pending" for r in rows)
+    assert all(r["api_requests"] == 0 and not r["pack_ciphertext"] and r["refs"] == [] for r in rows)
+    assert all(r["status"] == "skipped" and r["reason_code"] == "manual_review" for r in rows)
+    assert pg.execute("SELECT status FROM creator_import_batches WHERE id=%s", (batch["id"],)).fetchone()[
+        "status"] == "completed"
+    candidates = imports.page_data(cm, cm)["candidates"]
+    assert len(candidates) == 3
+    assert all(r["display_name"] == "—" and r["creator_type"] == "cap" and r["sources"] == ["Excel"]
+               for r in candidates)
+    first, second, missing = (row_for(pg, batch, h) for h in ("beauty.one_12", "second_02", "missing"))
+    imports.confirm_row(cm, first["id"], "beauty.one_12", creator)
+    imports.confirm_row(cm, first["id"], "@Beauty.One_12", creator)
+    imports.confirm_row(cm, second["id"], "corrected_02", creator)
+    imports.defer_row(cm, missing["id"])
     assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 1
-    formal = creator_handles.page_data(pilot.ids["cm"], tab="mine")["items"]
-    assert len(formal) == 1 and set(formal[0]["handles"]) == {"creator_one", "creator_second"}
-    again = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "again.xlsx", workbook("creator_one"))
-    pg.execute("UPDATE ai_feature_configs SET api_key_ciphertext=NULL,key_suffix=NULL,key_updated_at=NULL "
-               "WHERE feature='contact_assessment'")
-    pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (pilot.ids["cm"],))
-    imports.start_import(pilot.ids["cm"], again["id"])
-    drain(pilot)
-    assert row_for(pg, again, "creator_one")["reason_code"] == "existing" and len(calls) == 1
-    imports.preview_import(pilot.ids["owner"], pilot.ids["cm"], "roster.xlsx", data)
-    assert pg.execute("SELECT count(*) n FROM creator_import_rows WHERE batch_id=%s",
-                      (batch["id"],)).fetchone()["n"] == 3
+    assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (creator,)).fetchone()["creator_type"] == "cap"
+    assert pg.execute("SELECT status FROM contact_roles WHERE contact_id=%s AND role='creator'",
+                      (creator,)).fetchone()["status"] == "confirmed"
+    formal = creator_handles.page_data(cm, tab="mine")["items"]
+    assert len(formal) == 1 and set(formal[0]["handles"]) == {"beauty.one_12", "corrected_02"}
+    assert formal[0]["sources"] == ["Excel"]
+    imports.preview_import(owner, cm, "roster.xlsx", data)
+    imports.start_import(owner, batch["id"])
+    assert row_for(pg, batch, "second_02") is None
+    assert row_for(pg, batch, "missing")["review_status"] == "deferred"
+    assert pg.execute("SELECT count(*) n FROM creator_import_rows").fetchone()["n"] == 3
+    facts = _snapshot(pg, ("contacts", "contact_roles", "contact_social_accounts", "contact_assignments",
+                           "creator_account_assignments"))
+    again = imports.preview_import(owner, cm, "again.xlsx", workbook("beauty.one_12", "legacy_account"))
+    imports.start_import(owner, again["id"])
+    assert row_for(pg, again, "beauty.one_12")["reason_code"] == "existing"
+    assert _snapshot(pg, facts) == facts
+    conflict = row_for(pg, again, "legacy_account")
+    assert conflict["reason_code"] == "account_conflict" and conflict["contact_id"] is None
+    assert set(creator_handles.page_data(cm, tab="mine")["items"][0]["handles"]) == {"beauty.one_12", "corrected_02"}
+    assert pg.execute("SELECT id,display_name FROM contacts ORDER BY id").fetchall() == before_people
+    assert not pg.execute("SELECT 1 FROM creator_import_rows WHERE api_requests<>0").fetchone()
+    for creator_type in ("pending", "non_cap"):
+        with pg.transaction(force_rollback=True):
+            pg.execute("UPDATE contacts SET creator_type=%s WHERE id=%s", (creator_type, creator))
+            unchanged = _snapshot(pg, facts)
+            review = imports.preview_import(owner, cm, "review.xlsx", workbook("beauty.one_12"))
+            imports.start_import(owner, review["id"])
+            row = row_for(pg, review, "beauty.one_12")
+            assert row["review_status"] == "pending" and _snapshot(pg, facts) == unchanged
+            if creator_type == "pending":
+                assert row["contact_id"] == creator and row["reason_code"] == "manual_review"
+                imports.confirm_row(cm, row["id"], "beauty.one_12", creator)
+                assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (creator,)).fetchone()[
+                    "creator_type"] == "cap"
+            else:
+                assert row["contact_id"] is None and row["reason_code"] == "account_conflict"
 
 
-def test_two_inflight_handles_for_one_creator_preserve_results_and_api_usage(pg, pilot, monkeypatch):
-    calls, callbacks = prepare(pg, pilot, monkeypatch, peers=True)
-    group(pg, pilot, "second_handle_group", "creator_second", "creator", "peer")
-    pg.execute("INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,"
-               "body_ciphertext,message_create_time) SELECT 'second_handle_group','second_'||message_id,sender_open_id,"
-               "sender_type,message_type,body_ciphertext,message_create_time FROM chat_messages "
-               "WHERE message_id IN ('creator_7_question','peer_role')")
-    pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
-               "SELECT %s,chat_id,message_id FROM chat_messages WHERE chat_id='second_handle_group'",
-               (pilot.ids["cm"],))
-    batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "parallel.xlsx",
-                                   workbook("creator_one", "creator_second"))
-    imports.start_import(pilot.ids["cm"], batch["id"])
-    assert imports.prepare_next_import(pilot.settings) and imports.prepare_next_import(pilot.settings)
-    first, second = imports.claim_next_import(), imports.claim_next_import()
-    assert first and second
-
-    def finish_second_during_first_request():
-        callbacks.clear()
-        imports.run_claimed_import(second, pilot.settings)
-
-    callbacks.append(finish_second_during_first_request)
-    imports.run_claimed_import(first, pilot.settings)
-    for handle in ("creator_one", "creator_second"):
-        row = row_for(pg, batch, handle)
-        assert row["review_status"] == "confirmed" and row["contact_id"] == pilot.ids["creator"]
-        assert row["api_requests"] == 1 and row["input_tokens"] == 12 and row["output_tokens"] == 8
-        assert imports._pack(row, pilot.settings, "result_ciphertext")["response"]["text"]
-    assert len(calls) == 2 and pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 1
-
-
-def test_unique_known_creator_needs_no_messages_or_ai_and_groups_deduplicate_people(pg, pilot, monkeypatch):
-    calls, _ = prepare(pg, pilot, monkeypatch, unknown=False)
-    group(pg, pilot, "second_creator_group", "creator_one", "creator")
-    group(pg, pilot, "another_handle_group", "creator_second", "creator")
-    pg.execute("UPDATE chat_messages SET body_ciphertext=NULL")
-    pg.execute("UPDATE ai_feature_configs SET api_key_ciphertext=NULL,key_suffix=NULL,key_updated_at=NULL "
-               "WHERE feature='contact_assessment'")
-    batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "known.xlsx",
-                                   workbook("creator_one", "creator_second"))
-    imports.start_import(pilot.ids["cm"], batch["id"])
-    drain(pilot)
-    for handle in ("creator_one", "creator_second"):
-        row = row_for(pg, batch, handle)
-        assert row["review_status"] == "confirmed" and row["contact_id"] == pilot.ids["creator"]
-        assert row["api_requests"] == 0
-    assert not calls and pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 1
-    assert row_for(pg, batch, "creator_one")["stats"]["groups"] == 2
-    assert set(creator_handles.page_data(pilot.ids["cm"], tab="mine")["items"][0]["handles"]) == {
-        "creator_one", "creator_second"}
-
-
-def test_all_matching_groups_count_creators_before_admission_and_ignore_nonmembers(pg, pilot, monkeypatch):
-    calls, _ = prepare(pg, pilot, monkeypatch, unknown=False)
-    pilot.person("another")
-    group(pg, pilot, "second_creator_group", "creator_one", "another")
-    # An unrelated classified creator cannot affect a different handle's single-member group.
-    group(pg, pilot, "single_group", "single_handle", "creator")
-    batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "groups.xlsx",
-                                   workbook("creator_one", "single_handle", "unrelated_zebra"))
-    imports.start_import(pilot.ids["cm"], batch["id"])
-    drain(pilot)
-    ambiguous = row_for(pg, batch, "creator_one")
-    assert ambiguous["contact_id"] is None and ambiguous["review_status"] == "pending"
-    assert ambiguous["stats"]["creator_count"] == 2
-    assert row_for(pg, batch, "single_handle")["review_status"] == "confirmed"
-    missing = row_for(pg, batch, "unrelated_zebra")
-    assert missing["contact_id"] is None and missing["review_status"] == "pending"
-    assert not calls
-    for item in imports.page_data(pilot.ids["cm"], pilot.ids["cm"])["candidates"]:
-        assert item["contact_id"] is None and item["display_name"] == "—" and item["creator_type"] == "cap"
-
-
-@pytest.mark.parametrize("identified", [0, 2])
-def test_ai_identity_zero_or_multiple_creators_leave_blank_user(pg, pilot, monkeypatch, identified):
-    calls, _ = prepare(pg, pilot, monkeypatch)
-    another = pilot.person("another", pairs=2)
-    pg.execute("DELETE FROM contact_roles WHERE contact_id=%s", (another,))
-    group(pg, pilot, "chat_another", "creator_one", "another")
-    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='another_1_question'", (
-        message_body_cipher(pilot.settings.token_encryption_key).encrypt(json.dumps({
-            "text": "I create and post my own product videos every day."
-        })),
-    ))
-    original = contact_assessments.call_openai
-    def classify(*args, **kwargs):
-        response = original(*args, **kwargs)
-        result = json.loads(response["text"])
-        assert len(result["people"]) == 2
-        if not identified:
-            for person in result["people"]:
-                person.update(role="insufficient", confidence=0, basis="weak_context", evidence_refs=[])
-        response["text"] = json.dumps(result)
-        return response
-    monkeypatch.setattr(contact_assessments, "call_openai", classify)
-    batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "identity.xlsx", workbook("creator_one"))
-    imports.start_import(pilot.ids["cm"], batch["id"])
-    drain(pilot)
-    row = row_for(pg, batch, "creator_one")
-    assert len(calls) == 1 and row["api_requests"] == 1
-    assert row["review_status"] == "pending" and row["contact_id"] is None
-    assert row["reason_code"] == ("person_ambiguous" if not identified else "multiple_creators")
-    assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
-    monkeypatch.setattr(imports.creator_import_evidence, "build_evidence",
-                        lambda *args, **kwargs: pytest.fail("Candidate GET rescanned group history"))
-    item = imports.page_data(pilot.ids["cm"], pilot.ids["cm"])["candidates"][0]
-    assert item["contact_id"] is None and item["display_name"] == "—"
-    assert item["creator_type"] == "cap" and item["sources"] == ["Excel", "AI"]
-
-
-def test_import_scope_conflict_and_manual_edit_block_stale_ai_results(pg, pilot, monkeypatch):
-    calls, callbacks = prepare(pg, pilot, monkeypatch, peers=True)
-    batch = imports.preview_import(pilot.ids["owner"], pilot.ids["cm"], "roster.xlsx", workbook("creator_one"))
+def test_manual_import_scope_identity_account_and_type_conflicts_are_atomic(pg, pilot, monkeypatch):
+    prepare(pg, pilot, monkeypatch)
+    cm, owner, creator = pilot.ids["cm"], pilot.ids["owner"], pilot.ids["creator"]
+    batch = imports.preview_import(owner, cm, "roster.xlsx", workbook("creator_one", "occupied"))
     for action in (
-        lambda: imports.page_data(pilot.ids["cm"], pilot.ids["owner"]),
-        lambda: imports.search_users(pilot.ids["cm"], pilot.ids["owner"], "creator"),
-        lambda: imports.preview_import(pilot.ids["cm"], pilot.ids["owner"], "x.xlsx", workbook("x")),
+        lambda: imports.page_data(cm, owner),
+        lambda: imports.search_users(cm, owner, "creator"),
+        lambda: imports.preview_import(cm, owner, "x.xlsx", workbook("x")),
     ):
         with pytest.raises(PermissionError):
             action()
-    assert imports.search_users(pilot.ids["cm"], pilot.ids["cm"], "silent") == []
-    imports.start_import(pilot.ids["owner"], batch["id"])
-    pending = row_for(pg, batch, "creator_one")
+    assert imports.search_users(cm, cm, "silent") == []
+    imports.start_import(owner, batch["id"])
+    row = row_for(pg, batch, "creator_one")
     with pytest.raises(PermissionError):
-        imports.confirm_row(pilot.ids["cm"], pending["id"], "creator_one", pilot.ids["silent"])
-    with pg.transaction(force_rollback=True):
-        pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
-                   "VALUES(%s,%s,%s,'manual')", (uuid4(), pilot.ids["creator"], pilot.ids["owner"]))
-        with pytest.raises(ValueError, match="冲突"):
-            imports.confirm_row(pilot.ids["cm"], pending["id"], "creator_one", pilot.ids["creator"])
-        assert not pg.execute("SELECT 1 FROM contact_social_accounts WHERE import_row_id=%s",
-                              (pending["id"],)).fetchone()
-    with pg.transaction(force_rollback=True):
-        pg.execute("UPDATE contacts SET creator_type='non_cap' WHERE id=%s", (pilot.ids["creator"],))
-        with pytest.raises(ValueError, match="冲突"):
-            imports.confirm_row(pilot.ids["cm"], pending["id"], "creator_one", pilot.ids["creator"])
-    callbacks.append(
-        lambda: imports.confirm_row(pilot.ids["cm"], pending["id"], "corrected_handle", pilot.ids["creator"])
-    )
-    drain(pilot)
-    current = row_for(pg, batch, "corrected_handle")
-    assert current["review_status"] == "confirmed" and current["reason_code"] == "manual_confirmed"
-    assert current["confidence"] is None and current["refs"] == []
-    assert current["pack_ciphertext"] is None and current["result_ciphertext"] is None
-    assert current["fingerprint"] is None and current["config_fingerprint"] is None
-    assert imports.source_labels(current) == ["Excel"] and len(calls) == 1
-    assert not pg.execute("SELECT 1 FROM social_accounts WHERE normalized_handle='creator_one'").fetchone()
-
-
-def test_paused_or_revoked_import_does_not_send_and_expired_paid_lease_does_not_retry(pg, pilot, monkeypatch):
-    calls, _ = prepare(pg, pilot, monkeypatch, peers=True)
-    batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "roster.xlsx", workbook("creator_one"))
-    imports.start_import(pilot.ids["cm"], batch["id"])
-    imports.pause_import(pilot.ids["cm"], batch["id"])
-    assert not imports.prepare_next_import(pilot.settings) and imports.claim_next_import() is None
-    imports.resume_import(pilot.ids["cm"], batch["id"])
-    assert imports.prepare_next_import(pilot.settings)
-    with pg.transaction(force_rollback=True):
-        job = imports.claim_next_import()
-        pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (pilot.ids["cm"],))
-        imports.run_claimed_import(job, pilot.settings)
-        assert not calls and row_for(pg, batch, "creator_one")["review_status"] == "pending"
-    job = imports.claim_next_import()
-    pg.execute("UPDATE creator_import_rows SET lease_until=NOW()-INTERVAL '1 minute' WHERE id=%s", (job["id"],))
-    assert imports.claim_next_import() is None and not calls
-    assert row_for(pg, batch, "creator_one")["reason_code"] == "interrupted"
-
-
-def test_pending_batch_recheck_preserves_confirmed_deferred_and_paid_history(pg, pilot, monkeypatch):
-    calls, _ = prepare(pg, pilot, monkeypatch, unknown=False)
-    batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "recheck.xlsx",
-                                   workbook("creator_one", "later_handle", "deferred_handle"))
-    imports.start_import(pilot.ids["cm"], batch["id"])
-    drain(pilot)
-    confirmed = row_for(pg, batch, "creator_one")
-    deferred = row_for(pg, batch, "deferred_handle")
-    imports.defer_row(pilot.ids["cm"], deferred["id"])
-    pending = row_for(pg, batch, "later_handle")
-    pg.execute("UPDATE creator_import_rows SET api_requests=2,input_tokens=50,output_tokens=20 WHERE id=%s",
-               (pending["id"],))
-    group(pg, pilot, "later_group", "later_handle", "creator")
-    assert imports.recheck_batch(pilot.ids["cm"], batch["id"])["queued"] == 1
+        imports.confirm_row(cm, row["id"], "creator_one", pilot.ids["silent"])
     with pytest.raises(ValueError):
-        imports.recheck_batch(pilot.ids["cm"], batch["id"])
-    drain(pilot)
-    current = row_for(pg, batch, "later_handle")
-    assert current["review_status"] == "confirmed" and current["contact_id"] == pilot.ids["creator"]
-    assert (current["api_requests"], current["input_tokens"], current["output_tokens"]) == (2, 50, 20)
-    assert row_for(pg, batch, "creator_one") == confirmed
-    assert row_for(pg, batch, "deferred_handle")["review_status"] == "deferred"
-    assert not calls and pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 1
-    audit = pg.execute(
-        "SELECT metadata FROM audit_events WHERE action='creator_import_reanalysis_requested'"
-    ).fetchone()
-    assert audit["metadata"]["previous"]["pack_ciphertext"] == pending["pack_ciphertext"]
-    assert audit["metadata"]["previous"]["result_ciphertext"] == pending["result_ciphertext"]
-    assert audit["metadata"]["previous"]["refs"] == pending["refs"]
+        imports.confirm_row(cm, row["id"], "creator_one", uuid4())
+    with pytest.raises(ValueError):
+        imports.confirm_row(cm, row["id"], "occupied", creator)
+    for conflict in ("owner", "account", "type", "merchant", "rejected"):
+        with pg.transaction(force_rollback=True):
+            if conflict == "owner":
+                pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
+                           "VALUES(%s,%s,%s,'manual')", (uuid4(), creator, owner))
+            elif conflict == "type":
+                pg.execute("UPDATE contacts SET creator_type='non_cap' WHERE id=%s", (creator,))
+            elif conflict == "merchant":
+                pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) "
+                           "VALUES(%s,'merchant_contact','confirmed','manual')", (creator,))
+            elif conflict == "rejected":
+                pg.execute("UPDATE contact_roles SET status='rejected',source='manual' "
+                           "WHERE contact_id=%s AND role='creator'", (creator,))
+            with pytest.raises(ValueError, match="冲突"):
+                imports.confirm_row(
+                    cm, row["id"], "legacy_account" if conflict == "account" else "creator_one", creator,
+                )
+            assert not pg.execute("SELECT 1 FROM contact_social_accounts WHERE import_row_id=%s",
+                                  (row["id"],)).fetchone()
+    imports.confirm_row(cm, row["id"], "corrected_handle", creator)
+    assert row_for(pg, batch, "corrected_handle")["review_status"] == "confirmed"
+    with pytest.raises(ValueError):
+        imports.confirm_row(cm, row["id"], "other_handle", creator)
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (cm,))
+        with pytest.raises(PermissionError):
+            imports.start_import(owner, batch["id"])
+
+
+def test_manual_import_concurrent_confirmations_create_one_person_and_account_link(pg, pilot, monkeypatch):
+    prepare(pg, pilot, monkeypatch)
+    cm, creator = pilot.ids["cm"], pilot.ids["creator"]
+    batches = [imports.preview_import(actor, cm, name, workbook("same_account"))
+               for actor, name in ((cm, "one.xlsx"), (pilot.ids["owner"], "two.xlsx"))]
+    for batch in batches:
+        imports.start_import(cm, batch["id"])
+    row_ids = [row_for(pg, batch, "same_account")["id"] for batch in batches]
+    schema, dsn = pg.execute("SELECT current_schema() name").fetchone()["name"], pg.info.dsn
+    pg.execute(psycopg.sql.SQL("SET search_path TO {}").format(psycopg.sql.Identifier(schema)))
+    pg.commit()
+
+    @contextmanager
+    def connected():
+        with psycopg.connect(dsn, row_factory=dict_row,
+                             options=f"-csearch_path={schema} -clock_timeout=2000 -cstatement_timeout=5000") as conn:
+            yield conn
+
+    try:
+        monkeypatch.setattr(imports, "connection", connected)
+        barrier = Barrier(2)
+
+        def confirm(row_id):
+            barrier.wait(timeout=5)
+            return imports.confirm_row(cm, row_id, "same_account", creator)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(confirm, row_id) for row_id in row_ids]
+            assert all(f.result(timeout=10)["status"] == "confirmed" for f in futures)
+        assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 1
+        assert pg.execute("SELECT count(*) n FROM social_accounts "
+                          "WHERE normalized_handle='same_account'").fetchone()["n"] == 1
+        assert pg.execute("SELECT count(*) n FROM contact_social_accounts WHERE contact_id=%s",
+                          (creator,)).fetchone()["n"] == 1
+        extra = imports.preview_import(cm, cm, "extra.xlsx", workbook("second_account"))
+        imports.start_import(cm, extra["id"])
+        imports.confirm_row(cm, row_for(pg, extra, "second_account")["id"], "second_account", creator)
+        reverse = [imports.preview_import(cm, cm, name, workbook(*values)) for name, values in (
+            ("forward.xlsx", ("same_account", "second_account")),
+            ("reverse.xlsx", ("second_account", "same_account")),
+        )]
+        facts = _snapshot(pg, ("contacts", "contact_roles", "contact_social_accounts", "contact_assignments"))
+        second_lookup, original_existing = Barrier(2), imports._existing
+
+        def interleaved_existing(conn, row):
+            if row["row_number"] == 2:
+                second_lookup.wait(timeout=5)
+            return original_existing(conn, row)
+
+        monkeypatch.setattr(imports, "_existing", interleaved_existing)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            starts = [pool.submit(imports.start_import, cm, batch["id"]) for batch in reverse]
+            assert all(f.result(timeout=10)["status"] == "completed" for f in starts)
+        assert _snapshot(pg, facts) == facts
+        for batch in reverse:
+            for handle in ("same_account", "second_account"):
+                row = row_for(pg, batch, handle)
+                assert row["review_status"] == "confirmed" and row["reason_code"] == "existing"
+    finally:
+        pg.rollback()
+        with psycopg.connect(dsn, autocommit=True) as cleanup:
+            cleanup.execute(psycopg.sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(psycopg.sql.Identifier(schema)))
 
 
 def test_import_pages_and_user_search_only_expose_currently_accessible_identities(pg, pilot, monkeypatch):
-    prepare(pg, pilot, monkeypatch, matching_group=False)
+    prepare(pg, pilot, monkeypatch)
     cm, contact = pilot.ids["cm"], pilot.ids["creator"]
     batch = imports.preview_import(cm, cm, "roster.xlsx", workbook("roster_entry"))
     imports.start_import(cm, batch["id"])
@@ -423,219 +303,23 @@ def test_import_workbook_rejects_unsafe_or_ambiguous_input():
     assert parsed["counts"] == {"valid": 1, "duplicates": 1, "invalid": 0}
 
 
-def test_parentheses_and_plus_group_names_import_all_five_handles_without_ai(pg, pilot, monkeypatch):
-    calls, _ = prepare(pg, pilot, monkeypatch, unknown=False, matching_group=False)
-    named = {
-        "aquanails": "❤️ aquanailsbypatrycja (patrycjanails) X TT Media",
-        "bex": "❤️bex_mumof3 + bexmays X TT media",
-        "katie": "❤️katievictoriaftm (katiesshopfinds) & TT Media",
-        "charlotte": "❤️(shopwithcharlotte) X TT Media (WA contact",
-    }
-    for chat, name in named.items():
-        group(pg, pilot, chat, "placeholder", "creator")
-        pg.execute("UPDATE chats SET name=%s WHERE chat_id=%s", (name, chat))
-    # Dissolved historical copies contain a different creator and must not affect today's count.
-    pilot.person("another")
-    for chat, name in {
-        "old_bex": "bex_mumof3 X TT Media",
-        "old_charlotte": "Charlottescrunchymama (shopwithcharlotte) X TT Media",
-    }.items():
-        group(pg, pilot, chat, "placeholder", "another")
-        pg.execute("UPDATE chats SET name=%s,chat_status='dissolved' WHERE chat_id=%s", (name, chat))
-    wanted = ["aquanailsbypatrycja", "patrycjanails", "bex_mumof3", "katievictoriaftm", "shopwithcharlotte"]
-    batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "five.xlsx", workbook(*wanted))
-    imports.start_import(pilot.ids["cm"], batch["id"])
-    drain(pilot)
-    for handle in wanted:
-        row = row_for(pg, batch, handle)
-        assert row["review_status"] == "confirmed" and row["contact_id"] == pilot.ids["creator"]
-        assert row["api_requests"] == 0
-    assert not calls
-
-
-def test_similar_group_and_unknown_creator_are_resolved_in_one_ai_call(pg, pilot, monkeypatch):
-    calls, _ = prepare(pg, pilot, monkeypatch)
-    pg.execute("UPDATE chats SET name='creatr_one X TT Media' WHERE chat_id='chat_creator'")
-    # The CM establishes the group correspondence; the unknown person's separate activity identifies them.
-    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='creator_7_answer'", (
-        message_body_cipher(pilot.settings.token_encryption_key).encrypt(json.dumps({
-            "text": "This group is for @creator_one. Welcome to your creator group."
-        })),
-    ))
-    pilot.person("another")
-    group(pg, pilot, "unrelated_candidate", "creator_onee", "another")
-    original = contact_assessments.call_openai
-
-    def jointly_match(*args, **kwargs):
-        response = original(*args, **kwargs)
-        result, pack = json.loads(response["text"]), args[2]
-        selected = next(g["ref"] for g in pack["groups"] if "creatr_one" in g["name"])
-        assert len(result["groups"]) == 2
-        for found in result["groups"]:
-            if found["group_ref"] != selected:
-                found.update(match="unrelated", basis="context_only", evidence_refs=[found["group_ref"]])
-        response["text"] = json.dumps(result)
-        return response
-
-    monkeypatch.setattr(contact_assessments, "call_openai", jointly_match)
-    batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "similar.xlsx", workbook("creator_one"))
-    imports.start_import(pilot.ids["cm"], batch["id"])
-    drain(pilot)
-    row = row_for(pg, batch, "creator_one")
-    assert len(calls) == 1 and row["api_requests"] == 1
-    assert row["review_status"] == "confirmed" and row["contact_id"] == pilot.ids["creator"]
-    checked = imports._pack(row, pilot.settings, "result_ciphertext")["checked"]
-    assert checked["creator_count"] == 1 and checked["matched_group_count"] == 1
-    assert imports.source_labels(row) == ["Excel", "AI"]
-
-
-@pytest.mark.parametrize("match", ["uncertain", "unrelated"])
-def test_similar_group_known_creator_requires_ai_group_confirmation(pg, pilot, monkeypatch, match):
-    calls, _ = prepare(pg, pilot, monkeypatch, unknown=False)
-    pg.execute("UPDATE chats SET name='creator_onee X TT Media' WHERE chat_id='chat_creator'")
-    pg.execute("UPDATE chat_messages SET body_ciphertext=NULL")
-    original = contact_assessments.call_openai
-
-    def unresolved(*args, **kwargs):
-        response = original(*args, **kwargs)
-        result = json.loads(response["text"])
-        for found in result["groups"]:
-            found.update(match=match, basis="context_only", evidence_refs=[found["group_ref"]])
-        response["text"] = json.dumps(result)
-        return response
-
-    monkeypatch.setattr(contact_assessments, "call_openai", unresolved)
-    batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "uncertain.xlsx", workbook("creator_one"))
-    imports.start_import(pilot.ids["cm"], batch["id"])
-    drain(pilot)
-    row = row_for(pg, batch, "creator_one")
-    assert len(calls) == 1 and row["api_requests"] == 1
-    assert row["review_status"] == "pending" and row["contact_id"] is None
-    assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
-
-
-@pytest.mark.parametrize("creator_type", ["cap", "non_cap", "pending"])
-def test_only_cap_roster_resolves_silent_single_person_despite_old_ninety_percent_identity(
-    pg, pilot, monkeypatch, creator_type,
-):
-    calls, _ = prepare(pg, pilot, monkeypatch)
-    pg.execute("UPDATE contacts SET display_name='Kirsty' WHERE id=%s", (pilot.ids["creator"],))
-    pg.execute("UPDATE contact_assessments SET result=%s::jsonb WHERE contact_id=%s", (
-        json.dumps({"reason_code": "low_confidence", "roles": [{"role": "creator", "confidence": .9}]}),
-        pilot.ids["creator"],
-    ))
-    merchant = pilot.person("brand_member")
-    pg.execute("DELETE FROM contact_roles WHERE contact_id=%s", (merchant,))
-    pg.execute("INSERT INTO contact_roles(contact_id,role,status,source,is_primary) "
-               "VALUES(%s,'merchant_contact','confirmed','manual',TRUE)", (merchant,))
-    group(pg, pilot, "chat_creator", "creator_one", "creator", "brand_member")
-    group(pg, pilot, "duplicate_group", "creator_one", "creator", "brand_member")
-    pg.execute("UPDATE chat_messages SET body_ciphertext=NULL")
-    batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "silent.xlsx", workbook("creator_one"),
-                                   creator_type=creator_type)
-    imports.start_import(pilot.ids["cm"], batch["id"])
-    row = row_for(pg, batch, "creator_one")
-    with pytest.raises(ValueError, match="冲突"):
-        imports.confirm_row(pilot.ids["cm"], row["id"], "creator_one", merchant)
-    if creator_type == "cap":
-        for incomplete in ("partial", "unresolved_member"):
-            with pg.transaction(force_rollback=True):
-                if incomplete == "partial":
-                    pg.execute("UPDATE authorization_chats SET member_snapshot_status='partial' "
-                               "WHERE chat_id='chat_creator'")
-                else:
-                    pg.execute("INSERT INTO lark_identities(open_id) VALUES('ou_unresolved_member')")
-                    pg.execute("INSERT INTO chat_members(chat_id,open_id) "
-                               "VALUES('chat_creator','ou_unresolved_member')")
-                material = imports.creator_import_evidence.build_evidence(
-                    pg, pilot.settings, pilot.ids["cm"], "creator_one", creator_type="cap",
-                )
-                assert material["checked"]["user_ref"] is None
-                assert material["checked"]["reason_code"] == "person_unresolved"
-    drain(pilot)
-    row = row_for(pg, batch, "creator_one")
-    if creator_type == "cap":
-        assert row["review_status"] == "confirmed" and row["contact_id"] == pilot.ids["creator"]
-        assert row["confidence"] is None and imports.source_labels(row) == ["Excel"]
-        assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (pilot.ids["creator"],)).fetchone()[
-            "creator_type"] == "cap"
-    else:
-        assert row["review_status"] == "pending" and row["contact_id"] is None
-    assert not calls and row["api_requests"] == 0
-    assert pg.execute("SELECT source FROM contact_roles WHERE contact_id=%s",
-                      (merchant,)).fetchone()["source"] == "manual"
-
-
-def test_cap_multiple_people_accepts_cm_addressed_context_in_the_same_ai_call(pg, pilot, monkeypatch):
-    calls, _ = prepare(pg, pilot, monkeypatch, peers=True)
-    pg.execute("UPDATE chat_messages SET body_ciphertext=NULL WHERE sender_open_id='ou_creator'")
-    pg.execute("UPDATE chat_messages SET body_ciphertext=%s,mentions_json=%s::jsonb "
-               "WHERE message_id='creator_7_answer'", (
-                   message_body_cipher(pilot.settings.token_encryption_key).encrypt(json.dumps({
-                       "text": "@_user_1 You are the creator in this CAP account group. Please send your product video."
-                   })), json.dumps([{"key": "@_user_1", "id": "ou_creator", "id_type": "open_id"}]),
-               ))
-    original = contact_assessments.call_openai
-
-    def contextual_identity(*args, **kwargs):
-        response = original(*args, **kwargs)
-        pack, result = args[2], json.loads(response["text"])
-        directed = next(m for m in pack["messages"] if m.get("speaker_is_staff") and m.get("target_refs"))
-        person = next(p for p in result["people"] if p["user_ref"] in directed["target_refs"])
-        person.update(role="creator", confidence=.99, basis="direct_interaction", evidence_refs=[directed["ref"]])
-        response["text"] = json.dumps(result)
-        return response
-
-    monkeypatch.setattr(contact_assessments, "call_openai", contextual_identity)
-    batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "context.xlsx", workbook("creator_one"))
-    imports.start_import(pilot.ids["cm"], batch["id"])
-    drain(pilot)
-    row = row_for(pg, batch, "creator_one")
-    assert row["review_status"] == "confirmed" and row["contact_id"] == pilot.ids["creator"]
-    assert row["api_requests"] == 1 and len(calls) == 1
-    assert imports.source_labels(row) == ["Excel", "AI"]
-
-
-@pytest.mark.parametrize("change", ["body", "scope"])
-def test_paid_cap_context_cannot_survive_body_or_permission_changes(pg, pilot, monkeypatch, change):
-    calls, callbacks = prepare(pg, pilot, monkeypatch, peers=True)
-    batch = imports.preview_import(pilot.ids["cm"], pilot.ids["cm"], "changed.xlsx", workbook("creator_one"))
-    imports.start_import(pilot.ids["cm"], batch["id"])
-
-    def invalidate_evidence():
-        if change == "body":
-            pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='peer_role'", (
-                message_body_cipher(pilot.settings.token_encryption_key).encrypt(json.dumps({
-                    "text": "I create my own product videos and livestream every day."
-                })),
-            ))
-        else:
-            pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s",
-                       (pilot.ids["cm"],))
-
-    callbacks.append(invalidate_evidence)
-    drain(pilot)
-    row = row_for(pg, batch, "creator_one")
-    assert row["review_status"] == "pending" and row["contact_id"] is None
-    assert row["api_requests"] == 1 and row["input_tokens"] == 12 and row["output_tokens"] == 8
-    assert len(calls) == 1 and not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
-
-
 def test_creator_library_reset_preserves_sources_history_and_new_data_on_replay(pg, pilot, monkeypatch):
-    calls, _ = prepare(pg, pilot, monkeypatch, peers=True)
+    prepare(pg, pilot, monkeypatch)
     monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(pg))
     cm, owner, creator = pilot.ids["cm"], pilot.ids["owner"], pilot.ids["creator"]
     data = workbook("creator_one", "not_found")
     batch = imports.preview_import(owner, cm, "original.xlsx", data)
     imports.start_import(owner, batch["id"])
-    drain(pilot)
-    assert row_for(pg, batch, "creator_one")["review_status"] == "confirmed" and len(calls) == 1
+    imports.confirm_row(cm, row_for(pg, batch, "creator_one")["id"], "creator_one", creator)
+    # Seed paid legacy history directly: the retired AI import worker no longer exists.
+    pg.execute("UPDATE creator_import_rows SET pack_ciphertext='saved-pack',result_ciphertext='saved-result',"
+               "fingerprint='saved-fingerprint',api_requests=1,input_tokens=12,output_tokens=8,"
+               "response_id='saved-response',request_id='saved-request' WHERE handle='creator_one'")
     pg.execute("UPDATE chats SET name='new_handle X TT' WHERE chat_id='chat_creator'")
     queued = imports.preview_import(cm, cm, "inflight.xlsx", workbook("new_handle"))
     imports.start_import(cm, queued["id"])
-    assert imports.prepare_next_import(pilot.settings)
-    inflight = imports.claim_next_import()
-    assert inflight
+    pg.execute("UPDATE creator_import_rows SET status='running',attempts=1,lease_until=NOW()+INTERVAL '1 hour' "
+               "WHERE batch_id=%s", (queued["id"],))
     pg.execute("INSERT INTO contact_roles(contact_id,role,status,source,is_primary) "
                "VALUES(%s,'merchant_contact','confirmed','manual',TRUE)", (pilot.ids["cm"],))
     merchant, rejected, merchant_assessment = pilot.person("merchant"), pilot.person("rejected"), uuid4()
@@ -764,15 +448,13 @@ def test_creator_library_reset_preserves_sources_history_and_new_data_on_replay(
             "api_requests": 1, "input_tokens": tokens, "output_tokens": output}
     assert not pg.execute("SELECT 1 FROM ai_feature_configs WHERE enabled "
                           "AND feature IN ('contact_assessment','contact_assignment','creator_workflow')").fetchone()
-    assert not imports.prepare_next_import(pilot.settings) and not imports.claim_next_import()
     assert not creator_ownership.prepare_next_preview(pilot.settings) and not creator_ownership.claim_next_ownership()
     assert not creator_handles.prepare_next_preview(pilot.settings) and not creator_handles.claim_next_handle()
     assert not contact_assessments.queue_eligible_contact_assessments()
     assert not contact_assessments.claim_next_contact_assessment()
-    imports.run_claimed_import(inflight, pilot.settings)
-    assert len(calls) == 1 and creator_handles.page_data(cm, tab="mine")["total_count"] == 0
+    assert row_for(pg, queued, "new_handle")["status"] == "invalid"
     with pytest.raises(ValueError):
-        imports.recheck_batch(cm, batch["id"])
+        imports.start_import(cm, batch["id"])
     new_batch = imports.preview_import(owner, cm, "original.xlsx", data)
     assert new_batch["id"] != batch["id"]
     imports.start_import(owner, new_batch["id"])

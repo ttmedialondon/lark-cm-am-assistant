@@ -30,5 +30,5 @@ def test_shared_gate_rejects_when_three_valid_leases_are_running() -> None:
     assert "offhours_summary_tasks" in combined_query
     assert "creator_ownership_tasks" in combined_query
     assert "creator_handle_tasks" in combined_query
-    assert "creator_import_rows" in combined_query
+    assert "creator_import_rows" not in combined_query
     assert "lease_until > NOW()" in combined_query

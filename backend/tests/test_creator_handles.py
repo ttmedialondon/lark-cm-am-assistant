@@ -46,7 +46,9 @@ def _task(pg, case, contact=None):
 
 
 def _case(pg, pilot, monkeypatch, *, clues=True, uncertain=False):
-    for module in (handles, evidence):
+    from app import creator_imports
+
+    for module in (handles, evidence, creator_imports):
         monkeypatch.setattr(module, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(handles, "get_settings", lambda: pilot.settings)
     if clues:
@@ -153,7 +155,7 @@ def test_suggestions_preview_then_explicit_auto_admission_is_atomic_and_idempote
     _drain_preview(pilot.settings)
     assert _snapshot(pg, paid) == paid and len(case.calls) == 1
     for _ in range(2):
-        assert handles.page_data(pilot.ids["cm"])["items"][0]["can_confirm"]
+        assert handles.page_data(pilot.ids["cm"])["items"] == []  # Archived AI work is not an Excel candidate.
     assert len(case.calls) == 1 and handles.start_run(pilot.ids["owner"], case.run) == 0
     _drain_preview(pilot.settings)
     assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
@@ -175,15 +177,6 @@ def test_cm_can_fill_missing_handles_but_not_cross_scope_or_bypass_input_checks(
     case = _case(pg, pilot, monkeypatch, clues=False)
     task = _task(pg, case)
     assert task["status"] == "skipped" and not case.calls
-    avatar = "https://s1-imfile.feishucdn.com/static-resource/v1/example.png"
-    for url, status, expected in (
-        (None, "succeeded", None), (avatar, "succeeded", avatar),
-        (avatar, "unavailable", None), ("https://untrusted.example/avatar.png", "succeeded", None),
-    ):
-        with pg.transaction(force_rollback=True):
-            pg.execute("UPDATE lark_identities SET avatar_url=%s,avatar_status=%s WHERE open_id='ou_creator'",
-                       (url, status))
-            assert handles.page_data(pilot.ids["cm"])["items"][0]["avatar_url"] == expected
     outsider = uuid4()
     pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext,body_consent_at) "
                "VALUES(%s,'ou_outsider','test',NOW())", (outsider,))
@@ -207,21 +200,37 @@ def test_cm_can_fill_missing_handles_but_not_cross_scope_or_bypass_input_checks(
     assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 1
     assert pg.execute("SELECT source FROM contact_assignments").fetchone()["source"] == "manual"
     formal = handles.page_data(pilot.ids["cm"], tab="confirmed")["items"]
-    assert len(formal) == 1 and formal[0]["creator_type"] == "pending"
-    assert formal[0]["contact_id"] == str(case.creator)
+    assert formal == []  # The current library only lists CAP people.
     with pytest.raises(PermissionError):
         handles.set_creator_type(outsider, outsider, case.creator, "cap")
     for actor_id, creator_type in ((pilot.ids["cm"], "cap"), (pilot.ids["owner"], "non_cap"),
                                    (pilot.ids["cm"], "pending")):
         handles.set_creator_type(actor_id, pilot.ids["cm"], case.creator, creator_type)
         handles.set_creator_type(actor_id, pilot.ids["cm"], case.creator, creator_type)
-        person = handles.page_data(pilot.ids["cm"], tab="confirmed")["items"][0]
-        assert person["creator_type"] == creator_type and len(person["handles"]) == 2
+        assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (case.creator,)).fetchone()[
+            "creator_type"] == creator_type
+        people = handles.page_data(pilot.ids["cm"], tab="confirmed")["items"]
+        if creator_type == "cap":
+            assert len(people) == 1 and people[0]["contact_id"] == str(case.creator)
+            assert len(people[0]["handles"]) == 2
+        else:
+            assert people == []
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE contacts SET creator_type='cap' WHERE id=%s", (case.creator,))
+        avatar = "https://s1-imfile.feishucdn.com/static-resource/v1/example.png"
+        for url, status, expected in (
+            (None, "succeeded", None), (avatar, "succeeded", avatar),
+            (avatar, "unavailable", None), ("https://untrusted.example/avatar.png", "succeeded", None),
+        ):
+            with pg.transaction(force_rollback=True):
+                pg.execute("UPDATE lark_identities SET avatar_url=%s,avatar_status=%s WHERE open_id='ou_creator'",
+                           (url, status))
+                assert handles.page_data(pilot.ids["cm"], tab="mine")["items"][0]["avatar_url"] == expected
     changes = pg.execute("SELECT count(*) n FROM audit_events WHERE action='creator_handles_type_updated'").fetchone()
     assert changes["n"] == 3
     with pytest.raises(ValueError):
         handles.set_creator_type(pilot.ids["cm"], pilot.ids["cm"], case.creator, "invalid")
-    assert handles.page_data(pilot.ids["cm"], tab="confirmed")["items"][0]["creator_type"] == "pending"
+    assert handles.page_data(pilot.ids["cm"], tab="confirmed")["items"] == []
     assert not case.calls
 
 
@@ -324,9 +333,10 @@ def test_existing_person_or_account_owners_are_not_overwritten_and_no_partial_ac
     task = _task(pg, case)
     with pg.transaction(force_rollback=True):
         pg.execute("DELETE FROM contact_social_accounts WHERE contact_id=%s", (pilot.ids["legacy"],))
+        pg.execute("UPDATE contacts SET creator_type='cap' WHERE id=%s", (pilot.ids["legacy"],))
         legacy = handles.page_data(pilot.ids["owner"], tab="mine")["items"]
         assert len(legacy) == 1 and legacy[0]["handles"] == ["legacy_account"]
-        assert legacy[0]["reason"] == "原有正式记录，本轮未改动。"
+        assert legacy[0]["sources"] == ["手动"]
     for cm in (pilot.ids["cm"], pilot.ids["owner"]):
         with pg.transaction(force_rollback=True):
             pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
@@ -335,6 +345,7 @@ def test_existing_person_or_account_owners_are_not_overwritten_and_no_partial_ac
             if cm == pilot.ids["cm"]:
                 handles.confirm_task(pilot.ids["cm"], task["id"], ["new_handle"])
                 assert _snapshot(pg, ("contact_assignments",))["contact_assignments"] == before["contact_assignments"]
+                pg.execute("UPDATE contacts SET creator_type='cap' WHERE id=%s", (case.creator,))
                 assert handles.page_data(cm, cm_id=cm, tab="mine")["items"][0]["handles"] == ["new_handle"]
             else:
                 with pytest.raises(ValueError, match="冲突"):
@@ -377,8 +388,7 @@ def test_revocation_during_response_and_parent_change_before_dispatch_are_safe(p
             operation()
     with pg.transaction(force_rollback=True):
         pg.execute("UPDATE authorizations SET body_consent_at=%s WHERE id=%s", (consent, pilot.ids["cm"]))
-        item = handles.page_data(pilot.ids["cm"])["items"][0]
-        assert not item["handle_options"] and archived["model_output"]["reason"] not in item["reason"]
+        assert handles.page_data(pilot.ids["cm"])["items"] == []
     assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
 
 
@@ -521,7 +531,7 @@ def test_preparation_and_expiry_lock_run_before_task(pg, pilot, monkeypatch):
     assert not case.calls
 
 
-def test_mixed_sources_share_pagination_and_one_person_keeps_all_confirmed_handles(pg, pilot, monkeypatch):
+def test_excel_only_pages_exclude_old_ai_candidates_and_merge_manually_confirmed_handles(pg, pilot, monkeypatch):
     from test_creator_imports import workbook
 
     from app import creator_imports as imports
@@ -533,34 +543,26 @@ def test_mixed_sources_share_pagination_and_one_person_keeps_all_confirmed_handl
     _drain_paid(pilot.settings)
     paid = len(case.calls)
     cm = pilot.ids["cm"]
+    assert handles.page_data(cm)["items"] == []
     batch = imports.preview_import(
-        cm, cm, "mixed.xlsx", workbook("creator_one", *(f"unmatched_{n}" for n in range(26)))
+        cm, cm, "roster.xlsx", workbook("creator_one", "creator_two", *(f"unmatched_{n}" for n in range(25)))
     )
     imports.start_import(cm, batch["id"])
-    for _ in range(27):
-        assert imports.prepare_next_import(pilot.settings)
-    # The matching group already has exactly one known creator: import ignores the older
-    # account-ownership AI's low score, and doesn't send another paid request.
-    known = pg.execute("SELECT * FROM creator_import_rows WHERE batch_id=%s AND handle='creator_one'",
-                       (batch["id"],)).fetchone()
-    assert known["review_status"] == "confirmed" and known["api_requests"] == 0
     page = handles.page_data(cm, cm_id=cm)
     following = handles.page_data(cm, cm_id=cm, page=2)
     assert page["total_count"] == 27 and page["total_pages"] == 2
     assert len(page["items"]) == 25 and len(following["items"]) == 2
     items = page["items"] + following["items"]
-    assert len({(r["kind"], r["id"]) for r in items}) == 27
-    assert {tuple(r["sources"]) for r in items} == {("Excel",), ("AI",)}
-    assert handles.page_data(cm, cm_id=cm, query="creator_one")["items"] == []
-    extra = handles.page_data(cm, cm_id=cm, query="creator_two")["items"]
-    assert len(extra) == 1 and extra[0]["kind"] == "ai"
-    assert [r["handle"] for r in extra[0]["handle_options"]] == ["creator_two"]
-    formal = handles.page_data(cm, cm_id=cm, tab="mine")["items"]
-    assert len(formal) == 1 and formal[0]["source"] == "Excel + AI" and formal[0]["creator_type"] == "cap"
-    assert extra[0]["can_confirm"]
-    handles.confirm_task(cm, extra[0]["id"], ["creator_two"])
+    assert len({r["id"] for r in items}) == 27
+    assert all(r["kind"] == "import" and r["sources"] == ["Excel"] and r["contact_id"] is None for r in items)
+    assert page["run"] is None and not any(page["usage"].values())
+    assert len(handles.page_data(cm, query="creator_one")["items"]) == 1
+    for handle in ("creator_one", "creator_two"):
+        row = pg.execute("SELECT id FROM creator_import_rows WHERE batch_id=%s AND handle=%s",
+                         (batch["id"], handle)).fetchone()
+        imports.confirm_row(cm, row["id"], handle, case.creator)
     formal = handles.page_data(cm, cm_id=cm, tab="mine")["items"]
     assert len(formal) == 1 and set(formal[0]["handles"]) == {"creator_one", "creator_two"}
-    assert formal[0]["source"] == "Excel + AI"
-    assert handles.page_data(cm, cm_id=cm)["total_count"] == 26
+    assert formal[0]["sources"] == ["Excel"] and formal[0]["creator_type"] == "cap"
+    assert handles.page_data(cm)["total_count"] == 25
     assert len(case.calls) == paid

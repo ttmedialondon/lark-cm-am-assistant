@@ -795,131 +795,12 @@ def run_claimed_handle(job, settings):
         _finish(job, "failed", "provider_error", settings, response)
 
 
-def _mixed_candidates(conn, cm_id, ai_rows, settings, query):
-    from . import creator_imports
-
-    # Combine scoped metadata; check cited account evidence for overlapping handles, never all chat history.
-    imported = conn.execute(
-        """SELECT r.*,c.display_name,c.creator_type,b.creator_type batch_creator_type FROM creator_import_rows r
-        JOIN creator_import_batches b ON b.id=r.batch_id LEFT JOIN contacts c ON c.id=r.contact_id
-        WHERE r.cm_authorization_id=%s AND b.policy_version=%s AND b.status<>'preview'
-        AND r.review_status<>'confirmed' ORDER BY r.created_at DESC,r.id""",
-        (cm_id, creator_imports.POLICY_VERSION),
-    ).fetchall()
-    formal = {}
-    for account in conn.execute(
-        """SELECT l.contact_id,s.normalized_handle FROM contact_social_accounts l
-        JOIN social_accounts s ON s.id=l.social_account_id WHERE l.status='confirmed'
-        AND l.relationship='owner' AND s.platform='tiktok' AND (
-            EXISTS (SELECT 1 FROM contact_assignments a WHERE a.contact_id=l.contact_id
-                AND a.responsible_authorization_id=%s AND a.ended_at IS NULL)
-            OR EXISTS (SELECT 1 FROM creator_account_assignments a WHERE a.contact_id=l.contact_id
-                AND a.social_account_id=s.id AND a.responsible_authorization_id=%s AND a.ended_at IS NULL))""",
-        (cm_id, cm_id),
-    ).fetchall():
-        formal.setdefault(account["contact_id"], set()).add(account["normalized_handle"].lower())
-    combined, by_contact, seen = [], {}, set()
-    for row in imported:
-        if row["handle"] in formal.get(row["contact_id"], set()) and row["outcome"] != "conflict":
-            continue
-        key = (row["handle"], row["contact_id"])
-        if key in seen:
-            continue
-        seen.add(key)
-        row["kind"] = "import"
-        combined.append(row)
-        if row["contact_id"]:
-            by_contact.setdefault(row["contact_id"], []).append(row)
-    for row in ai_rows:
-        row["kind"] = "ai"
-        result = _decode(row, "result_ciphertext", settings)
-        options = {c["handle"] for c in result.get("candidates", [])}
-        saved = formal.get(row["contact_id"], set())
-        if saved and options <= saved and row.get("outcome") != "conflict":
-            continue
-        options -= saved
-        matches = by_contact.get(row["contact_id"], [])
-        covered = {r["handle"] for r in matches}
-        mergeable = False
-        if options & covered and row.get("outcome") != "conflict":
-            try:
-                _parent(conn, row, settings, full=False)
-                mergeable = _valid_handle_material(row, settings, full=False)
-            except (ValueError, PermissionError):
-                pass
-        if mergeable:
-            for item in matches:
-                if item["handle"] in options:
-                    item["merged_ai_task"] = row
-        if mergeable and options <= covered:
-            continue
-        row["candidate_handles"] = options - covered if mergeable else options
-        combined.append(row)
-    if query:
-        needle = query.casefold()
-        filtered = []
-        for row in combined:
-            if row["kind"] == "import":
-                if needle in row["handle"].casefold() or (
-                    needle in (row["display_name"] or "").casefold()
-                    and row["contact_id"] and creator_imports._accessible(conn, cm_id, row["contact_id"])
-                ):
-                    filtered.append(row)
-            elif needle in (row["display_name"] or "").casefold():
-                filtered.append(row)
-            elif any(needle in handle.casefold() for handle in row["candidate_handles"]):
-                try:
-                    _parent(conn, row, settings, full=False)
-                    if _valid_handle_material(row, settings, full=False):
-                        filtered.append(row)
-                except (ValueError, PermissionError):
-                    pass
-        combined = filtered
-    return sorted(combined, key=lambda r: (
-        (r.get("handle") or min(r.get("candidate_handles") or {r["display_name"] or ""})).casefold(),
-        str(r["id"]),
-    ))
-
-
-def _formal_sources(conn, cm_id, contact_id, handles, settings):
-    from . import creator_imports
-
-    rows = conn.execute(
-        """SELECT r.contact_id,r.stats,r.result_ciphertext,r.outcome,r.confidence FROM creator_import_rows r
-        JOIN creator_import_batches b ON b.id=r.batch_id WHERE r.cm_authorization_id=%s
-        AND r.handle=ANY(%s::text[]) AND b.status<>'preview' AND b.policy_version=%s""",
-        (cm_id, [h.lower() for h in handles], creator_imports.POLICY_VERSION),
-    ).fetchall()
-    sources = {"Excel"} if rows else set()
-    if any(row["contact_id"] == contact_id and "AI" in creator_imports.source_labels(row) for row in rows):
-        sources.add("AI")
-    if conn.execute(
-        """SELECT 1 FROM creator_handle_tasks WHERE cm_authorization_id=%s AND contact_id=%s
-        AND review_status='confirmed' AND policy_version=%s LIMIT 1""", (cm_id, contact_id, POLICY_VERSION)
-    ).fetchone():
-        sources.add("AI")
-    if "AI" not in sources:
-        for task in conn.execute(
-            """SELECT * FROM creator_handle_tasks WHERE cm_authorization_id=%s AND contact_id=%s
-            AND status='succeeded' AND policy_version=%s ORDER BY created_at DESC,id DESC""",
-            (cm_id, contact_id, POLICY_VERSION),
-        ).fetchall():
-            result = _decode(task, "result_ciphertext", settings)
-            if not {c["handle"] for c in result.get("candidates", [])} & set(handles):
-                continue
-            if (
-                creator_imports._accessible(conn, cm_id, contact_id)
-                and _valid_handle_material(task, settings, full=False)
-            ):
-                sources.add("AI")
-                break
-    return [label for label in ("Excel", "AI") if label in sources] or ["手动"]
-
-
 def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
+    """Current library: Excel CAP candidates and manually confirmed people."""
     from . import creator_imports
 
-    settings = get_settings()
+    query = str(query or "").strip()[:120]
+    page = max(1, min(int(page), 10000))
     with connection() as conn:
         cm_id, owner = _access(conn, actor_id, cm_id)
         cms = [
@@ -930,224 +811,69 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
             ).fetchall()
             if owner or r["id"] == cm_id
         ]
-        run = conn.execute(
-            "SELECT * FROM creator_handle_runs WHERE cm_authorization_id=%s AND policy_version=%s "
-            "ORDER BY created_at DESC,id DESC LIMIT 1", (cm_id, POLICY_VERSION),
-        ).fetchone()
-        counts = {key: 0 for key in (*TASK_LABELS, "total", "completed", "candidates", "confirmed")}
-        usage = {"api_requests": 0, "input_tokens": 0, "output_tokens": 0}
-        if run:
-            for row in conn.execute(
-                "SELECT status,count(*) n FROM creator_handle_tasks WHERE run_id=%s GROUP BY status", (run["id"],)
-            ).fetchall():
-                counts[row["status"]] = row["n"]
-                counts["total"] += row["n"]
-            counts["completed"] = counts["succeeded"]
-            usage = conn.execute(
-                """SELECT coalesce(sum(api_requests),0) api_requests,coalesce(sum(input_tokens),0) input_tokens,
-                coalesce(sum(output_tokens),0) output_tokens FROM creator_handle_tasks WHERE run_id=%s""",
-                (run["id"],),
-            ).fetchone()
-        candidate_base = """FROM creator_handle_tasks t JOIN contacts c ON c.id=t.contact_id
-            JOIN creator_ownership_tasks p ON p.id=t.ownership_task_id
-            WHERE t.cm_authorization_id=%s AND t.review_status<>'confirmed' AND t.policy_version=%s
-            AND p.policy_version=%s AND p.status='succeeded' AND p.outcome='suggested' AND p.confidence>=.95
-            AND NOT EXISTS (SELECT 1 FROM creator_ownership_tasks n WHERE n.contact_id=p.contact_id
-              AND n.cm_authorization_id=p.cm_authorization_id AND n.status='succeeded'
-              AND (n.created_at,n.id)>(p.created_at,p.id))
-            AND NOT EXISTS (SELECT 1 FROM contact_assignments a
-              WHERE a.contact_id=t.contact_id AND a.ended_at IS NULL AND a.responsible_authorization_id<>%s)
-            AND NOT EXISTS (SELECT 1 FROM creator_account_assignments a
-              WHERE a.contact_id=t.contact_id AND a.ended_at IS NULL AND a.responsible_authorization_id<>%s)"""
-        candidate_args = [cm_id, POLICY_VERSION, ownership.POLICY_VERSION, cm_id, cm_id]
-        # Preserve previously confirmed account-level records, without duplicating people.
-        formal_base = """FROM (SELECT DISTINCT ON(contact_id) * FROM (
-            SELECT id,contact_id,handle_task_id,0 AS priority FROM contact_assignments
+        imported = creator_imports.page_data(actor_id, cm_id, q=query if tab=="candidates" else "", page=page)
+        # Person-level and older account-level assignments describe the same
+        # library. UNION ensures that a person with several handles appears once.
+        formal_base = """FROM contacts c WHERE c.creator_type='cap' AND c.id IN (
+            SELECT contact_id FROM contact_assignments
             WHERE responsible_authorization_id=%s AND ended_at IS NULL
-            UNION ALL SELECT a.id,a.contact_id,NULL::uuid AS handle_task_id,1 AS priority
-            FROM creator_account_assignments a WHERE a.responsible_authorization_id=%s AND a.ended_at IS NULL
-              AND NOT EXISTS (SELECT 1 FROM contact_assignments p
-                WHERE p.contact_id=a.contact_id AND p.ended_at IS NULL)
-            ) assignments ORDER BY contact_id,priority,id) a JOIN contacts c ON c.id=a.contact_id
-            LEFT JOIN creator_handle_tasks t ON t.id=a.handle_task_id WHERE TRUE"""
-        formal_args = [cm_id, cm_id]
-        counts["candidates"] = conn.execute("SELECT count(*) n " + candidate_base, candidate_args).fetchone()["n"]
-        counts["confirmed"] = conn.execute("SELECT count(*) n " + formal_base, formal_args).fetchone()["n"]
-        query = str(query).strip()[:120]
-        page = max(1, int(page))
-        if tab not in ("candidates", "confirmed", "mine"):
-            tab = "candidates"
+            UNION SELECT contact_id FROM creator_account_assignments
+            WHERE responsible_authorization_id=%s AND ended_at IS NULL)"""
+        args = [cm_id, cm_id]
+        confirmed = conn.execute("SELECT count(*) n " + formal_base, args).fetchone()["n"]
+        counts = dict.fromkeys((*TASK_LABELS, "total", "completed", "candidates", "confirmed"), 0)
+        counts.update(candidates=imported["total"], confirmed=confirmed)
         if tab == "candidates":
-            ai_rows = conn.execute(
-                "SELECT t.*,c.display_name,c.creator_type " + candidate_base, candidate_args
-            ).fetchall()
-            all_rows = _mixed_candidates(conn, cm_id, ai_rows, settings, query)
-            total = len(all_rows)
-            counts["candidates"] = total
-            pages = max(1, (total + 24) // 25)
-            page = min(page, pages)
-            rows = all_rows[(page - 1) * 25:page * 25]
+            items, total = imported["candidates"], imported["total"]
+            pages, page = imported["total_pages"], imported["page"]
         else:
-            base, args = formal_base, formal_args.copy()
-            columns = "t.*,a.id AS assignment_id,a.contact_id AS formal_contact_id,c.display_name,c.creator_type"
             if query:
-                base += " AND (c.display_name ILIKE %s OR EXISTS (SELECT 1 FROM contact_social_accounts l " \
-                    "JOIN social_accounts s ON s.id=l.social_account_id WHERE l.contact_id=c.id " \
-                    "AND l.status='confirmed' AND l.relationship='owner' AND s.normalized_handle ILIKE %s))"
-                args.extend(["%" + query + "%"] * 2)
-            total = conn.execute("SELECT count(*) n " + base, args).fetchone()["n"]
-            pages = max(1, (total + 24) // 25)
-            page = min(page, pages)
-            rows = conn.execute(
-                "SELECT " + columns + " " + base + " ORDER BY c.display_name,c.id LIMIT 25 OFFSET %s",
-                [*args, (page - 1) * 25],
-            ).fetchall()
-        import_items = {
-            item["id"]: item for item in creator_imports.candidate_items(
-                conn, cm_id, [r for r in rows if r.get("kind") == "import"]
-            )
-        }
-        items = []
-        for row in rows:
-            if row.get("kind") == "import":
-                item = import_items[str(row["id"])]
-                merged = row.get("merged_ai_task")
-                if merged and item["contact_id"]:
-                    try:
-                        _parent(conn, merged, settings, full=False)
-                        item["sources"] = ["Excel", "AI"]
-                        item["source"] = "Excel + AI"
-                    except (ValueError, PermissionError):
-                        pass
-                items.append(item)
-                continue
-            contact_id = row.get("formal_contact_id") or row["contact_id"]
-            identity = conn.execute(
-                "SELECT open_id,CASE WHEN avatar_status='unavailable' THEN NULL ELSE avatar_url END AS avatar_url "
-                "FROM lark_identities WHERE contact_id=%s AND identity_type='user' "
-                "ORDER BY last_seen_at DESC,open_id LIMIT 1",
-                (contact_id,),
-            ).fetchone()
-            valid_parent = False
-            if row.get("ownership_task_id"):
-                try:
-                    _parent(conn, row, settings, full=False)
-                    valid_parent = True
-                except (ValueError, PermissionError):
-                    pass
-            # Polling checks only cited material, never rescans the full message history.
-            # Hide private derived suggestions as soon as their source is no longer readable.
-            readable = valid_parent and _valid_handle_material(row, settings, full=False)
-            result = _decode(row, "result_ciphertext", settings) if readable else {}
-            options = [{"handle": c["handle"], "confidence": c["confidence"]} for c in result.get("candidates", [])]
-            if tab == "candidates":
-                options = [option for option in options if option["handle"] in row["candidate_handles"]]
-            handles = row.get("selected_handles") or []
-            if tab != "candidates":
+                formal_base += """ AND (POSITION(lower(%s) IN lower(COALESCE(c.display_name,'')))>0
+                    OR EXISTS (SELECT 1 FROM contact_social_accounts l JOIN social_accounts s
+                        ON s.id=l.social_account_id WHERE l.contact_id=c.id AND l.status='confirmed'
+                        AND l.relationship='owner' AND POSITION(lower(%s) IN lower(s.normalized_handle))>0))"""
+                args.extend((query,query))
+            total = conn.execute("SELECT count(*) n " + formal_base, args).fetchone()["n"]
+            pages = max(1,(total+24)//25)
+            page = min(page,pages)
+            people = conn.execute("SELECT c.id,c.display_name,c.creator_type " + formal_base
+                                  + " ORDER BY c.display_name,c.id LIMIT 25 OFFSET %s", [*args,(page-1)*25]).fetchall()
+            items = []
+            for person in people:
+                identity = conn.execute(
+                    """SELECT open_id,CASE WHEN avatar_status='unavailable' THEN NULL ELSE avatar_url END avatar_url
+                    FROM lark_identities WHERE contact_id=%s AND identity_type='user'
+                    ORDER BY last_seen_at DESC,open_id LIMIT 1""", (person["id"],),
+                ).fetchone()
                 accounts = conn.execute(
-                        """SELECT s.display_handle
-                        FROM social_accounts s WHERE s.id IN (
-                            SELECT l.social_account_id FROM contact_social_accounts l
-                            WHERE l.contact_id=%s AND l.status='confirmed' AND l.relationship='owner'
-                            UNION SELECT a.social_account_id FROM creator_account_assignments a
-                            WHERE a.contact_id=%s AND a.responsible_authorization_id=%s AND a.ended_at IS NULL
-                        ) ORDER BY s.normalized_handle""",
-                        (contact_id, contact_id, cm_id),
-                    ).fetchall()
-                handles = [r["display_handle"] for r in accounts]
-            status = row.get("status")
-            reason = (
-                REASONS["account_conflict"]
-                if row.get("outcome") == "conflict"
-                else result.get("reason") or REASONS.get(row.get("reason_code"), "等待核对 handle。")
-            )
-            if result.get("outcome") == "review":
-                notes = list(
-                    dict.fromkeys(
-                        note
-                        for candidate in result.get("candidates", [])
-                        for note in [*candidate.get("conflicts", []), *candidate.get("missing_info", [])]
-                    )
-                )
-                if notes:
-                    reason = "待核对：" + "；".join(notes[:3])
-            if tab == "candidates" and not valid_parent:
-                reason = REASONS["parent_changed"]
-            elif row.get("pack_ciphertext") and not readable:
-                reason = "匹配材料已变化，请重新核对；不会自动入库。"
-            elif tab != "candidates" and not row.get("handle_task_id") and not row.get("ownership_task_id"):
-                reason = "原有正式记录，本轮未改动。"
-            task_run = None
-            if owner and tab == "candidates" and row.get("run_id"):
-                task_run = (
-                    run
-                    if run and run["id"] == row["run_id"]
-                    else conn.execute("SELECT * FROM creator_handle_runs WHERE id=%s", (row["run_id"],)).fetchone()
-                )
-            items.append(
-                {
-                    "id": str(row.get("id") or row.get("assignment_id")),
-                    "kind": "ai",
-                    "sources": ["AI"] if tab == "candidates"
-                    else _formal_sources(conn, cm_id, contact_id, handles, settings),
-                    "contact_id": str(contact_id),
-                    "display_name": row["display_name"],
+                    """SELECT s.display_handle FROM social_accounts s WHERE s.id IN (
+                        SELECT social_account_id FROM contact_social_accounts
+                        WHERE contact_id=%s AND status='confirmed' AND relationship='owner'
+                        UNION SELECT social_account_id FROM creator_account_assignments
+                        WHERE contact_id=%s AND responsible_authorization_id=%s AND ended_at IS NULL
+                    ) ORDER BY s.normalized_handle""", (person["id"],person["id"],cm_id),
+                ).fetchall()
+                has_excel = conn.execute(
+                    """SELECT 1 FROM creator_import_rows r JOIN creator_import_batches b ON b.id=r.batch_id
+                    WHERE r.contact_id=%s AND r.cm_authorization_id=%s AND r.review_status='confirmed'
+                    AND b.policy_version=%s LIMIT 1""", (person["id"],cm_id,creator_imports.POLICY_VERSION),
+                ).fetchone()
+                sources = ["Excel"] if has_excel else ["手动"]
+                items.append({
+                    "id": str(person["id"]), "kind": "confirmed", "contact_id": str(person["id"]),
+                    "display_name": person["display_name"] or "未命名用户", "creator_type": "cap",
                     "open_id": identity["open_id"] if identity else None,
                     "avatar_url": safe_avatar_url(identity["avatar_url"]) if identity else None,
                     "private_chat_url": private_chat_url(identity["open_id"] if identity else None),
-                    "handle_options": options,
-                    "handles": handles,
-                    "creator_type": row["creator_type"],
-                    "status_label": "已入库"
-                    if tab != "candidates"
-                    else "已暂缓"
-                    if row["review_status"] == "deferred"
-                    else "存在冲突"
-                    if row.get("outcome") == "conflict"
-                    else "匹配通过"
-                    if row.get("outcome") == "matched" and readable
-                    else TASK_LABELS.get(status, "待确认"),
-                    "reason": reason,
-                    "can_confirm": tab == "candidates"
-                    and valid_parent
-                    and status in ("succeeded", "skipped", "failed", "invalid"),
-                    "can_defer": tab == "candidates",
-                    "can_recheck": bool(
-                        task_run
-                        and task_run["status"] in ("preview", "completed")
-                        and not task_run["auto_admit"]
-                        and valid_parent
-                        and row["review_status"] != "confirmed"
-                        and status in ("succeeded", "skipped", "failed", "invalid")
-                        and row["attempts"] < 2
-                    ),
-                    "has_evidence": readable,
-                }
-            )
-        for item in items:
-            item["source"] = " + ".join(item["sources"])
+                    "handles": [r["display_handle"] for r in accounts],
+                    "sources": sources, "source": " + ".join(sources),
+                    "status_label": "已入库", "can_confirm": False, "can_defer": False,
+                })
         return {
-            "cms": cms,
-            "selected_cm_id": str(cm_id),
-            "can_manage": owner,
-            "run": None
-            if not run
-            else {
-                "id": str(run["id"]),
-                "status": run["status"],
-                "status_label": RUN_LABELS[run["status"]],
-                "auto_admit": run["auto_admit"],
-                "can_start": owner and run["status"] in ("preview", "completed") and counts["ready"] > 0,
-                "can_pause": owner and run["status"] == "running",
-                "can_resume": owner and run["status"] == "paused",
-            },
-            "counts": counts,
-            "usage": usage,
-            "import_batches": creator_imports.batch_summaries(conn, cm_id),
-            "items": items,
-            "total_count": total,
-            "total_pages": pages,
-            "page": page,
+            "cms": cms, "selected_cm_id": str(cm_id), "can_manage": owner,
+            "run": None, "counts": counts, "usage": {"api_requests": 0, "input_tokens": 0, "output_tokens": 0},
+            "import_batches": imported["batches"], "items": items,
+            "total_count": total, "total_pages": pages, "page": page,
         }
 
 

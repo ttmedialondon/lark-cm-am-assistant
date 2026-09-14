@@ -52,7 +52,7 @@ def test_cm_can_read_review_own_handles_without_admin_and_cannot_cross_scope(mon
     html = client.get("/creators")
     assert html.status_code == 200
     assert "候选达人" in html.text and "我的达人" in html.text
-    assert "导入达人账号名单" in html.text and 'value="cap" selected' in html.text
+    assert "导入 CAP 达人账号名单" in html.text and "整份名单的属性固定为 CAP" in html.text
     assert 'id="creators-type-column" hidden' in html.text
     assert 'id="creators-type-column" hidden' not in client.get("/creators?tab=mine").text
     assert 'id="creators-status-column" hidden' not in html.text
@@ -79,51 +79,39 @@ def test_cm_can_read_review_own_handles_without_admin_and_cannot_cross_scope(mon
     assert client.post(type_url, data={"cm_id": str(actor["id"]), "creator_type": "cap"}).status_code == 400
     assert client.post(type_url, data={
         "csrf_token": "csrf", "cm_id": str(actor["id"]), "creator_type": "non_cap", "actor_id": str(foreign),
-    }).status_code == 200
-    assert calls[-1] == (actor["id"], actor["id"], task, "non_cap")
+    }).status_code == 410
+    assert not any(len(call) == 4 and call[-1] == "non_cap" for call in calls)
 
 
-def test_scan_and_auto_admit_are_owner_only_and_explicit_csrf_is_required(monkeypatch):
+def test_retired_ai_and_type_actions_cannot_run_but_still_require_active_auth_and_csrf(monkeypatch):
     client, actor = browser(monkeypatch)
-    run, task = uuid4(), uuid4()
+    run, task, batch = uuid4(), uuid4(), uuid4()
     calls = []
     for name in (
         "create_preview", "start_run", "pause_run", "resume_run", "set_auto_admit", "confirm_task", "defer_task",
-        "recheck_task",
+        "recheck_task", "set_creator_type",
     ):
         monkeypatch.setattr(creator_handles, name, lambda *args: calls.append(args) or run)
     actions = ["/creators/preview", *(f"/creators/runs/{run}/{name}" for name in (
         "start", "pause", "resume", "auto-admit",
-    )), f"/creators/tasks/{task}/recheck"]
+    )), f"/creators/tasks/{task}/recheck", f"/creators/people/{task}/type",
+        f"/creators/imports/{batch}/pause", f"/creators/imports/{batch}/resume"]
     for path in actions:
         assert client.post(path, data={
             "csrf_token": "csrf", "cm_id": str(actor["id"]), "enabled": "1",
-        }).status_code == 403
+        }).status_code == 410
     for invalid in ({}, {"csrf_token": "wrong", "handles": '["valid"]'},
                     {"csrf_token": "csrf", "handles": '"not-array"'}, {"csrf_token": "csrf", "handles": "[]"}):
         assert client.post(f"/creators/tasks/{task}/confirm", data=invalid).status_code == 400
-    assert not calls
-    owner, admin = browser(monkeypatch, owner=True)
+    owner, _admin = browser(monkeypatch, owner=True)
     for path in actions:
         assert owner.post(path, data={"cm_id": str(actor["id"]), "enabled": "1"}).status_code == 400
+        assert owner.post(path, data={"csrf_token": "csrf", "enabled": "1"}).status_code == 410
     assert not calls
-    assert owner.post(f"/creators/runs/{run}/auto-admit", data={"csrf_token": "csrf"}).status_code == 400
-    assert owner.post(f"/creators/runs/{run}/auto-admit", data={
-        "csrf_token": "csrf", "enabled": "0",
-    }).status_code == 200
-    assert calls == [(admin["id"], run, False)]
-    assert owner.post(f"/creators/tasks/{task}/recheck", data={"csrf_token": "csrf"}).status_code == 200
-    assert calls == [(admin["id"], run, False), (admin["id"], task)]
-
-    def unchanged(*_args):
-        raise ValueError("材料未变化，不会重复付费。")
-
-    monkeypatch.setattr(creator_handles, "recheck_task", unchanged)
-    response = owner.post(f"/creators/tasks/{task}/recheck", data={"csrf_token": "csrf"})
-    assert response.status_code == 400 and "材料未变化" in response.json()["error"]
-    assert calls == [(admin["id"], run, False), (admin["id"], task)]
     revoked, _ = browser(monkeypatch, active=False)
     assert revoked.get("/creators").status_code == 403
+    for path in actions:
+        assert revoked.post(path, data={"csrf_token": "csrf"}).status_code == 403
     assert revoked.post(f"/creators/tasks/{task}/defer", data={"csrf_token": "csrf"}).status_code == 403
 
 
@@ -156,8 +144,9 @@ def test_excel_upload_is_bounded_scoped_and_requires_explicit_start_and_confirma
     assert result.status_code == 200 and result.json()["counts"]["valid"] == 1
     assert result.headers["cache-control"] == "no-store, max-age=0"
     assert calls == [("preview", actor["id"], "CAP handles.xlsx", b"xlsx", "cap")]
-    assert client.post(url + "&creator_type=non_cap", content=b"xlsx", headers=headers).status_code == 200
-    assert calls[-1] == ("preview", actor["id"], "CAP handles.xlsx", b"xlsx", "non_cap")
+    for creator_type in ("non_cap", "pending"):
+        assert client.post(url + "&creator_type=" + creator_type, content=b"xlsx", headers=headers).status_code == 400
+    assert len(calls) == 1
     assert client.post(f"/creators/imports/{batch}/start").status_code == 400
     assert client.post(f"/creators/imports/{batch}/start", data={"csrf_token": "csrf"}).status_code == 200
     assert calls[-1] == ("start", actor["id"], batch)

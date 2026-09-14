@@ -31,15 +31,15 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 | `social_accounts`、`contact_social_accounts` | 平台账号及关联用户；一个用户可以关联多个 handle |
 | `creator_workflow_candidates`、`creator_workflow_sources`、`creator_workflow_requests` | 保留的旧线索、来源和请求历史；无现行写入入口 |
 | `creator_account_assignments` | 旧账号级正式归属，继续作为冲突和旧名单读取依据；新版不往旧名单表写入 |
-| `contact_assignments` | 人级负责人；第三步统一入库事务写入，引用 `ownership_task_id` 和 `handle_task_id`，与账号绑定同时完成 |
+| `contact_assignments` | 人级负责人；当前人工入库事务与账号绑定同时完成，引用 `import_row_id`；旧 AI 任务引用保留为历史 |
 | `creator_ownership_runs`、`creator_ownership_tasks`、`creator_ownership_refs` | 第二步 CM 批次、人×CM任务/受控结论、授权绑定且冻结的消息引用；输入与派生说明加密，原文仍来自原存储 |
-| `creator_handle_runs`、`creator_handle_tasks` | 第三步批次、自动开关、第二步建议对应的候选、加密账号材料/结果、冻结引用、真实用量及人工状态 |
-| `creator_import_batches`、`creator_import_rows` | 单列 Excel 批次与账号行；分别记录上传人、所选 CM 和明确声明的名单属性。账号对应群内的达人按联系人去重，唯一达人可入库，零人或多人时用户留空。用 `import_row_id` 保留入库来源，不伪造联系人或第二步父任务 |
+| `creator_handle_runs`、`creator_handle_tasks` | 独立旧 handle 批次和任务历史；当前 CAP 页面不读取其候选，扫描入口已停用 |
+| `creator_import_batches`、`creator_import_rows` | 单列 CAP Excel 批次与账号行；分别记录上传人和所选 CM。预览存于批次，确认导入后同步创建用户可空的账号行；人工确认用户及冲突后入库。用 `import_row_id` 保留来源，不创建空壳联系人，不进入 AI 队列 |
 | `creator_workflow_ai_runs`、`creator_workflow_ai_tasks`、`creator_workflow_onboarding` | 旧扫描结果、引用与接入记录，仅保留历史，未完成项已取消 |
 | `offhours_summary_settings`、`offhours_summary_runs`、`offhours_summary_tasks` | 指定总结时段、执行版本和会话结果 |
 | `admin_roles`、`admin_page_permissions`、`audit_events` | 主人身份、逐页权限、必要的查看/修改审计 |
 
-现有人员类别复用 creator、partner_contact、internal_colleague、merchant_contact、platform_contact、other_external_contact 六个代码。人工已确认身份优先于可信内部同事事实，后者优先于新 AI 类别；人员类别不改变原始租户事实或后台权限。角色、所属组织和负责人是独立事实。达人 CAP 属性保存于 `contacts.creator_type`，值为 `cap`／`non_cap`／`pending`，默认 `pending`；一个人多个账号共用同一属性。Excel 导入使用上传时明确声明的名单属性，确认用户并入库后写到联系人；已有相反属性时提示冲突。
+现有人员类别复用 creator、partner_contact、internal_colleague、merchant_contact、platform_contact、other_external_contact 六个代码。人工已确认身份优先于可信内部同事事实，后者优先于新 AI 类别；人员类别不改变原始租户事实或后台权限。角色、所属组织和负责人是独立事实。达人 CAP 属性保存于 `contacts.creator_type`，值为 `cap`／`non_cap`／`pending`，默认 `pending`；一个人多个账号共用同一属性。当前 Excel 导入固定 CAP，人工确认用户并入库后写到联系人；已有相反属性时提示冲突。底层属性枚举保留，当前前台不提供非 CAP 导入及属性切换。
 
 ## 3. 授权与正文边界
 

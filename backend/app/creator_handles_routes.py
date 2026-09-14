@@ -9,7 +9,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import admin_permissions, creator_handles, creator_imports
+from . import creator_handles, creator_imports
 from .admin import _csrf_matches, _form_fields
 
 
@@ -29,16 +29,14 @@ def create_router(*, current_authorization, render_template, csrf_token):
         code = 403 if isinstance(exc, PermissionError) else 404 if isinstance(exc, LookupError) else 400
         return payload({"error": str(exc)}, code)
 
-    def actor(request, *, owner=False):
+    def actor(request):
         auth = current_authorization(request)
         if not auth or auth["status"] != "active":
             raise PermissionError("登录授权已失效，请重新登录。")
-        if owner and not admin_permissions.access_for(auth["id"])["is_owner"]:
-            raise PermissionError("扫描设置仅限系统主人操作。")
         return auth
 
-    async def form_for(request, *, owner=False):
-        auth = actor(request, owner=owner)
+    async def form_for(request):
+        auth = actor(request)
         form = await _form_fields(request)
         if not _csrf_matches(form, csrf_token(auth)):
             raise ValueError("请求校验失败，请刷新页面后重试。")
@@ -62,43 +60,26 @@ def create_router(*, current_authorization, render_template, csrf_token):
             return error(exc)
 
     @router.post("/preview")
-    async def preview(request: Request):
-        try:
-            auth, form = await form_for(request, owner=True)
-            cm_id = UUID(form.get("cm_id", ""))
-            ownership_run = UUID(form["ownership_run_id"]) if form.get("ownership_run_id") else None
-            run_id = await run_in_threadpool(creator_handles.create_preview, auth["id"], cm_id, ownership_run)
-            return payload({"run_id": run_id})
-        except (ValueError, LookupError, PermissionError) as exc:
-            return error(exc)
-
     @router.post("/runs/{run_id}/start")
     @router.post("/runs/{run_id}/pause")
     @router.post("/runs/{run_id}/resume")
     @router.post("/runs/{run_id}/auto-admit")
-    async def manage(request: Request, run_id: UUID):
+    @router.post("/tasks/{task_id}/recheck")
+    @router.post("/imports/{batch_id}/pause")
+    @router.post("/imports/{batch_id}/resume")
+    @router.post("/people/{contact_id}/type")
+    async def retired_action(request: Request):
         try:
-            auth, form = await form_for(request, owner=True)
-            action = request.url.path.rsplit("/", 1)[-1]
-            if action == "auto-admit":
-                if form.get("enabled") not in {"0", "1"}:
-                    raise ValueError("请选择是否开启自动入库。")
-                await run_in_threadpool(creator_handles.set_auto_admit, auth["id"], run_id, form["enabled"] == "1")
-            else:
-                function = {"start": creator_handles.start_run, "pause": creator_handles.pause_run,
-                            "resume": creator_handles.resume_run}[action]
-                await run_in_threadpool(function, auth["id"], run_id)
-            return payload({"run_id": run_id})
+            await form_for(request)
+            return payload({"error": "当前仅支持 CAP 名单导入和人工确认，此操作已停用。"}, 410)
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
 
     @router.post("/tasks/{task_id}/confirm")
     @router.post("/tasks/{task_id}/defer")
-    @router.post("/tasks/{task_id}/recheck")
     async def review(request: Request, task_id: UUID):
         try:
-            recheck = request.url.path.endswith("/recheck")
-            auth, form = await form_for(request, owner=recheck)
+            auth, form = await form_for(request)
             if request.url.path.endswith("/confirm"):
                 try:
                     handles = json.loads(form.get("handles", "[]"))
@@ -109,8 +90,6 @@ def create_router(*, current_authorization, render_template, csrf_token):
                 ):
                     raise ValueError("请填写 1 至 20 个 handle，每个单独一行。")
                 await run_in_threadpool(creator_handles.confirm_task, auth["id"], task_id, handles)
-            elif recheck:
-                await run_in_threadpool(creator_handles.recheck_task, auth["id"], task_id)
             else:
                 await run_in_threadpool(creator_handles.defer_task, auth["id"], task_id)
             return payload({"ok": True})
@@ -125,24 +104,14 @@ def create_router(*, current_authorization, render_template, csrf_token):
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
 
-    @router.post("/people/{contact_id}/type")
-    async def update_creator_type(request: Request, contact_id: UUID):
-        try:
-            auth, form = await form_for(request)
-            await run_in_threadpool(
-                creator_handles.set_creator_type, auth["id"], UUID(form.get("cm_id", "")),
-                contact_id, form.get("creator_type", ""),
-            )
-            return payload({"ok": True})
-        except (ValueError, LookupError, PermissionError) as exc:
-            return error(exc)
-
     @router.post("/imports/preview")
     async def import_preview(request: Request, cm_id: UUID, creator_type: str = "cap"):
         try:
             auth = actor(request)
             if not _csrf_matches({"csrf_token": request.headers.get("X-CSRF-Token", "")}, csrf_token(auth)):
                 raise ValueError("请求校验失败，请刷新页面后重试。")
+            if creator_type != "cap":
+                raise ValueError("当前导入仅支持 CAP 达人名单。")
             if request.headers.get("content-type", "").split(";", 1)[0] != "application/octet-stream":
                 raise ValueError("请上传 .xlsx 文件。")
             limit = creator_imports.MAX_FILE_BYTES
@@ -156,7 +125,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
             filename = unquote(request.headers.get("X-Filename", "")[:512])
             result = await run_in_threadpool(
                 creator_imports.preview_import, auth["id"], cm_id, filename, bytes(content),
-                creator_type=creator_type,
+                creator_type="cap",
             )
             return payload(result)
         except (ValueError, LookupError, PermissionError) as exc:
@@ -179,14 +148,10 @@ def create_router(*, current_authorization, render_template, csrf_token):
             return error(exc)
 
     @router.post("/imports/{batch_id}/start")
-    @router.post("/imports/{batch_id}/pause")
-    @router.post("/imports/{batch_id}/resume")
-    async def import_manage(request: Request, batch_id: UUID):
+    async def import_start(request: Request, batch_id: UUID):
         try:
             auth, _form = await form_for(request)
-            function = {"start": creator_imports.start_import, "pause": creator_imports.pause_import,
-                        "resume": creator_imports.resume_import}[request.url.path.rsplit("/", 1)[-1]]
-            await run_in_threadpool(function, auth["id"], batch_id)
+            await run_in_threadpool(creator_imports.start_import, auth["id"], batch_id)
             return payload({"ok": True})
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
