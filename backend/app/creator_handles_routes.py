@@ -1,6 +1,7 @@
 """Session-scoped creator candidates; CM review is a frontend permission, not an admin grant."""
 
 import json
+from urllib.parse import unquote
 from uuid import UUID
 
 from fastapi import APIRouter, Request
@@ -8,7 +9,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import admin_permissions, creator_handles
+from . import admin_permissions, creator_handles, creator_imports
 from .admin import _csrf_matches, _form_fields
 
 
@@ -121,6 +122,93 @@ def create_router(*, current_authorization, render_template, csrf_token):
         try:
             auth = actor(request)
             return payload(creator_handles.task_evidence(auth["id"], task_id))
+        except (ValueError, LookupError, PermissionError) as exc:
+            return error(exc)
+
+    @router.post("/people/{contact_id}/type")
+    async def update_creator_type(request: Request, contact_id: UUID):
+        try:
+            auth, form = await form_for(request)
+            await run_in_threadpool(
+                creator_handles.set_creator_type, auth["id"], UUID(form.get("cm_id", "")),
+                contact_id, form.get("creator_type", ""),
+            )
+            return payload({"ok": True})
+        except (ValueError, LookupError, PermissionError) as exc:
+            return error(exc)
+
+    @router.post("/imports/preview")
+    async def import_preview(request: Request, cm_id: UUID):
+        try:
+            auth = actor(request)
+            if not _csrf_matches({"csrf_token": request.headers.get("X-CSRF-Token", "")}, csrf_token(auth)):
+                raise ValueError("请求校验失败，请刷新页面后重试。")
+            if request.headers.get("content-type", "").split(";", 1)[0] != "application/octet-stream":
+                raise ValueError("请上传 .xlsx 文件。")
+            limit = creator_imports.MAX_FILE_BYTES
+            if int(request.headers.get("content-length", "0")) > limit:
+                raise ValueError("文件过大，请上传不超过 2 MB 的表格。")
+            content = bytearray()
+            async for chunk in request.stream():
+                if len(content) + len(chunk) > limit:
+                    raise ValueError("文件过大，请上传不超过 2 MB 的表格。")
+                content.extend(chunk)
+            filename = unquote(request.headers.get("X-Filename", "")[:512])
+            result = await run_in_threadpool(
+                creator_imports.preview_import, auth["id"], cm_id, filename, bytes(content),
+            )
+            return payload(result)
+        except (ValueError, LookupError, PermissionError) as exc:
+            return error(exc)
+
+    @router.get("/imports/data")
+    def import_data(request: Request, cm_id: UUID, q: str = "", page: int = 1):
+        try:
+            auth = actor(request)
+            return payload(creator_imports.page_data(auth["id"], cm_id, q=q[:120], page=max(1, page)))
+        except (ValueError, LookupError, PermissionError) as exc:
+            return error(exc)
+
+    @router.get("/imports/users")
+    def import_users(request: Request, cm_id: UUID, q: str = ""):
+        try:
+            auth = actor(request)
+            return payload(creator_imports.search_users(auth["id"], cm_id, q[:120]))
+        except (ValueError, LookupError, PermissionError) as exc:
+            return error(exc)
+
+    @router.post("/imports/{batch_id}/start")
+    @router.post("/imports/{batch_id}/pause")
+    @router.post("/imports/{batch_id}/resume")
+    async def import_manage(request: Request, batch_id: UUID):
+        try:
+            auth, _form = await form_for(request)
+            function = {"start": creator_imports.start_import, "pause": creator_imports.pause_import,
+                        "resume": creator_imports.resume_import}[request.url.path.rsplit("/", 1)[-1]]
+            await run_in_threadpool(function, auth["id"], batch_id)
+            return payload({"ok": True})
+        except (ValueError, LookupError, PermissionError) as exc:
+            return error(exc)
+
+    @router.post("/imports/rows/{row_id}/confirm")
+    @router.post("/imports/rows/{row_id}/defer")
+    async def import_review(request: Request, row_id: UUID):
+        try:
+            auth, form = await form_for(request)
+            if request.url.path.endswith("/confirm"):
+                handle = form.get("handle", "").strip()
+                if not handle or len(handle) > 160:
+                    raise ValueError("请填写有效的 handle。")
+                try:
+                    contact_id = UUID(form.get("contact_id", ""))
+                except ValueError as exc:
+                    raise ValueError("请搜索并选择对应用户。") from exc
+                await run_in_threadpool(
+                    creator_imports.confirm_row, auth["id"], row_id, handle, contact_id,
+                )
+            else:
+                await run_in_threadpool(creator_imports.defer_row, auth["id"], row_id)
+            return payload({"ok": True})
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
 

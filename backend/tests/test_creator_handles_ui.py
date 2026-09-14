@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from app import admin_permissions, creator_handles, creator_handles_routes
+from app import admin_permissions, creator_handles, creator_handles_routes, creator_imports
 
 
 def browser(monkeypatch, *, owner=False, active=True):
@@ -52,6 +52,9 @@ def test_cm_can_read_review_own_handles_without_admin_and_cannot_cross_scope(mon
     html = client.get("/creators")
     assert html.status_code == 200
     assert "候选达人" in html.text and "我的达人" in html.text
+    assert "导入达人账号名单" in html.text and "CAP 属性默认为待定" in html.text
+    assert 'id="creators-type-column" hidden' in html.text
+    assert 'id="creators-type-column" hidden' not in client.get("/creators?tab=mine").text
     assert 'id="creators-status-column" hidden' not in html.text
     assert 'id="creators-status-column" hidden' in client.get("/creators?tab=mine").text
     assert 'id="creators-preview"' not in html.text
@@ -71,6 +74,13 @@ def test_cm_can_read_review_own_handles_without_admin_and_cannot_cross_scope(mon
             "csrf_token": "csrf", "handles": json.dumps(handles),
         }).status_code == 403
     assert client.get(f"/creators/tasks/{foreign}/evidence").status_code == 403
+    monkeypatch.setattr(creator_handles, "set_creator_type", lambda *args: calls.append(args))
+    type_url = f"/creators/people/{task}/type"
+    assert client.post(type_url, data={"cm_id": str(actor["id"]), "creator_type": "cap"}).status_code == 400
+    assert client.post(type_url, data={
+        "csrf_token": "csrf", "cm_id": str(actor["id"]), "creator_type": "non_cap", "actor_id": str(foreign),
+    }).status_code == 200
+    assert calls[-1] == (actor["id"], actor["id"], task, "non_cap")
 
 
 def test_scan_and_auto_admit_are_owner_only_and_explicit_csrf_is_required(monkeypatch):
@@ -115,3 +125,43 @@ def test_scan_and_auto_admit_are_owner_only_and_explicit_csrf_is_required(monkey
     revoked, _ = browser(monkeypatch, active=False)
     assert revoked.get("/creators").status_code == 403
     assert revoked.post(f"/creators/tasks/{task}/defer", data={"csrf_token": "csrf"}).status_code == 403
+
+
+def test_excel_upload_is_bounded_scoped_and_requires_explicit_start_and_confirmation(monkeypatch):
+    client, actor = browser(monkeypatch)
+    batch, row, person, foreign = uuid4(), uuid4(), uuid4(), uuid4()
+    calls = []
+
+    def preview(actor_id, cm_id, filename, content):
+        if cm_id != actor_id:
+            raise PermissionError("只能导入自己的名单。")
+        calls.append(("preview", actor_id, filename, content))
+        return {"id": str(batch), "status": "preview", "counts": {"valid": 1, "duplicates": 0, "invalid": 0},
+                "rows": [{"row_number": 2, "handle": "example", "error": ""}]}
+
+    monkeypatch.setattr(creator_imports, "preview_import", preview)
+    monkeypatch.setattr(creator_imports, "start_import", lambda *args: calls.append(("start", *args)))
+    monkeypatch.setattr(creator_imports, "confirm_row", lambda *args: calls.append(("confirm", *args)))
+    url = f"/creators/imports/preview?cm_id={actor['id']}"
+    headers = {"Content-Type": "application/octet-stream", "X-Filename": "CAP%20handles.xlsx"}
+    assert client.post(url, content=b"xlsx", headers=headers).status_code == 400
+    headers["X-CSRF-Token"] = "csrf"
+    assert client.post(url, content=b"x" * (creator_imports.MAX_FILE_BYTES + 1), headers=headers).status_code == 400
+    assert client.post(url, content=iter([b"x" * (creator_imports.MAX_FILE_BYTES + 1)]),
+                       headers=headers).status_code == 400
+    assert not calls
+    assert client.post(f"/creators/imports/preview?cm_id={foreign}", content=b"xlsx",
+                       headers=headers).status_code == 403
+    result = client.post(url, content=b"xlsx", headers=headers)
+    assert result.status_code == 200 and result.json()["counts"]["valid"] == 1
+    assert result.headers["cache-control"] == "no-store, max-age=0"
+    assert calls == [("preview", actor["id"], "CAP handles.xlsx", b"xlsx")]
+    assert client.post(f"/creators/imports/{batch}/start").status_code == 400
+    assert client.post(f"/creators/imports/{batch}/start", data={"csrf_token": "csrf"}).status_code == 200
+    assert calls[-1] == ("start", actor["id"], batch)
+    confirm = f"/creators/imports/rows/{row}/confirm"
+    assert client.post(confirm, data={"handle": "example", "contact_id": str(person)}).status_code == 400
+    assert client.post(confirm, data={"csrf_token": "csrf", "handle": "example"}).status_code == 400
+    assert client.post(confirm, data={"csrf_token": "csrf", "handle": "example", "contact_id": str(person),
+                                      "actor_id": str(foreign)}).status_code == 200
+    assert calls[-1] == ("confirm", actor["id"], row, "example", person)

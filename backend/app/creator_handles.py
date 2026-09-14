@@ -364,6 +364,35 @@ def confirm_task(actor_id, task_id, handles):
         return _admit(conn, task, handles, actor_id, get_settings())
 
 
+def set_creator_type(actor_id, cm_id, contact_id, creator_type):
+    if creator_type not in ("cap", "non_cap", "pending"):
+        raise ValueError("请选择 CAP、非CAP 或待定。")
+    actor_id, contact_id = ownership._uuid(actor_id), ownership._uuid(contact_id)
+    with connection() as conn, conn.transaction():
+        cm_id, _ = _access(conn, actor_id, cm_id)
+        person = conn.execute("SELECT creator_type FROM contacts WHERE id=%s FOR UPDATE", (contact_id,)).fetchone()
+        if not person or not conn.execute(
+            """SELECT 1 FROM contact_assignments WHERE contact_id=%s
+            AND responsible_authorization_id=%s AND ended_at IS NULL
+            UNION ALL SELECT 1 FROM creator_account_assignments a WHERE a.contact_id=%s
+            AND a.responsible_authorization_id=%s AND a.ended_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM contact_assignments p WHERE p.contact_id=a.contact_id
+                AND p.ended_at IS NULL)
+            AND NOT EXISTS (SELECT 1 FROM creator_account_assignments other WHERE other.contact_id=a.contact_id
+                AND other.ended_at IS NULL AND other.responsible_authorization_id<>a.responsible_authorization_id)
+            LIMIT 1""",
+            (contact_id, cm_id, contact_id, cm_id),
+        ).fetchone():
+            raise PermissionError("只能修改该负责人名下已入库达人的属性。")
+        if person["creator_type"] == creator_type:
+            return
+        conn.execute("UPDATE contacts SET creator_type=%s,updated_at=NOW() WHERE id=%s", (creator_type, contact_id))
+        _audit(conn, actor_id, "type_updated", {
+            "contact_id": str(contact_id), "cm_id": str(cm_id),
+            "previous_type": person["creator_type"], "creator_type": creator_type,
+        })
+
+
 def defer_task(actor_id, task_id):
     actor_id = ownership._uuid(actor_id)
     with connection() as conn, conn.transaction():
@@ -822,10 +851,10 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
             tab = "candidates"
         if tab == "candidates":
             base, args = candidate_base, candidate_args.copy()
-            columns = "t.*,c.display_name"
+            columns = "t.*,c.display_name,c.creator_type"
         else:
             base, args = formal_base, formal_args.copy()
-            columns = "t.*,a.id AS assignment_id,a.contact_id AS formal_contact_id,c.display_name"
+            columns = "t.*,a.id AS assignment_id,a.contact_id AS formal_contact_id,c.display_name,c.creator_type"
         if query:
             base += " AND c.display_name ILIKE %s"
             args.append("%" + query + "%")
@@ -859,10 +888,9 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
             options = [{"handle": c["handle"], "confidence": c["confidence"]} for c in result.get("candidates", [])]
             handles = row.get("selected_handles") or []
             if tab != "candidates":
-                handles = [
-                    r["display_handle"]
-                    for r in conn.execute(
-                        """SELECT s.display_handle FROM social_accounts s WHERE s.id IN (
+                accounts = conn.execute(
+                        """SELECT s.display_handle
+                        FROM social_accounts s WHERE s.id IN (
                             SELECT l.social_account_id FROM contact_social_accounts l
                             WHERE l.contact_id=%s AND l.status='confirmed' AND l.relationship='owner'
                             UNION SELECT a.social_account_id FROM creator_account_assignments a
@@ -870,7 +898,7 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
                         ) ORDER BY s.normalized_handle""",
                         (contact_id, contact_id, cm_id),
                     ).fetchall()
-                ]
+                handles = [r["display_handle"] for r in accounts]
             status = row.get("status")
             reason = (
                 REASONS["account_conflict"]
@@ -903,12 +931,14 @@ def page_data(actor_id, cm_id=None, tab="candidates", query="", page=1):
             items.append(
                 {
                     "id": str(row.get("id") or row.get("assignment_id")),
+                    "contact_id": str(contact_id),
                     "display_name": row["display_name"],
                     "open_id": identity["open_id"] if identity else None,
                     "avatar_url": safe_avatar_url(identity["avatar_url"]) if identity else None,
                     "private_chat_url": private_chat_url(identity["open_id"] if identity else None),
                     "handle_options": options,
                     "handles": handles,
+                    "creator_type": row["creator_type"],
                     "status_label": "已入库"
                     if tab != "candidates"
                     else "已暂缓"

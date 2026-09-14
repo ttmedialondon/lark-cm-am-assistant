@@ -173,8 +173,10 @@ def test_cm_can_fill_missing_handles_but_not_cross_scope_or_bypass_input_checks(
     task = _task(pg, case)
     assert task["status"] == "skipped" and not case.calls
     avatar = "https://s1-imfile.feishucdn.com/static-resource/v1/example.png"
-    for url, status, expected in ((None, "succeeded", None), (avatar, "succeeded", avatar),
-                                  (avatar, "unavailable", None), ("https://untrusted.example/avatar.png", "succeeded", None)):
+    for url, status, expected in (
+        (None, "succeeded", None), (avatar, "succeeded", avatar),
+        (avatar, "unavailable", None), ("https://untrusted.example/avatar.png", "succeeded", None),
+    ):
         with pg.transaction(force_rollback=True):
             pg.execute("UPDATE lark_identities SET avatar_url=%s,avatar_status=%s WHERE open_id='ou_creator'",
                        (url, status))
@@ -188,6 +190,8 @@ def test_cm_can_fill_missing_handles_but_not_cross_scope_or_bypass_input_checks(
         lambda: handles.task_evidence(outsider, task["id"]),
         lambda: handles.start_run(pilot.ids["cm"], case.run),
         lambda: handles.set_auto_admit(pilot.ids["cm"], case.run, True),
+        lambda: handles.set_creator_type(outsider, pilot.ids["cm"], case.creator, "cap"),
+        lambda: handles.set_creator_type(pilot.ids["cm"], pilot.ids["cm"], case.creator, "cap"),
     ):
         with pytest.raises(PermissionError):
             operation()
@@ -199,7 +203,22 @@ def test_cm_can_fill_missing_handles_but_not_cross_scope_or_bypass_input_checks(
     assert handles.confirm_task(pilot.ids["cm"], task["id"], ["manual_two", "manual.one"]) == 0
     assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 1
     assert pg.execute("SELECT source FROM contact_assignments").fetchone()["source"] == "manual"
-    assert len(handles.page_data(pilot.ids["cm"], tab="confirmed")["items"]) == 1
+    formal = handles.page_data(pilot.ids["cm"], tab="confirmed")["items"]
+    assert len(formal) == 1 and formal[0]["creator_type"] == "pending"
+    assert formal[0]["contact_id"] == str(case.creator)
+    with pytest.raises(PermissionError):
+        handles.set_creator_type(outsider, outsider, case.creator, "cap")
+    for actor_id, creator_type in ((pilot.ids["cm"], "cap"), (pilot.ids["owner"], "non_cap"),
+                                   (pilot.ids["cm"], "pending")):
+        handles.set_creator_type(actor_id, pilot.ids["cm"], case.creator, creator_type)
+        handles.set_creator_type(actor_id, pilot.ids["cm"], case.creator, creator_type)
+        person = handles.page_data(pilot.ids["cm"], tab="confirmed")["items"][0]
+        assert person["creator_type"] == creator_type and len(person["handles"]) == 2
+    changes = pg.execute("SELECT count(*) n FROM audit_events WHERE action='creator_handles_type_updated'").fetchone()
+    assert changes["n"] == 3
+    with pytest.raises(ValueError):
+        handles.set_creator_type(pilot.ids["cm"], pilot.ids["cm"], case.creator, "invalid")
+    assert handles.page_data(pilot.ids["cm"], tab="confirmed")["items"][0]["creator_type"] == "pending"
     assert not case.calls
 
 
