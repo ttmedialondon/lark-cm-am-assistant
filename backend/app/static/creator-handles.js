@@ -32,7 +32,7 @@
     el("import-message").className = `small mt-3 ${error ? "text-danger" : "text-secondary"}`;
   }
   function makeImportRow(item) {
-    const row = node("tr"), handleCell = node("td"), userCell = node("td"), statusCell = node("td");
+    const row = node("tr"), handleCell = node("td"), userCell = node("td");
     handleCell.style.minWidth = "200px"; userCell.style.minWidth = "240px";
     const handle = node("input", "", "form-control"); handle.maxLength = 160;
     handle.setAttribute("aria-label", "达人 handle"); handle.placeholder = "—";
@@ -45,18 +45,17 @@
     const search = node("button", "搜索", "btn btn-sm btn-outline-secondary"); search.type = "button";
     const choices = node("div", "", "d-flex flex-column gap-1 mt-1"); choices.setAttribute("aria-live", "polite");
     searchLine.append(user, search); userCell.append(searchLine, choices);
-    const phase = node("div", "", "fw-semibold"), status = node("div"), reason = node("div", "", "small text-secondary mt-1");
     const editNote = node("div", "账号或用户已修改，原 AI 判断不适用于本次修改；确认时重新核验。", "small text-warning mt-1");
-    editNote.hidden = true; statusCell.append(phase, status, reason, editNote);
+    editNote.hidden = true;
     const actions = node("td"), actionsList = node("div", "", "d-flex gap-1 flex-wrap");
     const confirm = node("button", "确认入库", "btn btn-sm btn-primary"); confirm.type = "button";
     const defer = node("button", "暂缓", "btn btn-sm btn-outline-secondary"); defer.type = "button";
     const evidence = node("button", "查看证据链", "btn btn-sm btn-outline-secondary"); evidence.type = "button";
     evidence.addEventListener("click", () => showEvidence(item.id, parts.dirty));
-    actionsList.append(confirm, defer, evidence); actions.append(actionsList);
+    actionsList.append(confirm, defer, evidence); actions.append(actionsList, editNote);
     const typeCell = node("td"); typeCell.hidden = true;
-    row.append(handleCell, userCell, typeCell, statusCell, actions);
-    const parts = {row, handle, creatorType, groups, user, search, choices, phase, status, reason, editNote, confirm, defer, evidence, contactId: "", dirty: false, searchVersion: 0};
+    row.append(handleCell, userCell, typeCell, actions);
+    const parts = {row, handle, creatorType, groups, user, search, choices, editNote, confirm, defer, evidence, contactId: "", dirty: false, searchVersion: 0};
     const check = () => {
       confirm.disabled = busy || !parts.canConfirm || !handle.value.trim() || !parts.contactId;
       editNote.hidden = !parts.dirty;
@@ -121,8 +120,6 @@
     parts.canConfirm = !!item.can_confirm;
     parts.creatorType.textContent = "CAP 属性：CAP";
     parts.groups.textContent = item.group_names?.length ? `群：${item.group_names.join("、")}` : "群：—";
-    parts.phase.textContent = item.phase_label || "";
-    parts.status.textContent = item.status_label || "待确认"; parts.reason.textContent = item.reason || "";
     parts.editNote.hidden = !parts.dirty;
     parts.handle.disabled = busy || !parts.canConfirm; parts.user.disabled = busy || !parts.canConfirm;
     parts.search.disabled = busy || !parts.canConfirm;
@@ -144,14 +141,13 @@
     personWrap.append(avatar, name); person.append(personWrap);
     const handleCell = node("td"); handleCell.style.minWidth = "250px";
     const saved = node("div", "", "mb-2"); handleCell.append(saved);
-    const typeCell = node("td", "CAP"), statusCell = node("td");
+    const typeCell = node("td", "CAP");
     const actions = node("td");
-    const parts = {row, name, avatar, initial, saved, typeCell, statusCell, actions};
-    row.append(handleCell, person, typeCell, statusCell, actions);
+    const parts = {row, name, avatar, initial, saved, typeCell, actions};
+    row.append(handleCell, person, typeCell, actions);
     return parts;
   }
   function render() {
-    el("status-column").hidden = tab !== "candidates";
     el("type-column").hidden = tab !== "mine";
     if (data.can_manage) el("cm").disabled = busy;
     for (const key of ["mine", "candidates"]) {
@@ -192,7 +188,6 @@
       }
       if (!item.handles?.length) parts.saved.textContent = "—";
       parts.typeCell.hidden = tab !== "mine";
-      parts.statusCell.hidden = tab !== "candidates";
       parts.actions.replaceChildren();
       for (const evidenceRow of item.evidence_rows || []) {
         const button = node("button", `@${evidenceRow.handle} · 查看证据链`, "btn btn-sm btn-outline-secondary d-block mb-1");
