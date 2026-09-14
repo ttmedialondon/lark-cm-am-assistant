@@ -1147,7 +1147,7 @@ def _discover_chats(
                         member_snapshot_status, member_snapshot_checked_at,
                         p2p_counterpart_id, p2p_counterpart_type,
                         p2p_counterpart_open_id, p2p_counterpart_seen_at
-                    ) VALUES (%s, %s, TRUE, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, TRUE, %s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL)
                     ON CONFLICT (authorization_id, chat_id) DO UPDATE SET
                         is_visible = TRUE,
                         last_seen_at = EXCLUDED.last_seen_at,
@@ -1179,9 +1179,7 @@ def _discover_chats(
                         p2p_counterpart_open_id = EXCLUDED.p2p_counterpart_open_id,
                         p2p_counterpart_seen_at = CASE
                             WHEN EXCLUDED.p2p_counterpart_type = 'bot' THEN NULL
-                            WHEN EXCLUDED.p2p_counterpart_open_id IS NULL
-                                THEN authorization_chats.p2p_counterpart_seen_at
-                            ELSE EXCLUDED.p2p_counterpart_seen_at
+                            ELSE authorization_chats.p2p_counterpart_seen_at
                         END
                     """,
                     (
@@ -1195,12 +1193,10 @@ def _discover_chats(
                         snapshot_checked_at,
                         counterpart_id,
                         counterpart_type,
-                        counterpart_open_id,
-                        seen_at if counterpart_open_id else None,
                     ),
                 )
                 # Page commits lock access before identities/contacts. Keep
-                # discovery in the same order so confirmation can do likewise.
+                # that order, then fill the FK after a new identity exists.
                 if counterpart_open_id:
                     _upsert_lark_identity(conn, counterpart_open_id, seen_at=seen_at)
                     _ensure_contact_for_identity(
@@ -1209,6 +1205,12 @@ def _discover_chats(
                         tenant_classification="unresolved",
                         identity_type="user",
                         seen_at=seen_at,
+                    )
+                    conn.execute(
+                        """UPDATE authorization_chats
+                           SET p2p_counterpart_open_id=%s,p2p_counterpart_seen_at=%s
+                           WHERE authorization_id=%s AND chat_id=%s""",
+                        (counterpart_open_id, seen_at, authorization["id"], chat_id),
                     )
                 if measurement:
                     _store_member_snapshot(

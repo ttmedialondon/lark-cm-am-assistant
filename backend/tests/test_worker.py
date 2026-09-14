@@ -133,9 +133,66 @@ def test_tenant_classification_keeps_unknown_people_neutral() -> None:
     ) == "known_external"
 
 
-def test_p2p_contact_discovery_skips_bots() -> None:
+def test_p2p_contact_discovery_skips_bots(pg, monkeypatch) -> None:
     assert _p2p_counterpart_open_id("ou_person", "user") == "ou_person"
     assert _p2p_counterpart_open_id("cli_bot", "bot") is None
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
+    job = worker.SyncJob(UUID(int=1), UUID(int=2), "incremental", 1, "running", 1)
+    pg.execute(
+        "INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,'ou_cm','test')",
+        (job.authorization_id,),
+    )
+    pg.execute(
+        """INSERT INTO sync_jobs(id,authorization_id,mode,status,discovery_status,discovery_generation)
+               VALUES(%s,%s,'incremental','running','running',1)""",
+        (job.id, job.authorization_id),
+    )
+
+    class Client:
+        target_id, target_type = "ou_person", "user"
+
+        def list_chats(self, _token, page_token, *, types):
+            assert page_token is None and types == "p2p"
+            return {"items": [
+                {"chat_id": "oc_person", "p2p_target_id": self.target_id,
+                 "p2p_target_type": self.target_type},
+                {"chat_id": "oc_bot", "p2p_target_id": "cli_bot", "p2p_target_type": "bot"},
+            ]}
+
+    client = Client()
+    assert pg.execute("SELECT 1 FROM lark_identities WHERE open_id='ou_person'").fetchone() is None
+    contact_id = None
+    for _ in range(2):
+        assert worker._discover_chats(
+            job, {"id": job.authorization_id}, "test", client, SimpleNamespace(), chat_type="p2p",
+        ) == 2
+        rows = pg.execute(
+            """SELECT access.chat_id,access.p2p_counterpart_open_id,access.p2p_counterpart_seen_at,
+                      identity.contact_id
+               FROM authorization_chats access
+               LEFT JOIN lark_identities identity ON identity.open_id=access.p2p_counterpart_open_id
+               ORDER BY access.chat_id""",
+        ).fetchall()
+        assert rows[0] == {"chat_id": "oc_bot", "p2p_counterpart_open_id": None,
+                           "p2p_counterpart_seen_at": None, "contact_id": None}
+        assert rows[1]["p2p_counterpart_open_id"] == "ou_person"
+        assert rows[1]["p2p_counterpart_seen_at"] is not None
+        assert rows[1]["contact_id"] is not None
+        if contact_id is not None:
+            assert rows[1]["contact_id"] == contact_id
+        contact_id = rows[1]["contact_id"]
+        assert pg.execute("SELECT COUNT(*) AS count FROM contacts").fetchone()["count"] == 1
+        assert pg.execute("SELECT 1 FROM lark_identities WHERE open_id='cli_bot'").fetchone() is None
+
+    client.target_id, client.target_type = "cli_bot", "bot"
+    worker._discover_chats(
+        job, {"id": job.authorization_id}, "test", client, SimpleNamespace(), chat_type="p2p",
+    )
+    assert pg.execute(
+        "SELECT p2p_counterpart_open_id,p2p_counterpart_seen_at FROM authorization_chats WHERE chat_id='oc_person'",
+    ).fetchone() == {"p2p_counterpart_open_id": None, "p2p_counterpart_seen_at": None}
+    assert pg.execute("SELECT contact_id FROM lark_identities WHERE open_id='ou_person'").fetchone()[
+        "contact_id"] == contact_id
 
 
 def test_member_snapshot_follows_lark_pagination_and_keeps_member_facts() -> None:

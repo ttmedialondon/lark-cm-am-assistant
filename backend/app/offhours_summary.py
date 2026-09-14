@@ -198,14 +198,30 @@ def save_settings_and_enqueue(conn, actor_id, fields):
 
 def _roster(conn):
     return conn.execute(
-        """SELECT ca.contact_id, sa.display_handle, sa.id AS account_id, i.open_id,
+        """WITH people AS MATERIALIZED (
+               SELECT contact_id FROM contact_assignments
+               WHERE responsible_authorization_id=%s AND ended_at IS NULL FOR SHARE
+           ), legacy AS MATERIALIZED (
+               SELECT contact_id,social_account_id FROM creator_account_assignments
+               WHERE responsible_authorization_id=%s AND ended_at IS NULL
+                 AND relationship='owner' FOR SHARE
+           ), owners AS MATERIALIZED (
+               SELECT contact_id,social_account_id FROM contact_social_accounts
+               WHERE status='confirmed' AND relationship='owner'
+                 AND contact_id IN (SELECT contact_id FROM people UNION SELECT contact_id FROM legacy)
+               FOR SHARE
+           )
+           SELECT c.id AS contact_id, sa.display_handle, sa.id AS account_id, i.open_id,
                   COALESCE(i.display_name,c.display_name) AS name
-           FROM creator_account_assignments ca LEFT JOIN social_accounts sa ON sa.id=ca.social_account_id
-           JOIN contacts c ON c.id=ca.contact_id
-           JOIN lark_identities i ON i.contact_id=ca.contact_id AND i.identity_type='user'
-           WHERE ca.responsible_authorization_id=%s AND ca.ended_at IS NULL
-           ORDER BY ca.contact_id,sa.id,i.open_id FOR SHARE OF ca,c,i""",
-        (REMI_ID,),
+           FROM contacts c JOIN lark_identities i ON i.contact_id=c.id AND i.identity_type='user'
+           LEFT JOIN social_accounts sa ON sa.id IN (
+               SELECT social_account_id FROM owners WHERE contact_id=c.id
+               UNION SELECT social_account_id FROM legacy WHERE contact_id=c.id
+           )
+           WHERE c.creator_type='cap'
+             AND c.id IN (SELECT contact_id FROM people UNION SELECT contact_id FROM legacy)
+           ORDER BY c.id,sa.id,i.open_id FOR SHARE OF c,i""",
+        (REMI_ID, REMI_ID),
     ).fetchall()
 
 

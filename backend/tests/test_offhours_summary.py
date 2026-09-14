@@ -155,7 +155,7 @@ def seeded(pg, monkeypatch):
         )
     pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (ids["owner"],))
     for name in ("cm", "person", "other"):
-        pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)", (ids[name], name))
+        pg.execute("INSERT INTO contacts(id,display_name,creator_type) VALUES(%s,%s,'cap')", (ids[name], name))
         pg.execute(
             """INSERT INTO lark_identities(open_id,contact_id,display_name,tenant_classification)
                    VALUES(%s,%s,%s,%s)""",
@@ -182,10 +182,14 @@ def seeded(pg, monkeypatch):
         (candidate_id, ids["cm"], ids["person"], account),
     )
     pg.execute(
-        """INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,
-               contact_id,relationship,source,created_by_authorization_id,candidate_id)
-               VALUES(%s,%s,%s,%s,'associated','cm_confirmation',%s,%s)""",
-        (uuid4(), account, ids["cm"], ids["person"], ids["cm"], candidate_id),
+        """INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source)
+               VALUES(%s,%s,%s,'manual')""",
+        (uuid4(), ids["person"], ids["cm"]),
+    )
+    pg.execute(
+        """INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source)
+               VALUES(%s,%s,'owner','confirmed','cm_confirmation')""",
+        (ids["person"], account),
     )
     cipher = message_body_cipher(settings.token_encryption_key)
 
@@ -245,16 +249,42 @@ def seeded(pg, monkeypatch):
 
     monkeypatch.setattr(ai.contact_assessments, "call_openai", model)
     return SimpleNamespace(
-        ids=ids, settings=settings, save=save, calls=calls, add=add, start=start, end=end, fields=fields, cipher=cipher
+        ids=ids, settings=settings, save=save, calls=calls, add=add, start=start, end=end, fields=fields, cipher=cipher,
+        account=account, candidate_id=candidate_id,
     )
 
 
-@pytest.mark.parametrize("with_handle", [True, False])
-def test_save_enabled_immediately_queues_claims_and_stores_encrypted_summary(pg, seeded, with_handle):
+@pytest.mark.parametrize("roster_kind", ["current", "missing_handle", "legacy", "both"])
+def test_save_enabled_immediately_queues_claims_and_stores_encrypted_summary(pg, seeded, roster_kind):
     s = seeded
-    if not with_handle:
-        pg.execute("UPDATE creator_workflow_candidates SET normalized_handle=NULL,social_account_id=NULL")
-        pg.execute("UPDATE creator_account_assignments SET social_account_id=NULL")
+    if roster_kind == "missing_handle":
+        pg.execute("DELETE FROM contact_social_accounts")
+    if roster_kind in {"legacy", "both"}:
+        pg.execute(
+            """INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,
+                   contact_id,relationship,source,created_by_authorization_id,candidate_id)
+                   VALUES(%s,%s,%s,%s,'owner','cm_confirmation',%s,%s)""",
+            (uuid4(), s.account, s.ids["cm"], s.ids["person"], s.ids["cm"], s.candidate_id),
+        )
+        if roster_kind == "legacy":
+            pg.execute("DELETE FROM contact_assignments")
+            pg.execute("DELETE FROM contact_social_accounts")
+    for who, relationship, status in (
+        ("person", "associated", "confirmed"), ("person", "owner", "rejected"),
+        ("other", "owner", "confirmed"),
+    ):
+        account = uuid4()
+        pg.execute(
+            """INSERT INTO social_accounts(id,platform,normalized_handle,display_handle)
+                   VALUES(%s,'tiktok',%s,%s)""", (account, str(account), str(account)),
+        )
+        pg.execute(
+            """INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source)
+                   VALUES(%s,%s,%s,%s,'cm_confirmation')""", (s.ids[who], account, relationship, status),
+        )
+    roster = ai._roster(pg)
+    assert len(roster) == 1 and roster[0]["contact_id"] == s.ids["person"]
+    assert roster[0]["display_handle"] == (None if roster_kind == "missing_handle" else "@alice")
     assert s.save(False)["enabled"] is False
     assert ai.claim_next_summary() is None
     queued = s.save()
@@ -266,7 +296,7 @@ def test_save_enabled_immediately_queues_claims_and_stores_encrypted_summary(pg,
     assert len(s.calls) == 1 and len(view["events"]) == 1
     assert view["window"]["is_open"]
     assert view["events"][0]["priority"] == "P2"
-    if not with_handle:
+    if roster_kind == "missing_handle":
         assert s.calls[0]["users"]["U1"]["handles"] == []
         assert view["events"][0]["creator_handle"] is None
     assert "unrelated outsider secret" not in json.dumps(s.calls)
@@ -295,7 +325,7 @@ def test_acl_owner_remi_and_explicit_test_grant_not_arbitrary_roster_reviewer(pg
         ai.get_summary_view(pg, s.ids["tester"])
 
 
-@pytest.mark.parametrize("change", ["hide", "delete", "reassign", "consent"])
+@pytest.mark.parametrize("change", ["hide", "delete", "reassign", "non_cap", "consent"])
 def test_revocation_or_edit_before_provider_exports_nothing(pg, seeded, change):
     s = seeded
     s.save()
@@ -305,7 +335,9 @@ def test_revocation_or_edit_before_provider_exports_nothing(pg, seeded, change):
     elif change == "delete":
         pg.execute("UPDATE chat_messages SET is_deleted=TRUE WHERE message_id='m1'")
     elif change == "reassign":
-        pg.execute("UPDATE creator_account_assignments SET ended_at=NOW()")
+        pg.execute("UPDATE contact_assignments SET ended_at=NOW()")
+    elif change == "non_cap":
+        pg.execute("UPDATE contacts SET creator_type='non_cap' WHERE id=%s", (s.ids["person"],))
     else:
         pg.execute("UPDATE authorizations SET body_consent_at=NULL WHERE id=%s", (s.ids["cm"],))
     ai.run_claimed_summary(job, s.settings)
