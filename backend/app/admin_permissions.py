@@ -20,6 +20,10 @@ PAGES = (
     {"key": "contacts", "label": "人员目录", "path": "/admin/contacts", "description": "查看联系人身份与关联资料"},
     {"key": "ai", "label": "AI 功能", "path": "/admin/ai", "description": "查看 AI 功能与运行配置，不可修改"},
     {"key": "jobs", "label": "同步任务", "path": "/admin/jobs", "description": "查看同步任务及运行结果"},
+    {
+        "key": "creator-roster", "label": "跨 CM 达人名单", "path": "/creators",
+        "description": "通过负责人筛选查看各 CM 已入库的达人名单",
+    },
 )
 PAGE_KEYS = frozenset(page["key"] for page in PAGES)
 

@@ -149,7 +149,9 @@
   }
   function render() {
     el("type-column").hidden = tab !== "mine";
-    if (data.can_manage) el("cm").disabled = busy;
+    el("import-open").hidden = Boolean(data.read_only);
+    el("candidates").hidden = Boolean(data.read_only);
+    if (data.can_select_cm) el("cm").disabled = busy;
     for (const key of ["mine", "candidates"]) {
       el(key).className = `btn ${key === tab ? "btn-primary" : "btn-outline-secondary"}`;
       el(key).setAttribute("aria-pressed", String(key === tab));
@@ -384,12 +386,13 @@
   });
   el("import-check").addEventListener("click", checkImport);
   el("import-confirm").addEventListener("click", startImport);
-  if (data.can_manage) {
+  if (data.can_select_cm) {
     if (data.cms?.length) {
       el("cm").replaceChildren(...data.cms.map(cm => { const option = node("option", cm.name); option.value = cm.id; return option; }));
       el("cm").value = data.selected_cm_id;
     }
     el("cm").addEventListener("change", () => {
+      tab = "mine";
       data = {...data, items: [], import_batches: [], page: 1, total_count: 0, total_pages: 0};
       page = 1; clearRows(); render(); refresh();
     });

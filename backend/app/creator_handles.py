@@ -64,13 +64,20 @@ def _owner(conn, actor):
         return False
 
 
-def _access(conn, actor, cm_id=None, *, manage=False):
+def _can_view_all(conn, actor):
+    return _owner(conn, actor) or bool(conn.execute(
+        "SELECT 1 FROM admin_page_permissions WHERE authorization_id=%s AND permission='creator-roster'",
+        (actor,),
+    ).fetchone())
+
+
+def _access(conn, actor, cm_id=None, *, manage=False, read_only=False):
     actor = ownership._uuid(actor)
     if not conn.execute("SELECT 1 FROM authorizations WHERE id=%s AND status='active'", (actor,)).fetchone():
         raise PermissionError("请重新登录。")
     owner = _owner(conn, actor)
     cm_id = ownership._uuid(cm_id) if cm_id else actor
-    if (manage or actor != cm_id) and not owner:
+    if (manage or actor != cm_id) and not owner and not (read_only and not manage and _can_view_all(conn, actor)):
         raise PermissionError("只能处理您自己的达人候选。")
     if not ownership._cm(conn, cm_id):
         raise PermissionError("该负责人的聊天授权不可用，请先完成授权。")
@@ -802,16 +809,19 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
     query = str(query or "").strip()[:120]
     page = max(1, min(int(page), 10000))
     with connection() as conn:
-        cm_id, owner = _access(conn, actor_id, cm_id)
+        cm_id, owner = _access(conn, actor_id, cm_id, read_only=tab != "candidates")
+        can_select_cm = _can_view_all(conn, actor_id)
+        read_only = not owner and ownership._uuid(actor_id) != cm_id
         cms = [
             {"id": str(r["id"]), "name": r["display_name"] or "未命名用户"}
             for r in conn.execute(
                 """SELECT id,display_name FROM authorizations WHERE status='active'
                 AND body_consent_at IS NOT NULL ORDER BY display_name,id"""
             ).fetchall()
-            if owner or r["id"] == cm_id
+            if can_select_cm or r["id"] == cm_id
         ]
-        imported = creator_imports.page_data(actor_id, cm_id, q=query if tab=="candidates" else "", page=page)
+        imported = ({"total": 0, "batches": []} if read_only else
+                    creator_imports.page_data(actor_id, cm_id, q=query if tab=="candidates" else "", page=page))
         # Person-level and older account-level assignments describe the same
         # library. UNION ensures that a person with several handles appears once.
         formal_base = """FROM contacts c WHERE c.creator_type='cap' AND c.id IN (
@@ -880,11 +890,12 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
                     "private_chat_url": private_chat_url(identity["open_id"] if identity else None),
                     "handles": [r["display_handle"] for r in accounts],
                     "sources": sources, "source": " + ".join(sources),
-                    "evidence_rows": list(evidence_rows.values()),
+                    "evidence_rows": [] if read_only else list(evidence_rows.values()),
                     "status_label": "已入库", "can_confirm": False, "can_defer": False,
                 })
         return {
             "cms": cms, "selected_cm_id": str(cm_id), "can_manage": owner,
+            "can_select_cm": can_select_cm, "read_only": read_only,
             "run": None, "counts": counts, "usage": {"api_requests": 0, "input_tokens": 0, "output_tokens": 0},
             "import_batches": imported["batches"], "items": items,
             "total_count": total, "total_pages": pages, "page": page,

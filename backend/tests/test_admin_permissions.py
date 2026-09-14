@@ -171,5 +171,7 @@ def test_migration_has_fixed_keys_and_no_implicit_grants():
     sql = (Path(__file__).parents[1] / "migrations/027_admin_page_permissions.sql").read_text()
     assert "PRIMARY KEY (authorization_id, permission)" in sql
     assert "INSERT" not in sql
+    current_sql = (Path(__file__).parents[1] / "migrations/054_creator_roster_view_permission.sql").read_text()
+    assert "INSERT" not in current_sql
     for key in admin_permissions.PAGE_KEYS:
-        assert f"'{key}'" in sql
+        assert f"'{key}'" in current_sql

@@ -192,6 +192,18 @@ def test_cm_can_fill_missing_handles_but_not_cross_scope_or_bypass_input_checks(
     ):
         with pytest.raises(PermissionError):
             operation()
+    pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-roster')",
+               (outsider,))
+    view = handles.page_data(outsider, pilot.ids["cm"])
+    assert view["can_select_cm"] and view["read_only"] and not view["can_manage"]
+    assert len(view["cms"]) > 1 and view["import_batches"] == []
+    with pytest.raises(PermissionError):
+        handles.page_data(outsider, pilot.ids["cm"], tab="candidates")
+    with pytest.raises(PermissionError):
+        handles.confirm_task(outsider, task["id"], ["stolen"])
+    pg.execute("DELETE FROM admin_page_permissions WHERE authorization_id=%s", (outsider,))
+    with pytest.raises(PermissionError):
+        handles.page_data(outsider, pilot.ids["cm"])
     for values in ([], [""], ["bad handle"], ["https://evil.example/@person"], ["good", "bad/handle"]):
         with pytest.raises(ValueError):
             handles.confirm_task(pilot.ids["cm"], task["id"], values)
@@ -549,15 +561,15 @@ def test_excel_only_pages_exclude_old_ai_candidates_and_merge_manually_confirmed
         cm, cm, "roster.xlsx", workbook("creator_one", "creator_two", *(f"unmatched_{n}" for n in range(25)))
     )
     imports.start_import(cm, batch["id"])
-    page = handles.page_data(cm, cm_id=cm)
-    following = handles.page_data(cm, cm_id=cm, page=2)
+    page = handles.page_data(cm, cm_id=cm, tab="candidates")
+    following = handles.page_data(cm, cm_id=cm, tab="candidates", page=2)
     assert page["total_count"] == 27 and page["total_pages"] == 2
     assert len(page["items"]) == 25 and len(following["items"]) == 2
     items = page["items"] + following["items"]
     assert len({r["id"] for r in items}) == 27
     assert all(r["kind"] == "import" and r["sources"] == ["Excel"] and r["contact_id"] is None for r in items)
     assert page["run"] is None and not any(page["usage"].values())
-    assert len(handles.page_data(cm, query="creator_one")["items"]) == 1
+    assert len(handles.page_data(cm, tab="candidates", query="creator_one")["items"]) == 1
     for handle in ("creator_one", "creator_two"):
         row = pg.execute("SELECT id FROM creator_import_rows WHERE batch_id=%s AND handle=%s",
                          (batch["id"], handle)).fetchone()
@@ -565,5 +577,6 @@ def test_excel_only_pages_exclude_old_ai_candidates_and_merge_manually_confirmed
     formal = handles.page_data(cm, cm_id=cm, tab="mine")["items"]
     assert len(formal) == 1 and set(formal[0]["handles"]) == {"creator_one", "creator_two"}
     assert formal[0]["sources"] == ["Excel"] and formal[0]["creator_type"] == "cap"
-    assert handles.page_data(cm)["total_count"] == 25
+    assert handles.page_data(cm, tab="candidates")["total_count"] == 25
+    assert handles.page_data(cm)["total_count"] == 1
     assert len(case.calls) == paid
