@@ -7,12 +7,12 @@
     <input type="hidden" name="q" value="{{ q|default('') }}">
     <input type="hidden" name="permission_filter" value="{{ permission_filter|default('all') }}">
     <fieldset>
-      <legend class="form-label mb-2">{{ user.display_name }} 可以查看的后台页面</legend>
+      <legend class="form-label mb-2">{{ user.display_name }} 的页面与操作权限</legend>
       <div class="admin-users__permission-grid">
         {% for permission in permission_pages %}<label class="admin-users__permission-option"><input class="form-check-input" type="checkbox" name="permissions" value="{{ permission.key }}"{% if permission.key in permission_access.configured_permissions %} checked{% endif %}><span><span class="fw-medium">{{ permission.label }}</span><span class="admin-users__permission-description">{{ permission.description }}</span></span></label>{% endfor %}
       </div>
     </fieldset>
-    <p class="admin-users__sensitive-note">勾选后可查看该页面原有的数据范围，不限于本人数据。“消息内容”涉及聊天记录，请按需开放。页面权限不包含修改业务数据或分配权限。</p>
+    <p class="admin-users__sensitive-note">“达人完整管理”包含跨 CM 审批、证据查看及导入扫描操作；其余选项为只读页面权限。“消息内容”仍受单独配置的 CM 范围限制。以上权限均不包含分配权限。</p>
     <div class="d-flex flex-wrap align-items-center gap-2"><button class="btn btn-sm btn-primary" type="submit">保存权限</button><span class="text-secondary small">全部不勾选 = 仅前台</span></div>
   </form>
 </details>

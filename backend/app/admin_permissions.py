@@ -24,6 +24,10 @@ PAGES = (
         "key": "creator-roster", "label": "跨 CM 达人名单", "path": "/creators",
         "description": "通过负责人筛选查看各 CM 已入库的达人名单",
     },
+    {
+        "key": "creator-manage", "label": "达人完整管理", "path": "/creators",
+        "description": "管理所有 CM 的达人：候选审批、证据链、导入及扫描操作",
+    },
 )
 PAGE_KEYS = frozenset(page["key"] for page in PAGES)
 

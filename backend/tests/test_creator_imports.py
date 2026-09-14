@@ -933,3 +933,44 @@ def test_group_person_refs_do_not_cross_people_groups_or_current_access(pg, pilo
         assert not hidden["groups"] and not hidden["users"] and not hidden["messages"]
         pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (cm,))
         assert not evidence.build_group_evidence(pg, pilot.settings, cm, "target_account")["eligible"]
+
+
+def test_delegated_creator_manager_can_review_evidence_and_import_across_cms(pg, pilot, monkeypatch):
+    prepare(pg, pilot, monkeypatch)
+    cm, creator = pilot.ids['cm'], pilot.ids['creator']
+    manager = uuid4()
+    pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext,body_consent_at) "
+               "VALUES(%s,'ou_manager','test',NOW())", (manager,))
+    pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-manage')",
+               (manager,))
+    group(pg, pilot, 'delegated_group', 'delegated_handle', 'creator')
+    batch = imports.preview_import(manager, cm, 'delegated.xlsx',
+                                   workbook('delegated_handle', 'manual_handle', 'defer_handle'))
+    imports.start_import(manager, batch['id'])
+    imports.pause_import(manager, batch['id'])
+    imports.resume_import(manager, batch['id'])
+    drain(pilot)
+    matched = row_for(pg, batch, 'delegated_handle')
+    assert matched['review_status'] == 'confirmed'
+    assert imports.row_evidence(manager, matched['id'])['groups']
+    manual = row_for(pg, batch, 'manual_handle')
+    imports.confirm_row(manager, manual['id'], 'manual_handle', creator)
+    imports.defer_row(manager, row_for(pg, batch, 'defer_handle')['id'])
+    assert imports.search_users(manager, cm, 'creator')
+    view = creator_handles.page_data(manager, cm)
+    assert view['can_manage'] and view['can_select_cm'] and not view['read_only']
+    assert view['items'][0]['evidence_rows']
+    assert creator_handles.page_data(manager, cm, tab='candidates')['import_batches']
+    saved = pg.execute('SELECT uploaded_by,cm_authorization_id FROM creator_import_batches WHERE id=%s',
+                       (batch['id'],)).fetchone()
+    assert saved['uploaded_by'] == manager and saved['cm_authorization_id'] == cm
+    assert not pg.execute('SELECT 1 FROM admin_roles WHERE authorization_id=%s', (manager,)).fetchone()
+    pg.execute('DELETE FROM admin_page_permissions WHERE authorization_id=%s', (manager,))
+    for action in (
+        lambda: creator_handles.page_data(manager, cm, tab='candidates'),
+        lambda: imports.row_evidence(manager, matched['id']),
+        lambda: imports.confirm_row(manager, manual['id'], 'manual_handle', creator),
+        lambda: imports.recheck_batch(manager, batch['id']),
+    ):
+        with pytest.raises(PermissionError):
+            action()

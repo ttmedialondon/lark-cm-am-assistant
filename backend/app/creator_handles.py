@@ -66,7 +66,8 @@ def _owner(conn, actor):
 
 def _can_view_all(conn, actor):
     return _owner(conn, actor) or bool(conn.execute(
-        "SELECT 1 FROM admin_page_permissions WHERE authorization_id=%s AND permission='creator-roster'",
+        "SELECT 1 FROM admin_page_permissions WHERE authorization_id=%s "
+        "AND permission IN ('creator-roster','creator-manage')",
         (actor,),
     ).fetchone())
 
@@ -75,13 +76,16 @@ def _access(conn, actor, cm_id=None, *, manage=False, read_only=False):
     actor = ownership._uuid(actor)
     if not conn.execute("SELECT 1 FROM authorizations WHERE id=%s AND status='active'", (actor,)).fetchone():
         raise PermissionError("请重新登录。")
-    owner = _owner(conn, actor)
+    can_manage = _owner(conn, actor) or bool(conn.execute(
+        "SELECT 1 FROM admin_page_permissions WHERE authorization_id=%s AND permission='creator-manage'",
+        (actor,),
+    ).fetchone())
     cm_id = ownership._uuid(cm_id) if cm_id else actor
-    if (manage or actor != cm_id) and not owner and not (read_only and not manage and _can_view_all(conn, actor)):
+    if (manage or actor != cm_id) and not can_manage and not (read_only and not manage and _can_view_all(conn, actor)):
         raise PermissionError("只能处理您自己的达人候选。")
     if not ownership._cm(conn, cm_id):
         raise PermissionError("该负责人的聊天授权不可用，请先完成授权。")
-    return cm_id, owner
+    return cm_id, can_manage
 
 
 def _run(conn, actor, run_id, *, manage=False):
@@ -809,9 +813,9 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
     query = str(query or "").strip()[:120]
     page = max(1, min(int(page), 10000))
     with connection() as conn:
-        cm_id, owner = _access(conn, actor_id, cm_id, read_only=tab != "candidates")
+        cm_id, can_manage = _access(conn, actor_id, cm_id, read_only=tab != "candidates")
         can_select_cm = _can_view_all(conn, actor_id)
-        read_only = not owner and ownership._uuid(actor_id) != cm_id
+        read_only = not can_manage and ownership._uuid(actor_id) != cm_id
         cms = [
             {"id": str(r["id"]), "name": r["display_name"] or "未命名用户"}
             for r in conn.execute(
@@ -894,7 +898,7 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
                     "status_label": "已入库", "can_confirm": False, "can_defer": False,
                 })
         return {
-            "cms": cms, "selected_cm_id": str(cm_id), "can_manage": owner,
+            "cms": cms, "selected_cm_id": str(cm_id), "can_manage": can_manage,
             "can_select_cm": can_select_cm, "read_only": read_only,
             "run": None, "counts": counts, "usage": {"api_requests": 0, "input_tokens": 0, "output_tokens": 0},
             "import_batches": imported["batches"], "items": items,
