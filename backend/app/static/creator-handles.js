@@ -328,7 +328,8 @@
       const nextStep = importPreview.status !== "preview" ? "这份表已导入，不会重复启动，请查看页面上的导入进度。" : counts.valid ? "请核对后开始匹配。" : "请修改表格后重新上传。";
       importMessage(`有效 handle ${counts.valid || 0} · 重复 ${counts.duplicates || 0} · 无效 ${counts.invalid || 0}。${nextStep}`);
       const preview = el("import-preview"); preview.replaceChildren();
-      preview.append(node("p", `负责人：${selectedCMName()} · CAP 属性：${creatorTypeLabel(importPreview.creator_type)}。先找对应群，需要时由 AI 核对相关群和达人，再合并去重匹配。`, "small"));
+      const rule = importPreview.creator_type === "cap" ? "确定对应群后排除明确非达人，唯一可选用户直接匹配；未区分人选由 AI 结合上下文核对，多位已确认达人留空。" : "先找对应群，复用或识别有效达人身份，再合并去重匹配。";
+      preview.append(node("p", `负责人：${selectedCMName()} · CAP 属性：${creatorTypeLabel(importPreview.creator_type)}。${rule}`, "small"));
       const list = node("div", "", "border rounded p-2"); list.style.maxHeight = "240px"; list.style.overflowY = "auto";
       for (const item of (importPreview.rows || []).slice(0, 100)) {
         list.append(node("div", `第 ${item.row_number} 行 · ${item.handle || "—"}${item.error ? ` · ${item.error}` : ""}`, `small py-1 ${item.error ? "text-danger" : ""}`));
@@ -342,12 +343,13 @@
   }
   async function startImport() {
     if (busy || !importPreview) return;
+    const isCAP = importPreview.creator_type === "cap";
     busy = true; render(); importMessage("正在提交匹配任务…");
     try {
       await read(await fetch(`/creators/imports/${importPreview.id}/start`, {method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: new URLSearchParams({csrf_token: app.dataset.csrf})}));
       importPreview = null; el("import-dialog").close();
       tab = "candidates"; page = 1; clearRows();
-      notice("已提交匹配。系统会查找对应群，需要时由 AI 一起核对群和达人。已确定的群合并去重后，唯一达人且无冲突就入库；群不确定、零位或多位达人时，用户留空待核对，handle 和 CAP 属性保留。");
+      notice(isCAP ? "已提交匹配。确定对应群后，排除明确非达人，唯一可选用户且无冲突就入库；未区分人选由 AI 结合上下文核对。无法确定群或人员、已有多位达人时，用户留空待核对，handle 和 CAP 保留。" : "已提交匹配。系统会核对对应群及有效达人身份；唯一达人且无冲突就入库，其余用户留空待核对，handle 和名单属性保留。");
       void refresh();
     } catch (error) { importMessage(error.message, true); }
     finally { busy = false; render(); }

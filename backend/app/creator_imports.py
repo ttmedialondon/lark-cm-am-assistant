@@ -24,7 +24,10 @@ REASONS = {
     "existing": "已有相同账号和负责人，已复用正式关联",
     "classified": "匹配已完成，请核对对应用户",
     "unique_creator": "对应群内只有一位已识别达人，已匹配",
-    "no_creator": "对应群内未识别到达人，用户留空待核对",
+    "unique_cap_candidate": "CAP 对应群排除明确非达人后只有一位人选，已匹配",
+    "no_creator": "人员身份依据不足，用户留空待核对",
+    "person_unresolved": "对应群已确定，人员尚未定位，请核对成员资料和分类",
+    "person_ambiguous": "对应群已确定，但多个人选尚未区分，用户留空待核对",
     "multiple_creators": "对应群内有多位达人，用户留空待核对",
     "group_not_found": "未找到 handle 对应群，用户留空待核对",
     "group_uncertain": "找到相似群，但尚未确定对应关系，用户留空待核对",
@@ -33,7 +36,7 @@ REASONS = {
     "manual_confirmed": "已确认入库",
     "no_match": "未找到对应用户，请搜索并确认",
     "insufficient_material": "材料不足，请手动确认",
-    "account_conflict": "已有账号、人员类别、CAP 属性或负责人冲突，未覆盖原资料",
+    "account_conflict": "存在账号、人员分类、CAP 属性或负责人冲突，未覆盖原资料",
     "other_batch": "相同 handle 已在另一个批次分析，请等待或手动确认",
     "authorization_changed": "授权或原文已变化，请重新上传核对",
     "configuration_changed": "OpenAI 配置已变化，请重新上传核对",
@@ -528,17 +531,26 @@ def _refresh_known_result(conn, row, settings, *, response=None):
     material = creator_import_evidence.build_evidence(
         conn, settings, row["cm_authorization_id"], row["handle"], creator_type=row["batch_creator_type"],
     )
-    if material["checked"] is None:
-        return False
+    result = material["checked"]
+    original = ({"pack": _pack(row, settings), "refs": row["refs"], "fingerprint": row["fingerprint"]}
+                if response else None)
+    if result is None:
+        context = row["stats"].get("classification_context_fingerprint")
+        if not (response and context and context == material["stats"].get("classification_context_fingerprint")
+                and row["refs"] == material["refs"]
+                and all(original["pack"][key] == material["pack"][key] for key in ("groups", "messages"))):
+            return False
+        try:
+            result = creator_import_evidence.validate_result(response["text"], material["pack"])
+        except (ValueError, TypeError, KeyError):
+            return False
     conn.execute(
         """UPDATE creator_import_rows SET pack_ciphertext=%s,refs=%s,fingerprint=%s,stats=%s WHERE id=%s""",
         (ownership._cipher(settings).encrypt(ownership._encode(material["pack"])), Jsonb(material["refs"]),
          material["fingerprint"], Jsonb(material["stats"]), row["id"]),
     )
-    original = ({"pack": _pack(row, settings), "refs": row["refs"], "fingerprint": row["fingerprint"]}
-                if response else None)
     row.update(refs=material["refs"], stats=material["stats"])
-    _apply_result(conn, row, material["checked"], settings, response=response, response_evidence=original)
+    _apply_result(conn, row, result, settings, response=response, response_evidence=original)
     _settle(conn, row["batch_id"])
     return True
 
@@ -547,7 +559,9 @@ def _apply_result(conn, row, result, settings, *, response=None, response_eviden
     """One admission path for existing classifications, cached results and fresh identity AI."""
     contact_id = creator_import_evidence.resolve_contact(row["refs"], result.get("user_ref"))
     stats = {"ai_matched_handle": result["ai_used"], "creator_count": result["creator_count"],
-             "matched_group_count": result["matched_group_count"], "group_match_kind": result["group_match_kind"]}
+             "matched_group_count": result["matched_group_count"], "group_match_kind": result["group_match_kind"],
+             "person_match_kind": result["person_match_kind"],
+             "person_candidate_count": result["person_candidate_count"]}
     conn.execute(
         """UPDATE creator_import_rows SET status='succeeded',reason_code=%s,result_ciphertext=%s,
         contact_id=%s,confidence=%s,outcome=%s,stats=stats||%s::jsonb,lease_until=NULL,updated_at=NOW() WHERE id=%s""",

@@ -456,3 +456,69 @@ def test_joint_group_validation_rejects_forged_and_cross_group_evidence(pg, scop
     uncertain["groups"][1].update(match="unrelated", confidence=.2)
     checked = imports.validate_result(json.dumps(uncertain), pack)
     assert checked["user_ref"] is None and checked["reason_code"] == "group_uncertain"
+
+
+def test_cap_context_refs_must_identify_the_person_in_the_same_group(pg, scope):
+    from copy import deepcopy
+
+    from app import creator_import_evidence as imports
+
+    ids, settings, add = scope
+    pg.execute("INSERT INTO chats(chat_id,chat_mode,name) VALUES('second','group','creator._123 X TT')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'second')", (ids["cm"],))
+    pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('second','ou_other'),('second','ou_cm')")
+    add("cm", "@_user_1 is the CAP creator for this group; please send your video.", chat="group", mention="creator")
+    add("other", "I represent the seller brand and handle product inventory for our store.", chat="second")
+    add("cm", "@_user_1 is a creator in a different group.", chat="second", mention="creator")
+    material = imports.build_evidence(pg, settings, ids["cm"], "creator._123", creator_type="cap")
+    pack = material["pack"]
+    assert material["eligible"]
+    creator = next(r["label"] for r in material["refs"] if r.get("contact_id") == str(ids["creator"]))
+    other = next(r["label"] for r in material["refs"] if r.get("contact_id") == str(ids["other"]))
+    target_group = next(r["label"] for r in material["refs"] if r.get("chat_id") == "group" and r["kind"] == "group")
+    directed = next(m for m in pack["messages"] if m["speaker"] == "CM1" and m["group_ref"] == target_group)
+    elsewhere = next(m for m in pack["messages"] if m["speaker"] == "CM1" and m["group_ref"] != target_group)
+    own_other = next(m for m in pack["messages"] if m["speaker"] == other)
+    result = {"groups": [{"group_ref": g["ref"], "match": "matched", "confidence": .99,
+                          "basis": "explicit_handle", "evidence_refs": [g["ref"]]} for g in pack["groups"]],
+              "people": [
+                  {"user_ref": creator, "role": "creator", "confidence": .99,
+                   "basis": "direct_interaction", "evidence_refs": [directed["ref"]]},
+                  {"user_ref": other, "role": "merchant_contact", "confidence": .99,
+                   "basis": "self_declaration", "evidence_refs": [own_other["ref"]]},
+              ]}
+    assert imports.validate_result(json.dumps(result), pack)["user_ref"] == creator
+    for refs in ([], [target_group]):
+        contextual = deepcopy(result)
+        contextual["people"][0].update(confidence=.9, evidence_refs=refs)
+        assert imports.validate_result(json.dumps(contextual), pack)["user_ref"] == creator
+    unproven_exclusion = deepcopy(result)
+    unproven_exclusion["people"][1]["evidence_refs"] = [own_other["group_ref"]]
+    checked = imports.validate_result(json.dumps(unproven_exclusion), pack)
+    assert checked["user_ref"] is None and checked["reason_code"] == "person_ambiguous"
+    for person_index, ref in ((0, elsewhere["ref"]), (1, directed["ref"])):
+        invalid = deepcopy(result)
+        invalid["people"][person_index]["evidence_refs"] = [ref]
+        with pytest.raises(ValueError):
+            imports.validate_result(json.dumps(invalid), pack)
+    strict = deepcopy(pack)
+    strict["roster"]["creator_type"] = "non_cap"
+    with pytest.raises(ValueError):
+        imports.validate_result(json.dumps(result), strict)
+    undecided = deepcopy(result)
+    undecided["people"][1].update(role="insufficient", confidence=0, basis="weak_context", evidence_refs=[])
+    checked = imports.validate_result(json.dumps(undecided), pack)
+    assert checked["user_ref"] is None and checked["reason_code"] == "person_ambiguous"
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE lark_identities SET display_name='SharedName' WHERE open_id='ou_creator'")
+        pg.execute("UPDATE authorizations SET display_name='SharedName' WHERE id=%s", (ids["cm"],))
+        message_id = add("cm", "SharedName is the CAP creator in this group.", chat="group")
+        ambiguous = imports.build_evidence(pg, settings, ids["cm"], "creator._123", creator_type="cap")
+        message_refs = {r["label"] for r in ambiguous["refs"] if r.get("message_id") == message_id}
+        assert not any(m["target_refs"] for m in ambiguous["pack"]["messages"] if m["ref"] in message_refs)
+    with pg.transaction(force_rollback=True):
+        for contact in (ids["creator"], ids["other"]):
+            pg.execute("INSERT INTO contact_roles(contact_id,role,status,source,is_primary) "
+                       "VALUES(%s,'merchant_contact','confirmed','manual',TRUE)", (contact,))
+        empty = imports.build_evidence(pg, settings, ids["cm"], "creator._123", creator_type="cap")
+        assert empty["checked"]["user_ref"] is None and empty["checked"]["reason_code"] == "person_unresolved"
