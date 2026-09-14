@@ -217,6 +217,28 @@ def test_message_page_grantee_can_read_and_is_recorded_as_the_actual_viewer(cons
     assert response.headers["referrer-policy"] == "same-origin"
 
 
+def test_source_restriction_filters_directory_and_blocks_forged_source(console, monkeypatch):
+    monkeypatch.setattr(admin_permissions, "access_for", lambda _: admin_permissions._access({
+        "status": "active", "permissions": ["messages"],
+        "message_source_id": console.source["id"],
+    }))
+    response = console.browser.get("/admin/messages", params={"user_page": 99})
+    assert response.status_code == 200
+    assert console.contexts[-1]["users"] == [console.source]
+    assert console.contexts[-1]["user_page"]["total_count"] == 1
+    assert console.calls["users"] == []
+    response = _open(console, chat_id=console.chat["chat_id"])
+    assert response.status_code == 200
+    assert console.calls["audit"] == [(console.actor["id"], console.source["id"], console.chat["chat_id"])]
+    counts = {key: len(value) for key, value in console.calls.items()}
+    response = console.browser.get("/admin/messages", params={
+        "user_id": str(uuid4()), "chat_id": console.chat["chat_id"], "page": 2,
+    })
+    assert response.status_code == 403
+    assert {key: len(value) for key, value in console.calls.items()} == counts
+    assert response.headers["cache-control"] == "no-store, max-age=0"
+
+
 def test_source_and_filter_forms_reset_dependent_selection_state(console):
     response = _open(console, chat_id=console.chat["chat_id"], user_page=2, conversation_page=2,
                      page=2, conversation_query="creator", conversation_type="group")

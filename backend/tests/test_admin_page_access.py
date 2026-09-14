@@ -178,7 +178,7 @@ def test_owner_navigation_exposes_every_page():
         active_page="users",
     )
     backend_links = {link for link in re.findall(r'href="([^"]+)"', html) if link.startswith("/admin")}
-    assert backend_links == {page["path"] for page in admin_permissions.PAGES}
+    assert backend_links == {page["path"] for page in admin_permissions.PAGES if page["path"].startswith("/admin")}
     assert _page_menu_targets(html) == [page["path"] for page in admin_permissions.PAGES]
     _assert_no_navigation_role_labels(html)
 

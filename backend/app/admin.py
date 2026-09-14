@@ -114,6 +114,7 @@ def create_admin_router(
                     "title": "当前页面或操作未获授权", "detail": "仅可查看系统主人已勾选的页面；管理操作仅限主人。",
                 }, 403)
         return {"authorization": authorization, "admin_role": "owner" if acl["is_owner"] else "member",
+                "message_source_id": acl.get("message_source_id"),
                 "admin_permissions": acl["permissions"], "admin_landing_path": acl["landing_path"]}, None
 
     def page_context(access_context: dict[str, Any], active_page: str) -> dict[str, Any]:
@@ -464,7 +465,18 @@ def create_admin_router(
             return denied
         assert access_context is not None
 
-        user_page_data = admin_reporting.users(user_page)
+        source_limit = access_context["message_source_id"]
+        if source_limit is not None and user_id is not None and user_id != source_limit:
+            return render_template(request, "error.html", {
+                "title": "消息来源未获授权", "detail": "你只能查看已获授权的 CM 消息。",
+            }, 403)
+        if source_limit is not None:
+            source = admin_reporting.user_detail(source_limit, include_conversations=False, include_jobs=False)
+            user_page_data = admin_reporting._page_result(
+                [source["user"]] if source else [], 1, total_count=1 if source else 0,
+            )
+        else:
+            user_page_data = admin_reporting.users(user_page)
         users = user_page_data["items"]
         selected_user = next((item for item in users if item["id"] == user_id), None)
         selected_user_in_page = selected_user is not None

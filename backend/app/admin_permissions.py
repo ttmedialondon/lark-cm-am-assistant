@@ -36,6 +36,7 @@ def _access(row: Mapping[str, Any] | None) -> dict[str, Any]:
     permissions = PAGE_KEYS if owner else configured if active and not owner_account else frozenset()
     return {
         "is_owner": owner,
+        "message_source_id": row.get("message_source_id") if row and not owner else None,
         "is_owner_account": owner_account,
         "permissions": permissions,
         "configured_permissions": PAGE_KEYS if owner else configured,
@@ -58,6 +59,8 @@ def users_access_data(authorization_ids: Iterable[UUID]) -> dict[UUID, dict[str,
         rows = conn.execute(
             """
             SELECT a.id, a.status, r.role, r.is_active AS role_active,
+                   (SELECT source_authorization_id FROM admin_message_source_limits
+                    WHERE authorization_id = a.id) AS message_source_id,
                    COALESCE(array_agg(DISTINCT p.permission)
                        FILTER (WHERE p.permission IS NOT NULL), '{}'::text[]) AS permissions
             FROM authorizations a
