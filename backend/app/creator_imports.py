@@ -51,7 +51,8 @@ BATCH_LABELS = {"preview": "等待开始", "running": "匹配中", "paused": "�
 
 def source_labels(row):
     """A paid request alone is not an AI account-person suggestion."""
-    ai = (row.get("stats") or {}).get("ai_matched_handle") or (
+    stats = row.get("stats") or {}
+    ai = stats.get("ai_matched_handle") if "ai_matched_handle" in stats else (
         row.get("result_ciphertext") is not None
         and row.get("outcome") in {"matched", "review", "conflict"}
         and row.get("confidence") is not None

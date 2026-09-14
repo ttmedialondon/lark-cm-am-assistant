@@ -121,6 +121,7 @@ def test_excel_auto_manual_and_repeated_import_preserve_people_and_creator_type(
     assert missing["contact_id"] is None and missing["api_requests"] == 0
     assert imports.source_labels(matched) == ["Excel", "AI"]
     assert imports.source_labels({**matched, "stats": {}}) == ["Excel", "AI"]
+    assert imports.source_labels({**matched, "stats": {"ai_matched_handle": False}}) == ["Excel"]
     assert imports.source_labels(missing) == ["Excel"]
     assert pg.execute("SELECT count(*) n FROM contacts").fetchone()["n"] == before_people
     assert (
