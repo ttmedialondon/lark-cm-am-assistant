@@ -255,7 +255,7 @@ def seeded(pg, monkeypatch):
     )
 
 
-@pytest.mark.parametrize("roster_kind", ["current", "missing_handle", "legacy", "both"])
+@pytest.mark.parametrize("roster_kind", ["current", "missing_handle", "multi_handle", "legacy", "both"])
 def test_save_enabled_immediately_queues_claims_and_stores_encrypted_summary(pg, seeded, roster_kind):
     s = seeded
     if roster_kind == "missing_handle":
@@ -286,6 +286,16 @@ def test_save_enabled_immediately_queues_claims_and_stores_encrypted_summary(pg,
     roster = ai._roster(pg)
     assert len(roster) == 1 and roster[0]["contact_id"] == s.ids["person"]
     assert roster[0]["display_handle"] == (None if roster_kind == "missing_handle" else "@alice")
+    if roster_kind == "multi_handle":
+        account = uuid4()
+        pg.execute(
+            """INSERT INTO social_accounts(id,platform,normalized_handle,display_handle)
+                   VALUES(%s,'tiktok','alice_shop','@alice_shop')""", (account,),
+        )
+        pg.execute(
+            """INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source)
+                   VALUES(%s,%s,'owner','confirmed','cm_confirmation')""", (s.ids["person"], account),
+        )
     assert s.save(False)["enabled"] is False
     assert ai.claim_next_summary() is None
     queued = s.save()
@@ -300,6 +310,12 @@ def test_save_enabled_immediately_queues_claims_and_stores_encrypted_summary(pg,
     if roster_kind == "missing_handle":
         assert s.calls[0]["users"]["U1"]["handles"] == []
         assert view["events"][0]["creator_handle"] is None
+        assert view["events"][0]["creator_handles"] == []
+    elif roster_kind == "multi_handle":
+        assert view["events"][0]["creator_handle"] is None
+        assert set(view["events"][0]["creator_handles"]) == {"@alice", "@alice_shop"}
+    else:
+        assert view["events"][0]["creator_handles"] == ["@alice"]
     assert "unrelated outsider secret" not in json.dumps(s.calls)
     assert "future CM reply" not in json.dumps(s.calls)
     record = pg.execute("SELECT * FROM offhours_summary_tasks").fetchone()

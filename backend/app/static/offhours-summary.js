@@ -33,7 +33,7 @@
     heading.append(node("span", `oh-priority ${level ? `oh-${level.toLowerCase()}` : "oh-warning"}`, level || "待核实"),
       node("h3", "oh-event-title", event.title));
     const identity = node("div", "oh-identity");
-    identity.append(node("span", "", `达人 handle：${event.creator_handle || "—"}`),
+    identity.append(node("span", "", `达人 handle：${event.creator_handle || event.creator_handles?.join("、") || "—"}`),
       node("span", "", `Lark 用户：${event.lark_user_name || "—"}`));
     if (event.conversation_type) identity.append(node("span", "",
       `${event.conversation_type === "private" ? "私聊" : "群聊"}：${event.conversation_name || "—"}`));
@@ -41,9 +41,9 @@
     if (needsReview(event)) card.append(node("span", "oh-review-tag", "信息不足，需结合原文核实"));
     card.append(node("p", "oh-summary", event.summary));
     const meta = node("div", "oh-event-meta");
-    for (const [name, value] of [["时段内最新进展", event.latest_progress], ["为什么是这个等级", event.reason]]) {
-      const field = node("dl"); field.append(node("dt", "", name), node("dd", "", value)); meta.append(field);
-    }
+    const progress = node("dl");
+    progress.append(node("dt", "", "时段内最新进展"), node("dd", "", event.latest_progress));
+    meta.append(progress);
     card.append(meta);
     const evidence = Array.isArray(event.evidence) ? event.evidence : [];
     if (evidence.length) {
@@ -66,7 +66,7 @@
       .map(detail => detail.dataset.detailKey));
     const all = events();
     const filtered = all.filter(event => (selected === "all" || selected === "review" && needsReview(event) || priority(event) === selected)
-      && (!query || [event.creator_handle, event.lark_user_name, event.conversation_name, event.title, event.summary, event.latest_progress, event.reason]
+      && (!query || [event.creator_handle, ...(event.creator_handles || []), event.lark_user_name, event.conversation_name, event.title, event.summary, event.latest_progress]
         .some(value => String(value || "").toLocaleLowerCase().includes(query))));
     filtered.sort((a, b) => (priorities.indexOf(priority(a)) < 0 ? 4 : priorities.indexOf(priority(a)))
       - (priorities.indexOf(priority(b)) < 0 ? 4 : priorities.indexOf(priority(b))));

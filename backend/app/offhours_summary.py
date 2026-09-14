@@ -1034,6 +1034,7 @@ def get_summary_view(conn, actor_id):
                     {
                         "id": f"{task['id']}:{i}",
                         "creator_handle": event["handle"],
+                        "creator_handles": user["handles"],
                         "lark_user_name": user["name"],
                         "conversation_type": "private" if current["pack"]["is_private"] else "group",
                         "conversation_name": current["pack"]["chat_name"],
