@@ -328,7 +328,7 @@
       const nextStep = importPreview.status !== "preview" ? "这份表已导入，不会重复启动，请查看页面上的导入进度。" : counts.valid ? "请核对后开始匹配。" : "请修改表格后重新上传。";
       importMessage(`有效 handle ${counts.valid || 0} · 重复 ${counts.duplicates || 0} · 无效 ${counts.invalid || 0}。${nextStep}`);
       const preview = el("import-preview"); preview.replaceChildren();
-      preview.append(node("p", `负责人：${selectedCMName()} · CAP 属性：${creatorTypeLabel(importPreview.creator_type)}。名单已确认达人身份，AI 匹配账号对应用户。`, "small"));
+      preview.append(node("p", `负责人：${selectedCMName()} · CAP 属性：${creatorTypeLabel(importPreview.creator_type)}。按账号对应群中的达人匹配，多个群合并去重后核对人数。`, "small"));
       const list = node("div", "", "border rounded p-2"); list.style.maxHeight = "240px"; list.style.overflowY = "auto";
       for (const item of (importPreview.rows || []).slice(0, 100)) {
         list.append(node("div", `第 ${item.row_number} 行 · ${item.handle || "—"}${item.error ? ` · ${item.error}` : ""}`, `small py-1 ${item.error ? "text-danger" : ""}`));
@@ -347,7 +347,7 @@
       await read(await fetch(`/creators/imports/${importPreview.id}/start`, {method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: new URLSearchParams({csrf_token: app.dataset.csrf})}));
       importPreview = null; el("import-dialog").close();
       tab = "candidates"; page = 1; clearRows();
-      notice("已提交匹配。名单已确认达人身份，AI 匹配账号对应用户；关系可靠且无冲突的按名单 CAP 属性入库。未找到对应用户的保留 handle、用户留空，其余留待核对。");
+      notice("已提交匹配。对应群合并去重后，唯一达人且无冲突就自动入库；没有识别到达人或有多位达人时，用户留空待核对，handle 和名单 CAP 属性保留。");
       void refresh();
     } catch (error) { importMessage(error.message, true); }
     finally { busy = false; render(); }

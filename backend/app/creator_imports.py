@@ -1,4 +1,4 @@
-"""Explicit single-CM handle imports, with bounded reverse account matching."""
+"""Explicit single-CM rosters matched to the unique creator in their groups."""
 
 from __future__ import annotations
 
@@ -22,7 +22,12 @@ POLICY_VERSION = "creator-import-v1"
 LOGGER = logging.getLogger(__name__)
 REASONS = {
     "existing": "已有相同账号和负责人，已复用正式关联",
-    "classified": "AI 已分析，仍需核对账号与用户",
+    "classified": "匹配已完成，请核对对应用户",
+    "unique_creator": "对应群内只有一位已识别达人，已匹配",
+    "no_creator": "对应群内未识别到达人，用户留空待核对",
+    "multiple_creators": "对应群内有多位达人，用户留空待核对",
+    "group_not_found": "未找到 handle 对应群，用户留空待核对",
+    "no_readable_material": "当前没有可访问的对应群，用户留空待核对",
     "manual_confirmed": "已确认入库",
     "no_match": "未找到对应用户，请搜索并确认",
     "insufficient_material": "材料不足，请手动确认",
@@ -47,23 +52,10 @@ STATUS_LABELS = {
     "invalid": "待确认",
 }
 BATCH_LABELS = {"preview": "等待开始", "running": "匹配中", "paused": "已暂停", "completed": "匹配完成"}
-ADMISSION_REASONS = {
-    "confidence_below_threshold": "账号归属置信度未达到 95%",
-    "creator_identity_unconfirmed": "达人身份尚未可靠确认",
-    "account_evidence_insufficient": "账号与用户的直接关系未通过证据校验",
-    "missing_info": "账号归属仍有待补充的核验信息",
-    "conflict": "AI 发现尚未解决的冲突",
-    "material_incomplete": "相关材料超过本次取材上限，覆盖不完整",
-    "account_change_signal": "存在改名或账号变更线索",
-    "competing_claimants": "有其他用户认领同一账号",
-    "multiple_users": "存在多个可能用户，尚未唯一确定",
-    "user_not_found": "尚未找到具体的 Lark 用户",
-    "ai_review": "AI 仍建议人工核对",
-}
 
 
 def source_labels(row):
-    """A paid request alone is not an AI account-person suggestion."""
+    """Credit AI only when a valid identity result contributed to the match."""
     stats = row.get("stats") or {}
     ai = stats.get("ai_matched_handle") if "ai_matched_handle" in stats else (
         row.get("result_ciphertext") is not None
@@ -218,7 +210,7 @@ def _conflict(conn, row, contact_id, handle):
     )
 
 
-def _admit(conn, row, actor, handle, contact_id, *, automatic=False, score=None, existing=False):
+def _admit(conn, row, actor, handle, contact_id, *, automatic=False, existing=False):
     try:
         handle = normalize_handle(handle)
     except ValueError as exc:
@@ -270,7 +262,8 @@ def _admit(conn, row, actor, handle, contact_id, *, automatic=False, score=None,
         (
             contact_id,
             account["id"],
-            "excel_ai_verified" if automatic else "cm_confirmation",
+            "excel_ai_verified" if automatic and "AI" in source_labels(row)
+            else "excel_verified" if automatic else "cm_confirmation",
             None if automatic else actor,
             row["id"],
         ),
@@ -283,9 +276,9 @@ def _admit(conn, row, actor, handle, contact_id, *, automatic=False, score=None,
             uuid4(),
             contact_id,
             row["cm_authorization_id"],
-            "ai" if automatic else "manual",
-            score,
-            None if automatic else actor,
+            "manual",
+            None,
+            actor,
             row["id"],
             contact_id,
         ),
@@ -339,7 +332,8 @@ def _record_roster_identity(conn, row, actor, contact_id, *, automatic):
         reviewed_by_authorization_id=EXCLUDED.reviewed_by_authorization_id,reviewed_at=NOW(),updated_at=NOW()
         WHERE contact_roles.status<>'confirmed' OR EXCLUDED.source='cm_confirmation'
         OR contact_roles.source IN ('ai_auto_confirmed','lark_internal_tenant')""",
-        (contact_id, "excel_ai_verified" if automatic else "cm_confirmation", None if automatic else actor),
+        (contact_id, "excel_ai_verified" if automatic and "AI" in source_labels(row)
+         else "excel_verified" if automatic else "cm_confirmation", None if automatic else actor),
     )
     conn.execute("UPDATE contact_roles SET is_primary=TRUE WHERE contact_id=%s AND role='creator'", (contact_id,))
 
@@ -459,28 +453,37 @@ def defer_row(actor_id, row_id):
         return {"id": str(row["id"]), "status": "deferred"}
 
 
-def recheck_row(actor_id, row_id):
-    """Explicitly retry a completed row after correcting its evidence or matching rules."""
+def recheck_batch(actor_id, batch_id):
+    """Rebuild pending matches under current rules, preserving formal data and paid usage."""
     with connection() as conn, conn.transaction():
-        row, batch = _row(conn, actor_id, row_id)
-        if batch["status"] != "completed" or row["review_status"] != "pending":
-            raise ValueError("只能重新匹配已完成批次中尚未确认的账号。")
-        _audit(conn, ownership._uuid(actor_id), "reanalysis_requested", {
-            "row_id": str(row["id"]), "handle": row["handle"],
-            "previous": {key: row[key] for key in (
-                "pack_ciphertext", "result_ciphertext", "refs", "fingerprint", "stats", "request_id", "response_id",
-            )},
-        })
-        conn.execute(
-            """UPDATE creator_import_rows SET status='pending',reason_code='',outcome=NULL,contact_id=NULL,
-            pack_ciphertext=NULL,result_ciphertext=NULL,refs='[]',fingerprint=NULL,config_fingerprint=NULL,
-            confidence=NULL,stats='{"force_reanalysis":true}',attempts=0,lease_until=NULL,
-            scheduled_at=NOW(),updated_at=NOW() WHERE id=%s""", (row["id"],),
-        )
-        conn.execute(
-            "UPDATE creator_import_batches SET status='running',updated_at=NOW() WHERE id=%s", (batch["id"],),
-        )
-        return {"id": str(row["id"]), "status": "pending"}
+        batch = _batch(conn, actor_id, batch_id)
+        if batch["status"] not in {"completed", "paused"} or conn.execute(
+            "SELECT 1 FROM creator_import_rows WHERE batch_id=%s AND status IN ('preparing','queued','running')",
+            (batch["id"],),
+        ).fetchone():
+            raise ValueError("请等待本批匹配结束后再重新匹配。")
+        rows = conn.execute(
+            "SELECT * FROM creator_import_rows WHERE batch_id=%s AND review_status='pending' FOR UPDATE",
+            (batch["id"],),
+        ).fetchall()
+        for row in rows:
+            _audit(conn, ownership._uuid(actor_id), "reanalysis_requested", {
+                "row_id": str(row["id"]), "handle": row["handle"],
+                "previous": {key: row[key] for key in (
+                    "pack_ciphertext", "result_ciphertext", "refs", "fingerprint", "stats", "request_id", "response_id",
+                )},
+            })
+            conn.execute(
+                """UPDATE creator_import_rows SET status='pending',reason_code='',outcome=NULL,contact_id=NULL,
+                pack_ciphertext=NULL,result_ciphertext=NULL,refs='[]',fingerprint=NULL,config_fingerprint=NULL,
+                confidence=NULL,stats='{}',attempts=0,lease_until=NULL,request_id=NULL,response_id=NULL,
+                scheduled_at=NOW(),updated_at=NOW() WHERE id=%s""", (row["id"],),
+            )
+        if rows:
+            conn.execute(
+                "UPDATE creator_import_batches SET status='running',updated_at=NOW() WHERE id=%s", (batch["id"],),
+            )
+        return {"id": str(batch["id"]), "queued": len(rows)}
 
 
 def _existing(conn, row):
@@ -514,269 +517,51 @@ def _valid(conn, row, settings):
     pack = _pack(row, settings)
     return creator_import_evidence.validate_evidence(
         conn, settings, row["cm_authorization_id"], row["handle"], pack, row["refs"], row["fingerprint"],
-        creator_type=pack.get("roster", {}).get("creator_type", "pending"),
+        creator_type=row["batch_creator_type"],
     )
 
 
-def _roster_handle_result(conn, row, task, settings, pack, model):
-    """Apply the roster's account-link checks to raw, currently readable person-first AI evidence."""
-    if row.get("batch_creator_type", "pending") == "pending" or not isinstance(model, dict):
-        return None
-    candidates = [c for c in model.get("candidates", [])
-                  if normalize_handle(c.get("handle", "")) == row["handle"]]
-    if len(candidates) != 1 or row["handle"] not in pack.get("allowed_handles", []):
-        return None
-    fresh = creator_import_evidence.build_evidence(
+def _refresh_known_result(conn, row, settings, *, response=None):
+    """Another handle may have classified the same member while this row was queued."""
+    material = creator_import_evidence.build_evidence(
         conn, settings, row["cm_authorization_id"], row["handle"], creator_type=row["batch_creator_type"],
     )
-    people = {r["label"]: r["contact_id"] for r in fresh["refs"] if r["kind"] == "person"}
-    claimants = sorted({
-        "U1" if people.get(ref) == str(task["contact_id"]) else "other"
-        for ref in fresh["stats"].get("account_claimant_refs", [])
-    })
-    person = conn.execute(
-        creator_import_evidence.admin_reporting.CONTACT_DIRECTORY_SQL
-        + "SELECT category,classification_source FROM directory WHERE contact_id=%s", (task["contact_id"],),
-    ).fetchone()
-    review_pack = creator_import_evidence.with_roster({
-        **pack, "imported_handle": row["handle"],
-        "users": [{"ref": "U1", "known_category": person["category"],
-                   "category_source": person["classification_source"]}],
-        "groups": [{**group, "other_external_by_user": {
-            "U1": group.get("member_summary", {}).get("other_external_or_unknown", 0),
-        }} for group in pack["groups"]],
-    }, row["batch_creator_type"], account_change_signal=fresh["stats"].get("account_change_signal", True),
-        account_claimant_refs=claimants)
-    candidate = {key: value for key, value in candidates[0].items() if key != "handle"}
-    candidate.update(user_ref="U1", is_creator=True, creator_confidence=1)
-    return creator_import_evidence.validate_result(ownership._encode({
-        "outcome": model["outcome"], "reason": model["reason"], "candidates": [candidate],
-    }), review_pack)
-
-
-def _reuse_handle_results(conn, row, settings):
-    """Reuse current account evidence; the spreadsheet already supplies the CM."""
-    from .creator_handle_evidence import validate_result
-
-    tasks = conn.execute(
-        """SELECT t.* FROM creator_handle_tasks t WHERE t.cm_authorization_id=%s
-        AND t.policy_version=%s AND t.status='succeeded' AND t.review_status<>'deferred'
-        AND t.result_ciphertext IS NOT NULL AND NOT EXISTS (
-            SELECT 1 FROM creator_handle_tasks n WHERE n.cm_authorization_id=t.cm_authorization_id
-            AND n.contact_id=t.contact_id AND n.status='succeeded'
-            AND (n.created_at,n.id)>(t.created_at,t.id)) ORDER BY t.contact_id""",
-        (row["cm_authorization_id"], creator_handles.POLICY_VERSION),
-    ).fetchall()
-    matches = []
-    for task in tasks:
-        result = creator_handles._decode(task, "result_ciphertext", settings)
-        if not any(c.get("handle") == row["handle"] for c in result.get("candidates", [])):
-            continue
-        if not _accessible(conn, row["cm_authorization_id"], task["contact_id"]):
-            continue
-        if not creator_handles._valid_handle_material(task, settings):
-            continue
-        pack = creator_handles._decode(task, "pack_ciphertext", settings)
-        stored = _pack(task, settings, "result_ciphertext")
-        model = stored.get("model_output")
-        if not model and (stored.get("response") or {}).get("text"):
-            model = json.loads(stored["response"]["text"])
-        checked = _roster_handle_result(conn, row, task, settings, pack, model)
-        if checked is not None:
-            result, candidate = checked, checked["candidates"][0]
-        else:
-            result = validate_result(ownership._encode(result), pack)
-            candidate = next(c for c in result["candidates"] if c["handle"] == row["handle"])
-        matches.append((task, result, candidate))
-    if not matches:
+    if material["checked"] is None:
         return False
-    contact_id = matches[0][0]["contact_id"] if len(matches) == 1 else None
-    conflict = len(matches) > 1 or bool(contact_id and _conflict(conn, row, contact_id, row["handle"]))
-    # An earlier reverse match proposing somebody else must not silently disappear.
-    if row.get("contact_id") and row["contact_id"] != contact_id and row.get("result_ciphertext"):
-        if _valid(conn, row, settings):
-            conflict, contact_id = True, None
-    task, result, candidate = matches[0]
-    matched = (
-        not conflict and candidate["confidence"] >= 0.95
-        and not candidate["conflicts"] and not candidate["missing_info"]
-        and (result.get("creator_confirmed") if "admission_blockers" in result
-             else ownership._creator(conn, contact_id))
-        and ("admission_blockers" not in result or result["outcome"] == "matched")
-    )
-    stats = {"ai_matched_handle": True, "reused_handle_task_ids": [str(t["id"]) for t, _, _ in matches]}
-    if any("admission_blockers" in checked for _, checked, _ in matches):
-        stats["admission_blockers"] = list(dict.fromkeys(
-            code for _, checked, _ in matches for code in checked.get("admission_blockers", [])
-        ))
-        if conflict:
-            stats["admission_blockers"].append("multiple_users" if len(matches) > 1 else "conflict")
-    if len(matches) == 1:
-        stats["reused_handle_task_id"] = str(task["id"])
     conn.execute(
-        """UPDATE creator_import_rows SET status='succeeded',reason_code=%s,contact_id=%s,
-        outcome=%s,confidence=%s,stats=%s,lease_until=NULL,updated_at=NOW() WHERE id=%s""",
-        (
-            "account_conflict" if conflict else "classified", contact_id,
-            "conflict" if conflict else "matched" if matched else "review",
-            candidate["confidence"] if len(matches) == 1 else None, Jsonb(stats), row["id"],
-        ),
+        """UPDATE creator_import_rows SET pack_ciphertext=%s,refs=%s,fingerprint=%s,stats=%s WHERE id=%s""",
+        (ownership._cipher(settings).encrypt(ownership._encode(material["pack"])), Jsonb(material["refs"]),
+         material["fingerprint"], Jsonb(material["stats"]), row["id"]),
     )
-    if matched:
+    original = ({"pack": _pack(row, settings), "refs": row["refs"], "fingerprint": row["fingerprint"]}
+                if response else None)
+    row.update(refs=material["refs"], stats=material["stats"])
+    _apply_result(conn, row, material["checked"], settings, response=response, response_evidence=original)
+    _settle(conn, row["batch_id"])
+    return True
+
+
+def _apply_result(conn, row, result, settings, *, response=None, response_evidence=None):
+    """One admission path for existing classifications, cached results and fresh identity AI."""
+    contact_id = creator_import_evidence.resolve_contact(row["refs"], result.get("user_ref"))
+    stats = {"ai_matched_handle": result["ai_used"], "creator_count": result["creator_count"]}
+    conn.execute(
+        """UPDATE creator_import_rows SET status='succeeded',reason_code=%s,result_ciphertext=%s,
+        contact_id=%s,confidence=%s,outcome=%s,stats=stats||%s::jsonb,lease_until=NULL,updated_at=NOW() WHERE id=%s""",
+        (result["reason_code"], ownership._cipher(settings).encrypt(ownership._encode({
+            "response": response, "checked": result, "response_evidence": response_evidence,
+        })), contact_id, result["confidence"], result["outcome"], Jsonb(stats), row["id"]),
+    )
+    if result["outcome"] == "matched" and contact_id:
         try:
             with conn.transaction():
-                _admit(
-                    conn, row, row["uploaded_by"], row["handle"], contact_id,
-                    automatic=True, score=candidate["confidence"],
-                )
+                _admit(conn, {**row, "stats": {**row["stats"], **stats}}, row["uploaded_by"], row["handle"],
+                       contact_id, automatic=True)
         except (ValueError, PermissionError):
             conn.execute(
                 "UPDATE creator_import_rows SET outcome='conflict',reason_code='account_conflict' WHERE id=%s",
                 (row["id"],),
             )
-    return True
-
-
-def reconcile_handle_results(settings, cm_id, *, handles=None, limit=100):
-    """Free reconciliation of finished imports with existing AI results, never a paid retry."""
-    count = 0
-    with connection() as conn:
-        rows = conn.execute(
-            """SELECT r.id,r.batch_id FROM creator_import_rows r JOIN creator_import_batches b ON b.id=r.batch_id
-            WHERE r.cm_authorization_id=%s AND b.policy_version=%s AND b.status<>'preview'
-            AND r.review_status='pending' AND r.status IN ('succeeded','skipped','failed','invalid')"""
-            + (" AND r.handle=ANY(%s::text[])" if handles is not None else "")
-            + " ORDER BY r.created_at,r.id LIMIT %s",
-            (ownership._uuid(cm_id), POLICY_VERSION, *([handles] if handles is not None else []), limit),
-        ).fetchall()
-    for candidate in rows:
-        with connection() as conn, conn.transaction():
-            batch = conn.execute(
-                "SELECT * FROM creator_import_batches WHERE id=%s FOR UPDATE", (candidate["batch_id"],)
-            ).fetchone()
-            if not batch:
-                continue
-            row = conn.execute(
-                """SELECT r.*,b.uploaded_by,b.creator_type batch_creator_type FROM creator_import_rows r
-                JOIN creator_import_batches b ON b.id=r.batch_id WHERE r.id=%s
-                AND r.review_status='pending' AND r.status IN ('succeeded','skipped','failed','invalid')
-                FOR UPDATE OF r""", (candidate["id"],)
-            ).fetchone()
-            if row:
-                creator_handles._access(conn, row["uploaded_by"], row["cm_authorization_id"])
-                count += bool(_reuse_handle_results(conn, row, settings))
-                _settle(conn, row["batch_id"])
-    return count
-
-
-def confirm_roster_type(actor_id, batch_id, creator_type, settings):
-    """Apply an explicit roster declaration and freely recheck saved, unchanged AI evidence.
-
-    Original packs/refs/responses stay intact: adding a trusted roster fact must not
-    silently assign an old M/U reference to a different message or person.
-    """
-    if creator_type not in {"cap", "non_cap"}:
-        raise ValueError("请明确选择 CAP 或非 CAP 名单。")
-    with connection() as conn, conn.transaction():
-        batch = _batch(conn, actor_id, batch_id)
-        if batch["status"] not in {"completed", "paused"} or conn.execute(
-            "SELECT 1 FROM creator_import_rows WHERE batch_id=%s AND status IN ('preparing','queued','running')",
-            (batch["id"],),
-        ).fetchone():
-            raise ValueError("请等待匹配完成后再确认名单属性。")
-        rows = conn.execute(
-            "SELECT * FROM creator_import_rows WHERE batch_id=%s ORDER BY row_number FOR UPDATE", (batch["id"],),
-        ).fetchall()
-        checks = {}
-        # Validate all snapshots before the first admission changes a person's classification.
-        for row in rows:
-            if (row["review_status"] != "pending" or not row["pack_ciphertext"]
-                    or not row["result_ciphertext"]):
-                continue
-            stored = _pack(row, settings, "result_ciphertext")
-            if not (stored.get("response") or {}).get("text"):
-                continue
-            if not _valid(conn, row, settings):
-                checks[row["id"]] = None
-                continue
-            pack = _pack(row, settings)
-            fresh = creator_import_evidence.build_evidence(
-                conn, settings, row["cm_authorization_id"], row["handle"], creator_type=creator_type,
-            )
-            review_pack = creator_import_evidence.with_roster(
-                pack, creator_type, account_change_signal=fresh["stats"].get("account_change_signal", True),
-            )
-            old_people = {r["contact_id"]: r["label"] for r in row["refs"] if r["kind"] == "person"}
-            new_people = {r["label"]: r["contact_id"] for r in fresh["refs"] if r["kind"] == "person"}
-            review_pack["meta"]["account_claimant_refs"] = sorted({
-                old_people.get(new_people.get(ref), "other")
-                for ref in fresh["stats"].get("account_claimant_refs", [])
-            })
-            try:
-                checked = creator_import_evidence.validate_result(stored["response"]["text"], review_pack)
-            except (ValueError, KeyError, TypeError):
-                continue
-            stored["checked"] = checked
-            stored["roster_type"] = creator_type
-            checks[row["id"]] = (stored, checked)
-        conn.execute(
-            "UPDATE creator_import_batches SET creator_type=%s,updated_at=NOW() WHERE id=%s",
-            (creator_type, batch["id"]),
-        )
-        counts = {"admitted": 0, "existing_updated": 0, "review": 0, "stale": 0, "conflicts": 0}
-        for row in rows:
-            row["batch_creator_type"] = creator_type
-            if row["review_status"] == "confirmed":
-                try:
-                    with conn.transaction():
-                        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,137034))",
-                                     ("tiktok:" + row["handle"],))
-                        conn.execute("SELECT id FROM contacts WHERE id=%s FOR UPDATE", (row["contact_id"],))
-                        if _conflict(conn, row, row["contact_id"], row["handle"]):
-                            raise ValueError(REASONS["account_conflict"])
-                        _record_roster_identity(conn, row, actor_id, row["contact_id"], automatic=True)
-                        counts["existing_updated"] += 1
-                except ValueError:
-                    counts["conflicts"] += 1
-                continue
-            if row["id"] not in checks:
-                counts["review"] += 1
-                continue
-            check = checks[row["id"]]
-            if check is None:
-                conn.execute(
-                    "UPDATE creator_import_rows SET reason_code='authorization_changed',updated_at=NOW() WHERE id=%s",
-                    (row["id"],),
-                )
-                counts["stale"] += 1
-                continue
-            stored, checked = check
-            contact_id = creator_import_evidence.resolve_contact(row["refs"], checked.get("user_ref"))
-            conn.execute(
-                """UPDATE creator_import_rows SET result_ciphertext=%s,status='succeeded',reason_code='classified',
-                contact_id=%s,confidence=%s,outcome=%s,stats=stats||%s::jsonb,updated_at=NOW() WHERE id=%s""",
-                (ownership._cipher(settings).encrypt(ownership._encode(stored)), contact_id,
-                 checked["confidence"], checked["outcome"],
-                 Jsonb({"ai_matched_handle": bool(checked["candidates"]), "roster_rechecked": creator_type}),
-                 row["id"]),
-            )
-            if checked["outcome"] != "matched":
-                counts["review"] += 1
-                continue
-            try:
-                with conn.transaction():
-                    _admit(conn, row, actor_id, row["handle"], contact_id, automatic=True, score=checked["confidence"])
-                    counts["admitted"] += 1
-            except (ValueError, PermissionError):
-                conn.execute(
-                    "UPDATE creator_import_rows SET outcome='conflict',reason_code='account_conflict' WHERE id=%s",
-                    (row["id"],),
-                )
-                counts["conflicts"] += 1
-        _audit(conn, ownership._uuid(actor_id), "roster_confirmed", {
-            "batch_id": str(batch["id"]), "creator_type": creator_type, **counts,
-        })
-        return counts
 
 
 def prepare_next_import(settings):
@@ -808,10 +593,6 @@ def prepare_next_import(settings):
                 _admit(conn, row, row["uploaded_by"], row["handle"], contact_id, automatic=True, existing=True)
                 _settle(conn, row["batch_id"])
                 return True
-            force_reanalysis = row["stats"].get("force_reanalysis", False)
-            if not force_reanalysis and _reuse_handle_results(conn, row, settings):
-                _settle(conn, row["batch_id"])
-                return True
             material = creator_import_evidence.build_evidence(
                 conn, settings, row["cm_authorization_id"], row["handle"], creator_type=row["batch_creator_type"],
             )
@@ -839,46 +620,22 @@ def prepare_next_import(settings):
                     row["id"],
                 ),
             )
-            if status == "queued" and not force_reanalysis:
+            row.update(refs=material["refs"], stats=material["stats"])
+            if material["checked"] is not None:
+                _apply_result(conn, row, material["checked"], settings)
+            elif status == "queued":
                 cached = conn.execute(
                     """SELECT result_ciphertext FROM creator_import_rows
                     WHERE cm_authorization_id=%s AND handle=%s AND status='succeeded' AND result_ciphertext IS NOT NULL
                     AND fingerprint=%s AND config_fingerprint=%s ORDER BY updated_at DESC LIMIT 1""",
-                    (
-                        row["cm_authorization_id"],
-                        row["handle"],
-                        material["fingerprint"],
-                        ownership._config_fingerprint(config),
-                    ),
+                    (row["cm_authorization_id"], row["handle"], material["fingerprint"],
+                     ownership._config_fingerprint(config)),
                 ).fetchone()
                 if cached:
-                    stored = _pack(cached, settings, "result_ciphertext")
-                    result = creator_import_evidence.validate_result(stored["response"]["text"], material["pack"])
-                    contact_id = creator_import_evidence.resolve_contact(material["refs"], result.get("user_ref"))
-                    conn.execute(
-                        """UPDATE creator_import_rows SET status='succeeded',reason_code='classified',
-                        result_ciphertext=%s,contact_id=%s,confidence=%s,outcome=%s,
-                        stats=stats||%s::jsonb WHERE id=%s""",
-                        (cached["result_ciphertext"], contact_id, result["confidence"], result["outcome"],
-                         Jsonb({"ai_matched_handle": bool(result["candidates"])}), row["id"]),
-                    )
-                    if result["outcome"] == "matched" and result["confidence"] >= 0.95 and result["creator_confirmed"]:
-                        try:
-                            with conn.transaction():
-                                _admit(
-                                    conn,
-                                    row,
-                                    row["uploaded_by"],
-                                    row["handle"],
-                                    contact_id,
-                                    automatic=True,
-                                    score=result["confidence"],
-                                )
-                        except (ValueError, PermissionError):
-                            conn.execute(
-                                """UPDATE creator_import_rows SET outcome='conflict',reason_code='account_conflict'
-                                WHERE id=%s""", (row["id"],),
-                            )
+                    response = _pack(cached, settings, "result_ciphertext")["response"]
+                    if response:
+                        result = creator_import_evidence.validate_result(response["text"], material["pack"])
+                        _apply_result(conn, row, result, settings, response=response)
         except (ValueError, PermissionError) as exc:
             conn.execute("ROLLBACK TO SAVEPOINT import_prepare")
             reason = (
@@ -954,6 +711,7 @@ def _finish(job, status, reason, settings, response=None, result=None):
         row = _current(conn, job)
         if not row:
             return
+        refresh = False
         if result:
             try:
                 creator_handles._access(conn, row["uploaded_by"], row["cm_authorization_id"])
@@ -961,53 +719,30 @@ def _finish(job, status, reason, settings, response=None, result=None):
                 if (
                     not config
                     or ownership._config_fingerprint(config) != row["config_fingerprint"]
-                    or not _valid(conn, row, settings)
                 ):
-                    raise ValueError("资料变化")
+                    raise ValueError("配置变化")
+                if not _valid(conn, row, settings):
+                    refresh = True
+                    status, reason, result = "invalid", "authorization_changed", None
             except (ValueError, PermissionError):
                 status, reason, result = "invalid", "authorization_changed", None
-        contact_id = creator_import_evidence.resolve_contact(row["refs"], result.get("user_ref")) if result else None
         usage = (response or {}).get("usage", {})
         conn.execute(
             """UPDATE creator_import_rows SET status=%s,reason_code=%s,result_ciphertext=%s,
-            outcome=%s,contact_id=%s,confidence=%s,input_tokens=input_tokens+%s,output_tokens=output_tokens+%s,
-            response_id=%s,request_id=%s,stats=stats||%s::jsonb,lease_until=NULL,updated_at=NOW() WHERE id=%s""",
-            (
-                status,
-                reason,
-                ownership._cipher(settings).encrypt(ownership._encode({"response": response, "checked": result}))
-                if response
-                else None,
-                result["outcome"] if result else None,
-                contact_id,
-                result["confidence"] if result else None,
-                usage.get("input_tokens") or 0,
-                usage.get("output_tokens") or 0,
-                (response or {}).get("response_id"),
-                (response or {}).get("telemetry", {}).get("openai_request_id"),
-                Jsonb({"ai_matched_handle": bool(result and result["candidates"])}),
-                row["id"],
-            ),
+            outcome=NULL,contact_id=NULL,confidence=NULL,input_tokens=input_tokens+%s,output_tokens=output_tokens+%s,
+            response_id=%s,request_id=%s,stats=stats||'{"ai_matched_handle":false}'::jsonb,
+            lease_until=NULL,updated_at=NOW() WHERE id=%s""",
+            (status, reason,
+             ownership._cipher(settings).encrypt(ownership._encode({"response": response, "checked": None}))
+             if response else None,
+             usage.get("input_tokens") or 0, usage.get("output_tokens") or 0,
+             (response or {}).get("response_id"), (response or {}).get("telemetry", {}).get("openai_request_id"),
+             row["id"]),
         )
-        if result and result["outcome"] == "matched" and result["confidence"] >= 0.95 and result["creator_confirmed"]:
-            try:
-                # A savepoint prevents a rejected admission from discarding the useful AI result.
-                with conn.transaction():
-                    _admit(
-                        conn,
-                        row,
-                        row["uploaded_by"],
-                        row["handle"],
-                        contact_id,
-                        automatic=True,
-                        score=result["confidence"],
-                    )
-            except (ValueError, PermissionError):
-                conn.execute(
-                    """UPDATE creator_import_rows SET outcome='conflict',reason_code='account_conflict'
-                    WHERE id=%s""",
-                    (row["id"],),
-                )
+        if result:
+            _apply_result(conn, row, result, settings, response=response)
+        elif refresh:
+            _refresh_known_result(conn, row, settings, response=response)
         _settle(conn, row["batch_id"])
 
 
@@ -1025,14 +760,15 @@ def run_claimed_import(job, settings):
                     (row["id"],),
                 )
                 return
-            config = ownership._config(conn)
-            if (
-                not config
-                or ownership._config_fingerprint(config) != row["config_fingerprint"]
-                or not _valid(conn, row, settings)
-                or row["batch_status"] != "running"
-            ):
+            if row["batch_status"] != "running":
+                raise ValueError("批次状态已变化")
+            if not _valid(conn, row, settings):
+                if _refresh_known_result(conn, row, settings):
+                    return
                 raise ValueError("材料已变化")
+            config = ownership._config(conn)
+            if not config or ownership._config_fingerprint(config) != row["config_fingerprint"]:
+                raise ValueError("配置已变化")
             pack = _pack(row, settings)
             key = api_key_cipher(settings.token_encryption_key).decrypt(config["api_key_ciphertext"])
             conn.execute("UPDATE creator_import_rows SET api_requests=api_requests+1 WHERE id=%s", (row["id"],))
@@ -1116,57 +852,15 @@ def batch_summaries(conn, cm_id):
     return decorated
 
 
-def _review_reason(conn, row, settings, visible):
+def _review_reason(row, visible):
     if row["contact_id"] and not visible:
         return "对应用户当前不可访问，请重新选择可访问的 Lark 用户。"
-    if row["reason_code"] != "classified":
-        return REASONS.get(row["reason_code"], "材料不足，请核对对应用户" if row["status"] == "skipped" else "")
-    codes = (row.get("stats") or {}).get("admission_blockers", [])
-    # Read stored analysis only. A list refresh must not rebuild evidence or call AI.
-    reused = (row.get("stats") or {}).get("reused_handle_task_id")
-    if reused and "admission_blockers" not in (row.get("stats") or {}):
-        from .creator_handle_evidence import _strong
-
-        task = conn.execute(
-            "SELECT * FROM creator_handle_tasks WHERE id=%s AND cm_authorization_id=%s",
-            (ownership._uuid(reused), row["cm_authorization_id"]),
-        ).fetchone()
-        if task:
-            result = creator_handles._decode(task, "result_ciphertext", settings)
-            pack = creator_handles._decode(task, "pack_ciphertext", settings)
-            candidate = next((c for c in result.get("candidates", []) if c["handle"] == row["handle"]), None)
-            if candidate:
-                refs = {r["ref"]: r for r in [*pack.get("groups", []), *pack.get("messages", [])]}
-                cited = [refs[ref] for ref in candidate["evidence_refs"] if ref in refs]
-                conditions = {
-                    "confidence_below_threshold": candidate["confidence"] < 0.95,
-                    "creator_identity_unconfirmed": not ownership._creator(conn, row["contact_id"]),
-                    "account_evidence_insufficient": not _strong(candidate, pack, cited),
-                    "missing_info": bool(candidate["missing_info"]),
-                    "conflict": bool(candidate["conflicts"]),
-                    "material_incomplete": pack.get("meta", {}).get("material_incomplete"),
-                    "account_change_signal": pack.get("meta", {}).get("account_change_signal"),
-                }
-                codes = [code for code, blocked in conditions.items() if blocked]
-    elif row.get("result_ciphertext") and row.get("pack_ciphertext"):
-        stored = _pack(row, settings, "result_ciphertext")
-        checked = stored.get("checked") or {}
-        codes = checked.get("admission_blockers")
-        if codes is None and (stored.get("response") or {}).get("text"):
-            checked = creator_import_evidence.validate_result(
-                stored["response"]["text"], _pack(row, settings)
-            )
-            codes = checked["admission_blockers"]
-    explanations = [ADMISSION_REASONS[code] for code in (codes or []) if code in ADMISSION_REASONS]
-    if not explanations:
-        explanations = [REASONS["classified"]]
-    if row["contact_id"] and row["confidence"] is not None:
-        explanations.insert(0, f"AI 账号归属评分 {float(row['confidence']) * 100:g}%（入库门槛 95%）")
-    return "；".join(explanations)
+    if row["reason_code"] == "multiple_creators":
+        return f"对应群合并去重后有 {row['stats']['creator_count']} 位达人，用户留空待核对。"
+    return REASONS.get(row["reason_code"], "请核对 handle 和 Lark 用户。")
 
 
 def candidate_items(conn, cm_id, rows):
-    settings = creator_handles.get_settings()
     contact_ids = list({r["contact_id"] for r in rows if r["contact_id"]})
     visible_ids = {
         r["id"] for r in conn.execute(
@@ -1185,8 +879,8 @@ def candidate_items(conn, cm_id, rows):
             "sources": source_labels(r),
             "source": " + ".join(source_labels(r)),
             "status_label": "暂缓" if r["review_status"] == "deferred"
-            else "AI 已分析，待核对" if r["reason_code"] == "classified" else STATUS_LABELS[r["status"]],
-            "reason": _review_reason(conn, r, settings, r["contact_id"] in visible_ids),
+            else "匹配完成，待核对" if r["status"] == "succeeded" else STATUS_LABELS[r["status"]],
+            "reason": _review_reason(r, r["contact_id"] in visible_ids),
             "confidence": float(r["confidence"])
             if r["confidence"] is not None and r["contact_id"] in visible_ids else None,
             "can_confirm": True,

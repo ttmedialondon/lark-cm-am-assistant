@@ -319,30 +319,23 @@ def test_old_rename_and_over_limit_material_cannot_silently_produce_high_confide
     assert not empty["eligible"] and empty["reason_code"] == "no_handle_clue"
 
 
-def test_reverse_import_requires_scoped_person_proof_preserves_roles_and_rechecks_history(pg, scope, monkeypatch):
+def test_import_group_identity_evidence_preserves_scope_and_rechecks_changes(pg, scope):
     from app import creator_import_evidence as imports
 
     ids, settings, add = scope
-    add("creator", "My TikTok account is @creator._123. I will post my video tomorrow.", chat="group")
-    add("other", "HIDDEN_IMPORT_SECRET my account is @creator._123", observer="owner")
+    own_id = add("creator", "I create my own product videos and stream LIVE every week.", chat="group")
+    add("other", "HIDDEN_IMPORT_SECRET I create videos", observer="owner")
     material = imports.build_evidence(pg, settings, ids["cm"], "@Creator._123")
     assert material["eligible"] and material["stats"]["users"] == 1
     packed = json.dumps(material["pack"])
     assert "HIDDEN_IMPORT_SECRET" not in packed and "ou_creator" not in packed and str(ids["creator"]) not in packed
     assert imports.resolve_contact(material["refs"], "U1") == str(ids["creator"])
-
-    def result(pack, *, basis="self_declared", user="U1", creator_confidence=0.99):
-        return json.dumps({"outcome": "matched", "reason": "本人发布视频并声明账号。", "candidates": [{
-            "user_ref": user, "confidence": 0.99, "is_creator": True, "creator_confidence": creator_confidence,
-            "basis": basis, "evidence_refs": [r["ref"] for r in [*pack["groups"], *pack["messages"]]],
-            "conflicts": [], "missing_info": [],
-        }]})
-
-    assert imports.validate_result(result(material["pack"]), material["pack"])["outcome"] == "matched"
-    assert imports.validate_result(result(material["pack"], basis="group_business_identity"),
-                                   material["pack"])["outcome"] == "review"
+    result = {"people": [{"user_ref": "U1", "role": "creator", "confidence": .99,
+                          "basis": "self_declaration", "evidence_refs": [material["pack"]["messages"][0]["ref"]]}]}
+    assert imports.validate_result(json.dumps(result), material["pack"])["outcome"] == "matched"
+    result["people"][0]["user_ref"] = "U999"
     with pytest.raises(ValueError):
-        imports.validate_result(result(material["pack"], user="U999"), material["pack"])
+        imports.validate_result(json.dumps(result), material["pack"])
 
     def current():
         return imports.validate_evidence(pg, settings, ids["cm"], "creator._123", material["pack"],
@@ -350,61 +343,39 @@ def test_reverse_import_requires_scoped_person_proof_preserves_roles_and_recheck
 
     assert current()
     pg.execute("UPDATE chats SET name='An unrelated new chat name' WHERE chat_id='private'")
-    assert current()  # Unrelated chat metadata does not constantly invalidate the import job.
-    pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s AND chat_id='group'",
-               (ids["cm"],))
-    assert not current()
-    pg.execute("UPDATE authorization_chats SET is_visible=TRUE WHERE authorization_id=%s AND chat_id='group'",
-               (ids["cm"],))
-    pg.execute("INSERT INTO contact_roles(contact_id,role,status,source,is_primary) "
-               "VALUES(%s,'merchant_contact','confirmed','manual',TRUE)", (ids["creator"],))
-    protected = imports.build_evidence(pg, settings, ids["cm"], "creator._123")
-    assert not current()
-    assert not protected["eligible"] and protected["pack"]["users"] == []
-    pg.execute("DELETE FROM contact_roles WHERE contact_id=%s", (ids["creator"],))
-    pg.execute("UPDATE chats SET name='Business discussion' WHERE chat_id='group'")
-    fallback = imports.build_evidence(pg, settings, ids["cm"], "creator._123")
-    assert fallback["eligible"] and fallback["stats"]["retrieval"] == "message_or_similar"
-    assert imports.validate_result(result(fallback["pack"]), fallback["pack"])["outcome"] == "matched"
-    add("creator", "I have posted my video.", chat="group")
-    monkeypatch.setattr(imports, "LOCAL_SEARCH_MESSAGES", 1)
-    limited = imports.build_evidence(pg, settings, ids["cm"], "creator._123")
-    assert limited["stats"]["material_incomplete"]
-    assert imports.validate_result(result(limited["pack"]), limited["pack"])["outcome"] == "review"
-    monkeypatch.setattr(imports, "LOCAL_SEARCH_MESSAGES", 20_000)
-    pg.execute("DELETE FROM authorization_message_observations")
-    pg.execute("DELETE FROM chat_messages")
-    pg.execute("UPDATE chats SET name='creator._123 X TT' WHERE chat_id='group'")
-    question = add("cm", "@_user_1 Can you send your video ad code?", chat="group", mention="creator")
-    add("creator", "Here is my ad code: SPARKTEST123", chat="group", parent=question)
-    group = imports.build_evidence(pg, settings, ids["cm"], "creator._123")
-    assert "SPARKTEST123" not in json.dumps(group["pack"])
-    assert imports.validate_result(result(group["pack"], basis="group_business_identity"),
-                                   group["pack"])["outcome"] == "matched"
-    pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('group','ou_other')")
-    ambiguous = imports.build_evidence(pg, settings, ids["cm"], "creator._123")
-    assert imports.validate_result(result(ambiguous["pack"], basis="group_business_identity"),
-                                   ambiguous["pack"])["outcome"] == "review"
+    assert current()
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE chat_messages SET is_deleted=TRUE WHERE message_id=%s", (own_id,))
+        assert not current()
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s AND chat_id='group'",
+                   (ids["cm"],))
+        assert not current()
+    with pg.transaction(force_rollback=True):
+        pg.execute("INSERT INTO contact_roles(contact_id,role,status,source,is_primary) "
+                   "VALUES(%s,'merchant_contact','confirmed','manual',TRUE)", (ids["creator"],))
+        assert not current()
+        protected = imports.build_evidence(pg, settings, ids["cm"], "creator._123")
+        assert not protected["eligible"] and protected["checked"]["user_ref"] is None
+    # A private handle declaration cannot substitute for a matching group.
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE chats SET name='Business discussion' WHERE chat_id='group'")
+        add("creator", "My account is @creator._123", chat="private")
+        missing = imports.build_evidence(pg, settings, ids["cm"], "creator._123")
+        assert not missing["eligible"] and missing["checked"]["user_ref"] is None
 
-    pg.execute("DELETE FROM authorization_message_observations")
-    pg.execute("DELETE FROM chat_messages")
-    pg.execute("DELETE FROM chat_members WHERE open_id='ou_other'")
-    add("creator", "My account is @creator._123", chat="private")
-    quiet = imports.build_evidence(pg, settings, ids["cm"], "creator._123")
-    assert quiet["eligible"] and quiet["stats"]["groups"] == 1
-    assert all(m["group_ref"] is None for m in quiet["pack"]["messages"])  # Quiet member, private evidence.
-    assert imports.validate_result(result(quiet["pack"]), quiet["pack"])["outcome"] == "review"
     pg.execute("INSERT INTO contact_roles(contact_id,role,status,source,is_primary) "
                "VALUES(%s,'creator','confirmed','manual',TRUE)", (ids["creator"],))
-    classified = imports.build_evidence(pg, settings, ids["cm"], "creator._123")
-    assert imports.validate_result(result(classified["pack"], creator_confidence=0.1),
-                                   classified["pack"])["outcome"] == "matched"
+    pg.execute("UPDATE chat_messages SET body_ciphertext=NULL")
+    known = imports.build_evidence(pg, settings, ids["cm"], "creator._123")
+    assert not known["eligible"] and known["checked"]["outcome"] == "matched"
+    assert known["pack"]["messages"] == []
     pg.execute("INSERT INTO chats(chat_id,chat_mode,name) VALUES('second','group','creator._123。cm1')")
     pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'second')", (ids["cm"],))
-    add("other", "My account is @creator._123. I have posted my video.", chat="second")
-    competing = imports.build_evidence(pg, settings, ids["cm"], "creator._123")
-    assert competing["stats"]["groups"] == 2 and len(competing["stats"]["account_claimant_refs"]) == 2
-    creator_ref = next(r["label"] for r in competing["refs"]
-                       if r["kind"] == "person" and r["contact_id"] == str(ids["creator"]))
-    assert imports.validate_result(result(competing["pack"], user=creator_ref),
-                                   competing["pack"])["outcome"] == "review"  # AI omitted the competing claimant.
+    pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('second','ou_creator'),('second','ou_other')")
+    assert imports.build_evidence(pg, settings, ids["cm"], "creator._123")["checked"]["creator_count"] == 1
+    pg.execute("INSERT INTO contact_roles(contact_id,role,status,source,is_primary) "
+               "VALUES(%s,'creator','confirmed','manual',TRUE)", (ids["other"],))
+    multiple = imports.build_evidence(pg, settings, ids["cm"], "creator._123")
+    assert multiple["stats"]["groups"] == 2 and multiple["checked"]["creator_count"] == 2
+    assert not multiple["eligible"] and multiple["checked"]["user_ref"] is None

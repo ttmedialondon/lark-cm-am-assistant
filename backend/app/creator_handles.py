@@ -773,15 +773,6 @@ def run_claimed_handle(job, settings):
         )
         result = validate_result(response["text"], pack)
         _finish(job, "succeeded", "classified", settings, response, result)
-        # A later AI answer can complete an earlier Excel candidate without another paid request.
-        try:
-            from .creator_imports import reconcile_handle_results
-
-            reconcile_handle_results(
-                settings, job["cm_authorization_id"], handles=[c["handle"] for c in result["candidates"]]
-            )
-        except Exception:
-            LOGGER.warning("Excel reconciliation deferred after handle result task=%s", job["id"])
     except contact_assessments.OpenAIRequestError as exc:
         if exc.is_quota:
             ai_dispatch.pause_for_quota()
