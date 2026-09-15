@@ -896,6 +896,15 @@ def test_creator_timeline_full_coverage_history_tools_resume_and_revocation(pg, 
     assert [ref for chunk in segments for ref in chunk] == [m['ref'] for m in data['messages']]
     assert not timeline.history(data,dict(query='',chat_id='unauthorized',message_id='',offset=0))['messages']
     assert timeline.history(data,dict(query='Original',chat_id='',message_id='',offset=0))['messages'][0]['message_id']=='ancient'
+    # Database mention-label row order must not invalidate identical source content.
+    pg.execute("UPDATE chat_messages SET mentions_json=%s::jsonb WHERE message_id='m1'",
+               (json.dumps([dict(id='ou_person',id_type='open_id',key='@_user_1'),
+                            dict(id='ou_other',id_type='open_id',key='@_user_2')]),))
+    first_order=timeline.load(pg,run,s.ids['person'],s.end,s.settings)['fingerprint']
+    original_names=timeline.mention_names
+    monkeypatch.setattr(timeline,'mention_names',lambda conn,rows: dict(reversed(list(original_names(conn,rows).items()))))
+    assert timeline.load(pg,run,s.ids['person'],s.end,s.settings)['fingerprint']==first_order
+    monkeypatch.setattr(timeline,'mention_names',original_names)
     # Schedule/claim a creator task in the existing manual run for this isolated fixture.
     timeline.schedule(pg,run,s.end)
     pg.execute('UPDATE offhours_summary_settings SET next_check_at=NULL')

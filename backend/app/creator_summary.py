@@ -19,7 +19,7 @@ PART_CHARS = 12000
 
 
 def dumps(value):
-    return json.dumps(value, ensure_ascii=False, default=str)
+    return json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
 
 
 def decode(value, settings):
