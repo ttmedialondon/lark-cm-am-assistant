@@ -592,3 +592,26 @@ def test_local_save_deadlock_retry_never_repeats_the_paid_request(pg, people, mo
     assert len(calls) == 1 and len(saves) == 2
     row = pg.execute("SELECT status,attempts FROM contact_assessments WHERE id=%s", (job["id"],)).fetchone()
     assert row == {"status": "succeeded", "attempts": 1}
+
+
+def test_summary_history_function_call_preserves_stateless_continuation(monkeypatch):
+    from app import creator_summary
+    captured = {}
+    call = {'type':'function_call','name':'read_history','call_id':'call-test',
+            'arguments':'{"query":"order","chat_id":"","message_id":"","offset":0}'}
+    class Response:
+        status_code = 200
+        headers = {}
+        def json(self):
+            return {'id':'response-test','status':'completed','output':[call], 'usage':{}}
+    def post(url,**kwargs):
+        captured.update(kwargs['json'])
+        return Response()
+    monkeypatch.setattr(contact_assessments.httpx,'post',post)
+    conversation=[{'role':'user','content':'Synthetic messages only'}]
+    response=contact_assessments.call_openai({'model':'test-model'},'test-key',{},uuid4(),
+        instructions='Summarize',output_format=creator_summary.output_format(),conversation=conversation,
+        tools=creator_summary.tools())
+    assert captured['store'] is False and captured['input']==conversation
+    assert captured['include']==['reasoning.encrypted_content']
+    assert response['function_calls']==[call] and response['output']==[call]

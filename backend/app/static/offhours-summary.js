@@ -36,13 +36,14 @@
     identity.append(node("span", "", `达人 handle：${event.creator_handle || event.creator_handles?.join("、") || "—"}`),
       node("span", "", `Lark 用户：${event.lark_user_name || "—"}`));
     if (event.conversation_type) identity.append(node("span", "",
-      `${event.conversation_type === "private" ? "私聊" : "群聊"}：${event.conversation_name || "—"}`));
+      `${event.conversation_type === "combined" ? "相关会话" : event.conversation_type === "private" ? "私聊" : "群聊"}：${event.conversation_name || "—"}`));
+    if (event.event_number) identity.append(node("span", "", `${event.event_number} · ${{new:"本时段新发生",updated:"本时段有进展",unresolved:"历史未解决"}[event.period_activity] || ""}`));
     card.append(heading, identity);
     if (needsReview(event)) card.append(node("span", "oh-review-tag", "信息不足，需结合原文核实"));
     card.append(node("p", "oh-summary", event.summary));
     const meta = node("div", "oh-event-meta");
     const progress = node("dl");
-    progress.append(node("dt", "", "时段内最新进展"), node("dd", "", event.latest_progress));
+    progress.append(node("dt", "", "截至该时段的进展"), node("dd", "", event.latest_progress));
     meta.append(progress);
     card.append(meta);
     const evidence = Array.isArray(event.evidence) ? event.evidence : [];
@@ -52,7 +53,7 @@
       details.append(node("summary", "", `查看相关原文（${evidence.length}）`));
       for (const message of evidence) {
         const item = node("figure", "oh-message");
-        item.append(node("figcaption", "", `${message.sender_name || "—"} · ${date(message.created_at)}（英国时间）`),
+        item.append(node("figcaption", "", `${message.chat_name ? message.chat_name + " · " : ""}${message.sender_name || "—"} · ${date(message.created_at)}（英国时间）`),
           node("blockquote", "", message.text || "该消息没有可显示的文字。"));
         messages.append(item);
       }
@@ -123,6 +124,8 @@
       if (pending) description += `，${pending} 个等待或处理中`;
       if (failed) description += `，${failed} 个未能完成`;
       description += "。";
+      if (data.message_progress?.total) description += ` 消息片段已处理 ${data.message_progress.processed} / ${data.message_progress.total}。`;
+      if (data.event_counts) description += ` 新发生 ${data.event_counts.new} 件，有进展 ${data.event_counts.updated} 件，历史未解决 ${data.event_counts.unresolved} 件。`;
       if (data.coverage) description += ` 已检查 ${data.coverage.related_groups || 0} 个相关群聊、${data.coverage.related_private_chats || 0} 个私聊；本时段纳入 ${data.coverage.group_conversations || 0} 个群聊、${data.coverage.private_conversations || 0} 个私聊，共 ${data.coverage.messages || 0} 条消息。`;
       if (run.cutoff) description += ` 本轮读取到 ${date(run.cutoff)}（英国时间）。`;
       if (data.window?.is_open) description += " 尚未到时段结束时间，请稍后查看更新。";
