@@ -905,7 +905,18 @@ def test_creator_timeline_full_coverage_history_tools_resume_and_revocation(pg, 
     assert progress['status']=='queued' and progress['processed_messages']>0
     checkpoint = timeline.decode(progress['checkpoint_ciphertext'],s.settings)
     assert checkpoint['index']==1
-    # Restart claims the next segment, does not repay/reprocess the successful segment.
+    # Invalid coverage gets feedback and retries the same segment, without advancing it.
+    original_model=ai.contact_assessments.call_openai
+    monkeypatch.setattr(ai.contact_assessments,'call_openai',lambda *a,**k: {'text':json.dumps({'processed_refs':[], 'updates':[]})})
+    following=ai.claim_next_summary()
+    ai.run_claimed_summary(following,s.settings)
+    bad=pg.execute('SELECT * FROM offhours_summary_tasks WHERE id=%s',(job['id'],)).fetchone()
+    bad_checkpoint=timeline.decode(bad['checkpoint_ciphertext'],s.settings)
+    assert bad['status']=='queued' and bad_checkpoint['index']==1
+    assert '系统证据校验未通过' in bad_checkpoint['conversation'][-1]['content']
+    monkeypatch.setattr(ai.contact_assessments,'call_openai',original_model)
+    pg.execute('UPDATE offhours_summary_tasks SET scheduled_at=NOW() WHERE id=%s',(job['id'],))
+    # Restart claims the same segment, does not repay/reprocess the successful segment.
     following = ai.claim_next_summary()
     ai.run_claimed_summary(following,s.settings)
     progress = pg.execute('SELECT * FROM offhours_summary_tasks WHERE id=%s',(job['id'],)).fetchone()

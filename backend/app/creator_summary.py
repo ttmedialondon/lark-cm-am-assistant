@@ -374,7 +374,9 @@ merge_reason 明确说明关联事实；evidence_refs 保留起因及最新进�
 无窗内消息的未解决历史事项保留；已解决旧事项保留历史记录但不算本时段新发生。
 status 为 open/resolved/uncertain。只有明确业务结果证据才可 resolved，单独 Thanks/All sorted 不足。
 anchor_ref 是该事项目前可找到的最早起因消息，更新同一事项应保持或向前追溯。
-每个 update 必须有一条本次提供或补查得到的证据；归属依据需达人发言、明确回复/@或唯一达人群的业务消息。
+每个 update 的 evidence_refs 必须引用目标达人 speaker=creator 的原文，或引用明确回复/@、目标私聊、唯一达人群 CM 消息。
+其他人的独立事项不能输出为本达人的事件，缺少归属原文时先补查；仍无证据则不输出该事件。
+新增事项也要填写非空 merge_reason，说明新增依据。
 不要按缺少回复自动提升等级。图片、音频等仍未读取，不得凭空补全。
 review_event 不为空时，最后复核该事项：重新核实归属、等级、实际进展、重复事件和原文支持。
 复核必须输出该事项的 update（existing_id=review_event）或把它并入另一项的 merged_ids；不能新建事项。
@@ -393,7 +395,10 @@ def output_format(core_refs=None):
         "status": {"type": "string", "enum": ["open", "resolved", "uncertain"]},
         "needs_review": {"type": "boolean"},
         "evidence_refs": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-        **{k: {"type": "string"} for k in ("title", "summary", "latest_progress", "reason", "merge_reason")},
+        **{
+            k: {"type": "string", "minLength": 1}
+            for k in ("title", "summary", "latest_progress", "reason", "merge_reason")
+        },
     }
     return {
         "type": "json_schema",
@@ -445,6 +450,8 @@ def apply_updates(raw, checkpoint, data, core_refs, allowed):
             "uncertain",
         ):
             raise core.InvalidModelOutput("invalid classification")
+        if not update.get("merge_reason") and update.get("existing_id") is None:
+            update["merge_reason"] = "本段新识别事项。"
         if type(update["needs_review"]) is not bool or any(
             not isinstance(update[k], str) or not update[k].strip()
             for k in ("title", "summary", "latest_progress", "reason", "merge_reason")
@@ -633,22 +640,43 @@ def step(job, settings):
                 )
             checkpoint["tool_rounds"] += 1
         else:
-            if review:
-                updates = json.loads(response["text"])["updates"]
-                if (
-                    len(updates) != 1
-                    or not any(u["existing_id"] == review or review in u["merged_ids"] for u in updates)
-                    or any(u["existing_id"] is None for u in updates)
-                ):
-                    raise core.InvalidModelOutput("event review incomplete")
-            apply_updates(response["text"], checkpoint, data, refs, set(checkpoint["allowed"]))
-            checkpoint["processed"] += len(refs)
-            if review:
-                checkpoint["reviewed"].append(review)
-            else:
-                checkpoint["index"] += 1
-            checkpoint["conversation"] = None
-            checkpoint["tool_rounds"] = 0
+            try:
+                if review:
+                    updates = json.loads(response["text"])["updates"]
+                    if (
+                        len(updates) != 1
+                        or not any(u["existing_id"] == review or review in u["merged_ids"] for u in updates)
+                        or any(u["existing_id"] is None for u in updates)
+                    ):
+                        raise core.InvalidModelOutput("event review incomplete")
+                apply_updates(response["text"], checkpoint, data, refs, set(checkpoint["allowed"]))
+                checkpoint["processed"] += len(refs)
+                if review:
+                    checkpoint["reviewed"].append(review)
+                else:
+                    checkpoint["index"] += 1
+                checkpoint["conversation"] = None
+                checkpoint["tool_rounds"] = 0
+            except core.InvalidModelOutput as exc:
+                # Retry the same segment with actionable validation feedback;
+                # no coverage or event state is advanced by an invalid answer.
+                checkpoint["conversation"].append({"role": "assistant", "content": response["text"]})
+                checkpoint["conversation"].append(
+                    {
+                        "role": "user",
+                        "content": "系统证据校验未通过：" + str(exc) + "。请修正并重新返回本段完整结果。"
+                        "processed_refs 必须完整照抄 core_refs；所有说明非空。"
+                        "事件必须有目标达人归属原文。需要时调用 read_history 补查；"
+                        "若只是其他人的事项，不要输出该事件。不能伪造证据或改变目标人。",
+                    }
+                )
+                with core.connection() as conn, conn.transaction():
+                    checked(conn, job, settings)
+                    conn.execute(
+                        "UPDATE offhours_summary_tasks SET checkpoint_ciphertext=%s WHERE id=%s",
+                        (core._cipher(settings.token_encryption_key).encrypt(dumps(checkpoint)), job["id"]),
+                    )
+                raise
     finished = checkpoint["index"] == len(segments) and all(
         e["id"] in checkpoint["reviewed"] for e in checkpoint["ledger"]
     )

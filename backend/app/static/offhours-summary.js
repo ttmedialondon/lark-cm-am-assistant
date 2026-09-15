@@ -118,7 +118,7 @@
         completed: "本轮分析已结束", partial: "已有部分分析结果", failed: "本轮分析遇到问题",
         cancelled: "本轮分析已停止", disabled: "分析已关闭", paused: "分析已暂停",
       }[run.status] || "正在整理分析结果";
-      title = !data.enabled ? "分析已关闭" : data.window?.is_open ? "时段未结束 · 当前为部分结果"
+      title = !data.enabled ? "分析已关闭" : !total && run.status === "queued" ? "已排队，准备分析" : data.window?.is_open ? "时段未结束 · 当前为部分结果"
         : data.window?.is_partial ? "当前为部分结果 · 尚有资料缺口" : status;
       description = `已完成 ${complete} / ${total} 个分析任务`;
       if (pending) description += `，${pending} 个等待或处理中`;
