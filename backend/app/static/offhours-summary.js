@@ -107,8 +107,6 @@
     const run = data.run, counts = run?.counts || {};
     const settingsLink = document.querySelector('.oh-actions a[href^="/admin/"]');
     if (settingsLink) settingsLink.hidden = !data.can_manage;
-    $("oh-scope").textContent = `${data.responsible?.name || "Remi"} · 已确认达人`;
-    $("oh-window").textContent = `${date(data.window?.start)} → ${date(data.window?.end)}`;
     const complete = Number(counts.completed || 0), failed = Number(counts.failed || 0);
     const pending = Number(counts.queued || 0) + Number(counts.running || 0);
     const total = complete + failed + pending;
@@ -193,6 +191,10 @@
   document.querySelectorAll("[data-priority]").forEach(button => button.addEventListener("click", () => {
     selected = button.dataset.priority; renderEvents();
   }));
+  $("oh-selection").addEventListener("change", () => {
+    clearTimeout(timer);
+    $("oh-selection").requestSubmit();
+  });
   $("oh-search").addEventListener("input", event => { query = event.target.value.trim().toLocaleLowerCase(); renderEvents(); });
   $("oh-refresh").addEventListener("click", refresh);
   document.addEventListener("visibilitychange", () => { if (document.hidden) clearTimeout(timer); else refresh(); });

@@ -44,7 +44,7 @@ async function fixture(t, data = report()) {
   return {page, state, errors};
 }
 
-test("bilingual user labels are displayed literally in scope and evidence", async t => {
+test("bilingual user labels are displayed literally in evidence", async t => {
   const label = "Remi（Quanzhen Liang）";
   const data = report({responsible: {id: "remi-id", name: label}, events: [event("P2", {
     lark_user_name: "Sample Creator",
@@ -52,7 +52,6 @@ test("bilingual user labels are displayed literally in scope and evidence", asyn
       created_at: "2026-09-09T20:00:00Z", sender_name: label}],
   })]});
   const {page, errors} = await fixture(t, data);
-  assert((await page.locator("#oh-scope").textContent()).includes(label));
   await page.getByText("查看相关原文（1）").click();
   assert((await page.locator(".oh-evidence").textContent()).includes(label));
   assert.deepEqual(errors, []);
@@ -65,8 +64,6 @@ test("grades are sorted, gaps stay separate, and filters/search/evidence work wi
   assert.equal(await page.locator("#oh-count-P3").textContent(), "1");
   assert.equal(await page.locator('a[href^="/admin/"]').count(), 0);
   assert((await page.locator("#oh-status-title").textContent()).includes("部分结果"));
-  assert((await page.locator("#oh-window").textContent()).includes("18:00"));
-  assert((await page.locator("#oh-window").textContent()).includes("12:00"));
   assert(await page.locator("#oh-gaps").isVisible());
   await page.locator('.oh-filter[data-priority="P0"]').click();
   assert.equal(await page.locator(".oh-event").count(), 1);
@@ -180,4 +177,23 @@ test("admin owner and read-only fixtures expose the right controls without makin
     if (process.env.OH_SCREENSHOT_DIR) await card.screenshot({path: path.join(process.env.OH_SCREENSHOT_DIR, `offhours-admin-${role}.png`)});
     await page.close();
   }
+});
+
+test("each summary selector navigates immediately without a submit button", async t => {
+  const data = report({selection: {
+    cms: [{id: "remi-id", name: "Remi"}, {id: "nero-id", name: "Nero"}],
+    dates: ["2026-09-09", "2026-09-10"], date: "2026-09-09", period: "off",
+  }});
+  const {page, errors} = await fixture(t, data);
+  assert.equal(await page.locator('#oh-selection button, [aria-label="总结范围"]').count(), 0);
+  for (const [name, value] of [["cm_id", "nero-id"], ["date", "2026-09-10"], ["period", "work"]]) {
+    await Promise.all([
+      page.waitForURL(url => url.searchParams.get(name) === value),
+      page.locator(`#oh-selection select[name="${name}"]`).selectOption(value),
+    ]);
+    const url = new URL(page.url());
+    assert.equal(url.pathname, "/dashboard/offhours-summary");
+    assert.equal(url.searchParams.size, 3);
+  }
+  assert.deepEqual(errors, []);
 });
