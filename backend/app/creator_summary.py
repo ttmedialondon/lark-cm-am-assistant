@@ -79,6 +79,8 @@ def load(conn, run, person, cutoff, settings, *, roster=None, chats=None, conten
             if row["sender_open_id"] in known_creators
             else "colleague"
             if row["tenant_classification"] == "internal"
+            else "other_creator"
+            if roles.get(row["contact_id"]) == "creator"
             else roles.get(row["contact_id"], "unknown")
         )
         text, unavailable = core._body(row, cipher, names, full=True)
@@ -149,6 +151,12 @@ def load(conn, run, person, cutoff, settings, *, roster=None, chats=None, conten
         for row in rows
     ]
     for row in source_rows:
+        if (
+            roles.get(row["contact_id"]) == "creator"
+            and row["sender_open_id"] not in known_creators
+            and row["sender_open_id"] != cm["open_id"]
+        ):
+            row["speaker_override"] = "other_creator"
         if row["body_ciphertext"]:
             row["body_ciphertext"] = core._hash(cipher.decrypt(row["body_ciphertext"]))
     fingerprint = core._hash(

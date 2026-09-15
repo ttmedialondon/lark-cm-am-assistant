@@ -884,10 +884,11 @@ def test_creator_timeline_full_coverage_history_tools_resume_and_revocation(pg, 
               at=s.start+timedelta(seconds=i))
     s.add('ancient',text='Original request',at=s.start-timedelta(days=20))
     s.add('future',text='Must never export',at=s.end+timedelta(seconds=1))
+    pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) VALUES(%s,'creator','confirmed','manual')",(s.ids['other'],))
     data = timeline.load(pg,run,s.ids['person'],s.end,s.settings)
     assert len(data['messages']) == 220
     assert sum(len(m['text']) for m in data['messages'] if m['message_id']=='bulk-0') == 25001
-    assert any(m['speaker'] != 'creator' for m in data['messages'])
+    assert all(m['speaker']=='other_creator' for m in data['messages'] if m['message_id']=='outside')
     assert any(m['message_id']=='ancient' for m in data['messages'])
     assert not any(m['message_id']=='future' for m in data['messages'])
     segments = timeline.chunks(data['messages'])
