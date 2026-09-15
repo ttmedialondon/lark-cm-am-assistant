@@ -14,24 +14,20 @@ from zoneinfo import ZoneInfo
 from cryptography.exceptions import InvalidTag
 
 from . import ai_dispatch, contact_assessments, creator_import_evidence, creator_imports
-from .ai_feature_config import FeatureConfigInputError, api_key_cipher
+from .ai_feature_config import FeatureConfigInputError
 from .config import get_settings
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
 from .message_mentions import mention_names, mention_targets, resolve_mentions, rich_mention_text
 
 FEATURE = "offhours_summary"
-POLICY_VERSION = "offhours-v2"
+POLICY_VERSION = "shift-dialogue-v3"
 REMI_ID = UUID("24d1ef13-3762-4359-ba11-d26c03cf1f7f")
 TEST_VIEWERS = frozenset({UUID("9d5f4370-6463-4c3a-a2ed-67753a1cabc0"), UUID("1225b4a0-fbd8-431e-962e-25e66943a8a0")})
 TIMEZONE = "Europe/London"
 LONDON = ZoneInfo(TIMEZONE)
 DEFAULT_START = "2026-09-09T18:00"
 DEFAULT_END = "2026-09-10T12:00"
-MAX_MESSAGES = 200
-MAX_CONTEXT = 100
-MAX_CHATS = 300
-MAX_BODY_CHARS = 2000
 MAX_EVENTS = 30
 MAX_ATTEMPTS = 3
 LOGGER = logging.getLogger(__name__)
@@ -120,16 +116,6 @@ def _parse_window(start, end):
         if value.astimezone(UTC).astimezone(LONDON).replace(tzinfo=None) != value.replace(tzinfo=None):
             raise SummaryInputError("所填时间处于英国夏令时跳时，请选择其他时间。")
     return tuple(value.astimezone(UTC) for value in values)
-
-
-def three_workday_deadline(value):
-    """Three Mon–Fri calendar days, at the same London wall-clock time; no holidays."""
-    value = value.astimezone(LONDON)
-    remaining = 3
-    while remaining:
-        value += timedelta(days=1)
-        remaining -= value.weekday() < 5
-    return value.astimezone(UTC)
 
 
 def get_settings_view(conn):
@@ -409,8 +395,8 @@ def _body(row, cipher, names=None):
         text = " ".join(fragments(payload))
     text = resolve_mentions(text, row.get("mentions_json"), names)
     text = re.sub(r"([?&](?:token|access_token|key|signature)=)[^&\s]+", r"\1[redacted]", text, flags=re.I)
-    incomplete = len(text) > MAX_BODY_CHARS or not text.strip() or "[未解析的@用户]" in text
-    return (text[:MAX_BODY_CHARS] or "[正文不可读取，需人工查看原消息]"), incomplete
+    incomplete = not text.strip() or "[未解析的@用户]" in text
+    return (text or "[正文不可读取，需人工查看原消息]"), incomplete
 
 
 def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, related_chats=None):
@@ -433,18 +419,18 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
     opens = {r["open_id"] for r in roster}
     all_senders = sorted(opens | {cm["open_id"]})
     recent = conn.execute(
-        _MESSAGE_SQL, (cm_id, chat_id, run["window_start"], cutoff, all_senders, MAX_MESSAGES + 1)
+        _MESSAGE_SQL, (cm_id, chat_id, run["window_start"], cutoff, all_senders, None)
     ).fetchall()
     earlier = conn.execute(
         _MESSAGE_SQL,
-        (cm_id, chat_id, run["window_start"] - timedelta(days=7), run["window_start"], all_senders, MAX_CONTEXT + 1),
+        (cm_id, chat_id, run["window_start"] - timedelta(days=7), run["window_start"], all_senders, None),
     ).fetchall()
-    rows = list(reversed(recent[:MAX_MESSAGES]))
+    rows = list(reversed(recent))
     relevant_opens = {r["sender_open_id"] for r in rows if r["sender_open_id"] in opens}
     reply_ids = {r.get(key) for r in rows if r["sender_open_id"] == cm["open_id"] for key in ("parent_id", "root_id")}
     relevant_opens.update(
         r["sender_open_id"]
-        for r in earlier[:MAX_CONTEXT]
+        for r in earlier
         if r["message_id"] in reply_ids and r["sender_open_id"] in opens
     )
     if chat["p2p_counterpart_open_id"] in opens:
@@ -467,12 +453,12 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
             people[label]["open_ids"].append(row["open_id"])
     users = {f"U{i + 1}": person for i, person in enumerate(people.values())}
     speaker_labels = {openid: label for label, user in users.items() for openid in user["open_ids"]}
-    selected = [*reversed(earlier[:MAX_CONTEXT]), *rows]
+    selected = [*reversed(earlier), *rows]
     selected = [r for r in selected if r["sender_open_id"] == cm["open_id"] or r["sender_open_id"] in speaker_labels]
     names = mention_names(conn, selected)
     cipher = message_body_cipher((settings or get_settings()).token_encryption_key)
     messages, refs, mention_fingerprints = [], {}, {}
-    incomplete = len(recent) > MAX_MESSAGES or len(earlier) > MAX_CONTEXT
+    incomplete = False
     for row in selected:
         label = f"M{len(messages) + 1}"
         body, unavailable = _body(row, cipher, names)
@@ -484,7 +470,6 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
                 "text": body,
                 "time": row["message_create_time"].isoformat(),
                 "in_window": row["message_create_time"] >= run["window_start"],
-                "three_workday_deadline_reached": three_workday_deadline(row["message_create_time"]) <= cutoff,
                 "unavailable_or_truncated": unavailable,
                 "unreadable": body.startswith("[附件或正文不可读取") or body.startswith("[正文不可读取"),
                 "parent_message_id": row.get("parent_id"),
@@ -611,14 +596,16 @@ def _schedule_run(conn, state, now):
     # Discover every related conversation before applying the bounded content limit.
     chats = _related_chats(conn, roster, cm_id=cm_id)
     gaps = []
-    if len(chats) > MAX_CHATS:
-        gaps.append("超过本次 300 个会话的检查上限；当前结果不完整。")
     count, messages, synced = 0, 0, True
     private_count = 0
-    selected_ids = []
+    selected_ids, cutoffs = [], []
     run = {**dict(state), "id": state["run_id"]}
-    for chat in chats[:MAX_CHATS]:
-        evidence = _load_chat(conn, run, chat["chat_id"], cutoff, roster=roster, related_chats=chats)
+    for chat in chats:
+        previous = conn.execute("""SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND chat_id=%s
+            ORDER BY is_current DESC,created_at DESC LIMIT 1""", (state["run_id"], chat["chat_id"])).fetchone()
+        active = previous and previous['is_current'] and previous['status'] in ('queued', 'running')
+        chat_cutoff = previous['cutoff'] if active else cutoff
+        evidence = _load_chat(conn, run, chat["chat_id"], chat_cutoff, roster=roster, related_chats=chats)
         if not evidence:
             watermark = max(
                 [t for t in (chat["last_incremental_at"], chat["last_backfill_at"]) if t]
@@ -631,9 +618,11 @@ def _schedule_run(conn, state, now):
         messages += sum(m["in_window"] for m in evidence["pack"]["messages"])
         synced = synced and evidence["synced"]
         if evidence["incomplete"]:
-            gaps.append("部分会话超过消息长度/数量上限，或有附件无法读取；不能当作完整总结。")
-        if not evidence["pack"]["is_private"]:
-            gaps.append("群聊仅纳入已确认达人及 CM 发言，其他人员回复未纳入，进展可能不完整。")
+            gaps.append("部分附件或正文不可读取；分析仅依据可读消息。")
+        cutoffs.append(chat_cutoff)
+        if active:
+            selected_ids.append(previous['id'])
+            continue
         conn.execute(
             """UPDATE offhours_summary_tasks SET is_current=FALSE
                      WHERE run_id=%s AND chat_id=%s AND input_fingerprint<>%s""",
@@ -646,21 +635,22 @@ def _schedule_run(conn, state, now):
             (state["run_id"], chat["chat_id"], evidence["fingerprint"]),
         )
         selected = conn.execute(
-            """INSERT INTO offhours_summary_tasks(id,run_id,chat_id,input_fingerprint,cutoff)
-                     VALUES(%s,%s,%s,%s,%s) ON CONFLICT(run_id,chat_id,input_fingerprint)
+            """INSERT INTO offhours_summary_tasks(id,run_id,chat_id,input_fingerprint,cutoff,checkpoint_ciphertext)
+                     VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(run_id,chat_id,input_fingerprint)
                      DO UPDATE SET is_current=TRUE,
                      cutoff=CASE WHEN offhours_summary_tasks.status='cancelled' THEN EXCLUDED.cutoff
                             ELSE offhours_summary_tasks.cutoff END,
                      status=CASE WHEN offhours_summary_tasks.status='cancelled' THEN 'queued'
                             ELSE offhours_summary_tasks.status END RETURNING id""",
-            (uuid4(), state["run_id"], chat["chat_id"], evidence["fingerprint"], cutoff),
+            (uuid4(), state["run_id"], chat["chat_id"], evidence["fingerprint"], chat_cutoff,
+             previous["checkpoint_ciphertext"] if previous else None),
         ).fetchone()
         selected_ids.append(selected["id"])
     conn.execute(
         """UPDATE offhours_summary_tasks SET is_current=FALSE,
                  status=CASE WHEN status IN ('queued','running') THEN 'cancelled' ELSE status END,
                  lease_until=CASE WHEN status IN ('queued','running') THEN NULL ELSE lease_until END
-                 WHERE run_id=%s AND NOT(id=ANY(%s::uuid[]))""",
+                 WHERE run_id=%s AND chat_id IS NOT NULL AND NOT(id=ANY(%s::uuid[]))""",
         (state["run_id"], selected_ids),
     )
     if not synced:
@@ -672,6 +662,7 @@ def _schedule_run(conn, state, now):
     if roster and not count:
         gaps.append("尚未找到已同步的时段内相关消息；这不代表 Lark 中没有消息。")
     coverage = {
+        "policy": POLICY_VERSION,
         "confirmed_creators": len({r["contact_id"] for r in roster}),
         "conversations": count,
         "private_conversations": private_count,
@@ -680,7 +671,7 @@ def _schedule_run(conn, state, now):
         "related_groups": sum(not chat["p2p_counterpart_open_id"] for chat in chats),
         "messages": messages,
         "gaps": list(dict.fromkeys(gaps)),
-        "cutoff": cutoff.isoformat(),
+        "cutoff": min(cutoffs, default=cutoff).isoformat(),
         "synced": synced,
         "content_incomplete": any("上限" in gap or "附件" in gap for gap in gaps),
     }
@@ -699,13 +690,6 @@ def _schedule_run(conn, state, now):
 
 def claim_next_summary():
     with connection() as conn, conn.transaction():
-        try:
-            schedule_if_due(conn)
-        except (PermissionError, SummaryInputError):
-            conn.execute("UPDATE offhours_summary_settings SET next_check_at=NULL WHERE id")
-            conn.execute("""UPDATE offhours_summary_tasks SET status='cancelled',lease_until=NULL,
-                         error_message='试运行授权已失效。' WHERE status IN ('queued','running')""")
-            return None
         conn.execute(
             """UPDATE offhours_summary_tasks SET status=CASE WHEN attempts<%s THEN 'queued' ELSE 'failed' END,
                      lease_until=NULL,scheduled_at=NOW()+INTERVAL '30 seconds',error_message='处理进程中断，有限重试。'
@@ -719,7 +703,7 @@ def claim_next_summary():
                             JOIN offhours_summary_runs r ON r.id=t.run_id
                             JOIN offhours_summary_settings s ON s.id
                             WHERE (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL))
-                              AND t.chat_id IS NOT NULL AND t.status='queued' AND t.is_current AND t.scheduled_at<=NOW()
+                              AND t.status='queued' AND t.is_current AND t.scheduled_at<=NOW()
                             ORDER BY t.scheduled_at,t.created_at FOR UPDATE OF t SKIP LOCKED LIMIT 1""").fetchone()
         if not row:
             return None
@@ -748,15 +732,14 @@ unknown 或 ambiguous 表示无法核实对象；不能根据名字相似推断�
 P0: 明确要求退出/unlink/terminate/leave agency，严重投诉、真实 escalate/report 威胁，威胁终止合作；
 付费合作/flat fee 未付款、金额错误或付款纠纷。不包括普通 affiliate commission；普通付款时间询问不是纠纷。
 P1: violation/warning/appeal、账号封禁/LIVE 权限异常、affiliate commission 异常；影响产出或销售的商品链接流量异常；
-明显生气着急不满、同一问题反复催促。明确需求满 3 个工作日没有有效回复，也可升级 P1（由系统校验时间）。
+明显生气着急不满、同一问题反复催促。不得仅因等待时长、没有看到回复或缺少其他成员发言升级。
 P2: 正常业务请求或新的运营信息，例如 voucher/sample/SKU/product link申请、video link boost、FS/LE/campaign、
 想 join/link agency、今晚 LIVE/明天发视频/视频已发布。即使无需回复，只要有新运营信息，至少 P2。
 P3: 仅感谢、礼貌、结束确认或 emoji，无任何新运营信息。Thanks 不能抹去上下文中未解决的危机；
 All sorted 只记为对方声称已解决，不自动关闭。未知 fee 类型、附件/音频/截图/仅链接无法理解应标 needs_review，
 priority=null，不可当作 P3。若同一事项可读文字已明确证明更高等级，保留该等级并标资料不全。
 不要建议回复、代写回复、推荐行动、发通知、自动结单或创建待办。latest_progress 只陈述已发生的进展。
-aging_request_ref 仅填写真实明确请求首次出现的消息；no_effective_response 仅表示该请求在已给上下文仍无有效回复，
-不能根据没有回复记录断言现实中无人处理。context_complete=false 时不能仅因未见回复判 P1。
+不能根据没有回复记录断言现实中无人处理，不按等待时长自动升级。
 reason 必须指出真实业务原因。所有 evidence_refs 和 user/handle 必须来自输入。"""
 
 
@@ -766,7 +749,7 @@ def _format(evidence):
         "handle": {"type": ["string", "null"]},
         "priority": {"type": ["string", "null"], "enum": ["P0", "P1", "P2", "P3", None]},
         **{
-            key: {"type": "string", "maxLength": limit}
+            key: {"type": "string", "minLength": 1, "maxLength": limit}
             for key, limit in (("title", 100), ("summary", 700), ("latest_progress", 500), ("reason", 500))
         },
         "needs_review": {"type": "boolean"},
@@ -776,9 +759,7 @@ def _format(evidence):
             "minItems": 1,
             "maxItems": 20,
         },
-        "aging_request_ref": {"type": ["string", "null"]},
-        "no_effective_response": {"type": "boolean"},
-        "priority_basis": {"type": "string", "enum": ["content", "three_workdays", "insufficient"]},
+        "priority_basis": {"type": "string", "enum": ["content", "insufficient"]},
     }
     return {
         "type": "json_schema",
@@ -828,7 +809,7 @@ def _validate(raw, evidence):
             raise InvalidModelOutput("invented handle")
         if item["priority"] not in {"P0", "P1", "P2", "P3", None}:
             raise InvalidModelOutput("invalid level")
-        if type(item["needs_review"]) is not bool or type(item["no_effective_response"]) is not bool:
+        if type(item["needs_review"]) is not bool:
             raise InvalidModelOutput("invalid boolean")
         for key, limit in (("title", 100), ("summary", 700), ("latest_progress", 500), ("reason", 500)):
             if not isinstance(item[key], str) or not 1 <= len(item[key].strip()) <= limit:
@@ -867,23 +848,9 @@ def _validate(raw, evidence):
             if item["handle"].lstrip("@").casefold() not in source:
                 item["handle"] = None
                 item["needs_review"] = True
-        request_ref = item["aging_request_ref"]
-        if request_ref is not None and (
-            request_ref not in messages or messages[request_ref]["speaker"] != item["user"]
-        ):
-            raise InvalidModelOutput("invalid aging reference")
         basis = item["priority_basis"]
-        if basis not in {"content", "three_workdays", "insufficient"}:
+        if basis not in {"content", "insufficient"}:
             raise InvalidModelOutput("invalid basis")
-        if basis == "three_workdays" and not (
-            request_ref
-            and item["no_effective_response"]
-            and evidence["history_complete"]
-            and messages[request_ref]["three_workday_deadline_reached"]
-        ):
-            raise InvalidModelOutput("unsupported working-day escalation")
-        if basis == "three_workdays" and item["priority"] != "P1":
-            raise InvalidModelOutput("invalid working-day priority")
         if (
             item["priority"] is None
             or basis == "insufficient"
@@ -908,7 +875,8 @@ def _current(conn, job):
         """SELECT t.status,t.attempts,t.lease_until>NOW() AS leased FROM offhours_summary_tasks t
                         JOIN offhours_summary_runs r ON r.id=t.run_id
                         JOIN offhours_summary_settings s ON s.id WHERE t.id=%s
-                        AND (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL)) FOR UPDATE OF t""",
+                        AND t.is_current AND (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL))
+                        FOR UPDATE OF t""",
         (job["id"],),
     ).fetchone()
     if (
@@ -945,97 +913,18 @@ def _finish(job, status, error, *, delay=0):
 
 
 def run_claimed_summary(job, settings):
-    called, succeeded = False, False
-    try:
-        with connection() as conn, conn.transaction():
-            _current(conn, job)
-            cfg = _config(conn)
-            evidence = _load_chat(conn, job, job["chat_id"], job["cutoff"], settings=settings)
-            if not evidence or evidence["fingerprint"] != job["input_fingerprint"]:
-                raise SummaryInputError("消息或名单已变化。")
-        key = api_key_cipher(settings.token_encryption_key).decrypt(cfg["api_key_ciphertext"])
-        # Check again just before exporting a bounded pack to the provider.
-        with connection() as conn, conn.transaction():
-            _current(conn, job)
-            current = _load_chat(conn, job, job["chat_id"], job["cutoff"], settings=settings)
-            if not current or current["fingerprint"] != evidence["fingerprint"]:
-                raise SummaryInputError("输入授权或内容已变化。")
-        called = True
-        response = contact_assessments.call_openai(
-            cfg,
-            key,
-            evidence["pack"],
-            job["responsible_authorization_id"],
-            instructions=_INSTRUCTIONS,
-            output_format=_format(evidence),
-            max_output_tokens=6000,
-        )
-        result = _validate(response["text"], evidence)
-        succeeded = True
-        with connection() as conn, conn.transaction():
-            _current(conn, job)
-            current = _load_chat(conn, job, job["chat_id"], job["cutoff"], settings=settings)
-            if not current or current["fingerprint"] != evidence["fingerprint"]:
-                raise SummaryInputError("调用期间输入授权或内容已变化。")
-            conn.execute(
-                """UPDATE offhours_summary_tasks SET status='succeeded',result_ciphertext=%s,
-                         model=%s,response_id=%s,usage=%s::jsonb,lease_until=NULL,
-                         finished_at=NOW(),error_message=NULL WHERE id=%s""",
-                (
-                    _cipher(settings.token_encryption_key).encrypt(json.dumps(result, ensure_ascii=False)),
-                    cfg["model"],
-                    response.get("response_id"),
-                    json.dumps(response.get("usage") or {}),
-                    job["id"],
-                ),
-            )
-    except (InvalidModelOutput, contact_assessments._ModelOutputError):
-        _finish(job, "invalid", "模型拒答、输出不完整或依据无效；此会话未完成，不能当作低风险。")
-    except contact_assessments.OpenAIRequestError as exc:
-        if exc.is_quota:
-            ai_dispatch.pause_for_quota()
-        retry = exc.retryable and not exc.is_quota and job["attempts"] < MAX_ATTEMPTS
-        delay = contact_assessments._retry_delay(exc.retry_after_seconds, job["attempts"])
-        if retry:
-            ai_dispatch.throttle(delay)
-        _finish(
-            job,
-            "queued" if retry else "failed",
-            "OpenAI 请求未完成；" + ("等待有限重试。" if retry else "请检查配置或服务状态。"),
-            delay=delay,
-        )
-    except contact_assessments.ContactAssessmentInputError:
-        # The reused transport converts network/time-out failures to this type.
-        # Treat them as bounded failures, not source changes that requeue forever.
-        retry = job["attempts"] < MAX_ATTEMPTS
-        _finish(
-            job,
-            "queued" if retry else "failed",
-            "OpenAI 网络请求未完成；" + ("等待有限重试。" if retry else "请检查连接后保存重试。"),
-            delay=30,
-        )
-    except (PermissionError, SummaryInputError):
-        _finish(job, "cancelled", "授权、资料或配置已变化；本次结果未保存。")
-    except (InvalidTag, ValueError, UnicodeDecodeError):
-        _finish(job, "failed", "加密资料或配置无法读取，请检查配置后保存重试。")
-    except Exception:
-        LOGGER.warning("offhours summary failed; no user content logged")
-        _finish(job, "failed", "消息总结未完成，请检查服务状态。")
-    finally:
-        if called:
-            # Separate transaction: admin saves lock config before task rows.
-            with connection() as conn, conn.transaction():
-                conn.execute(
-                    """UPDATE ai_feature_configs SET last_tested_at=NOW(),last_test_status=%s
-                             WHERE feature=%s AND model=%s AND project_id=%s AND api_key_ciphertext=%s""",
-                    (
-                        "succeeded" if succeeded else "failed",
-                        FEATURE,
-                        cfg["model"],
-                        cfg["project_id"],
-                        cfg["api_key_ciphertext"],
-                    ),
-                )
+    from . import summary_dialogues
+    summary_dialogues.run(job, settings)
+
+
+def prepare_next_summary(settings):
+    # Reuse the existing single preparation executor; never block AI dispatch.
+    from . import summary_dialogues
+    with connection() as conn, conn.transaction():
+        before = conn.execute("SELECT count(*) AS n FROM offhours_summary_tasks").fetchone()["n"]
+        schedule_if_due(conn)
+        summary_dialogues.schedule_merges(conn, settings)
+        return conn.execute("SELECT count(*) AS n FROM offhours_summary_tasks").fetchone()["n"] != before
 
 
 def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None):
@@ -1080,6 +969,7 @@ def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None):
     settings = get_settings()
     roster = _roster(conn, cm_id)
     related_chats = _related_chats(conn, roster, settings=settings, cm_id=cm_id)
+    from . import summary_dialogues
     for task in tasks:
         name = {"succeeded": "completed", "queued": "queued", "running": "running"}.get(task["status"], "failed")
         counts[name] += 1
@@ -1088,36 +978,16 @@ def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None):
                 gaps.append(task["error_message"])
             continue
         try:
-            current = _load_chat(
-                conn, row, task["chat_id"], task["cutoff"], settings=settings,
-                roster=roster, related_chats=related_chats,
-            )
-            if not current or current["fingerprint"] != task["input_fingerprint"]:
-                raise SummaryInputError("资料已变化")
-            events = json.loads(_cipher(settings.token_encryption_key).decrypt(task["result_ciphertext"]))
-            for i, event in enumerate(events):
-                user = current["users"][event["user"]]
-                view["events"].append(
-                    {
-                        "id": f"{task['id']}:{i}",
-                        "creator_handle": event["handle"],
-                        "creator_handles": user["handles"],
-                        "lark_user_name": user["name"],
-                        "conversation_type": "private" if current["pack"]["is_private"] else "group",
-                        "conversation_name": current["pack"]["chat_name"],
-                        "priority": event["priority"],
-                        "title": event["title"],
-                        "summary": event["summary"],
-                        "latest_progress": event["latest_progress"],
-                        "reason": event["reason"],
-                        "needs_review": event["needs_review"],
-                        "evidence": [current["refs"][ref] for ref in event["evidence_refs"]],
-                    }
-                )
+            if task["chat_id"] is None:
+                view["events"].extend(summary_dialogues.view_events(conn, row, task, settings, roster, related_chats))
         except (PermissionError, SummaryInputError, InvalidTag, ValueError, KeyError):
             counts["completed"] -= 1
             counts["failed"] += 1
             gaps.append("部分结果因当前授权、名单或消息资料变化已隐藏；需重新处理。")
+    chat_tasks = [t for t in tasks if t["chat_id"] is not None]
+    if chat_tasks and all(t["status"] == "succeeded" for t in chat_tasks):
+        if not any(t["chat_id"] is None for t in tasks):
+            counts["queued"] += 1  # Preparation must still create the within-period merge.
     if row.get("period") and not coverage.get("cutoff"):
         status = "queued"
         gaps.append("正在准备该时段的群聊和私聊材料。")

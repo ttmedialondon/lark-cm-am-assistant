@@ -36,7 +36,7 @@
     identity.append(node("span", "", `达人 handle：${event.creator_handle || event.creator_handles?.join("、") || "—"}`),
       node("span", "", `Lark 用户：${event.lark_user_name || "—"}`));
     if (event.conversation_type) identity.append(node("span", "",
-      `${event.conversation_type === "private" ? "私聊" : "群聊"}：${event.conversation_name || "—"}`));
+      `${event.conversation_type === "private" ? "私聊" : event.conversation_type === "combined" ? "相关会话" : "群聊"}：${event.conversation_name || "—"}`));
     card.append(heading, identity);
     if (needsReview(event)) card.append(node("span", "oh-review-tag", "信息不足，需结合原文核实"));
     card.append(node("p", "oh-summary", event.summary));
@@ -52,7 +52,7 @@
       details.append(node("summary", "", `查看相关原文（${evidence.length}）`));
       for (const message of evidence) {
         const item = node("figure", "oh-message");
-        item.append(node("figcaption", "", `${message.sender_name || "—"} · ${date(message.created_at)}（英国时间）`),
+        item.append(node("figcaption", "", `${message.chat_name ? message.chat_name + " · " : ""}${message.sender_name || "—"} · ${date(message.created_at)}（英国时间）`),
           node("blockquote", "", message.text || "该消息没有可显示的文字。"));
         messages.append(item);
       }
@@ -94,6 +94,15 @@
       $("oh-empty-description").textContent = data.can_manage
         ? "开启消息总结后，系统按上班和下班时段整理已入库达人的消息。"
         : "分析尚未开启。开启后，这里会展示已入库达人的真实消息总结。";
+    } else if (data.run?.status === "completed" && !data.coverage?.messages) {
+      $("oh-empty-title").textContent = "本时段暂无已同步的相关消息";
+      $("oh-empty-description").textContent = "尚未同步的消息不包含在本轮范围内。";
+    } else if (data.run?.status === "completed") {
+      $("oh-empty-title").textContent = "分析完成，未识别出事项";
+      $("oh-empty-description").textContent = "本轮已处理的消息未形成可展示事项，资料缺口另行标明。";
+    } else if (data.run?.counts?.failed) {
+      $("oh-empty-title").textContent = "部分分析未完成";
+      $("oh-empty-description").textContent = "失败部分不能当作没有事项。";
     } else {
       $("oh-empty-title").textContent = data.run ? "暂时没有可展示的事件" : "等待分析任务";
       $("oh-empty-description").textContent = "请结合上方的分析进度与资料缺口查看。没有结果不代表没有风险。";
@@ -117,7 +126,7 @@
         completed: "本轮分析已结束", partial: "已有部分分析结果", failed: "本轮分析遇到问题",
         cancelled: "本轮分析已停止", disabled: "分析已关闭", paused: "分析已暂停",
       }[run.status] || "正在整理分析结果";
-      title = !data.enabled ? "分析已关闭" : data.window?.is_open ? "时段未结束 · 当前为部分结果"
+      title = !data.enabled ? "分析已关闭" : data.window?.is_open ? "时段更新中 · 当前为部分结果"
         : data.window?.is_partial ? "当前为部分结果 · 尚有资料缺口" : status;
       description = `已完成 ${complete} / ${total} 个分析任务`;
       if (pending) description += `，${pending} 个等待或处理中`;

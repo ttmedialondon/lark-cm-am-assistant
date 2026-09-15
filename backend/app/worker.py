@@ -255,7 +255,7 @@ def _prepare_creator_preview(settings: Settings, next_queue: int) -> tuple[bool,
     """Give each local preparation queue a turn; an idle queue does not delay the other."""
 
     queues = (creator_ownership.prepare_next_preview, creator_handles.prepare_next_preview,
-              creator_imports.prepare_next_import)
+              creator_imports.prepare_next_import, offhours_summary.prepare_next_summary)
     for offset in range(len(queues)):
         index = (next_queue + offset) % len(queues)
         try:

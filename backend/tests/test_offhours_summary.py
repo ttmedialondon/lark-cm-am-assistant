@@ -13,18 +13,16 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from app import creator_import_evidence, creator_imports, creator_ownership, summary_periods
+from app import creator_import_evidence, creator_imports, creator_ownership, summary_periods, summary_dialogues
 from app import offhours_summary as ai
 from app.ai_feature_config import save_feature_config
 from app.crypto import message_body_cipher
 
 
-def test_window_and_working_days_skip_weekend_at_same_london_time():
+def test_windows_reject_invalid_or_nonexistent_london_times():
     start, end = ai._parse_window(ai.DEFAULT_START, ai.DEFAULT_END)
     assert start == datetime(2026, 9, 9, 17, tzinfo=UTC)
     assert end == datetime(2026, 9, 10, 11, tzinfo=UTC)
-    friday = datetime(2026, 9, 4, 16, tzinfo=UTC)
-    assert ai.three_workday_deadline(friday) == datetime(2026, 9, 9, 16, tzinfo=UTC)
     for values in (
         (ai.DEFAULT_END, ai.DEFAULT_START),
         ("bad", ai.DEFAULT_END),
@@ -57,8 +55,6 @@ def sample_event(**overrides):
         "reason": "正常样品申请。",
         "needs_review": False,
         "evidence_refs": ["M1"],
-        "aging_request_ref": None,
-        "no_effective_response": False,
         "priority_basis": "content",
         **overrides,
     }
@@ -235,7 +231,7 @@ def seeded(pg, monkeypatch):
     def save(enabled=True, key="test-key-not-real"):
         save_feature_config(
             pg,
-            ai.api_key_cipher(settings.token_encryption_key),
+            ai.contact_assessments.api_key_cipher(settings.token_encryption_key),
             ai.FEATURE,
             provider="openai",
             project_id="test-project",
@@ -253,7 +249,7 @@ def seeded(pg, monkeypatch):
         assert kwargs["output_format"]["strict"]
         message = next(m for m in input_pack["messages"] if m["in_window"] and m["speaker"] == "U1")
         return {
-            "text": json.dumps({"events": [sample_event(
+            "text": json.dumps({"processed_refs": input_pack.get("core_refs", []), "events": [sample_event(
                 evidence_refs=[message["ref"]], handle=next(iter(input_pack["users"]["U1"]["handles"]), None)
             )]}),
             "usage": {"input_tokens": 1},
@@ -314,6 +310,7 @@ def test_save_enabled_immediately_queues_claims_and_stores_encrypted_summary(pg,
     job = ai.claim_next_summary()
     assert job and job["attempts"] == 1
     ai.run_claimed_summary(job, s.settings)
+    finish_merges(pg, s)
     view = ai.get_summary_view(pg, s.ids["owner"])
     assert len(s.calls) == 1 and len(view["events"]) == 1
     assert view["window"]["is_open"]
@@ -342,6 +339,7 @@ def test_acl_owner_remi_and_explicit_test_grant_not_arbitrary_roster_reviewer(pg
     s = seeded
     s.save()
     ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
+    finish_merges(pg, s)
     for name in ("owner", "cm", "tester"):
         assert len(ai.get_summary_view(pg, s.ids[name])["events"]) == 1
     with pytest.raises(PermissionError):
@@ -376,23 +374,6 @@ def test_revocation_or_edit_before_provider_exports_nothing(pg, seeded, change):
     )
 
 
-def test_routine_reencrypt_does_not_rescan_but_late_message_does(pg, seeded):
-    s = seeded
-    s.save()
-    first = ai.claim_next_summary()
-    ai.run_claimed_summary(first, s.settings)
-    pg.execute(
-        "UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='m1'",
-        (s.cipher.encrypt(json.dumps({"text": "Sample please"})),),
-    )
-    pg.execute("UPDATE authorization_message_observations SET observed_at=NOW()")
-    ai.schedule_if_due(pg, force=True)
-    assert ai.claim_next_summary() is None
-    s.add("late", text="Now I need a voucher", at=s.start + timedelta(hours=2))
-    ai.schedule_if_due(pg, force=True)
-    second = ai.claim_next_summary()
-    assert second and second["input_fingerprint"] != first["input_fingerprint"]
-    assert pg.execute("SELECT COUNT(*) AS n FROM offhours_summary_tasks WHERE is_current").fetchone()["n"] == 1
 
 
 def test_disable_reenable_keeps_fencing_monotonic_and_old_call_cannot_commit(pg, seeded):
@@ -503,16 +484,19 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
     pg.execute("UPDATE contact_social_accounts SET import_row_id=%s WHERE social_account_id=%s", (row_id, s.account))
 
     def model(_cfg, _key, input_pack, _cm, **_kwargs):
+        if 'a' in input_pack:
+            return {'text': json.dumps({'same': False, 'basis_kind': 'none',
+                **{k: '' for k in ('basis_value', 'quote_a', 'quote_b', 'title', 'summary', 'latest_progress')}})}
         s.calls.append(input_pack)
         assert len(input_pack["users"]) == 1
         assert input_pack["users"]["U1"]["handles"] == ["@alice"]
         if input_pack["chat_name"] == groups["group_ai"][0]:
             assert input_pack["unique_group_user"] is None
-            return {"text": json.dumps({"events": []}), "usage": {"input_tokens": 1}}
+            return {"text": json.dumps({"events": [], "processed_refs": input_pack["core_refs"]}), "usage": {"input_tokens": 1}}
         if not input_pack["is_private"]:
             assert input_pack["unique_group_user"] == "U1"
         message = next(m for m in input_pack["messages"] if m["in_window"])
-        return {"text": json.dumps({"events": [sample_event(evidence_refs=[message["ref"]])]}),
+        return {"text": json.dumps({"processed_refs": input_pack.get("core_refs", []), "events": [sample_event(evidence_refs=[message["ref"]])]}),
                 "usage": {"input_tokens": 1}}
 
     monkeypatch.setattr(ai.contact_assessments, "call_openai", model)
@@ -535,8 +519,10 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
     assert {p["chat_name"] for p in s.calls if not p["is_private"]} == {
         groups["group_named"][0], groups["group_ai"][0],
     }
+    ai.schedule_if_due(pg, force=True)
+    finish_merges(pg, s)
     view = ai.get_summary_view(pg, s.ids["owner"])
-    assert len(view["events"]) == 2 and view["run"]["counts"]["completed"] == 3
+    assert len(view["events"]) == 2 and view["run"]["counts"]["completed"] == 4
     assert not any("group_hidden" in json.dumps(p) or "group_unrelated" in json.dumps(p) for p in s.calls)
 
     # A second, unassigned creator still prevents a uniqueness inference. The
@@ -562,6 +548,7 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
     targeted = ai._load_chat(pg, run, "group_named", s.end, settings=s.settings)
     assert ai._validate(json.dumps({"events": [event]}), targeted)[0]["priority"] == "P2"
     pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='group_ai'")
+    finish_merges(pg, s)
     view = ai.get_summary_view(pg, s.ids["owner"])
     assert not any(ref["chat_id"] == "group_ai" for event in view["events"] for ref in event["evidence"])
 
@@ -571,13 +558,14 @@ def test_current_acl_hides_already_generated_results(pg, seeded):
     s.save()
     ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
     pg.execute("UPDATE chat_messages SET is_deleted=TRUE WHERE message_id='m1'")
+    finish_merges(pg, s)
     view = ai.get_summary_view(pg, s.ids["owner"])
     assert not view["events"] and view["run"]["counts"]["failed"] == 1
 
 
 def test_relevant_chats_are_filtered_before_limit(pg, seeded):
     s = seeded
-    for i in range(ai.MAX_CHATS + 1):
+    for i in range(301):
         chat = f"aaa-unrelated-{i}"
         pg.execute("INSERT INTO chats(chat_id) VALUES(%s)", (chat,))
         pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,%s)", (s.ids["cm"], chat))
@@ -585,34 +573,6 @@ def test_relevant_chats_are_filtered_before_limit(pg, seeded):
     assert ai.claim_next_summary()["chat_id"] == "chat"
 
 
-@pytest.mark.parametrize("complete_first", [False, True])
-def test_a_to_b_to_a_reuses_success_or_requeues_cancelled_with_monotonic_fence(pg, seeded, complete_first):
-    s = seeded
-    s.save()
-    first = ai.claim_next_summary()
-    if complete_first:
-        ai.run_claimed_summary(first, s.settings)
-    pg.execute(
-        "UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='m1'",
-        (s.cipher.encrypt(json.dumps({"text": "A different new request"})),),
-    )
-    ai.schedule_if_due(pg, force=True)
-    pg.execute(
-        "UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='m1'",
-        (s.cipher.encrypt(json.dumps({"text": "Sample please"})),),
-    )
-    ai.schedule_if_due(pg, force=True)
-    if complete_first:
-        assert ai.claim_next_summary() is None
-        assert len(ai.get_summary_view(pg, s.ids["owner"])["events"]) == 1
-        assert len(s.calls) == 1
-    else:
-        revived = ai.claim_next_summary()
-        assert revived["id"] == first["id"] and revived["attempts"] > first["attempts"]
-        ai.run_claimed_summary(first, s.settings)
-        assert not s.calls
-        ai.run_claimed_summary(revived, s.settings)
-        assert len(s.calls) == 1
 
 
 def test_shared_admission_limits_summary_claims_to_three(pg, seeded):
@@ -660,21 +620,6 @@ def test_end_boundary_is_exclusive_even_when_message_was_synced_early(pg, seeded
     assert "future CM reply" not in json.dumps(snapshot)
 
 
-def test_failed_or_quota_model_is_never_success_or_routine(pg, seeded, monkeypatch):
-    s = seeded
-    s.save()
-    monkeypatch.setattr(ai.contact_assessments, "call_openai", lambda *_a, **_k: {"text": "refusal"})
-    ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
-    view = ai.get_summary_view(pg, s.ids["owner"])
-    assert not view["events"] and view["run"]["counts"]["failed"] == 1
-    assert (
-        pg.execute("SELECT last_test_status FROM ai_feature_configs WHERE feature=%s", (ai.FEATURE,)).fetchone()[
-            "last_test_status"
-        ]
-        == "failed"
-    )
-    ai.ai_dispatch.pause_for_quota()
-    assert "配额" in " ".join(ai.get_summary_view(pg, s.ids["owner"])["run"]["gaps"])
 
 
 def test_network_failure_retries_are_bounded_not_cancelled_refresh_loop(pg, seeded, monkeypatch):
@@ -723,6 +668,7 @@ def test_mentions_ui_and_ai_share_resolved_text_and_id_based_targets_without_mut
     assert data["refs"][message["ref"]]["text"] == message["text"]
     assert "ou_" not in json.dumps(data["pack"])
     ai.run_claimed_summary(job, s.settings)
+    finish_merges(pg, s)
     view = ai.get_summary_view(pg, s.ids["owner"])
     assert view["events"][0]["evidence"][0]["text"] == s.calls[0]["messages"][0]["text"]
     assert original == pg.execute(
@@ -745,6 +691,7 @@ def test_same_display_different_mention_identity_invalidates_only_affected_input
     after = ai._load_chat(pg, first, "chat", first["cutoff"], settings=s.settings)
     assert before["pack"] == after["pack"] and before["fingerprint"] != after["fingerprint"]
     assert not ai.get_summary_view(pg, s.ids["owner"])["events"]
+    ai.schedule_if_due(pg, force=True)
     ai.schedule_if_due(pg, force=True)
     assert ai.claim_next_summary()["input_fingerprint"] == after["fingerprint"]
 
@@ -777,7 +724,7 @@ def test_mention_display_update_invalidates_relevant_message_summary(pg, seeded)
     assert "@New（原名）" in after["pack"]["messages"][0]["text"]
 
 
-def test_rich_mentions_render_before_clipping_and_keep_credentials_redacted():
+def test_rich_mentions_keep_full_text_and_credentials_redacted():
     cipher = message_body_cipher(b"x" * 32)
     mentions = [{"key": "@_user_1", "id": "ou_cm", "id_type": "open_id", "name": "Original"}]
     row = {
@@ -796,7 +743,7 @@ def test_rich_mentions_render_before_clipping_and_keep_credentials_redacted():
     assert ai._body(row, cipher)[0].startswith("@_user_1x")
     row["body_ciphertext"] = cipher.encrypt(json.dumps({"text": "@_user_1 " + "x" * 2000}))
     text, incomplete = ai._body(row, cipher, {"ou_cm": "Remi（Original）"})
-    assert text.startswith("@Remi（Original） ") and len(text) == ai.MAX_BODY_CHARS and incomplete
+    assert text.startswith("@Remi（Original） ") and len(text) > 2000 and not incomplete
 
 
 def test_recurring_periods_keep_history_and_cm_scope_separate(pg, seeded):
@@ -820,11 +767,12 @@ def test_recurring_periods_keep_history_and_cm_scope_separate(pg, seeded):
     job = ai.claim_next_summary()
     assert job['run_id'] == target['id']
     ai.run_claimed_summary(job, s.settings)
+    finish_merges(pg, s)
     historical = ai.get_summary_view(pg, s.ids['cm'], day=target['report_date'], period=target['period'])
     assert historical['events'] and len(s.calls) == 1
     ai._schedule_run(pg, {**target, 'run_id': target['id']}, now)
     assert pg.execute('SELECT count(*) n FROM offhours_summary_tasks WHERE run_id=%s',
-                      (target['id'],)).fetchone()['n'] == 1
+                      (target['id'],)).fetchone()['n'] == 2
     with pytest.raises(PermissionError):
         summary_periods.selection(pg, s.ids['reviewer'], s.ids['cm'])
     cm_id, start, end, selected = summary_periods.selection(pg, s.ids['cm'])
@@ -854,20 +802,100 @@ def test_recurring_periods_keep_history_and_cm_scope_separate(pg, seeded):
         summary_periods.selection(pg, s.ids['tester'], second_cm)
 
 
-def test_simple_rollback_retires_timeline_tasks_and_requeues_conversations(pg, seeded):
+
+
+def finish_merges(pg, s):
+    summary_dialogues.schedule_merges(pg, s.settings)
+    for _ in range(50):
+        job = ai.claim_next_summary()
+        if job is None:
+            return
+        ai.run_claimed_summary(job, s.settings)
+    raise AssertionError('queue did not finish')
+
+
+def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, seeded, monkeypatch):
     s = seeded
+    long_body = 'Long message beginning ' + 'z' * 19000 + ' final-marker'
+    for i in range(215):
+        s.add(f'noise-{i}', text=f'Routine {i}', at=s.start + timedelta(minutes=i + 1))
+    s.add('long', text=long_body, at=s.start + timedelta(hours=5))
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='m1'",
+               (s.cipher.encrypt(json.dumps({'text': 'Please send sample order ABC-123'})),))
+    s.add('ancient', text='too old secret', at=s.start - timedelta(days=8))
+    s.add('history', text='Earlier sample ABC-123', at=s.start - timedelta(days=6))
+    pg.execute("UPDATE chat_messages SET parent_id='history' WHERE message_id='m1'")
+    pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) VALUES(%s,%s,%s,'manual')",
+               (uuid4(), s.ids['other'], s.ids['cm']))
+    pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('second','Related campaign group','group')")
+    pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,backfill_complete,
+        backfill_window_start_at,last_incremental_at,sync_status) VALUES(%s,'second',TRUE,%s,%s,'succeeded')""",
+               (s.ids['cm'], s.start - timedelta(days=9), s.end))
+    for who in ('person', 'other'):
+        pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('second',%s)", ('ou_' + who,))
+        pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,
+            body_ciphertext,message_create_time) VALUES('second',%s,%s,'text',%s,%s)""",
+                   (who, 'ou_' + who, s.cipher.encrypt(json.dumps({'text':
+                    'Sample order ABC-123 arrived' if who == 'person' else 'unrelated other creator secret'})),
+                    s.start + timedelta(hours=6)))
+        pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) VALUES(%s,'second',%s)",
+                   (s.ids['cm'], who))
+    calls, failed = [], False
+
+    def model(_cfg, _key, pack, _cm, **kwargs):
+        nonlocal failed
+        calls.append(pack)
+        if 'a' in pack:
+            a, b = pack['a'], pack['b']
+            return {'text': json.dumps({'same': True, 'basis_kind': 'identifier', 'basis_value': 'ABC-123',
+                'quote_a': a['evidence'][0]['text'], 'quote_b': b['evidence'][0]['text'],
+                'title': '样品订单', 'summary': '样品订单已送达。', 'latest_progress': '达人确认收到。'})}
+        user = next(iter(pack['users']))
+        assert {m['speaker'] for m in pack['messages']} <= {user, 'CM'}
+        assert len(pack['users']) == 1
+        if pack['users'][user]['name'] == 'person':
+            assert 'other creator secret' not in json.dumps(pack)
+            assert 'outsider secret' not in json.dumps(pack)
+        assert 'future CM reply' not in json.dumps(pack) and 'too old secret' not in json.dumps(pack)
+        if len(calls) == 2 and not failed:
+            failed = True
+            raise ai.contact_assessments.ContactAssessmentInputError('synthetic transient failure')
+        targets = [m for m in pack['messages'] if m['ref'] in pack['core_refs'] and m['speaker'] == user
+                   and m['message_id'] in ('m1', 'person')]
+        return {'text': json.dumps({'processed_refs': pack['core_refs'], 'events': [sample_event(
+            user=user, evidence_refs=[m['ref']], handle=None) for m in targets]})}
+
+    monkeypatch.setattr(ai.contact_assessments, 'call_openai', model)
     s.save()
-    run = pg.execute('SELECT run_id FROM offhours_summary_settings WHERE id').fetchone()['run_id']
-    pg.execute("UPDATE offhours_summary_runs SET period='work',report_date=CURRENT_DATE WHERE id=%s", (run,))
-    old = pg.execute("SELECT id FROM offhours_summary_tasks WHERE run_id=%s", (run,)).fetchone()['id']
-    pg.execute("UPDATE offhours_summary_tasks SET status='succeeded',result_ciphertext='retained' WHERE id=%s", (old,))
-    timeline = uuid4()
-    pg.execute("""INSERT INTO offhours_summary_tasks(id,run_id,contact_id,input_fingerprint,cutoff)
-        VALUES(%s,%s,%s,'obsolete-timeline',NOW())""", (timeline, run, s.ids['person']))
-    pg.execute((Path(__file__).parents[1] / 'migrations/062_restore_conversation_summaries.sql').read_text())
-    retired = pg.execute('SELECT status,is_current FROM offhours_summary_tasks WHERE id=%s', (timeline,)).fetchone()
-    assert retired == {'status': 'cancelled', 'is_current': False}
-    assert pg.execute('SELECT result_ciphertext FROM offhours_summary_tasks WHERE id=%s', (old,)).fetchone()['result_ciphertext'] == 'retained'
-    ai.schedule_if_due(pg, force=True)
-    job = ai.claim_next_summary()
-    assert job['id'] == old and job['chat_id'] == 'chat' and job['contact_id'] is None
+    for _ in range(100):
+        job = ai.claim_next_summary()
+        if not job:
+            break
+        ai.run_claimed_summary(job, s.settings)
+        pg.execute("UPDATE offhours_summary_tasks SET scheduled_at=NOW() WHERE status='queued'")
+    else:
+        pytest.fail('conversation queue did not finish')
+    rows = pg.execute("SELECT * FROM offhours_summary_tasks WHERE is_current").fetchall()
+    assert all(t['status'] == 'succeeded' for t in rows)
+    assert sum(t['processed_messages'] for t in rows) > 215
+    first_pack = calls[0]
+    assert sum(p == first_pack for p in calls) == 1  # Successful chunks were not repeated after the failure.
+    person_packs = [p for p in calls if 'messages' in p and next(iter(p['users'].values()))['name'] == 'person']
+    long_parts = {m['ref']: m['text'] for p in person_packs for m in p['messages']
+                  if m['message_id'] == 'long' and m['ref'] in p['core_refs']}
+    assert ''.join(long_parts.values()) == long_body
+    assert any(m['message_id'] == 'history' for p in person_packs for m in p['messages'])
+    finish_merges(pg, s)
+    view = ai.get_summary_view(pg, s.ids['owner'])
+    assert view['run']['counts']['failed'] == 0 and view['run']['status'] == 'completed'
+    assert len(view['events']) == 1
+    assert {e['chat_id'] for e in view['events'][0]['evidence']} == {'chat', 'second'}
+    assert view['events'][0]['latest_progress'] == '达人确认收到。'
+    # Changed access hides the merged narrative as well as its evidence.
+    pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='second'")
+    assert ai.get_summary_view(pg, s.ids['owner'])['events'] == []
+    # A shared topic without a concrete identifier is not sufficient merge proof.
+    e = {'evidence': [{'text': 'payment please'}]}
+    with pytest.raises(ai.InvalidModelOutput):
+        summary_dialogues.combine(json.dumps({'same': True, 'basis_kind': 'identifier', 'basis_value': 'payment',
+            'quote_a': 'payment please', 'quote_b': 'payment please', 'title': 'x', 'summary': 'x', 'latest_progress': 'x'}), e, e)
