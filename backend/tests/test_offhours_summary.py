@@ -1028,3 +1028,47 @@ def test_creator_timeline_cross_chat_tool_call_and_period_identity(pg, seeded, m
                (s.cipher.encrypt(json.dumps({'text':'Edited message'})),))
     with pytest.raises(ai.SummaryInputError):
         timeline.view_events(pg,base,oldtask,s.settings)
+
+
+def test_creator_result_commit_does_not_hold_task_lock_while_waiting_for_scheduler(pg, seeded, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from app import creator_summary as timeline
+    s=seeded
+    s.save()
+    run=dict(pg.execute('SELECT * FROM offhours_summary_runs').fetchone())
+    timeline.schedule(pg,dict(run,run_id=run['id'],refresh_until=s.end+timedelta(days=1)),s.end)
+    pg.execute('UPDATE offhours_summary_settings SET next_check_at=NULL')
+    job=ai.claim_next_summary()
+    schema=pg.execute('SELECT current_schema() AS name').fetchone()['name']
+    dsn=pg.info.dsn
+    pg.commit()  # These synthetic rows must be visible to the second connection.
+    def connection():
+        conn=psycopg.connect(dsn,row_factory=dict_row)
+        conn.execute(psycopg.sql.SQL('SET search_path TO {}').format(psycopg.sql.Identifier(schema)))
+        conn.commit()
+        return conn
+    monkeypatch.setattr(ai,'connection',connection)
+    monkeypatch.setattr(ai.contact_assessments,'call_openai',lambda *a,**kw: {
+        'text':json.dumps({'processed_refs':json.loads(kw['conversation'][0]['content'])['core_refs'],'updates':[]})})
+    reached=Event()
+    real_touch=timeline.touch_runs
+    def touch(job,finished):
+        reached.set()
+        real_touch(job,finished)
+    monkeypatch.setattr(timeline,'touch_runs',touch)
+    executor=ThreadPoolExecutor(max_workers=1)
+    try:
+        pg.execute('SELECT id FROM offhours_summary_runs WHERE id=%s FOR UPDATE',(run['id'],))
+        future=executor.submit(timeline.step,job,s.settings)
+        assert reached.wait(10)
+        # Scheduler owns the run; it can still acquire the task after its result commits.
+        row=pg.execute('SELECT status FROM offhours_summary_tasks WHERE id=%s FOR UPDATE NOWAIT',(job['id'],)).fetchone()
+        assert row['status']=='succeeded'
+        pg.commit()
+        future.result(timeout=10)
+    finally:
+        pg.rollback()
+        executor.shutdown(wait=True)
+        pg.execute(psycopg.sql.SQL('DROP SCHEMA {} CASCADE').format(psycopg.sql.Identifier(schema)))
+        pg.commit()

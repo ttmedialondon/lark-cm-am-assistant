@@ -945,7 +945,11 @@ def _finish(job, status, error, *, delay=0):
                      WHERE id=%s AND status='running' AND attempts=%s""",
             (status, error, delay, status, job["id"], job["attempts"]),
         )
-        if status == "cancelled" and _enabled(conn):
+    # Scheduling locks must never be acquired while holding a task update lock.
+    if status == "cancelled":
+        with connection() as conn, conn.transaction():
+            if not _enabled(conn):
+                return
             conn.execute("UPDATE offhours_summary_runs SET next_check_at=NOW() "
                          "WHERE id=%s AND period IS NOT NULL AND refresh_until>NOW()", (job["run_id"],))
             conn.execute(

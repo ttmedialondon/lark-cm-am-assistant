@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from cryptography.exceptions import InvalidTag
+from psycopg.errors import DeadlockDetected, SerializationFailure
 
 from . import admin_reporting, contact_assessments
 from . import offhours_summary as core
@@ -719,9 +720,21 @@ def step(job, settings):
                 job["id"],
             ),
         )
+    # Release task/source locks before touching run scheduling locks.
+    touch_runs(job, finished)
+
+
+def touch_runs(job, finished):
+    with core.connection() as conn, conn.transaction():
+        conn.execute(
+            """SELECT id FROM offhours_summary_runs WHERE id=%s OR
+            (%s AND responsible_authorization_id=%s AND window_start>=%s
+             AND window_start<%s+INTERVAL '7 days' AND period IS NOT NULL)
+            ORDER BY window_start,id FOR UPDATE""",
+            (job["run_id"], finished, job["responsible_authorization_id"], job["window_end"], job["window_end"]),
+        ).fetchall()
         conn.execute("UPDATE offhours_summary_runs SET updated_at=NOW() WHERE id=%s", (job["run_id"],))
         if finished:
-            # Later periods must incorporate this predecessor, including a late backfill.
             conn.execute(
                 """UPDATE offhours_summary_runs SET next_check_at=NOW(),
                 refresh_until=GREATEST(refresh_until,NOW()+INTERVAL '1 day')
@@ -744,6 +757,13 @@ def run(job, settings):
         if retry:
             core.ai_dispatch.throttle(delay)
         core._finish(job, "queued" if retry else "failed", "OpenAI 请求未完成；当前分段保留待重试。", delay=delay)
+    except (DeadlockDetected, SerializationFailure):
+        core._finish(
+            job,
+            "queued" if job["attempts"] < core.MAX_ATTEMPTS else "failed",
+            "并发更新重试；已完成的分段保留。",
+            delay=5,
+        )
     except core.InvalidModelOutput as exc:
         retry = job["attempts"] < core.MAX_ATTEMPTS
         core._finish(job, "queued" if retry else "failed", "证据校验未完成：" + str(exc), delay=30)
@@ -756,8 +776,8 @@ def run(job, settings):
     ):
         retry = job["attempts"] < core.MAX_ATTEMPTS
         core._finish(job, "queued" if retry else "failed", "分段分析或证据校验未完成；未计作已处理。", delay=30)
-    except Exception:
-        core.LOGGER.warning("creator summary failed; no user content logged")
+    except Exception as exc:
+        core.LOGGER.warning("creator summary failed: %s; no user content logged", type(exc).__name__)
         core._finish(job, "failed", "消息总结未完成，请检查服务状态。")
 
 
