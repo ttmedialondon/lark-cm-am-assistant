@@ -786,7 +786,8 @@ def validate_handling(item, messages):
         messages[r].get("unreadable") or messages[r].get("unavailable_or_truncated")
         or not messages[r].get("text", "").strip() for r in refs
     ):
-        raise InvalidModelOutput("unreadable handling evidence")
+        item["handling_status"] = "uncertain"
+        item["handling_reason"] = "处理状态依据包含不可读取内容，尚不能确认完成或无需处理。"
 
 
 def _format(evidence):

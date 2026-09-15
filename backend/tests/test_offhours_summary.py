@@ -117,8 +117,8 @@ def test_missing_media_and_multi_handle_do_not_invent_risk_or_duplicate_account(
     data["pack"]["messages"][0].update(unreadable=True, unavailable_or_truncated=True)
     result = ai._validate(json.dumps({"events": [sample_event(priority="P0")]}), data)
     assert result[0]["priority"] is None
-    with pytest.raises(ai.InvalidModelOutput):
-        ai._validate(json.dumps({"events": [sample_event(handling_status="resolved")]}), data)
+    result = ai._validate(json.dumps({"events": [sample_event(handling_status="resolved")]}), data)
+    assert result[0]["handling_status"] == "uncertain"
     with pytest.raises(ai.InvalidModelOutput):
         ai._validate(json.dumps({"events": [sample_event(), sample_event()]}), data)
 
