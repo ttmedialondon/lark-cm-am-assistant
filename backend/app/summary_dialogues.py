@@ -209,6 +209,9 @@ MERGE_INSTRUCTIONS = """你核对同一个 CAP 达人在同一时段的两条事
 只有明确的订单、商品、金额连同业务上下文或直接引用关系，才合并；主题相似不够。
 无可靠对应关系返回 same=false，保留两件事。same=true 时必须从两边原文分别逐字引用依据，
 basis_kind 填 identifier/product/amount/reference；basis_value 填双方共有的具体依据，不能填付款/样品等主题。
+identifier/product/amount 的 basis_value 必须是双方原文都包含的连续原样文本（只忽略大小写），
+不得翻译、拼接、概括、补全标识或统一改写金额。若只能通过明确承接关系证明，请用 reference 并引用完整依据；
+找不到可靠依据则 same=false，不能为了合并而编造共有标识。
 reference 可用双方明确承接关系，但必须有完整引用依据；仅 thanks/yes/ok 不成立。
 返回合并后的中文标题、摘要和截至时段的进展。不能因未看到回复推定无人处理，不能新增事实。
 同一事项新的礼貌消息不能消除未解决问题；明确已发生的解决进展可以更新摘要及处理状态。
