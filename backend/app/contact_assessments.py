@@ -1040,8 +1040,6 @@ def call_openai(
     instructions: str,
     output_format: Mapping[str, Any],
     max_output_tokens: int = 500,
-    conversation: list | None = None,
-    tools: list | None = None,
 ) -> dict[str, Any]:
     """Call Responses once for an evidence-bound internal AI feature."""
 
@@ -1055,20 +1053,12 @@ def call_openai(
         "text": {"format": output_format},
         "safety_identifier": hashlib.sha256(str(contact_id).encode("ascii")).hexdigest(),
     }
-    if conversation is not None:
-        payload["input"] = conversation
-        payload["reasoning"] = {"effort": "medium"}
-    if tools:
-        payload["include"] = ["reasoning.encrypted_content"]
-        payload["tools"] = tools
-        payload["parallel_tool_calls"] = False
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     if config.get("project_id"):
         headers["OpenAI-Project"] = config["project_id"]
     started = time.perf_counter()
     try:
-        response = httpx.post("https://api.openai.com/v1/responses", headers=headers, json=payload,
-                              timeout=180.0 if tools else 45.0)
+        response = httpx.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=45.0)
     except httpx.HTTPError as exc:
         raise ContactAssessmentInputError("AI 服务暂时不可用；请稍后重新发起。") from exc
     telemetry = _openai_telemetry(response, started)
@@ -1087,9 +1077,7 @@ def call_openai(
         )
     try:
         data = response.json()
-        function_calls = ([item for item in data.get("output", []) if item.get("type") == "function_call"]
-                          if tools else [])
-        text = "" if function_calls else _response_text(data)
+        text = _response_text(data)
     except (TypeError, ValueError, KeyError) as exc:
         raise _ModelOutputError("invalid response") from exc
     if data.get("status") not in {None, "completed"}:
@@ -1097,7 +1085,6 @@ def call_openai(
     usage = data.get("usage") if isinstance(data.get("usage"), Mapping) else {}
     return {
         "text": text,
-        **({"output": data.get("output", []), "function_calls": function_calls} if tools else {}),
         "response_id": _bounded_text(data.get("id"), 160),
         "usage": {
             "input_tokens": _nonnegative_int(usage.get("input_tokens")),

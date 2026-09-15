@@ -380,7 +380,7 @@ _MESSAGE_SQL = """SELECT m.*,i.display_name AS sender_name,i.contact_id FROM cha
     ORDER BY m.message_create_time DESC,m.message_id DESC LIMIT %s FOR SHARE OF m,o"""
 
 
-def _body(row, cipher, names=None, *, full=False):
+def _body(row, cipher, names=None):
     if not row["body_ciphertext"] or row["message_type"] not in {"text", "post", "share_chat", "share_user"}:
         return "[附件或正文不可读取，需人工查看原消息]", True
     raw = cipher.decrypt(row["body_ciphertext"])
@@ -409,8 +409,8 @@ def _body(row, cipher, names=None, *, full=False):
         text = " ".join(fragments(payload))
     text = resolve_mentions(text, row.get("mentions_json"), names)
     text = re.sub(r"([?&](?:token|access_token|key|signature)=)[^&\s]+", r"\1[redacted]", text, flags=re.I)
-    incomplete = (not full and len(text) > MAX_BODY_CHARS) or not text.strip() or "[未解析的@用户]" in text
-    return ((text if full else text[:MAX_BODY_CHARS]) or "[正文不可读取，需人工查看原消息]"), incomplete
+    incomplete = len(text) > MAX_BODY_CHARS or not text.strip() or "[未解析的@用户]" in text
+    return (text[:MAX_BODY_CHARS] or "[正文不可读取，需人工查看原消息]"), incomplete
 
 
 def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, related_chats=None):
@@ -583,7 +583,7 @@ def schedule_if_due(conn, *, force=False):
             return
         state = conn.execute("""SELECT *,id AS run_id FROM offhours_summary_runs
             WHERE period IS NOT NULL AND next_check_at<=%s
-            ORDER BY next_check_at,window_start ASC,id FOR UPDATE SKIP LOCKED LIMIT 1""", (now,)).fetchone()
+            ORDER BY next_check_at,window_start DESC,id FOR UPDATE SKIP LOCKED LIMIT 1""", (now,)).fetchone()
         if state:
             try:
                 with conn.transaction():
@@ -604,9 +604,6 @@ def schedule_if_due(conn, *, force=False):
 
 
 def _schedule_run(conn, state, now):
-    if state.get("period"):
-        from . import creator_summary
-        return creator_summary.schedule(conn, state, now)
     cm_id = state["responsible_authorization_id"]
     _authorize(conn, state["requested_by_authorization_id"], owner_only=True, cm_id=cm_id)
     cutoff = min(now, state["window_end"])
@@ -722,19 +719,7 @@ def claim_next_summary():
                             JOIN offhours_summary_runs r ON r.id=t.run_id
                             JOIN offhours_summary_settings s ON s.id
                             WHERE (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL))
-                              AND t.status='queued' AND t.is_current AND t.scheduled_at<=NOW()
-                              AND (t.contact_id IS NULL OR NOT EXISTS (
-                                SELECT 1 FROM offhours_summary_tasks earlier
-                                JOIN offhours_summary_runs er ON er.id=earlier.run_id
-                                WHERE earlier.contact_id=t.contact_id
-                                AND er.responsible_authorization_id=r.responsible_authorization_id
-                                AND er.window_start<r.window_start AND earlier.is_current
-                                AND earlier.status IN ('queued','running')))
-                              AND (t.contact_id IS NULL OR NOT EXISTS (
-                                SELECT 1 FROM offhours_summary_runs er
-                                WHERE er.responsible_authorization_id=r.responsible_authorization_id
-                                AND er.period IS NOT NULL AND er.window_start<r.window_start
-                                AND er.next_check_at<=NOW() AND NOT(er.coverage ? 'policy')))
+                              AND t.chat_id IS NOT NULL AND t.status='queued' AND t.is_current AND t.scheduled_at<=NOW()
                             ORDER BY t.scheduled_at,t.created_at FOR UPDATE OF t SKIP LOCKED LIMIT 1""").fetchone()
         if not row:
             return None
@@ -960,9 +945,6 @@ def _finish(job, status, error, *, delay=0):
 
 
 def run_claimed_summary(job, settings):
-    if job.get("contact_id"):
-        from . import creator_summary
-        return creator_summary.run(job, settings)
     called, succeeded = False, False
     try:
         with connection() as conn, conn.transaction():
@@ -1106,11 +1088,6 @@ def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None):
                 gaps.append(task["error_message"])
             continue
         try:
-            if task.get("contact_id"):
-                from . import creator_summary
-                view["events"].extend(creator_summary.view_events(
-                    conn, row, task, settings, roster=roster, chats=related_chats))
-                continue
             current = _load_chat(
                 conn, row, task["chat_id"], task["cutoff"], settings=settings,
                 roster=roster, related_chats=related_chats,
@@ -1162,10 +1139,6 @@ def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None):
         "gaps": list(dict.fromkeys(gaps)),
         "cutoff": coverage.get("cutoff"),
     }
-    view["message_progress"] = {"processed": sum(t.get("processed_messages", 0) for t in tasks),
-                                "total": sum(t.get("total_messages", 0) for t in tasks)}
-    view["event_counts"] = {kind: sum(e.get("period_activity") == kind for e in view["events"])
-                            for kind in ("new", "updated", "unresolved")}
     view["coverage"] = {key: coverage.get(key, 0) for key in (
         "confirmed_creators", "conversations", "messages", "private_conversations", "group_conversations",
         "related_private_chats", "related_groups",
