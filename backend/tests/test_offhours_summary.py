@@ -495,7 +495,8 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
         if 'a' in input_pack:
             return {'text': json.dumps({'same': False, 'basis_kind': 'none', 'handling_status': 'uncertain',
                 'handling_reason': '不合并', 'handling_evidence_refs': ['E1'],
-                **{k: '' for k in ('basis_value', 'quote_a', 'quote_b', 'title', 'summary', 'latest_progress')}})}
+                'quote_a_ref': 'E1', 'quote_b_ref': 'E1',
+                **{k: '' for k in ('basis_value', 'title', 'summary', 'latest_progress')}})}
         s.calls.append(input_pack)
         assert len(input_pack["users"]) == 1
         assert input_pack["users"]["U1"]["handles"] == ["@alice"]
@@ -857,7 +858,8 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
         if 'a' in pack:
             a, b = pack['a'], pack['b']
             return {'text': json.dumps({'same': True, 'basis_kind': 'identifier', 'basis_value': 'ABC-123',
-                'quote_a': a['evidence'][0]['text'], 'quote_b': b['evidence'][0]['text'],
+                'quote_a_ref': next(r for r,e in pack['evidence_messages'].items() if e in a['evidence']),
+                'quote_b_ref': next(r for r,e in pack['evidence_messages'].items() if e in b['evidence']),
                 'title': '样品订单', 'summary': '样品订单已送达。', 'latest_progress': '达人确认收到。',
                 'handling_status': 'resolved', 'handling_reason': '达人已确认对应订单收到。',
                 'handling_evidence_refs': [r for r, e in pack['evidence_messages'].items() if 'arrived' in e['text']]})}
@@ -911,5 +913,5 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
     e = {'evidence': [{'text': 'payment please'}]}
     with pytest.raises(ai.InvalidModelOutput):
         summary_dialogues.combine(json.dumps({'same': True, 'basis_kind': 'identifier', 'basis_value': 'payment',
-            'quote_a': 'payment please', 'quote_b': 'payment please', 'title': 'x', 'summary': 'x', 'latest_progress': 'x',
+            'quote_a_ref': 'E1', 'quote_b_ref': 'E1', 'title': 'x', 'summary': 'x', 'latest_progress': 'x',
             'handling_status': 'unresolved', 'handling_reason': '未完成', 'handling_evidence_refs': ['E1']}), e, e)
