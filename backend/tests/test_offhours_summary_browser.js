@@ -57,14 +57,14 @@ test("bilingual user labels are displayed literally in evidence", async t => {
   assert.deepEqual(errors, []);
 });
 
-test("grades are sorted, gaps stay separate, and filters/search/evidence work without writes", async t => {
+test("grades are sorted and filters/search/evidence work without writes", async t => {
   const {page, state, errors} = await fixture(t);
   assert.deepEqual(await page.locator(".oh-event .oh-priority").allTextContents(), ["P0", "P1", "P2", "P3", "待核实"]);
   assert(!(await page.locator(".oh-routine .oh-event").isVisible()));
   assert.equal(await page.locator("#oh-count-P3").textContent(), "1");
   assert.equal(await page.locator('a[href^="/admin/"]').count(), 0);
   assert((await page.locator("#oh-status-title").textContent()).includes("部分结果"));
-  assert(await page.locator("#oh-gaps").isVisible());
+  assert.equal(await page.locator("#oh-gaps").count(), 0);
   await page.locator('.oh-filter[data-priority="P0"]').click();
   assert.equal(await page.locator(".oh-event").count(), 1);
   await page.getByText("查看相关原文（1）").click();

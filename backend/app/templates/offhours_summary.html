@@ -20,7 +20,6 @@
       <button type="button" class="oh-stat oh-p2" data-priority="P2" aria-pressed="false"><span>P2 · 正常跟进</span><strong id="oh-count-P2">0</strong><small>业务请求 / 运营信息</small></button>
       <button type="button" class="oh-stat oh-p3" data-priority="P3" aria-pressed="false"><span>P3 · 日常沟通</span><strong id="oh-count-P3">0</strong><small>礼貌回复 / 简单确认</small></button>
     </section>
-    <section class="oh-gaps oh-warning" id="oh-gaps" aria-labelledby="oh-gaps-title" hidden><h2 id="oh-gaps-title">还不能下结论的部分</h2><p>资料不完整或分析失败，不代表没有风险，也不会算成 P3。</p><ul id="oh-gap-list"></ul></section>
     <section class="oh-workspace" aria-labelledby="oh-list-title">
       <div class="oh-toolbar"><div><h2 id="oh-list-title">发生了哪些事</h2><span id="oh-visible-count" class="oh-small" aria-live="polite"></span></div><label class="oh-search"><span class="oh-sr-only">搜索达人或事件</span><input class="form-control" id="oh-search" type="search" autocomplete="off" maxlength="120" placeholder="搜索 handle、用户或事件"></label></div>
       <div class="oh-filters" role="group" aria-label="按等级筛选"><button class="oh-filter" type="button" data-priority="all" aria-pressed="true">全部事件</button><button class="oh-filter" type="button" data-priority="P0" aria-pressed="false">P0</button><button class="oh-filter" type="button" data-priority="P1" aria-pressed="false">P1</button><button class="oh-filter" type="button" data-priority="P2" aria-pressed="false">P2</button><button class="oh-filter" type="button" data-priority="P3" aria-pressed="false">P3</button><button class="oh-filter" type="button" data-priority="review" aria-pressed="false">待核实 <span id="oh-review-count">0</span></button></div>
@@ -32,5 +31,5 @@
   </main>
 </div>
 <script id="offhours-summary-data" type="application/json">{{ summary_data|tojson }}</script>
-<script src="/static/offhours-summary.js?v=20260915-select" defer></script>
+<script src="/static/offhours-summary.js?v=20260915-clean" defer></script>
 {% endblock %}

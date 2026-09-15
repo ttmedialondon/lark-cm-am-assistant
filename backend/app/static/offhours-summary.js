@@ -143,10 +143,6 @@
       document.querySelector(`.oh-stat[data-priority="${level}"]`).setAttribute("aria-label", `${level} ${labels[level]}，${run ? count : "尚未分析"}`);
     }
     $("oh-review-count").textContent = String(all.filter(needsReview).length);
-    const gaps = Array.isArray(run?.gaps) ? [...run.gaps] : [];
-    if (failed && !gaps.length) gaps.push(`${failed} 个任务未能完成，相关消息未纳入完整判断。`);
-    $("oh-gaps").hidden = !gaps.length;
-    $("oh-gap-list").replaceChildren(...gaps.map(gap => node("li", "", typeof gap === "string" ? gap : gap.message || gap.reason || "部分资料未能完成判断。")));
     renderEvents();
   }
 
