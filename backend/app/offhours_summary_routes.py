@@ -4,7 +4,7 @@ from fastapi import APIRouter, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, RedirectResponse
 
-from . import offhours_summary
+from . import offhours_summary, summary_periods
 from .db import connection
 
 
@@ -28,7 +28,17 @@ def create_router(*, current_authorization, render_template):
         if not auth or auth["status"] != "active":
             raise PermissionError("登录授权已失效，请重新登录。")
         with connection() as conn, conn.transaction():
-            data = offhours_summary.get_summary_view(conn, auth["id"])
+            try:
+                cm_id, _start, _end, selection = summary_periods.selection(
+                    conn, auth["id"], request.query_params.get("cm_id"),
+                    request.query_params.get("date"), request.query_params.get("period"),
+                )
+            except ValueError as exc:
+                raise offhours_summary.SummaryInputError("请选择有效的 CM、日期和时段。") from exc
+            data = offhours_summary.get_summary_view(
+                conn, auth["id"], cm_id=cm_id, day=selection["date"], period=selection["period"],
+            )
+            data["selection"] = selection
         return auth, jsonable_encoder(data)
 
     def denied(exc):

@@ -13,7 +13,7 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from app import creator_import_evidence, creator_imports, creator_ownership
+from app import creator_import_evidence, creator_imports, creator_ownership, summary_periods
 from app import offhours_summary as ai
 from app.ai_feature_config import save_feature_config
 from app.crypto import message_body_cipher
@@ -33,6 +33,17 @@ def test_window_and_working_days_skip_weekend_at_same_london_time():
     ):
         with pytest.raises(ai.SummaryInputError):
             ai._parse_window(*values)
+
+
+def test_shift_windows_are_adjacent_and_follow_london_dst():
+    for day, night_hours in [('2026-09-14', 16), ('2026-03-28', 15), ('2026-10-24', 17)]:
+        work = summary_periods.window(day, 'work')
+        off = summary_periods.window(day, 'off')
+        assert work[1] == off[0]
+        assert work[1] - work[0] == timedelta(hours=8)
+        assert off[1] - off[0] == timedelta(hours=night_hours)
+        next_day = (datetime.fromisoformat(day) + timedelta(days=1)).date()
+        assert off[1] == summary_periods.window(next_day, 'work')[0]
 
 
 def sample_event(**overrides):
@@ -118,7 +129,7 @@ def pg(monkeypatch):
         conn.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(psycopg.sql.Identifier(schema)))
         conn.execute(psycopg.sql.SQL("SET LOCAL search_path TO {}").format(psycopg.sql.Identifier(schema)))
         for path in sorted((Path(__file__).parents[1] / "migrations").glob("*.sql")):
-            if int(path.name[:3]) <= 51:
+            if int(path.name[:3]) <= 51 or int(path.name[:3]) >= 54:
                 conn.execute(path.read_text())
         monkeypatch.setattr(ai, "connection", lambda: nullcontext(conn))
         monkeypatch.setattr(ai.ai_dispatch, "connection", lambda: nullcontext(conn))
@@ -786,3 +797,58 @@ def test_rich_mentions_render_before_clipping_and_keep_credentials_redacted():
     row["body_ciphertext"] = cipher.encrypt(json.dumps({"text": "@_user_1 " + "x" * 2000}))
     text, incomplete = ai._body(row, cipher, {"ou_cm": "Remi（Original）"})
     assert text.startswith("@Remi（Original） ") and len(text) == ai.MAX_BODY_CHARS and incomplete
+
+
+def test_recurring_periods_keep_history_and_cm_scope_separate(pg, seeded):
+    s = seeded
+    s.save()
+    pg.execute('UPDATE offhours_summary_settings SET recurring_enabled=TRUE,next_period_check_at=NULL')
+    now = datetime.now(UTC)
+    summary_periods.seed_due(pg, now)
+    first = pg.execute('SELECT id FROM offhours_summary_runs WHERE period IS NOT NULL').fetchall()
+    assert 12 <= len(first) <= 14
+    pg.execute('UPDATE offhours_summary_settings SET next_period_check_at=NULL')
+    summary_periods.seed_due(pg, now)
+    assert pg.execute('SELECT id FROM offhours_summary_runs WHERE period IS NOT NULL').fetchall() == first
+    target = pg.execute("""SELECT r.* FROM offhours_summary_runs r JOIN chat_messages m
+        ON m.message_create_time>=r.window_start AND m.message_create_time<r.window_end
+        WHERE r.period IS NOT NULL AND m.message_id='m1'""").fetchone()
+    assert target
+    pg.execute("UPDATE offhours_summary_tasks SET status='cancelled'")
+    ai._schedule_run(pg, {**target, 'run_id': target['id']}, now)
+    pg.execute('UPDATE offhours_summary_runs SET next_check_at=NULL')
+    job = ai.claim_next_summary()
+    assert job['run_id'] == target['id']
+    ai.run_claimed_summary(job, s.settings)
+    historical = ai.get_summary_view(pg, s.ids['cm'], day=target['report_date'], period=target['period'])
+    assert historical['events'] and len(s.calls) == 1
+    ai._schedule_run(pg, {**target, 'run_id': target['id']}, now)
+    assert pg.execute('SELECT count(*) n FROM offhours_summary_tasks WHERE run_id=%s',
+                      (target['id'],)).fetchone()['n'] == 1
+    with pytest.raises(PermissionError):
+        summary_periods.selection(pg, s.ids['reviewer'], s.ids['cm'])
+    cm_id, start, end, selected = summary_periods.selection(pg, s.ids['cm'])
+    assert cm_id == s.ids['cm'] and len(selected['dates']) == 7 and end > start
+    with pytest.raises(ai.SummaryInputError):
+        summary_periods.selection(pg, s.ids['cm'], day='2020-01-01', period='work')
+    pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-manage')",
+               (s.ids['tester'],))
+    second_cm = s.ids['reviewer']
+    pg.execute('UPDATE contact_assignments SET responsible_authorization_id=%s', (second_cm,))
+    assert ai._roster(pg, second_cm) and not ai._roster(pg, s.ids['cm'])
+    assert ai._related_chats(pg, ai._roster(pg, second_cm), cm_id=second_cm) == []
+    assert summary_periods.selection(pg, s.ids['tester'], second_cm)[0] == second_cm
+    pg.execute('UPDATE offhours_summary_settings SET next_period_check_at=NULL')
+    summary_periods.seed_due(pg, now)
+    other = pg.execute('SELECT * FROM offhours_summary_runs WHERE period IS NOT NULL '
+                       'AND responsible_authorization_id=%s ORDER BY window_start DESC LIMIT 1',
+                       (second_cm,)).fetchone()
+    ai._schedule_run(pg, {**other, 'run_id': other['id']}, now)
+    view = ai.get_summary_view(pg, s.ids['tester'], cm_id=second_cm,
+                               day=other['report_date'], period=other['period'])
+    assert view['responsible']['id'] == str(second_cm) and view['events'] == []
+    assert pg.execute('SELECT count(*) n FROM offhours_summary_runs WHERE responsible_authorization_id=%s '
+                      'AND period IS NOT NULL', (s.ids['cm'],)).fetchone()['n'] == len(first)
+    pg.execute('DELETE FROM admin_page_permissions WHERE authorization_id=%s', (s.ids['tester'],))
+    with pytest.raises(PermissionError):
+        summary_periods.selection(pg, s.ids['tester'], second_cm)

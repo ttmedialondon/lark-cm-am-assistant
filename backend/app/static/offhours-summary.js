@@ -92,8 +92,8 @@
     } else if (!data.enabled && !data.run) {
       $("oh-empty-title").textContent = "尚未开启分析";
       $("oh-empty-description").textContent = data.can_manage
-        ? "在分析设置中保存并开启后，系统会立即开始分析 Remi 已确认达人的消息。这里不会使用假数据。"
-        : "分析尚未开启。开启后，这里会展示 Remi 已确认达人的真实消息总结。";
+        ? "开启消息总结后，系统按上班和下班时段整理已入库达人的消息。"
+        : "分析尚未开启。开启后，这里会展示已入库达人的真实消息总结。";
     } else {
       $("oh-empty-title").textContent = data.run ? "暂时没有可展示的事件" : "等待分析任务";
       $("oh-empty-description").textContent = "请结合上方的分析进度与资料缺口查看。没有结果不代表没有风险。";
@@ -128,6 +128,9 @@
       if (data.coverage) description += ` 已检查 ${data.coverage.related_groups || 0} 个相关群聊、${data.coverage.related_private_chats || 0} 个私聊；本时段纳入 ${data.coverage.group_conversations || 0} 个群聊、${data.coverage.private_conversations || 0} 个私聊，共 ${data.coverage.messages || 0} 条消息。`;
       if (run.cutoff) description += ` 本轮读取到 ${date(run.cutoff)}（英国时间）。`;
       if (data.window?.is_open) description += " 尚未到时段结束时间，请稍后查看更新。";
+    } else if (data.window?.is_future) {
+      title = "时段尚未开始";
+      description = "到达开始时间后，系统会自动收集并总结该时段的消息。";
     } else if (data.enabled) {
       title = "已开启 · 等待分析任务";
       description = "后台正在准备当前时段的数据。尚未有结果不代表没有消息或没有风险。";
@@ -160,7 +163,9 @@
     if (loading || denied) return;
     loading = true; clearTimeout(timer); $("oh-refresh").disabled = true;
     try {
-      const response = await fetch("/dashboard/offhours-summary/data", {
+      const params = new URLSearchParams({cm_id: data.responsible.id,
+        date: data.selection.date, period: data.selection.period});
+      const response = await fetch("/dashboard/offhours-summary/data?" + params, {
         cache: "no-store", credentials: "same-origin", redirect: "error", headers: {Accept: "application/json"},
       });
       if ([401, 403].includes(response.status)) {

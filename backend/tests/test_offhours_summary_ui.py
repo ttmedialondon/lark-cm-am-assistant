@@ -20,6 +20,7 @@ APP = Path(__file__).resolve().parents[1] / "app"
 
 
 def render(data):
+    data = {"selection": {"cms": [], "dates": [], "date": "2026-09-15", "period": "work"}, **data}
     env = Environment(loader=FileSystemLoader(APP / "templates"), autoescape=select_autoescape())
     return env.get_template("offhours_summary.html").render(
         authorization={"display_name": "Tester"}, summary_data=data,
@@ -95,8 +96,10 @@ def client(monkeypatch):
     monkeypatch.setattr(routes, "connection", lambda: nullcontext(conn))
     monkeypatch.setattr(
         routes.offhours_summary, "get_summary_view",
-        lambda connection, actor: calls.append((connection, actor)) or {"events": []},
+        lambda connection, actor, **kwargs: calls.append((connection, actor)) or {"events": []},
     )
+    monkeypatch.setattr(routes.summary_periods, "selection",
+                        lambda conn, actor, *args: (actor, None, None, {"date": "2026-09-15", "period": "work"}))
     app = FastAPI()
     app.include_router(routes.create_router(
         current_authorization=lambda _: auth,
@@ -123,7 +126,7 @@ def test_revoked_session_and_backend_scope_denial_never_render_data(client, monk
     assert not calls
     auth["status"] = "active"
 
-    def deny(*_):
+    def deny(*_, **kwargs):
         raise PermissionError("当前账号不能查看此总结。")
 
     monkeypatch.setattr(routes.offhours_summary, "get_summary_view", deny)
@@ -136,7 +139,7 @@ def test_revoked_session_and_backend_scope_denial_never_render_data(client, monk
 def test_source_cm_authorization_loss_returns_forbidden_so_browser_clears_results(client, monkeypatch):
     api, _, _, _ = client
 
-    def revoked_source(*_):
+    def revoked_source(*_, **kwargs):
         raise routes.offhours_summary.SummaryInputError("Remi 的消息读取授权已失效。")
 
     monkeypatch.setattr(routes.offhours_summary, "get_summary_view", revoked_source)

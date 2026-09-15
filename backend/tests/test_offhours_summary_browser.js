@@ -11,6 +11,7 @@ const event = (priority, extra = {}) => ({id: priority, creator_handle: "sample.
   reason: "用于验证界面布局与排序。", needs_review: false,
   evidence: [{message_id: "message-1", chat_id: "chat-1", text: "Please check this issue.", created_at: "2026-09-09T20:00:00Z", sender_name: "Sample Creator"}], ...extra});
 const report = (extra = {}) => ({responsible: {id: "remi-id", name: "Remi"}, enabled: true, can_manage: false,
+  selection: {cms: [{id: "remi-id", name: "Remi"}], dates: ["2026-09-09"], date: "2026-09-09", period: "off"},
   window: {start: "2026-09-09T17:00:00Z", end: "2026-09-10T11:00:00Z", timezone: "Europe/London", is_partial: true, is_open: true},
   run: {id: "run-1", status: "running", updated_at: "2026-09-10T01:00:00Z", cutoff: "2026-09-10T01:00:00Z",
     counts: {queued: 1, running: 2, completed: 4, failed: 1}, gaps: ["有一段会话同步不完整，尚不能下结论。"]},
@@ -34,7 +35,7 @@ async function fixture(t, data = report()) {
     }
     if (url.pathname === "/dashboard/offhours-summary") return route.fulfill({contentType: "text/html", body: rendered.stdout});
     if (url.pathname.startsWith("/static/")) return route.fulfill({contentType: url.pathname.endsWith(".js") ? "text/javascript" : "text/css", body: fs.readFileSync(path.join(backend, "app", url.pathname))});
-    state.calls.push({method: route.request().method(), url: url.pathname});
+    state.calls.push({method: route.request().method(), url: url.pathname, search: url.search});
     if (url.pathname.endsWith("/data")) return route.fulfill({status: state.status, json: state.data});
     return route.abort();
   });
@@ -102,7 +103,7 @@ test("disabled state contains no pretend counts or seeded results", async t => {
   assert.equal(await page.locator("#oh-count-P0").textContent(), "—");
   assert.equal(await page.locator(".oh-event").count(), 0);
   assert.equal(await page.locator('a[href="/admin/ai#offhours-summary"]').count(), 1);
-  assert((await page.locator("#oh-empty-description").textContent()).includes("不会使用假数据"));
+  assert((await page.locator("#oh-empty-description").textContent()).includes("已入库达人"));
   assert.equal(state.calls.length, 0);
   assert.deepEqual(errors, []);
 });

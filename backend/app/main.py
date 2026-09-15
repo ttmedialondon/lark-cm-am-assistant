@@ -313,7 +313,7 @@ def dashboard(request: Request):
             "body_consent": bool(authorization["body_consent_at"]),
             "offhours_summary_visible": (
                 authorization["status"] == "active" and (
-                    str(authorization["id"]) == "24d1ef13-3762-4359-ba11-d26c03cf1f7f"
+                    bool(authorization.get("body_consent_at"))
                     or admin_access["is_owner"]
                     or _is_remi_tester(authorization, admin_access)
                 )

@@ -1,4 +1,4 @@
-"""A bounded, explicitly enabled Remi pilot; summaries never send or suggest replies."""
+"""Bounded creator summaries with current source checks; never send or suggest replies."""
 
 from __future__ import annotations
 
@@ -53,7 +53,8 @@ def _hash(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
 
 
-def _authorize(conn, actor_id, *, owner_only=False):
+def _authorize(conn, actor_id, *, owner_only=False, cm_id=REMI_ID):
+    cm_id = UUID(str(cm_id))
     actor_id = UUID(str(actor_id))
     # Caller transactions keep these live grants stable until export/read finishes.
     for table, column in (
@@ -62,7 +63,7 @@ def _authorize(conn, actor_id, *, owner_only=False):
     ):
         conn.execute(
             f"SELECT {column} FROM {table} WHERE {column}=ANY(%s::uuid[]) FOR SHARE",
-            (sorted({actor_id, REMI_ID}, key=str),),
+            (sorted({actor_id, cm_id}, key=str),),
         ).fetchall()
     actor = conn.execute(
         """SELECT a.status, r.role, r.is_active FROM authorizations a
@@ -78,11 +79,16 @@ def _authorize(conn, actor_id, *, owner_only=False):
         and (owner or actor_id != UUID("9d5f4370-6463-4c3a-a2ed-67753a1cabc0"))
         and not (actor["role"] == "owner" and not actor["is_active"])
     )
-    if (owner_only and not owner) or (not owner and actor_id != REMI_ID and not tester):
-        raise PermissionError("此试运行仅对 Remi、系统主人和已授权的两位测试人员开放。")
-    cm = conn.execute("SELECT * FROM authorizations WHERE id=%s", (REMI_ID,)).fetchone()
-    if not cm or cm["status"] != "active" or not cm["assignment_eligible"] or not cm["body_consent_at"]:
-        raise SummaryInputError("Remi 的有效授权或消息正文授权尚未就绪。")
+    manager = bool(conn.execute(
+        "SELECT 1 FROM admin_page_permissions WHERE authorization_id=%s AND permission='creator-manage' FOR SHARE",
+        (actor_id,),
+    ).fetchone())
+    tester = tester and cm_id == REMI_ID
+    if (owner_only and not owner) or (not owner and actor_id != cm_id and not tester and not manager):
+        raise PermissionError("只能查看自己或已获授权的 CM 总结。")
+    cm = conn.execute("SELECT * FROM authorizations WHERE id=%s", (cm_id,)).fetchone()
+    if not cm or cm["status"] != "active" or not cm["body_consent_at"]:
+        raise SummaryInputError("该 CM 的有效授权或消息正文授权尚未就绪。")
     return dict(cm), owner
 
 
@@ -131,6 +137,9 @@ def get_settings_view(conn):
         "SELECT r.* FROM offhours_summary_settings s JOIN offhours_summary_runs r ON r.id=s.run_id WHERE s.id"
     ).fetchone()
     return {
+        "recurring_enabled": bool((conn.execute(
+            "SELECT recurring_enabled FROM offhours_summary_settings WHERE id"
+        ).fetchone() or {}).get("recurring_enabled")),
         "window_start_input": row["window_start"].astimezone(LONDON).strftime("%Y-%m-%dT%H:%M")
         if row
         else DEFAULT_START,
@@ -151,6 +160,17 @@ def save_settings_and_enqueue(conn, actor_id, fields):
         _authorize(conn, actor_id, owner_only=True)
         if not _enabled(conn):
             raise SummaryInputError("仅支持已配置有效密钥的 OpenAI 接口。")
+    recurring = conn.execute("SELECT * FROM offhours_summary_settings WHERE id FOR UPDATE").fetchone()
+    if recurring and recurring["recurring_enabled"]:
+        conn.execute("UPDATE offhours_summary_settings SET next_period_check_at=NULL WHERE id")
+        if cfg["enabled"]:
+            conn.execute("""UPDATE offhours_summary_runs SET next_check_at=NOW(),
+                refresh_until=GREATEST(window_end,NOW())+INTERVAL '24 hours'
+                WHERE period IS NOT NULL AND window_start>=NOW()-INTERVAL '7 days'""")
+        else:
+            conn.execute("""UPDATE offhours_summary_tasks SET status='cancelled',lease_until=NULL,
+                error_message='功能已关闭。' WHERE status IN ('queued','running')""")
+        return {"enabled": cfg["enabled"], "queued": 0, "run_id": str(recurring["run_id"])}
     start, end = _parse_window(fields.get("window_start", DEFAULT_START), fields.get("window_end", DEFAULT_END))
     signature = _hash([cfg["provider"], cfg["project_id"], cfg["model"], cfg["api_key_ciphertext"], start, end])
     current = conn.execute("SELECT * FROM offhours_summary_settings WHERE id FOR UPDATE").fetchone()
@@ -196,7 +216,7 @@ def save_settings_and_enqueue(conn, actor_id, fields):
     }
 
 
-def _roster(conn):
+def _roster(conn, cm_id=REMI_ID):
     return conn.execute(
         """WITH people AS MATERIALIZED (
                SELECT contact_id FROM contact_assignments
@@ -221,7 +241,7 @@ def _roster(conn):
            WHERE c.creator_type='cap'
              AND c.id IN (SELECT contact_id FROM people UNION SELECT contact_id FROM legacy)
            ORDER BY c.id,sa.id,i.open_id FOR SHARE OF c,i""",
-        (REMI_ID, REMI_ID),
+        (cm_id, cm_id),
     ).fetchall()
 
 
@@ -233,7 +253,7 @@ _CHAT_SQL = """SELECT c.chat_id,c.name,c.chat_mode,ac.p2p_counterpart_open_id,ac
       AND COALESCE(c.chat_status,'normal')='normal'"""
 
 
-def _related_chats(conn, roster, *, settings=None):
+def _related_chats(conn, roster, *, settings=None, cm_id=REMI_ID):
     """All currently readable conversations linked to the formal roster's identities.
 
     Historical observations discover relationships only; no historical body is read
@@ -244,14 +264,14 @@ def _related_chats(conn, roster, *, settings=None):
     cm = conn.execute(
         """SELECT id,open_id,body_consent_at FROM authorizations WHERE id=%s
            AND status='active' AND body_consent_at IS NOT NULL FOR SHARE""",
-        (REMI_ID,),
+        (cm_id,),
     ).fetchone()
     if not cm:
-        raise SummaryInputError("Remi 的聊天授权已失效。")
+        raise SummaryInputError("该 CM 的聊天授权已失效。")
     identities = {row["open_id"]: row["contact_id"] for row in roster}
     chats = {
         row["chat_id"]: {**row, "contact_ids": set(), "verified_contact_ids": set(), "unique_contact_id": None}
-        for row in conn.execute(_CHAT_SQL + " ORDER BY c.chat_id", (REMI_ID,)).fetchall()
+        for row in conn.execute(_CHAT_SQL + " ORDER BY c.chat_id", (cm_id,)).fetchall()
     }
     if not chats:
         return []
@@ -269,7 +289,7 @@ def _related_chats(conn, roster, *, settings=None):
            WHERE o.authorization_id=%s AND o.observed_at>=%s
              AND m.chat_id=ANY(%s::text[]) AND m.sender_open_id=ANY(%s::text[])
              AND NOT m.is_deleted AND m.body_ciphertext IS NOT NULL""",
-        (list(chats), list(identities), REMI_ID, cm["body_consent_at"], list(chats), list(identities)),
+        (list(chats), list(identities), cm_id, cm["body_consent_at"], list(chats), list(identities)),
     ).fetchall()
     for relation in related:
         chats[relation["chat_id"]]["contact_ids"].add(identities[relation["open_id"]])
@@ -292,7 +312,7 @@ def _related_chats(conn, roster, *, settings=None):
         (
             sorted(set(identities.values()), key=str),
             sorted({row["account_id"] for row in roster if row["account_id"]}, key=str),
-            REMI_ID, REMI_ID, creator_imports.POLICY_VERSION,
+            cm_id, cm_id, creator_imports.POLICY_VERSION,
         ),
     ).fetchall()
     settings = settings or get_settings()
@@ -394,28 +414,30 @@ def _body(row, cipher, names=None):
 
 
 def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, related_chats=None):
-    cm, _ = _authorize(conn, run["requested_by_authorization_id"], owner_only=True)
+    cm_id = run.get("responsible_authorization_id", REMI_ID)
+    cm, _ = _authorize(conn, run["requested_by_authorization_id"], owner_only=True, cm_id=cm_id)
     conn.execute(
         """SELECT chat_id FROM authorization_chats WHERE authorization_id=%s AND chat_id=%s FOR SHARE""",
-        (REMI_ID, chat_id),
+        (cm_id, chat_id),
     ).fetchall()
     conn.execute("SELECT chat_id FROM chats WHERE chat_id=%s FOR SHARE", (chat_id,)).fetchall()
-    chat = conn.execute(_CHAT_SQL + " AND c.chat_id=%s", (REMI_ID, chat_id)).fetchone()
+    chat = conn.execute(_CHAT_SQL + " AND c.chat_id=%s", (cm_id, chat_id)).fetchone()
     if not chat:
         raise SummaryInputError("会话授权已失效。")
-    roster = _roster(conn) if roster is None else roster
-    related_chats = _related_chats(conn, roster, settings=settings) if related_chats is None else related_chats
+    roster = _roster(conn, cm_id) if roster is None else roster
+    if related_chats is None:
+        related_chats = _related_chats(conn, roster, settings=settings, cm_id=cm_id)
     relation = next((item for item in related_chats if item["chat_id"] == chat_id), None)
     if relation is None:
         return None
     opens = {r["open_id"] for r in roster}
     all_senders = sorted(opens | {cm["open_id"]})
     recent = conn.execute(
-        _MESSAGE_SQL, (REMI_ID, chat_id, run["window_start"], cutoff, all_senders, MAX_MESSAGES + 1)
+        _MESSAGE_SQL, (cm_id, chat_id, run["window_start"], cutoff, all_senders, MAX_MESSAGES + 1)
     ).fetchall()
     earlier = conn.execute(
         _MESSAGE_SQL,
-        (REMI_ID, chat_id, run["window_start"] - timedelta(days=7), run["window_start"], all_senders, MAX_CONTEXT + 1),
+        (cm_id, chat_id, run["window_start"] - timedelta(days=7), run["window_start"], all_senders, MAX_CONTEXT + 1),
     ).fetchall()
     rows = list(reversed(recent[:MAX_MESSAGES]))
     relevant_opens = {r["sender_open_id"] for r in rows if r["sender_open_id"] in opens}
@@ -551,17 +573,43 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
 
 def schedule_if_due(conn, *, force=False):
     conn.execute("SELECT pg_advisory_xact_lock(hashtextextended('offhours-summary',0))")
+    from .summary_periods import seed_due
+
+    now = datetime.now(UTC)
+    seed_due(conn, now)
+    recurring = conn.execute("SELECT recurring_enabled FROM offhours_summary_settings WHERE id").fetchone()
+    if recurring and recurring["recurring_enabled"]:
+        if not _enabled(conn):
+            return
+        state = conn.execute("""SELECT *,id AS run_id FROM offhours_summary_runs
+            WHERE period IS NOT NULL AND next_check_at<=%s
+            ORDER BY next_check_at,window_start DESC,id FOR UPDATE SKIP LOCKED LIMIT 1""", (now,)).fetchone()
+        if state:
+            try:
+                with conn.transaction():
+                    _schedule_run(conn, dict(state), now)
+            except (PermissionError, SummaryInputError):
+                conn.execute("UPDATE offhours_summary_runs SET next_check_at=NULL WHERE id=%s", (state["id"],))
+                conn.execute("""UPDATE offhours_summary_tasks SET status='cancelled',lease_until=NULL,
+                    error_message='该 CM 授权已失效。' WHERE run_id=%s AND status IN ('queued','running')""",
+                    (state["id"],))
+        return
     state = conn.execute("""SELECT s.*,r.window_start,r.window_end,r.requested_by_authorization_id,
                          r.responsible_authorization_id FROM offhours_summary_settings s
                          JOIN offhours_summary_runs r ON r.id=s.run_id WHERE s.id FOR UPDATE OF s""").fetchone()
     now = datetime.now(UTC)
     if not state or not _enabled(conn) or (not force and (not state["next_check_at"] or state["next_check_at"] > now)):
         return
-    _authorize(conn, state["requested_by_authorization_id"], owner_only=True)
+    _schedule_run(conn, dict(state), now)
+
+
+def _schedule_run(conn, state, now):
+    cm_id = state["responsible_authorization_id"]
+    _authorize(conn, state["requested_by_authorization_id"], owner_only=True, cm_id=cm_id)
     cutoff = min(now, state["window_end"])
-    roster = _roster(conn)
+    roster = _roster(conn, cm_id)
     # Discover every related conversation before applying the bounded content limit.
-    chats = _related_chats(conn, roster)
+    chats = _related_chats(conn, roster, cm_id=cm_id)
     gaps = []
     if len(chats) > MAX_CHATS:
         gaps.append("超过本次 300 个会话的检查上限；当前结果不完整。")
@@ -585,7 +633,7 @@ def schedule_if_due(conn, *, force=False):
         if evidence["incomplete"]:
             gaps.append("部分会话超过消息长度/数量上限，或有附件无法读取；不能当作完整总结。")
         if not evidence["pack"]["is_private"]:
-            gaps.append("群聊仅纳入已确认达人及 Remi 发言，其他人员回复未纳入，进展可能不完整。")
+            gaps.append("群聊仅纳入已确认达人及 CM 发言，其他人员回复未纳入，进展可能不完整。")
         conn.execute(
             """UPDATE offhours_summary_tasks SET is_current=FALSE
                      WHERE run_id=%s AND chat_id=%s AND input_fingerprint<>%s""",
@@ -620,7 +668,7 @@ def schedule_if_due(conn, *, force=False):
     if now < state["window_end"]:
         gaps.append("时段未结束；新同步消息会在开启期间继续纳入。")
     if not roster:
-        gaps.append("尚无已确认且关联有效 Lark 用户的 Remi 达人。")
+        gaps.append("尚无已确认且关联有效 Lark 用户的达人。")
     if roster and not count:
         gaps.append("尚未找到已同步的时段内相关消息；这不代表 Lark 中没有消息。")
     coverage = {
@@ -641,10 +689,12 @@ def schedule_if_due(conn, *, force=False):
         (json.dumps(coverage, ensure_ascii=False), state["run_id"]),
     )
     continue_checking = now < state["refresh_until"]
-    conn.execute(
-        "UPDATE offhours_summary_settings SET next_check_at=%s WHERE id",
-        (now + timedelta(seconds=60) if continue_checking else None,),
-    )
+    next_check = now + timedelta(minutes=10 if now < state["window_end"] else 60) if continue_checking else None
+    if state.get("period"):
+        conn.execute("UPDATE offhours_summary_runs SET next_check_at=%s WHERE id=%s",
+                     (next_check, state["run_id"]))
+    else:
+        conn.execute("UPDATE offhours_summary_settings SET next_check_at=%s WHERE id", (next_check,))
 
 
 def claim_next_summary():
@@ -667,8 +717,9 @@ def claim_next_summary():
         row = conn.execute("""SELECT t.*,r.requested_by_authorization_id,r.responsible_authorization_id,
                             r.window_start,r.window_end FROM offhours_summary_tasks t
                             JOIN offhours_summary_runs r ON r.id=t.run_id
-                            JOIN offhours_summary_settings s ON s.run_id=r.id
-                            WHERE t.status='queued' AND t.is_current AND t.scheduled_at<=NOW()
+                            JOIN offhours_summary_settings s ON s.id
+                            WHERE (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL))
+                              AND t.status='queued' AND t.is_current AND t.scheduled_at<=NOW()
                             ORDER BY t.scheduled_at,t.created_at FOR UPDATE OF t SKIP LOCKED LIMIT 1""").fetchone()
         if not row:
             return None
@@ -855,7 +906,9 @@ def _validate(raw, evidence):
 def _current(conn, job):
     row = conn.execute(
         """SELECT t.status,t.attempts,t.lease_until>NOW() AS leased FROM offhours_summary_tasks t
-                        JOIN offhours_summary_settings s ON s.run_id=t.run_id WHERE t.id=%s FOR UPDATE OF t""",
+                        JOIN offhours_summary_runs r ON r.id=t.run_id
+                        JOIN offhours_summary_settings s ON s.id WHERE t.id=%s
+                        AND (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL)) FOR UPDATE OF t""",
         (job["id"],),
     ).fetchone()
     if (
@@ -878,6 +931,8 @@ def _finish(job, status, error, *, delay=0):
             (status, error, delay, status, job["id"], job["attempts"]),
         )
         if status == "cancelled" and _enabled(conn):
+            conn.execute("UPDATE offhours_summary_runs SET next_check_at=NOW() "
+                         "WHERE id=%s AND period IS NOT NULL AND refresh_until>NOW()", (job["run_id"],))
             conn.execute(
                 """UPDATE offhours_summary_settings SET next_check_at=NOW()
                          WHERE run_id=%s AND refresh_until>NOW()""",
@@ -906,7 +961,7 @@ def run_claimed_summary(job, settings):
             cfg,
             key,
             evidence["pack"],
-            REMI_ID,
+            job["responsible_authorization_id"],
             instructions=_INSTRUCTIONS,
             output_format=_format(evidence),
             max_output_tokens=6000,
@@ -979,13 +1034,20 @@ def run_claimed_summary(job, settings):
                 )
 
 
-def get_summary_view(conn, actor_id):
-    cm, owner = _authorize(conn, actor_id)
-    row = conn.execute("""SELECT r.* FROM offhours_summary_settings s
+def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None):
+    cm, owner = _authorize(conn, actor_id, cm_id=cm_id)
+    if period is not None:
+        from .summary_periods import window
+        start, end = window(day, period)
+        row = conn.execute("SELECT * FROM offhours_summary_runs WHERE responsible_authorization_id=%s "
+                           "AND report_date=%s AND period=%s", (cm_id, day, period)).fetchone()
+    else:
+        row = conn.execute("""SELECT r.* FROM offhours_summary_settings s
                         JOIN offhours_summary_runs r ON r.id=s.run_id WHERE s.id""").fetchone()
-    start, end = (row["window_start"], row["window_end"]) if row else _parse_window(DEFAULT_START, DEFAULT_END)
+    if period is None:
+        start, end = (row["window_start"], row["window_end"]) if row else _parse_window(DEFAULT_START, DEFAULT_END)
     view = {
-        "responsible": {"id": str(REMI_ID), "name": cm["display_name"] or "Remi"},
+        "responsible": {"id": str(cm_id), "name": cm["display_name"] or "CM"},
         "can_manage": owner,
         "enabled": _enabled(conn),
         "window": {
@@ -994,6 +1056,7 @@ def get_summary_view(conn, actor_id):
             "timezone": TIMEZONE,
             "is_partial": datetime.now(UTC) < end,
             "is_open": datetime.now(UTC) < end,
+            "is_future": datetime.now(UTC) < start,
         },
         "run": None,
         "events": [],
@@ -1011,8 +1074,8 @@ def get_summary_view(conn, actor_id):
         (row["id"],),
     ).fetchall()
     settings = get_settings()
-    roster = _roster(conn)
-    related_chats = _related_chats(conn, roster, settings=settings)
+    roster = _roster(conn, cm_id)
+    related_chats = _related_chats(conn, roster, settings=settings, cm_id=cm_id)
     for task in tasks:
         name = {"succeeded": "completed", "queued": "queued", "running": "running"}.get(task["status"], "failed")
         counts[name] += 1
@@ -1051,7 +1114,10 @@ def get_summary_view(conn, actor_id):
             counts["completed"] -= 1
             counts["failed"] += 1
             gaps.append("部分结果因当前授权、名单或消息资料变化已隐藏；需重新处理。")
-    if counts["queued"] or counts["running"]:
+    if row.get("period") and not coverage.get("cutoff"):
+        status = "queued"
+        gaps.append("正在准备该时段的群聊和私聊材料。")
+    elif counts["queued"] or counts["running"]:
         status = "running"
         gaps.append("AI 正在处理；未完成的会话不能当作没有重要消息。")
     elif counts["failed"]:

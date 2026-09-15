@@ -53,9 +53,9 @@ AI_FEATURES = {
         "enabled_label": "开启全员身份识别",
     },
     "offhours_summary": {
-        "title": "下班消息总结（Remi 试用）",
-        "description": "只整理 Remi 已确认达人的消息，合并事项并按 P0–P3 分级；不生成或发送回复。",
-        "enabled_label": "开启下班消息总结（保存后立即排队）",
+        "title": "达人消息总结",
+        "description": "整理已入库达人的群聊和私聊，按上班、下班时段归纳并分级。",
+        "enabled_label": "开启达人消息总结",
     },
 }
 
