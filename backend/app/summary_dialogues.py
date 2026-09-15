@@ -211,12 +211,29 @@ MERGE_INSTRUCTIONS = """你核对同一个 CAP 达人在同一时段的两条事
 basis_kind 填 identifier/product/amount/reference；basis_value 填双方共有的具体依据，不能填付款/样品等主题。
 reference 可用双方明确承接关系，但必须有完整引用依据；仅 thanks/yes/ok 不成立。
 返回合并后的中文标题、摘要和截至时段的进展。不能因未看到回复推定无人处理，不能新增事实。
-同一事项新的礼貌消息不能消除未解决问题；明确已发生的解决进展可以更新摘要，不自动结单。
+同一事项新的礼貌消息不能消除未解决问题；明确已发生的解决进展可以更新摘要及处理状态。
+合并时从 evidence_messages 的 E 引用重新判断处理状态，不能照搬 a 或 b 的状态；same=false 时状态字段不被使用。
 """
 
+MERGE_INSTRUCTIONS += core.HANDLING_INSTRUCTIONS
 
-def merge_format():
+
+def merged_evidence(left, right):
+    unique = {core._hash(e): e for e in left["evidence"] + right["evidence"]}
+    return {
+        f"E{i}": e
+        for i, e in enumerate(
+            sorted(
+                unique.values(), key=lambda e: (e.get("created_at", ""), e.get("chat_id", ""), e.get("message_id", ""))
+            ),
+            1,
+        )
+    }
+
+
+def merge_format(refs=("E1",)):
     props = {
+        **core.handling_fields(refs),
         "same": {"type": "boolean"},
         "basis_kind": {"type": "string", "enum": ["identifier", "product", "amount", "reference", "none"]},
         **{
@@ -264,6 +281,8 @@ def combine(raw, left, right):
     for key in ("title", "summary", "latest_progress"):
         if not isinstance(value[key], str) or not value[key].strip():
             raise core.InvalidModelOutput("empty merge text")
+    messages = merged_evidence(left, right)
+    core.validate_handling(value, messages)
     levels = ["P0", "P1", "P2", "P3"]
     # Preserve the strongest supported signal; a greeting cannot erase a concern.
     priorities = [e["priority"] for e in (left, right) if e["priority"] in levels]
@@ -271,6 +290,9 @@ def combine(raw, left, right):
     evidence = {core._hash(e): e for e in left["evidence"] + right["evidence"]}
     return {
         **left,
+        **{k: value[k] for k in ("handling_status", "handling_reason")},
+        "handling_evidence": [messages[r] for r in value["handling_evidence_refs"]],
+        "handling_evidence_refs": [],
         **{k: value[k] for k in ("title", "summary", "latest_progress")},
         "priority": priority,
         "needs_review": left["needs_review"] or right["needs_review"],
@@ -331,6 +353,10 @@ def step(job, settings):
                 e["evidence"] = [
                     {**pending["refs"][ref], "chat_name": data["pack"]["chat_name"]} for ref in e["evidence_refs"]
                 ]
+                e["handling_evidence"] = [
+                    {**pending["refs"][ref], "chat_name": data["pack"]["chat_name"]}
+                    for ref in e["handling_evidence_refs"]
+                ]
             completed[pending["fingerprint"]] = events
         finished = all(c["fingerprint"] in completed for c in chunks)
         result = {"users": data["users"], "events": [e for c in chunks for e in completed.get(c["fingerprint"], [])]}
@@ -349,8 +375,14 @@ def step(job, settings):
             else:
                 # Pairwise comparison keeps unrelated items independent and avoids
                 # an ever-growing full-ledger model prompt. Originals stay attached.
+                evidence_messages = merged_evidence(ledger[against], candidate)
                 response = request(
-                    job, settings, cfg, {"a": ledger[against], "b": candidate}, merge_format(), MERGE_INSTRUCTIONS
+                    job,
+                    settings,
+                    cfg,
+                    {"a": ledger[against], "b": candidate, "evidence_messages": evidence_messages},
+                    merge_format(evidence_messages),
+                    MERGE_INSTRUCTIONS,
                 )
                 merged = combine(response["text"], ledger[against], candidate)
                 if merged:

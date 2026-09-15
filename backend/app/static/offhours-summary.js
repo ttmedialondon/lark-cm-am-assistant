@@ -32,6 +32,11 @@
     const heading = node("div", "oh-event-heading");
     heading.append(node("span", `oh-priority ${level ? `oh-${level.toLowerCase()}` : "oh-warning"}`, level || "待核实"),
       node("h3", "oh-event-title", event.title));
+    const handlingLabels = {resolved: "已处理", unresolved: "没有处理", uncertain: "待核实", not_required: "无需处理"};
+    const handling = node("span", `oh-handling oh-handling-${event.handling_status || "pending"}`,
+      handlingLabels[event.handling_status] || "待分析");
+    handling.title = "截至所选时段；没有处理表示尚未看到处理完成的证据";
+    heading.append(handling);
     const identity = node("div", "oh-identity");
     identity.append(node("span", "", `达人 handle：${event.creator_handle || event.creator_handles?.join("、") || "—"}`),
       node("span", "", `Lark 用户：${event.lark_user_name || "—"}`));
@@ -43,6 +48,7 @@
     const meta = node("div", "oh-event-meta");
     const progress = node("dl");
     progress.append(node("dt", "", "时段内最新进展"), node("dd", "", event.latest_progress));
+    if (event.handling_reason) progress.append(node("dd", "oh-small", event.handling_reason));
     meta.append(progress);
     card.append(meta);
     const evidence = Array.isArray(event.evidence) ? event.evidence : [];
@@ -52,6 +58,9 @@
       details.append(node("summary", "", `查看相关原文（${evidence.length}）`));
       for (const message of evidence) {
         const item = node("figure", "oh-message");
+        const supportsStatus = (event.handling_evidence || []).some(e => e.chat_id === message.chat_id
+          && e.message_id === message.message_id && e.text === message.text);
+        if (supportsStatus) item.append(node("span", "oh-small", "处理状态依据"));
         item.append(node("figcaption", "", `${message.chat_name ? message.chat_name + " · " : ""}${message.sender_name || "—"} · ${date(message.created_at)}（英国时间）`),
           node("blockquote", "", message.text || "该消息没有可显示的文字。"));
         messages.append(item);

@@ -8,6 +8,8 @@ const {chromium} = require("playwright");
 const backend = path.resolve(__dirname, "..");
 const event = (priority, extra = {}) => ({id: priority, creator_handle: "sample.handle", lark_user_name: "Sample Creator",
   priority, title: `${priority} fixture event`, summary: "这是用于浏览器测试的假数据，不会写入数据库。", latest_progress: "在所选时段内尚未看到进一步回复。",
+  handling_status: ({P0: "resolved", P1: "unresolved", P2: "uncertain", P3: "not_required"})[priority],
+  handling_reason: "截至所选时段判断。",
   reason: "用于验证界面布局与排序。", needs_review: false,
   evidence: [{message_id: "message-1", chat_id: "chat-1", text: "Please check this issue.", created_at: "2026-09-09T20:00:00Z", sender_name: "Sample Creator"}], ...extra});
 const report = (extra = {}) => ({responsible: {id: "remi-id", name: "Remi"}, enabled: true, can_manage: false,
@@ -59,6 +61,7 @@ test("bilingual user labels are displayed literally in evidence", async t => {
 
 test("grades are sorted and filters/search/evidence work without writes", async t => {
   const {page, state, errors} = await fixture(t);
+  assert.deepEqual(await page.locator(".oh-handling").allTextContents(), ["已处理", "没有处理", "待核实", "无需处理", "待分析"]);
   assert.deepEqual(await page.locator(".oh-event .oh-priority").allTextContents(), ["P0", "P1", "P2", "P3", "待核实"]);
   assert(!(await page.locator(".oh-routine .oh-event").isVisible()));
   assert.equal(await page.locator("#oh-count-P3").textContent(), "1");

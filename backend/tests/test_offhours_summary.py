@@ -52,6 +52,9 @@ def sample_event(**overrides):
         "title": "申请样品",
         "summary": "达人申请新的样品。",
         "latest_progress": "尚未看到后续确认。",
+        "handling_status": "unresolved",
+        "handling_reason": "尚未看到完成结果。",
+        "handling_evidence_refs": overrides.get("evidence_refs", ["M1"]),
         "reason": "正常样品申请。",
         "needs_review": False,
         "evidence_refs": ["M1"],
@@ -85,6 +88,9 @@ def pack():
     "changes",
     [
         {"user": "outsider"},
+        {"handling_status": "invented"},
+        {"handling_evidence_refs": ["unknown"]},
+        {"handling_reason": ""},
         {"handle": "@fabricated"},
         {"evidence_refs": ["unknown"]},
         {
@@ -111,6 +117,8 @@ def test_missing_media_and_multi_handle_do_not_invent_risk_or_duplicate_account(
     data["pack"]["messages"][0].update(unreadable=True, unavailable_or_truncated=True)
     result = ai._validate(json.dumps({"events": [sample_event(priority="P0")]}), data)
     assert result[0]["priority"] is None
+    with pytest.raises(ai.InvalidModelOutput):
+        ai._validate(json.dumps({"events": [sample_event(handling_status="resolved")]}), data)
     with pytest.raises(ai.InvalidModelOutput):
         ai._validate(json.dumps({"events": [sample_event(), sample_event()]}), data)
 
@@ -485,7 +493,8 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
 
     def model(_cfg, _key, input_pack, _cm, **_kwargs):
         if 'a' in input_pack:
-            return {'text': json.dumps({'same': False, 'basis_kind': 'none',
+            return {'text': json.dumps({'same': False, 'basis_kind': 'none', 'handling_status': 'uncertain',
+                'handling_reason': '不合并', 'handling_evidence_refs': ['E1'],
                 **{k: '' for k in ('basis_value', 'quote_a', 'quote_b', 'title', 'summary', 'latest_progress')}})}
         s.calls.append(input_pack)
         assert len(input_pack["users"]) == 1
@@ -849,7 +858,9 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
             a, b = pack['a'], pack['b']
             return {'text': json.dumps({'same': True, 'basis_kind': 'identifier', 'basis_value': 'ABC-123',
                 'quote_a': a['evidence'][0]['text'], 'quote_b': b['evidence'][0]['text'],
-                'title': '样品订单', 'summary': '样品订单已送达。', 'latest_progress': '达人确认收到。'})}
+                'title': '样品订单', 'summary': '样品订单已送达。', 'latest_progress': '达人确认收到。',
+                'handling_status': 'resolved', 'handling_reason': '达人已确认对应订单收到。',
+                'handling_evidence_refs': [r for r, e in pack['evidence_messages'].items() if 'arrived' in e['text']]})}
         user = next(iter(pack['users']))
         assert {m['speaker'] for m in pack['messages']} <= {user, 'CM'}
         assert len(pack['users']) == 1
@@ -891,6 +902,8 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
     assert len(view['events']) == 1
     assert {e['chat_id'] for e in view['events'][0]['evidence']} == {'chat', 'second'}
     assert view['events'][0]['latest_progress'] == '达人确认收到。'
+    assert view['events'][0]['handling_status'] == 'resolved'
+    assert view['events'][0]['handling_evidence'][0]['chat_id'] == 'second'
     # Changed access hides the merged narrative as well as its evidence.
     pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='second'")
     assert ai.get_summary_view(pg, s.ids['owner'])['events'] == []
@@ -898,4 +911,5 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
     e = {'evidence': [{'text': 'payment please'}]}
     with pytest.raises(ai.InvalidModelOutput):
         summary_dialogues.combine(json.dumps({'same': True, 'basis_kind': 'identifier', 'basis_value': 'payment',
-            'quote_a': 'payment please', 'quote_b': 'payment please', 'title': 'x', 'summary': 'x', 'latest_progress': 'x'}), e, e)
+            'quote_a': 'payment please', 'quote_b': 'payment please', 'title': 'x', 'summary': 'x', 'latest_progress': 'x',
+            'handling_status': 'unresolved', 'handling_reason': '未完成', 'handling_evidence_refs': ['E1']}), e, e)

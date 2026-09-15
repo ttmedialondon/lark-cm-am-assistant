@@ -21,7 +21,7 @@ from .db import connection
 from .message_mentions import mention_names, mention_targets, resolve_mentions, rich_mention_text
 
 FEATURE = "offhours_summary"
-POLICY_VERSION = "shift-dialogue-v3"
+POLICY_VERSION = "shift-handling-v4"
 REMI_ID = UUID("24d1ef13-3762-4359-ba11-d26c03cf1f7f")
 TEST_VIEWERS = frozenset({UUID("9d5f4370-6463-4c3a-a2ed-67753a1cabc0"), UUID("1225b4a0-fbd8-431e-962e-25e66943a8a0")})
 TIMEZONE = "Europe/London"
@@ -501,6 +501,8 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
             "chat_id": chat_id,
             "text": body,
             "created_at": row["message_create_time"].isoformat(),
+            "unavailable_or_truncated": unavailable,
+            "unreadable": messages[-1]["unreadable"],
             "sender_name": row["sender_name"]
             or (
                 cm["display_name"]
@@ -736,15 +738,60 @@ P1: violation/warning/appeal、账号封禁/LIVE 权限异常、affiliate commis
 P2: 正常业务请求或新的运营信息，例如 voucher/sample/SKU/product link申请、video link boost、FS/LE/campaign、
 想 join/link agency、今晚 LIVE/明天发视频/视频已发布。即使无需回复，只要有新运营信息，至少 P2。
 P3: 仅感谢、礼貌、结束确认或 emoji，无任何新运营信息。Thanks 不能抹去上下文中未解决的危机；
-All sorted 只记为对方声称已解决，不自动关闭。未知 fee 类型、附件/音频/截图/仅链接无法理解应标 needs_review，
+All sorted 必须明确对应当前事项才能证明完成。未知 fee 类型、附件/音频/截图/仅链接无法理解应标 needs_review，
 priority=null，不可当作 P3。若同一事项可读文字已明确证明更高等级，保留该等级并标资料不全。
-不要建议回复、代写回复、推荐行动、发通知、自动结单或创建待办。latest_progress 只陈述已发生的进展。
+不要建议回复、代写回复、推荐行动、发通知或创建待办。处理状态仅为报告判断，不执行业务结单。
+latest_progress 只陈述已发生的进展。
 不能根据没有回复记录断言现实中无人处理，不按等待时长自动升级。
 reason 必须指出真实业务原因。所有 evidence_refs 和 user/handle 必须来自输入。"""
 
 
+HANDLING_INSTRUCTIONS = """
+独立判断 handling_status：resolved=已处理，unresolved=没有处理，uncertain=待核实，not_required=无需处理。
+状态只截至输入时段截止时间；不使用未来结果，不推测线下或其他成员已处理。
+先确定事件实际诉求。回复收到/我去查/承诺/已提交通常只是进展：提交付款不能证明到账，
+提交申诉不能证明恢复；但诉求本身只是提交或询问日期时，明确完成提交或回答日期可以满足诉求。
+resolved 必须有明确对应同一事项的完成事实，可以来自达人或负责 CM，不强制双方确认。
+孤立的 thanks/ok/emoji、未来承诺、没有继续追问不能证明完成。
+按原文时间核对所有相关证据：完成后再次反馈仍有问题，应为 unresolved；矛盾无法解释则 uncertain。
+多项诉求部分完成仍 unresolved；缺失的关键附件/引用导致无法判断、对象不清则 uncertain。
+只有纯礼貌或无需任何处理的信息通知才 not_required，不能把带着感谢的未解决请求放入此类。
+没有看到完成证据可 unresolved，但理由必须写尚未看到完成结果，不能断言现实中无人处理。
+handling_reason 中文简短说明实际依据。handling_evidence_refs 必须引用输入中的对应原文，
+resolved 必须引用完成事实，其他状态引用未完成请求、矛盾或无需处理的消息。状态与 P0-P3 独立。
+"""
+_INSTRUCTIONS += HANDLING_INSTRUCTIONS
+
+
+def handling_fields(refs):
+    return {
+        "handling_status": {"type": "string", "enum": ["resolved", "unresolved", "uncertain", "not_required"]},
+        "handling_reason": {"type": "string", "minLength": 1, "maxLength": 500},
+        "handling_evidence_refs": {"type": "array", "items": {"type": "string", "enum": list(refs)},
+                                   "minItems": 1, "maxItems": 20},
+    }
+
+
+def validate_handling(item, messages):
+    if item.get("handling_status") not in {"resolved", "unresolved", "uncertain", "not_required"}:
+        raise InvalidModelOutput("invalid handling status")
+    reason = item.get("handling_reason")
+    refs = item.get("handling_evidence_refs")
+    if not isinstance(reason, str) or not 1 <= len(reason.strip()) <= 500:
+        raise InvalidModelOutput("invalid handling reason")
+    if (not isinstance(refs, list) or not 1 <= len(refs) <= 20
+            or any(not isinstance(r, str) or r not in messages for r in refs)):
+        raise InvalidModelOutput("invalid handling evidence")
+    if item["handling_status"] in {"resolved", "not_required"} and any(
+        messages[r].get("unreadable") or messages[r].get("unavailable_or_truncated")
+        or not messages[r].get("text", "").strip() for r in refs
+    ):
+        raise InvalidModelOutput("unreadable handling evidence")
+
+
 def _format(evidence):
     properties = {
+        **handling_fields(evidence["refs"]),
         "user": {"type": "string", "enum": list(evidence["users"])},
         "handle": {"type": ["string", "null"]},
         "priority": {"type": ["string", "null"], "enum": ["P0", "P1", "P2", "P3", None]},
@@ -821,6 +868,8 @@ def _validate(raw, evidence):
             or any(not isinstance(r, str) or r not in messages for r in refs)
         ):
             raise InvalidModelOutput("invalid reference")
+        validate_handling(item, messages)
+        item["evidence_refs"] = refs = list(dict.fromkeys(refs + item["handling_evidence_refs"]))
         own = [messages[r] for r in refs if messages[r]["speaker"] == item["user"]]
         if not any(messages[r]["in_window"] for r in refs):
             raise InvalidModelOutput("no current message")

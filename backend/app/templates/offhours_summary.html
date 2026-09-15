@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}达人消息总结 · TT Media{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/offhours-summary.css?v=20260910-1">{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/offhours-summary.css?v=20260916-handling">{% endblock %}
 {% block body %}
 <div class="page oh-page">
   <header class="navbar"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media 消息提醒</a><div class="oh-nav"><span>{{ authorization.display_name or '当前用户' }}</span><a href="/dashboard">返回前台</a></div></div></header>
@@ -31,5 +31,5 @@
   </main>
 </div>
 <script id="offhours-summary-data" type="application/json">{{ summary_data|tojson }}</script>
-<script src="/static/offhours-summary.js?v=20260915-shift-dialogue-v3" defer></script>
+<script src="/static/offhours-summary.js?v=20260916-shift-handling-v4" defer></script>
 {% endblock %}
