@@ -13,7 +13,7 @@ from . import offhours_summary as core
 from .crypto import message_body_cipher
 from .message_mentions import mention_names, mention_targets
 
-POLICY = "creator-timeline-v1"
+POLICY = "creator-timeline-v2"
 CHUNK_CHARS = 48000
 PART_CHARS = 12000
 
@@ -169,6 +169,14 @@ def load(conn, run, person, cutoff, settings, *, roster=None, chats=None, conten
         "user": user,
         "predecessor": dependency,
         "predecessor_id": predecessor["id"] if predecessor else None,
+        "window_message_keys": [
+            (r["chat_id"], r["message_id"]) for r in rows if r["message_create_time"] >= run["window_start"]
+        ],
+        "window_unavailable": any(
+            (not r["body_ciphertext"] or r["message_type"] not in {"text", "post", "share_chat", "share_user"})
+            for r in rows
+            if r["message_create_time"] >= run["window_start"]
+        ),
         "messages": messages,
         "refs": {m["ref"]: m for m in messages},
         "chats": chats,
@@ -194,12 +202,10 @@ def schedule(conn, state, now):
     chosen, message_ids, active_chats = [], set(), set()
     synced, unavailable = True, False
     for person in sorted({r["contact_id"] for r in roster}, key=str):
-        data = load(conn, state, person, cutoff, settings, roster=roster, chats=chats)
-        for m in data["messages"]:
-            if m["in_window"]:
-                message_ids.add((m["chat_id"], m["message_id"]))
-                active_chats.add(m["chat_id"])
-                unavailable |= m["unavailable"]
+        data = load(conn, state, person, cutoff, settings, roster=roster, chats=chats, content=False)
+        message_ids.update(data["window_message_keys"])
+        active_chats.update(chat_id for chat_id, _ in data["window_message_keys"])
+        unavailable |= data["window_unavailable"]
         synced &= data["synced"]
         previous = conn.execute(
             "SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND contact_id=%s AND is_current FOR UPDATE",
@@ -222,7 +228,7 @@ def schedule(conn, state, now):
             DO UPDATE SET is_current=TRUE,attempts=0,
             status=CASE WHEN offhours_summary_tasks.status='cancelled' THEN 'queued'
             ELSE offhours_summary_tasks.status END RETURNING id""",
-            (uuid4(), run_id, person, data["fingerprint"], cutoff, len(data["messages"])),
+            (uuid4(), run_id, person, data["fingerprint"], cutoff, len(data["window_message_keys"])),
         ).fetchone()
         chosen.append(row["id"])
     conn.execute(
@@ -357,7 +363,8 @@ INSTRUCTIONS = (
 跨会话处理规则：
 输入 user 对应一位已确认达人；speaker=creator 是此人，other_creator 是其他达人。
 所有相关群及私聊应结合分析。其他人发言可证明进展，不能把其他人的问题归给达人。
-扫描 core_refs 中每个消息片段，processed_refs 必须逐一覆盖；context 只是补充上下文。
+扫描 core_refs 中每个消息片段，processed_refs 必须原样完整抄回，包括已检查但与达人无关的消息。
+不能仅返回事件用到的消息编号。context 只是补充上下文，不要求产生事件。
 ledger 是已经识别的事项（包括历史），按具体订单、活动、商品、金额、时间、引用链判断同一件事。
 同一问题跨群/私聊、重复催促、后续处理更新同一 event_id；不能仅因都涉及付款就合并。
 updates 仅包含本段新增或变化的事项；existing_id 只能使用 ledger 的编号，新增填 null。
@@ -376,7 +383,7 @@ merged_ids 仅填写确认为重复并被并入 existing_id 的已有编号；�
 )
 
 
-def output_format():
+def output_format(core_refs=None):
     props = {
         "existing_id": {"type": ["string", "null"]},
         "merged_ids": {"type": "array", "items": {"type": "string"}},
@@ -397,7 +404,11 @@ def output_format():
             "additionalProperties": False,
             "required": ["processed_refs", "updates"],
             "properties": {
-                "processed_refs": {"type": "array", "items": {"type": "string"}},
+                "processed_refs": {
+                    "type": "array",
+                    "items": {"type": "string", **({"enum": core_refs} if core_refs else {})},
+                    **({"minItems": len(core_refs), "maxItems": len(core_refs)} if core_refs is not None else {}),
+                },
                 "updates": {
                     "type": "array",
                     "items": {
@@ -415,7 +426,9 @@ def output_format():
 def apply_updates(raw, checkpoint, data, core_refs, allowed):
     result = json.loads(raw)
     if set(result) != {"processed_refs", "updates"} or sorted(result["processed_refs"]) != sorted(core_refs):
-        raise core.InvalidModelOutput("incomplete segment coverage")
+        raise core.InvalidModelOutput(
+            f"incomplete segment coverage: expected {len(core_refs)}, received {len(result.get('processed_refs', []))}"
+        )
     ledger = {e["id"]: e for e in checkpoint["ledger"]}
     required = set(output_format()["schema"]["properties"]["updates"]["items"]["properties"])
     for update in result["updates"]:
@@ -515,6 +528,7 @@ def initial_checkpoint(conn, job, data, settings):
         (job["responsible_authorization_id"], job["contact_id"], job["cutoff"], job["window_start"]),
     ).fetchone()
     prior = decode(previous["result_ciphertext"], settings) if previous else None
+    recheck_refs = {r for e in (prior["ledger"] if prior else []) for r in e["evidence_refs"]}
     # An edit, deletion or revoked conversation invalidates the inherited narrative.
     if prior and any(
         ref not in data["refs"] or source_hash(data["refs"][ref]) != value
@@ -535,7 +549,11 @@ def initial_checkpoint(conn, job, data, settings):
             prior = candidate
     ledger = prior["ledger"] if prior else []
     known = prior.get("source_hashes", {}) if prior else {}
-    scan = [m for m in data["messages"] if m["ref"] not in known]
+    scan = [
+        m
+        for m in data["messages"]
+        if m["ref"] not in known and (m["in_window"] or bool(prior) or m["ref"] in recheck_refs)
+    ]
     return {
         "ledger": ledger,
         "predecessor": data["predecessor"],
@@ -596,7 +614,7 @@ def step(job, settings):
             {},
             job["responsible_authorization_id"],
             instructions=INSTRUCTIONS,
-            output_format=output_format(),
+            output_format=output_format(refs),
             max_output_tokens=24000,
             conversation=checkpoint["conversation"],
             tools=tools(),
