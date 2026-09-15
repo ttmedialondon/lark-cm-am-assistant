@@ -1043,6 +1043,8 @@ def test_creator_result_commit_does_not_hold_task_lock_while_waiting_for_schedul
     schema=pg.execute('SELECT current_schema() AS name').fetchone()['name']
     dsn=pg.info.dsn
     pg.commit()  # These synthetic rows must be visible to the second connection.
+    pg.execute(psycopg.sql.SQL('SET search_path TO {}').format(psycopg.sql.Identifier(schema)))
+    pg.commit()
     def connection():
         conn=psycopg.connect(dsn,row_factory=dict_row)
         conn.execute(psycopg.sql.SQL('SET search_path TO {}').format(psycopg.sql.Identifier(schema)))
