@@ -915,3 +915,86 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
         summary_dialogues.combine(json.dumps({'same': True, 'basis_kind': 'identifier', 'basis_value': 'payment',
             'quote_a_ref': 'E1', 'quote_b_ref': 'E1', 'title': 'x', 'summary': 'x', 'latest_progress': 'x',
             'handling_status': 'unresolved', 'handling_reason': '未完成', 'handling_evidence_refs': ['E1']}), e, e)
+
+
+def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded, monkeypatch):
+    from app import summary_replies as replies
+    s = seeded
+    monkeypatch.setattr(replies, "connection", lambda: nullcontext(pg))
+    s.save()
+    ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
+    finish_merges(pg, s)
+    event_id = ai.get_summary_view(pg, s.ids["cm"])["events"][0]["id"]
+    long_text = "Sample A-200: thanks for explaining that, lovely. " * 900
+    s.add("long-current", who="cm", text=long_text, at=datetime.now(UTC))
+    pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('reply-group','Shared group','group')")
+    pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,backfill_complete,
+        last_incremental_at,sync_status) VALUES(%s,'reply-group',TRUE,NOW(),'succeeded')""", (s.ids["cm"],))
+    pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('reply-group','ou_person')")
+    pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,body_ciphertext,
+        message_create_time) VALUES('reply-group','broadcast','ou_cm','text',%s,NOW())""",
+        (s.cipher.encrypt(json.dumps({"text": "OUTSIDER_GROUP_SECRET"})),))
+    pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+        VALUES(%s,'reply-group','broadcast')""", (s.ids["cm"],))
+    with pytest.raises(PermissionError):
+        replies.enqueue(pg, s.ids["reviewer"], event_id, s.settings)
+    calls = []
+
+    def model(cfg, key, pack, actor, **kwargs):
+        calls.append(pack)
+        assert "unrelated outsider secret" not in json.dumps(pack)
+        assert "OUTSIDER_GROUP_SECRET" not in json.dumps(pack)
+        assert "future CM reply" not in json.dumps(pack)
+        if "edited_draft" in pack:
+            return {"text": json.dumps({"chinese_translation": "我可以帮你核对这笔 £200 的付款。"})}
+        if "core_refs" in pack:
+            return {"text": json.dumps({"processed_refs": pack["core_refs"],
+                "relevant_refs": pack["core_refs"],
+                "style_refs": [m["ref"] for m in pack["messages"] if m["speaker"] == "CM"]})}
+        resolved = any("now resolved" in m["text"] for m in pack["messages"])
+        return {"text": json.dumps({"outcome": "resolved" if resolved else "ready", "language": "en",
+            "draft": "" if resolved else "Happy to check that £200 payment with you.",
+            "chinese_translation": "" if resolved else "我可以帮你核对这笔 £200 的付款。",
+            "explanation": "后续已确认解决。" if resolved else "尚未看到处理完成结果。",
+            "checks": [] if resolved else ["确认能够进行核对。"],
+            "evidence_refs": [m["ref"] for m in pack["messages"]]})}
+
+    monkeypatch.setattr(ai.contact_assessments, "call_openai", model)
+    job_id = replies.enqueue(pg, s.ids["cm"], event_id, s.settings)
+    assert replies.enqueue(pg, s.ids["cm"], event_id, s.settings) == job_id
+
+    def finish():
+        for _ in range(12):
+            job = replies.claim()
+            if not job:
+                break
+            replies.run(job, s.settings)
+        else:
+            pytest.fail("reply queue did not finish")
+        assert not pg.execute("SELECT 1 FROM summary_reply_tasks WHERE status<>'succeeded'").fetchone()
+
+    finish()
+    result = replies.read(pg, s.ids["cm"], job_id, s.settings, fresh=True)
+    assert result["result"]["outcome"] == "ready" and result["result"]["chinese_translation"]
+    processed = {m["ref"]: m for pack in calls if "core_refs" in pack for m in pack["messages"]
+                 if m["ref"] in pack["core_refs"] and m["message_id"] == "long-current"}
+    assert "".join(m["text"] for m in sorted(processed.values(), key=lambda m: m["part"])) == long_text
+    stored = pg.execute("SELECT result_ciphertext FROM summary_reply_tasks WHERE id=%s", (job_id,)).fetchone()
+    assert "Happy" not in stored["result_ciphertext"]
+    with pytest.raises(PermissionError):
+        replies.read(pg, s.ids["owner"], job_id, s.settings)
+    translated = replies.enqueue(pg, s.ids["cm"], event_id, s.settings, parent_id=job_id,
+                                 text="Happy to check the £200 payment with you.")
+    finish()
+    assert replies.read(pg, s.ids["cm"], translated, s.settings, fresh=True)["result"]["draft"].startswith("Happy")
+    s.add("resolved-later", text="This specific issue is now resolved, thank you.", at=datetime.now(UTC))
+    assert replies.read(pg, s.ids["cm"], job_id, s.settings, fresh=True)["status"] == "stale"
+    assert replies.read(pg, s.ids["cm"], translated, s.settings, fresh=True)["status"] == "stale"
+    latest = replies.enqueue(pg, s.ids["cm"], event_id, s.settings)
+    finish()
+    latest_result = replies.read(pg, s.ids["cm"], latest, s.settings, fresh=True)["result"]
+    assert latest_result["outcome"] == "resolved" and latest_result["draft"] == ""
+    assert ai.get_summary_view(pg, s.ids["cm"])["events"][0]["handling_status"] == "unresolved"
+    pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='chat'")
+    with pytest.raises(ai.SummaryInputError):
+        replies.read(pg, s.ids["cm"], job_id, s.settings, fresh=True)

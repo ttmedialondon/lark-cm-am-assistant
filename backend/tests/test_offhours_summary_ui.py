@@ -79,9 +79,9 @@ def test_template_never_exposes_admin_to_a_viewer_and_escapes_private_json():
     assert 'href="/admin/ai#offhours-summary"' in render({"can_manage": True})
 
 
-def test_client_is_read_only_and_does_not_persist_or_interpolate_messages_as_html():
+def test_client_does_not_persist_or_interpolate_messages_as_html():
     script = (APP / "static/offhours-summary.js").read_text()
-    for forbidden in ("localStorage", "sessionStorage", "innerHTML", "insertAdjacentHTML", 'method: "POST"'):
+    for forbidden in ("localStorage", "sessionStorage", "innerHTML", "insertAdjacentHTML"):
         assert forbidden not in script
     assert 'cache: "no-store"' in script
     assert 'credentials: "same-origin"' in script
@@ -103,7 +103,7 @@ def client(monkeypatch):
     app = FastAPI()
     app.include_router(routes.create_router(
         current_authorization=lambda _: auth,
-        render_template=lambda *_: HTMLResponse("page"),
+        render_template=lambda *_: HTMLResponse("page"), csrf_token=lambda _: "test-csrf",
     ))
     return TestClient(app), auth, calls, conn
 
@@ -148,3 +148,17 @@ def test_source_cm_authorization_loss_returns_forbidden_so_browser_clears_result
         assert result.status_code == 403
         assert result.headers["cache-control"].startswith("no-store")
         assert "page" not in result.text
+
+
+def test_reply_creation_requires_session_csrf_and_server_scope(client, monkeypatch):
+    api, auth, _, _ = client
+    captured = []
+    monkeypatch.setattr(routes.offhours_summary, "get_settings", lambda: object())
+    monkeypatch.setattr(routes.summary_replies, "enqueue", lambda conn, actor, event, settings, **kwargs:
+                        captured.append((actor, event)) or "reply-job")
+    assert api.post("/dashboard/offhours-summary/replies", json={"event_id": "test:0"}).status_code == 403
+    result = api.post("/dashboard/offhours-summary/replies", headers={"X-CSRF-Token": "test-csrf"},
+                      json={"event_id": "test:0", "actor_id": str(uuid4())})
+    assert result.status_code == 202 and captured == [(auth["id"], "test:0")]
+    auth["status"] = "revoked"
+    assert api.get("/dashboard/offhours-summary/replies/reply-job").status_code == 403

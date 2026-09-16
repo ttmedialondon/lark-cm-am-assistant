@@ -22,7 +22,7 @@ const report = (extra = {}) => ({responsible: {id: "remi-id", name: "Remi"}, ena
 async function fixture(t, data = report()) {
   const state = {data, calls: [], status: 200};
   const rendered = spawnSync(path.join(backend, ".venv/bin/python"), ["-c",
-    "import json,sys; from jinja2 import Environment,FileSystemLoader,select_autoescape; data=json.load(sys.stdin); print(Environment(loader=FileSystemLoader('app/templates'),autoescape=select_autoescape()).get_template('offhours_summary.html').render(authorization={'display_name':'Reviewer'},summary_data=data))"],
+    "import json,sys; from jinja2 import Environment,FileSystemLoader,select_autoescape; data=json.load(sys.stdin); print(Environment(loader=FileSystemLoader('app/templates'),autoescape=select_autoescape()).get_template('offhours_summary.html').render(authorization={'display_name':'Reviewer'},summary_data=data,csrf_token='fixture-csrf'))"],
     {cwd: backend, input: JSON.stringify(data), encoding: "utf8"});
   assert.equal(rendered.status, 0, rendered.stderr);
   const browser = await chromium.launch({headless: true, channel: "chrome"});
@@ -208,5 +208,53 @@ test("each summary selector navigates immediately without a submit button", asyn
     assert.equal(url.pathname, "/dashboard/offhours-summary");
     assert.equal(url.searchParams.size, 3);
   }
+  assert.deepEqual(errors, []);
+});
+
+
+test("reply drafts preserve edits, translate before copying, and block stale or revoked suggestions", async t => {
+  const {page, errors} = await fixture(t, report({events: [event("P1")]}));
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  let edited = "", stale = false, revoked = false;
+  const posted = [];
+  await page.route("**/dashboard/offhours-summary/replies**", route => {
+    if (revoked) return route.fulfill({status: 403, json: {error: "权限已失效"}});
+    const req = route.request();
+    if (req.method() === "POST") {
+      const body = req.postDataJSON(); posted.push(body);
+      assert.equal(req.headers()["x-csrf-token"], "fixture-csrf");
+      if (body.parent_id) edited = body.text;
+      return route.fulfill({status: 202, json: {id: body.parent_id ? "translation" : "draft", status: "queued"}});
+    }
+    if (stale) return route.fulfill({json: {status: "stale", error: "收到新消息，请重新生成建议。"}});
+    const translation = req.url().includes("/translation?");
+    return route.fulfill({json: {status: "succeeded", result: translation
+      ? {draft: edited, chinese_translation: "修改后的中文翻译，金额仍为 £200。"}
+      : {outcome: "ready", language: "en", draft: "Hi lovely, I can check that £200 payment with you. Could you confirm which order this concerns?",
+        chinese_translation: "你好，我可以帮你核对这笔 £200 的付款。请确认对应哪笔订单。", explanation: "尚未看到完成结果。",
+        checks: ["确认可以核对。"], checked_at: "2026-09-16T01:00:00Z"}}});
+  });
+  await page.getByRole("button", {name: "生成回复建议", exact: true}).click();
+  const editor = page.getByLabel("建议回复（可编辑）");
+  await editor.waitFor({state: "visible"});
+  const newText = "Hi lovely, I can check that £200 payment with you. I have the order number already, so you do not need to resend it.";
+  await editor.fill(newText);
+  assert(await page.getByRole("button", {name: "复制回复", exact: true}).isDisabled());
+  assert(!(await page.locator(".oh-reply-translation").textContent()).includes("请确认对应哪笔订单"));
+  await page.getByText("修改后的中文翻译，金额仍为 £200。", {exact: true}).waitFor();
+  await page.getByRole("button", {name: "刷新结果", exact: true}).click();
+  assert.equal(await editor.inputValue(), newText);
+  await page.getByRole("button", {name: "复制回复", exact: true}).click();
+  await page.getByText("已复制回复正文；未发送，也未改变事件处理状态。", {exact: true}).waitFor();
+  assert.equal(await page.evaluate(() => navigator.clipboard.readText()), newText);
+  assert.equal(await page.locator(".oh-handling").textContent(), "没有处理");
+  stale = true;
+  await page.getByRole("button", {name: "复制回复", exact: true}).click();
+  await page.getByText("收到新消息，请重新生成建议。", {exact: true}).waitFor();
+  assert(await page.getByRole("button", {name: "复制回复", exact: true}).isDisabled());
+  revoked = true;
+  await page.getByRole("button", {name: "重新生成", exact: true}).click();
+  await page.waitForFunction(() => document.querySelectorAll(".oh-event").length === 0);
+  assert.equal(posted.length, 2);
   assert.deepEqual(errors, []);
 });

@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}达人消息总结 · TT Media{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/offhours-summary.css?v=20260916-handling">{% endblock %}
+{% block extra_head %}<meta name="summary-csrf-token" content="{{ csrf_token }}"><link rel="stylesheet" href="/static/offhours-summary.css?v=20260916-reply-drafts">{% endblock %}
 {% block body %}
 <div class="page oh-page">
   <header class="navbar"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media 消息提醒</a><div class="oh-nav"><span>{{ authorization.display_name or '当前用户' }}</span><a href="/dashboard">返回前台</a></div></div></header>
@@ -26,10 +26,10 @@
       <div id="oh-events"></div>
       <div class="oh-empty" id="oh-empty" hidden><h3 id="oh-empty-title">尚未开始分析</h3><p id="oh-empty-description"></p></div>
     </section>
-    <p class="oh-footnote">这里只整理已确认达人范围内、当前有权限读取的消息。不自动回复、不生成回复建议，也不替 CM 处理业务。AI 总结请结合原文核实。</p>
-    <noscript><div class="oh-banner oh-warning">请启用 JavaScript 后查看总结。本页为只读页面，不会提交或发送消息。</div></noscript>
+    <p class="oh-footnote">这里只整理已确认达人范围内、当前有权限读取的消息。回复建议需人工核对并发送，生成或复制不会改变事件处理状态。AI 总结请结合原文核实。</p>
+    <noscript><div class="oh-banner oh-warning">请启用 JavaScript 后查看总结。回复建议不会自动发送消息。</div></noscript>
   </main>
 </div>
 <script id="offhours-summary-data" type="application/json">{{ summary_data|tojson }}</script>
-<script src="/static/offhours-summary.js?v=20260916-chat-links" defer></script>
+<script src="/static/offhours-summary.js?v=20260916-reply-drafts" defer></script>
 {% endblock %}

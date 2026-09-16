@@ -24,6 +24,7 @@ from . import (
     identity_profiles,
     offhours_summary,
     organization_sync,
+    summary_replies,
 )
 from .config import Settings, get_settings
 from .crypto import TokenCipher, message_body_cipher
@@ -220,6 +221,7 @@ def _dispatch_ai_turn(
             creator_handles.run_claimed_handle,
         ),
         (creator_imports.claim_next_import, creator_imports.run_claimed_import),
+        (summary_replies.claim, summary_replies.run),
     )
     for offset in range(len(queues)):
         index = (next_queue + offset) % len(queues)

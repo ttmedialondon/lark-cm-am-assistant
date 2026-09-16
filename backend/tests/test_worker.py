@@ -250,6 +250,8 @@ def test_dispatch_uses_at_most_three_slots_and_fairly_rotates_queues(monkeypatch
     ownership_jobs = iter(({"id": "ownership-1"}, {"id": "ownership-2"}))
     handle_jobs = iter(({"id": "handle-1"}, {"id": "handle-2"}))
     import_jobs = iter(({"id": "import-1"},))
+    reply_jobs = iter(({"id": "reply-1"},))
+    monkeypatch.setattr(worker.summary_replies, "claim", lambda: next(reply_jobs, None))
     monkeypatch.setattr(worker.offhours_summary, "claim_next_summary", lambda: next(summary_jobs, None))
     monkeypatch.setattr(worker.contact_assessments, "claim_next_contact_assessment",
                         lambda: next(assessment_jobs, None))
@@ -267,11 +269,11 @@ def test_dispatch_uses_at_most_three_slots_and_fairly_rotates_queues(monkeypatch
     assert [job["id"] for _runner, job in submitted] == ["identity-1", "summary-1", "ownership-1"]
     futures.clear()
     preference = worker._fill_ai_slots(object(), Executor(), futures, preference)
-    assert preference == 1
-    assert [job["id"] for _runner, job in submitted[3:]] == ["handle-1", "import-1", "identity-2"]
+    assert preference == 0
+    assert [job["id"] for _runner, job in submitted[3:]] == ["handle-1", "import-1", "reply-1"]
     futures.clear()
-    assert worker._fill_ai_slots(object(), Executor(), futures, preference) == 4
-    assert [job["id"] for _runner, job in submitted[6:]] == ["summary-2", "ownership-2", "handle-2"]
+    assert worker._fill_ai_slots(object(), Executor(), futures, preference) == 3
+    assert [job["id"] for _runner, job in submitted[6:]] == ["identity-2", "summary-2", "ownership-2"]
 
 
 def test_offhours_tasks_fill_three_parallel_slots_without_waiting(monkeypatch) -> None:
@@ -289,6 +291,7 @@ def test_offhours_tasks_fill_three_parallel_slots_without_waiting(monkeypatch) -
     monkeypatch.setattr(worker.creator_ownership, "claim_next_ownership", lambda: None)
     monkeypatch.setattr(worker.creator_handles, "claim_next_handle", lambda: None)
     monkeypatch.setattr(worker.creator_imports, "claim_next_import", lambda: None)
+    monkeypatch.setattr(worker.summary_replies, "claim", lambda: None)
     futures = set()
     worker._fill_ai_slots(object(), Executor(), futures, 0)
     assert submitted == [0, 1, 2]

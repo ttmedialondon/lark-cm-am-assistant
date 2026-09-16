@@ -1,4 +1,4 @@
-/* Read-only report. Private messages stay in memory and are rendered as text. */
+/* Human-reviewed drafts; no message sending. Private messages stay in memory and are rendered as text. */
 (() => {
   "use strict";
   const $ = id => document.getElementById(id);
@@ -26,6 +26,149 @@
   function priority(event) { return priorities.includes(event.priority) ? event.priority : null; }
   function needsReview(event) { return event.needs_review || !priority(event); }
   function events() { return Array.isArray(data.events) ? data.events : []; }
+
+  const replyStates = new Map();
+  function clearReplies() {
+    for (const state of replyStates.values()) {
+      state.version++; clearTimeout(state.timer); clearTimeout(state.editTimer);
+      state.text = ""; state.panel.replaceChildren();
+    }
+    replyStates.clear();
+  }
+  async function replyRequest(path, body) {
+    const response = await fetch(`/dashboard/offhours-summary/replies${path}`, {
+      method: body ? "POST" : "GET", cache: "no-store", credentials: "same-origin", redirect: "error",
+      headers: {Accept: "application/json", ...(body ? {"Content-Type": "application/json",
+        "X-CSRF-Token": document.querySelector('meta[name="summary-csrf-token"]').content} : {})},
+      ...(body ? {body: JSON.stringify(body)} : {}),
+    });
+    if ([401, 403].includes(response.status)) {
+      denied = true; clearReplies(); data = {events: [], enabled: false, run: null}; render();
+      throw new Error("登录或查看权限已失效，请重新登录。");
+    }
+    const value = await response.json();
+    if (!response.ok) throw new Error(value.error || "生成暂未完成，请重试。");
+    return value;
+  }
+  function replyPanel(event) {
+    if (replyStates.has(event.id)) return replyStates.get(event.id).panel;
+    const panel = node("section", "oh-reply"), feedback = node("p", "oh-small");
+    const generate = node("button", "btn btn-outline-primary btn-sm", "生成回复建议"); generate.type = "button";
+    const content = node("div", "oh-reply-content"); content.hidden = true;
+    const label = node("label", "", "建议回复（可编辑）");
+    const editor = node("textarea", "form-control oh-reply-editor");
+    editor.id = `reply-${event.id}`; editor.rows = 7; label.htmlFor = editor.id;
+    const translationLabel = node("div", "oh-small", "中文翻译");
+    const translation = node("p", "oh-reply-translation");
+    const checks = node("p", "oh-small oh-reply-checks");
+    const copy = node("button", "btn btn-primary btn-sm", "复制回复"); copy.type = "button";
+    const translate = node("button", "btn btn-outline-secondary btn-sm", "更新中文翻译"); translate.type = "button";
+    const actions = node("div", "oh-actions"); actions.append(copy, translate);
+    content.append(label, editor, translationLabel, translation, checks, actions);
+    panel.append(generate, feedback, content);
+    const state = {panel, version: 0, text: "", jobId: null, copyId: null, readyText: null, timer: null, editTimer: null};
+    replyStates.set(event.id, state);
+    function stale(message) {
+      copy.disabled = true; translate.disabled = true; generate.disabled = false;
+      state.readyText = null; feedback.textContent = message;
+    }
+    async function poll(jobId, version, isTranslation = false) {
+      if (denied || version !== state.version) return;
+      try {
+        const value = await replyRequest(`/${encodeURIComponent(jobId)}?fresh=true`);
+        if (denied || version !== state.version) return;
+        if (["queued", "running"].includes(value.status)) {
+          state.timer = setTimeout(() => poll(jobId, version, isTranslation), 2500); return;
+        }
+        generate.disabled = false;
+        if (value.status !== "succeeded") { stale(value.error || "资料已变化，请重新生成。"); return; }
+        const result = value.result;
+        if (isTranslation) {
+          if (result.draft !== state.text) return;
+          translation.textContent = result.chinese_translation;
+          state.readyText = state.text; state.copyId = jobId;
+          copy.disabled = false; translate.disabled = false;
+          feedback.textContent = "中文翻译已更新。请核对后复制，由 CM 自行发送。";
+        } else {
+          feedback.textContent = result.explanation;
+          checks.textContent = result.checks?.length ? `发送前需确认：${result.checks.join("；")}` : "";
+          content.hidden = result.outcome !== "ready";
+          if (result.outcome !== "ready") {
+            if (result.checks?.length) feedback.textContent += ` ${result.checks.join("；")}`;
+            generate.textContent = "重新核对"; return;
+          }
+          state.jobId = jobId; state.copyId = jobId;
+          editor.value = state.text = state.readyText = result.draft;
+          translation.textContent = result.chinese_translation;
+          translationLabel.hidden = translation.hidden = result.language === "zh";
+          copy.disabled = false; translate.disabled = false; generate.textContent = "重新生成";
+          feedback.textContent += `（核对于 ${date(result.checked_at)}；消息同步至 ${date(result.synced_through)}）`;
+        }
+        // Check for new messages without overwriting an edited draft or its translation.
+        state.timer = setTimeout(() => checkFresh(version), 30000);
+      } catch (error) { if (!denied && version === state.version) stale(error.message); }
+    }
+    async function checkFresh(version) {
+      if (denied || version !== state.version || !state.copyId) return;
+      if (document.hidden) { state.timer = setTimeout(() => checkFresh(version), 30000); return; }
+      try {
+        const value = await replyRequest(`/${encodeURIComponent(state.copyId)}?fresh=true`);
+        if (denied || version !== state.version) return;
+        if (value.status !== "succeeded") { stale(value.error || "收到新消息，请重新生成。"); return; }
+        state.timer = setTimeout(() => checkFresh(version), 30000);
+      } catch (error) { if (!denied && version === state.version) stale(error.message); }
+    }
+    generate.addEventListener("click", async () => {
+      const version = ++state.version; clearTimeout(state.timer); clearTimeout(state.editTimer);
+      generate.disabled = true; copy.disabled = true; content.hidden = true;
+      feedback.textContent = "正在核对最新对话并生成建议…";
+      try {
+        const value = await replyRequest("", {event_id: event.id});
+        if (!denied && version === state.version) poll(value.id, version);
+      } catch (error) { if (!denied && version === state.version) stale(error.message); }
+    });
+    async function updateTranslation() {
+      clearTimeout(state.editTimer); clearTimeout(state.timer);
+      if (!state.text.trim() || !state.jobId || denied) return;
+      const version = ++state.version;
+      copy.disabled = true; translate.disabled = true;
+      translationLabel.hidden = translation.hidden = false;
+      translation.textContent = "正在更新中文翻译…";
+      try {
+        const value = await replyRequest("", {event_id: event.id, parent_id: state.jobId, text: state.text});
+        if (!denied && version === state.version) poll(value.id, version, true);
+      } catch (error) { if (!denied && version === state.version) stale(error.message); }
+    }
+    editor.addEventListener("input", () => {
+      state.text = editor.value; state.readyText = null; state.version++;
+      clearTimeout(state.timer); clearTimeout(state.editTimer);
+      copy.disabled = true; translate.disabled = false;
+      translation.textContent = "正文已修改，中文翻译待更新。";
+      translationLabel.hidden = translation.hidden = false;
+      state.editTimer = setTimeout(updateTranslation, 1500);
+    });
+    translate.addEventListener("click", updateTranslation);
+    copy.addEventListener("click", async () => {
+      const version = state.version, text = state.text;
+      copy.disabled = true;
+      try {
+        const value = await replyRequest(`/${encodeURIComponent(state.copyId)}?fresh=true`);
+        if (denied || version !== state.version || text !== state.text) return;
+        if (value.status !== "succeeded" || state.readyText !== text) {
+          stale(value.error || "建议或翻译已过时，请更新后再复制。"); return;
+        }
+        await navigator.clipboard.writeText(text);
+        feedback.textContent = "已复制回复正文；未发送，也未改变事件处理状态。";
+        copy.disabled = false;
+      } catch (error) {
+        if (!denied && version === state.version) {
+          feedback.textContent = error.name === "NotAllowedError" ? "浏览器未允许复制，请选择正文手动复制。" : error.message;
+          // A failed freshness check must not make an old draft copyable.
+        }
+      }
+    });
+    return panel;
+  }
 
   function eventCard(event) {
     const level = priority(event), card = node("article", "oh-event");
@@ -85,10 +228,12 @@
       }
       details.append(messages); card.append(details);
     } else card.append(node("p", "oh-small", "当前没有可展示的原文，请勿仅凭总结作出结论。"));
+    if (event.handling_status === "unresolved") card.append(replyPanel(event));
     return card;
   }
 
   function renderEvents() {
+    if (!denied && document.activeElement?.closest(".oh-reply")) return;
     const openDetails = new Set([...$("oh-events").querySelectorAll("details[open][data-detail-key]")]
       .map(detail => detail.dataset.detailKey));
     const all = events();
@@ -199,7 +344,7 @@
         cache: "no-store", credentials: "same-origin", redirect: "error", headers: {Accept: "application/json"},
       });
       if ([401, 403].includes(response.status)) {
-        denied = true;
+        denied = true; clearReplies();
         data = {events: [], enabled: false, run: null}; render();
         $("oh-empty-title").textContent = "当前无法查看总结";
         $("oh-empty-description").textContent = "登录或查看权限已变化。请重新登录后再打开本页。";
