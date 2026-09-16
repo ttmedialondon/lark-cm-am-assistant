@@ -19,7 +19,7 @@ POLICY_VERSION = "creator-import-group-person-v5"
 MAX_GROUPS, MAX_USERS, MAX_MESSAGES, MAX_CHARS = 8, 80, 48, 20_000
 LOCAL_SEARCH_MESSAGES = 20_000
 HISTORY_SEARCH_MESSAGES = 200_000
-_TOKEN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._]{0,63}")
+_TOKEN = re.compile(r"[A-Za-z0-9._]{1,64}")
 _OUTCOMES = {"matched", "review", "not_found"}
 
 

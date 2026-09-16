@@ -607,6 +607,39 @@ def test_import_workbook_rejects_unsafe_or_ambiguous_input():
             imports.parse_xlsx(name, content)
     parsed = imports.parse_xlsx("roster.xlsx", workbook("handle", "https://www.tiktok.com/@Account.One", "account.one"))
     assert parsed["counts"] == {"valid": 1, "duplicates": 1, "invalid": 0}
+    parsed = imports.parse_xlsx("roster.xlsx", workbook("handle", ".horsegirlatheart", "@.horsegirlatheart", "horsegirlatheart"))
+    assert parsed["counts"] == {"valid": 2, "duplicates": 1, "invalid": 0}
+    assert [row["handle"] for row in parsed["rows"]] == [".horsegirlatheart", ".horsegirlatheart", "horsegirlatheart"]
+    groups, _ = imports.creator_import_evidence._candidate_groups([
+        {"chat_id": "dot", "name": ".horsegirlatheart X TT Media"},
+        {"chat_id": "other", "name": "horsegirlatheart X TT Media"},
+    ], ".horsegirlatheart")
+    assert [(g["chat_id"], g["match_kind"]) for g in groups] == [("dot", "exact"), ("other", "similar")]
+    assert imports.creator_import_evidence._TOKEN.findall(".horsegirlatheart") == [".horsegirlatheart"]
+
+
+def test_leading_dot_repair_preserves_preview_and_existing_decisions(pg, pilot, monkeypatch):
+    prepare(pg, pilot, monkeypatch)
+    cm = pilot.ids["cm"]
+    migration = (Path(__file__).parents[1] / "migrations/066_leading_dot_import_handles.sql").read_text()
+    for status in ("preview", "running", "paused", "completed"):
+        batch = imports.preview_import(cm, cm, "dots.xlsx", workbook("handle", "." + status, "regular_" + status))
+        entries = batch["rows"]
+        entries[0]["error"] = "handle 格式不正确"
+        pg.execute("UPDATE creator_import_batches SET status=%s,preview_rows=%s::jsonb WHERE id=%s",
+                   (status, json.dumps(entries), batch["id"]))
+    pg.execute(migration)
+    pg.execute(migration)  # Replays must not duplicate rows or audits.
+    batches = pg.execute("SELECT * FROM creator_import_batches ORDER BY filename").fetchall()
+    for batch in batches:
+        original = batch["preview_rows"][0]["handle"][1:]
+        assert batch["counts"] == {"valid": 2, "duplicates": 0, "invalid": 0}
+        assert batch["status"] == ("running" if original == "completed" else original)
+        rows = pg.execute("SELECT handle,status,contact_id FROM creator_import_rows WHERE batch_id=%s", (batch["id"],)).fetchall()
+        assert len(rows) == (0 if original == "preview" else 1)
+        if rows:
+            assert rows[0] == {"handle": "." + original, "status": "pending", "contact_id": None}
+    assert pg.execute("SELECT count(*) n FROM audit_events WHERE action='creator_import_leading_dot_repaired'").fetchone()["n"] == 4
 
 
 def test_creator_library_reset_preserves_sources_history_and_new_data_on_replay(pg, pilot, monkeypatch):

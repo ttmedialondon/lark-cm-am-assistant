@@ -20,7 +20,7 @@ from .message_mentions import mention_targets, resolve_mentions, rich_mention_te
 
 POLICY_VERSION = "creator-handle-evidence-v2"
 MAX_MESSAGES, MAX_BODY_CHARS, MAX_GROUPS, MAX_GROUP_CHARS = 40, 16_000, 20, 4_000
-_HANDLE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._]{0,63}\Z", re.ASCII)
+_HANDLE = re.compile(r"[A-Za-z0-9._]{1,64}\Z", re.ASCII)
 _URL = re.compile(r"https?://(?:www\.|m\.)?tiktok\.com/@([A-Za-z0-9._]+)(?:/video/\d+)?[^\s<>\"']*", re.I)
 _AT = re.compile(r"(?<![\w@])@([A-Za-z0-9._]{1,64})(?![\w.])", re.ASCII)
 _DECLARATION = re.compile(

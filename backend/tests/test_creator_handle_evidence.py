@@ -97,6 +97,10 @@ def _result(pack, *, handle="creator._123", basis="self_declared", labels=None):
 
 
 def test_exact_normalization_and_group_patterns_reject_guessing():
+    for value in (".horsegirlatheart", " @.Horsegirlatheart ", "https://www.tiktok.com/@.horsegirlatheart"):
+        assert handles.normalize_handle(value) == ".horsegirlatheart"
+    assert handles._name_handles("❤️ .horsegirlatheart X TT Media") == [".horsegirlatheart"]
+    assert handles._self_handles("My handle is @.horsegirlatheart") == {".horsegirlatheart"}
     for value in ("@Creator._123", "creator._123", "https://www.tiktok.com/@Creator._123/?lang=en"):
         assert handles.normalize_handle(value) == "creator._123"
     for bad in (
