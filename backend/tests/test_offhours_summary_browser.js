@@ -49,13 +49,23 @@ async function fixture(t, data = report()) {
 test("bilingual user labels are displayed literally in evidence", async t => {
   const label = "Remi（Quanzhen Liang）";
   const data = report({responsible: {id: "remi-id", name: label}, events: [event("P2", {
-    lark_user_name: "Sample Creator",
-    evidence: [{message_id: "message-1", chat_id: "chat-1", text: "Checked.",
-      created_at: "2026-09-09T20:00:00Z", sender_name: label}],
+    lark_user_name: "Sample Creator", conversation_type: "combined",
+    evidence: ["oc_first", "oc_first", "oc_second", "javascript:alert(1)"].map((chat_id, i) => ({
+      message_id: `message-${i}`, chat_id, chat_name: "同名 <b>会话</b>", text: "Checked.",
+      created_at: "2026-09-09T20:00:00Z", sender_name: label})),
   })]});
   const {page, errors} = await fixture(t, data);
-  await page.getByText("查看相关原文（1）").click();
+  await page.getByText("查看相关原文（4）").click();
   assert((await page.locator(".oh-evidence").textContent()).includes(label));
+  const links = page.locator(".oh-conversations a");
+  assert.equal(await links.count(), 2);
+  assert.deepEqual(await links.allTextContents(), ["同名 <b>会话</b>", "同名 <b>会话</b>"]);
+  assert.equal(await page.locator(".oh-conversations b").count(), 0);
+  for (const [i, chat] of ["oc_first", "oc_second"].entries()) {
+    assert.equal(await links.nth(i).getAttribute("href"), `https://applink.larksuite.com/client/chat/open?openChatId=${chat}`);
+    assert.equal(await links.nth(i).getAttribute("target"), "_blank");
+    assert.equal(await links.nth(i).getAttribute("rel"), "noopener noreferrer");
+  }
   assert.deepEqual(errors, []);
 });
 

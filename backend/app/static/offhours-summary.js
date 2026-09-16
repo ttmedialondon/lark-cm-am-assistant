@@ -40,8 +40,26 @@
     const identity = node("div", "oh-identity");
     identity.append(node("span", "", `达人 handle：${event.creator_handle || event.creator_handles?.join("、") || "—"}`),
       node("span", "", `Lark 用户：${event.lark_user_name || "—"}`));
-    if (event.conversation_type) identity.append(node("span", "",
-      `${event.conversation_type === "private" ? "私聊" : event.conversation_type === "combined" ? "相关会话" : "群聊"}：${event.conversation_name || "—"}`));
+    if (event.conversation_type) {
+      const conversations = node("span", "oh-conversations",
+        `${event.conversation_type === "private" ? "私聊" : event.conversation_type === "combined" ? "相关会话" : "群聊"}：`);
+      const chats = new Map((event.evidence || []).map(message => [message.chat_id, message.chat_name]));
+      if (!chats.size) conversations.append(document.createTextNode(event.conversation_name || "—"));
+      let index = 0;
+      for (const [chatId, name] of chats) {
+        if (index++) conversations.append(document.createTextNode("、"));
+        const label = name || event.conversation_name || "未命名会话";
+        if (typeof chatId === "string" && /^oc_[A-Za-z0-9_-]{1,128}$/.test(chatId)) {
+          const link = node("a", "", label);
+          link.href = `https://applink.larksuite.com/client/chat/open?openChatId=${encodeURIComponent(chatId)}`;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.title = "在 Lark 中打开此会话（需有会话访问权限）";
+          conversations.append(link);
+        } else conversations.append(document.createTextNode(label));
+      }
+      identity.append(conversations);
+    }
     card.append(heading, identity);
     if (needsReview(event)) card.append(node("span", "oh-review-tag", "信息不足，需结合原文核实"));
     card.append(node("p", "oh-summary", event.summary));
