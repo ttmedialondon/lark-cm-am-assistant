@@ -218,9 +218,10 @@ def test_message_page_grantee_can_read_and_is_recorded_as_the_actual_viewer(cons
 
 
 def test_source_restriction_filters_directory_and_blocks_forged_source(console, monkeypatch):
+    allowed = [console.source["id"]]
     monkeypatch.setattr(admin_permissions, "access_for", lambda _: admin_permissions._access({
         "status": "active", "permissions": ["messages"],
-        "message_source_id": console.source["id"],
+        "message_source_ids": allowed,
     }))
     response = console.browser.get("/admin/messages", params={"user_page": 99})
     assert response.status_code == 200
@@ -237,6 +238,25 @@ def test_source_restriction_filters_directory_and_blocks_forged_source(console, 
     assert response.status_code == 403
     assert {key: len(value) for key, value in console.calls.items()} == counts
     assert response.headers["cache-control"] == "no-store, max-age=0"
+    sources = {console.source["id"]: console.source}
+    for name in ("Nero", "Janette", "Jenette Z", "Mona"):
+        source_id = uuid4()
+        sources[source_id] = {**console.source, "id": source_id, "display_name": name}
+        allowed.append(source_id)
+    monkeypatch.setattr(admin_reporting, "user_detail", lambda source_id, **_: {"user": sources[source_id]})
+    response = console.browser.get("/admin/messages")
+    assert response.status_code == 200
+    assert {u["id"] for u in console.contexts[-1]["users"]} == set(allowed)
+    assert console.contexts[-1]["user_page"]["total_count"] == 5
+    for source_id in allowed:
+        response = _open(console, user_id=str(source_id), chat_id=console.chat["chat_id"])
+        assert response.status_code == 200
+        assert console.calls["messages"][-1][0] == source_id
+    revoked = allowed.pop()
+    counts = {key: len(value) for key, value in console.calls.items()}
+    assert _open(console, user_id=str(revoked)).status_code == 403
+    assert _open(console, user_id=str(uuid4())).status_code == 403
+    assert {key: len(value) for key, value in console.calls.items()} == counts
 
 
 def test_source_and_filter_forms_reset_dependent_selection_state(console):

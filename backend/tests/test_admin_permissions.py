@@ -58,8 +58,8 @@ def test_owner_implicitly_has_every_page_without_explicit_grants(monkeypatch):
     assert result["configured_permissions"] == admin_permissions.PAGE_KEYS
     assert result["landing_path"] == "/admin"
     assert admin_permissions._access({
-        **account(OWNER, role="owner", role_active=True), "message_source_id": PERSON,
-    })["message_source_id"] is None
+        **account(OWNER, role="owner", role_active=True), "message_source_ids": [PERSON],
+    })["message_source_ids"] is None
 
 
 @pytest.mark.parametrize("status", ["revoked", "attention_required"])
@@ -186,10 +186,11 @@ def test_message_source_limit_survives_page_permission_saves(pg, monkeypatch):
                    (person, str(person)))
     pg.execute("INSERT INTO admin_roles (authorization_id, role, is_active) VALUES (%s, 'owner', TRUE)", (OWNER,))
     pg.execute("INSERT INTO admin_message_source_limits VALUES (%s, %s)", (PERSON, OWNER))
+    pg.execute("INSERT INTO admin_message_source_limits VALUES (%s, %s)", (PERSON, PERSON))
     monkeypatch.setattr(admin_permissions, "connection", lambda: nullcontext(pg))
     for grants in (["messages"], [], ["messages", "creator-roster"]):
         admin_permissions.set_permissions(OWNER, PERSON, grants)
         result = admin_permissions.access_for(PERSON)
-        assert result["message_source_id"] == OWNER
+        assert result["message_source_ids"] == [OWNER, PERSON]
         assert result["permissions"] == set(grants)
-    assert admin_permissions.access_for(OWNER)["message_source_id"] is None
+    assert admin_permissions.access_for(OWNER)["message_source_ids"] is None
