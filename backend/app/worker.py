@@ -697,9 +697,9 @@ def _schedule_member_snapshot(
     page_futures: dict[Future[dict[str, Any]], PageClaim],
     member_futures: dict[Future[MemberSnapshotMeasurement], MemberSnapshotClaim],
 ) -> None:
-    """Rosters are one low-priority slot and never start during message work."""
+    """One roster slot shares the API admission limit without waiting for message work to end."""
 
-    if page_futures or member_futures or _has_ready_message_work():
+    if member_futures:
         return
     if "im:chat.members:read" not in settings.oauth_scopes:
         _mark_one_member_snapshot_unavailable()
@@ -720,20 +720,6 @@ def _schedule_member_snapshot(
         _release_member_snapshot_claim(claim, "pending")
         return
     member_futures[executor.submit(_read_member_snapshot, client, access_token, claim.chat_id)] = claim
-
-
-def _has_ready_message_work() -> bool:
-    with connection() as conn:
-        row = conn.execute(
-            """
-            SELECT EXISTS (
-                SELECT 1
-                FROM sync_jobs
-                WHERE status = 'running' OR (status = 'queued' AND scheduled_at <= NOW())
-            ) AS ready
-            """
-        ).fetchone()
-    return bool(row["ready"])
 
 
 def _claim_member_snapshot(settings: Settings) -> MemberSnapshotClaim | None:
@@ -760,7 +746,13 @@ def _claim_member_snapshot(settings: Settings) -> MemberSnapshotClaim | None:
                   WHERE active_snapshot.member_snapshot_claim_id IS NOT NULL
                     AND active_snapshot.member_snapshot_lease_until > NOW()
               )
-            ORDER BY access.member_snapshot_checked_at NULLS FIRST, access.chat_id
+            ORDER BY EXISTS (
+                SELECT 1 FROM creator_import_rows r JOIN creator_import_batches b ON b.id=r.batch_id
+                WHERE r.cm_authorization_id=access.authorization_id AND r.review_status='pending'
+                  AND r.status IN ('pending','preparing') AND b.status='running'
+                  AND r.stats->>'analysis_stage'='person'
+                  AND r.refs @> jsonb_build_array(jsonb_build_object('chat_id',access.chat_id))
+              ) DESC, access.member_snapshot_checked_at NULLS FIRST, access.chat_id
             FOR UPDATE SKIP LOCKED
             LIMIT 1
             """,
@@ -1350,7 +1342,7 @@ def _read_member_snapshot(client: LarkClient, access_token: str, chat_id: str) -
     if total is None:
         LOGGER.info("member snapshot response omitted a usable user total")
         return MemberSnapshotMeasurement(None, "unavailable", "unavailable", checked_at)
-    snapshot_status = "partial" if partial else "succeeded"
+    snapshot_status = "partial" if partial or len(unique_members) != total else "succeeded"
     return MemberSnapshotMeasurement(
         count=total,
         count_status="succeeded",

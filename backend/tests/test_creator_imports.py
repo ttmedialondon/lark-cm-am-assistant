@@ -1067,3 +1067,22 @@ def test_delegated_creator_manager_can_review_evidence_and_import_across_cms(pg,
     ):
         with pytest.raises(PermissionError):
             action()
+
+
+def test_person_analysis_waits_for_members_and_resumes_without_repeating_group_ai(pg, pilot, monkeypatch):
+    calls, callbacks = prepare(pg, pilot, monkeypatch)
+    group(pg, pilot, "chat_creator", "waiting_creator", "creator")
+    pg.execute("UPDATE authorization_chats SET member_snapshot_status='pending' WHERE chat_id='chat_creator'")
+    batch = imports.preview_import(pilot.ids["owner"], pilot.ids["cm"], "wait.xlsx", workbook("waiting_creator"))
+    imports.start_import(pilot.ids["owner"], batch["id"])
+    drain(pilot)
+    row = row_for(pg, batch, "waiting_creator")
+    assert row['reason_code'] == 'members_pending' and row['status'] == 'pending'
+    assert [p['stage'] for p in calls] == ['group']
+    assert not imports.prepare_next_import(pilot.settings)
+    pg.execute("UPDATE authorization_chats SET member_snapshot_status='succeeded' WHERE chat_id='chat_creator'")
+    pg.execute("UPDATE creator_import_rows SET scheduled_at=NOW() WHERE id=%s", (row['id'],))
+    drain(pilot)
+    row = row_for(pg, batch, "waiting_creator")
+    assert row['review_status'] == 'confirmed'
+    assert [p['stage'] for p in calls] == ['group', 'person']

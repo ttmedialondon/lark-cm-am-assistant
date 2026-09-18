@@ -673,3 +673,18 @@ def test_delayed_only_job_yields_its_coordinator_slot() -> None:
     assert worker._yield_job_to_retry_if_idle(Connection(), job)
 
     assert any("SET status = 'queued', scheduled_at = %s" in query for query, _params in calls)
+
+
+def test_member_snapshot_runs_alongside_message_work_with_one_roster_slot(monkeypatch):
+    claim = SimpleNamespace(authorization_id="cm", chat_id="group")
+    monkeypatch.setattr(worker, "_claim_member_snapshot", lambda settings: claim)
+    monkeypatch.setattr(worker, "_authorization", lambda aid: {"status": "active"})
+    monkeypatch.setattr(worker, "_usable_access_token", lambda *args: "token")
+    submitted = []
+    executor = SimpleNamespace(submit=lambda *args: submitted.append(args) or "future")
+    settings = SimpleNamespace(oauth_scopes=["im:chat.members:read"])
+    members = {}
+    worker._schedule_member_snapshot(settings, "client", executor, {"message": "running"}, members)
+    assert members == {"future": claim} and len(submitted) == 1
+    worker._schedule_member_snapshot(settings, "client", executor, {"message": "running"}, members)
+    assert len(submitted) == 1

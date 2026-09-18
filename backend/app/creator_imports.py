@@ -30,6 +30,8 @@ REASONS = {
     "person_not_found": "尚未定位对应的 Lark 用户。",
     "configuration_changed": "AI 配置不可用或已变化，请检查配置后重新分析。",
     "authorization_changed": "相关授权或材料已变化，请重新检查。",
+    "members_incomplete": "群已定位，但群成员资料不完整，尚不能确定对应达人。",
+    "members_pending": "群已定位，正在补齐群成员，完成后自动继续找人。",
     "preparation_failed": "证据准备异常，可以重新检查。",
     "interrupted": "分析中断，未自动重复付费请求。",
     "provider_error": "AI 请求异常，可以重新检查。",
@@ -979,7 +981,7 @@ def prepare_next_import(settings):
         batch = conn.execute(
             """SELECT b.id FROM creator_import_batches b WHERE b.status='running'
             AND b.policy_version=%s AND EXISTS (SELECT 1 FROM creator_import_rows r WHERE r.batch_id=b.id
-            AND r.status='pending' AND r.review_status='pending') ORDER BY b.created_at,b.id
+            AND r.status='pending' AND r.review_status='pending' AND r.scheduled_at<=NOW()) ORDER BY b.created_at,b.id
             FOR UPDATE OF b SKIP LOCKED LIMIT 1""",
             (POLICY_VERSION,),
         ).fetchone()
@@ -988,6 +990,7 @@ def prepare_next_import(settings):
         row = conn.execute(
             """SELECT r.*,b.uploaded_by FROM creator_import_rows r JOIN creator_import_batches b
             ON b.id=r.batch_id WHERE r.batch_id=%s AND r.status='pending' AND r.review_status='pending'
+            AND r.scheduled_at<=NOW()
             ORDER BY r.row_number,r.id FOR UPDATE OF r SKIP LOCKED LIMIT 1""",
             (batch["id"],),
         ).fetchone()
@@ -1004,9 +1007,18 @@ def prepare_next_import(settings):
             chain, results = _decode(row, settings), _decode(row, settings, "result_ciphertext")
             if chain and not _valid_chain(conn, settings, row, chain, results, full=True):
                 raise ValueError("authorization_changed")
-            material = _build_material(conn, settings, row, stage, chain, results)
-            config = ownership._config(conn)
-            reason = material["reason_code"] if not material["eligible"] else "" if config else "configuration_changed"
+            waiting_members = stage == "person" and conn.execute(
+                """SELECT 1 FROM authorization_chats WHERE authorization_id=%s
+                AND chat_id=ANY(%s::text[]) AND member_snapshot_status='pending' LIMIT 1""",
+                (row["cm_authorization_id"], _selected_chats(chain, results)),
+            ).fetchone()
+            if waiting_members:
+                reason = "members_pending"
+            else:
+                material = _build_material(conn, settings, row, stage, chain, results)
+                config = ownership._config(conn)
+                reason = (material["reason_code"] if not material["eligible"]
+                          else "" if config else "configuration_changed")
     except (ValueError, PermissionError):
         reason = "authorization_changed"
     except Exception:
@@ -1028,6 +1040,13 @@ def prepare_next_import(settings):
             or current["review_status"] != "pending"
             or (current["stats"].get("analysis_generation", 0) != row["stats"].get("analysis_generation", 0))
         ):
+            return True
+        if reason == "members_pending":
+            conn.execute(
+                """UPDATE creator_import_rows SET status='pending',reason_code=%s,lease_until=NULL,
+                scheduled_at=NOW()+INTERVAL '15 seconds',updated_at=NOW() WHERE id=%s""",
+                (reason, row["id"]),
+            )
             return True
         chain = _decode(current, settings)
         if material:
@@ -1186,6 +1205,10 @@ def _finish(job, settings, *, response=None, result=None, reason=""):
         next_stage = "person" if matched and stage == "group" else "completed"
         status = "pending" if next_stage == "person" else "invalid" if reason else "succeeded"
         reason = reason or ("" if matched else (result or {}).get("reason_code") or f"{stage}_review")
+        if reason == "person_not_found" and any(
+            g.get("member_snapshot_status") != "succeeded" for g in chain["person"]["pack"]["groups"]
+        ):
+            reason = "members_incomplete"
         conn.execute(
             """UPDATE creator_import_rows SET status=%s,reason_code=%s,contact_id=%s,outcome=%s,
             confidence=%s,result_ciphertext=%s,attempts=CASE WHEN %s THEN 0 ELSE attempts END,
