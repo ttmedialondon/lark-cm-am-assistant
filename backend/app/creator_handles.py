@@ -38,7 +38,7 @@ REASONS = {
     "no_handle_clues": "没有找到明确的 handle 线索，可手动填写。",
     "no_handle_clue": "没有找到明确的 handle 线索，可手动填写。",
     "not_found": "没有找到可确认的 handle，可手动填写。",
-    "account_conflict": "账号或负责人存在冲突，未覆盖已有记录。",
+    "account_conflict": "账号与人员关联存在冲突，未覆盖已有记录。",
 }
 RUN_LABELS = {
     "preparing": "正在准备材料",
@@ -178,9 +178,11 @@ def _seed(conn, source):
         AND NOT EXISTS (SELECT 1 FROM creator_ownership_tasks n WHERE n.contact_id=t.contact_id
           AND n.cm_authorization_id=t.cm_authorization_id AND n.status='succeeded'
           AND (n.created_at,n.id)>(t.created_at,t.id))
-        AND NOT EXISTS (SELECT 1 FROM contact_assignments a WHERE a.contact_id=t.contact_id AND a.ended_at IS NULL)
+        AND NOT EXISTS (SELECT 1 FROM contact_assignments a WHERE a.contact_id=t.contact_id
+          AND a.responsible_authorization_id=t.cm_authorization_id AND a.ended_at IS NULL)
         AND NOT EXISTS (SELECT 1 FROM creator_account_assignments a
-          WHERE a.contact_id=t.contact_id AND a.ended_at IS NULL)
+          WHERE a.contact_id=t.contact_id AND a.responsible_authorization_id=t.cm_authorization_id
+          AND a.ended_at IS NULL)
         ORDER BY t.contact_id""",
         (source["id"], ownership.POLICY_VERSION),
     ).fetchall()
@@ -257,14 +259,6 @@ def _settle(conn, run_id):
 
 
 def _conflict(conn, task, handles):
-    if conn.execute(
-        """SELECT 1 FROM contact_assignments WHERE contact_id=%s AND ended_at IS NULL
-        AND responsible_authorization_id<>%s
-        UNION ALL SELECT 1 FROM creator_account_assignments WHERE contact_id=%s AND ended_at IS NULL
-        AND responsible_authorization_id<>%s LIMIT 1""",
-        (task["contact_id"], task["cm_authorization_id"], task["contact_id"], task["cm_authorization_id"]),
-    ).fetchone():
-        return True
     return bool(
         conn.execute(
             """SELECT 1 FROM social_accounts s WHERE s.platform='tiktok'
@@ -274,8 +268,8 @@ def _conflict(conn, task, handles):
           OR EXISTS (SELECT 1 FROM contact_social_accounts l WHERE l.social_account_id=s.id
             AND l.contact_id=%s AND l.status='rejected')
           OR EXISTS (SELECT 1 FROM creator_account_assignments a WHERE a.social_account_id=s.id
-            AND a.ended_at IS NULL AND (a.contact_id<>%s OR a.responsible_authorization_id<>%s))) LIMIT 1""",
-            (handles, task["contact_id"], task["contact_id"], task["contact_id"], task["cm_authorization_id"]),
+            AND a.ended_at IS NULL AND a.contact_id<>%s)) LIMIT 1""",
+            (handles, task["contact_id"], task["contact_id"], task["contact_id"]),
         ).fetchone()
     )
 
@@ -346,7 +340,9 @@ def _admit(conn, task, handles, actor, settings, *, automatic=False):
     conn.execute(
         """INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source,confidence,
         created_by_authorization_id,ownership_task_id,handle_task_id) SELECT %s,%s,%s,%s,%s,%s,%s,%s
-        WHERE NOT EXISTS (SELECT 1 FROM contact_assignments WHERE contact_id=%s AND ended_at IS NULL)""",
+        WHERE NOT EXISTS (SELECT 1 FROM contact_assignments WHERE contact_id=%s
+          AND responsible_authorization_id=%s AND ended_at IS NULL)
+        ON CONFLICT (contact_id,responsible_authorization_id) WHERE ended_at IS NULL DO NOTHING""",
         (
             uuid4(),
             task["contact_id"],
@@ -357,6 +353,7 @@ def _admit(conn, task, handles, actor, settings, *, automatic=False):
             task["ownership_task_id"],
             task["id"],
             task["contact_id"],
+            task["cm_authorization_id"],
         ),
     )
     conn.execute(
@@ -392,10 +389,6 @@ def set_creator_type(actor_id, cm_id, contact_id, creator_type):
             AND responsible_authorization_id=%s AND ended_at IS NULL
             UNION ALL SELECT 1 FROM creator_account_assignments a WHERE a.contact_id=%s
             AND a.responsible_authorization_id=%s AND a.ended_at IS NULL
-            AND NOT EXISTS (SELECT 1 FROM contact_assignments p WHERE p.contact_id=a.contact_id
-                AND p.ended_at IS NULL)
-            AND NOT EXISTS (SELECT 1 FROM creator_account_assignments other WHERE other.contact_id=a.contact_id
-                AND other.ended_at IS NULL AND other.responsible_authorization_id<>a.responsible_authorization_id)
             LIMIT 1""",
             (contact_id, cm_id, contact_id, cm_id),
         ).fetchone():

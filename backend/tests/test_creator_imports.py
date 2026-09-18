@@ -167,7 +167,7 @@ def test_cap_excel_two_stage_matching_manual_confirmation_and_replays_preserve_p
     assert row_for(pg, again, "beauty.one_12")["reason_code"] == "existing"
     assert _snapshot(pg, facts) == facts
     conflict = row_for(pg, again, "legacy_account")
-    assert conflict["reason_code"] == "account_conflict" and conflict["contact_id"] is None
+    assert conflict["status"] == "pending" and conflict["contact_id"] == pilot.ids["legacy"]
     assert set(creator_handles.page_data(cm, tab="mine")["items"][0]["handles"]) == {"beauty.one_12", "corrected_02"}
     assert pg.execute("SELECT id,display_name FROM contacts ORDER BY id").fetchall() == before_people
     assert row_for(pg, batch, "corrected_02")["api_requests"] == 1
@@ -210,12 +210,9 @@ def test_manual_import_scope_identity_account_and_type_conflicts_are_atomic(pg, 
         imports.confirm_row(cm, row["id"], "creator_one", uuid4())
     with pytest.raises(ValueError):
         imports.confirm_row(cm, row["id"], "occupied", creator)
-    for conflict in ("owner", "account", "type", "merchant", "rejected"):
+    for conflict in ("account", "type", "merchant", "rejected"):
         with pg.transaction(force_rollback=True):
-            if conflict == "owner":
-                pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
-                           "VALUES(%s,%s,%s,'manual')", (uuid4(), creator, owner))
-            elif conflict == "type":
+            if conflict == "type":
                 pg.execute("UPDATE contacts SET creator_type='non_cap' WHERE id=%s", (creator,))
             elif conflict == "merchant":
                 pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) "
@@ -243,6 +240,51 @@ def test_manual_import_scope_identity_account_and_type_conflicts_are_atomic(pg, 
         pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (cm,))
         with pytest.raises(PermissionError):
             imports.start_import(owner, batch["id"])
+
+
+def test_shared_creator_reuses_identity_without_sharing_message_permissions(pg, pilot, monkeypatch):
+    from scripts.reconcile_shared_creators import reconcile_row
+    calls, _ = prepare(pg, pilot, monkeypatch)
+    cm, other, person = pilot.ids["cm"], pilot.ids["owner"], pilot.ids["creator"]
+    original = imports.preview_import(cm, cm, "first.xlsx", workbook("shared_handle"))
+    imports.start_import(cm, original["id"])
+    imports.confirm_row(cm, row_for(pg, original, "shared_handle")["id"], "shared_handle", person)
+    link_before = pg.execute("SELECT * FROM contact_social_accounts WHERE contact_id=%s", (person,)).fetchone()
+    denied = imports.preview_import(other, other, "denied.xlsx", workbook("shared_handle"))
+    imports.start_import(other, denied["id"])
+    assert row_for(pg, denied, "shared_handle")["reason_code"] == "authorization_changed"
+    assert pg.execute("SELECT count(*) n FROM contact_assignments WHERE contact_id=%s", (person,)).fetchone()["n"] == 1
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id,p2p_counterpart_open_id) "
+               "SELECT %s,chat_id,p2p_counterpart_open_id FROM authorization_chats WHERE authorization_id=%s",
+               (other, cm))
+    denied_row = row_for(pg, denied, "shared_handle")
+    assert reconcile_row(pg, other, denied_row["id"]) == "admitted"
+    assert reconcile_row(pg, other, denied_row["id"]) == "unchanged"
+    shared = imports.preview_import(other, other, "shared.xlsx", workbook("@shared_handle"))
+    imports.start_import(other, shared["id"])
+    imports.start_import(other, shared["id"])
+    saved = row_for(pg, shared, "shared_handle")
+    assert saved["review_status"] == "confirmed" and saved["reason_code"] == "existing"
+    assert saved["api_requests"] == 0 and not calls
+    assert pg.execute("SELECT count(*) n FROM contact_assignments WHERE contact_id=%s", (person,)).fetchone()["n"] == 2
+    assert pg.execute("SELECT count(*) n FROM social_accounts WHERE normalized_handle='shared_handle'").fetchone()["n"] == 1
+    link = pg.execute("SELECT * FROM contact_social_accounts WHERE contact_id=%s", (person,)).fetchone()
+    assert link["import_row_id"] == link_before["import_row_id"]  # Preserve original identity evidence.
+    for target in (cm, other):
+        view = creator_handles.page_data(other, cm_id=target, tab="mine")
+        assert any(item["id"] == str(person) for item in view["items"])
+    with pytest.raises(PermissionError):
+        imports.row_evidence(cm, saved["id"])
+    # Ending one CM's relationship leaves the other CM's library intact.
+    pg.execute("UPDATE contact_assignments SET ended_at=NOW() WHERE contact_id=%s AND responsible_authorization_id=%s",
+               (person, cm))
+    assert not creator_handles.page_data(cm, cm_id=cm, tab="mine")["items"]
+    assert any(item["id"] == str(person) for item in creator_handles.page_data(other, cm_id=other, tab="mine")["items"])
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (other,))
+        another = imports.preview_import(other, other, "revoked.xlsx", workbook("handle", "shared_handle"))
+        imports.start_import(other, another["id"])
+        assert row_for(pg, another, "shared_handle")["review_status"] == "pending"
 
 
 def test_manual_import_concurrent_confirmations_create_one_person_and_account_link(pg, pilot, monkeypatch):
@@ -303,6 +345,24 @@ def test_manual_import_concurrent_confirmations_create_one_person_and_account_li
             for handle in ("same_account", "second_account"):
                 row = row_for(pg, batch, handle)
                 assert row["review_status"] == "confirmed" and row["reason_code"] == "existing"
+        other = pilot.ids["owner"]
+        with connected() as conn:
+            conn.execute("INSERT INTO authorization_chats(authorization_id,chat_id,p2p_counterpart_open_id) "
+                         "SELECT %s,chat_id,p2p_counterpart_open_id FROM authorization_chats WHERE authorization_id=%s",
+                         (other, cm))
+        shared_batches = [imports.preview_import(other, target, "shared.xlsx", workbook("concurrent_shared"))
+                          for target in (cm, other)]
+        for batch in shared_batches:
+            imports.start_import(other, batch["id"])
+        with connected() as conn:
+            shared_ids = [row_for(conn, batch, "concurrent_shared")["id"] for batch in shared_batches]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = [pool.submit(imports.confirm_row, other, rid, "concurrent_shared", creator) for rid in shared_ids]
+            assert all(f.result(timeout=10)["status"] == "confirmed" for f in results)
+        with connected() as conn:
+            assert conn.execute("SELECT count(*) n FROM contact_assignments WHERE contact_id=%s AND ended_at IS NULL",
+                                (creator,)).fetchone()["n"] == 2
+            assert conn.execute("SELECT count(*) n FROM social_accounts WHERE normalized_handle='concurrent_shared'").fetchone()["n"] == 1
     finally:
         pg.rollback()
         with psycopg.connect(dsn, autocommit=True) as cleanup:

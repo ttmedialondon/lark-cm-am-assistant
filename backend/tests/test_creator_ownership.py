@@ -164,7 +164,7 @@ def test_preview_responses_cannot_bypass_handle_stage_preserves_existing_data(pg
     task = _task(pg, run, pilot.ids["creator"])
     assert task["status"] == "ready" and task["evidence_count"] >= 10
     assert _task(pg, run, pilot.ids["silent"])["status"] == "skipped"
-    assert _task(pg, run, pilot.ids["legacy"]) is None
+    assert _task(pg, run, pilot.ids["legacy"])["status"] == "skipped"
     assert pilot.calls == []
     assert [r["label"] for r in ownership._refs(pg, task)] == [f"M{i}" for i in range(1, task["evidence_count"] + 1)]
     assert ownership.start_run(pilot.ids["owner"], run) == 1
@@ -270,14 +270,14 @@ def test_pause_before_dispatch_and_owner_loss_during_response_are_safe(pg, pilot
     assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
 
 
-def test_existing_owner_wins_before_dispatch_and_before_confirmation(pg, pilot):
+def test_existing_same_cm_assignment_prevents_duplicate_dispatch_and_confirmation(pg, pilot):
     second = pilot.person("second_creator", pairs=1)
     run = _prepared(pilot)
     ownership.start_run(pilot.ids["owner"], run)
 
     def assign(contact):
         pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
-                   "VALUES(%s,%s,%s,'manual')", (uuid4(), contact, pilot.ids["owner"]))
+                   "VALUES(%s,%s,%s,'manual')", (uuid4(), contact, pilot.ids["cm"]))
 
     assign(pilot.ids["creator"])
     _run_all(pilot)
@@ -291,7 +291,7 @@ def test_existing_owner_wins_before_dispatch_and_before_confirmation(pg, pilot):
     assert _snapshot(pg, existing) == existing
     new_run = _prepared(pilot)
     data = ownership.page_data(pilot.ids["cm"], new_run, include_private=True)
-    assert data["run"]["excluded_owned_count"] == 3 and data["counts"]["ready"] == 0
+    assert data["run"]["excluded_owned_count"] == 2 and data["counts"]["ready"] == 0
     assert ownership.start_run(pilot.ids["owner"], new_run) == 0 and len(pilot.calls) == 1
 
 

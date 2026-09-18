@@ -361,9 +361,11 @@ def test_existing_person_or_account_owners_are_not_overwritten_and_no_partial_ac
                 pg.execute("UPDATE contacts SET creator_type='cap' WHERE id=%s", (case.creator,))
                 assert handles.page_data(cm, cm_id=cm, tab="mine")["items"][0]["handles"] == ["new_handle"]
             else:
-                with pytest.raises(ValueError, match="冲突"):
-                    handles.confirm_task(pilot.ids["cm"], task["id"], ["new_handle"])
-                assert _snapshot(pg, before) == before
+                handles.confirm_task(pilot.ids["cm"], task["id"], ["new_handle"])
+                assert pg.execute("SELECT count(*) n FROM contact_assignments WHERE contact_id=%s",
+                                  (case.creator,)).fetchone()["n"] == 2
+                assert pg.execute("SELECT 1 FROM contact_assignments WHERE id=%s",
+                                  (before["contact_assignments"][0]["id"],)).fetchone()
     before = _snapshot(pg, ("contact_assignments", "social_accounts", "contact_social_accounts",
                             "creator_account_assignments"))
     with pytest.raises(ValueError, match="冲突"):

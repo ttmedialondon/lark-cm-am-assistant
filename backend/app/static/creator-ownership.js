@@ -105,7 +105,7 @@
     const preparing = run?.status === "preparing";
     const prepared = Math.max(0, (counts.total || 0) - (counts.pending || 0) - (counts.preparing || 0));
     const exceptions = (counts.failed || 0) + (counts.invalid || 0) + (counts.cancelled || 0);
-    el("scope").textContent = run ? `已分类达人 ${run.directory_count || 0} 人 · 已有负责人排除 ${run.excluded_owned_count || 0} 人 · 缺少 Lark 用户排除 ${run.excluded_identity_count || 0} 人` : "";
+    el("scope").textContent = run ? `已分类达人 ${run.directory_count || 0} 人 · 已在当前 CM 名下排除 ${run.excluded_owned_count || 0} 人 · 缺少 Lark 用户排除 ${run.excluded_identity_count || 0} 人` : "";
     el("run-status").textContent = run?.status_label || "尚未预筛选";
     el("progress").textContent = preparing ? `已预筛选 ${prepared} / ${counts.total || 0} 人 · 符合分析条件 ${counts.ready || 0} 人` : run ? `范围 ${counts.total || 0} 人 · 待分析 ${counts.ready || 0} · 排队 ${counts.queued || 0} · 分析中 ${counts.running || 0}` : "预筛选只读取现有材料，不调用 OpenAI。";
     el("progress-bar").max = counts.total || 1;

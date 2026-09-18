@@ -792,8 +792,9 @@ def test_recurring_periods_keep_history_and_cm_scope_separate(pg, seeded):
     pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-manage')",
                (s.ids['tester'],))
     second_cm = s.ids['reviewer']
-    pg.execute('UPDATE contact_assignments SET responsible_authorization_id=%s', (second_cm,))
-    assert ai._roster(pg, second_cm) and not ai._roster(pg, s.ids['cm'])
+    pg.execute('INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) '
+               "SELECT gen_random_uuid(),contact_id,%s,'manual' FROM contact_assignments", (second_cm,))
+    assert ai._roster(pg, second_cm) == ai._roster(pg, s.ids['cm'])
     assert ai._related_chats(pg, ai._roster(pg, second_cm), cm_id=second_cm) == []
     assert summary_periods.selection(pg, s.ids['tester'], second_cm)[0] == second_cm
     pg.execute('UPDATE offhours_summary_settings SET next_period_check_at=NULL')

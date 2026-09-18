@@ -44,7 +44,7 @@ REASONS = {
     "person_uncertain": "群已定位，但这个 handle 对应的用户尚未确定。",
     "group_unavailable": "对应群当前不可访问，请检查授权。",
     "no_readable_material": "负责人当前没有有效的可读聊天授权。",
-    "account_conflict": "存在账号、人员分类、CAP 属性或负责人冲突，未覆盖原资料",
+    "account_conflict": "存在账号归属、人员分类或 CAP 属性冲突，未覆盖原资料",
 }
 BATCH_LABELS = {"preview": "待确认导入", "running": "正在识别", "paused": "已暂停", "completed": "识别完成"}
 PHASE_LABELS = {"group": "AI 找群", "person": "AI 找人", "completed": "已完成"}
@@ -181,28 +181,19 @@ def _conflict(conn, row, contact_id, handle):
     return _identity_conflict(conn, contact_id) or bool(
         conn.execute(
             """
-        SELECT 1 FROM contact_assignments WHERE contact_id=%s AND ended_at IS NULL
-            AND responsible_authorization_id<>%s
-        UNION ALL SELECT 1 FROM creator_account_assignments WHERE contact_id=%s AND ended_at IS NULL
-            AND responsible_authorization_id<>%s
-        UNION ALL SELECT 1 FROM social_accounts s WHERE s.platform='tiktok'
+        SELECT 1 FROM social_accounts s WHERE s.platform='tiktok'
           AND lower(s.normalized_handle)=%s AND (
             EXISTS (SELECT 1 FROM contact_social_accounts l WHERE l.social_account_id=s.id
               AND (l.status='confirmed' AND (l.contact_id<>%s OR l.relationship<>'owner')
                    OR l.contact_id=%s AND l.status='rejected'))
             OR EXISTS (SELECT 1 FROM creator_account_assignments a WHERE a.social_account_id=s.id
-              AND a.ended_at IS NULL AND (a.contact_id<>%s OR a.responsible_authorization_id<>%s))) LIMIT 1
+              AND a.ended_at IS NULL AND a.contact_id<>%s)) LIMIT 1
         """,
             (
-                contact_id,
-                row["cm_authorization_id"],
-                contact_id,
-                row["cm_authorization_id"],
                 handle,
                 contact_id,
                 contact_id,
                 contact_id,
-                row["cm_authorization_id"],
             ),
         ).fetchone()
     )
@@ -252,7 +243,7 @@ def _admit(conn, row, actor, handle, contact_id, *, automatic=False):
         reviewed_by_authorization_id,reviewed_at,import_row_id)
         VALUES(%s,%s,'owner','confirmed',%s,%s,NOW(),%s)
         ON CONFLICT(contact_id,social_account_id,relationship) DO UPDATE SET
-        import_row_id=EXCLUDED.import_row_id,updated_at=NOW()
+            import_row_id=COALESCE(contact_social_accounts.import_row_id,EXCLUDED.import_row_id),updated_at=NOW()
         WHERE contact_social_accounts.status='confirmed'""",
         (
             contact_id,
@@ -265,7 +256,9 @@ def _admit(conn, row, actor, handle, contact_id, *, automatic=False):
     conn.execute(
         """INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source,confidence,
         created_by_authorization_id,import_row_id) SELECT %s,%s,%s,%s,%s,%s,%s
-        WHERE NOT EXISTS (SELECT 1 FROM contact_assignments WHERE contact_id=%s AND ended_at IS NULL)""",
+        WHERE NOT EXISTS (SELECT 1 FROM contact_assignments WHERE contact_id=%s
+          AND responsible_authorization_id=%s AND ended_at IS NULL)
+        ON CONFLICT (contact_id,responsible_authorization_id) WHERE ended_at IS NULL DO NOTHING""",
         (
             uuid4(),
             contact_id,
@@ -275,6 +268,7 @@ def _admit(conn, row, actor, handle, contact_id, *, automatic=False):
             None if automatic else actor,
             row["id"],
             contact_id,
+            row["cm_authorization_id"],
         ),
     )
     if not automatic and (row["handle"] != handle or row["contact_id"] != contact_id):
@@ -367,7 +361,7 @@ def start_import(actor_id, batch_id):
         if batch["status"] == "preview":
             if not batch["counts"].get("valid"):
                 raise ValueError("没有可以导入的 handle，请修改表格。")
-            for entry in batch["preview_rows"]:
+            for entry in sorted(batch["preview_rows"], key=lambda entry: entry["handle"]):
                 if entry["error"]:
                     continue
                 row = conn.execute(
@@ -393,10 +387,18 @@ def start_import(actor_id, batch_id):
                             person = conn.execute(
                                 "SELECT creator_type FROM contacts WHERE id=%s", (contact_id,)
                             ).fetchone()
-                            # Reusing an existing CAP account only records this
-                            # import's link; it never re-reviews or locks people.
+                            # Reuse the verified identity; add only this CM's missing
+                            # responsibility through the normal admission checks.
                             # A previous pending CAP attribute needs manual confirmation.
                             if person["creator_type"] == "cap":
+                                if not _accessible(conn, row["cm_authorization_id"], contact_id):
+                                    raise PermissionError("该用户不在这位负责人的可访问联系人范围内。")
+                                if not conn.execute(
+                                    "SELECT 1 FROM contact_assignments WHERE contact_id=%s "
+                                    "AND responsible_authorization_id=%s AND ended_at IS NULL",
+                                    (contact_id, row["cm_authorization_id"]),
+                                ).fetchone():
+                                    _admit(conn, row, actor_id, row["handle"], contact_id, automatic=True)
                                 conn.execute(
                                     """UPDATE creator_import_rows SET contact_id=%s,review_status='confirmed',
                                     status='succeeded',outcome='matched',reason_code='existing',
@@ -408,12 +410,13 @@ def start_import(actor_id, batch_id):
                                 conn.execute(
                                     "UPDATE creator_import_rows SET contact_id=%s WHERE id=%s", (contact_id, row["id"])
                                 )
-                except ValueError:
+                except (ValueError, PermissionError) as exc:
                     conn.execute(
-                        "UPDATE creator_import_rows SET status='skipped',reason_code='account_conflict',"
+                        "UPDATE creator_import_rows SET status='skipped',reason_code=%s,"
                         "outcome='conflict' "
                         "WHERE id=%s",
-                        (row["id"],),
+                        ("authorization_changed" if isinstance(exc, PermissionError) else "account_conflict",
+                         row["id"]),
                     )
             conn.execute(
                 "UPDATE creator_import_batches SET status='running',updated_at=NOW() WHERE id=%s", (batch["id"],)
@@ -450,26 +453,20 @@ def defer_row(actor_id, row_id):
 
 
 def _existing(conn, row):
+    # A confirmed account/person fact is reusable across CMs; responsibility is separate.
     found = conn.execute(
-        """SELECT DISTINCT s.id,l.contact_id,(
-            EXISTS (SELECT 1 FROM contact_assignments a WHERE a.contact_id=l.contact_id AND a.ended_at IS NULL
-                AND a.responsible_authorization_id=%s)
-            OR EXISTS (SELECT 1 FROM creator_account_assignments a WHERE a.social_account_id=s.id
-                AND a.contact_id=l.contact_id AND a.responsible_authorization_id=%s AND a.ended_at IS NULL)
-            ) assigned_here,(
-            EXISTS (SELECT 1 FROM contact_assignments a WHERE a.contact_id=l.contact_id AND a.ended_at IS NULL
-                AND a.responsible_authorization_id<>%s)
-            OR EXISTS (SELECT 1 FROM creator_account_assignments a WHERE a.social_account_id=s.id
-                AND a.responsible_authorization_id<>%s AND a.ended_at IS NULL)
-            ) assigned_elsewhere FROM social_accounts s
-        LEFT JOIN contact_social_accounts l ON l.social_account_id=s.id AND l.status='confirmed'
-            AND l.relationship='owner'
-        WHERE s.platform='tiktok' AND lower(s.normalized_handle)=%s""",
-        (*(row["cm_authorization_id"],) * 4, row["handle"]),
+        """SELECT DISTINCT s.id,l.contact_id FROM social_accounts s
+        LEFT JOIN LATERAL (
+            SELECT contact_id FROM contact_social_accounts WHERE social_account_id=s.id
+              AND status='confirmed' AND relationship='owner'
+            UNION SELECT contact_id FROM creator_account_assignments WHERE social_account_id=s.id
+              AND ended_at IS NULL AND relationship='owner'
+        ) l ON TRUE WHERE s.platform='tiktok' AND lower(s.normalized_handle)=%s""",
+        (row["handle"],),
     ).fetchall()
-    if len(found) > 1 or any(item["assigned_elsewhere"] for item in found):
+    if len(found) > 1:
         raise ValueError(REASONS["account_conflict"])
-    return found[0]["contact_id"] if found and found[0]["assigned_here"] else None
+    return found[0]["contact_id"] if found else None
 
 
 def batch_summaries(conn, cm_id):

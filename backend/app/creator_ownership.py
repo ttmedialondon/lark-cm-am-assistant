@@ -29,7 +29,7 @@ REASONS = {
     "no_substantive_messages": "缺少业务内容",
     "insufficient_exchange": "双方材料不足",
     "insufficient_two_way_messages": "双方材料不足",
-    "already_assigned": "已有负责人，未改动",
+    "already_assigned": "已在当前 CM 名下，未改动",
     "insufficient_two_way_material": "双方材料不足",
     "identity_changed": "人员类别或用户信息已变化",
     "authorization_changed": "授权或原文已变化，请重新预筛选",
@@ -102,13 +102,14 @@ def _cm(conn, cm_id):
     ).fetchone()
 
 
-def _owned(conn, contact_id):
+def _owned(conn, contact_id, cm_id):
     return bool(
         conn.execute(
-            """SELECT 1 FROM contact_assignments WHERE contact_id=%s AND ended_at IS NULL
+            """SELECT 1 FROM contact_assignments WHERE contact_id=%s
+           AND responsible_authorization_id=%s AND ended_at IS NULL
            UNION ALL SELECT 1 FROM creator_account_assignments
-           WHERE contact_id=%s AND ended_at IS NULL LIMIT 1""",
-            (contact_id, contact_id),
+           WHERE contact_id=%s AND responsible_authorization_id=%s AND ended_at IS NULL LIMIT 1""",
+            (contact_id, cm_id, contact_id, cm_id),
         ).fetchone()
     )
 
@@ -169,8 +170,9 @@ def create_preview(actor_id, cm_id):
         owned = {
             r["contact_id"]
             for r in conn.execute(
-                """SELECT contact_id FROM contact_assignments WHERE ended_at IS NULL
-               UNION SELECT contact_id FROM creator_account_assignments WHERE ended_at IS NULL"""
+                """SELECT contact_id FROM contact_assignments WHERE ended_at IS NULL AND responsible_authorization_id=%s
+               UNION SELECT contact_id FROM creator_account_assignments
+               WHERE ended_at IS NULL AND responsible_authorization_id=%s""", (cm_id, cm_id)
             ).fetchall()
         }
         eligible = [r for r in rows if r["contact_id"] not in owned and r["open_id"]]
@@ -224,7 +226,7 @@ def _eligible_now(conn, task):
         return "authorization_changed"
     if not _creator(conn, task["contact_id"]):
         return "identity_changed"
-    if _owned(conn, task["contact_id"]):
+    if _owned(conn, task["contact_id"], task["cm_authorization_id"]):
         return "already_assigned"
     return ""
 
