@@ -361,6 +361,24 @@ def normalize_user_permission_filter(value: str) -> str:
     return value if value in {"all", "none", "any", "owner"} | PAGE_KEYS else "all"
 
 
+def message_users(page: int = 1, *, source_id: UUID | None = None) -> dict[str, Any]:
+    """Source picker metadata only: never aggregate the message ledger."""
+    with connection() as conn:
+        rows = conn.execute(
+            """SELECT id, display_name, status AS authorization_status, body_consent_at
+               FROM authorizations WHERE (%s::uuid IS NULL OR id=%s)
+               ORDER BY authorized_at DESC""", (source_id, source_id),
+        ).fetchall()
+    page, _, offset = _page_window(page, total_count=len(rows))
+    return _page_result([_decorate_user(row) for row in rows[offset:offset + LIST_PAGE_SIZE]],
+                        page, total_count=len(rows))
+
+
+def message_user(source_id: UUID) -> dict[str, Any] | None:
+    rows = message_users(source_id=source_id)["items"]
+    return {"user": rows[0]} if rows else None
+
+
 def users(page: int = 1, query: str = "", permission_filter: str = "all") -> dict[str, Any]:
     """Return per-user statistics without double-counting canonical messages."""
 

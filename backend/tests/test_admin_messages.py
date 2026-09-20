@@ -100,8 +100,8 @@ def console(monkeypatch):
             "metrics": {"message_count": 250, "content_count": state["content_count"], "own_message_count": 30},
         }
 
-    monkeypatch.setattr(admin_reporting, "users", users)
-    monkeypatch.setattr(admin_reporting, "user_detail", user_detail)
+    monkeypatch.setattr(admin_reporting, "message_users", users)
+    monkeypatch.setattr(admin_reporting, "message_user", user_detail)
     monkeypatch.setattr(admin_reporting, "message_conversations", directory)
     monkeypatch.setattr(admin_reporting, "message_conversation", conversation)
     monkeypatch.setattr(admin_reporting, "message_page", messages)
@@ -135,15 +135,19 @@ def test_text_export_zip_and_source_permissions(console, monkeypatch):
 
     calls = []
 
-    def build(path, source_id, viewer_id):
+    def stream(source_id, viewer_id, check_access):
         calls.append((source_id, viewer_id))
-        with ZipFile(path, 'w') as archive:
-            message_export.write_conversation(archive, '群聊_测试_1.xlsx', [
-                ('2026-09-20 10:00:00+01:00', '=sender', '=HYPERLINK("bad")\n原文'),
-                ('2026-09-20 10:01:00+01:00', '张三', '长' * 40000),
-            ])
+        with message_export.ZipBuffer() as output:
+            with ZipFile(output, 'w') as archive:
+                message_export.write_conversation(archive, '群聊_测试_1.xlsx', [
+                    ('2026-09-20 10:00:00+01:00', '=sender', '=HYPERLINK("bad")\n原文'),
+                    ('2026-09-20 10:01:00+01:00', '张三', '长' * 40000),
+                ])
+                check_access()
+                yield from output.drain()
+            yield from output.drain()
 
-    monkeypatch.setattr(message_export, 'build_export', build)
+    monkeypatch.setattr(message_export, 'stream_export', stream)
     monkeypatch.setattr(admin_permissions, 'access_for', lambda _: {
         'has_admin_access': True, 'is_owner': False, 'permissions': ['messages'],
         'message_source_ids': [console.source['id']], 'landing_path': '/admin/messages',
@@ -155,6 +159,8 @@ def test_text_export_zip_and_source_permissions(console, monkeypatch):
     response = console.browser.get(url, params={'user_id': str(console.source['id'])})
     assert response.status_code == 200
     assert response.headers['cache-control'].startswith('no-store')
+    assert 'content-length' not in response.headers
+    assert response.headers['content-disposition'].startswith('attachment;')
     with ZipFile(BytesIO(response.content)) as archive:
         book = load_workbook(BytesIO(archive.read(archive.namelist()[0])))
         sheet = book.active
@@ -207,7 +213,18 @@ def test_export_reads_all_consented_text_and_excludes_inaccessible_rows(pg, monk
 
     monkeypatch.setattr(message_export, 'mention_names', unlocked_lookup)
     path = tmp_path / 'export.zip'
-    message_export.build_export(path, source, source)
+    access_checks = []
+    iterator = message_export.stream_export(source, source, lambda: access_checks.append(True))
+    first_chunk = next(iterator)
+    assert first_chunk.startswith(b'PK')
+    # The first bytes arrive before the export finishes or its audit is committed.
+    assert pg.execute("SELECT count(*) n FROM audit_events WHERE action='admin_messages_exported'").fetchone()['n'] == 0
+    with path.open('wb') as output:
+        output.write(first_chunk)
+        for chunk in iterator:
+            assert len(chunk) <= 65536
+            output.write(chunk)
+    assert len(access_checks) == 2
     assert lookup_calls
     with ZipFile(path) as archive:
         assert len(archive.namelist()) == 2
@@ -220,6 +237,18 @@ def test_export_reads_all_consented_text_and_excludes_inaccessible_rows(pg, monk
         assert rows[0][2] == 'message-0'
         assert {row[2] for row in rows} == {f'message-{i}' for i in [*range(500), 501]}
     assert pg.execute("SELECT count(*) n FROM audit_events WHERE action='admin_messages_exported'").fetchone()['n'] == 1
+    interrupted = message_export.stream_export(source, source, lambda: None)
+    assert next(interrupted).startswith(b'PK')
+    interrupted.close()
+    assert not pg.execute("SELECT name FROM pg_cursors WHERE name='message_export'").fetchall()
+    assert pg.execute("SELECT count(*) n FROM audit_events WHERE action='admin_messages_exported'").fetchone()['n'] == 1
+
+    def revoked():
+        raise PermissionError('revoked')
+
+    with pytest.raises(PermissionError):
+        b''.join(message_export.stream_export(source, source, revoked))
+    assert not pg.execute("SELECT name FROM pg_cursors WHERE name='message_export'").fetchall()
 
 
 def _query(url):
@@ -288,7 +317,7 @@ def test_source_outside_current_user_page_loads_only_metadata(console):
     response = _open(console, user_page=2)
     assert response.status_code == 200
     assert console.calls["user_detail"] == [(
-        (console.source["id"],), {"include_conversations": False, "include_jobs": False},
+        (console.source["id"],), {},
     )]
     assert console.contexts[-1]["selected_user_in_page"] is False
     assert 'selected>Remi' in response.text or 'selected="selected">Remi' in response.text
@@ -340,7 +369,7 @@ def test_source_restriction_filters_directory_and_blocks_forged_source(console, 
         source_id = uuid4()
         sources[source_id] = {**console.source, "id": source_id, "display_name": name}
         allowed.append(source_id)
-    monkeypatch.setattr(admin_reporting, "user_detail", lambda source_id, **_: {"user": sources[source_id]})
+    monkeypatch.setattr(admin_reporting, "message_user", lambda source_id, **_: {"user": sources[source_id]})
     response = console.browser.get("/admin/messages")
     assert response.status_code == 200
     assert {u["id"] for u in console.contexts[-1]["users"]} == set(allowed)

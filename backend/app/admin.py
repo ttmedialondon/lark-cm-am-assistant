@@ -10,16 +10,14 @@ from __future__ import annotations
 import hmac
 import json
 from collections.abc import Callable
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any, Protocol
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, quote, urlencode
 from uuid import UUID, uuid4
 
+import anyio
 from fastapi import APIRouter, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
-from starlette.background import BackgroundTask
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import (
@@ -462,38 +460,39 @@ def create_admin_router(
         limits = context["message_source_ids"]
         if limits is not None and user_id not in limits:
             return Response("消息来源未获授权", status_code=403)
-        source = admin_reporting.user_detail(user_id, include_conversations=False, include_jobs=False)
+        source = admin_reporting.message_user(user_id)
         if not source:
             return Response("未找到人员", status_code=404)
         user = source["user"]
         if user.get("authorization_status") != "active" or not user.get("body_consent_at"):
             return Response("该人员当前无有效正文授权", status_code=403)
-        temporary = TemporaryDirectory(prefix="lark-export-")
-        try:
-            path = Path(temporary.name) / "messages.zip"
-            message_export.build_export(path, user_id, context["authorization"]["id"])
+
+        def check_access():
             refreshed, denied = access(request)
             if denied is not None:
-                temporary.cleanup()
-                return denied
+                raise PermissionError("导出访问权限已变化")
             limits = refreshed["message_source_ids"]
-            latest = admin_reporting.user_detail(user_id, include_conversations=False, include_jobs=False)
+            latest = admin_reporting.message_user(user_id)
             if (limits is not None and user_id not in limits) or not latest or (
                 latest["user"].get("authorization_status") != "active"
                 or latest["user"].get("body_consent_at") != user["body_consent_at"]
             ):
-                temporary.cleanup()
-                return Response("授权已变化，请重新打开页面", status_code=403)
-            return FileResponse(path, media_type="application/zip",
-                                filename=f'{message_export.safe_name(user["display_name"])}_全部聊天记录.zip',
-                                headers={"Cache-Control": "no-store, max-age=0"},
-                                background=BackgroundTask(temporary.cleanup))
-        except ValueError as exc:
-            temporary.cleanup()
-            return render_template(request, "error.html", {"title": "暂时无法导出", "detail": str(exc)}, 400)
-        except Exception:
-            temporary.cleanup()
-            raise
+                raise PermissionError("消息来源授权已变化")
+
+        async def chunks():
+            iterator = message_export.stream_export(user_id, context["authorization"]["id"], check_access)
+            try:
+                while (chunk := await run_in_threadpool(next, iterator, None)) is not None:
+                    yield chunk
+            finally:
+                with anyio.CancelScope(shield=True):
+                    await run_in_threadpool(iterator.close)
+
+        filename = quote(f'{message_export.safe_name(user["display_name"])}_全部聊天记录.zip')
+        return StreamingResponse(chunks(), media_type="application/zip", headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
+            "Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no",
+        })
 
     @router.get("/admin/messages")
     def admin_messages(
@@ -517,7 +516,7 @@ def create_admin_router(
                 "title": "消息来源未获授权", "detail": "你只能查看已获授权的 CM 消息。",
             }, 403)
         if source_limit is not None:
-            sources = [admin_reporting.user_detail(source_id, include_conversations=False, include_jobs=False)
+            sources = [admin_reporting.message_user(source_id)
                        for source_id in source_limit]
             allowed_users = sorted([source["user"] for source in sources if source],
                                    key=lambda user: user.get("display_name") or "")
@@ -525,12 +524,12 @@ def create_admin_router(
                 allowed_users, 1, total_count=len(allowed_users),
             )
         else:
-            user_page_data = admin_reporting.users(user_page)
+            user_page_data = admin_reporting.message_users(user_page)
         users = user_page_data["items"]
         selected_user = next((item for item in users if item["id"] == user_id), None)
         selected_user_in_page = selected_user is not None
         if user_id is not None and selected_user is None:
-            selected = admin_reporting.user_detail(user_id, include_conversations=False, include_jobs=False)
+            selected = admin_reporting.message_user(user_id)
             selected_user = selected["user"] if selected else None
         if user_id is not None and not selected_user:
             return render_template(

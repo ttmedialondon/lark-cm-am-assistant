@@ -27,7 +27,7 @@
         </form>
         {% if selected_user and (user_page.previous_url or user_page.next_url) %}<details class="message-console__more-sources"><summary>更多人员 · 当前第 {{ user_page.page }} 页</summary>{% with pager=user_page %}{% include "admin/_pagination.html" %}{% endwith %}</details>{% endif %}
         {% if selected_user %}<p class="message-console__source-hint">切换人员会清空会话筛选和已打开的记录。</p>{% endif %}
-        {% if selected_user and not source_unavailable_reason %}<a class="btn btn-outline-primary mt-2" href="/admin/messages/export?user_id={{ selected_user.id }}">下载全部聊天记录</a><p class="text-secondary small mt-1">下载此人已同步的全部文字聊天记录（私聊及群聊），每个会话一份 Excel，打包为 ZIP；不受当前筛选影响。记录较多时请等待下载开始。</p>{% endif %}
+        {% if selected_user and not source_unavailable_reason %}<a class="btn btn-outline-primary mt-2" href="/admin/messages/export?user_id={{ selected_user.id }}">下载全部聊天记录</a><p class="text-secondary small mt-1">每个会话一份 Excel，打包为 ZIP。边生成边下载，可在浏览器下载列表查看。</p>{% endif %}
       </div>
     </header>
 
