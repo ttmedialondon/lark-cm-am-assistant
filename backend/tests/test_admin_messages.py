@@ -125,6 +125,93 @@ def _open(console, **params):
     return console.browser.get("/admin/messages", params={"user_id": str(console.source["id"]), **params})
 
 
+def test_text_export_zip_and_source_permissions(console, monkeypatch):
+    from io import BytesIO
+    from zipfile import ZipFile
+
+    from openpyxl import load_workbook
+
+    from app import message_export
+
+    calls = []
+
+    def build(path, source_id, viewer_id):
+        calls.append((source_id, viewer_id))
+        with ZipFile(path, 'w') as archive:
+            message_export.write_conversation(archive, '群聊_测试_1.xlsx', [
+                ('2026-09-20 10:00:00+01:00', '=sender', '=HYPERLINK("bad")\n原文'),
+                ('2026-09-20 10:01:00+01:00', '张三', '长' * 40000),
+            ])
+
+    monkeypatch.setattr(message_export, 'build_export', build)
+    monkeypatch.setattr(admin_permissions, 'access_for', lambda _: {
+        'has_admin_access': True, 'is_owner': False, 'permissions': ['messages'],
+        'message_source_ids': [console.source['id']], 'landing_path': '/admin/messages',
+    })
+    assert '下载全部聊天记录' in _open(console).text
+    url = '/admin/messages/export'
+    assert console.browser.get(url, params={'user_id': str(uuid4())}).status_code == 403
+    assert not calls
+    response = console.browser.get(url, params={'user_id': str(console.source['id'])})
+    assert response.status_code == 200
+    assert response.headers['cache-control'].startswith('no-store')
+    with ZipFile(BytesIO(response.content)) as archive:
+        book = load_workbook(BytesIO(archive.read(archive.namelist()[0])))
+        sheet = book.active
+        assert sheet['C2'].data_type == 's'
+        assert sheet['C2'].value == '=HYPERLINK("bad")\n原文'
+        assert sheet['B2'].data_type == 's'
+        assert sheet['C3'].value + sheet['C4'].value == '长' * 40000
+    console.source['authorization_status'] = 'revoked'
+    assert console.browser.get(url, params={'user_id': str(console.source['id'])}).status_code == 403
+    assert len(calls) == 1
+
+
+def test_export_reads_all_consented_text_and_excludes_inaccessible_rows(pg, monkeypatch, tmp_path):
+    import json
+    from contextlib import nullcontext
+    from io import BytesIO
+    from zipfile import ZipFile
+
+    from openpyxl import load_workbook
+
+    from app import message_export
+
+    source = uuid4()
+    pg.execute("""INSERT INTO authorizations(id,open_id,access_token_ciphertext,body_consent_at)
+                  VALUES(%s,'export-user','unused',NOW() - INTERVAL '1 day')""", (source,))
+    for chat in ('group', 'private', 'hidden'):
+        pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES(%s,'同名',%s)",
+                   (chat, 'p2p' if chat == 'private' else 'group'))
+        pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id,is_visible) VALUES(%s,%s,%s)",
+                   (source, chat, chat != 'hidden'))
+    for i in range(505):
+        chat = 'group' if i < 501 else 'private' if i < 504 else 'hidden'
+        kind = 'image' if i == 502 else 'text'
+        pg.execute("""INSERT INTO chat_messages(chat_id,message_id,message_type,body_ciphertext,is_deleted)
+                      VALUES(%s,%s,%s,%s,%s)""",
+                   (chat, str(i).zfill(4), kind, json.dumps({'text': f'message-{i}'}), i == 503))
+        pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id,observed_at)
+                      VALUES(%s,%s,%s,NOW() - %s * INTERVAL '1 day')""",
+                   (source, chat, str(i).zfill(4), 2 if i == 500 else 0))
+    monkeypatch.setattr(message_export, 'connection', lambda: nullcontext(pg))
+    monkeypatch.setattr(message_export, 'get_settings', lambda: SimpleNamespace(token_encryption_key='unused'))
+    monkeypatch.setattr(message_export, 'message_body_cipher', lambda _: SimpleNamespace(decrypt=lambda value: value))
+    path = tmp_path / 'export.zip'
+    message_export.build_export(path, source, source)
+    with ZipFile(path) as archive:
+        assert len(archive.namelist()) == 2
+        rows = []
+        for name in archive.namelist():
+            book = load_workbook(BytesIO(archive.read(name)), read_only=True)
+            rows.extend(list(book.active.values)[1:])
+            book.close()
+        assert len(rows) == 501
+        assert rows[0][2] == 'message-0'
+        assert {row[2] for row in rows} == {f'message-{i}' for i in [*range(500), 501]}
+    assert pg.execute("SELECT count(*) n FROM audit_events WHERE action='admin_messages_exported'").fetchone()['n'] == 1
+
+
 def _query(url):
     assert urlsplit(url).path == "/admin/messages"
     return parse_qs(urlsplit(url).query)

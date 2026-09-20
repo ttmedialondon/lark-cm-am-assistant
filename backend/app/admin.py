@@ -10,13 +10,16 @@ from __future__ import annotations
 import hmac
 import json
 from collections.abc import Callable
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Protocol
 from urllib.parse import parse_qs, urlencode
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from . import (
@@ -26,6 +29,7 @@ from . import (
     ai_feature_config,
     contact_assessments,
     creator_ownership,
+    message_export,
     offhours_summary,
     organization_sync,
 )
@@ -102,6 +106,7 @@ def create_admin_router(
             "/admin": "overview", "/admin/users": "users", "/admin/users/{authorization_id}": "users",
             "/admin/chats": "chats", "/admin/messages": "messages", "/admin/contacts": "contacts",
             "/admin/contacts/{open_id}": "contacts",
+            "/admin/messages/export": "messages",
             "/admin/ai": "ai", "/admin/jobs": "jobs",
             "/admin/ai/creator-ownership": "ai", "/admin/ai/creator-ownership/data": "ai",
         }.get(route_path)
@@ -448,6 +453,47 @@ def create_admin_router(
                 "chat_page": pagination(chat_page, "/admin/chats"),
             },
         )
+
+    @router.get("/admin/messages/export")
+    def export_messages(request: Request, user_id: UUID) -> Response:
+        context, denied = access(request)
+        if denied is not None:
+            return denied
+        limits = context["message_source_ids"]
+        if limits is not None and user_id not in limits:
+            return Response("消息来源未获授权", status_code=403)
+        source = admin_reporting.user_detail(user_id, include_conversations=False, include_jobs=False)
+        if not source:
+            return Response("未找到人员", status_code=404)
+        user = source["user"]
+        if user.get("authorization_status") != "active" or not user.get("body_consent_at"):
+            return Response("该人员当前无有效正文授权", status_code=403)
+        temporary = TemporaryDirectory(prefix="lark-export-")
+        try:
+            path = Path(temporary.name) / "messages.zip"
+            message_export.build_export(path, user_id, context["authorization"]["id"])
+            refreshed, denied = access(request)
+            if denied is not None:
+                temporary.cleanup()
+                return denied
+            limits = refreshed["message_source_ids"]
+            latest = admin_reporting.user_detail(user_id, include_conversations=False, include_jobs=False)
+            if (limits is not None and user_id not in limits) or not latest or (
+                latest["user"].get("authorization_status") != "active"
+                or latest["user"].get("body_consent_at") != user["body_consent_at"]
+            ):
+                temporary.cleanup()
+                return Response("授权已变化，请重新打开页面", status_code=403)
+            return FileResponse(path, media_type="application/zip",
+                                filename=f'{message_export.safe_name(user["display_name"])}_全部聊天记录.zip',
+                                headers={"Cache-Control": "no-store, max-age=0"},
+                                background=BackgroundTask(temporary.cleanup))
+        except ValueError as exc:
+            temporary.cleanup()
+            return render_template(request, "error.html", {"title": "暂时无法导出", "detail": str(exc)}, 400)
+        except Exception:
+            temporary.cleanup()
+            raise
 
     @router.get("/admin/messages")
     def admin_messages(

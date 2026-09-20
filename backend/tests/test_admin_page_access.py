@@ -28,6 +28,7 @@ GET_ROUTES = (
     ("users", f"/admin/users/{TARGET}"),
     ("chats", "/admin/chats"),
     ("messages", "/admin/messages"),
+    ("messages", f"/admin/messages/export?user_id={TARGET}"),
     ("contacts", "/admin/contacts"),
     ("contacts", "/admin/contacts/ou_contact"),
     ("ai", "/admin/ai"),
