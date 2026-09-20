@@ -83,7 +83,8 @@ def build_export(path, source_id, viewer_id):
 
                 def text_rows(source):
                     while batch := list(islice(source, 500)):
-                        names = mention_names(conn, batch)
+                        # Exports are long reads; holding identity locks blocks sync and can deadlock.
+                        names = mention_names(conn, batch, lock=False)
                         for row in batch:
                             raw = cipher.decrypt(row['body_ciphertext'])
                             try:

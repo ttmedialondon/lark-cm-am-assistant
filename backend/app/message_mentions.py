@@ -66,7 +66,7 @@ def mention_targets(mentions, names=None):
     return result
 
 
-def mention_names(conn, rows):
+def mention_names(conn, rows, *, lock=True):
     """Call ONLY after authorizing rows. Read labels for their explicit mentions.
 
     This is not a directory search and grants no access to anyone's messages.
@@ -86,7 +86,7 @@ def mention_names(conn, rows):
         row["open_id"]: row["display_name"]
         for row in conn.execute(
             """SELECT open_id,display_name FROM lark_identities
-               WHERE open_id=ANY(%s::text[]) AND identity_type='user' FOR SHARE""",
+               WHERE open_id=ANY(%s::text[]) AND identity_type='user'""" + (" FOR SHARE" if lock else ""),
             (ids,),
         ).fetchall()
         if _name(row["display_name"])

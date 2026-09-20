@@ -93,6 +93,10 @@ def test_batch_lookup_is_only_explicit_metadata_ids_not_senders_or_other_rows():
         assert mention_names(conn, [{"mentions_json": invalid}]) == {}
     assert len(queries) == 1
 
+    assert "FOR SHARE" in queries[0][0]
+    assert mention_names(conn, rows, lock=False) == {"ou_cm": "Remi（Quanzhen Liang）"}
+    assert "FOR SHARE" not in queries[-1][0]
+
 
 def test_rich_at_tags_require_same_message_open_id_mapping():
     mentions = [mention()]

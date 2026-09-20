@@ -197,8 +197,18 @@ def test_export_reads_all_consented_text_and_excludes_inaccessible_rows(pg, monk
     monkeypatch.setattr(message_export, 'connection', lambda: nullcontext(pg))
     monkeypatch.setattr(message_export, 'get_settings', lambda: SimpleNamespace(token_encryption_key='unused'))
     monkeypatch.setattr(message_export, 'message_body_cipher', lambda _: SimpleNamespace(decrypt=lambda value: value))
+    lookup = message_export.mention_names
+    lookup_calls = []
+
+    def unlocked_lookup(conn, rows, *, lock=True):
+        assert lock is False  # Long exports must not hold row locks against the sync worker.
+        lookup_calls.append(len(rows))
+        return lookup(conn, rows, lock=lock)
+
+    monkeypatch.setattr(message_export, 'mention_names', unlocked_lookup)
     path = tmp_path / 'export.zip'
     message_export.build_export(path, source, source)
+    assert lookup_calls
     with ZipFile(path) as archive:
         assert len(archive.namelist()) == 2
         rows = []
