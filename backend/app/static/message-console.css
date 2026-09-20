@@ -16,7 +16,8 @@
 .message-console__source-picker { flex: 0 1 34rem; min-width: 0; }
 .message-console__user-form .form-label { margin-bottom: .35rem; font-size: .75rem; color: var(--mc-muted); }
 .message-console__user-form .form-select { min-width: 0; width: 100%; font-size: .8125rem; }
-.message-console__source-hint { margin: .4rem 0 0; color: var(--mc-muted); font-size: .7rem; }
+.message-console__source-actions { display: flex; align-items: stretch; gap: .5rem; }
+.message-console__source-actions .btn { flex-shrink: 0; font-size: .8125rem; }
 .message-console__more-sources { margin-top: .45rem; color: var(--mc-muted); font-size: .75rem; }
 .message-console__more-sources > summary { width: fit-content; cursor: pointer; }
 .message-console__more-sources .card-footer { margin-top: .5rem; padding: .5rem .75rem; border: 1px solid var(--mc-line); border-radius: .5rem; background: white; }
@@ -113,6 +114,9 @@
   .message-console__message { max-width: 94%; }
 }
 @media (max-width: 479.98px) {
+  .message-console__source-actions { flex-wrap: wrap; }
+  .message-console__source-actions .form-select { flex-basis: 100%; }
+  .message-console__source-actions .btn { flex: 1; }
   .message-console__source-cards { grid-template-columns: minmax(0, 1fr); padding: .85rem; }
   .message-console__start-header { align-items: flex-start; padding: 1rem; }
   .message-console__reading-meta { flex-direction: column; }
