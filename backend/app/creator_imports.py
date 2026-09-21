@@ -171,34 +171,38 @@ def _identity_conflict(conn, contact_id):
 
 
 def _conflict(conn, row, contact_id, handle):
-    roster_type = row.get("batch_creator_type", "pending")
-    if (
-        roster_type != "pending"
-        and conn.execute(
-            "SELECT 1 FROM contacts WHERE id=%s AND creator_type NOT IN ('pending',%s)",
-            (contact_id, roster_type),
-        ).fetchone()
-    ):
-        return True
-    return _identity_conflict(conn, contact_id) or bool(
-        conn.execute(
-            """
-        SELECT 1 FROM social_accounts s WHERE s.platform='tiktok'
-          AND lower(s.normalized_handle)=%s AND (
-            EXISTS (SELECT 1 FROM contact_social_accounts l WHERE l.social_account_id=s.id
-              AND (l.status='confirmed' AND (l.contact_id<>%s OR l.relationship<>'owner')
-                   OR l.contact_id=%s AND l.status='rejected'))
-            OR EXISTS (SELECT 1 FROM creator_account_assignments a WHERE a.social_account_id=s.id
-              AND a.ended_at IS NULL AND a.contact_id<>%s)) LIMIT 1
-        """,
-            (
-                handle,
-                contact_id,
-                contact_id,
-                contact_id,
-            ),
-        ).fetchone()
-    )
+    return _conflicts(conn, [(row, contact_id, handle)])[0]
+
+
+def _conflicts(conn, items):
+    """Check a batch with the same rules as admission, preserving input order."""
+    if not items:
+        return []
+    rows = conn.execute(
+        """SELECT (
+            (x.roster_type<>'pending' AND EXISTS (
+                SELECT 1 FROM contacts c WHERE c.id=x.contact_id
+                  AND c.creator_type NOT IN ('pending',x.roster_type)))
+            OR EXISTS (SELECT 1 FROM contact_roles r WHERE r.contact_id=x.contact_id AND (
+                r.status='confirmed' AND r.role<>'creator'
+                  AND r.source NOT IN ('ai_auto_confirmed','lark_internal_tenant')
+                OR r.status='rejected' AND r.role='creator'))
+            OR EXISTS (SELECT 1 FROM lark_identities i WHERE i.contact_id=x.contact_id
+                AND i.identity_type='user' AND i.tenant_classification='internal')
+            OR EXISTS (SELECT 1 FROM social_accounts s WHERE s.platform='tiktok'
+                AND lower(s.normalized_handle)=x.handle AND (
+                    EXISTS (SELECT 1 FROM contact_social_accounts l WHERE l.social_account_id=s.id
+                        AND (l.status='confirmed' AND (l.contact_id<>x.contact_id OR l.relationship<>'owner')
+                            OR l.contact_id=x.contact_id AND l.status='rejected'))
+                    OR EXISTS (SELECT 1 FROM creator_account_assignments a WHERE a.social_account_id=s.id
+                        AND a.ended_at IS NULL AND a.contact_id<>x.contact_id)))
+        ) AS conflict FROM unnest(%s::uuid[],%s::text[],%s::text[])
+          WITH ORDINALITY AS x(contact_id,roster_type,handle,position) ORDER BY x.position""",
+        ([contact_id for _, contact_id, _ in items],
+         [row.get("batch_creator_type", "pending") for row, _, _ in items],
+         [handle for _, _, handle in items]),
+    ).fetchall()
+    return [bool(row["conflict"]) for row in rows]
 
 
 def _admit(conn, row, actor, handle, contact_id, *, automatic=False):
@@ -616,46 +620,51 @@ def candidate_items(conn, cm_id, rows):
 
 
 def page_data(actor_id, cm_id, q="", page=1, *, include_candidates=True):
-    q, page = str(q or "").strip()[:120], max(1, min(int(page), 10000))
     with connection() as conn:
         cm_id, _ = creator_access.access(conn, actor_id, cm_id)
-        decorated = batch_summaries(conn, cm_id)
-        base = """FROM creator_import_rows r JOIN creator_import_batches b ON b.id=r.batch_id
-            WHERE r.cm_authorization_id=%s AND b.policy_version=%s
-            AND b.status<>'preview' AND r.review_status<>'confirmed'"""
-        params = (cm_id, POLICY_VERSION)
-        if q:
-            base += (
-                """ AND (POSITION(lower(%s) IN lower(r.handle))>0 OR EXISTS (
-                SELECT 1 FROM contacts c WHERE c.id=r.contact_id
-                AND POSITION(lower(%s) IN lower(COALESCE(c.display_name,'')))>0
-                AND EXISTS ("""
-                + _ACCESSIBLE
-                + ")))"
-            )
-            params += (q, q, cm_id)
-        total = conn.execute("SELECT count(*) n " + base, params).fetchone()["n"]
-        page = min(page, max(1, math.ceil(total / 25)))
-        if not include_candidates:
-            return {"batches": decorated, "total": total}
-        # Paginate before checking identity access; a refresh must never enumerate all CM-visible users.
-        rows = conn.execute(
-            "WITH page_rows AS MATERIALIZED (SELECT r.*,b.creator_type batch_creator_type "
-            + base
-            + " ORDER BY r.created_at DESC,r.id LIMIT 25 OFFSET %s) "
-            "SELECT r.*,c.display_name,c.creator_type FROM page_rows r "
-            "LEFT JOIN contacts c ON c.id=r.contact_id "
-            "ORDER BY r.created_at DESC,r.id",
-            (*params, (page - 1) * 25),
-        ).fetchall()
-        candidates = candidate_items(conn, cm_id, rows)
-        return {
-            "batches": decorated,
-            "candidates": candidates,
-            "total": total,
-            "page": page,
-            "total_pages": max(1, math.ceil(total / 25)),
-        }
+        return _page_data(conn, cm_id, q, page, include_candidates=include_candidates)
+
+
+def _page_data(conn, cm_id, q="", page=1, *, include_candidates=True):
+    """Read candidates using the caller's already-authorized CM and connection."""
+    q, page = str(q or "").strip()[:120], max(1, min(int(page), 10000))
+    decorated = batch_summaries(conn, cm_id)
+    base = """FROM creator_import_rows r JOIN creator_import_batches b ON b.id=r.batch_id
+        WHERE r.cm_authorization_id=%s AND b.policy_version=%s
+        AND b.status<>'preview' AND r.review_status<>'confirmed'"""
+    params = (cm_id, POLICY_VERSION)
+    if q:
+        base += (
+            """ AND (POSITION(lower(%s) IN lower(r.handle))>0 OR EXISTS (
+            SELECT 1 FROM contacts c WHERE c.id=r.contact_id
+            AND POSITION(lower(%s) IN lower(COALESCE(c.display_name,'')))>0
+            AND EXISTS ("""
+            + _ACCESSIBLE
+            + ")))"
+        )
+        params += (q, q, cm_id)
+    total = conn.execute("SELECT count(*) n " + base, params).fetchone()["n"]
+    page = min(page, max(1, math.ceil(total / 25)))
+    if not include_candidates:
+        return {"batches": decorated, "total": total}
+    # Paginate before checking identity access; a refresh must never enumerate all CM-visible users.
+    rows = conn.execute(
+        "WITH page_rows AS MATERIALIZED (SELECT r.*,b.creator_type batch_creator_type "
+        + base
+        + " ORDER BY r.created_at DESC,r.id LIMIT 25 OFFSET %s) "
+        "SELECT r.*,c.display_name,c.creator_type FROM page_rows r "
+        "LEFT JOIN contacts c ON c.id=r.contact_id "
+        "ORDER BY r.created_at DESC,r.id",
+        (*params, (page - 1) * 25),
+    ).fetchall()
+    candidates = candidate_items(conn, cm_id, rows)
+    return {
+        "batches": decorated,
+        "candidates": candidates,
+        "total": total,
+        "page": page,
+        "total_pages": max(1, math.ceil(total / 25)),
+    }
 
 
 def _decode(row, settings, key="pack_ciphertext"):

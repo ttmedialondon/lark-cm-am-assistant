@@ -563,8 +563,13 @@ def test_excel_only_pages_exclude_old_ai_candidates_and_merge_manually_confirmed
         cm, cm, "roster.xlsx", workbook("creator_one", "creator_two", *(f"unmatched_{n}" for n in range(25)))
     )
     imports.start_import(cm, batch["id"])
-    page = creator_roster.page_data(cm, cm_id=cm, tab="candidates")
-    following = creator_roster.page_data(cm, cm_id=cm, tab="candidates", page=2)
+    def no_nested_connection():
+        raise AssertionError("Roster reads must reuse their authorized connection")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(imports, "connection", no_nested_connection)
+        page = creator_roster.page_data(cm, cm_id=cm, tab="candidates")
+        following = creator_roster.page_data(cm, cm_id=cm, tab="candidates", page=2)
     assert page["total_count"] == 27 and page["total_pages"] == 2
     assert len(page["items"]) == 25 and len(following["items"]) == 2
     items = page["items"] + following["items"]

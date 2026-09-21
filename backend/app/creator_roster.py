@@ -23,8 +23,8 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
             if can_select_cm or r["id"] == cm_id
         ]
         imported = ({"total": 0, "batches": []} if read_only else
-                    creator_imports.page_data(actor_id, cm_id, q=query if tab=="candidates" else "", page=page,
-                                              include_candidates=tab == "candidates"))
+                    creator_imports._page_data(conn, cm_id, q=query if tab=="candidates" else "", page=page,
+                                               include_candidates=tab == "candidates"))
         # Person-level and older account-level assignments describe the same
         # library. UNION ensures that a person with several handles appears once.
         formal_base = """FROM contacts c WHERE c.creator_type='cap' AND c.id IN (

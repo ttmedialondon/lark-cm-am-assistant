@@ -340,16 +340,17 @@ def _related_chats(conn, roster, *, settings=None, cm_id=REMI_ID):
             if str(row["contact_id"]) != str(person):
                 continue
             selected = creator_imports._selected_chats(chain, decisions)
-            if (
-                not selected
-                or creator_imports._conflict(conn, row, row["contact_id"], row["handle"])
-            ):
+            if not selected:
                 continue
             candidates.append((row, selected, chain))
         except (InvalidTag, KeyError, TypeError, ValueError):
             # An unreadable/obsolete import cannot grant access or identify a person.
             # Independently observed relationships above remain usable.
             continue
+    conflicts = creator_imports._conflicts(
+        conn, [(row, row["contact_id"], row["handle"]) for row, _, _ in candidates]
+    )
+    candidates = [item for item, conflict in zip(candidates, conflicts, strict=True) if not conflict]
     materials = [material for _, _, chain in candidates for material in chain.values()]
     try:
         valid = iter(creator_import_evidence.validate_reference_batch(conn, settings, cm_id, materials))

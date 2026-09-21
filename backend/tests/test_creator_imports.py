@@ -213,6 +213,19 @@ def test_manual_import_scope_identity_account_and_type_conflicts_are_atomic(pg, 
     assert imports.search_users(cm, cm, "silent") == []
     imports.start_import(owner, batch["id"])
     row = row_for(pg, batch, "creator_one")
+    safe = pilot.person("batch_safe")
+    class Meter:
+        calls = 0
+
+        def execute(self, *args, **kwargs):
+            self.calls += 1
+            return pg.execute(*args, **kwargs)
+
+    meter = Meter()
+    safe_item = ({"batch_creator_type": "cap"}, safe, "unlinked_safe")
+    assert imports._conflicts(meter, []) == [] and meter.calls == 0
+    assert imports._conflicts(meter, [safe_item] * 50) == [False] * 50
+    assert meter.calls == 1
     with pytest.raises(PermissionError):
         imports.confirm_row(cm, row["id"], "creator_one", pilot.ids["silent"])
     with pytest.raises(ValueError):
@@ -229,6 +242,9 @@ def test_manual_import_scope_identity_account_and_type_conflicts_are_atomic(pg, 
             elif conflict == "rejected":
                 pg.execute("UPDATE contact_roles SET status='rejected',source='manual' "
                            "WHERE contact_id=%s AND role='creator'", (creator,))
+            handle = "legacy_account" if conflict == "account" else "creator_one"
+            assert imports._conflicts(pg, [safe_item, ({"batch_creator_type": "cap"}, creator, handle),
+                                          safe_item]) == [False, True, False]
             with pytest.raises(ValueError, match="冲突"):
                 imports.confirm_row(
                     cm, row["id"], "legacy_account" if conflict == "account" else "creator_one", creator,
