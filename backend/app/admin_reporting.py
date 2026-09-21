@@ -404,7 +404,9 @@ def users(page: int = 1, query: str = "", permission_filter: str = "all") -> dic
         page, limit, offset = _page_window(page, total_count=total_count)
         rows = conn.execute(
             f"""
-            WITH page_users AS MATERIALIZED (
+            WITH deleted_messages AS MATERIALIZED (
+                SELECT chat_id,message_id FROM chat_messages WHERE is_deleted
+            ), page_users AS MATERIALIZED (
                 SELECT a.id FROM authorizations a LEFT JOIN admin_roles r ON r.authorization_id=a.id
                 WHERE {filters} ORDER BY a.authorized_at DESC, a.id LIMIT %s OFFSET %s
             ), conversation_counts AS (
@@ -420,8 +422,8 @@ def users(page: int = 1, query: str = "", permission_filter: str = "all") -> dic
                   ON ac.authorization_id = o.authorization_id AND ac.chat_id = o.chat_id
                 JOIN chats c ON c.chat_id = ac.chat_id
                 WHERE ac.is_visible AND COALESCE(c.chat_status, 'normal') = 'normal'
-                  AND NOT EXISTS (SELECT 1 FROM chat_messages m
-                      WHERE m.chat_id=o.chat_id AND m.message_id=o.message_id AND m.is_deleted)
+                  AND NOT EXISTS (SELECT 1 FROM deleted_messages m
+                      WHERE m.chat_id=o.chat_id AND m.message_id=o.message_id)
                 GROUP BY o.authorization_id
             ), latest_jobs AS (
                 SELECT DISTINCT ON (authorization_id)
@@ -485,7 +487,9 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
     with connection() as conn:
         user = conn.execute(
             f"""
-            WITH conversation_counts AS (
+            WITH deleted_messages AS MATERIALIZED (
+                SELECT chat_id,message_id FROM chat_messages WHERE is_deleted
+            ), conversation_counts AS (
                 {CONVERSATION_COUNTS_SQL}
             ), message_counts AS (
                 SELECT
@@ -499,8 +503,8 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
                 WHERE o.authorization_id = %s
                   AND ac.is_visible
                   AND COALESCE(c.chat_status, 'normal') = 'normal'
-                  AND NOT EXISTS (SELECT 1 FROM chat_messages m
-                      WHERE m.chat_id=o.chat_id AND m.message_id=o.message_id AND m.is_deleted)
+                  AND NOT EXISTS (SELECT 1 FROM deleted_messages m
+                      WHERE m.chat_id=o.chat_id AND m.message_id=o.message_id)
                 GROUP BY o.authorization_id
             ), latest_jobs AS (
                 SELECT DISTINCT ON (authorization_id)

@@ -10,7 +10,7 @@
       <span class="badge {% if admin_role == 'owner' %}bg-indigo-lt{% else %}bg-secondary-lt{% endif %}">{% if admin_role == 'owner' %}系统主人 · 全部权限{% else %}只读查看{% endif %}</span>
     </div>
     {% if saved %}<div class="alert alert-success" role="status">权限已保存。</div>{% endif %}
-    <div class="admin-users__stats" aria-label="全部人员的权限统计">
+    <div class="admin-users__stats mb-3" aria-label="全部人员的权限统计">
       <div class="card"><div class="card-body"><div class="text-secondary">全部已接入人员</div><div class="admin-users__number">{{ summary.total }}</div></div></div>
       <div class="card"><div class="card-body"><div class="text-secondary">可进入后台</div><div class="admin-users__number text-primary">{{ summary.backend }}</div></div></div>
       <div class="card"><div class="card-body"><div class="text-secondary">仅可使用前台</div><div class="admin-users__number">{{ summary.frontend }}</div></div></div>
