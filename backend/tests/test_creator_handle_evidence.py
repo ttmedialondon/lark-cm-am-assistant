@@ -77,23 +77,6 @@ def scope(pg, monkeypatch):
     return ids, settings, add
 
 
-def _result(pack, *, handle="creator._123", basis="self_declared", labels=None):
-    return json.dumps(
-        {
-            "outcome": "matched",
-            "reason": "已核对账号关系",
-            "candidates": [
-                {
-                    "handle": handle,
-                    "confidence": 0.99,
-                    "basis": basis,
-                    "evidence_refs": labels or [r["ref"] for r in [*pack["groups"], *pack["messages"]]],
-                    "conflicts": [],
-                    "missing_info": [],
-                },
-            ],
-        }
-    )
 
 
 def test_exact_normalization_and_group_patterns_reject_guessing():
@@ -165,7 +148,6 @@ def test_self_account_keeps_exact_handle_and_current_scope_not_other_bodies(pg, 
             "someone_else",
         )
     )
-    assert handles.validate_result(_result(material["pack"]), material["pack"])["outcome"] == "matched"
     assert handles.validate_evidence(
         ids["creator"], ids["cm"], settings, material["pack"], material["refs"], material["fingerprint"]
     )
@@ -209,8 +191,6 @@ def test_self_account_keeps_exact_handle_and_current_scope_not_other_bodies(pg, 
     assert not handles.validate_evidence(
         ids["creator"], ids["cm"], settings, material["pack"], material["refs"][:-1], material["fingerprint"]
     )
-    with pytest.raises(ValueError):
-        handles.validate_result(_result(material["pack"], handle="invented_name"), material["pack"])
 
 
 def test_group_named_account_requires_actual_own_account_business_not_one_creator_or_at(pg, scope):
@@ -237,32 +217,7 @@ def test_group_named_account_requires_actual_own_account_business_not_one_creato
     assert packed.count("[已提供广告授权码]") == 1
     assert not material["stats"]["material_incomplete"] and material["stats"]["excluded_group_messages"] == 48
     assert not any(m["handles"] for m in material["pack"]["messages"])  # Only the title supplies the handle.
-    assert (
-        handles.validate_result(_result(material["pack"], basis="group_business_identity"), material["pack"])["outcome"]
-        == "matched"
-    )
-    promise_refs = [g["ref"] for g in material["pack"]["groups"]] + [
-        m["ref"] for m in material["pack"]["messages"] if "已提供广告授权码" not in m["text"]
-    ]
-    assert (
-        handles.validate_result(
-            _result(material["pack"], basis="group_business_identity", labels=promise_refs), material["pack"]
-        )["outcome"]
-        == "matched"
-    )
-    title_only = [g["ref"] for g in material["pack"]["groups"]]
-    assert (
-        handles.validate_result(
-            _result(material["pack"], basis="group_business_identity", labels=title_only), material["pack"]
-        )["outcome"]
-        == "review"
-    )
     pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('group','ou_other')")
-    other = handles.build_evidence(ids["creator"], ids["cm"], settings)
-    assert (
-        handles.validate_result(_result(other["pack"], basis="group_business_identity"), other["pack"])["outcome"]
-        == "review"
-    )
     assert not handles.validate_evidence(
         ids["creator"], ids["cm"], settings, material["pack"], material["refs"], material["fingerprint"]
     )
@@ -280,11 +235,6 @@ def test_group_named_account_requires_actual_own_account_business_not_one_creato
     pg.execute("DELETE FROM chat_messages")
     cm = add("cm", "@_user_1 Can I apply for a sample for you?", chat="group", mention="creator")
     add("creator", "Okay thanks!", chat="group", parent=cm)
-    weak = handles.build_evidence(ids["creator"], ids["cm"], settings)
-    assert (
-        handles.validate_result(_result(weak["pack"], basis="group_business_identity"), weak["pack"])["outcome"]
-        == "review"
-    )
     add("cm", "Can you send your video ad code?", chat="group")
     add("creator", "Here is my ad code: SPARKTEST456", chat="group")
     paired = handles.build_evidence(ids["creator"], ids["cm"], settings)
@@ -303,7 +253,6 @@ def test_old_rename_and_over_limit_material_cannot_silently_produce_high_confide
     current = handles.build_evidence(ids["creator"], ids["cm"], settings)
     assert current["stats"]["account_change_signal"] and current["stats"]["material_incomplete"]
     assert current["stats"]["messages"] <= 40 and current["stats"]["body_chars"] <= 16000
-    assert handles.validate_result(_result(current["pack"]), current["pack"])["outcome"] == "review"
     assert not handles.validate_evidence(
         ids["creator"], ids["cm"], settings, material["pack"], material["refs"], material["fingerprint"]
     )

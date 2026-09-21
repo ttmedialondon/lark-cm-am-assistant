@@ -87,7 +87,6 @@ def test_cm_can_read_review_own_handles_without_admin_and_cannot_cross_scope(mon
             "csrf_token": "csrf", "handles": json.dumps(handles),
         }).status_code == 403
     assert client.get(f"/creators/tasks/{foreign}/evidence").status_code == 403
-    monkeypatch.setattr(creator_handles, "set_creator_type", lambda *args: calls.append(args))
     type_url = f"/creators/people/{task}/type"
     assert client.post(type_url, data={"cm_id": str(actor["id"]), "creator_type": "cap"}).status_code == 400
     assert client.post(type_url, data={
@@ -100,10 +99,7 @@ def test_retired_handle_ai_and_type_actions_still_require_active_auth_and_csrf(m
     client, actor = browser(monkeypatch)
     run, task = uuid4(), uuid4()
     calls = []
-    for name in (
-        "create_preview", "start_run", "pause_run", "resume_run", "set_auto_admit", "confirm_task", "defer_task",
-        "recheck_task", "set_creator_type",
-    ):
+    for name in ("confirm_task", "defer_task"):
         monkeypatch.setattr(creator_handles, name, lambda *args: calls.append(args) or run)
     actions = ["/creators/preview", *(f"/creators/runs/{run}/{name}" for name in (
         "start", "pause", "resume", "auto-admit",

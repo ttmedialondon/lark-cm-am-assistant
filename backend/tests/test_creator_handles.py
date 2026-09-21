@@ -1,4 +1,4 @@
-"""Critical third-step workflows: real PostgreSQL/evidence, mocked OpenAI only."""
+"""Historical manual review and current roster; no retired scanner is used to seed fixtures."""
 
 import json
 import re
@@ -11,6 +11,7 @@ from uuid import uuid4
 import psycopg
 import pytest
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from test_creator_ownership import _prepared, _run_all, _snapshot
 from test_creator_ownership import pilot as parent_pilot
 
@@ -24,28 +25,12 @@ from app.crypto import message_body_cipher
 pilot = parent_pilot
 
 
-def _drain_preview(settings):
-    for _ in range(30):
-        if not handles.prepare_next_preview(settings):
-            return
-    pytest.fail("handle preparation did not settle")
-
-
-def _drain_paid(settings):
-    for _ in range(30):
-        job = handles.claim_next_handle()
-        if not job:
-            return
-        handles.run_claimed_handle(job, settings)
-    pytest.fail("handle paid queue did not settle")
-
-
 def _task(pg, case, contact=None):
     return pg.execute("SELECT * FROM creator_handle_tasks WHERE run_id=%s AND contact_id=%s",
                       (case.run, contact or case.creator)).fetchone()
 
 
-def _case(pg, pilot, monkeypatch, *, clues=True, uncertain=False):
+def _case(pg, pilot, monkeypatch, *, clues=True):
     from app import creator_imports
 
     for module in (handles, evidence, creator_imports, creator_roster):
@@ -60,118 +45,27 @@ def _case(pg, pilot, monkeypatch, *, clues=True, uncertain=False):
         pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'handle_group')",
                    (pilot.ids["cm"],))
         pg.execute("INSERT INTO chat_members(chat_id,open_id,member_type) VALUES('handle_group','ou_creator','user')")
-    if uncertain:
-        unsure = pilot.person("unsure", pairs=2)
-        original = openai_client.call_openai
-
-        def second_stage(*args, **kwargs):
-            response = original(*args, **kwargs)
-            if args[3] == unsure:
-                result = json.loads(response["text"])
-                result.update(outcome="uncertain", confidence=.8)
-                response["text"] = json.dumps(result)
-            return response
-
-        monkeypatch.setattr(openai_client, "call_openai", second_stage)
     source = _prepared(pilot)
     ownership.start_run(pilot.ids["owner"], source)
     _run_all(pilot)
-    before_preview = len(pilot.calls)
-    run = handles.create_preview(pilot.ids["owner"], pilot.ids["cm"], source)
-    assert pg.execute("SELECT auto_admit FROM creator_handle_runs WHERE id=%s", (run,)).fetchone()["auto_admit"]
-    # Most cases below exercise manual review; an owner may explicitly pause automatic admission.
-    handles.set_auto_admit(pilot.ids["owner"], run, False)
-    _drain_preview(pilot.settings)
-    assert len(pilot.calls) == before_preview
-    case = SimpleNamespace(run=run, source=source, creator=pilot.ids["creator"], calls=[], callbacks=[], score=.99,
-                           outcome="matched")
-
-    def handle_response(config, key, pack, contact_id, **kwargs):
-        assert kwargs["instructions"] == evidence.INSTRUCTIONS
-        assert kwargs["output_format"]["strict"] and kwargs["output_format"]["name"] == "creator_handle_v1"
-        case.calls.append(contact_id)
-        candidates = [{"handle": handle, "confidence": case.score, "basis": "self_declared",
-                       "evidence_refs": [m["ref"] for m in pack["messages"] if handle in m["self_handles"]],
-                       "conflicts": [], "missing_info": []} for handle in pack["allowed_handles"]]
-        result = {"outcome": case.outcome, "reason": "本人明确提供账号。", "candidates": candidates}
-        for callback in case.callbacks:
-            callback()
-        return {"text": json.dumps(result), "response_id": f"handle_response_{len(case.calls)}",
-                "usage": {"input_tokens": 17, "output_tokens": 9},
-                "telemetry": {"openai_request_id": f"handle_request_{len(case.calls)}"}}
-
-    monkeypatch.setattr(openai_client, "call_openai", handle_response)
-    return case
-
-
-def test_suggestions_preview_then_explicit_auto_admission_is_atomic_and_idempotent(pg, pilot, monkeypatch):
-    case = _case(pg, pilot, monkeypatch, uncertain=True)
-    protected = ("contact_roles", "contact_assessments", "creator_account_assignments", "creator_workflow_candidates",
-                 "chat_messages", "authorization_message_observations", "authorizations")
-    before = _snapshot(pg, protected)
-    task = _task(pg, case)
-    assert task["status"] == "ready" and not case.calls
-    assert pg.execute("SELECT count(*) n FROM creator_handle_tasks WHERE run_id=%s", (case.run,)).fetchone()["n"] == 1
-    run = pg.execute("SELECT auto_admit FROM creator_handle_runs WHERE id=%s", (case.run,)).fetchone()
-    assert not run["auto_admit"]
-    assert all("text" not in ref and "body" not in ref for ref in task["refs"])
-    assert handles.create_preview(pilot.ids["owner"], pilot.ids["cm"], case.source) == case.run
-    pending = _task(pg, case)
-    assert pending["status"] == "pending" and pending["pack_ciphertext"] is None and pending["refs"] == []
-    assert pending["fingerprint"] is None and pending["api_requests"] == 0 and not case.calls
-    _drain_preview(pilot.settings)
-    rebuilt = _task(pg, case)
-    assert rebuilt["id"] == task["id"] and rebuilt["status"] == "ready"
-    assert rebuilt["fingerprint"] == task["fingerprint"] and not case.calls
-    with pytest.raises(ValueError):
-        ownership.confirm_tasks(pilot.ids["owner"], case.source, [task["ownership_task_id"]])
-    with pg.transaction(force_rollback=True):
-        old_source, old_parent, old_run = uuid4(), uuid4(), uuid4()
-        pg.execute("""INSERT INTO creator_ownership_runs(id,cm_authorization_id,requested_by,policy_version,status)
-            SELECT %s,cm_authorization_id,requested_by,policy_version,'completed'
-            FROM creator_ownership_runs WHERE id=%s""", (old_source, case.source))
-        pg.execute("""INSERT INTO creator_ownership_tasks(id,run_id,contact_id,cm_authorization_id,policy_version,
-            status,outcome,confidence,created_at) SELECT %s,%s,contact_id,cm_authorization_id,policy_version,
-            'succeeded',outcome,confidence,created_at-INTERVAL '1 day' FROM creator_ownership_tasks WHERE id=%s""",
-            (old_parent, old_source, task["ownership_task_id"]))
-        pg.execute("""INSERT INTO creator_handle_runs(id,ownership_run_id,cm_authorization_id,requested_by,
-            policy_version,status) SELECT %s,%s,cm_authorization_id,requested_by,policy_version,'running'
-            FROM creator_handle_runs WHERE id=%s""", (old_run, old_source, case.run))
-        pg.execute("""INSERT INTO creator_handle_tasks(id,run_id,ownership_task_id,contact_id,cm_authorization_id,
-            policy_version,status) SELECT %s,%s,%s,contact_id,cm_authorization_id,policy_version,'queued'
-            FROM creator_handle_tasks WHERE id=%s""", (uuid4(), old_run, old_parent, task["id"]))
-        with pytest.raises(ValueError, match="旧批次"):
-            handles.start_run(pilot.ids["owner"], case.run)
-        assert _task(pg, case)["status"] == "ready" and not case.calls
-    assert handles.start_run(pilot.ids["owner"], case.run) == 1
-    assert handles.start_run(pilot.ids["owner"], case.run) == 0
-    with pytest.raises(ValueError, match="运行中"):
-        handles.create_preview(pilot.ids["owner"], pilot.ids["cm"], case.source)
-    assert _task(pg, case)["status"] == "queued" and not case.calls
-    _drain_paid(pilot.settings)
-    task = _task(pg, case)
-    assert task["status"] == "succeeded" and task["outcome"] == "matched" and task["api_requests"] == 1
-    paid = _snapshot(pg, ("creator_handle_tasks",))
-    assert handles.create_preview(pilot.ids["owner"], pilot.ids["cm"], case.source) == case.run
-    _drain_preview(pilot.settings)
-    assert _snapshot(pg, paid) == paid and len(case.calls) == 1
-    for _ in range(2):
-        assert creator_roster.page_data(pilot.ids["cm"])["items"] == []  # Archived AI work is not an Excel candidate.
-    assert len(case.calls) == 1 and handles.start_run(pilot.ids["owner"], case.run) == 0
-    _drain_preview(pilot.settings)
-    assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
-    handles.set_auto_admit(pilot.ids["owner"], case.run, True)
-    _drain_preview(pilot.settings)
-    assignment = pg.execute("SELECT * FROM contact_assignments").fetchone()
-    assert assignment["source"] == "ai" and assignment["handle_task_id"] == task["id"]
-    assert assignment["responsible_authorization_id"] == pilot.ids["cm"]
-    assert _task(pg, case)["selected_handles"] == ["creator_one", "creator_two"]
-    links = pg.execute("SELECT * FROM contact_social_accounts WHERE handle_task_id=%s", (task["id"],)).fetchall()
-    assert len(links) == 2 and all(row["contact_id"] == case.creator for row in links)
-    assert handles.confirm_task(pilot.ids["cm"], task["id"], ["@CREATOR_TWO", "creator_one"]) == 0
-    with pytest.raises(ValueError):
-        handles.confirm_task(pilot.ids["cm"], task["id"], ["different_account"])
-    assert _snapshot(pg, protected) == before and len(case.calls) == 1
+    parent = pg.execute("SELECT id FROM creator_ownership_tasks WHERE run_id=%s AND contact_id=%s",
+                        (source, pilot.ids["creator"])).fetchone()
+    material = evidence.build_evidence(pilot.ids["creator"], pilot.ids["cm"], pilot.settings)
+    run, task = uuid4(), uuid4()
+    pg.execute("""INSERT INTO creator_handle_runs(id,ownership_run_id,cm_authorization_id,requested_by,
+                  policy_version,status,auto_admit) VALUES(%s,%s,%s,%s,%s,'completed',FALSE)""",
+               (run, source, pilot.ids["cm"], pilot.ids["owner"], handles.POLICY_VERSION))
+    pg.execute("""INSERT INTO creator_handle_tasks(id,run_id,ownership_task_id,contact_id,cm_authorization_id,
+                  policy_version,status,pack_ciphertext,refs,stats,fingerprint)
+                  VALUES(%s,%s,%s,%s,%s,%s,'skipped',%s,%s,%s,%s)""",
+               (task, run, parent["id"], pilot.ids["creator"], pilot.ids["cm"], handles.POLICY_VERSION,
+                creator_data.cipher(pilot.settings).encrypt(creator_data.encode(material["pack"])),
+                Jsonb(json.loads(creator_data.encode(material["refs"]))), Jsonb(material["stats"]),
+                material["fingerprint"]))
+    def no_model(*args, **kwargs):
+        raise AssertionError("Historical review must never call a model")
+    monkeypatch.setattr(openai_client, "call_openai", no_model)
+    return SimpleNamespace(run=run, source=source, creator=pilot.ids["creator"], calls=[])
 
 
 def test_cm_can_fill_missing_handles_but_not_cross_scope_or_bypass_input_checks(pg, pilot, monkeypatch):
@@ -185,10 +79,6 @@ def test_cm_can_fill_missing_handles_but_not_cross_scope_or_bypass_input_checks(
         lambda: creator_roster.page_data(outsider, pilot.ids["cm"]),
         lambda: handles.confirm_task(outsider, task["id"], ["stolen"]),
         lambda: handles.task_evidence(outsider, task["id"]),
-        lambda: handles.start_run(pilot.ids["cm"], case.run),
-        lambda: handles.set_auto_admit(pilot.ids["cm"], case.run, True),
-        lambda: handles.set_creator_type(outsider, pilot.ids["cm"], case.creator, "cap"),
-        lambda: handles.set_creator_type(pilot.ids["cm"], pilot.ids["cm"], case.creator, "cap"),
     ):
         with pytest.raises(PermissionError):
             operation()
@@ -214,20 +104,6 @@ def test_cm_can_fill_missing_handles_but_not_cross_scope_or_bypass_input_checks(
     assert pg.execute("SELECT source FROM contact_assignments").fetchone()["source"] == "manual"
     formal = creator_roster.page_data(pilot.ids["cm"], tab="confirmed")["items"]
     assert formal == []  # The current library only lists CAP people.
-    with pytest.raises(PermissionError):
-        handles.set_creator_type(outsider, outsider, case.creator, "cap")
-    for actor_id, creator_type in ((pilot.ids["cm"], "cap"), (pilot.ids["owner"], "non_cap"),
-                                   (pilot.ids["cm"], "pending")):
-        handles.set_creator_type(actor_id, pilot.ids["cm"], case.creator, creator_type)
-        handles.set_creator_type(actor_id, pilot.ids["cm"], case.creator, creator_type)
-        assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (case.creator,)).fetchone()[
-            "creator_type"] == creator_type
-        people = creator_roster.page_data(pilot.ids["cm"], tab="confirmed")["items"]
-        if creator_type == "cap":
-            assert len(people) == 1 and people[0]["contact_id"] == str(case.creator)
-            assert len(people[0]["handles"]) == 2
-        else:
-            assert people == []
     with pg.transaction(force_rollback=True):
         pg.execute("UPDATE contacts SET creator_type='cap' WHERE id=%s", (case.creator,))
         avatar = "https://s1-imfile.feishucdn.com/static-resource/v1/example.png"
@@ -239,106 +115,38 @@ def test_cm_can_fill_missing_handles_but_not_cross_scope_or_bypass_input_checks(
                 pg.execute("UPDATE lark_identities SET avatar_url=%s,avatar_status=%s WHERE open_id='ou_creator'",
                            (url, status))
                 assert creator_roster.page_data(pilot.ids["cm"], tab="mine")["items"][0]["avatar_url"] == expected
-    changes = pg.execute("SELECT count(*) n FROM audit_events WHERE action='creator_handles_type_updated'").fetchone()
-    assert changes["n"] == 3
-    with pytest.raises(ValueError):
-        handles.set_creator_type(pilot.ids["cm"], pilot.ids["cm"], case.creator, "invalid")
     assert creator_roster.page_data(pilot.ids["cm"], tab="confirmed")["items"] == []
     assert not case.calls
 
 
-def test_low_confidence_and_changed_parent_permission_group_or_members_never_auto_admit(pg, pilot, monkeypatch):
+def test_historical_evidence_and_manual_review_revalidate_current_scope(pg, pilot, monkeypatch):
     case = _case(pg, pilot, monkeypatch)
-    case.score = .94
-    handles.start_run(pilot.ids["owner"], case.run)
-    _drain_paid(pilot.settings)
     task = _task(pg, case)
-    assert task["outcome"] == "review"  # Real validator downgrades the mocked high-level matched verdict.
-    handles.set_auto_admit(pilot.ids["owner"], case.run, True)
-    _drain_preview(pilot.settings)
-    assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
-    with pytest.raises(PermissionError):
-        handles.recheck_task(pilot.ids["cm"], task["id"])
-    with pytest.raises(ValueError):
-        handles.recheck_task(pilot.ids["owner"], task["id"])
-    handles.set_auto_admit(pilot.ids["owner"], case.run, False)
-    before = _snapshot(pg, ("creator_handle_tasks", "audit_events"))
-    with pytest.raises(ValueError):
-        handles.recheck_task(pilot.ids["owner"], task["id"])  # Identical material cannot be billed again.
-    assert _snapshot(pg, before) == before
-    for status in ("running", "paused"):
-        with pg.transaction(force_rollback=True):
-            pg.execute("UPDATE creator_handle_runs SET status=%s WHERE id=%s", (status, case.run))
-            with pytest.raises(ValueError):
-                handles.recheck_task(pilot.ids["owner"], task["id"])
-    # A group-title change only affects handle evidence, leaving the real parent material valid.
-    pg.execute("UPDATE chats SET name='creator_one * Trutonic Media' WHERE chat_id='handle_group'")
-    with pg.transaction(force_rollback=True):
-        pg.execute("UPDATE creator_ownership_tasks SET outcome='uncertain' WHERE id=%s",
-                   (task["ownership_task_id"],))
-        with pytest.raises(ValueError):
-            handles.recheck_task(pilot.ids["owner"], task["id"])
-    assert handles.recheck_task(pilot.ids["owner"], task["id"]) == case.run
-    pending = _task(pg, case)
-    assert pending["status"] == "pending" and pending["result_ciphertext"] is None
-    for key in ("attempts", "api_requests", "input_tokens", "output_tokens"):
-        assert pending[key] == task[key]
-    event = pg.execute("SELECT action,metadata FROM audit_events WHERE metadata ? 'previous_task_ciphertext'")
-    event = event.fetchone()
-    assert event["action"] == "creator_handles_recheck_requested"
-    archived = json.loads(creator_data.cipher(pilot.settings).decrypt(event["metadata"]["previous_task_ciphertext"]))
-    for key in ("pack_ciphertext", "result_ciphertext", "fingerprint", "attempts", "api_requests",
-                "input_tokens", "output_tokens"):
-        assert archived[key] == task[key]
-    assert archived["id"] == str(task["id"])
-    _drain_preview(pilot.settings)
-    assert len(case.calls) == 1 and _task(pg, case)["status"] == "ready"
-    assert _task(pg, case)["fingerprint"] != task["fingerprint"]
-    case.score, case.outcome = .99, "review"
-    assert handles.start_run(pilot.ids["owner"], case.run) == 1
-    assert handles.start_run(pilot.ids["owner"], case.run) == 0
-    _drain_paid(pilot.settings)
-    task = _task(pg, case)
-    stored = json.loads(creator_data.cipher(pilot.settings).decrypt(task["result_ciphertext"]))
-    assert stored["model_output"]["outcome"] == stored["checked"]["outcome"] == task["outcome"] == "review"
-    assert all(c["confidence"] == .99 and not c["conflicts"] and not c["missing_info"]
-               for c in stored["checked"]["candidates"])
-    assert handles._decode(task, "result_ciphertext", pilot.settings) == stored["checked"]
-    assert (task["attempts"], task["api_requests"], task["input_tokens"], task["output_tokens"]) == (2, 2, 34, 18)
-    assert len(case.calls) == 2
-    pg.execute("UPDATE chats SET name='creator_one X TT' WHERE chat_id='handle_group'")
-    with pytest.raises(ValueError):
-        handles.recheck_task(pilot.ids["owner"], task["id"])
-    pg.execute("UPDATE chats SET name='creator_one * Trutonic Media' WHERE chat_id='handle_group'")
-    handles.set_auto_admit(pilot.ids["owner"], case.run, True)
-    _drain_preview(pilot.settings)
-    assert handles.start_run(pilot.ids["owner"], case.run) == 0 and len(case.calls) == 2
-    assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
-    # Reuse the frozen real material to exercise sensitive admission after different facts change.
-    payload = handles._decode(task, "result_ciphertext", pilot.settings)
-    payload["outcome"] = "matched"
-    for candidate in payload["candidates"]:
-        candidate.update(confidence=.99, missing_info=[])
-    pg.execute("UPDATE creator_handle_tasks SET outcome='matched',result_ciphertext=%s WHERE id=%s",
-               (creator_data.cipher(pilot.settings).encrypt(json.dumps(payload)), task["id"]))
-    pg.execute("INSERT INTO lark_identities(open_id,display_name) VALUES('ou_unknown','Other')")
-    changes = (
-        ("UPDATE chats SET name='renamed X TT' WHERE chat_id='handle_group'", ()),
-        ("INSERT INTO chat_members(chat_id,open_id,member_type) VALUES('handle_group','ou_unknown','user')", ()),
+    actor = pilot.ids["cm"]
+    assert handles.task_evidence(actor, task["id"])["messages"]
+    handles.defer_task(actor, task["id"])
+    assert _task(pg, case)["review_status"] == "deferred"
+    for statement, params in (
+        ("UPDATE authorizations SET status='revoked' WHERE id=%s", (actor,)),
         ("UPDATE creator_ownership_tasks SET outcome='uncertain' WHERE id=%s", (task["ownership_task_id"],)),
-        ("UPDATE authorizations SET body_consent_at=NULL WHERE id=%s", (pilot.ids["cm"],)),
-    )
-    for query, params in changes:
+        ("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (actor,)),
+    ):
         with pg.transaction(force_rollback=True):
-            pg.execute(query, params)
-            assert handles.prepare_next_preview(pilot.settings)
-            assert _task(pg, case)["outcome"] == "conflict"
+            pg.execute(statement, params)
+            for operation in (
+                lambda: handles.task_evidence(actor, task["id"]),
+                lambda: handles.confirm_task(actor, task["id"], ["creator_one"]),
+            ):
+                with pytest.raises((PermissionError, ValueError)):
+                    operation()
             assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
-    # A paused run must not keep auto-admitting completed requests.
-    pg.execute("UPDATE creator_handle_runs SET status='paused' WHERE id=%s", (case.run,))
-    _drain_preview(pilot.settings)
-    assert _task(pg, case)["review_status"] == "pending"
-    assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE chats SET name='Changed group' WHERE chat_id='handle_group'")
+        with pytest.raises(ValueError):
+            handles.task_evidence(actor, task["id"])
+    assert handles.confirm_task(actor, task["id"], ["creator_one"]) == 1
+    with pytest.raises(ValueError):
+        handles.defer_task(actor, task["id"])
 
 
 def test_existing_person_or_account_owners_are_not_overwritten_and_no_partial_accounts(pg, pilot, monkeypatch):
@@ -371,40 +179,6 @@ def test_existing_person_or_account_owners_are_not_overwritten_and_no_partial_ac
     with pytest.raises(ValueError, match="冲突"):
         handles.confirm_task(pilot.ids["cm"], task["id"], ["new_unused", "legacy_account"])
     assert _snapshot(pg, before) == before
-
-
-def test_revocation_during_response_and_parent_change_before_dispatch_are_safe(pg, pilot, monkeypatch):
-    case = _case(pg, pilot, monkeypatch)
-    handles.start_run(pilot.ids["owner"], case.run)
-    job = handles.claim_next_handle()
-    with pg.transaction(force_rollback=True):
-        pg.execute("UPDATE creator_ownership_tasks SET outcome='uncertain' WHERE id=%s",
-                   (job["ownership_task_id"],))
-        handles.run_claimed_handle(job, pilot.settings)
-        assert _task(pg, case)["status"] == "invalid" and _task(pg, case)["api_requests"] == 0
-    handles.pause_run(pilot.ids["owner"], case.run)
-    handles.run_claimed_handle(job, pilot.settings)
-    assert not case.calls and _task(pg, case)["api_requests"] == 0
-    assert _task(pg, case)["attempts"] == 0
-    handles.resume_run(pilot.ids["owner"], case.run)
-    consent = pg.execute("SELECT body_consent_at FROM authorizations WHERE id=%s",
-                         (pilot.ids["cm"],)).fetchone()["body_consent_at"]
-    case.callbacks.append(lambda: pg.execute("UPDATE authorizations SET body_consent_at=NULL WHERE id=%s",
-                                             (pilot.ids["cm"],)))
-    _drain_paid(pilot.settings)
-    task = _task(pg, case)
-    assert task["status"] == "invalid" and task["api_requests"] == 1
-    archived = json.loads(creator_data.cipher(pilot.settings).decrypt(task["result_ciphertext"]))
-    assert archived["model_output"]["outcome"] == "matched" and archived["checked"] is None
-    assert handles._decode(task, "result_ciphertext", pilot.settings) == {}
-    for operation in (lambda: creator_roster.page_data(pilot.ids["cm"]),
-                      lambda: handles.task_evidence(pilot.ids["owner"], task["id"])):
-        with pytest.raises(PermissionError):
-            operation()
-    with pg.transaction(force_rollback=True):
-        pg.execute("UPDATE authorizations SET body_consent_at=%s WHERE id=%s", (consent, pilot.ids["cm"]))
-        assert creator_roster.page_data(pilot.ids["cm"])["items"] == []
-    assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
 
 
 def test_concurrent_confirmation_is_single_write(pg, pilot, monkeypatch):
@@ -500,52 +274,6 @@ def test_concurrent_confirmation_is_single_write(pg, pilot, monkeypatch):
             cleanup.execute(psycopg.sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(psycopg.sql.Identifier(schema)))
 
 
-def test_preparation_and_expiry_lock_run_before_task(pg, pilot, monkeypatch):
-    case = _case(pg, pilot, monkeypatch, clues=False)
-    task = _task(pg, case)
-    queries = []
-
-    class RecordedConnection:
-        def __getattr__(self, name):
-            return getattr(pg, name)
-
-        def execute(self, query, *args, **kwargs):
-            queries.append(" ".join(str(query).split()))
-            return pg.execute(query, *args, **kwargs)
-
-    monkeypatch.setattr(handles, "connection", lambda: nullcontext(RecordedConnection()))
-    original = evidence.build_evidence
-
-    def prepare(*args, fail=False):
-        result = original(*args)
-        queries.clear()  # Observe the save/cleanup transaction, after read-only material building.
-        if fail:
-            raise ValueError("test interrupted material preparation")
-        return result
-
-    def first_locked_table():
-        query = next(q for q in queries if "creator_handle_" in q and (
-            "FOR UPDATE" in q or q.startswith("UPDATE creator_handle_")
-        ))
-        return "creator_handle_runs" if "creator_handle_runs" in query else "creator_handle_tasks"
-
-    for fail, expected in ((False, "skipped"), (True, "failed")):
-        pg.execute("UPDATE creator_handle_tasks SET status='pending' WHERE id=%s", (task["id"],))
-        pg.execute("UPDATE creator_handle_runs SET status='preparing' WHERE id=%s", (case.run,))
-        monkeypatch.setattr(evidence, "build_evidence", lambda *args, fail=fail: prepare(*args, fail=fail))
-        assert handles.prepare_next_preview(pilot.settings)
-        assert first_locked_table() == "creator_handle_runs"
-        assert _task(pg, case)["status"] == expected
-    pg.execute("UPDATE creator_handle_tasks SET status='running',lease_until=NOW()-INTERVAL '1 minute' WHERE id=%s",
-               (task["id"],))
-    pg.execute("UPDATE creator_handle_runs SET status='running' WHERE id=%s", (case.run,))
-    queries.clear()
-    assert handles.claim_next_handle() is None
-    assert first_locked_table() == "creator_handle_runs"
-    assert _task(pg, case)["status"] == "failed"
-    assert not case.calls
-
-
 def test_excel_only_pages_exclude_old_ai_candidates_and_merge_manually_confirmed_handles(pg, pilot, monkeypatch):
     from test_creator_imports import workbook
 
@@ -553,9 +281,6 @@ def test_excel_only_pages_exclude_old_ai_candidates_and_merge_manually_confirmed
 
     monkeypatch.setattr(imports, "connection", lambda: nullcontext(pg))
     case = _case(pg, pilot, monkeypatch)
-    case.score, case.outcome = .94, "review"
-    handles.start_run(pilot.ids["owner"], case.run)
-    _drain_paid(pilot.settings)
     paid = len(case.calls)
     cm = pilot.ids["cm"]
     assert creator_roster.page_data(cm)["items"] == []

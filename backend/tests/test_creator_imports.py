@@ -873,7 +873,6 @@ def test_creator_library_reset_preserves_sources_history_and_new_data_on_replay(
     assert not pg.execute("SELECT 1 FROM ai_feature_configs WHERE enabled "
                           "AND feature IN ('contact_assessment','contact_assignment','creator_workflow')").fetchone()
     assert not creator_ownership.prepare_next_preview(pilot.settings) and not creator_ownership.claim_next_ownership()
-    assert not creator_handles.prepare_next_preview(pilot.settings) and not creator_handles.claim_next_handle()
     assert not contact_assessments.queue_eligible_contact_assessments()
     assert not contact_assessments.claim_next_contact_assessment()
     assert row_for(pg, queued, "new_handle")["status"] == "invalid"

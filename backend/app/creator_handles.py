@@ -1,32 +1,18 @@
-"""Third-step account matching; only current ownership suggestions become candidates."""
+"""Historical handle evidence and manual review; automated scanning is retired."""
 
 from __future__ import annotations
 
 import json
-import logging
 from uuid import uuid4
 
 from psycopg.types.json import Jsonb
 
-from . import ai_dispatch, creator_access, creator_data, openai_client
+from . import creator_access, creator_data
 from . import creator_ownership as ownership
-from .ai_feature_config import api_key_cipher
 from .config import get_settings
 from .db import connection
 
 POLICY_VERSION = "creator-handles-v1"
-LOGGER = logging.getLogger(__name__)
-TASK_LABELS = {
-    "pending": "等待取材",
-    "preparing": "正在取材",
-    "ready": "待分析",
-    "queued": "排队中",
-    "running": "正在找 handle",
-    "succeeded": "待确认",
-    "skipped": "待填写 handle",
-    "failed": "分析异常，可手动填写",
-    "invalid": "材料已变化，需重新核对",
-}
 REASONS = {
     **ownership.REASONS,
     "parent_changed": "第二步的归属建议已变化，请重新核对负责人。",
@@ -37,13 +23,6 @@ REASONS = {
     "no_handle_clue": "没有找到明确的 handle 线索，可手动填写。",
     "not_found": "没有找到可确认的 handle，可手动填写。",
     "account_conflict": "账号与人员关联存在冲突，未覆盖已有记录。",
-}
-RUN_LABELS = {
-    "preparing": "正在准备材料",
-    "preview": "等待开始",
-    "running": "分析中",
-    "paused": "已暂停",
-    "completed": "分析完成",
 }
 
 
@@ -133,97 +112,6 @@ def _valid_handle_material(task, settings, *, full=True):
     )
 
 
-def _seed(conn, source):
-    """Free candidate intake, never a formal assignment or a paid queue start."""
-    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,137033))", (str(source["cm_authorization_id"]),))
-    run = conn.execute("SELECT * FROM creator_handle_runs WHERE ownership_run_id=%s", (source["id"],)).fetchone()
-    candidates = conn.execute(
-        """SELECT t.* FROM creator_ownership_tasks t WHERE t.run_id=%s
-        AND t.status='succeeded' AND t.outcome='suggested' AND t.confidence>=.95 AND t.policy_version=%s
-        AND NOT EXISTS (SELECT 1 FROM creator_handle_tasks h WHERE h.ownership_task_id=t.id)
-        AND NOT EXISTS (SELECT 1 FROM creator_ownership_tasks n WHERE n.contact_id=t.contact_id
-          AND n.cm_authorization_id=t.cm_authorization_id AND n.status='succeeded'
-          AND (n.created_at,n.id)>(t.created_at,t.id))
-        AND NOT EXISTS (SELECT 1 FROM contact_assignments a WHERE a.contact_id=t.contact_id
-          AND a.responsible_authorization_id=t.cm_authorization_id AND a.ended_at IS NULL)
-        AND NOT EXISTS (SELECT 1 FROM creator_account_assignments a
-          WHERE a.contact_id=t.contact_id AND a.responsible_authorization_id=t.cm_authorization_id
-          AND a.ended_at IS NULL)
-        ORDER BY t.contact_id""",
-        (source["id"], ownership.POLICY_VERSION),
-    ).fetchall()
-    if not run:
-        run_id = uuid4()
-        conn.execute(
-            """INSERT INTO creator_handle_runs(id,ownership_run_id,cm_authorization_id,requested_by,
-            policy_version,status,auto_admit) VALUES(%s,%s,%s,%s,%s,'preparing',TRUE)""",
-            (run_id, source["id"], source["cm_authorization_id"], source["requested_by"], POLICY_VERSION),
-        )
-    else:
-        run_id = run["id"]
-    added = 0
-    for parent in candidates:
-        added += conn.execute(
-            """INSERT INTO creator_handle_tasks(id,run_id,ownership_task_id,contact_id,
-            cm_authorization_id,policy_version) VALUES(%s,%s,%s,%s,%s,%s)
-            ON CONFLICT(ownership_task_id) DO NOTHING""",
-            (uuid4(), run_id, parent["id"], parent["contact_id"], parent["cm_authorization_id"], POLICY_VERSION),
-        ).rowcount
-    if added and (not run or run["status"] not in ("running", "paused")):
-        conn.execute("UPDATE creator_handle_runs SET status='preparing',updated_at=NOW() WHERE id=%s", (run_id,))
-    _settle(conn, run_id)
-    return run_id
-
-
-def create_preview(actor_id, cm_id, ownership_run_id=None):
-    actor_id = creator_access.parse_id(actor_id)
-    with connection() as conn, conn.transaction():
-        cm_id, _ = creator_access.access(conn, actor_id, cm_id, manage=True)
-        source = conn.execute(
-            """SELECT * FROM creator_ownership_runs WHERE cm_authorization_id=%s
-            AND policy_version=%s AND status='completed' """
-            + ("AND id=%s " if ownership_run_id else "")
-            + "ORDER BY created_at DESC,id DESC LIMIT 1",
-            (cm_id, ownership.POLICY_VERSION, creator_access.parse_id(ownership_run_id))
-            if ownership_run_id
-            else (cm_id, ownership.POLICY_VERSION),
-        ).fetchone()
-        if not source:
-            raise ValueError("请先完成第二步达人归属判断。")
-        run_id = _seed(conn, source)
-        run = conn.execute("SELECT * FROM creator_handle_runs WHERE id=%s FOR UPDATE", (run_id,)).fetchone()
-        if run["status"] in ("running", "paused"):
-            raise ValueError("请先完成当前批次；运行中不会替换正在使用的材料。")
-        # An explicit free preview may refresh changed extraction rules/history, but never replay a paid request.
-        count = conn.execute(
-            """UPDATE creator_handle_tasks SET status='pending',reason_code='',pack_ciphertext=NULL,
-            result_ciphertext=NULL,refs='[]',stats='{}',fingerprint=NULL,config_fingerprint=NULL,
-            outcome=NULL,confidence=NULL,reused_from=NULL,finished_at=NULL,updated_at=NOW()
-            WHERE run_id=%s AND api_requests=0 AND attempts<2 AND review_status='pending'
-            AND status IN ('ready','skipped','failed','invalid','succeeded')""",
-            (run_id,),
-        ).rowcount
-        if count:
-            conn.execute("UPDATE creator_handle_runs SET status='preparing',updated_at=NOW() WHERE id=%s", (run_id,))
-        _audit(conn, actor_id, "preview", {"run_id": str(run_id), "cm_id": str(cm_id)})
-        return run_id
-
-
-def _settle(conn, run_id):
-    conn.execute(
-        """UPDATE creator_handle_runs r SET status='preview',updated_at=NOW()
-        WHERE id=%s AND status='preparing' AND NOT EXISTS (SELECT 1 FROM creator_handle_tasks t
-          WHERE t.run_id=r.id AND t.status IN ('pending','preparing'))""",
-        (run_id,),
-    )
-    conn.execute(
-        """UPDATE creator_handle_runs r SET status='completed',finished_at=NOW(),updated_at=NOW()
-        WHERE id=%s AND status='running' AND NOT EXISTS (SELECT 1 FROM creator_handle_tasks t
-          WHERE t.run_id=r.id AND t.status IN ('pending','preparing','queued','running'))""",
-        (run_id,),
-    )
-
-
 def _conflict(conn, task, handles):
     return bool(
         conn.execute(
@@ -240,8 +128,8 @@ def _conflict(conn, task, handles):
     )
 
 
-def _admit(conn, task, handles, actor, settings, *, automatic=False):
-    from .creator_handle_evidence import normalize_handle, validate_result
+def _admit(conn, task, handles, actor, settings):
+    from .creator_handle_evidence import normalize_handle
 
     if not isinstance(handles, list) or not 1 <= len(handles) <= 20 or any(not isinstance(v, str) for v in handles):
         raise ValueError("请填写或选择 1–20 个明确的 handle。")
@@ -255,20 +143,6 @@ def _admit(conn, task, handles, actor, settings, *, automatic=False):
     _parent(conn, task, settings)
     if task["status"] in ("pending", "preparing", "ready", "queued", "running"):
         raise ValueError("请等待本次取材或分析完成。")
-    score = None
-    if automatic:
-        if task["status"] != "succeeded" or not _valid_handle_material(task, settings):
-            raise ValueError(REASONS["authorization_changed"])
-        result = validate_result(
-            creator_data.encode(_decode(task, "result_ciphertext", settings)),
-            _decode(task, "pack_ciphertext", settings),
-        )
-        matched = [
-            c for c in result["candidates"] if c["confidence"] >= 0.95 and not c["conflicts"] and not c["missing_info"]
-        ]
-        if result["outcome"] != "matched" or set(handles) != {c["handle"] for c in matched}:
-            raise ValueError("账号匹配尚未满足自动入库条件。")
-        score = min(c["confidence"] for c in matched)
     # All writers use sorted account locks, then the person lock. No account can be silently stolen.
     for handle in handles:
         conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,137034))", ("tiktok:" + handle,))
@@ -277,7 +151,7 @@ def _admit(conn, task, handles, actor, settings, *, automatic=False):
     _parent(conn, task, settings, full=False)
     if _conflict(conn, task, handles):
         raise ValueError(REASONS["account_conflict"])
-    source = "ai_handle_verified" if automatic else "cm_confirmation"
+    source = "cm_confirmation"
     for handle in handles:
         account = conn.execute(
             """SELECT id FROM social_accounts WHERE platform='tiktok'
@@ -302,7 +176,7 @@ def _admit(conn, task, handles, actor, settings, *, automatic=False):
             ON CONFLICT(contact_id,social_account_id,relationship) DO UPDATE SET
             handle_task_id=COALESCE(contact_social_accounts.handle_task_id,EXCLUDED.handle_task_id)
             WHERE contact_social_accounts.status='confirmed'""",
-            (task["contact_id"], account["id"], source, None if automatic else actor, task["id"]),
+            (task["contact_id"], account["id"], source, actor, task["id"]),
         )
     conn.execute(
         """INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source,confidence,
@@ -314,9 +188,9 @@ def _admit(conn, task, handles, actor, settings, *, automatic=False):
             uuid4(),
             task["contact_id"],
             task["cm_authorization_id"],
-            "ai" if automatic else "manual",
-            score,
-            None if automatic else actor,
+            "manual",
+            None,
+            actor,
             task["ownership_task_id"],
             task["id"],
             task["contact_id"],
@@ -326,12 +200,12 @@ def _admit(conn, task, handles, actor, settings, *, automatic=False):
     conn.execute(
         """UPDATE creator_handle_tasks SET review_status='confirmed',selected_handles=%s,
         reviewed_by=%s,reviewed_at=NOW(),updated_at=NOW() WHERE id=%s""",
-        (handles, None if automatic else actor, task["id"]),
+        (handles, actor, task["id"]),
     )
     _audit(
         conn,
         actor,
-        "auto_admitted" if automatic else "confirmed",
+        "confirmed",
         {"task_id": str(task["id"]), "cm_id": str(task["cm_authorization_id"]), "accounts": len(handles)},
     )
     return 1
@@ -344,31 +218,6 @@ def confirm_task(actor_id, task_id, handles):
         return _admit(conn, task, handles, actor_id, get_settings())
 
 
-def set_creator_type(actor_id, cm_id, contact_id, creator_type):
-    if creator_type not in ("cap", "non_cap", "pending"):
-        raise ValueError("请选择 CAP、非CAP 或待定。")
-    actor_id, contact_id = creator_access.parse_id(actor_id), creator_access.parse_id(contact_id)
-    with connection() as conn, conn.transaction():
-        cm_id, _ = creator_access.access(conn, actor_id, cm_id)
-        person = conn.execute("SELECT creator_type FROM contacts WHERE id=%s FOR UPDATE", (contact_id,)).fetchone()
-        if not person or not conn.execute(
-            """SELECT 1 FROM contact_assignments WHERE contact_id=%s
-            AND responsible_authorization_id=%s AND ended_at IS NULL
-            UNION ALL SELECT 1 FROM creator_account_assignments a WHERE a.contact_id=%s
-            AND a.responsible_authorization_id=%s AND a.ended_at IS NULL
-            LIMIT 1""",
-            (contact_id, cm_id, contact_id, cm_id),
-        ).fetchone():
-            raise PermissionError("只能修改该负责人名下已入库达人的属性。")
-        if person["creator_type"] == creator_type:
-            return
-        conn.execute("UPDATE contacts SET creator_type=%s,updated_at=NOW() WHERE id=%s", (creator_type, contact_id))
-        _audit(conn, actor_id, "type_updated", {
-            "contact_id": str(contact_id), "cm_id": str(cm_id),
-            "previous_type": person["creator_type"], "creator_type": creator_type,
-        })
-
-
 def defer_task(actor_id, task_id):
     actor_id = creator_access.parse_id(actor_id)
     with connection() as conn, conn.transaction():
@@ -379,393 +228,6 @@ def defer_task(actor_id, task_id):
             "UPDATE creator_handle_tasks SET review_status='deferred',updated_at=NOW() WHERE id=%s", (task["id"],)
         )
         _audit(conn, actor_id, "deferred", {"task_id": str(task["id"])})
-
-
-def recheck_task(actor_id, task_id):
-    """Explicit free refresh of changed material, retaining the paid attempt history."""
-    from .creator_handle_evidence import build_evidence
-
-    actor_id = creator_access.parse_id(actor_id)
-    settings = get_settings()
-    with connection() as conn, conn.transaction():
-        task, run = _task(conn, actor_id, task_id)
-        creator_access.access(conn, actor_id, task["cm_authorization_id"], manage=True)
-        if run["status"] not in ("preview", "completed") or run["auto_admit"]:
-            raise ValueError("请先完成当前批次并关闭自动入库，再更新材料。")
-        if (
-            task["review_status"] == "confirmed"
-            or task["status"] not in ("succeeded", "skipped", "failed", "invalid")
-            or task["attempts"] >= 2
-        ):
-            raise ValueError("该候选不能重测：已入库、仍在处理或已达到两次尝试上限。")
-        _parent(conn, task, settings)
-        material = build_evidence(task["contact_id"], task["cm_authorization_id"], settings)
-        if material["fingerprint"] == task["fingerprint"]:
-            raise ValueError("材料没有变化，不重复调用 AI；可以直接人工核对 handle。")
-        _audit(
-            conn,
-            actor_id,
-            "recheck_requested",
-            {
-                "task_id": str(task["id"]),
-                "previous_task_ciphertext": creator_data.cipher(settings).encrypt(creator_data.encode(task)),
-            },
-        )
-        conn.execute(
-            """UPDATE creator_handle_tasks SET status='pending',reason_code='',fingerprint=NULL,
-            config_fingerprint=NULL,pack_ciphertext=NULL,result_ciphertext=NULL,refs='[]',stats='{}',
-            outcome=NULL,confidence=NULL,reused_from=NULL,review_status='pending',selected_handles='{}',
-            reviewed_by=NULL,reviewed_at=NULL,lease_until=NULL,scheduled_at=NOW(),started_at=NULL,finished_at=NULL,
-            response_id=NULL,request_id=NULL,updated_at=NOW() WHERE id=%s""",
-            (task["id"],),
-        )
-        conn.execute(
-            "UPDATE creator_handle_runs SET status='preparing',finished_at=NULL,updated_at=NOW() WHERE id=%s",
-            (run["id"],),
-        )
-        return run["id"]
-
-
-def _auto_next(conn, settings):
-    row = conn.execute(
-        """SELECT r.* FROM creator_handle_runs r WHERE r.auto_admit AND r.policy_version=%s
-        AND r.status<>'paused'
-        AND EXISTS (SELECT 1 FROM creator_handle_tasks t WHERE t.run_id=r.id AND t.status='succeeded'
-          AND t.outcome='matched' AND t.review_status='pending') ORDER BY r.created_at
-        FOR UPDATE OF r SKIP LOCKED LIMIT 1""",
-        (POLICY_VERSION,),
-    ).fetchone()
-    if not row:
-        return False
-    task = conn.execute(
-        """SELECT * FROM creator_handle_tasks WHERE run_id=%s AND status='succeeded'
-        AND outcome='matched' AND review_status='pending' ORDER BY created_at,id FOR UPDATE LIMIT 1""",
-        (row["id"],),
-    ).fetchone()
-    try:
-        with conn.transaction():
-            creator_access.require_owner(conn, row["requested_by"])
-            result = _decode(task, "result_ciphertext", settings)
-            _admit(
-                conn, task, [c["handle"] for c in result["candidates"]], row["requested_by"], settings, automatic=True
-            )
-    except (ValueError, PermissionError):
-        conn.execute(
-            """UPDATE creator_handle_tasks SET outcome='conflict',reason_code='account_conflict',
-            updated_at=NOW() WHERE id=%s""",
-            (task["id"],),
-        )
-    return True
-
-
-def prepare_next_preview(settings):
-    from .creator_handle_evidence import build_evidence
-
-    with connection() as conn, conn.transaction():
-        if _auto_next(conn, settings):
-            return True
-        # Seed only owner-requested, completed current-policy suggestions; this performs no paid request.
-        sources = conn.execute(
-            """SELECT DISTINCT ON (r.cm_authorization_id) r.* FROM creator_ownership_runs r
-            JOIN admin_roles a ON a.authorization_id=r.requested_by AND a.role='owner' AND a.is_active
-            JOIN authorizations requester ON requester.id=r.requested_by AND requester.status='active'
-            WHERE r.status='completed' AND r.policy_version=%s
-            ORDER BY r.cm_authorization_id,r.created_at DESC,r.id DESC""",
-            (ownership.POLICY_VERSION,),
-        ).fetchall()
-        for source in sources:
-            if creator_access.authorized_cm(conn, source["cm_authorization_id"]):
-                _seed(conn, source)
-        conn.execute("""UPDATE creator_handle_tasks SET status='pending',lease_until=NULL
-            WHERE status='preparing' AND lease_until<NOW()""")
-        job = conn.execute(
-            """SELECT t.*,r.requested_by FROM creator_handle_tasks t JOIN creator_handle_runs r
-            ON r.id=t.run_id WHERE t.status='pending' AND r.status IN ('preparing','running','paused')
-            AND t.policy_version=%s ORDER BY t.created_at,t.id FOR UPDATE OF t SKIP LOCKED LIMIT 1""",
-            (POLICY_VERSION,),
-        ).fetchone()
-        if not job:
-            return False
-        conn.execute(
-            "UPDATE creator_handle_tasks SET status='preparing',lease_until=NOW()+INTERVAL '10 minutes' WHERE id=%s",
-            (job["id"],),
-        )
-    try:
-        with connection() as conn:
-            creator_access.require_owner(conn, job["requested_by"])
-            _parent(conn, job, settings)
-        material = build_evidence(job["contact_id"], job["cm_authorization_id"], settings)
-        with connection() as conn, conn.transaction():
-            conn.execute("SELECT id FROM creator_handle_runs WHERE id=%s FOR UPDATE", (job["run_id"],))
-            current = conn.execute(
-                "SELECT * FROM creator_handle_tasks WHERE id=%s AND status='preparing' FOR UPDATE", (job["id"],)
-            ).fetchone()
-            if not current:
-                return True
-            _parent(conn, current, settings, full=False)
-            config = creator_data.config(conn)
-            config_fp = creator_data.config_fingerprint(config) if config else None
-            cached = conn.execute(
-                """SELECT * FROM creator_handle_tasks WHERE contact_id=%s AND cm_authorization_id=%s
-                AND policy_version=%s AND fingerprint=%s AND config_fingerprint=%s AND status='succeeded'
-                AND result_ciphertext IS NOT NULL ORDER BY finished_at DESC LIMIT 1""",
-                (job["contact_id"], job["cm_authorization_id"], POLICY_VERSION, material["fingerprint"], config_fp),
-            ).fetchone()
-            eligible = material["eligible"]
-            conn.execute(
-                """UPDATE creator_handle_tasks SET status=%s,reason_code=%s,fingerprint=%s,config_fingerprint=%s,
-                pack_ciphertext=%s,refs=%s,stats=%s,result_ciphertext=%s,outcome=%s,confidence=%s,reused_from=%s,
-                lease_until=NULL,finished_at=CASE WHEN %s THEN NOW() ELSE NULL END,updated_at=NOW() WHERE id=%s""",
-                (
-                    "succeeded" if cached and eligible else "ready" if eligible else "skipped",
-                    "reused" if cached and eligible else "prepared" if eligible else material["reason_code"],
-                    material["fingerprint"],
-                    config_fp,
-                    creator_data.cipher(settings).encrypt(creator_data.encode(material["pack"])),
-                    Jsonb(json.loads(creator_data.encode(material["refs"]))),
-                    Jsonb(material["stats"]),
-                    cached["result_ciphertext"] if cached and eligible else None,
-                    cached["outcome"] if cached and eligible else None if eligible else "not_found",
-                    cached["confidence"] if cached and eligible else None,
-                    cached["id"] if cached and eligible else None,
-                    bool(cached or not eligible),
-                    job["id"],
-                ),
-            )
-            _settle(conn, job["run_id"])
-    except Exception:
-        LOGGER.warning("handle preparation failed task=%s", job["id"])
-        with connection() as conn, conn.transaction():
-            conn.execute("SELECT id FROM creator_handle_runs WHERE id=%s FOR UPDATE", (job["run_id"],))
-            conn.execute(
-                """UPDATE creator_handle_tasks SET status='failed',reason_code='preparation_failed',
-                lease_until=NULL,finished_at=NOW() WHERE id=%s AND status='preparing'""",
-                (job["id"],),
-            )
-            _settle(conn, job["run_id"])
-    return True
-
-
-def start_run(actor_id, run_id):
-    actor_id = creator_access.parse_id(actor_id)
-    with connection() as conn, conn.transaction():
-        run = _run(conn, actor_id, run_id, manage=True)
-        if run["status"] == "running":
-            return 0
-        if run["status"] not in ("preview", "completed"):
-            raise ValueError("请等材料准备完成，暂停的批次请点击继续。")
-        if conn.execute(
-            """SELECT 1 FROM creator_handle_tasks current JOIN creator_handle_tasks previous
-            ON previous.contact_id=current.contact_id
-            AND previous.cm_authorization_id=current.cm_authorization_id
-            WHERE current.run_id=%s AND current.status='ready' AND previous.run_id<>current.run_id
-            AND previous.status IN ('queued','running') LIMIT 1""",
-            (run["id"],),
-        ).fetchone():
-            raise ValueError("同一达人还有旧批次在排队或分析，请先结束旧批次，避免重复调用。")
-        config = creator_data.config(conn)
-        if not config:
-            raise ValueError(REASONS["configuration_missing"])
-        config_fp = creator_data.config_fingerprint(config)
-        conn.execute(
-            """UPDATE creator_handle_tasks SET status='invalid',reason_code='configuration_changed'
-            WHERE run_id=%s AND status='ready' AND config_fingerprint IS DISTINCT FROM %s
-            AND config_fingerprint IS NOT NULL""",
-            (run["id"], config_fp),
-        )
-        count = conn.execute(
-            """UPDATE creator_handle_tasks SET status='queued',config_fingerprint=%s,
-            scheduled_at=NOW(),updated_at=NOW() WHERE run_id=%s AND status='ready'""",
-            (config_fp, run["id"]),
-        ).rowcount
-        conn.execute(
-            """UPDATE creator_handle_runs SET status='running',started_at=COALESCE(started_at,NOW()),
-            updated_at=NOW() WHERE id=%s""",
-            (run["id"],),
-        )
-        _settle(conn, run["id"])
-        _audit(conn, actor_id, "started", {"run_id": str(run["id"]), "queued": count})
-        return count
-
-
-def pause_run(actor_id, run_id):
-    with connection() as conn, conn.transaction():
-        run = _run(conn, actor_id, run_id, manage=True)
-        if run["status"] == "running":
-            conn.execute("UPDATE creator_handle_runs SET status='paused',updated_at=NOW() WHERE id=%s", (run["id"],))
-            _audit(conn, creator_access.parse_id(actor_id), "paused", {"run_id": str(run["id"])})
-
-
-def resume_run(actor_id, run_id):
-    with connection() as conn, conn.transaction():
-        run = _run(conn, actor_id, run_id, manage=True)
-        if run["status"] == "paused":
-            conn.execute("UPDATE creator_handle_runs SET status='running',updated_at=NOW() WHERE id=%s", (run["id"],))
-            _settle(conn, run["id"])
-            _audit(conn, creator_access.parse_id(actor_id), "resumed", {"run_id": str(run["id"])})
-
-
-def set_auto_admit(actor_id, run_id, enabled):
-    if not isinstance(enabled, bool):
-        raise ValueError("自动入库设置不正确。")
-    with connection() as conn, conn.transaction():
-        run = _run(conn, actor_id, run_id, manage=True)
-        conn.execute("UPDATE creator_handle_runs SET auto_admit=%s,updated_at=NOW() WHERE id=%s", (enabled, run["id"]))
-        _audit(conn, creator_access.parse_id(actor_id), "auto_admit_changed",
-               {"run_id": str(run["id"]), "enabled": enabled})
-
-
-def claim_next_handle():
-    with connection() as conn, conn.transaction():
-        for row in conn.execute("""SELECT DISTINCT run_id FROM creator_handle_tasks
-            WHERE status='running' AND lease_until<NOW() ORDER BY run_id""").fetchall():
-            if not conn.execute(
-                "SELECT id FROM creator_handle_runs WHERE id=%s FOR UPDATE SKIP LOCKED", (row["run_id"],)
-            ).fetchone():
-                continue
-            conn.execute(
-                """UPDATE creator_handle_tasks SET status='failed',reason_code='interrupted',
-                lease_until=NULL,finished_at=NOW() WHERE run_id=%s AND status='running' AND lease_until<NOW()""",
-                (row["run_id"],),
-            )
-            _settle(conn, row["run_id"])
-        if not ai_dispatch.can_claim(conn):
-            return None
-        task = conn.execute(
-            """SELECT t.*,r.requested_by FROM creator_handle_tasks t JOIN creator_handle_runs r ON r.id=t.run_id
-            WHERE r.status='running' AND t.status='queued' AND t.attempts<2 AND t.scheduled_at<=NOW()
-            AND t.policy_version=%s ORDER BY t.scheduled_at,t.created_at,t.id FOR UPDATE OF t SKIP LOCKED LIMIT 1""",
-            (POLICY_VERSION,),
-        ).fetchone()
-        if not task:
-            return None
-        conn.execute(
-            """UPDATE creator_handle_tasks SET status='running',attempts=attempts+1,
-            lease_until=NOW()+INTERVAL '10 minutes',started_at=NOW(),updated_at=NOW() WHERE id=%s""",
-            (task["id"],),
-        )
-        return {**task, "status": "running", "attempts": task["attempts"] + 1}
-
-
-def _current_paid(conn, job):
-    conn.execute("SELECT id FROM creator_handle_runs WHERE id=%s FOR UPDATE", (job["run_id"],))
-    return conn.execute(
-        """SELECT t.*,r.status AS run_status,r.requested_by FROM creator_handle_tasks t
-        JOIN creator_handle_runs r ON r.id=t.run_id WHERE t.id=%s AND t.status='running'
-        AND t.attempts=%s FOR UPDATE OF t""",
-        (job["id"], job["attempts"]),
-    ).fetchone()
-
-
-def _finish(job, status, reason, settings, response=None, result=None):
-    with connection() as conn, conn.transaction():
-        current = _current_paid(conn, job)
-        if not current:
-            return
-        if result:
-            try:
-                creator_access.require_owner(conn, current["requested_by"])
-                _parent(conn, current, settings)
-                config = creator_data.config(conn)
-                if (
-                    not config
-                    or creator_data.config_fingerprint(config) != current["config_fingerprint"]
-                    or current["run_status"] not in ("running", "paused")
-                    or not _valid_handle_material(current, settings)
-                ):
-                    raise ValueError("材料已变化")
-            except (ValueError, PermissionError):
-                status, reason, result = "invalid", "authorization_changed", None
-        usage = (response or {}).get("usage", {})
-        telemetry = (response or {}).get("telemetry", {})
-        score = min((c["confidence"] for c in result["candidates"]), default=None) if result else None
-        stored_result = None
-        if response and response.get("text"):
-            try:
-                model_output = json.loads(response["text"])
-            except (ValueError, TypeError):
-                model_output = response["text"]
-            stored_result = {"model_output": model_output, "checked": result}
-        elif result:
-            stored_result = {"model_output": None, "checked": result}
-        conn.execute(
-            """UPDATE creator_handle_tasks SET status=%s,reason_code=%s,result_ciphertext=%s,outcome=%s,
-            confidence=%s,response_id=COALESCE(%s,response_id),request_id=COALESCE(%s,request_id),
-            input_tokens=input_tokens+%s,output_tokens=output_tokens+%s,lease_until=NULL,finished_at=NOW(),updated_at=NOW()
-            WHERE id=%s""",
-            (
-                status,
-                reason,
-                creator_data.cipher(settings).encrypt(creator_data.encode(stored_result)) if stored_result else None,
-                result["outcome"] if result else None,
-                score,
-                (response or {}).get("response_id"),
-                telemetry.get("openai_request_id"),
-                usage.get("input_tokens") or 0,
-                usage.get("output_tokens") or 0,
-                job["id"],
-            ),
-        )
-        _settle(conn, job["run_id"])
-
-
-def run_claimed_handle(job, settings):
-    from .creator_handle_evidence import INSTRUCTIONS, output_format, validate_result
-
-    response = None
-    try:
-        with connection() as conn, conn.transaction():
-            task = _current_paid(conn, job)
-            if not task:
-                return
-            creator_access.require_owner(conn, task["requested_by"])
-            if task["run_status"] == "paused":
-                conn.execute(
-                    "UPDATE creator_handle_tasks SET status='queued',attempts=attempts-1,lease_until=NULL WHERE id=%s",
-                    (task["id"],),
-                )
-                return
-            _parent(conn, task, settings)
-            config = creator_data.config(conn)
-            if not config or creator_data.config_fingerprint(config) != task["config_fingerprint"]:
-                raise ValueError("配置已变化")
-            if task["run_status"] != "running" or not _valid_handle_material(task, settings):
-                raise ValueError("材料已变化")
-            pack = _decode(task, "pack_ciphertext", settings)
-            key = api_key_cipher(settings.token_encryption_key).decrypt(config["api_key_ciphertext"])
-            conn.execute("UPDATE creator_handle_tasks SET api_requests=api_requests+1 WHERE id=%s", (task["id"],))
-        response = openai_client.call_openai(
-            config,
-            key,
-            pack,
-            job["contact_id"],
-            instructions=INSTRUCTIONS,
-            output_format=output_format(),
-            max_output_tokens=2200,
-        )
-        result = validate_result(response["text"], pack)
-        _finish(job, "succeeded", "classified", settings, response, result)
-    except openai_client.OpenAIRequestError as exc:
-        if exc.is_quota:
-            ai_dispatch.pause_for_quota()
-        if exc.retryable and job["attempts"] < 2:
-            delay = min(max(exc.retry_after_seconds or 5, 1), 3600)
-            ai_dispatch.throttle(delay)
-            with connection() as conn, conn.transaction():
-                if _current_paid(conn, job):
-                    conn.execute(
-                        """UPDATE creator_handle_tasks SET status='queued',reason_code='rate_limited',lease_until=NULL,
-                        scheduled_at=NOW()+(%s*INTERVAL '1 second'),request_id=%s WHERE id=%s""",
-                        (delay, exc.telemetry.get("openai_request_id"), job["id"]),
-                    )
-        else:
-            _finish(job, "failed", "provider_error", settings, {"telemetry": exc.telemetry})
-    except (ValueError, PermissionError, TypeError, KeyError):
-        _finish(job, "invalid", "invalid_result" if response else "authorization_changed", settings, response)
-    except Exception:
-        LOGGER.warning("handle request failed task=%s", job["id"])
-        _finish(job, "failed", "provider_error", settings, response)
-
 
 
 def task_evidence(actor_id, task_id):
