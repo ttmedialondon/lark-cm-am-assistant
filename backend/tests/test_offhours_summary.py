@@ -488,7 +488,9 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
                VALUES(%s,%s,%s,'scope.xlsx','scope',%s,'completed','cap')""",
         (batch_id, s.ids["cm"], s.ids["owner"], creator_imports.POLICY_VERSION),
     )
-    cipher = creator_ownership._cipher(s.settings)
+    from app import creator_data
+
+    cipher = creator_data.cipher(s.settings)
     pg.execute(
         """INSERT INTO creator_import_rows(id,batch_id,cm_authorization_id,row_number,original_handle,
                handle,contact_id,status,review_status,outcome,pack_ciphertext,result_ciphertext)

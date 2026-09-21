@@ -18,7 +18,6 @@ import psycopg
 from . import (
     ai_dispatch,
     contact_assessments,
-    creator_handles,
     creator_imports,
     creator_ownership,
     identity_profiles,
@@ -216,10 +215,6 @@ def _dispatch_ai_turn(
             creator_ownership.claim_next_ownership,
             creator_ownership.run_claimed_ownership,
         ),
-        (
-            creator_handles.claim_next_handle,
-            creator_handles.run_claimed_handle,
-        ),
         (creator_imports.claim_next_import, creator_imports.run_claimed_import),
         (summary_replies.claim, summary_replies.run),
     )
@@ -256,8 +251,9 @@ def _fill_ai_slots(
 def _prepare_creator_preview(settings: Settings, next_queue: int) -> tuple[bool, int]:
     """Give each local preparation queue a turn; an idle queue does not delay the other."""
 
-    queues = (creator_ownership.prepare_next_preview, creator_handles.prepare_next_preview,
-              creator_imports.prepare_next_import, offhours_summary.prepare_next_summary)
+    # Retired handle scanning is not produced or dispatched; historical review stays available.
+    queues = (creator_ownership.prepare_next_preview, creator_imports.prepare_next_import,
+              offhours_summary.prepare_next_summary)
     for offset in range(len(queues)):
         index = (next_queue + offset) % len(queues)
         try:

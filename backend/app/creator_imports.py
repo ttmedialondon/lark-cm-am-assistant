@@ -12,8 +12,7 @@ from uuid import uuid4
 
 from psycopg.types.json import Jsonb
 
-from . import ai_dispatch, creator_access, creator_import_evidence, openai_client
-from . import creator_ownership as ownership
+from . import ai_dispatch, creator_access, creator_data, creator_import_evidence, openai_client
 from .ai_feature_config import api_key_cipher
 from .config import get_settings
 from .creator_handle_evidence import normalize_handle
@@ -63,7 +62,7 @@ def source_labels(row):
 def _audit(conn, actor, action, data):
     conn.execute(
         "INSERT INTO audit_events(id,authorization_id,action,metadata) VALUES(%s,%s,%s,%s)",
-        (uuid4(), actor, "creator_import_" + action, Jsonb(json.loads(ownership._encode(data)))),
+        (uuid4(), actor, "creator_import_" + action, Jsonb(json.loads(creator_data.encode(data)))),
     )
 
 
@@ -660,7 +659,7 @@ def page_data(actor_id, cm_id, q="", page=1, *, include_candidates=True):
 
 
 def _decode(row, settings, key="pack_ciphertext"):
-    return json.loads(ownership._cipher(settings).decrypt(row[key])) if row.get(key) else {}
+    return json.loads(creator_data.cipher(settings).decrypt(row[key])) if row.get(key) else {}
 
 
 def row_evidence(actor_id, row_id):
@@ -1019,7 +1018,7 @@ def prepare_next_import(settings):
                 reason = "members_pending"
             else:
                 material = _build_material(conn, settings, row, stage, chain, results)
-                config = ownership._config(conn)
+                config = creator_data.config(conn)
                 reason = (material["reason_code"] if not material["eligible"]
                           else "" if config else "configuration_changed")
     except (ValueError, PermissionError):
@@ -1074,10 +1073,10 @@ def prepare_next_import(settings):
             (
                 "invalid" if reason else "queued",
                 reason,
-                ownership._cipher(settings).encrypt(ownership._encode(chain)),
+                creator_data.cipher(settings).encrypt(creator_data.encode(chain)),
                 Jsonb((material or {}).get("refs", [])),
                 (material or {}).get("fingerprint"),
-                ownership._config_fingerprint(config) if config else None,
+                creator_data.config_fingerprint(config) if config else None,
                 Jsonb(stats),
                 row["id"],
             ),
@@ -1174,7 +1173,7 @@ def _record_response(conn, job, settings, response, *, late=False):
             {
                 "row_id": str(job["id"]),
                 "stage": _stage(job),
-                "response_ciphertext": ownership._cipher(settings).encrypt(ownership._encode(response)),
+                "response_ciphertext": creator_data.cipher(settings).encrypt(creator_data.encode(response)),
             },
         )
 
@@ -1189,8 +1188,8 @@ def _finish(job, settings, *, response=None, result=None, reason=""):
         if result:
             try:
                 creator_access.access(conn, row["uploaded_by"], row["cm_authorization_id"])
-                config = ownership._config(conn)
-                if not config or ownership._config_fingerprint(config) != row["config_fingerprint"]:
+                config = creator_data.config(conn)
+                if not config or creator_data.config_fingerprint(config) != row["config_fingerprint"]:
                     raise ValueError("configuration_changed")
                 if not _valid_chain(conn, settings, row, chain, results, full=True):
                     raise ValueError("authorization_changed")
@@ -1222,7 +1221,7 @@ def _finish(job, settings, *, response=None, result=None, reason=""):
                 contact_id,
                 "matched" if matched else "review",
                 (result or {}).get("confidence"),
-                ownership._cipher(settings).encrypt(ownership._encode(results)),
+                creator_data.cipher(settings).encrypt(creator_data.encode(results)),
                 next_stage == "person",
                 Jsonb(
                     {
@@ -1270,8 +1269,8 @@ def run_claimed_import(job, settings):
             chain, results = _decode(row, settings), _decode(row, settings, "result_ciphertext")
             if not _valid_chain(conn, settings, row, chain, results, full=True):
                 raise ValueError("authorization_changed")
-            config = ownership._config(conn)
-            if not config or ownership._config_fingerprint(config) != row["config_fingerprint"]:
+            config = creator_data.config(conn)
+            if not config or creator_data.config_fingerprint(config) != row["config_fingerprint"]:
                 raise ValueError("configuration_changed")
             key = api_key_cipher(settings.token_encryption_key).decrypt(config["api_key_ciphertext"])
             pack = chain[_stage(row)]["pack"]

@@ -14,7 +14,7 @@ from psycopg.rows import dict_row
 from test_creator_ownership import _prepared, _run_all, _snapshot
 from test_creator_ownership import pilot as parent_pilot
 
-from app import admin_reporting, openai_client
+from app import admin_reporting, creator_data, creator_roster, openai_client
 from app import creator_handle_evidence as evidence
 from app import creator_handles as handles
 from app import creator_ownership as ownership
@@ -48,7 +48,7 @@ def _task(pg, case, contact=None):
 def _case(pg, pilot, monkeypatch, *, clues=True, uncertain=False):
     from app import creator_imports
 
-    for module in (handles, evidence, creator_imports):
+    for module in (handles, evidence, creator_imports, creator_roster):
         monkeypatch.setattr(module, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(handles, "get_settings", lambda: pilot.settings)
     monkeypatch.setattr(creator_imports, "get_settings", lambda: pilot.settings)
@@ -156,7 +156,7 @@ def test_suggestions_preview_then_explicit_auto_admission_is_atomic_and_idempote
     _drain_preview(pilot.settings)
     assert _snapshot(pg, paid) == paid and len(case.calls) == 1
     for _ in range(2):
-        assert handles.page_data(pilot.ids["cm"])["items"] == []  # Archived AI work is not an Excel candidate.
+        assert creator_roster.page_data(pilot.ids["cm"])["items"] == []  # Archived AI work is not an Excel candidate.
     assert len(case.calls) == 1 and handles.start_run(pilot.ids["owner"], case.run) == 0
     _drain_preview(pilot.settings)
     assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
@@ -182,7 +182,7 @@ def test_cm_can_fill_missing_handles_but_not_cross_scope_or_bypass_input_checks(
     pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext,body_consent_at) "
                "VALUES(%s,'ou_outsider','test',NOW())", (outsider,))
     for operation in (
-        lambda: handles.page_data(outsider, pilot.ids["cm"]),
+        lambda: creator_roster.page_data(outsider, pilot.ids["cm"]),
         lambda: handles.confirm_task(outsider, task["id"], ["stolen"]),
         lambda: handles.task_evidence(outsider, task["id"]),
         lambda: handles.start_run(pilot.ids["cm"], case.run),
@@ -194,16 +194,16 @@ def test_cm_can_fill_missing_handles_but_not_cross_scope_or_bypass_input_checks(
             operation()
     pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-roster')",
                (outsider,))
-    view = handles.page_data(outsider, pilot.ids["cm"])
+    view = creator_roster.page_data(outsider, pilot.ids["cm"])
     assert view["can_select_cm"] and view["read_only"] and not view["can_manage"]
     assert len(view["cms"]) > 1 and view["import_batches"] == []
     with pytest.raises(PermissionError):
-        handles.page_data(outsider, pilot.ids["cm"], tab="candidates")
+        creator_roster.page_data(outsider, pilot.ids["cm"], tab="candidates")
     with pytest.raises(PermissionError):
         handles.confirm_task(outsider, task["id"], ["stolen"])
     pg.execute("DELETE FROM admin_page_permissions WHERE authorization_id=%s", (outsider,))
     with pytest.raises(PermissionError):
-        handles.page_data(outsider, pilot.ids["cm"])
+        creator_roster.page_data(outsider, pilot.ids["cm"])
     for values in ([], [""], ["bad handle"], ["https://evil.example/@person"], ["good", "bad/handle"]):
         with pytest.raises(ValueError):
             handles.confirm_task(pilot.ids["cm"], task["id"], values)
@@ -212,7 +212,7 @@ def test_cm_can_fill_missing_handles_but_not_cross_scope_or_bypass_input_checks(
     assert handles.confirm_task(pilot.ids["cm"], task["id"], ["manual_two", "manual.one"]) == 0
     assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 1
     assert pg.execute("SELECT source FROM contact_assignments").fetchone()["source"] == "manual"
-    formal = handles.page_data(pilot.ids["cm"], tab="confirmed")["items"]
+    formal = creator_roster.page_data(pilot.ids["cm"], tab="confirmed")["items"]
     assert formal == []  # The current library only lists CAP people.
     with pytest.raises(PermissionError):
         handles.set_creator_type(outsider, outsider, case.creator, "cap")
@@ -222,7 +222,7 @@ def test_cm_can_fill_missing_handles_but_not_cross_scope_or_bypass_input_checks(
         handles.set_creator_type(actor_id, pilot.ids["cm"], case.creator, creator_type)
         assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (case.creator,)).fetchone()[
             "creator_type"] == creator_type
-        people = handles.page_data(pilot.ids["cm"], tab="confirmed")["items"]
+        people = creator_roster.page_data(pilot.ids["cm"], tab="confirmed")["items"]
         if creator_type == "cap":
             assert len(people) == 1 and people[0]["contact_id"] == str(case.creator)
             assert len(people[0]["handles"]) == 2
@@ -238,12 +238,12 @@ def test_cm_can_fill_missing_handles_but_not_cross_scope_or_bypass_input_checks(
             with pg.transaction(force_rollback=True):
                 pg.execute("UPDATE lark_identities SET avatar_url=%s,avatar_status=%s WHERE open_id='ou_creator'",
                            (url, status))
-                assert handles.page_data(pilot.ids["cm"], tab="mine")["items"][0]["avatar_url"] == expected
+                assert creator_roster.page_data(pilot.ids["cm"], tab="mine")["items"][0]["avatar_url"] == expected
     changes = pg.execute("SELECT count(*) n FROM audit_events WHERE action='creator_handles_type_updated'").fetchone()
     assert changes["n"] == 3
     with pytest.raises(ValueError):
         handles.set_creator_type(pilot.ids["cm"], pilot.ids["cm"], case.creator, "invalid")
-    assert handles.page_data(pilot.ids["cm"], tab="confirmed")["items"] == []
+    assert creator_roster.page_data(pilot.ids["cm"], tab="confirmed")["items"] == []
     assert not case.calls
 
 
@@ -286,7 +286,7 @@ def test_low_confidence_and_changed_parent_permission_group_or_members_never_aut
     event = pg.execute("SELECT action,metadata FROM audit_events WHERE metadata ? 'previous_task_ciphertext'")
     event = event.fetchone()
     assert event["action"] == "creator_handles_recheck_requested"
-    archived = json.loads(ownership._cipher(pilot.settings).decrypt(event["metadata"]["previous_task_ciphertext"]))
+    archived = json.loads(creator_data.cipher(pilot.settings).decrypt(event["metadata"]["previous_task_ciphertext"]))
     for key in ("pack_ciphertext", "result_ciphertext", "fingerprint", "attempts", "api_requests",
                 "input_tokens", "output_tokens"):
         assert archived[key] == task[key]
@@ -299,7 +299,7 @@ def test_low_confidence_and_changed_parent_permission_group_or_members_never_aut
     assert handles.start_run(pilot.ids["owner"], case.run) == 0
     _drain_paid(pilot.settings)
     task = _task(pg, case)
-    stored = json.loads(ownership._cipher(pilot.settings).decrypt(task["result_ciphertext"]))
+    stored = json.loads(creator_data.cipher(pilot.settings).decrypt(task["result_ciphertext"]))
     assert stored["model_output"]["outcome"] == stored["checked"]["outcome"] == task["outcome"] == "review"
     assert all(c["confidence"] == .99 and not c["conflicts"] and not c["missing_info"]
                for c in stored["checked"]["candidates"])
@@ -320,7 +320,7 @@ def test_low_confidence_and_changed_parent_permission_group_or_members_never_aut
     for candidate in payload["candidates"]:
         candidate.update(confidence=.99, missing_info=[])
     pg.execute("UPDATE creator_handle_tasks SET outcome='matched',result_ciphertext=%s WHERE id=%s",
-               (ownership._cipher(pilot.settings).encrypt(json.dumps(payload)), task["id"]))
+               (creator_data.cipher(pilot.settings).encrypt(json.dumps(payload)), task["id"]))
     pg.execute("INSERT INTO lark_identities(open_id,display_name) VALUES('ou_unknown','Other')")
     changes = (
         ("UPDATE chats SET name='renamed X TT' WHERE chat_id='handle_group'", ()),
@@ -347,7 +347,7 @@ def test_existing_person_or_account_owners_are_not_overwritten_and_no_partial_ac
     with pg.transaction(force_rollback=True):
         pg.execute("DELETE FROM contact_social_accounts WHERE contact_id=%s", (pilot.ids["legacy"],))
         pg.execute("UPDATE contacts SET creator_type='cap' WHERE id=%s", (pilot.ids["legacy"],))
-        legacy = handles.page_data(pilot.ids["owner"], tab="mine")["items"]
+        legacy = creator_roster.page_data(pilot.ids["owner"], tab="mine")["items"]
         assert len(legacy) == 1 and legacy[0]["handles"] == ["legacy_account"]
         assert legacy[0]["sources"] == ["手动"]
     for cm in (pilot.ids["cm"], pilot.ids["owner"]):
@@ -359,7 +359,7 @@ def test_existing_person_or_account_owners_are_not_overwritten_and_no_partial_ac
                 handles.confirm_task(pilot.ids["cm"], task["id"], ["new_handle"])
                 assert _snapshot(pg, ("contact_assignments",))["contact_assignments"] == before["contact_assignments"]
                 pg.execute("UPDATE contacts SET creator_type='cap' WHERE id=%s", (case.creator,))
-                assert handles.page_data(cm, cm_id=cm, tab="mine")["items"][0]["handles"] == ["new_handle"]
+                assert creator_roster.page_data(cm, cm_id=cm, tab="mine")["items"][0]["handles"] == ["new_handle"]
             else:
                 handles.confirm_task(pilot.ids["cm"], task["id"], ["new_handle"])
                 assert pg.execute("SELECT count(*) n FROM contact_assignments WHERE contact_id=%s",
@@ -394,16 +394,16 @@ def test_revocation_during_response_and_parent_change_before_dispatch_are_safe(p
     _drain_paid(pilot.settings)
     task = _task(pg, case)
     assert task["status"] == "invalid" and task["api_requests"] == 1
-    archived = json.loads(ownership._cipher(pilot.settings).decrypt(task["result_ciphertext"]))
+    archived = json.loads(creator_data.cipher(pilot.settings).decrypt(task["result_ciphertext"]))
     assert archived["model_output"]["outcome"] == "matched" and archived["checked"] is None
     assert handles._decode(task, "result_ciphertext", pilot.settings) == {}
-    for operation in (lambda: handles.page_data(pilot.ids["cm"]),
+    for operation in (lambda: creator_roster.page_data(pilot.ids["cm"]),
                       lambda: handles.task_evidence(pilot.ids["owner"], task["id"])):
         with pytest.raises(PermissionError):
             operation()
     with pg.transaction(force_rollback=True):
         pg.execute("UPDATE authorizations SET body_consent_at=%s WHERE id=%s", (consent, pilot.ids["cm"]))
-        assert handles.page_data(pilot.ids["cm"])["items"] == []
+        assert creator_roster.page_data(pilot.ids["cm"])["items"] == []
     assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
 
 
@@ -558,31 +558,31 @@ def test_excel_only_pages_exclude_old_ai_candidates_and_merge_manually_confirmed
     _drain_paid(pilot.settings)
     paid = len(case.calls)
     cm = pilot.ids["cm"]
-    assert handles.page_data(cm)["items"] == []
+    assert creator_roster.page_data(cm)["items"] == []
     batch = imports.preview_import(
         cm, cm, "roster.xlsx", workbook("creator_one", "creator_two", *(f"unmatched_{n}" for n in range(25)))
     )
     imports.start_import(cm, batch["id"])
-    page = handles.page_data(cm, cm_id=cm, tab="candidates")
-    following = handles.page_data(cm, cm_id=cm, tab="candidates", page=2)
+    page = creator_roster.page_data(cm, cm_id=cm, tab="candidates")
+    following = creator_roster.page_data(cm, cm_id=cm, tab="candidates", page=2)
     assert page["total_count"] == 27 and page["total_pages"] == 2
     assert len(page["items"]) == 25 and len(following["items"]) == 2
     items = page["items"] + following["items"]
     assert len({r["id"] for r in items}) == 27
     assert all(r["kind"] == "import" and r["sources"] == ["Excel"] and r["contact_id"] is None for r in items)
     assert page["run"] is None and not any(page["usage"].values())
-    assert len(handles.page_data(cm, tab="candidates", query="creator_one")["items"]) == 1
+    assert len(creator_roster.page_data(cm, tab="candidates", query="creator_one")["items"]) == 1
     for handle in ("creator_one", "creator_two"):
         row = pg.execute("SELECT id FROM creator_import_rows WHERE batch_id=%s AND handle=%s",
                          (batch["id"], handle)).fetchone()
         imports.confirm_row(cm, row["id"], handle, case.creator)
-    formal = handles.page_data(cm, cm_id=cm, tab="mine")["items"]
+    formal = creator_roster.page_data(cm, cm_id=cm, tab="mine")["items"]
     assert len(formal) == 1 and set(formal[0]["handles"]) == {"creator_one", "creator_two"}
     assert formal[0]["sources"] == ["Excel"] and formal[0]["creator_type"] == "cap"
-    assert handles.page_data(cm, tab="candidates")["total_count"] == 25
-    assert handles.page_data(cm)["total_count"] == 1
+    assert creator_roster.page_data(cm, tab="candidates")["total_count"] == 25
+    assert creator_roster.page_data(cm)["total_count"] == 1
     def unused_candidates(*args):
         raise AssertionError("The confirmed tab must not load candidate details")
     monkeypatch.setattr(imports, "candidate_items", unused_candidates)
-    assert handles.page_data(cm)["items"] == formal
+    assert creator_roster.page_data(cm)["items"] == formal
     assert len(case.calls) == paid

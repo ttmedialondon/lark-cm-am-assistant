@@ -248,7 +248,6 @@ def test_dispatch_uses_at_most_three_slots_and_fairly_rotates_queues(monkeypatch
     assessment_jobs = iter(({"id": "identity-1"}, {"id": "identity-2"}))
     summary_jobs = iter(({"id": "summary-1"}, {"id": "summary-2"}))
     ownership_jobs = iter(({"id": "ownership-1"}, {"id": "ownership-2"}))
-    handle_jobs = iter(({"id": "handle-1"}, {"id": "handle-2"}))
     import_jobs = iter(({"id": "import-1"},))
     reply_jobs = iter(({"id": "reply-1"},))
     monkeypatch.setattr(worker.summary_replies, "claim", lambda: next(reply_jobs, None))
@@ -256,7 +255,6 @@ def test_dispatch_uses_at_most_three_slots_and_fairly_rotates_queues(monkeypatch
     monkeypatch.setattr(worker.contact_assessments, "claim_next_contact_assessment",
                         lambda: next(assessment_jobs, None))
     monkeypatch.setattr(worker.creator_ownership, "claim_next_ownership", lambda: next(ownership_jobs, None))
-    monkeypatch.setattr(worker.creator_handles, "claim_next_handle", lambda: next(handle_jobs, None))
     monkeypatch.setattr(worker.creator_imports, "claim_next_import", lambda: next(import_jobs, None))
 
     futures = set()
@@ -269,11 +267,11 @@ def test_dispatch_uses_at_most_three_slots_and_fairly_rotates_queues(monkeypatch
     assert [job["id"] for _runner, job in submitted] == ["identity-1", "summary-1", "ownership-1"]
     futures.clear()
     preference = worker._fill_ai_slots(object(), Executor(), futures, preference)
-    assert preference == 0
-    assert [job["id"] for _runner, job in submitted[3:]] == ["handle-1", "import-1", "reply-1"]
+    assert preference == 1
+    assert [job["id"] for _runner, job in submitted[3:]] == ["import-1", "reply-1", "identity-2"]
     futures.clear()
     assert worker._fill_ai_slots(object(), Executor(), futures, preference) == 3
-    assert [job["id"] for _runner, job in submitted[6:]] == ["identity-2", "summary-2", "ownership-2"]
+    assert [job["id"] for _runner, job in submitted[6:]] == ["summary-2", "ownership-2"]
 
 
 def test_offhours_tasks_fill_three_parallel_slots_without_waiting(monkeypatch) -> None:
@@ -289,7 +287,6 @@ def test_offhours_tasks_fill_three_parallel_slots_without_waiting(monkeypatch) -
     monkeypatch.setattr(worker.offhours_summary, "claim_next_summary", lambda: next(jobs))
     monkeypatch.setattr(worker.contact_assessments, "claim_next_contact_assessment", lambda: None)
     monkeypatch.setattr(worker.creator_ownership, "claim_next_ownership", lambda: None)
-    monkeypatch.setattr(worker.creator_handles, "claim_next_handle", lambda: None)
     monkeypatch.setattr(worker.creator_imports, "claim_next_import", lambda: None)
     monkeypatch.setattr(worker.summary_replies, "claim", lambda: None)
     futures = set()
@@ -303,7 +300,7 @@ def test_creator_previews_are_fair_single_flight_and_back_off_without_work(monke
     submitted = []
     prepared = []
     settings = SimpleNamespace(worker_idle_seconds=3)
-    ownership_jobs, handle_jobs = iter((True, False)), iter((True, False))
+    ownership_jobs, import_jobs = iter((True, False)), iter((True, False))
 
     def prepare(name, jobs):
         prepared.append(name)
@@ -320,9 +317,9 @@ def test_creator_previews_are_fair_single_flight_and_back_off_without_work(monke
     monkeypatch.setattr(worker.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(worker.creator_ownership, "prepare_next_preview",
                         lambda _: prepare("ownership", ownership_jobs))
-    monkeypatch.setattr(worker.creator_handles, "prepare_next_preview",
-                        lambda _: prepare("handle", handle_jobs))
-    monkeypatch.setattr(worker.creator_imports, "prepare_next_import", lambda _: False)
+    monkeypatch.setattr(worker.creator_imports, "prepare_next_import",
+                        lambda _: prepare("import", import_jobs))
+    monkeypatch.setattr(worker.offhours_summary, "prepare_next_summary", lambda _: False)
     executor = Executor()
     future, next_check, queue = worker._schedule_creator_preview(settings, executor, None, 0, 0)
     assert future is submitted[0][0]
@@ -335,13 +332,13 @@ def test_creator_previews_are_fair_single_flight_and_back_off_without_work(monke
         task.set_result(runner(settings, preference))
         future, next_check, queue = worker._schedule_creator_preview(settings, executor, future, next_check, queue)
         assert future is submitted[index+1][0]
-    assert prepared == ["ownership", "handle"]
+    assert prepared == ["ownership", "import"]
     task, runner, preference = submitted[2]
     task.set_result(runner(settings, preference))
     future, next_check, queue = worker._schedule_creator_preview(settings, executor, future, next_check, queue)
     assert future is None and next_check == 13.0
     assert worker._schedule_creator_preview(settings, executor, future, next_check, queue) == (None, 13.0, queue)
-    assert len(submitted) == 3 and prepared == ["ownership", "handle", "ownership", "handle"]
+    assert len(submitted) == 3 and prepared == ["ownership", "import", "ownership", "import"]
 
     now[0] = 13.0
     future, next_check, queue = worker._schedule_creator_preview(settings, executor, future, next_check, queue)
@@ -353,7 +350,7 @@ def test_creator_previews_are_fair_single_flight_and_back_off_without_work(monke
         raise RuntimeError("one preparation queue failed")
 
     monkeypatch.setattr(worker.creator_ownership, "prepare_next_preview", failed)
-    monkeypatch.setattr(worker.creator_handles, "prepare_next_preview", lambda _: True)
+    monkeypatch.setattr(worker.creator_imports, "prepare_next_import", lambda _: True)
     assert worker._prepare_creator_preview(settings, 0) == (True, 2)
 
 

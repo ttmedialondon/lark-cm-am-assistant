@@ -9,7 +9,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import creator_handles, creator_imports
+from . import creator_handles, creator_imports, creator_roster
 from .http_helpers import (
     csrf_matches as _csrf_matches,
 )
@@ -51,7 +51,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
         try:
             auth = actor(auth)
             tab = "candidates" if tab == "candidates" else "mine"
-            data = creator_handles.page_data(auth["id"], cm_id=cm_id, tab=tab, query=q[:120], page=max(1, page))
+            data = creator_roster.page_data(auth["id"], cm_id=cm_id, tab=tab, query=q[:120], page=max(1, page))
             if request.url.path.endswith("/data"):
                 return payload(data)
             return secure(render_template(request, "creator_handles.html", {

@@ -11,7 +11,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from app import admin_permissions, creator_handles, creator_handles_routes, creator_imports
+from app import admin_permissions, creator_handles, creator_handles_routes, creator_imports, creator_roster
 
 
 def browser(monkeypatch, *, owner=False, active=True):
@@ -54,7 +54,7 @@ def test_cm_can_read_review_own_handles_without_admin_and_cannot_cross_scope(mon
         calls.append((task_id, *args))
         return {"messages": [{"ref": "G1", "text": "Authorized group name"}]}
 
-    monkeypatch.setattr(creator_handles, "page_data", page_data)
+    monkeypatch.setattr(creator_roster, "page_data", page_data)
     for name in ("confirm_task", "defer_task", "task_evidence"):
         monkeypatch.setattr(creator_handles, name, scoped)
     html = client.get("/creators")

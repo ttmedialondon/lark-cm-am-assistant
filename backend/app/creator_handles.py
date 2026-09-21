@@ -8,13 +8,11 @@ from uuid import uuid4
 
 from psycopg.types.json import Jsonb
 
-from . import ai_dispatch, creator_access, openai_client
+from . import ai_dispatch, creator_access, creator_data, openai_client
 from . import creator_ownership as ownership
 from .ai_feature_config import api_key_cipher
 from .config import get_settings
 from .db import connection
-from .identity_profiles import safe_avatar_url
-from .lark_api import private_chat_url
 
 POLICY_VERSION = "creator-handles-v1"
 LOGGER = logging.getLogger(__name__)
@@ -112,7 +110,7 @@ def _parent(conn, task, settings, *, full=True):
 
 
 def _decode(task, key, settings):
-    value = json.loads(ownership._cipher(settings).decrypt(task[key])) if task.get(key) else {}
+    value = json.loads(creator_data.cipher(settings).decrypt(task[key])) if task.get(key) else {}
     if key == "result_ciphertext" and "checked" in value:
         return value["checked"] or {}
     return value
@@ -262,7 +260,8 @@ def _admit(conn, task, handles, actor, settings, *, automatic=False):
         if task["status"] != "succeeded" or not _valid_handle_material(task, settings):
             raise ValueError(REASONS["authorization_changed"])
         result = validate_result(
-            ownership._encode(_decode(task, "result_ciphertext", settings)), _decode(task, "pack_ciphertext", settings)
+            creator_data.encode(_decode(task, "result_ciphertext", settings)),
+            _decode(task, "pack_ciphertext", settings),
         )
         matched = [
             c for c in result["candidates"] if c["confidence"] >= 0.95 and not c["conflicts"] and not c["missing_info"]
@@ -409,7 +408,7 @@ def recheck_task(actor_id, task_id):
             "recheck_requested",
             {
                 "task_id": str(task["id"]),
-                "previous_task_ciphertext": ownership._cipher(settings).encrypt(ownership._encode(task)),
+                "previous_task_ciphertext": creator_data.cipher(settings).encrypt(creator_data.encode(task)),
             },
         )
         conn.execute(
@@ -504,8 +503,8 @@ def prepare_next_preview(settings):
             if not current:
                 return True
             _parent(conn, current, settings, full=False)
-            config = ownership._config(conn)
-            config_fp = ownership._config_fingerprint(config) if config else None
+            config = creator_data.config(conn)
+            config_fp = creator_data.config_fingerprint(config) if config else None
             cached = conn.execute(
                 """SELECT * FROM creator_handle_tasks WHERE contact_id=%s AND cm_authorization_id=%s
                 AND policy_version=%s AND fingerprint=%s AND config_fingerprint=%s AND status='succeeded'
@@ -522,8 +521,8 @@ def prepare_next_preview(settings):
                     "reused" if cached and eligible else "prepared" if eligible else material["reason_code"],
                     material["fingerprint"],
                     config_fp,
-                    ownership._cipher(settings).encrypt(ownership._encode(material["pack"])),
-                    Jsonb(json.loads(ownership._encode(material["refs"]))),
+                    creator_data.cipher(settings).encrypt(creator_data.encode(material["pack"])),
+                    Jsonb(json.loads(creator_data.encode(material["refs"]))),
                     Jsonb(material["stats"]),
                     cached["result_ciphertext"] if cached and eligible else None,
                     cached["outcome"] if cached and eligible else None if eligible else "not_found",
@@ -564,10 +563,10 @@ def start_run(actor_id, run_id):
             (run["id"],),
         ).fetchone():
             raise ValueError("同一达人还有旧批次在排队或分析，请先结束旧批次，避免重复调用。")
-        config = ownership._config(conn)
+        config = creator_data.config(conn)
         if not config:
             raise ValueError(REASONS["configuration_missing"])
-        config_fp = ownership._config_fingerprint(config)
+        config_fp = creator_data.config_fingerprint(config)
         conn.execute(
             """UPDATE creator_handle_tasks SET status='invalid',reason_code='configuration_changed'
             WHERE run_id=%s AND status='ready' AND config_fingerprint IS DISTINCT FROM %s
@@ -667,10 +666,10 @@ def _finish(job, status, reason, settings, response=None, result=None):
             try:
                 creator_access.require_owner(conn, current["requested_by"])
                 _parent(conn, current, settings)
-                config = ownership._config(conn)
+                config = creator_data.config(conn)
                 if (
                     not config
-                    or ownership._config_fingerprint(config) != current["config_fingerprint"]
+                    or creator_data.config_fingerprint(config) != current["config_fingerprint"]
                     or current["run_status"] not in ("running", "paused")
                     or not _valid_handle_material(current, settings)
                 ):
@@ -697,7 +696,7 @@ def _finish(job, status, reason, settings, response=None, result=None):
             (
                 status,
                 reason,
-                ownership._cipher(settings).encrypt(ownership._encode(stored_result)) if stored_result else None,
+                creator_data.cipher(settings).encrypt(creator_data.encode(stored_result)) if stored_result else None,
                 result["outcome"] if result else None,
                 score,
                 (response or {}).get("response_id"),
@@ -727,8 +726,8 @@ def run_claimed_handle(job, settings):
                 )
                 return
             _parent(conn, task, settings)
-            config = ownership._config(conn)
-            if not config or ownership._config_fingerprint(config) != task["config_fingerprint"]:
+            config = creator_data.config(conn)
+            if not config or creator_data.config_fingerprint(config) != task["config_fingerprint"]:
                 raise ValueError("配置已变化")
             if task["run_status"] != "running" or not _valid_handle_material(task, settings):
                 raise ValueError("材料已变化")
@@ -767,113 +766,6 @@ def run_claimed_handle(job, settings):
         LOGGER.warning("handle request failed task=%s", job["id"])
         _finish(job, "failed", "provider_error", settings, response)
 
-
-def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
-    """Current library: Excel CAP candidates and confirmed people."""
-    from . import creator_imports
-
-    query = str(query or "").strip()[:120]
-    page = max(1, min(int(page), 10000))
-    with connection() as conn:
-        cm_id, can_manage = creator_access.access(conn, actor_id, cm_id, read_only=tab != "candidates")
-        can_select_cm = creator_access.can_view_all(conn, actor_id)
-        read_only = not can_manage and creator_access.parse_id(actor_id) != cm_id
-        cms = [
-            {"id": str(r["id"]), "name": r["display_name"] or "未命名用户"}
-            for r in conn.execute(
-                """SELECT id,display_name FROM authorizations WHERE status='active'
-                AND body_consent_at IS NOT NULL ORDER BY display_name,id"""
-            ).fetchall()
-            if can_select_cm or r["id"] == cm_id
-        ]
-        imported = ({"total": 0, "batches": []} if read_only else
-                    creator_imports.page_data(actor_id, cm_id, q=query if tab=="candidates" else "", page=page,
-                                              include_candidates=tab == "candidates"))
-        # Person-level and older account-level assignments describe the same
-        # library. UNION ensures that a person with several handles appears once.
-        formal_base = """FROM contacts c WHERE c.creator_type='cap' AND c.id IN (
-            SELECT contact_id FROM contact_assignments
-            WHERE responsible_authorization_id=%s AND ended_at IS NULL
-            UNION SELECT contact_id FROM creator_account_assignments
-            WHERE responsible_authorization_id=%s AND ended_at IS NULL)"""
-        args = [cm_id, cm_id]
-        confirmed = conn.execute("SELECT count(*) n " + formal_base, args).fetchone()["n"]
-        counts = dict.fromkeys((*TASK_LABELS, "total", "completed", "candidates", "confirmed"), 0)
-        counts.update(candidates=imported["total"], confirmed=confirmed)
-        if tab == "candidates":
-            items, total = imported["candidates"], imported["total"]
-            pages, page = imported["total_pages"], imported["page"]
-        else:
-            if query:
-                formal_base += """ AND (POSITION(lower(%s) IN lower(COALESCE(c.display_name,'')))>0
-                    OR EXISTS (SELECT 1 FROM contact_social_accounts l JOIN social_accounts s
-                        ON s.id=l.social_account_id WHERE l.contact_id=c.id AND l.status='confirmed'
-                        AND l.relationship='owner' AND POSITION(lower(%s) IN lower(s.normalized_handle))>0))"""
-                args.extend((query,query))
-            total = conn.execute("SELECT count(*) n " + formal_base, args).fetchone()["n"] if query else confirmed
-            pages = max(1,(total+24)//25)
-            page = min(page,pages)
-            people = conn.execute("SELECT c.id,c.display_name,c.creator_type " + formal_base
-                                  + " ORDER BY c.display_name,c.id LIMIT 25 OFFSET %s", [*args,(page-1)*25]).fetchall()
-            imports_by_person = {person["id"]: [] for person in people}
-            for row in conn.execute(
-                """SELECT r.id,r.contact_id,r.handle,r.api_requests,r.stats,
-                    r.pack_ciphertext IS NOT NULL AS has_evidence
-                    FROM creator_import_rows r JOIN creator_import_batches b ON b.id=r.batch_id
-                    WHERE r.contact_id=ANY(%s::uuid[]) AND r.cm_authorization_id=%s
-                    AND r.review_status='confirmed' AND b.policy_version=%s
-                    ORDER BY r.created_at DESC,r.id DESC""",
-                (list(imports_by_person), cm_id, creator_imports.POLICY_VERSION),
-            ).fetchall():
-                imports_by_person[row["contact_id"]].append(row)
-            ids = list(imports_by_person)
-            identities = {r["contact_id"]: r for r in conn.execute(
-                """SELECT DISTINCT ON (contact_id) contact_id,open_id,
-                    CASE WHEN avatar_status='unavailable' THEN NULL ELSE avatar_url END avatar_url
-                    FROM lark_identities WHERE contact_id=ANY(%s::uuid[]) AND identity_type='user'
-                    ORDER BY contact_id,last_seen_at DESC,open_id""", (ids,),
-            ).fetchall()}
-            handles = {person_id: [] for person_id in ids}
-            for account in conn.execute(
-                """WITH links AS (
-                    SELECT contact_id,social_account_id FROM contact_social_accounts
-                    WHERE contact_id=ANY(%s::uuid[]) AND status='confirmed' AND relationship='owner'
-                    UNION SELECT contact_id,social_account_id FROM creator_account_assignments
-                    WHERE contact_id=ANY(%s::uuid[]) AND responsible_authorization_id=%s AND ended_at IS NULL
-                ) SELECT links.contact_id,s.display_handle FROM links
-                  JOIN social_accounts s ON s.id=links.social_account_id ORDER BY s.normalized_handle""",
-                (ids, ids, cm_id),
-            ).fetchall():
-                handles[account["contact_id"]].append(account["display_handle"])
-            items = []
-            for person in people:
-                identity = identities.get(person["id"])
-                import_rows = imports_by_person[person["id"]]
-                sources = list(dict.fromkeys(
-                    label for row in import_rows for label in creator_imports.source_labels(row)
-                )) or ["手动"]
-                evidence_rows = {}
-                for row in import_rows:
-                    if row["has_evidence"]:
-                        evidence_rows.setdefault(row["handle"], {"id": str(row["id"]), "handle": row["handle"]})
-                items.append({
-                    "id": str(person["id"]), "kind": "confirmed", "contact_id": str(person["id"]),
-                    "display_name": person["display_name"] or "未命名用户", "creator_type": "cap",
-                    "open_id": identity["open_id"] if identity else None,
-                    "avatar_url": safe_avatar_url(identity["avatar_url"]) if identity else None,
-                    "private_chat_url": private_chat_url(identity["open_id"] if identity else None),
-                    "handles": handles[person["id"]],
-                    "sources": sources, "source": " + ".join(sources),
-                    "evidence_rows": [] if read_only else list(evidence_rows.values()),
-                    "status_label": "已入库", "can_confirm": False, "can_defer": False,
-                })
-        return {
-            "cms": cms, "selected_cm_id": str(cm_id), "can_manage": can_manage,
-            "can_select_cm": can_select_cm, "read_only": read_only,
-            "run": None, "counts": counts, "usage": {"api_requests": 0, "input_tokens": 0, "output_tokens": 0},
-            "import_batches": imported["batches"], "items": items,
-            "total_count": total, "total_pages": pages, "page": page,
-        }
 
 
 def task_evidence(actor_id, task_id):

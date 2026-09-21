@@ -16,7 +16,15 @@ from psycopg.rows import dict_row
 from test_creator_ownership import _snapshot
 from test_creator_ownership import pilot as parent_pilot
 
-from app import admin_reporting, contact_assessments, creator_handles, creator_ownership, openai_client
+from app import (
+    admin_reporting,
+    contact_assessments,
+    creator_data,
+    creator_handles,
+    creator_ownership,
+    creator_roster,
+    openai_client,
+)
 from app import creator_imports as imports
 from app.crypto import message_body_cipher
 
@@ -57,6 +65,7 @@ def prepare(pg, pilot, monkeypatch):
     monkeypatch.setattr(imports, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(imports, "get_settings", lambda: pilot.settings)
     monkeypatch.setattr(creator_handles, "connection", lambda: nullcontext(pg))
+    monkeypatch.setattr(creator_roster, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(creator_handles, "get_settings", lambda: pilot.settings)
     calls, callbacks = [], []
 
@@ -152,7 +161,7 @@ def test_cap_excel_two_stage_matching_manual_confirmation_and_replays_preserve_p
     assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (creator,)).fetchone()["creator_type"] == "cap"
     assert pg.execute("SELECT status FROM contact_roles WHERE contact_id=%s AND role='creator'",
                       (creator,)).fetchone()["status"] == "confirmed"
-    formal = creator_handles.page_data(cm, tab="mine")["items"]
+    formal = creator_roster.page_data(cm, tab="mine")["items"]
     assert len(formal) == 1 and set(formal[0]["handles"]) == {"beauty.one_12", "corrected_02"}
     assert formal[0]["sources"] == ["Excel", "AI"]
     imports.preview_import(owner, cm, "roster.xlsx", data)
@@ -168,7 +177,7 @@ def test_cap_excel_two_stage_matching_manual_confirmation_and_replays_preserve_p
     assert _snapshot(pg, facts) == facts
     conflict = row_for(pg, again, "legacy_account")
     assert conflict["status"] == "pending" and conflict["contact_id"] == pilot.ids["legacy"]
-    assert set(creator_handles.page_data(cm, tab="mine")["items"][0]["handles"]) == {"beauty.one_12", "corrected_02"}
+    assert set(creator_roster.page_data(cm, tab="mine")["items"][0]["handles"]) == {"beauty.one_12", "corrected_02"}
     assert pg.execute("SELECT id,display_name FROM contacts ORDER BY id").fetchall() == before_people
     assert row_for(pg, batch, "corrected_02")["api_requests"] == 1
     assert imports.source_labels(row_for(pg, batch, "corrected_02")) == ["Excel"]
@@ -227,7 +236,7 @@ def test_manual_import_scope_identity_account_and_type_conflicts_are_atomic(pg, 
             assert not pg.execute("SELECT 1 FROM contact_social_accounts WHERE import_row_id=%s",
                                   (row["id"],)).fetchone()
     pg.execute("UPDATE creator_import_rows SET contact_id=%s,pack_ciphertext=%s WHERE id=%s",
-               (creator, creator_ownership._cipher(pilot.settings).encrypt("{}"), row["id"]))
+               (creator, creator_data.cipher(pilot.settings).encrypt("{}"), row["id"]))
     imports.confirm_row(cm, row["id"], "corrected_handle", creator)
     assert row_for(pg, batch, "corrected_handle")["review_status"] == "confirmed"
     prior = pg.execute("SELECT metadata->'previous' previous FROM audit_events "
@@ -271,15 +280,15 @@ def test_shared_creator_reuses_identity_without_sharing_message_permissions(pg, 
     link = pg.execute("SELECT * FROM contact_social_accounts WHERE contact_id=%s", (person,)).fetchone()
     assert link["import_row_id"] == link_before["import_row_id"]  # Preserve original identity evidence.
     for target in (cm, other):
-        view = creator_handles.page_data(other, cm_id=target, tab="mine")
+        view = creator_roster.page_data(other, cm_id=target, tab="mine")
         assert any(item["id"] == str(person) for item in view["items"])
     with pytest.raises(PermissionError):
         imports.row_evidence(cm, saved["id"])
     # Ending one CM's relationship leaves the other CM's library intact.
     pg.execute("UPDATE contact_assignments SET ended_at=NOW() WHERE contact_id=%s AND responsible_authorization_id=%s",
                (person, cm))
-    assert not creator_handles.page_data(cm, cm_id=cm, tab="mine")["items"]
-    assert any(item["id"] == str(person) for item in creator_handles.page_data(other, cm_id=other, tab="mine")["items"])
+    assert not creator_roster.page_data(cm, cm_id=cm, tab="mine")["items"]
+    assert any(item["id"] == str(person) for item in creator_roster.page_data(other, cm_id=other, tab="mine")["items"])
     with pg.transaction(force_rollback=True):
         pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (other,))
         another = imports.preview_import(other, other, "revoked.xlsx", workbook("handle", "shared_handle"))
@@ -398,15 +407,15 @@ def test_shared_group_identifies_each_handle_person_and_preserves_the_evidence_c
         assert row["review_status"] == "confirmed" and row["contact_id"] == contact
         assert (row["api_requests"], row["input_tokens"], row["output_tokens"]) == (2, 24, 16)
         assert row["stats"]["analysis_stage"] == "completed"
-        chain = json.loads(creator_ownership._cipher(pilot.settings).decrypt(row["pack_ciphertext"]))
-        judgments = json.loads(creator_ownership._cipher(pilot.settings).decrypt(row["result_ciphertext"]))
+        chain = json.loads(creator_data.cipher(pilot.settings).decrypt(row["pack_ciphertext"]))
+        judgments = json.loads(creator_data.cipher(pilot.settings).decrypt(row["result_ciphertext"]))
         assert set(chain) >= {"group", "person"} and set(judgments) >= {"group", "person"}
         assert all(chain[phase]["pack"]["imported_handle"] == handle and chain[phase]["refs"]
                    and chain[phase]["fingerprint"] for phase in ("group", "person"))
         assert len([u for u in chain["person"]["pack"]["users"] if u["eligible"]]) == 2
         assert judgments["group"]["group_refs"] and judgments["person"]["user_ref"]
         assert imports.source_labels(row) == ["Excel", "AI"]
-        formal = next(item for item in creator_handles.page_data(cm, tab="mine")["items"]
+        formal = next(item for item in creator_roster.page_data(cm, tab="mine")["items"]
                       if item["contact_id"] == str(contact))
         assert formal["sources"] == ["Excel", "AI"]
         assert {"id": str(row["id"]), "handle": handle} in formal["evidence_rows"]
@@ -792,7 +801,7 @@ def test_creator_library_reset_preserves_sources_history_and_new_data_on_replay(
                       "api_requests,input_tokens,output_tokens,response_id,request_id FROM creator_import_rows "
                       "ORDER BY id").fetchall()
     old_stats = pg.execute("SELECT id,stats,fingerprint FROM creator_import_rows ORDER BY id").fetchall()
-    assert creator_handles.page_data(cm, tab="mine")["total_count"] == 1
+    assert creator_roster.page_data(cm, tab="mine")["total_count"] == 1
     assert imports.page_data(cm, cm)["total"] == 2
     migration = (Path(__file__).parents[1] / "migrations" / "052_reset_creator_library_for_rule_review.sql").read_text()
     pg.execute(migration)
@@ -826,8 +835,8 @@ def test_creator_library_reset_preserves_sources_history_and_new_data_on_replay(
     assert audit["source_data_and_analysis_history_preserved"] and not audit["new_scan_started"]
     assert not pg.execute("SELECT 1 FROM creator_import_rows WHERE fingerprint IS NOT NULL").fetchone()
     for actor in (cm, owner):
-        assert creator_handles.page_data(actor, tab="mine")["total_count"] == 0
-        assert creator_handles.page_data(actor, tab="candidates")["total_count"] == 0
+        assert creator_roster.page_data(actor, tab="mine")["total_count"] == 0
+        assert creator_roster.page_data(actor, tab="candidates")["total_count"] == 0
         assert imports.page_data(actor, actor)["total"] == 0
     for table in ("creator_ownership_runs", "creator_ownership_tasks", "creator_handle_runs", "creator_handle_tasks",
                   "creator_import_batches"):
@@ -859,7 +868,7 @@ def test_creator_library_reset_preserves_sources_history_and_new_data_on_replay(
     imports.start_import(owner, new_batch["id"])
     imports.confirm_row(cm, row_for(pg, new_batch, "creator_one")["id"], "creator_one", creator)
     pg.execute(migration)
-    assert creator_handles.page_data(cm, tab="mine")["total_count"] == 1
+    assert creator_roster.page_data(cm, tab="mine")["total_count"] == 1
     assert row_for(pg, new_batch, "creator_one")["review_status"] == "confirmed"
     assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (creator,)).fetchone()["creator_type"] == "cap"
     assert pg.execute("SELECT count(*) n FROM audit_events WHERE action=%s", (action,)).fetchone()["n"] == 1
@@ -1050,17 +1059,17 @@ def test_delegated_creator_manager_can_review_evidence_and_import_across_cms(pg,
     imports.confirm_row(manager, manual['id'], 'manual_handle', creator)
     imports.defer_row(manager, row_for(pg, batch, 'defer_handle')['id'])
     assert imports.search_users(manager, cm, 'creator')
-    view = creator_handles.page_data(manager, cm)
+    view = creator_roster.page_data(manager, cm)
     assert view['can_manage'] and view['can_select_cm'] and not view['read_only']
     assert view['items'][0]['evidence_rows']
-    assert creator_handles.page_data(manager, cm, tab='candidates')['import_batches']
+    assert creator_roster.page_data(manager, cm, tab='candidates')['import_batches']
     saved = pg.execute('SELECT uploaded_by,cm_authorization_id FROM creator_import_batches WHERE id=%s',
                        (batch['id'],)).fetchone()
     assert saved['uploaded_by'] == manager and saved['cm_authorization_id'] == cm
     assert not pg.execute('SELECT 1 FROM admin_roles WHERE authorization_id=%s', (manager,)).fetchone()
     pg.execute('DELETE FROM admin_page_permissions WHERE authorization_id=%s', (manager,))
     for action in (
-        lambda: creator_handles.page_data(manager, cm, tab='candidates'),
+        lambda: creator_roster.page_data(manager, cm, tab='candidates'),
         lambda: imports.row_evidence(manager, matched['id']),
         lambda: imports.confirm_row(manager, manual['id'], 'manual_handle', creator),
         lambda: imports.recheck_batch(manager, batch['id']),

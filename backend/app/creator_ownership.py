@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import logging
 import math
@@ -11,10 +9,10 @@ from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
 
-from . import admin_reporting, ai_dispatch, creator_access, openai_client
+from . import admin_reporting, ai_dispatch, creator_access, creator_data, openai_client
 from .ai_feature_config import api_key_cipher
 from .config import get_settings
-from .crypto import TokenCipher, message_body_cipher
+from .crypto import message_body_cipher
 from .db import connection
 from .lark_api import private_chat_url
 from .message_text import display_body
@@ -69,14 +67,6 @@ RUN_LABELS = {
 }
 
 
-def _cipher(settings):
-    return TokenCipher(
-        hmac.digest(settings.token_encryption_key, b"creator-ownership/v1", "sha256"), b"creator-ownership/data/v1"
-    )
-
-
-def _encode(value):
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
 def _owned(conn, contact_id, cm_id):
@@ -101,16 +91,6 @@ def _creator(conn, contact_id):
     )
 
 
-def _config(conn):
-    # Sharing credentials does not couple this batch to the identity feature's on/off switch.
-    return conn.execute(
-        """SELECT provider,project_id,model,api_key_ciphertext FROM ai_feature_configs
-           WHERE feature='contact_assessment' AND provider='openai' AND api_key_ciphertext IS NOT NULL"""
-    ).fetchone()
-
-
-def _config_fingerprint(config):
-    return hashlib.sha256(_encode({k: config.get(k) for k in ("provider", "project_id", "model")}).encode()).hexdigest()
 
 
 def _audit(conn, actor, action, metadata):
@@ -255,8 +235,8 @@ def prepare_next_preview(settings):
                 return True
             creator_access.require_owner(conn, job["requested_by"])
             reason = _eligible_now(conn, current) or reason
-            config = _config(conn)
-            config_fp = _config_fingerprint(config) if config else None
+            config = creator_data.config(conn)
+            config_fp = creator_data.config_fingerprint(config) if config else None
             if reason or not material["eligible"]:
                 conn.execute(
                     """UPDATE creator_ownership_tasks SET status='skipped',reason_code=%s,
@@ -283,7 +263,7 @@ def prepare_next_preview(settings):
                             ref["authorization_id"],
                             ref["chat_id"],
                             ref["message_id"],
-                            Jsonb(json.loads(_encode(ref))),
+                            Jsonb(json.loads(creator_data.encode(ref))),
                         ),
                     )
                 cached = conn.execute(
@@ -304,7 +284,7 @@ def prepare_next_preview(settings):
                         "reused" if cached else "prepared",
                         material["fingerprint"],
                         config_fp,
-                        _cipher(settings).encrypt(_encode(material["pack"])),
+                        creator_data.cipher(settings).encrypt(creator_data.encode(material["pack"])),
                         len(refs),
                         Jsonb(material["stats"]),
                         cached["result_ciphertext"] if cached else None,
@@ -360,10 +340,10 @@ def start_run(actor_id, run_id, limit=20):
             return 0
         if run["status"] not in ("preview", "completed"):
             raise ValueError("请等预筛选完成；暂停的批次请点击继续。")
-        config = _config(conn)
+        config = creator_data.config(conn)
         if not config:
             raise ValueError(REASONS["configuration_missing"])
-        config_fp = _config_fingerprint(config)
+        config_fp = creator_data.config_fingerprint(config)
         tasks = conn.execute(
             """SELECT * FROM creator_ownership_tasks WHERE run_id=%s AND status='ready'
                ORDER BY created_at,id FOR UPDATE""",
@@ -676,8 +656,8 @@ def _finish_job(job, status, reason, *, response=None, result=None, settings=Non
                 invalid = "authorization_changed"
             if not invalid and not _valid_material(conn, current, settings):
                 invalid = "authorization_changed"
-            config = _config(conn)
-            if not invalid and (not config or _config_fingerprint(config) != current["config_fingerprint"]):
+            config = creator_data.config(conn)
+            if not invalid and (not config or creator_data.config_fingerprint(config) != current["config_fingerprint"]):
                 invalid = "configuration_changed"
             if invalid:
                 status, reason, result = "invalid", invalid, None
@@ -691,7 +671,7 @@ def _finish_job(job, status, reason, *, response=None, result=None, settings=Non
             (
                 status,
                 reason,
-                _cipher(settings).encrypt(_encode(result)) if result else None,
+                creator_data.cipher(settings).encrypt(creator_data.encode(result)) if result else None,
                 result["outcome"] if result else None,
                 result["confidence"] if result else None,
                 response.get("response_id") if response else None,
@@ -721,15 +701,15 @@ def run_claimed_ownership(job, settings):
                 )
                 return
             reason = _eligible_now(conn, current)
-            config = _config(conn)
-            if not reason and (not config or _config_fingerprint(config) != current["config_fingerprint"]):
+            config = creator_data.config(conn)
+            if not reason and (not config or creator_data.config_fingerprint(config) != current["config_fingerprint"]):
                 reason = "configuration_changed"
             if not reason and not _valid_material(conn, current, settings):
                 reason = "authorization_changed"
             if current["run_status"] != "running":
                 reason = "authorization_changed"
             if not reason:
-                pack = json.loads(_cipher(settings).decrypt(current["pack_ciphertext"]))
+                pack = json.loads(creator_data.cipher(settings).decrypt(current["pack_ciphertext"]))
                 key = api_key_cipher(settings.token_encryption_key).decrypt(config["api_key_ciphertext"])
                 conn.execute("UPDATE creator_ownership_tasks SET api_requests=api_requests+1 WHERE id=%s", (job["id"],))
         if reason:
@@ -833,7 +813,7 @@ def page_data(cm_id=None, run_id=None, query="", status="all", page=1, include_p
         )
         if selected and not any(c["id"] == str(selected) for c in cms):
             raise ValueError("该负责人没有有效的正文授权。")
-        config = _config(conn)
+        config = creator_data.config(conn)
         run = None
         if run_id:
             run = conn.execute(
@@ -931,7 +911,7 @@ def page_data(cm_id=None, run_id=None, query="", status="all", page=1, include_p
                 )
                 if material_valid and row["result_ciphertext"]:
                     try:
-                        result = json.loads(_cipher(settings).decrypt(row["result_ciphertext"]))
+                        result = json.loads(creator_data.cipher(settings).decrypt(row["result_ciphertext"]))
                     except (ValueError, TypeError):
                         pass
                 can_confirm = False
@@ -1044,7 +1024,8 @@ def task_evidence(actor_id, task_id):
                     "available": True,
                 }
             )
-        result = json.loads(_cipher(settings).decrypt(task["result_ciphertext"])) if task["result_ciphertext"] else {}
+        result = (json.loads(creator_data.cipher(settings).decrypt(task["result_ciphertext"]))
+                  if task["result_ciphertext"] else {})
         _audit(conn, actor_id, "evidence_viewed", {"task_id": str(task_id), "cm_id": str(task["cm_authorization_id"])})
         return {
             "cm_id": str(cm["id"]),
