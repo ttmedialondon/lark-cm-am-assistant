@@ -171,7 +171,8 @@ def schedule_merges(conn, settings):
 
 def merge_input(conn, run, task, settings, roster=None, chats=None, *, read_cache=None):
     core._authorize(
-        conn, run["requested_by_authorization_id"], owner_only=True, cm_id=run["responsible_authorization_id"]
+        conn, run["requested_by_authorization_id"], owner_only=True,
+        cm_id=run["responsible_authorization_id"], read_cache=read_cache,
     )
     roster = roster if roster is not None else core._roster(conn, run["responsible_authorization_id"])
     chats = (
@@ -203,9 +204,14 @@ def merge_input(conn, run, task, settings, roster=None, chats=None, *, read_cach
             continue
         key = ("fingerprint", source["id"])
         if key not in cache:
-            data = core._load_chat(
-                conn, run, source["chat_id"], source["cutoff"], settings=settings, roster=roster, related_chats=chats
-            )
+            try:
+                data = core._load_chat(
+                    conn, run, source["chat_id"], source["cutoff"], settings=settings,
+                    roster=roster, related_chats=chats, read_cache=read_cache,
+                )
+            except (PermissionError, core.SummaryInputError, InvalidTag, ValueError, KeyError):
+                cache[key] = None  # Failed material is not re-read for every creator in this response.
+                raise
             cache[key] = data["fingerprint"] if data else None
         if cache[key] != source["input_fingerprint"]:
             raise core.SummaryInputError("会话资料已变化。")

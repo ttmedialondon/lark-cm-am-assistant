@@ -50,7 +50,23 @@ def _hash(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
 
 
-def _authorize(conn, actor_id, *, owner_only=False, cm_id=REMI_ID):
+def _authorize(conn, actor_id, *, owner_only=False, cm_id=REMI_ID, read_cache=None):
+    """Reuse only within one read transaction holding the live grant SHARE locks."""
+    if read_cache is None:
+        return _authorize_live(conn, actor_id, owner_only=owner_only, cm_id=cm_id)
+    key = ("authorization", str(actor_id), owner_only, str(cm_id))
+    if key not in read_cache:
+        try:
+            read_cache[key] = _authorize_live(conn, actor_id, owner_only=owner_only, cm_id=cm_id)
+        except (PermissionError, SummaryInputError) as exc:
+            read_cache[key] = exc
+    result = read_cache[key]
+    if isinstance(result, Exception):
+        raise result.with_traceback(None)
+    return result
+
+
+def _authorize_live(conn, actor_id, *, owner_only=False, cm_id=REMI_ID):
     cm_id = UUID(str(cm_id))
     actor_id = UUID(str(actor_id))
     # Caller transactions keep these live grants stable until export/read finishes.
@@ -400,9 +416,10 @@ def _body(row, cipher, names=None):
     return (text or "[正文不可读取，需人工查看原消息]"), incomplete
 
 
-def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, related_chats=None):
+def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, related_chats=None, read_cache=None):
     cm_id = run.get("responsible_authorization_id", REMI_ID)
-    cm, _ = _authorize(conn, run["requested_by_authorization_id"], owner_only=True, cm_id=cm_id)
+    cm, _ = _authorize(conn, run["requested_by_authorization_id"], owner_only=True,
+                       cm_id=cm_id, read_cache=read_cache)
     conn.execute(
         """SELECT chat_id FROM authorization_chats WHERE authorization_id=%s AND chat_id=%s FOR SHARE""",
         (cm_id, chat_id),

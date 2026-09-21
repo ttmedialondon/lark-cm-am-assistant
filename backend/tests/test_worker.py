@@ -273,6 +273,28 @@ def test_dispatch_uses_at_most_three_slots_and_fairly_rotates_queues(monkeypatch
     assert worker._fill_ai_slots(object(), Executor(), futures, preference) == 3
     assert [job["id"] for _runner, job in submitted[6:]] == ["summary-2", "ownership-2"]
 
+    # Exhausted queues must not query on every busy Lark tick. Completion wakes
+    # the dispatcher immediately so a chained summary/reply is not delayed.
+    checks = []
+    now = [10.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(worker, "_fill_ai_slots", lambda *args: checks.append(now[0]) or args[-1])
+    settings = SimpleNamespace(worker_idle_seconds=3)
+    futures.clear()
+    preference, deadline = worker._schedule_ai(settings, Executor(), futures, preference, 0)
+    assert deadline == 13.0 and checks == [10.0]
+    now[0] = 10.05
+    assert worker._schedule_ai(settings, Executor(), futures, preference, deadline) == (preference, deadline)
+    assert checks == [10.0]
+    finished = TaskFuture()
+    finished.set_result(None)
+    futures.add(finished)
+    preference, deadline = worker._schedule_ai(settings, Executor(), futures, preference, deadline)
+    assert checks == [10.0, 10.05] and not futures
+    now[0] = deadline
+    worker._schedule_ai(settings, Executor(), futures, preference, deadline)
+    assert len(checks) == 3
+
 
 def test_offhours_tasks_fill_three_parallel_slots_without_waiting(monkeypatch) -> None:
     jobs = iter({"id": index} for index in range(3))

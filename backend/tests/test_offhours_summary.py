@@ -572,12 +572,51 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
     assert not any(ref["chat_id"] == "group_ai" for event in view["events"] for ref in event["evidence"])
 
 
-def test_current_acl_hides_already_generated_results(pg, seeded):
+def test_current_acl_hides_already_generated_results(pg, seeded, monkeypatch):
     s = seeded
     s.save()
     ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
-    pg.execute("UPDATE chat_messages SET is_deleted=TRUE WHERE message_id='m1'")
     finish_merges(pg, s)
+    run = pg.execute("SELECT r.* FROM offhours_summary_runs r JOIN offhours_summary_settings s "
+                     "ON s.run_id=r.id").fetchone()
+    task = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND chat_id IS NULL",
+                      (run["id"],)).fetchone()
+    roster = ai._roster(pg)
+    chats = ai._related_chats(pg, roster, settings=s.settings)
+    live, load = ai._authorize_live, ai._load_chat
+    calls = []
+
+    def authorized(*args, **kwargs):
+        calls.append("authorize")
+        return live(*args, **kwargs)
+
+    def loaded(*args, **kwargs):
+        calls.append("load")
+        return load(*args, **kwargs)
+
+    monkeypatch.setattr(ai, "_authorize_live", authorized)
+    monkeypatch.setattr(ai, "_load_chat", loaded)
+    cache = {}
+    for _ in range(2):
+        assert summary_dialogues.view_events(pg, run, task, s.settings, roster, chats, read_cache=cache)
+    assert calls.count("authorize") == calls.count("load") == 1
+
+    pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='chat'")
+    calls.clear()
+    cache = {}
+    for _ in range(2):
+        with pytest.raises(ai.SummaryInputError):
+            summary_dialogues.view_events(pg, run, task, s.settings, roster, chats, read_cache=cache)
+    assert calls.count("authorize") == calls.count("load") == 1
+    assert not ai.get_summary_view(pg, s.ids["cm"])["events"]
+    pg.execute("UPDATE authorization_chats SET is_visible=TRUE WHERE chat_id='chat'")
+    assert ai.get_summary_view(pg, s.ids["cm"])["events"]
+
+    pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (s.ids["owner"],))
+    assert not ai.get_summary_view(pg, s.ids["cm"])["events"]
+    pg.execute("UPDATE admin_roles SET is_active=TRUE WHERE authorization_id=%s", (s.ids["owner"],))
+    assert ai.get_summary_view(pg, s.ids["cm"])["events"]
+    pg.execute("UPDATE chat_messages SET is_deleted=TRUE WHERE message_id='m1'")
     view = ai.get_summary_view(pg, s.ids["owner"])
     assert not view["events"] and view["run"]["counts"]["failed"] == 1
 

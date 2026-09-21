@@ -106,6 +106,7 @@ def run_forever() -> None:
         LOGGER.warning("Lark App Secret is not configured; worker is waiting for administrator input")
 
     next_ai_queue = 0
+    next_ai_check = 0.0
     next_organization_check = 0.0
     ai_executor = ThreadPoolExecutor(max_workers=ai_dispatch.MAX_CONCURRENT_REQUESTS, thread_name_prefix="openai")
     ai_futures: set[Future[Any]] = set()
@@ -138,11 +139,12 @@ def run_forever() -> None:
     try:
         while True:
             try:
-                _reap_ai_futures(ai_futures)
                 _reap_page_futures(page_futures, settings)
                 _reap_member_futures(member_futures)
                 _recover_expired_leases()
-                next_ai_queue = _fill_ai_slots(settings, ai_executor, ai_futures, next_ai_queue)
+                next_ai_queue, next_ai_check = _schedule_ai(
+                    settings, ai_executor, ai_futures, next_ai_queue, next_ai_check,
+                )
                 preview_future, next_preview_check, next_preview_queue = _schedule_creator_preview(
                     settings, preview_executor, preview_future, next_preview_check, next_preview_queue,
                 )
@@ -246,6 +248,21 @@ def _fill_ai_slots(
         if not submitted:
             break
     return next_queue
+
+
+def _schedule_ai(settings, executor, futures, next_queue, next_check):
+    """Empty AI queues follow the idle cadence, not the busy Lark 50ms loop."""
+    previous = len(futures)
+    _reap_ai_futures(futures)
+    if len(futures) < previous:
+        next_check = 0.0  # Completion immediately frees a slot for chained work.
+    if time.monotonic() < next_check:
+        return next_queue, next_check
+    previous = len(futures)
+    next_queue = _fill_ai_slots(settings, executor, futures, next_queue)
+    next_check = (time.monotonic() + max(settings.worker_idle_seconds, 0.05)
+                  if len(futures) == previous and len(futures) < ai_dispatch.MAX_CONCURRENT_REQUESTS else 0.0)
+    return next_queue, next_check
 
 
 def _prepare_creator_preview(settings: Settings, next_queue: int) -> tuple[bool, int]:
