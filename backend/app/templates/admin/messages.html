@@ -9,8 +9,6 @@
     <header class="message-console__toolbar">
       <div class="message-console__heading">
         <h1>消息内容</h1>
-        <ol class="message-console__steps" aria-label="阅读步骤"><li{% if not selected_user %} aria-current="step"{% endif %}><span>1</span>选择人员</li><li{% if selected_user and not selected_chat %} aria-current="step"{% endif %}><span>2</span>查找会话</li><li{% if selected_chat %} aria-current="step"{% endif %}><span>3</span>阅读记录</li></ol>
-        <p>仅查看已同步、已授权保存的正文；打开会话会记录访问日志。</p>
       </div>
       <div class="message-console__source-picker">
         <form action="/admin/messages" method="get" class="message-console__user-form" id="message-source-form">
@@ -34,7 +32,6 @@
     <div class="message-console__workspace">
       <aside class="card message-console__directory" id="conversation-directory" aria-label="会话目录">
         <div class="message-console__directory-header">
-          <div class="message-console__section-label">2 · 查找会话</div>
           <h2 title="{{ selected_user.display_name }}">{{ selected_user.display_name }}</h2>
           <p>按名称排序{% if conversation_page and conversation_page.total_count is not none %} · 共 {{ conversation_page.total_count }} 个结果{% endif %}</p>
         </div>
@@ -75,7 +72,6 @@
           <div class="message-console__detail-empty"><span class="message-console__empty-step">!</span><h2>这个会话暂不可用</h2><p>它可能已不在当前人员的授权范围内，或当前无法读取。请重新选择会话。</p></div>
         {% elif selected_chat %}
           <header class="message-console__detail-header">
-            <div class="message-console__section-label">3 · 阅读记录</div>
             <div class="message-console__conversation-top"><span class="message-console__type">{{ selected_chat.chat_mode_label }}</span>{% if selected_chat.external %}<span class="message-console__external">外部会话</span>{% endif %}</div>
             <h2 title="{{ selected_chat.name }}">{{ selected_chat.name }}</h2>
             <div class="message-console__reading-meta"><span>授权来源：<strong>{{ selected_user.display_name }}</strong></span>{% if content_page %}<span><strong>{{ content_page.metrics.get('content_count', 0) }}</strong> 条已存正文</span>{% endif %}</div>
@@ -101,14 +97,14 @@
           </div>
           {% else %}<div class="message-console__detail-empty"><span class="message-console__empty-step">—</span><h2>暂无已存正文</h2><p>该会话在当前已同步、已授权的范围内没有已保存的正文，不代表原会话没有聊天记录。</p></div>{% endif %}
         {% else %}
-          <div class="message-console__detail-empty"><span class="message-console__empty-step">3</span><h2>选择一个会话开始阅读</h2><p>从会话目录中选择群聊或私聊。未打开会话前，不读取正文。</p></div>
+          <div class="message-console__detail-empty"><h2>请选择会话</h2></div>
         {% endif %}
       </section>
     </div>
     {% else %}
       <section class="card message-console__start" aria-labelledby="message-start-title">
-        <div class="message-console__start-header"><span class="message-console__empty-step">1</span><div><h2 id="message-start-title">{% if users %}先选择一位人员{% else %}还没有已接入人员{% endif %}</h2><p>{% if users %}选择聊天授权来源后，先进入会话目录，再自行打开记录。{% else %}人员完成 Lark 接入后，会出现在这里。{% endif %}</p></div></div>
-        {% if users %}<div class="message-console__source-cards">{% for user in users %}<a class="message-console__source-card" href="/admin/messages?user_id={{ user.id }}&amp;user_page={{ user_page.page }}" aria-label="查看 {{ user.display_name }} 的会话"><span class="message-console__source-avatar" aria-hidden="true">{{ (user.display_name or '?')[:1]|upper }}</span><div><strong title="{{ user.display_name }}">{{ user.display_name }}</strong><span>{{ source_label(user) }}</span><small>目录：{{ user.group_count }} 个群聊 · {{ user.p2p_count }} 个私聊</small></div><span class="message-console__source-arrow" aria-hidden="true">→</span></a>{% endfor %}</div>{% with pager=user_page %}{% include "admin/_pagination.html" %}{% endwith %}{% endif %}
+        <div class="message-console__start-header"><h2 id="message-start-title">{% if users %}请选择人员{% else %}暂无已接入人员{% endif %}</h2></div>
+        {% if users %}<div class="message-console__source-cards">{% for user in users %}<a class="message-console__source-card" href="/admin/messages?user_id={{ user.id }}&amp;user_page={{ user_page.page }}" aria-label="查看 {{ user.display_name }} 的会话"><span class="message-console__source-avatar" aria-hidden="true">{{ (user.display_name or '?')[:1]|upper }}</span><div><strong title="{{ user.display_name }}">{{ user.display_name }}</strong><span>{{ source_label(user) }}</span></div><span class="message-console__source-arrow" aria-hidden="true">→</span></a>{% endfor %}</div>{% with pager=user_page %}{% include "admin/_pagination.html" %}{% endwith %}{% endif %}
       </section>
     {% endif %}
   </div></main></div>

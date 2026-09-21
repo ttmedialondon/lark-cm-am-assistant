@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+from datetime import timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -31,6 +32,28 @@ def test_index_keeps_authenticated_users_on_the_dashboard(monkeypatch: pytest.Mo
     response = main.index(_request_with_session("active-session"))
     assert response.status_code == 303
     assert response.headers["location"] == "/dashboard"
+
+
+def test_session_touch_is_throttled_without_caching_revocation(pg, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(main, "connection", lambda: nullcontext(pg))
+    actor = uuid4()
+    session_hash = main._sha256("fixture-session")
+    pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,'touch_actor','fixture')",
+               (actor,))
+    pg.execute("INSERT INTO web_sessions(session_hash,authorization_id,expires_at,last_seen_at) "
+               "VALUES(%s,%s,NOW()+INTERVAL '1 day',NOW()-INTERVAL '10 minutes')", (session_hash, actor))
+    request = _request_with_session("fixture-session")
+    assert main._current_authorization(request)["status"] == "active"
+    touched = pg.execute("SELECT last_seen_at FROM web_sessions WHERE session_hash=%s", (session_hash,)).fetchone()
+    pg.execute("UPDATE web_sessions SET last_seen_at=NOW()-INTERVAL '1 minute' WHERE session_hash=%s", (session_hash,))
+    for _ in range(3):
+        assert main._current_authorization(request)["id"] == actor
+    unchanged = pg.execute("SELECT last_seen_at FROM web_sessions WHERE session_hash=%s", (session_hash,)).fetchone()
+    assert touched["last_seen_at"] - unchanged["last_seen_at"] == timedelta(minutes=1)
+    pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (actor,))
+    assert main._current_authorization(request)["status"] == "revoked"
+    pg.execute("DELETE FROM web_sessions WHERE session_hash=%s", (session_hash,))
+    assert main._current_authorization(request) is None
 
 
 def test_dashboard_keeps_messages_and_removes_retired_creator_controls() -> None:

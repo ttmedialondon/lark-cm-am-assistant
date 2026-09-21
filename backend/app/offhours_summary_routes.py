@@ -1,8 +1,10 @@
 """Session-scoped summaries and human-reviewed reply drafts for confirmed creators."""
 
+import hashlib
+
 from fastapi import APIRouter, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 from . import offhours_summary, summary_periods, summary_replies
@@ -77,7 +79,12 @@ def create_router(*, current_authorization, render_template, csrf_token=lambda a
     def data(request: Request):
         try:
             _, result = read(request)
-            return secure(JSONResponse(result))
+            response = secure(JSONResponse(result))
+            response.headers["ETag"] = '"' + hashlib.sha256(response.body).hexdigest() + '"'
+            # No cross-request cache: live grants/material are checked before a 304.
+            if request.headers.get("if-none-match") == response.headers["ETag"]:
+                return secure(Response(status_code=304, headers={"ETag": response.headers["ETag"]}))
+            return response
         except (PermissionError, offhours_summary.SummaryInputError) as exc:
             return denied(exc)
 

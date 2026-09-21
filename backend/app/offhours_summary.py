@@ -1020,6 +1020,7 @@ def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None):
     roster = _roster(conn, cm_id)
     related_chats = _related_chats(conn, roster, settings=settings, cm_id=cm_id)
     from . import summary_dialogues
+    read_cache = {}
     for task in tasks:
         name = {"succeeded": "completed", "queued": "queued", "running": "running"}.get(task["status"], "failed")
         counts[name] += 1
@@ -1029,7 +1030,9 @@ def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None):
             continue
         try:
             if task["chat_id"] is None:
-                view["events"].extend(summary_dialogues.view_events(conn, row, task, settings, roster, related_chats))
+                view["events"].extend(summary_dialogues.view_events(
+                    conn, row, task, settings, roster, related_chats, read_cache=read_cache
+                ))
         except (PermissionError, SummaryInputError, InvalidTag, ValueError, KeyError):
             counts["completed"] -= 1
             counts["failed"] += 1

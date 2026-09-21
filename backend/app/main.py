@@ -353,16 +353,18 @@ def _current_authorization(request: Request) -> dict[str, Any] | None:
         row = conn.execute(
             """
             SELECT a.id, a.open_id, a.display_name, a.status, a.last_error,
-                   a.body_consent_at, a.p2p_discovery_status, a.p2p_last_error
+                   a.body_consent_at, a.p2p_discovery_status, a.p2p_last_error,
+                   s.last_seen_at < NOW() - INTERVAL '5 minutes' AS touch_session
             FROM web_sessions s
             JOIN authorizations a ON a.id = s.authorization_id
             WHERE s.session_hash = %s AND s.expires_at > NOW()
             """,
             (_sha256(raw_session),),
         ).fetchone()
-        if row:
+        if row and row.pop("touch_session", False):
             conn.execute(
-                "UPDATE web_sessions SET last_seen_at = NOW() WHERE session_hash = %s",
+                """UPDATE web_sessions SET last_seen_at = NOW() WHERE session_hash = %s
+                   AND last_seen_at < NOW() - INTERVAL '5 minutes'""",
                 (_sha256(raw_session),),
             )
         return row

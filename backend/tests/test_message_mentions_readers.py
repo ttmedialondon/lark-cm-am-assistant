@@ -74,7 +74,8 @@ def test_admin_reader_only_looks_up_mentions_from_the_authorized_page(monkeypatc
         admin_reporting, "message_body_cipher", lambda _: SimpleNamespace(decrypt=lambda _: json.dumps({"text": TEXT}))
     )
 
-    def names(current, rows):
+    def names(current, rows, *, lock):
+        assert lock is False
         assert current is conn and rows == [row]
         assert len(calls) == 2
         assert "ac.is_visible AND ac.sync_enabled" in calls[-1][0]

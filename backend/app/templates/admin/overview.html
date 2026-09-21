@@ -6,15 +6,13 @@
   <div class="page-wrapper">
     <div class="page-body pt-0">
       <div class="container-xl">
-        <div class="alert alert-info" role="status">“首次同步中”表示历史会话正在安全分页回填，不是失败重试；“已接入 · 定时同步”表示首次回填已完成，下一轮会按 5 分钟周期检查。OAuth 令牌与应用密钥始终不展示。</div>
-        {% if lark_admission %}<div class="alert alert-{{ lark_admission.badge }}" role="status"><strong>{{ lark_admission.label }}</strong><span class="ms-2">{{ lark_admission.detail }}</span></div>{% endif %}
+        {% if lark_admission and lark_admission.badge != 'success' %}<div class="alert alert-{{ lark_admission.badge }}" role="status"><strong>{{ lark_admission.label }}</strong><span class="ms-2">{{ lark_admission.detail }}</span></div>{% endif %}
         <div class="row row-deck row-cards">
           {% for metric in metrics %}
           <div class="col-sm-6 col-lg-4">
             <div class="card"><div class="card-body">
-              <div class="subheader">{{ metric.label }}</div>
+              <div class="subheader" title="{{ metric.hint }}">{{ metric.label }}</div>
               <div class="h1 mb-1">{{ metric.value }}</div>
-              <div class="text-secondary small">{{ metric.hint }}</div>
             </div></div>
           </div>
           {% endfor %}
@@ -59,7 +57,7 @@
           </div>
         </div>
         <div class="card mt-4">
-          <div class="card-header"><div><h3 class="card-title mb-1">当前运行参数</h3><div class="text-secondary small">来自服务器运行配置；不展示数据库连接、令牌、密钥或其他可复用凭证。</div></div></div>
+          <div class="card-header"><h3 class="card-title">当前运行参数</h3></div>
           <div class="table-responsive"><table class="table table-vcenter card-table mb-0">
             <tbody>{% for item in runtime %}<tr><td>{{ item.label }}</td><td class="text-secondary">{{ item.value }}</td></tr>{% endfor %}</tbody>
           </table></div>

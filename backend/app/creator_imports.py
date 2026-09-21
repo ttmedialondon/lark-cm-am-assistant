@@ -615,7 +615,7 @@ def candidate_items(conn, cm_id, rows):
     return candidates
 
 
-def page_data(actor_id, cm_id, q="", page=1):
+def page_data(actor_id, cm_id, q="", page=1, *, include_candidates=True):
     q, page = str(q or "").strip()[:120], max(1, min(int(page), 10000))
     with connection() as conn:
         cm_id, _ = creator_handles._access(conn, actor_id, cm_id)
@@ -636,6 +636,8 @@ def page_data(actor_id, cm_id, q="", page=1):
             params += (q, q, cm_id)
         total = conn.execute("SELECT count(*) n " + base, params).fetchone()["n"]
         page = min(page, max(1, math.ceil(total / 25)))
+        if not include_candidates:
+            return {"batches": decorated, "total": total}
         # Paginate before checking identity access; a refresh must never enumerate all CM-visible users.
         rows = conn.execute(
             "WITH page_rows AS MATERIALIZED (SELECT r.*,b.creator_type batch_creator_type "

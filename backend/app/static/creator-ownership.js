@@ -15,6 +15,8 @@
   let page = data.page || 1;
   let query = el("query").value.trim();
   let evidenceVersion = 0;
+  let revision = "", revisionURL = "", denied = false;
+  el("initial").textContent = "";
 
   function node(tag, text = "", className = "") {
     const value = document.createElement(tag);
@@ -31,6 +33,11 @@
     el("notice").className = message ? `alert alert-${error ? "danger" : "success"}` : "alert d-none";
   }
   async function readResponse(response) {
+    if ([401, 403].includes(response.status) || response.redirected) {
+      denied = true; busy = true; evidenceVersion++;
+      data = {cms: [], items: [], counts: {}, usage: {}, run: null};
+      selected.clear(); el("evidence-body").replaceChildren(); el("evidence").close(); render();
+    }
     const payload = response.headers.get("content-type")?.includes("application/json") ? await response.json() : {};
     if (!response.ok || response.redirected) {
       throw new Error(payload.error || "访问失败，请检查登录状态或刷新后重试。");
@@ -166,18 +173,23 @@
     return params;
   }
   async function refresh(automatic = false) {
-    if (automatic && (reading || busy || document.hidden)) return;
+    if (denied || (automatic && (reading || busy || document.hidden))) return;
     const version = ++requestVersion;
     reading = true;
     try {
-      const next = await readResponse(await fetch(`${base}/data?${syncURL()}`, {cache: "no-store"}));
+      const url = `${base}/data?${syncURL()}`;
+      const response = await fetch(url, {cache: "no-store",
+        headers: revisionURL === url && revision ? {"If-None-Match": revision} : {}});
+      if (response.status === 304) return;
+      const next = await readResponse(response);
       if (version !== requestVersion) return;
-      data = next; render();
+      revision = response.headers.get("ETag") || ""; revisionURL = url;
+      if (JSON.stringify(data) !== JSON.stringify(next)) { data = next; render(); }
     } catch (error) { if (version === requestVersion) notice(error.message, true); }
     finally { if (version === requestVersion) reading = false; }
   }
   async function mutate(action, fields = {}) {
-    if (!owner || busy) return;
+    if (denied || !owner || busy) return;
     busy = true; render(); notice("");
     try {
       const path = action === "preview" ? "/preview" : `/${data.run.id}/${action}`;
@@ -249,5 +261,13 @@
     });
   }
   render();
-  setInterval(() => { if (data.run) refresh(true); }, 8000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(true); });
+  // Settled results still recheck live access/material, without an 8-second full refresh loop.
+  let lastCheck = Date.now();
+  setInterval(() => {
+    const active = ["preparing", "running"].includes(data.run?.status);
+    if (Date.now() - lastCheck >= (active ? 8000 : 60000)) {
+      lastCheck = Date.now(); refresh(true);
+    }
+  }, 8000);
 })();

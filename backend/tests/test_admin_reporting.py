@@ -153,6 +153,9 @@ def test_people_directory_all_contacts_current_policy_priority_and_unfiltered_pr
     filtered = admin_reporting.contacts(category="creator", query=" AI ")
     assert [row["display_name"] for row in filtered["items"]] == ["AI"]
     assert filtered["identity_summary"] == summary and filtered["total_count"] == 1
+    assert admin_reporting.contacts(page=999, category="creator", query="AI")["page"] == 1
+    empty = admin_reporting.contacts(query="not-present")
+    assert empty["items"] == [] and empty["total_count"] == 0 and empty["identity_summary"] == summary
     detail = admin_reporting.contact_detail("ou_AI", include_conversations=False)
     assert detail["contact"]["category"] == "creator"
     assert detail["conversations"]["items"] == []
@@ -300,6 +303,32 @@ def test_personnel_detail_skips_ungranted_conversation_and_job_queries(monkeypat
     assert len(calls) == 1
     assert detail["conversations"]["items"] == []
     assert detail["jobs"]["items"] == []
+
+
+def test_personnel_counts_preserve_deleted_hidden_and_paginated_scope(pg, monkeypatch):
+    monkeypatch.setattr(admin_reporting, "connection", lambda: nullcontext(pg))
+    actor = uuid4()
+    pg.execute("INSERT INTO authorizations(id,open_id,display_name,access_token_ciphertext) "
+               "VALUES(%s,'reporting_actor','Reporting','fixture')", (actor,))
+    for index in range(12):
+        chat = f"reporting_{index:02}"
+        pg.execute("INSERT INTO chats(chat_id,name,chat_status) VALUES(%s,%s,%s)",
+                   (chat, chat, 'dissolved' if index == 11 else 'normal'))
+        pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id,is_visible) VALUES(%s,%s,%s)",
+                   (actor, chat, index != 10))
+        for deleted in (False, True):
+            message = str(deleted)
+            pg.execute("INSERT INTO chat_messages(chat_id,message_id,is_deleted) VALUES(%s,%s,%s)",
+                       (chat, message, deleted))
+            pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id,"
+                       "sent_by_author) VALUES(%s,%s,%s,TRUE)", (actor, chat, message))
+    listing = admin_reporting.users(query="Reporting")
+    detail = admin_reporting.user_detail(actor)
+    for user in (listing["items"][0], detail["user"]):
+        assert user["message_count"] == user["own_message_count"] == 10
+    assert detail["conversations"]["total_count"] == 10
+    assert all(chat["message_count"] == 1 for chat in detail["conversations"]["items"])
+    assert admin_reporting.users(query="missing")["items"] == []
 
 
 def test_contact_detail_skips_ungranted_conversation_queries(monkeypatch):

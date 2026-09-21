@@ -581,4 +581,8 @@ def test_excel_only_pages_exclude_old_ai_candidates_and_merge_manually_confirmed
     assert formal[0]["sources"] == ["Excel"] and formal[0]["creator_type"] == "cap"
     assert handles.page_data(cm, tab="candidates")["total_count"] == 25
     assert handles.page_data(cm)["total_count"] == 1
+    def unused_candidates(*args):
+        raise AssertionError("The confirmed tab must not load candidate details")
+    monkeypatch.setattr(imports, "candidate_items", unused_candidates)
+    assert handles.page_data(cm)["items"] == formal
     assert len(case.calls) == paid

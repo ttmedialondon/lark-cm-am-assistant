@@ -7,6 +7,7 @@ avoids importing ``main`` back into an admin module.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 from collections.abc import Callable
@@ -683,7 +684,13 @@ def create_admin_router(
         except (ValueError, LookupError, PermissionError) as exc:
             return ownership_error(exc)
         if request.url.path.endswith("/data"):
-            return ownership_json(data)
+            response = ownership_json(data)
+            response.headers["ETag"] = '"' + hashlib.sha256(response.body).hexdigest() + '"'
+            # Compare only after current permissions and evidence have been rechecked.
+            if request.headers.get("if-none-match") == response.headers["ETag"]:
+                return Response(status_code=304, headers={key: value for key, value in response.headers.items()
+                                                         if key != "content-length"})
+            return response
         return render_template(request, "admin/creator_ownership.html", {
             **page_context(access_context, "ai"), "ownership": jsonable_encoder(data),
             "ownership_query": q[:120], "ownership_status": status,

@@ -164,7 +164,7 @@ def schedule_merges(conn, settings):
         )
 
 
-def merge_input(conn, run, task, settings, roster=None, chats=None):
+def merge_input(conn, run, task, settings, roster=None, chats=None, *, read_cache=None):
     core._authorize(
         conn, run["requested_by_authorization_id"], owner_only=True, cm_id=run["responsible_authorization_id"]
     )
@@ -176,23 +176,33 @@ def merge_input(conn, run, task, settings, roster=None, chats=None):
     )
     if not any(r["contact_id"] == task["contact_id"] for r in roster):
         raise core.SummaryInputError("达人归属已变化。")
-    sources = conn.execute(
-        """SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND is_current
-        AND chat_id IS NOT NULL ORDER BY id""",
-        (task["run_id"],),
-    ).fetchall()
+    # Only shared within one authorized read transaction; never reused across
+    # requests, users or runs. Every new request revalidates live message material.
+    cache = read_cache if read_cache is not None else {}
+    if "sources" not in cache:
+        cache["sources"] = conn.execute(
+            """SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND is_current
+            AND chat_id IS NOT NULL ORDER BY id""", (task["run_id"],),
+        ).fetchall()
+    sources = cache["sources"]
     if any(t["status"] != "succeeded" for t in sources):
         raise core.SummaryInputError("会话尚未完成。")
     events, source_hashes, person = [], [], None
     for source in sources:
-        saved = decode(source["result_ciphertext"], settings)
+        key = ("decoded", source["id"])
+        if key not in cache:
+            cache[key] = decode(source["result_ciphertext"], settings)
+        saved = cache[key]
         users = {k: u for k, u in saved["users"].items() if UUID(u["contact_id"]) == task["contact_id"]}
         if not users:
             continue
-        data = core._load_chat(
-            conn, run, source["chat_id"], source["cutoff"], settings=settings, roster=roster, related_chats=chats
-        )
-        if not data or data["fingerprint"] != source["input_fingerprint"]:
+        key = ("fingerprint", source["id"])
+        if key not in cache:
+            data = core._load_chat(
+                conn, run, source["chat_id"], source["cutoff"], settings=settings, roster=roster, related_chats=chats
+            )
+            cache[key] = data["fingerprint"] if data else None
+        if cache[key] != source["input_fingerprint"]:
             raise core.SummaryInputError("会话资料已变化。")
         source_hashes.append((str(source["id"]), source["input_fingerprint"]))
         person = next(iter(users.values()))
@@ -479,8 +489,8 @@ def run(job, settings):
         core._finish(job, "failed", "分析服务异常；已完成分段保留。")
 
 
-def view_events(conn, run, task, settings, roster, chats):
-    _, person = merge_input(conn, run, task, settings, roster, chats)
+def view_events(conn, run, task, settings, roster, chats, *, read_cache=None):
+    _, person = merge_input(conn, run, task, settings, roster, chats, read_cache=read_cache)
     result = decode(task["result_ciphertext"], settings)
     return [
         {

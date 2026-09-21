@@ -5,7 +5,7 @@
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl admin-directory__container">
     <div class="card admin-directory__card">
-      <div class="card-header"><div><h3 class="card-title mb-1">最近同步任务</h3><div class="text-secondary small">首次回填会安全分页续跑；正常续跑不会被记为失败。定时更新在计划时间到达前显示“等待下一轮检查”。</div></div></div>
+      <div class="card-header"><h3 class="card-title">最近同步任务</h3></div>
       {% if jobs %}
       <div class="table-responsive admin-directory__table"><table class="table table-vcenter card-table">
         <thead><tr><th>人员</th><th>模式</th><th>状态</th><th>目录</th><th>页数</th><th>发现会话</th><th>新增消息</th><th>本人消息</th><th>最近进度</th><th>完成时间</th></tr></thead>

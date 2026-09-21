@@ -259,7 +259,8 @@ def _query(url):
 def test_initial_console_does_not_choose_a_source_or_read_messages(console):
     response = console.browser.get("/admin/messages")
     assert response.status_code == 200
-    assert "先选择一位人员" in response.text
+    assert "请选择人员" in response.text
+    assert "个群聊 ·" not in response.text
     assert console.contexts[-1]["selected_user"] is None
     assert all(not console.calls[name] for name in ("directory", "chat", "messages", "audit"))
 
@@ -268,14 +269,14 @@ def test_empty_source_directory_has_its_own_state(console):
     console.state.update(sources=[], source_count=0)
     response = console.browser.get("/admin/messages")
     assert response.status_code == 200
-    assert "还没有已接入人员" in response.text
+    assert "暂无已接入人员" in response.text
     assert console.calls["messages"] == console.calls["audit"] == []
 
 
 def test_selecting_a_source_does_not_automatically_open_its_first_chat(console):
     response = _open(console)
     assert response.status_code == 200
-    assert "选择一个会话开始阅读" in response.text
+    assert "请选择会话" in response.text
     assert console.calls["directory"] == [(console.source["id"], 1, "", "all")]
     assert console.calls["chat"] == console.calls["messages"] == console.calls["audit"] == []
 

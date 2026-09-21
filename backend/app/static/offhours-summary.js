@@ -7,6 +7,7 @@
   let data = JSON.parse($("offhours-summary-data").textContent);
   $("offhours-summary-data").textContent = "";
   let selected = "all", query = "", timer = null, loading = false, denied = false;
+  let revision = "";
 
   function node(tag, className, text) {
     const element = document.createElement(tag);
@@ -331,7 +332,7 @@
     clearTimeout(timer);
     const active = data.enabled && (!data.run || data.window?.is_open
       || ["queued", "running"].includes(data.run.status));
-    if (!denied && !document.hidden) timer = setTimeout(refresh, active ? 10000 : 30000);
+    if (!denied && !document.hidden) timer = setTimeout(refresh, active ? 10000 : 60000);
   }
 
   async function refresh() {
@@ -341,8 +342,10 @@
       const params = new URLSearchParams({cm_id: data.responsible.id,
         date: data.selection.date, period: data.selection.period});
       const response = await fetch("/dashboard/offhours-summary/data?" + params, {
-        cache: "no-store", credentials: "same-origin", redirect: "error", headers: {Accept: "application/json"},
+        cache: "no-store", credentials: "same-origin", redirect: "error",
+        headers: {Accept: "application/json", ...(revision ? {"If-None-Match": revision} : {})},
       });
+      if (response.status === 304) { $("oh-feedback").hidden = true; return; }
       if ([401, 403].includes(response.status)) {
         denied = true; clearReplies();
         data = {events: [], enabled: false, run: null}; render();
@@ -355,7 +358,9 @@
       if (!response.ok) throw new Error("暂时无法刷新。仍显示上次已读取的结果，请稍后重试。");
       const next = await response.json();
       if (!next.window || !Array.isArray(next.events)) throw new Error("返回的数据不完整。仍显示上次已读取的结果，请稍后重试。");
-      data = next; $("oh-feedback").hidden = true; render();
+      revision = response.headers.get("ETag") || "";
+      $("oh-feedback").hidden = true;
+      if (JSON.stringify(data) !== JSON.stringify(next)) { data = next; render(); }
     } catch (error) {
       $("oh-feedback").textContent = error instanceof TypeError || error instanceof SyntaxError
         ? "连接暂时中断，结果可能已过时。请稍后刷新；这不代表没有新事件。" : error.message;

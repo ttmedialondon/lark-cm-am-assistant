@@ -4,10 +4,10 @@
 <div class="page admin-directory">
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl admin-directory__container">
-    <div class="d-flex flex-wrap align-items-center gap-2 mb-3"><div class="me-auto"><h2 class="page-title">人员目录</h2><div class="text-secondary">按人员去重，只判断业务身份；不匹配 CM、handle，也不写入“我的达人”。</div></div>{% if admin_role == 'owner' %}<a class="btn btn-outline-primary" href="/admin/ai#contact-assessment">配置 / 开启 / 暂停识别</a>{% endif %}<a class="btn btn-outline-secondary" href="{{ refresh_url }}">刷新进度与列表</a></div>
+    <div class="d-flex flex-wrap align-items-center gap-2 mb-3"><h2 class="page-title me-auto">人员目录</h2>{% if admin_role == 'owner' %}<a class="btn btn-outline-primary" href="/admin/ai#contact-assessment">识别设置</a>{% endif %}<a class="btn btn-outline-secondary" href="{{ refresh_url }}">刷新</a></div>
     {% set progress = identity_summary|default({}) %}
     <section class="card mb-3" aria-label="本轮全员身份识别进度"><div class="card-body">
-      {% if not progress.enabled %}<div class="text-secondary mb-2">识别已暂停，队列保留。重新开启后排队任务继续；已取消的在途任务可在人员详情继续识别。</div>{% endif %}
+      {% if not progress.enabled %}<div class="text-secondary mb-2">识别已暂停</div>{% endif %}
       <div class="d-flex flex-wrap gap-3 mb-2"><strong>全库 {{ progress.total|default(0) }} 人</strong><span>已处理 {{ progress.processed|default(0) }}</span><span>排队 {{ progress.queued|default(0) }}</span><span>{{ '分析中' if progress.enabled else '在途待收尾' }} {{ progress.running|default(0) }}</span><span>尚未安排 {{ progress.not_started|default(0) }}</span><span>已暂停 {{ progress.paused|default(0) }}</span></div>
       <progress class="w-100" aria-label="本轮已处理人数" max="{{ progress.total or 1 }}" value="{{ progress.processed|default(0) }}"></progress>
     </div></section>

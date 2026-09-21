@@ -818,7 +818,8 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
             if can_select_cm or r["id"] == cm_id
         ]
         imported = ({"total": 0, "batches": []} if read_only else
-                    creator_imports.page_data(actor_id, cm_id, q=query if tab=="candidates" else "", page=page))
+                    creator_imports.page_data(actor_id, cm_id, q=query if tab=="candidates" else "", page=page,
+                                              include_candidates=tab == "candidates"))
         # Person-level and older account-level assignments describe the same
         # library. UNION ensures that a person with several handles appears once.
         formal_base = """FROM contacts c WHERE c.creator_type='cap' AND c.id IN (
@@ -840,7 +841,7 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
                         ON s.id=l.social_account_id WHERE l.contact_id=c.id AND l.status='confirmed'
                         AND l.relationship='owner' AND POSITION(lower(%s) IN lower(s.normalized_handle))>0))"""
                 args.extend((query,query))
-            total = conn.execute("SELECT count(*) n " + formal_base, args).fetchone()["n"]
+            total = conn.execute("SELECT count(*) n " + formal_base, args).fetchone()["n"] if query else confirmed
             pages = max(1,(total+24)//25)
             page = min(page,pages)
             people = conn.execute("SELECT c.id,c.display_name,c.creator_type " + formal_base
@@ -856,21 +857,28 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
                 (list(imports_by_person), cm_id, creator_imports.POLICY_VERSION),
             ).fetchall():
                 imports_by_person[row["contact_id"]].append(row)
+            ids = list(imports_by_person)
+            identities = {r["contact_id"]: r for r in conn.execute(
+                """SELECT DISTINCT ON (contact_id) contact_id,open_id,
+                    CASE WHEN avatar_status='unavailable' THEN NULL ELSE avatar_url END avatar_url
+                    FROM lark_identities WHERE contact_id=ANY(%s::uuid[]) AND identity_type='user'
+                    ORDER BY contact_id,last_seen_at DESC,open_id""", (ids,),
+            ).fetchall()}
+            handles = {person_id: [] for person_id in ids}
+            for account in conn.execute(
+                """WITH links AS (
+                    SELECT contact_id,social_account_id FROM contact_social_accounts
+                    WHERE contact_id=ANY(%s::uuid[]) AND status='confirmed' AND relationship='owner'
+                    UNION SELECT contact_id,social_account_id FROM creator_account_assignments
+                    WHERE contact_id=ANY(%s::uuid[]) AND responsible_authorization_id=%s AND ended_at IS NULL
+                ) SELECT links.contact_id,s.display_handle FROM links
+                  JOIN social_accounts s ON s.id=links.social_account_id ORDER BY s.normalized_handle""",
+                (ids, ids, cm_id),
+            ).fetchall():
+                handles[account["contact_id"]].append(account["display_handle"])
             items = []
             for person in people:
-                identity = conn.execute(
-                    """SELECT open_id,CASE WHEN avatar_status='unavailable' THEN NULL ELSE avatar_url END avatar_url
-                    FROM lark_identities WHERE contact_id=%s AND identity_type='user'
-                    ORDER BY last_seen_at DESC,open_id LIMIT 1""", (person["id"],),
-                ).fetchone()
-                accounts = conn.execute(
-                    """SELECT s.display_handle FROM social_accounts s WHERE s.id IN (
-                        SELECT social_account_id FROM contact_social_accounts
-                        WHERE contact_id=%s AND status='confirmed' AND relationship='owner'
-                        UNION SELECT social_account_id FROM creator_account_assignments
-                        WHERE contact_id=%s AND responsible_authorization_id=%s AND ended_at IS NULL
-                    ) ORDER BY s.normalized_handle""", (person["id"],person["id"],cm_id),
-                ).fetchall()
+                identity = identities.get(person["id"])
                 import_rows = imports_by_person[person["id"]]
                 sources = list(dict.fromkeys(
                     label for row in import_rows for label in creator_imports.source_labels(row)
@@ -885,7 +893,7 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
                     "open_id": identity["open_id"] if identity else None,
                     "avatar_url": safe_avatar_url(identity["avatar_url"]) if identity else None,
                     "private_chat_url": private_chat_url(identity["open_id"] if identity else None),
-                    "handles": [r["display_handle"] for r in accounts],
+                    "handles": handles[person["id"]],
                     "sources": sources, "source": " + ".join(sources),
                     "evidence_rows": [] if read_only else list(evidence_rows.values()),
                     "status_label": "已入库", "can_confirm": False, "can_defer": False,

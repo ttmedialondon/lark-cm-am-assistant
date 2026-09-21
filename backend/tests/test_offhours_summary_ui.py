@@ -116,6 +116,11 @@ def test_route_uses_session_identity_not_query_scope_and_is_uncacheable(client):
     assert result.headers["cache-control"].startswith("no-store")
     assert "frame-ancestors 'none'" in result.headers["content-security-policy"]
     assert result.headers["x-content-type-options"] == "nosniff"
+    headers = {"If-None-Match": result.headers["etag"]}
+    assert api.get("/dashboard/offhours-summary/data", headers=headers).status_code == 304
+    assert len(calls) == 2  # Conditional reads still check live scope and message material.
+    auth["status"] = "revoked"
+    assert api.get("/dashboard/offhours-summary/data", headers=headers).status_code == 403
     assert api.post("/dashboard/offhours-summary/data", json={}).status_code == 405
 
 

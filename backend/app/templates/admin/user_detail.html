@@ -16,23 +16,23 @@
         <div class="col-sm-6 col-lg-3"><div class="subheader">可同步会话</div><div class="h2">{{ user.syncable_conversation_count }}</div><div class="text-secondary small">群聊 {{ user.group_count }} · 私聊 {{ user.p2p_count }}</div></div>
         <div class="col-sm-6 col-lg-3"><div class="subheader">首次回填</div><div class="h2">{{ user.sync_progress_label }}</div><div class="text-secondary small">群聊 {{ user.group_content_progress_label }} · 私聊 {{ user.p2p_content_progress_label }}</div></div>
         <div class="col-sm-6 col-lg-3"><div class="subheader">可见消息索引</div><div class="h2">{{ user.message_count }}</div><div class="text-secondary small">本人 {{ user.own_message_count }}</div></div>
-        <div class="col-sm-6 col-lg-3"><div class="subheader">私聊目录</div><div class="h5 mb-1">{{ user.p2p_status_label }}</div><div class="text-secondary small">目录发现不等于私聊正文已回填</div></div>
+        <div class="col-sm-6 col-lg-3"><div class="subheader">私聊目录</div><div class="h5 mb-1">{{ user.p2p_status_label }}</div></div>
       </div>
       {% if user.archived_conversation_count %}<div class="text-secondary small mt-3">已发现 {{ user.discovered_conversation_count }} 个会话；其中 {{ user.archived_conversation_count }} 个被 Lark 标为已归档/解散，因此不计划回填。</div>{% endif %}
       {% if 'messages' in admin_permissions %}<div class="mt-3"><a class="btn btn-sm btn-outline-primary" href="/admin/messages?user_id={{ user.id }}&amp;user_page={{ source_page }}">查看此人的会话</a></div>{% endif %}
     </div></div>
 
     <div class="card mb-4 admin-users__detail-access"><div class="card-header"><h3 class="card-title">后台访问权限</h3></div><div class="card-body">
-      {% if user_access.is_owner or user_access.is_owner_account %}<span class="badge bg-indigo-lt">{% if user_access.is_owner %}系统主人 · 全部权限{% else %}主人账号 · 当前不可用{% endif %}</span><p class="text-secondary mt-2 mb-0">{% if user_access.is_owner %}拥有所有后台入口和管理操作权限。{% else %}账号或主人角色已停用，当前不能进入后台。{% endif %}主人账号的权限不在这里变更。</p>
+      {% if user_access.is_owner or user_access.is_owner_account %}<span class="badge bg-indigo-lt">{% if user_access.is_owner %}系统主人 · 全部权限{% else %}主人账号 · 当前不可用{% endif %}</span>
       {% else %}<span class="badge {% if user_access.permissions %}bg-azure-lt{% else %}bg-secondary-lt{% endif %}">{{ user_access.access_label }}</span>
-        {% if user_access.permission_labels %}<div class="d-flex flex-wrap gap-2 mt-2">{% for label in user_access.permission_labels %}<span class="badge bg-secondary-lt">{{ label }}</span>{% endfor %}</div><p class="text-secondary small mt-2 mb-0">仅能查看以上页面，不能修改业务数据或分配权限。</p>{% else %}<p class="text-secondary mt-2 mb-0">未开放任何后台页面，只能使用前台。</p>{% endif %}
-        {% if admin_role == 'owner' %}{% with permission_access=user_access, permission_page=source_page %}{% include "admin/_user_permissions.html" %}{% endwith %}{% else %}<p class="text-secondary small mt-2 mb-0">后台权限只能由系统主人修改。</p>{% endif %}
+        {% if user_access.permission_labels %}<div class="d-flex flex-wrap gap-2 mt-2">{% for label in user_access.permission_labels %}<span class="badge bg-secondary-lt">{{ label }}</span>{% endfor %}</div>{% endif %}
+        {% if admin_role == 'owner' %}{% with permission_access=user_access, permission_page=source_page %}{% include "admin/_user_permissions.html" %}{% endwith %}{% endif %}
       {% endif %}
     </div></div>
 
     {% if can_view_conversations %}
     <div class="card mb-4">
-      <div class="card-header"><div><h3 class="card-title mb-1">当前可见会话</h3><div class="text-secondary small">同步状态属于该人员的授权关系。即使尚无消息索引，会话也会保留在这里；群成员人数是独立目录元数据。</div></div></div>
+      <div class="card-header"><h3 class="card-title">当前可见会话</h3></div>
       {% if conversations %}
       <div class="table-responsive"><table class="table table-vcenter card-table">
         <thead><tr><th>会话</th><th>类型</th><th>成员人数</th><th>消息索引</th><th>同步状态</th><th>最近同步</th></tr></thead>
@@ -49,7 +49,7 @@
     {% endif %}
     {% if can_view_jobs %}
     <div class="card">
-      <div class="card-header"><div><h3 class="card-title mb-1">同步任务</h3><div class="text-secondary small">分页续跑属于同一个任务，不会标成错误重试。</div></div></div>
+      <div class="card-header"><h3 class="card-title">同步任务</h3></div>
       {% if jobs %}
       <div class="table-responsive"><table class="table table-vcenter card-table">
         <thead><tr><th>模式</th><th>状态</th><th>目录</th><th>页数</th><th>发现会话</th><th>新增消息</th><th>最近进度</th><th>结束时间</th></tr></thead>

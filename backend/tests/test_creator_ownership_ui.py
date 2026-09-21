@@ -76,6 +76,9 @@ def test_read_only_permission_never_reads_private_evidence_or_mutates(monkeypatc
         assert response.status_code == 200
         assert response.headers["cache-control"] == "no-store, max-age=0"
     assert all(not read["include_private"] for read in reads)
+    headers = {"If-None-Match": response.headers["etag"]}
+    assert browser.get(f"{BASE}/data?cm_id={cm}", headers=headers).status_code == 304
+    assert len(reads) == 4  # Rendering + two ordinary reads + revalidated conditional read.
     assert browser.get(f"{BASE}/tasks/{task}/evidence").status_code == 403
     for action in ("start", "pause", "resume", "confirm", "defer"):
         assert browser.post(f"{BASE}/{run}/{action}", data={
@@ -84,6 +87,7 @@ def test_read_only_permission_never_reads_private_evidence_or_mutates(monkeypatc
     assert browser.post(f"{BASE}/preview", data={"csrf_token": "csrf", "cm_id": str(cm)}).status_code == 403
     denied, _ = client(monkeypatch, grants=("contacts",))
     assert denied.get(BASE).status_code == denied.get(f"{BASE}/data").status_code == 403
+    assert denied.get(f"{BASE}/data", headers=headers).status_code == 403
     signed_out, _ = client(monkeypatch, session=False)
     assert signed_out.get(BASE, follow_redirects=False).status_code == 303
 

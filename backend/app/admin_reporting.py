@@ -404,20 +404,24 @@ def users(page: int = 1, query: str = "", permission_filter: str = "all") -> dic
         page, limit, offset = _page_window(page, total_count=total_count)
         rows = conn.execute(
             f"""
-            WITH conversation_counts AS (
+            WITH page_users AS MATERIALIZED (
+                SELECT a.id FROM authorizations a LEFT JOIN admin_roles r ON r.authorization_id=a.id
+                WHERE {filters} ORDER BY a.authorized_at DESC, a.id LIMIT %s OFFSET %s
+            ), conversation_counts AS (
                 {CONVERSATION_COUNTS_SQL}
             ), message_counts AS (
                 SELECT
                     o.authorization_id,
-                    COUNT(*) FILTER (WHERE NOT m.is_deleted) AS message_count,
-                    COUNT(*) FILTER (WHERE o.sent_by_author AND NOT m.is_deleted) AS own_message_count
+                    COUNT(*) AS message_count,
+                    COUNT(*) FILTER (WHERE o.sent_by_author) AS own_message_count
                 FROM authorization_message_observations o
+                JOIN page_users p ON p.id=o.authorization_id
                 JOIN authorization_chats ac
                   ON ac.authorization_id = o.authorization_id AND ac.chat_id = o.chat_id
                 JOIN chats c ON c.chat_id = ac.chat_id
-                JOIN chat_messages m
-                  ON m.chat_id = o.chat_id AND m.message_id = o.message_id
                 WHERE ac.is_visible AND COALESCE(c.chat_status, 'normal') = 'normal'
+                  AND NOT EXISTS (SELECT 1 FROM chat_messages m
+                      WHERE m.chat_id=o.chat_id AND m.message_id=o.message_id AND m.is_deleted)
                 GROUP BY o.authorization_id
             ), latest_jobs AS (
                 SELECT DISTINCT ON (authorization_id)
@@ -460,13 +464,12 @@ def users(page: int = 1, query: str = "", permission_filter: str = "all") -> dic
                 j.last_http_status AS job_last_http_status,
                 j.last_error_code AS job_last_error_code
             FROM authorizations a
+            JOIN page_users p ON p.id=a.id
             LEFT JOIN admin_roles r ON r.authorization_id = a.id
             LEFT JOIN conversation_counts g ON g.authorization_id = a.id
             LEFT JOIN message_counts m ON m.authorization_id = a.id
             LEFT JOIN latest_jobs j ON j.authorization_id = a.id
-            WHERE {filters}
-            ORDER BY a.authorized_at DESC
-            LIMIT %s OFFSET %s
+            ORDER BY a.authorized_at DESC, a.id
             """,
             (*filter_params, limit, offset),
         ).fetchall()
@@ -487,17 +490,17 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
             ), message_counts AS (
                 SELECT
                     o.authorization_id,
-                    COUNT(*) FILTER (WHERE NOT m.is_deleted) AS message_count,
-                    COUNT(*) FILTER (WHERE o.sent_by_author AND NOT m.is_deleted) AS own_message_count
+                    COUNT(*) AS message_count,
+                    COUNT(*) FILTER (WHERE o.sent_by_author) AS own_message_count
                 FROM authorization_message_observations o
                 JOIN authorization_chats ac
                   ON ac.authorization_id = o.authorization_id AND ac.chat_id = o.chat_id
                 JOIN chats c ON c.chat_id = ac.chat_id
-                JOIN chat_messages m
-                  ON m.chat_id = o.chat_id AND m.message_id = o.message_id
                 WHERE o.authorization_id = %s
                   AND ac.is_visible
                   AND COALESCE(c.chat_status, 'normal') = 'normal'
+                  AND NOT EXISTS (SELECT 1 FROM chat_messages m
+                      WHERE m.chat_id=o.chat_id AND m.message_id=o.message_id AND m.is_deleted)
                 GROUP BY o.authorization_id
             ), latest_jobs AS (
                 SELECT DISTINCT ON (authorization_id)
@@ -580,6 +583,13 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
 
         conversations = conn.execute(
             """
+            WITH page_chats AS MATERIALIZED (
+                SELECT ac.* FROM authorization_chats ac
+                LEFT JOIN chats c ON c.chat_id=ac.chat_id
+                WHERE ac.authorization_id=%s AND ac.is_visible
+                  AND COALESCE(c.chat_status, 'normal')='normal'
+                ORDER BY LOWER(COALESCE(c.name, '')), ac.chat_id LIMIT %s OFFSET %s
+            )
             SELECT
                 ac.chat_id,
                 c.name,
@@ -600,15 +610,12 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
                 (ac.incremental_page_token IS NOT NULL) AS incremental_has_next_page,
                 ac.last_backfill_at,
                 ac.last_incremental_at,
-                COUNT(o.message_id) FILTER (WHERE NOT m.is_deleted) AS message_count
-            FROM authorization_chats ac
+                COUNT(o.message_id) FILTER (WHERE m.message_id IS NULL) AS message_count
+            FROM page_chats ac
             LEFT JOIN chats c ON c.chat_id = ac.chat_id
             LEFT JOIN authorization_message_observations o
               ON o.authorization_id = ac.authorization_id AND o.chat_id = ac.chat_id
-            LEFT JOIN chat_messages m ON m.chat_id = o.chat_id AND m.message_id = o.message_id
-            WHERE ac.authorization_id = %s
-              AND ac.is_visible
-              AND COALESCE(c.chat_status, 'normal') = 'normal'
+            LEFT JOIN chat_messages m ON m.chat_id = o.chat_id AND m.message_id = o.message_id AND m.is_deleted
             GROUP BY
                 ac.authorization_id, ac.chat_id, ac.member_count, ac.member_count_status,
                 ac.member_snapshot_status, ac.member_snapshot_checked_at, ac.member_snapshot_retry_at,
@@ -619,7 +626,6 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
                 ac.last_backfill_at, ac.last_incremental_at,
                 c.name, c.external, c.chat_mode
             ORDER BY LOWER(COALESCE(c.name, '')), ac.chat_id
-            LIMIT %s OFFSET %s
             """,
             (authorization_id, conversation_limit, conversation_offset),
         ).fetchall() if include_conversations else []
@@ -866,37 +872,16 @@ def contacts(
     filters = (category, category, organization_status, organization_status, organization_query, organization_query,
                query, query)
     with connection() as conn:
-        counts = conn.execute(f"""{CONTACT_DIRECTORY_SQL}
-            SELECT category,identity_ai_status,identity_ai_reason,identity_ai_enabled,COUNT(*) AS count FROM directory
-            GROUP BY category,identity_ai_status,identity_ai_reason,identity_ai_enabled""").fetchall()
-        total_count = int(
-            conn.execute(
-                f"""
-                {CONTACT_DIRECTORY_SQL}
-                SELECT COUNT(*) AS total_count FROM directory
-                WHERE (%s = 'all' OR category = %s)
-                  AND (%s = 'all' OR organization_status = %s)
-                  AND (
-                      %s = '' OR EXISTS (
-                          SELECT 1
-                          FROM contact_organization_links organization_link
-                          JOIN organizations organization_filter
-                            ON organization_filter.id = organization_link.organization_id
-                          WHERE organization_link.contact_id = directory.contact_id
-                            AND organization_link.status <> 'rejected'
-                            AND POSITION(LOWER(%s) IN LOWER(organization_filter.canonical_name)) > 0
-                      )
-                  )
-                  AND (%s='' OR POSITION(LOWER(%s) IN LOWER(COALESCE(display_name,'')))>0)
-                """,
-                filters,
-            ).fetchone()["total_count"]
-            or 0
-        )
-        page, limit, offset = _page_window(page, total_count=total_count)
+        # Materialize once: global category totals and the filtered page share
+        # the same identity/classification snapshot without a cross-request cache.
+        page, _, _ = _page_window(page)
         rows = conn.execute(
             f"""
             {CONTACT_DIRECTORY_SQL}
+            , counts AS (
+                SELECT category,identity_ai_status,identity_ai_reason,identity_ai_enabled,COUNT(*) AS count
+                FROM directory GROUP BY category,identity_ai_status,identity_ai_reason,identity_ai_enabled
+            ), filtered AS MATERIALIZED (
             SELECT * FROM directory
             WHERE (%s = 'all' OR category = %s)
               AND (%s = 'all' OR organization_status = %s)
@@ -912,29 +897,46 @@ def contacts(
                   )
               )
               AND (%s='' OR POSITION(LOWER(%s) IN LOWER(COALESCE(display_name,'')))>0)
+            ), totals AS (
+                SELECT COUNT(*) AS total_count FROM filtered
+            ), page_rows AS (
+                SELECT * FROM filtered
+                ORDER BY last_seen_at DESC NULLS LAST, LOWER(display_name), contact_id
+                LIMIT %s OFFSET (LEAST(%s, GREATEST(1,
+                    (SELECT CEIL(total_count::numeric / %s) FROM totals))) - 1)::int * %s
+            )
+            SELECT page_rows.*, totals.total_count,
+                (SELECT COALESCE(jsonb_agg(to_jsonb(counts)), '[]'::jsonb) FROM counts) AS category_counts
+            FROM totals LEFT JOIN page_rows ON TRUE
             ORDER BY last_seen_at DESC NULLS LAST, LOWER(display_name), contact_id
-            LIMIT %s OFFSET %s
             """,
-            (*filters, limit, offset),
+            (*filters, LIST_PAGE_SIZE, page, LIST_PAGE_SIZE, LIST_PAGE_SIZE),
         ).fetchall()
+        total_count = int(rows[0]["total_count"])
+        counts = rows[0]["category_counts"]
+        page, _, _ = _page_window(page, total_count=total_count)
+        rows = [row for row in rows if row["contact_id"] is not None]
         # Conversation/message counts are metadata, not model input. Count only this page's people.
         ids = [row["contact_id"] for row in rows]
         activity = conn.execute("""
             WITH identities AS (SELECT contact_id,open_id FROM lark_identities WHERE contact_id=ANY(%s::uuid[])),
+            messages AS MATERIALIZED (
+                SELECT identity.contact_id,message.chat_id,message.is_deleted
+                FROM identities identity JOIN chat_messages message ON message.sender_open_id=identity.open_id
+            ),
             conversations AS (
                 SELECT identity.contact_id,member.chat_id FROM chat_members member
                 JOIN identities identity USING(open_id)
-                UNION SELECT identity.contact_id,message.chat_id FROM chat_messages message
-                JOIN identities identity ON identity.open_id=message.sender_open_id
+                UNION SELECT contact_id,chat_id FROM messages
                 UNION SELECT identity.contact_id,association.chat_id FROM authorization_chats association
                 JOIN identities identity ON identity.open_id=association.p2p_counterpart_open_id
                 WHERE association.is_visible
             )
-            SELECT identity.contact_id,
-                (SELECT COUNT(*) FROM conversations c WHERE c.contact_id=identity.contact_id) AS conversation_count,
-                COUNT(message.message_id) FILTER(WHERE NOT message.is_deleted) AS message_count
-            FROM identities identity LEFT JOIN chat_messages message ON message.sender_open_id=identity.open_id
-            GROUP BY identity.contact_id
+            SELECT person.contact_id,
+                (SELECT COUNT(*) FROM conversations c WHERE c.contact_id=person.contact_id) AS conversation_count,
+                (SELECT COUNT(*) FROM messages m WHERE m.contact_id=person.contact_id AND NOT m.is_deleted)
+                    AS message_count
+            FROM (SELECT DISTINCT contact_id FROM identities) person
             """, (ids,)).fetchall() if ids else []
     activity_by_id = {row["contact_id"]: row for row in activity}
     result = _page_result([_decorate_contact({**row, **activity_by_id.get(row["contact_id"], {})})
@@ -1304,7 +1306,7 @@ def message_page(
             (*filters, limit, offset),
         ).fetchall()
 
-        names = mention_names(conn, rows[:MESSAGE_PAGE_SIZE])
+        names = mention_names(conn, rows[:MESSAGE_PAGE_SIZE], lock=False)
     cipher = message_body_cipher(get_settings().token_encryption_key)
     items = [_decorate_message(row, cipher, names) for row in reversed(rows[:MESSAGE_PAGE_SIZE])]
     return {
