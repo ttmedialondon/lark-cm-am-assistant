@@ -1,0 +1,144 @@
+{
+  "date": "2026-09-21",
+  "application_commit": "7ed1f41",
+  "scope": "Production summary service read, serial, fresh connection per sample; not HTTP/browser/concurrency timing",
+  "source": "/opt/lark-message-stats/backend/app/offhours_summary.py",
+  "connect_select_close": {
+    "samples": 20,
+    "p50_ms": 15.588,
+    "p95_ms": 18.797
+  },
+  "read_distribution": {
+    "samples": 20,
+    "p50_ms": 653.257,
+    "p95_ms": 783.88
+  },
+  "connections": {
+    "connect_probes": 20,
+    "fixture_selection": 1,
+    "summary_with_warmup": 21,
+    "note": "Each summary uses a fresh connection; connection setup is measured separately."
+  },
+  "samples": [
+    {
+      "read_ms": 728.37,
+      "queries": 26,
+      "serialize_etag_ms": 0.13,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 535.839,
+      "queries": 26,
+      "serialize_etag_ms": 0.115,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 592.316,
+      "queries": 26,
+      "serialize_etag_ms": 0.132,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 555.394,
+      "queries": 26,
+      "serialize_etag_ms": 0.108,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 783.88,
+      "queries": 26,
+      "serialize_etag_ms": 0.132,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 665.251,
+      "queries": 26,
+      "serialize_etag_ms": 0.115,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 572.988,
+      "queries": 26,
+      "serialize_etag_ms": 0.167,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 662.566,
+      "queries": 26,
+      "serialize_etag_ms": 0.119,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 789.442,
+      "queries": 26,
+      "serialize_etag_ms": 0.091,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 659.508,
+      "queries": 26,
+      "serialize_etag_ms": 0.127,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 563.315,
+      "queries": 26,
+      "serialize_etag_ms": 0.114,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 574.086,
+      "queries": 26,
+      "serialize_etag_ms": 0.12,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 715.795,
+      "queries": 26,
+      "serialize_etag_ms": 0.123,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 647.006,
+      "queries": 26,
+      "serialize_etag_ms": 0.108,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 527.328,
+      "queries": 26,
+      "serialize_etag_ms": 0.107,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 507.4,
+      "queries": 26,
+      "serialize_etag_ms": 0.113,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 664.747,
+      "queries": 26,
+      "serialize_etag_ms": 0.125,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 725.999,
+      "queries": 26,
+      "serialize_etag_ms": 0.142,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 553.616,
+      "queries": 26,
+      "serialize_etag_ms": 0.129,
+      "response_bytes": 923
+    },
+    {
+      "read_ms": 694.095,
+      "queries": 26,
+      "serialize_etag_ms": 0.119,
+      "response_bytes": 923
+    }
+  ]
+}
