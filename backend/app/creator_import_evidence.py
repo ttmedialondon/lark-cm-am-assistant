@@ -382,45 +382,69 @@ def validate_evidence(conn, settings, cm_id, handle, pack, refs, fingerprint, *,
 
 
 def validate_references(conn, settings, cm_id, material):
+    return validate_reference_batch(conn, settings, cm_id, [material])[0]
+
+
+def validate_reference_batch(conn, settings, cm_id, materials):
     """Permission and exact displayed-reference checks, without decrypting or rescanning history."""
+    if not materials:
+        return []
     cm = conn.execute("SELECT open_id,body_consent_at FROM authorizations WHERE id=%s AND status='active' "
                       "AND body_consent_at IS NOT NULL", (cm_id,)).fetchone()
-    stats = material.get('stats') or material.get('pack', {}).get('meta', {})
-    if not cm or stats.get('scope_fingerprint') != ownership._hash(
-            [str(cm_id), cm['open_id'], cm['body_consent_at']]):
-        return False
-    refs = material.get('refs', [])
-    groups = {r['chat_id']: r for r in refs if r.get('kind') == 'group'}
+    if not cm:
+        return [False] * len(materials)
+    scope = ownership._hash([str(cm_id), cm['open_id'], cm['body_consent_at']])
+    candidates = []
+    for index, material in enumerate(materials):
+        stats = material.get('stats') or material.get('pack', {}).get('meta', {})
+        if stats.get('scope_fingerprint') == scope:
+            refs = material.get('refs', [])
+            groups = {r['chat_id']: r for r in refs if r.get('kind') == 'group'}
+            candidates.append((index, material, groups))
+    group_ids = sorted({chat for _, _, groups in candidates for chat in groups})
     current_groups = conn.execute(
         """SELECT c.chat_id,c.name FROM authorization_chats ac JOIN chats c ON c.chat_id=ac.chat_id
            WHERE ac.authorization_id=%s AND ac.chat_id=ANY(%s::text[]) AND ac.is_visible AND ac.sync_enabled
              AND COALESCE(c.chat_status,'normal')='normal' AND COALESCE(c.chat_mode,'group')<>'p2p'""",
-        (cm_id, list(groups)),
-    ).fetchall() if groups else []
-    if len(current_groups) != len(groups) or any(
-            groups[g['chat_id']].get('name_hash') != ownership._hash(g['name']) for g in current_groups):
-        return False
-    message_refs = {(r['chat_id'], r['message_id']): r for r in refs if r.get('kind') == 'message'}
+        (cm_id, group_ids),
+    ).fetchall() if group_ids else []
+    names = {g['chat_id']: ownership._hash(g['name']) for g in current_groups}
+    # Reject invalid scope/group materials before reading their message or identity facts.
+    candidates = [(i, m, gs) for i, m, gs in candidates if all(
+        chat in names and ref.get('name_hash') == names[chat] for chat, ref in gs.items())]
+    group_ids = sorted({chat for _, _, gs in candidates for chat in gs})
+    refs = [r for _, m, _ in candidates for r in m.get('refs', [])]
+    message_ids = sorted({r['message_id'] for r in refs if r.get('kind') == 'message'})
     rows = conn.execute(
         'SELECT ' + ownership._COLUMNS + ' ' + ownership._READABLE
         + ' AND m.chat_id=ANY(%s::text[]) AND m.message_id=ANY(%s::text[])',
-        (cm_id, list(groups), [key[1] for key in message_refs]),
-    ).fetchall() if message_refs else []
-    rows = [r for r in rows if (r['chat_id'], r['message_id']) in message_refs]
+        (cm_id, group_ids, message_ids),
+    ).fetchall() if message_ids and group_ids else []
+    open_ids = sorted({oid for r in refs if r.get('kind') == 'person' for oid in r['open_ids']})
+    identities = conn.execute(
+        "SELECT open_id,contact_id,display_name,name,en_name,identity_type,tenant_classification "
+        "FROM lark_identities WHERE open_id=ANY(%s::text[]) ORDER BY open_id", (open_ids,),
+    ).fetchall() if open_ids else []
+    members, observed = handles._members(conn, cm_id, group_ids, {cm['open_id']: 'CM1'}) if group_ids else ([], [])
+    members.extend(observed)
+    results = [False] * len(materials)
+    for index, material, groups in candidates:
+        results[index] = _references_match(material, groups, rows, identities, members)
+    return results
+
+
+def _references_match(material, groups, rows, identities, members):
+    """Slice shared facts back to this material's own scope, never union visibility."""
+    refs = material.get('refs', [])
+    message_refs = {(r['chat_id'], r['message_id']): r for r in refs if r.get('kind') == 'message'}
+    rows = [r for r in rows if r['chat_id'] in groups and (r['chat_id'], r['message_id']) in message_refs]
     if len(rows) != len(message_refs) or any(
             message_refs[(r['chat_id'], r['message_id'])].get('body_hash') != ownership._hash(r['body_ciphertext'])
             or message_refs[(r['chat_id'], r['message_id'])].get('relation_hash') != ownership._relation_hash(r)
             for r in rows):
         return False
-    person_refs = [r for r in refs if r.get('kind') == 'person']
-    open_ids = sorted({openid for r in person_refs for openid in r['open_ids']})
-    identities = conn.execute(
-        "SELECT open_id,contact_id,display_name,name,en_name,identity_type,tenant_classification "
-        "FROM lark_identities WHERE open_id=ANY(%s::text[]) ORDER BY open_id", (open_ids,),
-    ).fetchall() if open_ids else []
-    members, observed = handles._members(conn, cm_id, list(groups), {cm['open_id']: 'CM1'}) if groups else ([], [])
-    visible = {r['open_id'] for r in [*members, *observed]}
-    for ref in person_refs:
+    visible = {r['open_id'] for r in members if r['chat_id'] in groups}
+    for ref in (r for r in refs if r.get('kind') == 'person'):
         current = [i for i in identities if i['open_id'] in ref['open_ids']]
         if (not set(ref['open_ids']) <= visible or any(str(i['contact_id']) != ref['contact_id'] for i in current)
                 or ref.get('identity_hash') != ownership._hash(current)):

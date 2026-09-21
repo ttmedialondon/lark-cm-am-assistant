@@ -319,6 +319,7 @@ def _related_chats(conn, roster, *, settings=None, cm_id=REMI_ID):
         ),
     ).fetchall()
     settings = settings or get_settings()
+    candidates = []
     for row in rows:
         stats = row.get("stats") or {}
         if stats.get("ai_invalidated") or stats.get("archived_for_rule_reset"):
@@ -342,12 +343,27 @@ def _related_chats(conn, roster, *, settings=None, cm_id=REMI_ID):
             if (
                 not selected
                 or creator_imports._conflict(conn, row, row["contact_id"], row["handle"])
-                or not creator_imports._valid_chain(conn, settings, row, chain, decisions, full=False)
             ):
                 continue
+            candidates.append((row, selected, chain))
         except (InvalidTag, KeyError, TypeError, ValueError):
             # An unreadable/obsolete import cannot grant access or identify a person.
             # Independently observed relationships above remain usable.
+            continue
+    materials = [material for _, _, chain in candidates for material in chain.values()]
+    try:
+        valid = iter(creator_import_evidence.validate_reference_batch(conn, settings, cm_id, materials))
+        checks = [all([next(valid) for _ in chain]) for _, _, chain in candidates]
+    except (KeyError, TypeError, ValueError):
+        # Malformed historical material must not suppress unrelated valid links.
+        checks = []
+        for row, _, chain in candidates:
+            try:
+                checks.append(creator_imports._valid_chain(conn, settings, row, chain, {}, full=False))
+            except (KeyError, TypeError, ValueError):
+                checks.append(False)
+    for (row, selected, _), valid in zip(candidates, checks, strict=True):
+        if not valid:
             continue
         for chat_id in selected:
             if chat_id in chats and chats[chat_id]["chat_mode"] != "p2p":

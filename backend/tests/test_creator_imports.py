@@ -991,10 +991,35 @@ def test_group_person_refs_do_not_cross_people_groups_or_current_access(pg, pilo
                                               unknown["refs"], unknown["fingerprint"])
     with pg.transaction(force_rollback=True):
         referenced = next(r["message_id"] for r in material["refs"] if r["label"] == own)
+        sole = evidence.build_person_evidence(pg, pilot.settings, cm, "target_account", ["second_group"])
+        mixed_scope = deepcopy(material)
+        mixed_scope["refs"] = [
+            *[r for r in sole["refs"] if r.get("kind") == "group"],
+            *[r for r in material["refs"] if r.get("kind") == "person" and r["label"] == target],
+        ]
+
+        class Meter:
+            calls = 0
+
+            def execute(self, *args, **kwargs):
+                self.calls += 1
+                return pg.execute(*args, **kwargs)
+
+        meter = Meter()
+        assert evidence.validate_reference_batch(
+            meter, pilot.settings, cm, [material] * 50 + [sole, mixed_scope]
+        ) == [True] * 51 + [False]
+        assert meter.calls == 6
         pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id=%s",
                    (message_body_cipher(pilot.settings.token_encryption_key).encrypt("Changed account evidence"),
                     referenced))
         assert not evidence.validate_references(pg, pilot.settings, cm, material)
+        assert evidence.validate_reference_batch(pg, pilot.settings, cm, [material, sole]) == [False, True]
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='first_group'")
+        assert evidence.validate_reference_batch(pg, pilot.settings, cm, [material, sole]) == [False, True]
+        pg.execute("UPDATE authorizations SET body_consent_at=NULL WHERE id=%s", (cm,))
+        assert evidence.validate_reference_batch(pg, pilot.settings, cm, [material, sole]) == [False, False]
     with pg.transaction(force_rollback=True):
         pg.execute("UPDATE chats SET name='Campaign lounge' WHERE chat_id IN ('first_group','second_group')")
         recalled = evidence.build_group_evidence(pg, pilot.settings, cm, "target_account")
