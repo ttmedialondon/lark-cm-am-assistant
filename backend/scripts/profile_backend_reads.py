@@ -22,6 +22,7 @@ class ReadMeter:
     def __init__(self, conn):
         self.conn, self.queries = conn, 0
         self.locations = Counter()
+        self.elapsed_ms = Counter()
 
     def execute(self, query, params=None):
         # The service may take SHARE locks while verifying evidence. Permit those
@@ -32,8 +33,13 @@ class ReadMeter:
             raise RuntimeError("diagnostic refused a non-read statement")
         self.queries += 1
         caller = sys._getframe(1)
-        self.locations[f"{Path(caller.f_code.co_filename).name}:{caller.f_lineno}"] += 1
-        return self.conn.execute(query, params)
+        location = f"{Path(caller.f_code.co_filename).name}:{caller.f_lineno}"
+        self.locations[location] += 1
+        started = time.perf_counter()
+        try:
+            return self.conn.execute(query, params)
+        finally:
+            self.elapsed_ms[location] += (time.perf_counter() - started) * 1000
 
 
 def main():
@@ -75,7 +81,9 @@ def main():
             if index:
                 samples.append({"read_ms": round(read_ms, 3), "queries": meter.queries,
                                 "serialize_etag_ms": round(encode_ms, 3), "response_bytes": len(body),
-                                "top_query_locations": meter.locations.most_common(8)})
+                                "top_query_locations": meter.locations.most_common(8),
+                                "top_query_time_ms": [(location, round(ms, 3))
+                                                      for location, ms in meter.elapsed_ms.most_common(8)]})
             conn.commit()  # Preserve the standard view audit; release all SHARE locks per sample.
     print(json.dumps({"summary_samples": samples, "read_median_ms": statistics.median(
         sample["read_ms"] for sample in samples)}), flush=True)
