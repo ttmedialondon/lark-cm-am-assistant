@@ -114,12 +114,12 @@
     const exceptions = (counts.failed || 0) + (counts.invalid || 0) + (counts.cancelled || 0);
     el("scope").textContent = run ? `已分类达人 ${run.directory_count || 0} 人 · 已在当前 CM 名下排除 ${run.excluded_owned_count || 0} 人 · 缺少 Lark 用户排除 ${run.excluded_identity_count || 0} 人` : "";
     el("run-status").textContent = run?.status_label || "尚未预筛选";
-    el("progress").textContent = preparing ? `已预筛选 ${prepared} / ${counts.total || 0} 人 · 符合分析条件 ${counts.ready || 0} 人` : run ? `范围 ${counts.total || 0} 人 · 待分析 ${counts.ready || 0} · 排队 ${counts.queued || 0} · 分析中 ${counts.running || 0}` : "预筛选只读取现有材料，不调用 OpenAI。";
+    el("progress").textContent = preparing ? `已预筛选 ${prepared} / ${counts.total || 0} 人 · 符合分析条件 ${counts.ready || 0} 人` : run ? `范围 ${counts.total || 0} 人 · 待分析 ${counts.ready || 0} · 排队 ${counts.queued || 0} · 分析中 ${counts.running || 0}` : "";
     el("progress-bar").max = counts.total || 1;
     el("progress-bar").value = preparing ? prepared : (counts.completed || 0) + (counts.skipped || 0) + exceptions;
     el("progress-bar").setAttribute("aria-label", preparing ? "本批次预筛选进度" : "本批次分析进度");
     el("usage").textContent = `有结果 ${counts.completed || 0} · 暂不分析 ${counts.skipped || 0} · 异常 / 失效 ${exceptions} · 复用 ${counts.reused || 0}　|　实际 API 请求 ${usage.requests || 0} 次 · 输入 ${usage.input_tokens || 0} / 输出 ${usage.output_tokens || 0} tokens`;
-    el("run-note").textContent = run?.status === "paused" ? "已暂停发起新请求；已经发出的请求会完成收尾。" : "暂不分析不代表不属于该 CM。刷新只读取状态，不发起分析。";
+    el("run-note").textContent = run?.status === "paused" ? "已暂停新请求，正在完成在途任务。" : "";
     el("api").textContent = data.api_message || "";
     el("cm").disabled = busy;
     if (owner) {
