@@ -13,9 +13,16 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from app import creator_import_evidence, creator_imports, creator_ownership, summary_periods, summary_dialogues
+from app import (
+    creator_import_evidence,
+    creator_imports,
+    creator_ownership,
+    openai_client,
+    summary_dialogues,
+    summary_periods,
+)
 from app import offhours_summary as ai
-from app.ai_feature_config import save_feature_config
+from app.ai_feature_config import api_key_cipher, save_feature_config
 from app.crypto import message_body_cipher
 
 
@@ -239,7 +246,7 @@ def seeded(pg, monkeypatch):
     def save(enabled=True, key="test-key-not-real"):
         save_feature_config(
             pg,
-            ai.contact_assessments.api_key_cipher(settings.token_encryption_key),
+                api_key_cipher(settings.token_encryption_key),
             ai.FEATURE,
             provider="openai",
             project_id="test-project",
@@ -263,7 +270,7 @@ def seeded(pg, monkeypatch):
             "usage": {"input_tokens": 1},
         }
 
-    monkeypatch.setattr(ai.contact_assessments, "call_openai", model)
+    monkeypatch.setattr(openai_client, "call_openai", model)
     return SimpleNamespace(
         ids=ids, settings=settings, save=save, calls=calls, add=add, start=start, end=end, fields=fields, cipher=cipher,
         account=account, candidate_id=candidate_id,
@@ -509,7 +516,7 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
         return {"text": json.dumps({"processed_refs": input_pack.get("core_refs", []), "events": [sample_event(evidence_refs=[message["ref"]])]}),
                 "usage": {"input_tokens": 1}}
 
-    monkeypatch.setattr(ai.contact_assessments, "call_openai", model)
+    monkeypatch.setattr(openai_client, "call_openai", model)
     assert s.save()["queued"] == 4
     tasks = pg.execute("SELECT chat_id FROM offhours_summary_tasks WHERE is_current").fetchall()
     assert {r["chat_id"] for r in tasks} == {"chat", "group_named", "group_renamed", "group_ai"}
@@ -637,9 +644,9 @@ def test_network_failure_retries_are_bounded_not_cancelled_refresh_loop(pg, seed
     s.save()
 
     def fail(*_a, **_k):
-        raise ai.contact_assessments.ContactAssessmentInputError("simulated timeout")
+        raise openai_client.AIInputError("simulated timeout")
 
-    monkeypatch.setattr(ai.contact_assessments, "call_openai", fail)
+    monkeypatch.setattr(openai_client, "call_openai", fail)
     for _ in range(ai.MAX_ATTEMPTS):
         job = ai.claim_next_summary()
         assert job
@@ -701,8 +708,8 @@ def test_same_display_different_mention_identity_invalidates_only_affected_input
     after = ai._load_chat(pg, first, "chat", first["cutoff"], settings=s.settings)
     assert before["pack"] == after["pack"] and before["fingerprint"] != after["fingerprint"]
     assert not ai.get_summary_view(pg, s.ids["owner"])["events"]
-    ai.schedule_if_due(pg, force=True)
-    ai.schedule_if_due(pg, force=True)
+    assert ai.schedule_if_due(pg, force=True) == 1
+    assert ai.schedule_if_due(pg, force=True) == 0
     assert ai.claim_next_summary()["input_fingerprint"] == after["fingerprint"]
 
 
@@ -873,13 +880,13 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
         assert 'future CM reply' not in json.dumps(pack) and 'too old secret' not in json.dumps(pack)
         if len(calls) == 2 and not failed:
             failed = True
-            raise ai.contact_assessments.ContactAssessmentInputError('synthetic transient failure')
+            raise openai_client.AIInputError('synthetic transient failure')
         targets = [m for m in pack['messages'] if m['ref'] in pack['core_refs'] and m['speaker'] == user
                    and m['message_id'] in ('m1', 'person')]
         return {'text': json.dumps({'processed_refs': pack['core_refs'], 'events': [sample_event(
             user=user, evidence_refs=[m['ref']], handle=None) for m in targets]})}
 
-    monkeypatch.setattr(ai.contact_assessments, 'call_openai', model)
+    monkeypatch.setattr(openai_client, 'call_openai', model)
     s.save()
     for _ in range(100):
         job = ai.claim_next_summary()
@@ -960,7 +967,7 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
             "checks": [] if resolved else ["确认能够进行核对。"],
             "evidence_refs": [m["ref"] for m in pack["messages"]]})}
 
-    monkeypatch.setattr(ai.contact_assessments, "call_openai", model)
+    monkeypatch.setattr(openai_client, "call_openai", model)
     job_id = replies.enqueue(pg, s.ids["cm"], event_id, s.settings)
     assert replies.enqueue(pg, s.ids["cm"], event_id, s.settings) == job_id
 

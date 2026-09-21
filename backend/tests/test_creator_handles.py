@@ -14,7 +14,7 @@ from psycopg.rows import dict_row
 from test_creator_ownership import _prepared, _run_all, _snapshot
 from test_creator_ownership import pilot as parent_pilot
 
-from app import admin_reporting, contact_assessments
+from app import admin_reporting, openai_client
 from app import creator_handle_evidence as evidence
 from app import creator_handles as handles
 from app import creator_ownership as ownership
@@ -62,7 +62,7 @@ def _case(pg, pilot, monkeypatch, *, clues=True, uncertain=False):
         pg.execute("INSERT INTO chat_members(chat_id,open_id,member_type) VALUES('handle_group','ou_creator','user')")
     if uncertain:
         unsure = pilot.person("unsure", pairs=2)
-        original = contact_assessments.call_openai
+        original = openai_client.call_openai
 
         def second_stage(*args, **kwargs):
             response = original(*args, **kwargs)
@@ -72,7 +72,7 @@ def _case(pg, pilot, monkeypatch, *, clues=True, uncertain=False):
                 response["text"] = json.dumps(result)
             return response
 
-        monkeypatch.setattr(contact_assessments, "call_openai", second_stage)
+        monkeypatch.setattr(openai_client, "call_openai", second_stage)
     source = _prepared(pilot)
     ownership.start_run(pilot.ids["owner"], source)
     _run_all(pilot)
@@ -100,7 +100,7 @@ def _case(pg, pilot, monkeypatch, *, clues=True, uncertain=False):
                 "usage": {"input_tokens": 17, "output_tokens": 9},
                 "telemetry": {"openai_request_id": f"handle_request_{len(case.calls)}"}}
 
-    monkeypatch.setattr(contact_assessments, "call_openai", handle_response)
+    monkeypatch.setattr(openai_client, "call_openai", handle_response)
     return case
 
 

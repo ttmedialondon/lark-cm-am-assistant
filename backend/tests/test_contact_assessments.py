@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import pytest
 
-from app import contact_assessments
+from app import contact_assessments, openai_client
 from app.crypto import message_body_cipher
 
 
@@ -104,9 +104,9 @@ def test_responses_request_is_nonpersistent_and_uses_configured_model(monkeypatc
         captured.update(kwargs)
         return Response()
 
-    monkeypatch.setattr(contact_assessments.httpx, "post", post)
+    monkeypatch.setattr(openai_client.httpx, "post", post)
     clock = iter((1.0, 1.125))
-    monkeypatch.setattr(contact_assessments.time, "perf_counter", lambda: next(clock))
+    monkeypatch.setattr(openai_client.time, "perf_counter", lambda: next(clock))
     result = contact_assessments._call_openai(
         {"model": "gpt-5.6-luna", "project_id": "proj_test"},
         "sk-test-only",
@@ -149,7 +149,7 @@ def test_responses_429_keeps_safe_retry_metadata(monkeypatch) -> None:
         def json():
             return {"error": {"code": "rate_limit_exceeded"}}
 
-    monkeypatch.setattr(contact_assessments.httpx, "post", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(openai_client.httpx, "post", lambda *_args, **_kwargs: Response())
 
     with pytest.raises(contact_assessments.OpenAIRequestError) as raised:
         contact_assessments._call_openai(
@@ -174,7 +174,7 @@ def test_responses_quota_429_is_not_treated_as_a_temporary_limit(monkeypatch) ->
         def json():
             return {"error": {"code": "insufficient_quota"}}
 
-    monkeypatch.setattr(contact_assessments.httpx, "post", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(openai_client.httpx, "post", lambda *_args, **_kwargs: Response())
 
     with pytest.raises(contact_assessments.OpenAIRequestError) as raised:
         contact_assessments._call_openai({"model": "gpt-5.6-luna"}, "sk-test-only", {"messages": []}, uuid4())
@@ -186,16 +186,16 @@ def test_retry_after_accepts_an_http_date(monkeypatch) -> None:
     class Response:
         headers = {"retry-after": "Thu, 01 Jan 1970 00:00:07 GMT"}
 
-    monkeypatch.setattr(contact_assessments.time, "time", lambda: 0.0)
+    monkeypatch.setattr(openai_client.time, "time", lambda: 0.0)
 
-    assert contact_assessments._retry_after_header(Response()) == 7
+    assert openai_client._retry_after_header(Response()) == 7
 
 
 def test_retry_after_rejects_a_non_finite_provider_value() -> None:
     class Response:
         headers = {"retry-after": "NaN"}
 
-    assert contact_assessments._retry_after_header(Response()) is None
+    assert openai_client._retry_after_header(Response()) is None
 
 
 def test_non_429_http_error_keeps_safe_telemetry_without_a_blind_retry(monkeypatch) -> None:
@@ -207,7 +207,7 @@ def test_non_429_http_error_keeps_safe_telemetry_without_a_blind_retry(monkeypat
         def json():
             return {"error": {"message": "untrusted provider text"}}
 
-    monkeypatch.setattr(contact_assessments.httpx, "post", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(openai_client.httpx, "post", lambda *_args, **_kwargs: Response())
 
     with pytest.raises(contact_assessments.OpenAIRequestError) as raised:
         contact_assessments._call_openai({"model": "gpt-5.6-luna"}, "sk-test-only", {"messages": []}, uuid4())

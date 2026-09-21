@@ -1,24 +1,21 @@
 """Session-scoped summaries and human-reviewed reply drafts for confirmed creators."""
 
-import hashlib
-
 from fastapi import APIRouter, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import offhours_summary, summary_periods, summary_replies
-from .admin import _csrf_matches
 from .db import connection
+from .http_helpers import conditional_response, secure_response
+from .http_helpers import csrf_matches as _csrf_matches
 
 
 def create_router(*, current_authorization, render_template, csrf_token=lambda auth: ""):
     router = APIRouter(prefix="/dashboard/offhours-summary", include_in_schema=False)
 
     def secure(response):
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-        response.headers["Referrer-Policy"] = "same-origin"
-        response.headers["X-Content-Type-Options"] = "nosniff"
+        secure_response(response)
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net https://unpkg.com; "
             "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https:; "
@@ -27,8 +24,7 @@ def create_router(*, current_authorization, render_template, csrf_token=lambda a
         )
         return response
 
-    def read(request):
-        auth = current_authorization(request)
+    def read(request, auth):
         if not auth or auth["status"] != "active":
             raise PermissionError("登录授权已失效，请重新登录。")
         with connection() as conn, conn.transaction():
@@ -57,10 +53,11 @@ def create_router(*, current_authorization, render_template, csrf_token=lambda a
 
     @router.get("")
     def page(request: Request):
-        if not current_authorization(request):
+        auth = current_authorization(request)
+        if not auth:
             return secure(RedirectResponse("/", status_code=303))
         try:
-            auth, data = read(request)
+            auth, data = read(request, auth)
             return secure(
                 render_template(
                     request,
@@ -78,13 +75,10 @@ def create_router(*, current_authorization, render_template, csrf_token=lambda a
     @router.get("/data")
     def data(request: Request):
         try:
-            _, result = read(request)
+            _, result = read(request, current_authorization(request))
             response = secure(JSONResponse(result))
-            response.headers["ETag"] = '"' + hashlib.sha256(response.body).hexdigest() + '"'
             # No cross-request cache: live grants/material are checked before a 304.
-            if request.headers.get("if-none-match") == response.headers["ETag"]:
-                return secure(Response(status_code=304, headers={"ETag": response.headers["ETag"]}))
-            return response
+            return conditional_response(request, response)
         except (PermissionError, offhours_summary.SummaryInputError) as exc:
             return denied(exc)
 
@@ -100,7 +94,7 @@ def create_router(*, current_authorization, render_template, csrf_token=lambda a
     @router.post("/replies")
     async def reply_create(request: Request):
         try:
-            auth = reply_actor(request, write=True)
+            auth = await run_in_threadpool(reply_actor, request, write=True)
             content = bytearray()
             async for piece in request.stream():
                 content.extend(piece)

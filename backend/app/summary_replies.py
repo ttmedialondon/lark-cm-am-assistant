@@ -6,9 +6,10 @@ import json
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from . import contact_assessments as api
 from . import offhours_summary as core
+from . import openai_client as api
 from . import summary_dialogues as dialogues
+from .ai_feature_config import api_key_cipher
 from .crypto import message_body_cipher
 from .db import connection
 from .message_mentions import mention_names
@@ -347,7 +348,7 @@ def step(job, settings):
                 pack["messages"].append(refs[ref])
             output = draft_schema(m["ref"] for m in pack["messages"] if m.get("purpose") != "style_only")
             instructions = DRAFT_INSTRUCTIONS
-    key = api.api_key_cipher(settings.token_encryption_key).decrypt(cfg["api_key_ciphertext"])
+    key = api_key_cipher(settings.token_encryption_key).decrypt(cfg["api_key_ciphertext"])
     response = api.call_openai(
         cfg, key, pack, job["actor_id"], instructions=instructions, output_format=output, max_output_tokens=16000
     )
@@ -422,7 +423,7 @@ def run(job, settings):
                 core.ai_dispatch.pause_for_quota()
             retry = exc.retryable and not exc.is_quota and job["attempts"] < 3
             if retry:
-                core.ai_dispatch.throttle(api._retry_delay(exc.retry_after_seconds, job["attempts"]))
+                core.ai_dispatch.throttle(api.retry_delay(exc.retry_after_seconds, job["attempts"]))
         message = "有新消息、事件或权限变化，请刷新后重新生成。" if stale else "生成未完成，请稍后重试。"
         with connection() as conn, conn.transaction():
             conn.execute(

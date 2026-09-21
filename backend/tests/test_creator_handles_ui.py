@@ -1,9 +1,11 @@
 """Frontend CM review stays separate from owner-only scan management."""
 
+import asyncio
 import json
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
@@ -18,8 +20,14 @@ def browser(monkeypatch, *, owner=False, active=True):
     templates = Environment(loader=FileSystemLoader(Path(__file__).parents[1] / "app/templates"),
                             autoescape=select_autoescape())
     app = FastAPI()
+    def authorization(_request):
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        actor["session_reads"] = actor.get("session_reads", 0) + 1
+        return actor
+
     app.include_router(creator_handles_routes.create_router(
-        current_authorization=lambda _request: actor,
+        current_authorization=authorization,
         csrf_token=lambda _auth: "csrf",
         render_template=lambda _request, name, context: HTMLResponse(templates.get_template(name).render(**context)),
     ))
@@ -51,6 +59,7 @@ def test_cm_can_read_review_own_handles_without_admin_and_cannot_cross_scope(mon
         monkeypatch.setattr(creator_handles, name, scoped)
     html = client.get("/creators")
     assert html.status_code == 200
+    assert actor["session_reads"] == 1
     assert "候选达人" in html.text and "我的达人" in html.text
     assert "导入 CAP 达人账号名单" in html.text and "整份名单的属性固定为 CAP" in html.text
     assert 'data-tab="mine"' in html.text

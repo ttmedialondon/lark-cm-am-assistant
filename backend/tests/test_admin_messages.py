@@ -77,8 +77,12 @@ def console(monkeypatch):
         "status": "active", "role": None, "role_active": False, "permissions": ["messages"],
     }))
 
-    def users(number):
+    def users(number=1, *, source_ids=None):
         calls["users"].append(number)
+        if source_ids is not None:
+            items = sorted([item for item in state["sources"] if item["id"] in source_ids],
+                           key=lambda item: item["display_name"])
+            return _page(items, 1, max(1, len(items)), len(items))
         return _page(state["sources"], number, 25, state["source_count"])
 
     def user_detail(*args, **kwargs):
@@ -354,7 +358,8 @@ def test_source_restriction_filters_directory_and_blocks_forged_source(console, 
     assert response.status_code == 200
     assert console.contexts[-1]["users"] == [console.source]
     assert console.contexts[-1]["user_page"]["total_count"] == 1
-    assert console.calls["users"] == []
+    assert console.calls["users"] == [1]
+    assert console.calls["user_detail"] == []
     response = _open(console, chat_id=console.chat["chat_id"])
     assert response.status_code == 200
     assert console.calls["audit"] == [(console.actor["id"], console.source["id"], console.chat["chat_id"])]
@@ -370,7 +375,7 @@ def test_source_restriction_filters_directory_and_blocks_forged_source(console, 
         source_id = uuid4()
         sources[source_id] = {**console.source, "id": source_id, "display_name": name}
         allowed.append(source_id)
-    monkeypatch.setattr(admin_reporting, "message_user", lambda source_id, **_: {"user": sources[source_id]})
+    console.state["sources"] = list(sources.values())
     response = console.browser.get("/admin/messages")
     assert response.status_code == 200
     assert {u["id"] for u in console.contexts[-1]["users"]} == set(allowed)
@@ -384,6 +389,11 @@ def test_source_restriction_filters_directory_and_blocks_forged_source(console, 
     assert _open(console, user_id=str(revoked)).status_code == 403
     assert _open(console, user_id=str(uuid4())).status_code == 403
     assert {key: len(value) for key, value in console.calls.items()} == counts
+
+    allowed.clear()
+    assert console.browser.get("/admin/messages").status_code == 200
+    assert console.contexts[-1]["users"] == []
+    assert console.calls["user_detail"] == []
 
 
 def test_source_and_filter_forms_reset_dependent_selection_state(console):

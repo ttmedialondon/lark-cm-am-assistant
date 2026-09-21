@@ -101,8 +101,16 @@ def client(monkeypatch):
     monkeypatch.setattr(routes.summary_periods, "selection",
                         lambda conn, actor, *args: (actor, None, None, {"date": "2026-09-15", "period": "work"}))
     app = FastAPI()
+    def authorization(_request):
+        import asyncio
+
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        auth["session_reads"] = auth.get("session_reads", 0) + 1
+        return auth
+
     app.include_router(routes.create_router(
-        current_authorization=lambda _: auth,
+        current_authorization=authorization,
         render_template=lambda *_: HTMLResponse("page"), csrf_token=lambda _: "test-csrf",
     ))
     return TestClient(app), auth, calls, conn
@@ -112,6 +120,7 @@ def test_route_uses_session_identity_not_query_scope_and_is_uncacheable(client):
     api, auth, calls, conn = client
     result = api.get(f"/dashboard/offhours-summary/data?responsible_id={uuid4()}&actor_id={uuid4()}")
     assert result.status_code == 200
+    assert auth["session_reads"] == 1
     assert calls == [(conn, auth["id"])]
     assert result.headers["cache-control"].startswith("no-store")
     assert "frame-ancestors 'none'" in result.headers["content-security-policy"]
@@ -137,6 +146,7 @@ def test_revoked_session_and_backend_scope_denial_never_render_data(client, monk
     monkeypatch.setattr(routes.offhours_summary, "get_summary_view", deny)
     result = api.get("/dashboard/offhours-summary")
     assert result.status_code == 403
+    assert auth["session_reads"] == 2
     assert "page" not in result.text
     assert result.headers["cache-control"].startswith("no-store")
 

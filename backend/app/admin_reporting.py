@@ -29,7 +29,8 @@ from .crypto import TokenCipher, message_body_cipher
 from .db import connection
 from .identity_profiles import safe_avatar_url
 from .lark_api import private_chat_url
-from .message_mentions import mention_names, resolve_mentions, rich_mention_text
+from .message_mentions import mention_names
+from .message_text import display_body as _readable_body
 
 LONDON_TIME_ZONE = ZoneInfo("Europe/London")
 LIST_PAGE_SIZE = 25
@@ -361,14 +362,19 @@ def normalize_user_permission_filter(value: str) -> str:
     return value if value in {"all", "none", "any", "owner"} | PAGE_KEYS else "all"
 
 
-def message_users(page: int = 1, *, source_id: UUID | None = None) -> dict[str, Any]:
+def message_users(page: int = 1, *, source_id: UUID | None = None,
+                  source_ids: list[UUID] | None = None) -> dict[str, Any]:
     """Source picker metadata only: never aggregate the message ledger."""
     with connection() as conn:
         rows = conn.execute(
             """SELECT id, display_name, status AS authorization_status, body_consent_at
                FROM authorizations WHERE (%s::uuid IS NULL OR id=%s)
-               ORDER BY authorized_at DESC""", (source_id, source_id),
+               AND (%s::uuid[] IS NULL OR id=ANY(%s::uuid[]))
+               ORDER BY authorized_at DESC""", (source_id, source_id, source_ids, source_ids),
         ).fetchall()
+    if source_ids is not None:
+        rows.sort(key=lambda row: row.get("display_name") or "")
+        return _page_result([_decorate_user(row) for row in rows], 1, total_count=len(rows))
     page, _, offset = _page_window(page, total_count=len(rows))
     return _page_result([_decorate_user(row) for row in rows[offset:offset + LIST_PAGE_SIZE]],
                         page, total_count=len(rows))
@@ -1470,53 +1476,12 @@ def _message_type_label(message_type: str | None) -> str:
             }.get(message_type, "其他消息")
 
 
-def _readable_body(raw: str, message_type: str | None, mentions=None, names=None) -> str:
-    """Show text and rich-text content without leaking raw JSON into the UI."""
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return resolve_mentions(raw, mentions, names)
-    texts = _body_text_values(parsed, mentions, names)
-    if texts:
-        return resolve_mentions("\n".join(texts), mentions, names)
-    kind = message_type or "未知类型"
-    return f"（{kind} 消息没有可展示的文本）"
-
-
 def _conversation_name(name: Any, chat_mode: str, chat_id: Any) -> str:
     if isinstance(name, str) and name:
         return name
     if chat_mode == "p2p":
         return f"未命名私聊 · {str(chat_id)[-8:]}"
     return "未命名群聊"
-
-
-def _body_text_values(value: Any, mentions=None, names=None) -> list[str]:
-    texts: list[str] = []
-
-    def collect(current: Any) -> None:
-        if isinstance(current, dict):
-            if current.get("tag") == "at":
-                texts.append(rich_mention_text(current.get("user_id"), mentions, names))
-                return
-            title = current.get("title")
-            if isinstance(title, str) and title and isinstance(current.get("content"), list):
-                texts.append(title)
-            text = current.get("text")
-            if isinstance(text, str) and text:
-                texts.append(text)
-            content = current.get("content")
-            if current.get("tag") in ("plain_text", "lark_md") and isinstance(content, str) and content:
-                texts.append(content)
-            for child in current.values():
-                collect(child)
-        elif isinstance(current, list):
-            for child in current:
-                collect(child)
-
-    collect(value)
-    return texts
 
 
 def _decorate_job(row: dict[str, Any]) -> dict[str, Any]:

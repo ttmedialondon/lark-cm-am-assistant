@@ -12,8 +12,9 @@ from uuid import UUID, uuid4
 from cryptography.exceptions import InvalidTag
 from psycopg.errors import DeadlockDetected, SerializationFailure
 
-from . import contact_assessments
 from . import offhours_summary as core
+from . import openai_client
+from .ai_feature_config import api_key_cipher
 
 PART_CHARS = 8000
 CHUNK_CHARS = 32000
@@ -108,7 +109,8 @@ def checked_chat(conn, job, settings):
 
 def schedule_merges(conn, settings):
     if not core._enabled(conn):
-        return
+        return 0
+    inserted = 0
     runs = conn.execute(
         """SELECT r.* FROM offhours_summary_runs r JOIN offhours_summary_settings s ON s.id
         WHERE (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL))
@@ -146,6 +148,7 @@ def schedule_merges(conn, settings):
                 WHERE run_id=%s AND contact_id=%s AND input_fingerprint<>%s""",
                 (run["id"], person, fingerprint),
             )
+            new_id = uuid4()
             task = conn.execute(
                 """INSERT INTO offhours_summary_tasks(id,run_id,contact_id,input_fingerprint,cutoff)
                 VALUES(%s,%s,%s,%s,%s) ON CONFLICT(run_id,contact_id,input_fingerprint) WHERE contact_id IS NOT NULL
@@ -153,8 +156,9 @@ def schedule_merges(conn, settings):
                 status=CASE WHEN offhours_summary_tasks.status='cancelled' THEN 'queued'
                     ELSE offhours_summary_tasks.status END
                 RETURNING id""",
-                (uuid4(), run["id"], person, fingerprint, max(t["cutoff"] for t in sources)),
+                (new_id, run["id"], person, fingerprint, max(t["cutoff"] for t in sources)),
             ).fetchone()
+            inserted += task["id"] == new_id
             selected.append(task["id"])
         conn.execute(
             """UPDATE offhours_summary_tasks SET is_current=FALSE,
@@ -162,6 +166,7 @@ def schedule_merges(conn, settings):
             WHERE run_id=%s AND contact_id IS NOT NULL AND NOT(id=ANY(%s::uuid[]))""",
             (run["id"], selected),
         )
+    return inserted
 
 
 def merge_input(conn, run, task, settings, roster=None, chats=None, *, read_cache=None):
@@ -442,8 +447,8 @@ def request(job, settings, cfg, pack, schema, instructions):
         else:
             core._current(conn, job)
             merge_input(conn, job, job, settings)
-    key = contact_assessments.api_key_cipher(settings.token_encryption_key).decrypt(cfg["api_key_ciphertext"])
-    return contact_assessments.call_openai(
+    key = api_key_cipher(settings.token_encryption_key).decrypt(cfg["api_key_ciphertext"])
+    return openai_client.call_openai(
         cfg,
         key,
         pack,
@@ -459,22 +464,22 @@ def run(job, settings):
         step(job, settings)
     except (PermissionError, core.SummaryInputError):
         core._finish(job, "cancelled", "授权或资料已变化，等待重新准备。")
-    except contact_assessments.OpenAIRequestError as exc:
+    except openai_client.OpenAIRequestError as exc:
         if exc.is_quota:
             core.ai_dispatch.pause_for_quota()
         retry = exc.retryable and not exc.is_quota and job["attempts"] < core.MAX_ATTEMPTS
-        delay = contact_assessments._retry_delay(exc.retry_after_seconds, job["attempts"])
+        delay = openai_client.retry_delay(exc.retry_after_seconds, job["attempts"])
         if retry:
             core.ai_dispatch.throttle(delay)
         core._finish(job, "queued" if retry else "failed", "OpenAI 请求未完成；已完成分段保留。", delay=delay)
     except (
         core.InvalidModelOutput,
-        contact_assessments._ModelOutputError,
+        openai_client.ModelOutputError,
         ValueError,
         KeyError,
         TypeError,
         InvalidTag,
-        contact_assessments.ContactAssessmentInputError,
+        openai_client.AIInputError,
         DeadlockDetected,
         SerializationFailure,
     ) as exc:

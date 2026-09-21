@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from psycopg.types.json import Jsonb
 
-from . import ai_dispatch, contact_assessments, creator_handles, creator_import_evidence
+from . import ai_dispatch, creator_access, creator_import_evidence, openai_client
 from . import creator_ownership as ownership
 from .ai_feature_config import api_key_cipher
 from .config import get_settings
@@ -69,23 +69,24 @@ def _audit(conn, actor, action, data):
 
 def _batch(conn, actor, batch_id):
     batch = conn.execute(
-        "SELECT * FROM creator_import_batches WHERE id=%s FOR UPDATE", (ownership._uuid(batch_id),)
+        "SELECT * FROM creator_import_batches WHERE id=%s FOR UPDATE", (creator_access.parse_id(batch_id),)
     ).fetchone()
     if not batch:
         raise LookupError("找不到该导入批次。")
-    creator_handles._access(conn, actor, batch["cm_authorization_id"])
+    creator_access.access(conn, actor, batch["cm_authorization_id"])
     if batch["policy_version"] != POLICY_VERSION:
         raise ValueError("导入规则已更新，请重新上传名单。")
     return batch
 
 
 def _row(conn, actor, row_id):
-    row = conn.execute("SELECT batch_id FROM creator_import_rows WHERE id=%s", (ownership._uuid(row_id),)).fetchone()
+    row = conn.execute("SELECT batch_id FROM creator_import_rows WHERE id=%s",
+                       (creator_access.parse_id(row_id),)).fetchone()
     if not row:
         raise LookupError("找不到该导入候选。")
     batch = _batch(conn, actor, row["batch_id"])
     row = conn.execute(
-        "SELECT * FROM creator_import_rows WHERE id=%s FOR UPDATE", (ownership._uuid(row_id),)
+        "SELECT * FROM creator_import_rows WHERE id=%s FOR UPDATE", (creator_access.parse_id(row_id),)
     ).fetchone()
     row["batch_creator_type"] = batch["creator_type"]
     return row, batch
@@ -127,7 +128,7 @@ def search_users(actor_id, cm_id, q):
     if not q:
         return []
     with connection() as conn:
-        cm_id, _ = creator_handles._access(conn, actor_id, cm_id)
+        cm_id, _ = creator_access.access(conn, actor_id, cm_id)
         rows = conn.execute(
             """WITH named AS MATERIALIZED (
                 SELECT c.id,COALESCE(NULLIF(c.display_name,''),'未命名用户') display_name FROM contacts c
@@ -206,7 +207,7 @@ def _admit(conn, row, actor, handle, contact_id, *, automatic=False):
         handle = normalize_handle(handle)
     except ValueError as exc:
         raise ValueError("请填写正确的 handle。") from exc
-    contact_id = ownership._uuid(contact_id)
+    contact_id = creator_access.parse_id(contact_id)
     if not handle:
         raise ValueError("请填写正确的 handle。")
     if row["review_status"] == "confirmed":
@@ -324,9 +325,9 @@ def preview_import(actor_id, cm_id, filename, content, creator_type="cap"):
     if creator_type != "cap":
         raise ValueError("本次仅支持 CAP 达人名单。")
     parsed = parse_xlsx(filename, content)
-    actor_id = ownership._uuid(actor_id)
+    actor_id = creator_access.parse_id(actor_id)
     with connection() as conn, conn.transaction():
-        cm_id, _ = creator_handles._access(conn, actor_id, cm_id)
+        cm_id, _ = creator_access.access(conn, actor_id, cm_id)
         fingerprint = hashlib.sha256(content).hexdigest()
         batch = conn.execute(
             """INSERT INTO creator_import_batches
@@ -407,7 +408,7 @@ def start_import(actor_id, batch_id):
                                     reviewed_at=NOW(),updated_at=NOW() WHERE id=%s""",
                                     (contact_id, row["id"]),
                                 )
-                                _audit(conn, ownership._uuid(actor_id), "reused", {"row_id": str(row["id"])})
+                                _audit(conn, creator_access.parse_id(actor_id), "reused", {"row_id": str(row["id"])})
                             else:
                                 conn.execute(
                                     "UPDATE creator_import_rows SET contact_id=%s WHERE id=%s", (contact_id, row["id"])
@@ -424,7 +425,7 @@ def start_import(actor_id, batch_id):
                 "UPDATE creator_import_batches SET status='running',updated_at=NOW() WHERE id=%s", (batch["id"],)
             )
             _settle(conn, batch["id"])
-            _audit(conn, ownership._uuid(actor_id), "started", {"batch_id": str(batch["id"])})
+            _audit(conn, creator_access.parse_id(actor_id), "started", {"batch_id": str(batch["id"])})
             batch = conn.execute("SELECT * FROM creator_import_batches WHERE id=%s", (batch["id"],)).fetchone()
         return {"id": str(batch["id"]), "status": batch["status"]}
 
@@ -434,7 +435,7 @@ def confirm_row(actor_id, row_id, handle, contact_id):
         row, batch = _row(conn, actor_id, row_id)
         if batch["status"] == "preview":
             raise ValueError("请先确认导入名单。")
-        _admit(conn, row, ownership._uuid(actor_id), handle, contact_id)
+        _admit(conn, row, creator_access.parse_id(actor_id), handle, contact_id)
         _settle(conn, row["batch_id"])
         return {"id": str(row["id"]), "status": "confirmed"}
 
@@ -449,7 +450,7 @@ def defer_row(actor_id, row_id):
             "lease_until=NULL,updated_at=NOW() WHERE id=%s",
             (row["id"],),
         )
-        _audit(conn, ownership._uuid(actor_id), "deferred", {"row_id": str(row["id"])})
+        _audit(conn, creator_access.parse_id(actor_id), "deferred", {"row_id": str(row["id"])})
         _settle(conn, row["batch_id"])
         return {"id": str(row["id"]), "status": "deferred"}
 
@@ -618,7 +619,7 @@ def candidate_items(conn, cm_id, rows):
 def page_data(actor_id, cm_id, q="", page=1, *, include_candidates=True):
     q, page = str(q or "").strip()[:120], max(1, min(int(page), 10000))
     with connection() as conn:
-        cm_id, _ = creator_handles._access(conn, actor_id, cm_id)
+        cm_id, _ = creator_access.access(conn, actor_id, cm_id)
         decorated = batch_summaries(conn, cm_id)
         base = """FROM creator_import_rows r JOIN creator_import_batches b ON b.id=r.batch_id
             WHERE r.cm_authorization_id=%s AND b.policy_version=%s
@@ -924,14 +925,14 @@ def recheck_batch(actor_id, batch_id, row_ids=None):
         batch = _batch(conn, actor_id, batch_id)
         if batch["status"] not in ("completed", "paused"):
             raise ValueError("请先等待本批结束或暂停，再重新检查。")
-        selected_ids = [ownership._uuid(row_id) for row_id in row_ids] if row_ids is not None else None
+        selected_ids = [creator_access.parse_id(row_id) for row_id in row_ids] if row_ids is not None else None
         rows = conn.execute(
             """SELECT * FROM creator_import_rows WHERE batch_id=%s AND review_status='pending'
                AND (%s::uuid[] IS NULL OR id=ANY(%s::uuid[])) FOR UPDATE""",
             (batch["id"], selected_ids, selected_ids),
         ).fetchall()
         for row in rows:
-            _invalidate_chain(conn, row, ownership._uuid(actor_id))
+            _invalidate_chain(conn, row, creator_access.parse_id(actor_id))
             conn.execute(
                 """UPDATE creator_import_rows SET status='pending',contact_id=NULL,outcome=NULL,
                 reason_code='',attempts=0,scheduled_at=NOW(),updated_at=NOW(),
@@ -1005,7 +1006,7 @@ def prepare_next_import(settings):
     stage, material, config, reason = _stage(row), None, None, ""
     try:
         with connection() as conn:
-            creator_handles._access(conn, row["uploaded_by"], row["cm_authorization_id"])
+            creator_access.access(conn, row["uploaded_by"], row["cm_authorization_id"])
             chain, results = _decode(row, settings), _decode(row, settings, "result_ciphertext")
             if chain and not _valid_chain(conn, settings, row, chain, results, full=True):
                 raise ValueError("authorization_changed")
@@ -1034,7 +1035,7 @@ def prepare_next_import(settings):
         if not current or batch["policy_version"] != POLICY_VERSION:
             return True
         try:
-            creator_handles._access(conn, row["uploaded_by"], row["cm_authorization_id"])
+            creator_access.access(conn, row["uploaded_by"], row["cm_authorization_id"])
         except PermissionError:
             reason = "authorization_changed"
         if (
@@ -1187,7 +1188,7 @@ def _finish(job, settings, *, response=None, result=None, reason=""):
         chain, results = _decode(row, settings), _decode(row, settings, "result_ciphertext")
         if result:
             try:
-                creator_handles._access(conn, row["uploaded_by"], row["cm_authorization_id"])
+                creator_access.access(conn, row["uploaded_by"], row["cm_authorization_id"])
                 config = ownership._config(conn)
                 if not config or ownership._config_fingerprint(config) != row["config_fingerprint"]:
                     raise ValueError("configuration_changed")
@@ -1265,7 +1266,7 @@ def run_claimed_import(job, settings):
                     (row["id"],),
                 )
                 return
-            creator_handles._access(conn, row["uploaded_by"], row["cm_authorization_id"])
+            creator_access.access(conn, row["uploaded_by"], row["cm_authorization_id"])
             chain, results = _decode(row, settings), _decode(row, settings, "result_ciphertext")
             if not _valid_chain(conn, settings, row, chain, results, full=True):
                 raise ValueError("authorization_changed")
@@ -1276,7 +1277,7 @@ def run_claimed_import(job, settings):
             pack = chain[_stage(row)]["pack"]
             conn.execute("UPDATE creator_import_rows SET api_requests=api_requests+1 WHERE id=%s", (row["id"],))
         group = _stage(job) == "group"
-        response = contact_assessments.call_openai(
+        response = openai_client.call_openai(
             config,
             key,
             pack,
@@ -1291,7 +1292,7 @@ def run_claimed_import(job, settings):
         )
         validator = creator_import_evidence.group_validate if group else creator_import_evidence.person_validate
         _finish(job, settings, response=response, result=validator(response["text"], pack))
-    except contact_assessments.OpenAIRequestError as exc:
+    except openai_client.OpenAIRequestError as exc:
         if exc.is_quota:
             ai_dispatch.pause_for_quota()
         if exc.retryable and not exc.is_quota and job["attempts"] < 2:

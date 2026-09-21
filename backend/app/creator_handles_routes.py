@@ -6,37 +6,37 @@ from uuid import UUID
 
 from fastapi import APIRouter, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import creator_handles, creator_imports
-from .admin import _csrf_matches, _form_fields
+from .http_helpers import (
+    csrf_matches as _csrf_matches,
+)
+from .http_helpers import (
+    error_response as error,
+)
+from .http_helpers import (
+    form_fields as _form_fields,
+)
+from .http_helpers import (
+    json_response as payload,
+)
+from .http_helpers import (
+    secure_response as secure,
+)
 
 
 def create_router(*, current_authorization, render_template, csrf_token):
     router = APIRouter(prefix="/creators", include_in_schema=False)
 
-    def secure(response):
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-        response.headers["Referrer-Policy"] = "same-origin"
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        return response
-
-    def payload(value, code=200):
-        return secure(JSONResponse(jsonable_encoder(value), status_code=code))
-
-    def error(exc):
-        code = 403 if isinstance(exc, PermissionError) else 404 if isinstance(exc, LookupError) else 400
-        return payload({"error": str(exc)}, code)
-
-    def actor(request):
-        auth = current_authorization(request)
+    def actor(auth):
         if not auth or auth["status"] != "active":
             raise PermissionError("登录授权已失效，请重新登录。")
         return auth
 
     async def form_for(request):
-        auth = actor(request)
+        auth = actor(await run_in_threadpool(current_authorization, request))
         form = await _form_fields(request)
         if not _csrf_matches(form, csrf_token(auth)):
             raise ValueError("请求校验失败，请刷新页面后重试。")
@@ -45,10 +45,11 @@ def create_router(*, current_authorization, render_template, csrf_token):
     @router.get("")
     @router.get("/data")
     def page(request: Request, cm_id: UUID | None = None, tab: str = "mine", q: str = "", page: int = 1):
-        if request.url.path == "/creators" and not current_authorization(request):
+        auth = current_authorization(request)
+        if request.url.path == "/creators" and not auth:
             return secure(RedirectResponse("/", status_code=303))
         try:
-            auth = actor(request)
+            auth = actor(auth)
             tab = "candidates" if tab == "candidates" else "mine"
             data = creator_handles.page_data(auth["id"], cm_id=cm_id, tab=tab, query=q[:120], page=max(1, page))
             if request.url.path.endswith("/data"):
@@ -98,7 +99,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
     @router.get("/tasks/{task_id}/evidence")
     def evidence(request: Request, task_id: UUID):
         try:
-            auth = actor(request)
+            auth = actor(current_authorization(request))
             return payload(creator_handles.task_evidence(auth["id"], task_id))
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
@@ -106,7 +107,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
     @router.post("/imports/preview")
     async def import_preview(request: Request, cm_id: UUID, creator_type: str = "cap"):
         try:
-            auth = actor(request)
+            auth = actor(await run_in_threadpool(current_authorization, request))
             if not _csrf_matches({"csrf_token": request.headers.get("X-CSRF-Token", "")}, csrf_token(auth)):
                 raise ValueError("请求校验失败，请刷新页面后重试。")
             if creator_type != "cap":
@@ -133,7 +134,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
     @router.get("/imports/data")
     def import_data(request: Request, cm_id: UUID, q: str = "", page: int = 1):
         try:
-            auth = actor(request)
+            auth = actor(current_authorization(request))
             return payload(creator_imports.page_data(auth["id"], cm_id, q=q[:120], page=max(1, page)))
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
@@ -141,7 +142,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
     @router.get("/imports/users")
     def import_users(request: Request, cm_id: UUID, q: str = ""):
         try:
-            auth = actor(request)
+            auth = actor(current_authorization(request))
             return payload(creator_imports.search_users(auth["id"], cm_id, q[:120]))
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
@@ -167,7 +168,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
     @router.get("/imports/rows/{row_id}/evidence")
     def import_evidence(request: Request, row_id: UUID):
         try:
-            auth = actor(request)
+            auth = actor(current_authorization(request))
             return payload(creator_imports.row_evidence(auth["id"], row_id))
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)

@@ -7,18 +7,16 @@ avoids importing ``main`` back into an admin module.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import Annotated, Any, Protocol
 from urllib.parse import parse_qs, quote, urlencode
 from uuid import UUID, uuid4
 
 import anyio
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import (
@@ -35,6 +33,20 @@ from . import (
 from .config import get_settings
 from .contact_taxonomy import ROLE_LABELS, ROLE_ORDER
 from .db import connection
+from .http_helpers import (
+    conditional_response,
+    form_body,
+    form_fields,
+)
+from .http_helpers import (
+    csrf_matches as _csrf_matches,
+)
+from .http_helpers import (
+    error_response as ownership_error,
+)
+from .http_helpers import (
+    json_response as ownership_json,
+)
 
 
 class TemplateRenderer(Protocol):
@@ -342,7 +354,9 @@ def create_admin_router(
         )
 
     @router.post("/admin/users/{authorization_id}/permissions")
-    async def admin_set_page_permissions(request: Request, authorization_id: UUID) -> Response:
+    def admin_set_page_permissions(
+        request: Request, authorization_id: UUID, *, body: Annotated[bytes, Depends(form_body)],
+    ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
@@ -350,7 +364,6 @@ def create_admin_router(
         try:
             if request.headers.get("content-type", "").split(";", 1)[0] != "application/x-www-form-urlencoded":
                 raise ValueError("请通过人员页面提交权限设置。")
-            body = await request.body()
             if len(body) > 4096:
                 raise ValueError("提交内容过长。")
             parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True, max_num_fields=20)
@@ -517,19 +530,13 @@ def create_admin_router(
                 "title": "消息来源未获授权", "detail": "你只能查看已获授权的 CM 消息。",
             }, 403)
         if source_limit is not None:
-            sources = [admin_reporting.message_user(source_id)
-                       for source_id in source_limit]
-            allowed_users = sorted([source["user"] for source in sources if source],
-                                   key=lambda user: user.get("display_name") or "")
-            user_page_data = admin_reporting._page_result(
-                allowed_users, 1, total_count=len(allowed_users),
-            )
+            user_page_data = admin_reporting.message_users(source_ids=list(source_limit))
         else:
             user_page_data = admin_reporting.message_users(user_page)
         users = user_page_data["items"]
         selected_user = next((item for item in users if item["id"] == user_id), None)
         selected_user_in_page = selected_user is not None
-        if user_id is not None and selected_user is None:
+        if user_id is not None and selected_user is None and source_limit is None:
             selected = admin_reporting.message_user(user_id)
             selected_user = selected["user"] if selected else None
         if user_id is not None and not selected_user:
@@ -657,15 +664,6 @@ def create_admin_router(
         assert access_context is not None
         return render_ai_config(request, access_context)
 
-    def ownership_json(payload: dict[str, Any], status_code: int = 200) -> Response:
-        return JSONResponse(jsonable_encoder(payload), status_code=status_code, headers={
-            "Cache-Control": "no-store, max-age=0", "Referrer-Policy": "same-origin",
-        })
-
-    def ownership_error(exc: Exception) -> Response:
-        code = 403 if isinstance(exc, PermissionError) else 404 if isinstance(exc, LookupError) else 400
-        return ownership_json({"error": str(exc)}, code)
-
     @router.get("/admin/ai/creator-ownership")
     @router.get("/admin/ai/creator-ownership/data")
     def admin_creator_ownership(
@@ -685,31 +683,26 @@ def create_admin_router(
             return ownership_error(exc)
         if request.url.path.endswith("/data"):
             response = ownership_json(data)
-            response.headers["ETag"] = '"' + hashlib.sha256(response.body).hexdigest() + '"'
             # Compare only after current permissions and evidence have been rechecked.
-            if request.headers.get("if-none-match") == response.headers["ETag"]:
-                return Response(status_code=304, headers={key: value for key, value in response.headers.items()
-                                                         if key != "content-length"})
-            return response
+            return conditional_response(request, response)
         return render_template(request, "admin/creator_ownership.html", {
             **page_context(access_context, "ai"), "ownership": jsonable_encoder(data),
             "ownership_query": q[:120], "ownership_status": status,
         })
 
     @router.post("/admin/ai/creator-ownership/preview")
-    async def admin_creator_ownership_preview(request: Request) -> Response:
+    def admin_creator_ownership_preview(
+        request: Request, *, form: Annotated[dict[str, str], Depends(form_fields)],
+    ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        form = await _form_fields(request)
         if not _csrf_matches(form, csrf_token(access_context["authorization"])):
             return ownership_json({"error": "请求校验失败，请刷新页面后重试。"}, 400)
         try:
             cm_id = UUID(form.get("cm_id", ""))
-            run_id = await run_in_threadpool(
-                creator_ownership.create_preview, access_context["authorization"]["id"], cm_id,
-            )
+            run_id = creator_ownership.create_preview(access_context['authorization']['id'], cm_id)
         except (ValueError, LookupError, PermissionError) as exc:
             return ownership_error(exc)
         return ownership_json({"run_id": run_id, "cm_id": cm_id})
@@ -719,12 +712,13 @@ def create_admin_router(
     @router.post("/admin/ai/creator-ownership/{run_id}/resume")
     @router.post("/admin/ai/creator-ownership/{run_id}/confirm")
     @router.post("/admin/ai/creator-ownership/{run_id}/defer")
-    async def admin_creator_ownership_action(request: Request, run_id: UUID) -> Response:
+    def admin_creator_ownership_action(
+        request: Request, run_id: UUID, *, form: Annotated[dict[str, str], Depends(form_fields)],
+    ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        form = await _form_fields(request)
         if not _csrf_matches(form, csrf_token(access_context["authorization"])):
             return ownership_json({"error": "请求校验失败，请刷新页面后重试。"}, 400)
         actor_id = access_context["authorization"]["id"]
@@ -736,14 +730,9 @@ def create_admin_router(
             if action == "start":
                 if form.get("limit") not in {"20", "all"}:
                     raise ValueError("请选择先分析 20 人或分析剩余。")
-                await run_in_threadpool(
-                    creator_ownership.start_run, actor_id, run_id, limit=20 if form["limit"] == "20" else None,
-                )
+                creator_ownership.start_run(actor_id, run_id, limit=20 if form['limit'] == '20' else None)
             elif action in {"pause", "resume"}:
-                await run_in_threadpool(
-                    creator_ownership.pause_run if action == "pause" else creator_ownership.resume_run,
-                    actor_id, run_id,
-                )
+                (creator_ownership.pause_run if action == 'pause' else creator_ownership.resume_run)(actor_id, run_id)
             else:
                 values = form.get("task_ids", "").split(",")
                 if not 1 <= len(values) <= 100 or len(values) != len(set(values)):
@@ -752,9 +741,7 @@ def create_admin_router(
                     task_ids = [UUID(value) for value in values]
                 except ValueError as exc:
                     raise ValueError("所选记录无效，请刷新后重试。") from exc
-                count = await run_in_threadpool(
-                    creator_ownership.defer_tasks, actor_id, run_id, task_ids,
-                )
+                count = creator_ownership.defer_tasks(actor_id, run_id, task_ids)
         except (ValueError, LookupError, PermissionError) as exc:
             return ownership_error(exc)
         return ownership_json({"run_id": run_id, "count": count})
@@ -890,12 +877,13 @@ def create_admin_router(
         return response
 
     @router.post("/admin/contacts/{open_id}/assessments")
-    async def admin_continue_contact_assessment(request: Request, open_id: str) -> Response:
+    def admin_continue_contact_assessment(
+        request: Request, open_id: str, *, form: Annotated[dict[str, str], Depends(form_fields)],
+    ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        form = await _form_fields(request)
         if not _csrf_matches(form, csrf_token(access_context["authorization"])):
             response = render_template(request, "error.html", {
                 "title": "请求校验失败", "detail": "请返回人员详情页后重试。",
@@ -922,13 +910,14 @@ def create_admin_router(
         return response
 
     @router.post("/admin/contacts/{open_id}/organization")
-    async def admin_confirm_contact_organization(
+    def admin_confirm_contact_organization(
         request: Request,
         open_id: str,
         page: int = 1,
         category: str = "all",
         organization_status: str = "all",
         organization_query: str = "",
+        *, form: Annotated[dict[str, str], Depends(form_fields)],
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
@@ -937,7 +926,6 @@ def create_admin_router(
         category = admin_reporting.normalize_contact_category(category)
         organization_status = admin_reporting.normalize_organization_status(organization_status)
         organization_query = admin_reporting.normalize_organization_query(organization_query)
-        form = await _form_fields(request)
         if not _csrf_matches(form, csrf_token(access_context["authorization"])):
             response = render_template(
                 request,
@@ -1021,7 +1009,7 @@ def create_admin_router(
         )
 
     @router.post("/admin/contacts/{open_id}/assessments/{assessment_id}/roles")
-    async def admin_confirm_assessment_role(
+    def admin_confirm_assessment_role(
         request: Request,
         open_id: str,
         assessment_id: UUID,
@@ -1029,6 +1017,7 @@ def create_admin_router(
         category: str = "all",
         organization_status: str = "all",
         organization_query: str = "",
+        *, form: Annotated[dict[str, str], Depends(form_fields)],
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
@@ -1046,7 +1035,6 @@ def create_admin_router(
             )
             response.headers["Cache-Control"] = "no-store, max-age=0"
             return response
-        form = await _form_fields(request)
         if not _csrf_matches(form, csrf_token(access_context["authorization"])):
             return render_contact_assessment(
                 request,
@@ -1090,7 +1078,7 @@ def create_admin_router(
         return response
 
     @router.post("/admin/contacts/{open_id}/assessments/{assessment_id}/dismiss")
-    async def admin_dismiss_contact_assessment(
+    def admin_dismiss_contact_assessment(
         request: Request,
         open_id: str,
         assessment_id: UUID,
@@ -1098,6 +1086,7 @@ def create_admin_router(
         category: str = "all",
         organization_status: str = "all",
         organization_query: str = "",
+        *, form: Annotated[dict[str, str], Depends(form_fields)],
     ) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
@@ -1115,7 +1104,6 @@ def create_admin_router(
             )
             response.headers["Cache-Control"] = "no-store, max-age=0"
             return response
-        form = await _form_fields(request)
         if not _csrf_matches(form, csrf_token(access_context["authorization"])):
             return render_contact_assessment(
                 request,
@@ -1155,12 +1143,11 @@ def create_admin_router(
         return response
 
     @router.post("/admin/ai")
-    async def admin_save_ai_config(request: Request) -> Response:
+    def admin_save_ai_config(request: Request, *, form: Annotated[dict[str, str], Depends(form_fields)]) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        form = await _form_fields(request)
         if not _csrf_matches(form, csrf_token(access_context["authorization"])):
             response = render_template(
                 request,
@@ -1238,12 +1225,11 @@ def create_admin_router(
         return response
 
     @router.post("/admin/ai/resume")
-    async def admin_resume_ai_queue(request: Request) -> Response:
+    def admin_resume_ai_queue(request: Request, *, form: Annotated[dict[str, str], Depends(form_fields)]) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        form = await _form_fields(request)
         if not _csrf_matches(form, csrf_token(access_context["authorization"])):
             response = render_template(
                 request,
@@ -1281,22 +1267,6 @@ def create_admin_router(
         )
 
     return router
-
-
-async def _form_fields(request: Request) -> dict[str, str]:
-    content_type = request.headers.get("content-type", "").split(";", 1)[0]
-    if content_type != "application/x-www-form-urlencoded":
-        return {}
-    body = await request.body()
-    if len(body) > 4096:
-        return {}
-    parsed = parse_qs(body.decode("utf-8", "replace"), keep_blank_values=True)
-    return {key: values[-1] for key, values in parsed.items() if values}
-
-
-def _csrf_matches(form: dict[str, str], expected: str) -> bool:
-    supplied = form.get("csrf_token")
-    return bool(supplied) and hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
 
 
 def _role_label(role: str) -> str:

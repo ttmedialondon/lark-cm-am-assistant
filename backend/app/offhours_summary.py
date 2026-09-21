@@ -13,12 +13,13 @@ from zoneinfo import ZoneInfo
 
 from cryptography.exceptions import InvalidTag
 
-from . import ai_dispatch, contact_assessments, creator_import_evidence, creator_imports
+from . import ai_dispatch, creator_import_evidence, creator_imports
 from .ai_feature_config import FeatureConfigInputError
 from .config import get_settings
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
 from .message_mentions import mention_names, mention_targets, resolve_mentions, rich_mention_text
+from .message_text import evidence_body
 
 FEATURE = "offhours_summary"
 POLICY_VERSION = "shift-handling-v4"
@@ -371,7 +372,7 @@ def _body(row, cipher, names=None):
         return "[附件或正文不可读取，需人工查看原消息]", True
     raw = cipher.decrypt(row["body_ciphertext"])
     if row["message_type"] == "text":
-        text = contact_assessments._readable_body(raw, "text")
+        text = evidence_body(raw, "text")
     else:
         try:
             payload = json.loads(raw)
@@ -567,30 +568,31 @@ def schedule_if_due(conn, *, force=False):
     recurring = conn.execute("SELECT recurring_enabled FROM offhours_summary_settings WHERE id").fetchone()
     if recurring and recurring["recurring_enabled"]:
         if not _enabled(conn):
-            return
+            return 0
         state = conn.execute("""SELECT *,id AS run_id FROM offhours_summary_runs
             WHERE period IS NOT NULL AND next_check_at<=%s
             ORDER BY next_check_at,window_start DESC,id FOR UPDATE SKIP LOCKED LIMIT 1""", (now,)).fetchone()
         if state:
             try:
                 with conn.transaction():
-                    _schedule_run(conn, dict(state), now)
+                    return _schedule_run(conn, dict(state), now)
             except (PermissionError, SummaryInputError):
                 conn.execute("UPDATE offhours_summary_runs SET next_check_at=NULL WHERE id=%s", (state["id"],))
                 conn.execute("""UPDATE offhours_summary_tasks SET status='cancelled',lease_until=NULL,
                     error_message='该 CM 授权已失效。' WHERE run_id=%s AND status IN ('queued','running')""",
                     (state["id"],))
-        return
+        return 0
     state = conn.execute("""SELECT s.*,r.window_start,r.window_end,r.requested_by_authorization_id,
                          r.responsible_authorization_id FROM offhours_summary_settings s
                          JOIN offhours_summary_runs r ON r.id=s.run_id WHERE s.id FOR UPDATE OF s""").fetchone()
     now = datetime.now(UTC)
     if not state or not _enabled(conn) or (not force and (not state["next_check_at"] or state["next_check_at"] > now)):
-        return
-    _schedule_run(conn, dict(state), now)
+        return 0
+    return _schedule_run(conn, dict(state), now)
 
 
 def _schedule_run(conn, state, now):
+    inserted = 0
     cm_id = state["responsible_authorization_id"]
     _authorize(conn, state["requested_by_authorization_id"], owner_only=True, cm_id=cm_id)
     cutoff = min(now, state["window_end"])
@@ -636,6 +638,7 @@ def _schedule_run(conn, state, now):
                      WHERE run_id=%s AND chat_id=%s AND input_fingerprint<>%s AND status IN ('queued','running')""",
             (state["run_id"], chat["chat_id"], evidence["fingerprint"]),
         )
+        new_id = uuid4()
         selected = conn.execute(
             """INSERT INTO offhours_summary_tasks(id,run_id,chat_id,input_fingerprint,cutoff,checkpoint_ciphertext)
                      VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(run_id,chat_id,input_fingerprint)
@@ -644,9 +647,10 @@ def _schedule_run(conn, state, now):
                             ELSE offhours_summary_tasks.cutoff END,
                      status=CASE WHEN offhours_summary_tasks.status='cancelled' THEN 'queued'
                             ELSE offhours_summary_tasks.status END RETURNING id""",
-            (uuid4(), state["run_id"], chat["chat_id"], evidence["fingerprint"], chat_cutoff,
+            (new_id, state["run_id"], chat["chat_id"], evidence["fingerprint"], chat_cutoff,
              previous["checkpoint_ciphertext"] if previous else None),
         ).fetchone()
+        inserted += selected["id"] == new_id
         selected_ids.append(selected["id"])
     conn.execute(
         """UPDATE offhours_summary_tasks SET is_current=FALSE,
@@ -688,6 +692,7 @@ def _schedule_run(conn, state, now):
                      (next_check, state["run_id"]))
     else:
         conn.execute("UPDATE offhours_summary_settings SET next_check_at=%s WHERE id", (next_check,))
+    return inserted
 
 
 def claim_next_summary():
@@ -971,10 +976,9 @@ def prepare_next_summary(settings):
     # Reuse the existing single preparation executor; never block AI dispatch.
     from . import summary_dialogues
     with connection() as conn, conn.transaction():
-        before = conn.execute("SELECT count(*) AS n FROM offhours_summary_tasks").fetchone()["n"]
-        schedule_if_due(conn)
-        summary_dialogues.schedule_merges(conn, settings)
-        return conn.execute("SELECT count(*) AS n FROM offhours_summary_tasks").fetchone()["n"] != before
+        inserted = schedule_if_due(conn)
+        inserted += summary_dialogues.schedule_merges(conn, settings)
+        return inserted > 0
 
 
 def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None):

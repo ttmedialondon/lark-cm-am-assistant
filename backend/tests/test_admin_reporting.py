@@ -175,8 +175,19 @@ def test_seconds_label_prefers_human_readable_units():
 
 
 def test_message_body_renderer_extracts_text_without_showing_raw_json():
+    from app.message_text import display_body, evidence_body
+
     assert admin_reporting._readable_body('{"text":"hello"}', "text") == "hello"
     assert admin_reporting._readable_body('{"zh_cn":{"content":[[{"text":"hello"}]]}}', "post") == "hello"
+    raw = json.dumps({"title": "Heading", "content": [
+        {"text": "Hello"}, {"tag": "at", "user_id": "ou_person"}, {"tag": "lark_md", "content": "Card"},
+    ]})
+    mentions = [{"id_type": "open_id", "id": "ou_person", "key": "@_user_1", "name": "Ada"}]
+    assert display_body(raw, "post", mentions) == "Heading\nHello\n@Ada\nCard"
+    assert evidence_body(raw, "post") == "Hello"  # Do not silently change paid evidence fingerprints.
+    for renderer in (display_body, evidence_body):
+        assert renderer("plain broken {", "text") == "plain broken {"
+        assert renderer('{"image_key":"not text"}', "image") == "（image 消息没有可展示的文本）"
 
 
 def test_sync_summary_shows_initial_progress_instead_of_a_generic_running_job():
@@ -329,6 +340,13 @@ def test_personnel_counts_preserve_deleted_hidden_and_paginated_scope(pg, monkey
     assert detail["conversations"]["total_count"] == 10
     assert all(chat["message_count"] == 1 for chat in detail["conversations"]["items"])
     assert admin_reporting.users(query="missing")["items"] == []
+    other = uuid4()
+    pg.execute("INSERT INTO authorizations(id,open_id,display_name,access_token_ciphertext) "
+               "VALUES(%s,'reporting_other','Other','fixture')", (other,))
+    selected = admin_reporting.message_users(source_ids=[actor, actor, uuid4()])
+    assert [item["id"] for item in selected["items"]] == [actor]
+    assert admin_reporting.message_users(source_ids=[])["items"] == []
+    assert {item["id"] for item in admin_reporting.message_users(source_ids=[actor, other])["items"]} == {actor, other}
 
 
 def test_contact_detail_skips_ungranted_conversation_queries(monkeypatch):

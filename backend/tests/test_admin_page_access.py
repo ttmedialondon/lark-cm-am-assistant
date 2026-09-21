@@ -1,5 +1,6 @@
 """Every backend entry is independently checked before querying its data."""
 
+import asyncio
 import re
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -91,8 +92,14 @@ def _client(monkeypatch, *, permissions=(), owner=False, status="active", contex
             contexts.append((name, context))
         return PlainTextResponse("rendered", status_code=status_code)
 
+    def authorization(_request):
+        # Session/ACL database work must not block the ASGI event loop.
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        return actor
+
     app.include_router(admin.create_admin_router(
-        current_authorization=lambda _: actor,
+        current_authorization=authorization,
         render_template=render,
         csrf_token=lambda _: "csrf",
     ))

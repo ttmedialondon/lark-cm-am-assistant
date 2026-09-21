@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from psycopg.types.json import Jsonb
 
-from . import ai_dispatch, contact_assessments
+from . import ai_dispatch, creator_access, openai_client
 from . import creator_ownership as ownership
 from .ai_feature_config import api_key_cipher
 from .config import get_settings
@@ -56,52 +56,20 @@ def _audit(conn, actor, action, metadata):
     )
 
 
-def _owner(conn, actor):
-    try:
-        ownership._owner(conn, actor)
-        return True
-    except PermissionError:
-        return False
-
-
-def _can_view_all(conn, actor):
-    return _owner(conn, actor) or bool(conn.execute(
-        "SELECT 1 FROM admin_page_permissions WHERE authorization_id=%s "
-        "AND permission IN ('creator-roster','creator-manage')",
-        (actor,),
-    ).fetchone())
-
-
-def _access(conn, actor, cm_id=None, *, manage=False, read_only=False):
-    actor = ownership._uuid(actor)
-    if not conn.execute("SELECT 1 FROM authorizations WHERE id=%s AND status='active'", (actor,)).fetchone():
-        raise PermissionError("请重新登录。")
-    can_manage = _owner(conn, actor) or bool(conn.execute(
-        "SELECT 1 FROM admin_page_permissions WHERE authorization_id=%s AND permission='creator-manage'",
-        (actor,),
-    ).fetchone())
-    cm_id = ownership._uuid(cm_id) if cm_id else actor
-    if (manage or actor != cm_id) and not can_manage and not (read_only and not manage and _can_view_all(conn, actor)):
-        raise PermissionError("只能处理您自己的达人候选。")
-    if not ownership._cm(conn, cm_id):
-        raise PermissionError("该负责人的聊天授权不可用，请先完成授权。")
-    return cm_id, can_manage
-
-
 def _run(conn, actor, run_id, *, manage=False):
     row = conn.execute(
-        "SELECT * FROM creator_handle_runs WHERE id=%s FOR UPDATE", (ownership._uuid(run_id),)
+        "SELECT * FROM creator_handle_runs WHERE id=%s FOR UPDATE", (creator_access.parse_id(run_id),)
     ).fetchone()
     if not row:
         raise LookupError("找不到该批次。")
-    _access(conn, actor, row["cm_authorization_id"], manage=manage)
+    creator_access.access(conn, actor, row["cm_authorization_id"], manage=manage)
     if row["policy_version"] != POLICY_VERSION:
         raise ValueError("该批次的账号匹配规则已更新，请重新核对。")
     return row
 
 
 def _task(conn, actor, task_id):
-    task_id = ownership._uuid(task_id)
+    task_id = creator_access.parse_id(task_id)
     row = conn.execute("SELECT run_id FROM creator_handle_tasks WHERE id=%s", (task_id,)).fetchone()
     if not row:
         raise LookupError("找不到该候选。")
@@ -135,7 +103,7 @@ def _parent(conn, task, settings, *, full=True):
     if (
         newer
         or not ownership._creator(conn, task["contact_id"])
-        or not ownership._cm(conn, task["cm_authorization_id"])
+        or not creator_access.authorized_cm(conn, task["cm_authorization_id"])
     ):
         raise ValueError(REASONS["parent_changed"])
     if not ownership._valid_material(conn, parent, settings, check_history=full):
@@ -210,15 +178,15 @@ def _seed(conn, source):
 
 
 def create_preview(actor_id, cm_id, ownership_run_id=None):
-    actor_id = ownership._uuid(actor_id)
+    actor_id = creator_access.parse_id(actor_id)
     with connection() as conn, conn.transaction():
-        cm_id, _ = _access(conn, actor_id, cm_id, manage=True)
+        cm_id, _ = creator_access.access(conn, actor_id, cm_id, manage=True)
         source = conn.execute(
             """SELECT * FROM creator_ownership_runs WHERE cm_authorization_id=%s
             AND policy_version=%s AND status='completed' """
             + ("AND id=%s " if ownership_run_id else "")
             + "ORDER BY created_at DESC,id DESC LIMIT 1",
-            (cm_id, ownership.POLICY_VERSION, ownership._uuid(ownership_run_id))
+            (cm_id, ownership.POLICY_VERSION, creator_access.parse_id(ownership_run_id))
             if ownership_run_id
             else (cm_id, ownership.POLICY_VERSION),
         ).fetchone()
@@ -371,7 +339,7 @@ def _admit(conn, task, handles, actor, settings, *, automatic=False):
 
 
 def confirm_task(actor_id, task_id, handles):
-    actor_id = ownership._uuid(actor_id)
+    actor_id = creator_access.parse_id(actor_id)
     with connection() as conn, conn.transaction():
         task, _ = _task(conn, actor_id, task_id)
         return _admit(conn, task, handles, actor_id, get_settings())
@@ -380,9 +348,9 @@ def confirm_task(actor_id, task_id, handles):
 def set_creator_type(actor_id, cm_id, contact_id, creator_type):
     if creator_type not in ("cap", "non_cap", "pending"):
         raise ValueError("请选择 CAP、非CAP 或待定。")
-    actor_id, contact_id = ownership._uuid(actor_id), ownership._uuid(contact_id)
+    actor_id, contact_id = creator_access.parse_id(actor_id), creator_access.parse_id(contact_id)
     with connection() as conn, conn.transaction():
-        cm_id, _ = _access(conn, actor_id, cm_id)
+        cm_id, _ = creator_access.access(conn, actor_id, cm_id)
         person = conn.execute("SELECT creator_type FROM contacts WHERE id=%s FOR UPDATE", (contact_id,)).fetchone()
         if not person or not conn.execute(
             """SELECT 1 FROM contact_assignments WHERE contact_id=%s
@@ -403,7 +371,7 @@ def set_creator_type(actor_id, cm_id, contact_id, creator_type):
 
 
 def defer_task(actor_id, task_id):
-    actor_id = ownership._uuid(actor_id)
+    actor_id = creator_access.parse_id(actor_id)
     with connection() as conn, conn.transaction():
         task, _ = _task(conn, actor_id, task_id)
         if task["review_status"] == "confirmed":
@@ -418,11 +386,11 @@ def recheck_task(actor_id, task_id):
     """Explicit free refresh of changed material, retaining the paid attempt history."""
     from .creator_handle_evidence import build_evidence
 
-    actor_id = ownership._uuid(actor_id)
+    actor_id = creator_access.parse_id(actor_id)
     settings = get_settings()
     with connection() as conn, conn.transaction():
         task, run = _task(conn, actor_id, task_id)
-        _access(conn, actor_id, task["cm_authorization_id"], manage=True)
+        creator_access.access(conn, actor_id, task["cm_authorization_id"], manage=True)
         if run["status"] not in ("preview", "completed") or run["auto_admit"]:
             raise ValueError("请先完成当前批次并关闭自动入库，再更新材料。")
         if (
@@ -477,7 +445,7 @@ def _auto_next(conn, settings):
     ).fetchone()
     try:
         with conn.transaction():
-            ownership._owner(conn, row["requested_by"])
+            creator_access.require_owner(conn, row["requested_by"])
             result = _decode(task, "result_ciphertext", settings)
             _admit(
                 conn, task, [c["handle"] for c in result["candidates"]], row["requested_by"], settings, automatic=True
@@ -507,7 +475,7 @@ def prepare_next_preview(settings):
             (ownership.POLICY_VERSION,),
         ).fetchall()
         for source in sources:
-            if ownership._cm(conn, source["cm_authorization_id"]):
+            if creator_access.authorized_cm(conn, source["cm_authorization_id"]):
                 _seed(conn, source)
         conn.execute("""UPDATE creator_handle_tasks SET status='pending',lease_until=NULL
             WHERE status='preparing' AND lease_until<NOW()""")
@@ -525,7 +493,7 @@ def prepare_next_preview(settings):
         )
     try:
         with connection() as conn:
-            ownership._owner(conn, job["requested_by"])
+            creator_access.require_owner(conn, job["requested_by"])
             _parent(conn, job, settings)
         material = build_evidence(job["contact_id"], job["cm_authorization_id"], settings)
         with connection() as conn, conn.transaction():
@@ -580,7 +548,7 @@ def prepare_next_preview(settings):
 
 
 def start_run(actor_id, run_id):
-    actor_id = ownership._uuid(actor_id)
+    actor_id = creator_access.parse_id(actor_id)
     with connection() as conn, conn.transaction():
         run = _run(conn, actor_id, run_id, manage=True)
         if run["status"] == "running":
@@ -626,7 +594,7 @@ def pause_run(actor_id, run_id):
         run = _run(conn, actor_id, run_id, manage=True)
         if run["status"] == "running":
             conn.execute("UPDATE creator_handle_runs SET status='paused',updated_at=NOW() WHERE id=%s", (run["id"],))
-            _audit(conn, ownership._uuid(actor_id), "paused", {"run_id": str(run["id"])})
+            _audit(conn, creator_access.parse_id(actor_id), "paused", {"run_id": str(run["id"])})
 
 
 def resume_run(actor_id, run_id):
@@ -635,7 +603,7 @@ def resume_run(actor_id, run_id):
         if run["status"] == "paused":
             conn.execute("UPDATE creator_handle_runs SET status='running',updated_at=NOW() WHERE id=%s", (run["id"],))
             _settle(conn, run["id"])
-            _audit(conn, ownership._uuid(actor_id), "resumed", {"run_id": str(run["id"])})
+            _audit(conn, creator_access.parse_id(actor_id), "resumed", {"run_id": str(run["id"])})
 
 
 def set_auto_admit(actor_id, run_id, enabled):
@@ -644,7 +612,8 @@ def set_auto_admit(actor_id, run_id, enabled):
     with connection() as conn, conn.transaction():
         run = _run(conn, actor_id, run_id, manage=True)
         conn.execute("UPDATE creator_handle_runs SET auto_admit=%s,updated_at=NOW() WHERE id=%s", (enabled, run["id"]))
-        _audit(conn, ownership._uuid(actor_id), "auto_admit_changed", {"run_id": str(run["id"]), "enabled": enabled})
+        _audit(conn, creator_access.parse_id(actor_id), "auto_admit_changed",
+               {"run_id": str(run["id"]), "enabled": enabled})
 
 
 def claim_next_handle():
@@ -696,7 +665,7 @@ def _finish(job, status, reason, settings, response=None, result=None):
             return
         if result:
             try:
-                ownership._owner(conn, current["requested_by"])
+                creator_access.require_owner(conn, current["requested_by"])
                 _parent(conn, current, settings)
                 config = ownership._config(conn)
                 if (
@@ -750,7 +719,7 @@ def run_claimed_handle(job, settings):
             task = _current_paid(conn, job)
             if not task:
                 return
-            ownership._owner(conn, task["requested_by"])
+            creator_access.require_owner(conn, task["requested_by"])
             if task["run_status"] == "paused":
                 conn.execute(
                     "UPDATE creator_handle_tasks SET status='queued',attempts=attempts-1,lease_until=NULL WHERE id=%s",
@@ -766,7 +735,7 @@ def run_claimed_handle(job, settings):
             pack = _decode(task, "pack_ciphertext", settings)
             key = api_key_cipher(settings.token_encryption_key).decrypt(config["api_key_ciphertext"])
             conn.execute("UPDATE creator_handle_tasks SET api_requests=api_requests+1 WHERE id=%s", (task["id"],))
-        response = contact_assessments.call_openai(
+        response = openai_client.call_openai(
             config,
             key,
             pack,
@@ -777,7 +746,7 @@ def run_claimed_handle(job, settings):
         )
         result = validate_result(response["text"], pack)
         _finish(job, "succeeded", "classified", settings, response, result)
-    except contact_assessments.OpenAIRequestError as exc:
+    except openai_client.OpenAIRequestError as exc:
         if exc.is_quota:
             ai_dispatch.pause_for_quota()
         if exc.retryable and job["attempts"] < 2:
@@ -806,9 +775,9 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
     query = str(query or "").strip()[:120]
     page = max(1, min(int(page), 10000))
     with connection() as conn:
-        cm_id, can_manage = _access(conn, actor_id, cm_id, read_only=tab != "candidates")
-        can_select_cm = _can_view_all(conn, actor_id)
-        read_only = not can_manage and ownership._uuid(actor_id) != cm_id
+        cm_id, can_manage = creator_access.access(conn, actor_id, cm_id, read_only=tab != "candidates")
+        can_select_cm = creator_access.can_view_all(conn, actor_id)
+        read_only = not can_manage and creator_access.parse_id(actor_id) != cm_id
         cms = [
             {"id": str(r["id"]), "name": r["display_name"] or "未命名用户"}
             for r in conn.execute(
@@ -917,7 +886,7 @@ def task_evidence(actor_id, task_id):
         pack = _decode(task, "pack_ciphertext", settings)
         result = _decode(task, "result_ciphertext", settings)
         person = conn.execute("SELECT display_name FROM contacts WHERE id=%s", (task["contact_id"],)).fetchone()
-        cm = ownership._cm(conn, task["cm_authorization_id"])
+        cm = creator_access.authorized_cm(conn, task["cm_authorization_id"])
         if not person or not cm:
             raise ValueError("人员或负责人授权已变化，请重新核对。")
         messages = []
@@ -947,7 +916,7 @@ def task_evidence(actor_id, task_id):
                     "available": True,
                 }
             )
-        _audit(conn, ownership._uuid(actor_id), "evidence_viewed", {"task_id": str(task["id"])})
+        _audit(conn, creator_access.parse_id(actor_id), "evidence_viewed", {"task_id": str(task["id"])})
         return {
             "display_name": person["display_name"],
             "cm_name": cm["display_name"],

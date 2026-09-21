@@ -11,12 +11,13 @@ from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
 
-from . import admin_reporting, ai_dispatch, contact_assessments
+from . import admin_reporting, ai_dispatch, creator_access, openai_client
 from .ai_feature_config import api_key_cipher
 from .config import get_settings
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
 from .lark_api import private_chat_url
+from .message_text import display_body
 
 POLICY_VERSION = "creator-ownership-v2"
 DEFAULT_CM_ID = UUID("24d1ef13-3762-4359-ba11-d26c03cf1f7f")
@@ -68,13 +69,6 @@ RUN_LABELS = {
 }
 
 
-def _uuid(value):
-    try:
-        return UUID(str(value))
-    except (ValueError, TypeError, AttributeError) as exc:
-        raise ValueError("请求标识无效。") from exc
-
-
 def _cipher(settings):
     return TokenCipher(
         hmac.digest(settings.token_encryption_key, b"creator-ownership/v1", "sha256"), b"creator-ownership/data/v1"
@@ -83,23 +77,6 @@ def _cipher(settings):
 
 def _encode(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
-
-
-def _owner(conn, actor_id):
-    if not conn.execute(
-        """SELECT 1 FROM authorizations a JOIN admin_roles r ON r.authorization_id=a.id
-           WHERE a.id=%s AND a.status='active' AND r.role='owner' AND r.is_active""",
-        (actor_id,),
-    ).fetchone():
-        raise PermissionError("只有当前有效的系统主人可以操作。")
-
-
-def _cm(conn, cm_id):
-    return conn.execute(
-        """SELECT id,open_id,display_name FROM authorizations
-           WHERE id=%s AND status='active' AND body_consent_at IS NOT NULL""",
-        (cm_id,),
-    ).fetchone()
 
 
 def _owned(conn, contact_id, cm_id):
@@ -144,12 +121,12 @@ def _audit(conn, actor, action, metadata):
 
 
 def create_preview(actor_id, cm_id):
-    actor_id, cm_id = _uuid(actor_id), _uuid(cm_id)
+    actor_id, cm_id = creator_access.parse_id(actor_id), creator_access.parse_id(cm_id)
     with connection() as conn, conn.transaction():
-        _owner(conn, actor_id)
+        creator_access.require_owner(conn, actor_id)
         # Serialize only this CM's batch buttons, not message synchronization.
         conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,137031))", (str(cm_id),))
-        if not _cm(conn, cm_id):
+        if not creator_access.authorized_cm(conn, cm_id):
             raise ValueError("该负责人没有有效的正文授权。")
         existing = conn.execute(
             """SELECT id FROM creator_ownership_runs WHERE cm_authorization_id=%s
@@ -222,7 +199,7 @@ def _valid_material(conn, task, settings, *, check_history=True):
 
 
 def _eligible_now(conn, task):
-    if not _cm(conn, task["cm_authorization_id"]):
+    if not creator_access.authorized_cm(conn, task["cm_authorization_id"]):
         return "authorization_changed"
     if not _creator(conn, task["contact_id"]):
         return "identity_changed"
@@ -267,7 +244,7 @@ def prepare_next_preview(settings):
         )
     try:
         with connection() as conn:
-            _owner(conn, job["requested_by"])
+            creator_access.require_owner(conn, job["requested_by"])
             reason = _eligible_now(conn, job)
         material = build_evidence(job["contact_id"], job["cm_authorization_id"], settings) if not reason else None
         with connection() as conn, conn.transaction():
@@ -276,7 +253,7 @@ def prepare_next_preview(settings):
             ).fetchone()
             if not current:
                 return True
-            _owner(conn, job["requested_by"])
+            creator_access.require_owner(conn, job["requested_by"])
             reason = _eligible_now(conn, current) or reason
             config = _config(conn)
             config_fp = _config_fingerprint(config) if config else None
@@ -352,17 +329,17 @@ def prepare_next_preview(settings):
 
 
 def _run_for_owner(conn, actor_id, run_id):
-    _owner(conn, actor_id)
+    creator_access.require_owner(conn, actor_id)
     run = conn.execute("SELECT * FROM creator_ownership_runs WHERE id=%s FOR UPDATE", (run_id,)).fetchone()
     if not run:
         raise LookupError("找不到该批次。")
-    if run["policy_version"] != POLICY_VERSION or not _cm(conn, run["cm_authorization_id"]):
+    if run["policy_version"] != POLICY_VERSION or not creator_access.authorized_cm(conn, run["cm_authorization_id"]):
         raise ValueError("该批次的规则或负责人授权已失效。")
     return run
 
 
 def start_run(actor_id, run_id, limit=20):
-    actor_id, run_id = _uuid(actor_id), _uuid(run_id)
+    actor_id, run_id = creator_access.parse_id(actor_id), creator_access.parse_id(run_id)
     if limit not in (20, None):
         raise ValueError("请选择先分析 20 人或分析剩余。")
     settings = get_settings()
@@ -437,7 +414,7 @@ def start_run(actor_id, run_id, limit=20):
 
 
 def pause_run(actor_id, run_id):
-    actor_id, run_id = _uuid(actor_id), _uuid(run_id)
+    actor_id, run_id = creator_access.parse_id(actor_id), creator_access.parse_id(run_id)
     with connection() as conn, conn.transaction():
         run = _run_for_owner(conn, actor_id, run_id)
         if run["status"] == "running":
@@ -446,7 +423,7 @@ def pause_run(actor_id, run_id):
 
 
 def resume_run(actor_id, run_id):
-    actor_id, run_id = _uuid(actor_id), _uuid(run_id)
+    actor_id, run_id = creator_access.parse_id(actor_id), creator_access.parse_id(run_id)
     with connection() as conn, conn.transaction():
         run = _run_for_owner(conn, actor_id, run_id)
         if run["status"] == "paused":
@@ -692,7 +669,7 @@ def _finish_job(job, status, reason, *, response=None, result=None, settings=Non
         if not current:
             return
         if result:
-            _owner(conn, current["requested_by"])
+            creator_access.require_owner(conn, current["requested_by"])
             conn.execute("SELECT id FROM contacts WHERE id=%s FOR UPDATE", (job["contact_id"],))
             invalid = _eligible_now(conn, current)
             if current["run_status"] not in ("running", "paused"):
@@ -734,7 +711,7 @@ def run_claimed_ownership(job, settings):
             current = _current_paid(conn, job)
             if not current:
                 return
-            _owner(conn, current["requested_by"])
+            creator_access.require_owner(conn, current["requested_by"])
             # Pause means no NEW requests. An already-sent request may finish, with all saving guards intact.
             if current["run_status"] == "paused":
                 conn.execute(
@@ -758,7 +735,7 @@ def run_claimed_ownership(job, settings):
         if reason:
             _finish_job(job, "invalid", reason)
             return
-        response = contact_assessments.call_openai(
+        response = openai_client.call_openai(
             config,
             key,
             pack,
@@ -769,7 +746,7 @@ def run_claimed_ownership(job, settings):
         )
         result = _validate_result(response["text"], pack)
         _finish_job(job, "succeeded", "classified", response=response, result=result, settings=settings)
-    except contact_assessments.OpenAIRequestError as exc:
+    except openai_client.OpenAIRequestError as exc:
         if exc.is_quota:
             ai_dispatch.pause_for_quota()
         if exc.retryable and job["attempts"] < 2:
@@ -788,7 +765,7 @@ def run_claimed_ownership(job, settings):
             _finish_job(job, "failed", "provider_error", response={"telemetry": exc.telemetry})
     except PermissionError:
         _finish_job(job, "invalid", "authorization_changed", response=response)
-    except contact_assessments.ContactAssessmentInputError:
+    except openai_client.AIInputError:
         _finish_job(job, "failed", "provider_error", response=response)
     except (ValueError, TypeError, KeyError):
         _finish_job(job, "invalid", "invalid_result", response=response)
@@ -799,7 +776,7 @@ def run_claimed_ownership(job, settings):
 
 def _review_tasks(conn, actor_id, run_id, task_ids):
     run = _run_for_owner(conn, actor_id, run_id)
-    ids = [_uuid(v) for v in task_ids]
+    ids = [creator_access.parse_id(v) for v in task_ids]
     if not ids or len(ids) > 100 or len(set(ids)) != len(ids):
         raise ValueError("请选择 1–100 条不重复的结果。")
     tasks = conn.execute(
@@ -817,7 +794,7 @@ def confirm_tasks(actor_id, run_id, task_ids):
 
 
 def defer_tasks(actor_id, run_id, task_ids):
-    actor_id, run_id = _uuid(actor_id), _uuid(run_id)
+    actor_id, run_id = creator_access.parse_id(actor_id), creator_access.parse_id(run_id)
     with connection() as conn, conn.transaction():
         tasks = _review_tasks(conn, actor_id, run_id, task_ids)
         if any(
@@ -848,11 +825,11 @@ def page_data(cm_id=None, run_id=None, query="", status="all", page=1, include_p
             ).fetchall()
         ]
         selected = (
-            _uuid(cm_id)
+            creator_access.parse_id(cm_id)
             if cm_id
             else DEFAULT_CM_ID
             if any(c["id"] == str(DEFAULT_CM_ID) for c in cms)
-            else (_uuid(cms[0]["id"]) if cms else None)
+            else (creator_access.parse_id(cms[0]["id"]) if cms else None)
         )
         if selected and not any(c["id"] == str(selected) for c in cms):
             raise ValueError("该负责人没有有效的正文授权。")
@@ -860,7 +837,8 @@ def page_data(cm_id=None, run_id=None, query="", status="all", page=1, include_p
         run = None
         if run_id:
             run = conn.execute(
-                "SELECT * FROM creator_ownership_runs WHERE id=%s AND cm_authorization_id=%s", (_uuid(run_id), selected)
+                "SELECT * FROM creator_ownership_runs WHERE id=%s AND cm_authorization_id=%s",
+                (creator_access.parse_id(run_id), selected),
             ).fetchone()
             if not run:
                 raise LookupError("找不到该负责人的批次。")
@@ -1022,10 +1000,10 @@ def page_data(cm_id=None, run_id=None, query="", status="all", page=1, include_p
 
 
 def task_evidence(actor_id, task_id):
-    actor_id, task_id = _uuid(actor_id), _uuid(task_id)
+    actor_id, task_id = creator_access.parse_id(actor_id), creator_access.parse_id(task_id)
     settings = get_settings()
     with connection() as conn, conn.transaction():
-        _owner(conn, actor_id)
+        creator_access.require_owner(conn, actor_id)
         task = conn.execute(
             """SELECT t.*,c.display_name FROM creator_ownership_tasks t
                JOIN contacts c ON c.id=t.contact_id WHERE t.id=%s""",
@@ -1035,7 +1013,7 @@ def task_evidence(actor_id, task_id):
             raise LookupError("找不到该判断结果。")
         if not _valid_material(conn, task, settings):
             raise ValueError("相关材料已变化或不再可读，请重新预筛选。")
-        cm = _cm(conn, task["cm_authorization_id"])
+        cm = creator_access.authorized_cm(conn, task["cm_authorization_id"])
         if not cm:
             raise ValueError("相关材料已变化或不再可读，请重新预筛选。")
         refs = _refs(conn, task)
@@ -1062,7 +1040,7 @@ def task_evidence(actor_id, task_id):
                     "sender_name": row["sender_name"] or "未命名用户",
                     "time_label": admin_reporting._message_time(row["message_create_time"]),
                     "chat_name": row["chat_name"] or "会话",
-                    "text": admin_reporting._readable_body(raw, row["message_type"], row["mentions_json"], names),
+                    "text": display_body(raw, row["message_type"], row["mentions_json"], names),
                     "available": True,
                 }
             )

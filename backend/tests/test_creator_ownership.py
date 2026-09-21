@@ -14,7 +14,7 @@ import pytest
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from app import admin_reporting, contact_assessments
+from app import admin_reporting, openai_client
 from app import creator_ownership as ownership
 from app import creator_ownership_evidence as evidence
 from app.ai_feature_config import api_key_cipher
@@ -122,7 +122,7 @@ def pilot(pg, monkeypatch):
             "usage": {"input_tokens": 123, "output_tokens": 45},
         })
 
-    monkeypatch.setattr(contact_assessments.httpx, "post", post)
+    monkeypatch.setattr(openai_client.httpx, "post", post)
     return SimpleNamespace(pg=pg, ids=ids, settings=settings, person=person, calls=calls, after_request=after_request)
 
 

@@ -16,7 +16,7 @@ from psycopg.rows import dict_row
 from test_creator_ownership import _snapshot
 from test_creator_ownership import pilot as parent_pilot
 
-from app import admin_reporting, contact_assessments, creator_handles, creator_ownership
+from app import admin_reporting, contact_assessments, creator_handles, creator_ownership, openai_client
 from app import creator_imports as imports
 from app.crypto import message_body_cipher
 
@@ -89,7 +89,7 @@ def prepare(pg, pilot, monkeypatch):
                 "usage": {"input_tokens": 12, "output_tokens": 8},
                 "telemetry": {"openai_request_id": f"synthetic-request-{len(calls)}"}}
 
-    monkeypatch.setattr(contact_assessments, "call_openai", respond)
+    monkeypatch.setattr(openai_client, "call_openai", respond)
     return calls, callbacks
 
 

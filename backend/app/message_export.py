@@ -18,7 +18,8 @@ from . import admin_reporting as reporting
 from .config import get_settings
 from .crypto import message_body_cipher
 from .db import connection
-from .message_mentions import mention_names
+from .message_mentions import mention_names, resolve_mentions
+from .message_text import body_text_values
 
 
 def safe_name(value):
@@ -132,8 +133,8 @@ def _write_export(conn, archive, output, source_id, viewer_id, cipher, check_acc
                         except json.JSONDecodeError:
                             text = raw
                         else:
-                            text = "\n".join(reporting._body_text_values(parsed, row.get("mentions_json"), names))
-                        text = reporting.resolve_mentions(text, row.get("mentions_json"), names)
+                            text = "\n".join(body_text_values(parsed, row.get("mentions_json"), names))
+                        text = resolve_mentions(text, row.get("mentions_json"), names)
                         if not text.strip():
                             continue
                         timestamp = row["message_create_time"]
