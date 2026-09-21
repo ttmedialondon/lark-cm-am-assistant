@@ -66,6 +66,32 @@
 
 ## 测试环境
 
+## 第三阶段：请求内复核与真实热点定位
+
+- ed3e2e4 已提交并推送 GitHub；生产运行目录仍为 f0dee27，没有切换服务。
+- 摘要的权限复核结果及失败取材在单次持锁读取中复用。新的请求仍重新检查；队列执行、付费前和入库前未使用这些请求缓存。扩展既有数据库测试验证成功复用、失效复用、会话撤权/恢复、Owner 撤权/恢复和消息删除。
+- 空 AI 队列按 worker_idle_seconds 降频检查，不再跟随活跃 Lark 的 50ms 循环持续查库。运行任务完成会立即唤醒队列领取，避免延误后续任务；公平轮转测试仍覆盖所有 5 类有效队列。
+- 当前完整测试：449 passed，28.23 秒，无跳过；backend/app Ruff 与 git diff --check 通过。
+
+### 对照测量与修正判断
+
+从 GitHub 拉取提交后，在生产主机建立独立的只读诊断代码工作树 /var/tmp/lark-optimization-profile-ed3e2e4，不启动其中的 Web/Worker，不修改生产运行目录。通过正常服务环境运行 profile_backend_reads.py，模块路径明确为此工作树。
+
+新代码对该特定摘要仍执行 481 条 SQL，读取中位数分别为 2240.836 ms、2090.6 ms。数据库负载和现场数据未冻结，这不是严格时延 A/B；但 SQL 数量未降低，明确证明本轮缓存没有解决该样本主要热点。不能把新增缓存描述为此报告已提速。
+
+新增按调用位置统计显示：
+
+- creator_import_evidence.validate_references 中 CM、群、消息读取各 62 次。
+- creator_handle_evidence._members 两条查询各 62 次。
+- 身份资料查询 61 次。
+- creator_imports._conflict 的联系人类型、身份冲突查询各 31 次。
+
+因此下一优先项是 _related_chats 对 31 条已确认导入关系逐条执行群/人员两阶段证据验证形成的 N+1。应批量取得同一 CM、同一读取范围内的群、消息引用、身份、成员事实，再逐个材料比较，保持材料各自的群范围与身份可见性，不能将不同群成员集合混用。已有权限缓存保留，但不替代这个热点的修复。
+
+连接池曾查阅官方接口：https://www.psycopg.org/psycopg3/docs/api/pool.html 。尚未引入：需要验证现有“没有显式 transaction 则退出回滚”的连接语义，以及嵌套独立连接在有界池中的饥饿风险，不能直接改用默认会成功提交的 pool.connection()。
+
+## 本地验证环境
+
 隔离本地 PostgreSQL：/tmp/lark-full-opt-pg.kUTdNj/data，监听 127.0.0.1:55439。该目录由本次任务新建，不是生产库。
 
 完整测试需同时设置 TEST_DATABASE_URL、IDENTITY_NAMES_TEST_DATABASE_URL、OFFHOURS_SUMMARY_TEST_DATABASE_URL 为 postgresql://postgres@127.0.0.1:55439/postgres；测试各自使用隔离 schema 并回滚。

@@ -8,7 +8,10 @@ Business data is not modified. Normal summary-view audits are preserved.
 import hashlib
 import json
 import statistics
+import sys
 import time
+from collections import Counter
+from pathlib import Path
 
 from fastapi.encoders import jsonable_encoder
 
@@ -18,6 +21,7 @@ from app import db, offhours_summary
 class ReadMeter:
     def __init__(self, conn):
         self.conn, self.queries = conn, 0
+        self.locations = Counter()
 
     def execute(self, query, params=None):
         # The service may take SHARE locks while verifying evidence. Permit those
@@ -27,10 +31,13 @@ class ReadMeter:
         if not audit and str(query).split(None, 1)[0].upper() not in {"SELECT", "WITH"}:
             raise RuntimeError("diagnostic refused a non-read statement")
         self.queries += 1
+        caller = sys._getframe(1)
+        self.locations[f"{Path(caller.f_code.co_filename).name}:{caller.f_lineno}"] += 1
         return self.conn.execute(query, params)
 
 
 def main():
+    print(json.dumps({"source": offhours_summary.__file__}), flush=True)
     connect = []
     for _ in range(20):
         started = time.perf_counter()
@@ -67,7 +74,8 @@ def main():
             encode_ms = (time.perf_counter() - started) * 1000
             if index:
                 samples.append({"read_ms": round(read_ms, 3), "queries": meter.queries,
-                                "serialize_etag_ms": round(encode_ms, 3), "response_bytes": len(body)})
+                                "serialize_etag_ms": round(encode_ms, 3), "response_bytes": len(body),
+                                "top_query_locations": meter.locations.most_common(8)})
             conn.commit()  # Preserve the standard view audit; release all SHARE locks per sample.
     print(json.dumps({"summary_samples": samples, "read_median_ms": statistics.median(
         sample["read_ms"] for sample in samples)}), flush=True)
