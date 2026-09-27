@@ -15,7 +15,6 @@ from uuid import UUID, uuid4
 
 import anyio
 from fastapi import APIRouter, Depends, Request
-from fastapi.encoders import jsonable_encoder
 from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -24,8 +23,6 @@ from . import (
     admin_reporting,
     ai_dispatch,
     ai_feature_config,
-    contact_assessments,
-    creator_ownership,
     message_export,
     offhours_summary,
     organization_sync,
@@ -34,18 +31,11 @@ from .config import get_settings
 from .contact_taxonomy import ROLE_LABELS, ROLE_ORDER
 from .db import connection
 from .http_helpers import (
-    conditional_response,
-    form_body,
-    form_fields,
-)
-from .http_helpers import (
     csrf_matches as _csrf_matches,
 )
 from .http_helpers import (
-    error_response as ownership_error,
-)
-from .http_helpers import (
-    json_response as ownership_json,
+    form_body,
+    form_fields,
 )
 
 
@@ -62,10 +52,10 @@ class TemplateRenderer(Protocol):
 CurrentAuthorization = Callable[[Request], dict[str, Any] | None]
 CsrfToken = Callable[[dict[str, Any]], str]
 AI_FEATURES = {
-    "contact_assessment": {
-        "title": "全员身份识别",
-        "description": "按在库人员本人的重要历史发言识别六类身份；置信度不足留待识别，不判断 CM 归属或 handle。",
-        "enabled_label": "开启全员身份识别",
+    "creator_import": {
+        "title": "CAP 名单匹配",
+        "description": "仅处理手动启动的 CAP 导入批次，不扫描全员或推断负责人。",
+        "enabled_label": "按导入批次手动启动",
     },
     "offhours_summary": {
         "title": "达人消息总结",
@@ -267,56 +257,6 @@ def create_admin_router(
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 
-    def render_contact_assessment(
-        request: Request,
-        access_context: dict[str, Any],
-        *,
-        open_id: str,
-        assessment_id: UUID,
-        source_page: int = 1,
-        source_category: str = "all",
-        source_organization_status: str = "all",
-        source_organization_query: str = "",
-        error: str | None = None,
-        status_code: int = 200,
-    ) -> Response:
-        """Render one advisory result; only this page can include evidence text."""
-
-        detail = contact_assessments.assessment_detail(assessment_id)
-        if not detail or not contact_assessments.assessment_matches_contact(assessment_id, open_id):
-            response = render_template(
-                request,
-                "error.html",
-                {"title": "未找到 AI 判定", "detail": "该判定不存在，或不属于当前联系人。"},
-                404,
-            )
-        else:
-            if any(item.get("available") for item in detail.get("evidence", ())):
-                contact_assessments.record_assessment_view(access_context["authorization"]["id"], assessment_id)
-            response = render_template(
-                request,
-                "admin/contact_assessment.html",
-                {
-                    **page_context(access_context, "contacts"),
-                    "assessment": detail,
-                    "identity_policy": contact_assessments.POLICY_VERSION,
-                    "route_open_id": open_id,
-                    "source_page": source_page,
-                    "source_category": source_category,
-                    "source_organization_status": source_organization_status,
-                    "source_organization_query": source_organization_query,
-                    "source_query": contact_query(
-                        page=source_page,
-                        category=source_category,
-                        organization_status=source_organization_status,
-                        organization_query=source_organization_query,
-                    ),
-                    "form_error": error,
-                },
-                status_code,
-            )
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-        return response
 
     @router.get("/admin")
     def admin_overview(request: Request) -> Response:
@@ -664,99 +604,6 @@ def create_admin_router(
         assert access_context is not None
         return render_ai_config(request, access_context)
 
-    @router.get("/admin/ai/creator-ownership")
-    @router.get("/admin/ai/creator-ownership/data")
-    def admin_creator_ownership(
-        request: Request, cm_id: UUID | None = None, run_id: UUID | None = None,
-        q: str = "", status: str = "all", page: int = 1,
-    ) -> Response:
-        access_context, denied = access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        try:
-            data = creator_ownership.page_data(
-                cm_id=cm_id, run_id=run_id, query=q[:120], status=status, page=max(1, page),
-                include_private=access_context["admin_role"] == "owner",
-            )
-        except (ValueError, LookupError, PermissionError) as exc:
-            return ownership_error(exc)
-        if request.url.path.endswith("/data"):
-            response = ownership_json(data)
-            # Compare only after current permissions and evidence have been rechecked.
-            return conditional_response(request, response)
-        return render_template(request, "admin/creator_ownership.html", {
-            **page_context(access_context, "ai"), "ownership": jsonable_encoder(data),
-            "ownership_query": q[:120], "ownership_status": status,
-        })
-
-    @router.post("/admin/ai/creator-ownership/preview")
-    def admin_creator_ownership_preview(
-        request: Request, *, form: Annotated[dict[str, str], Depends(form_fields)],
-    ) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
-            return ownership_json({"error": "请求校验失败，请刷新页面后重试。"}, 400)
-        try:
-            cm_id = UUID(form.get("cm_id", ""))
-            run_id = creator_ownership.create_preview(access_context['authorization']['id'], cm_id)
-        except (ValueError, LookupError, PermissionError) as exc:
-            return ownership_error(exc)
-        return ownership_json({"run_id": run_id, "cm_id": cm_id})
-
-    @router.post("/admin/ai/creator-ownership/{run_id}/start")
-    @router.post("/admin/ai/creator-ownership/{run_id}/pause")
-    @router.post("/admin/ai/creator-ownership/{run_id}/resume")
-    @router.post("/admin/ai/creator-ownership/{run_id}/confirm")
-    @router.post("/admin/ai/creator-ownership/{run_id}/defer")
-    def admin_creator_ownership_action(
-        request: Request, run_id: UUID, *, form: Annotated[dict[str, str], Depends(form_fields)],
-    ) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
-            return ownership_json({"error": "请求校验失败，请刷新页面后重试。"}, 400)
-        actor_id = access_context["authorization"]["id"]
-        action = request.url.path.rsplit("/", 1)[-1]
-        try:
-            count = None
-            if action == "confirm":
-                raise ValueError("请到前台候选核对 handle；第二步不能直接确认入库。")
-            if action == "start":
-                if form.get("limit") not in {"20", "all"}:
-                    raise ValueError("请选择先分析 20 人或分析剩余。")
-                creator_ownership.start_run(actor_id, run_id, limit=20 if form['limit'] == '20' else None)
-            elif action in {"pause", "resume"}:
-                (creator_ownership.pause_run if action == 'pause' else creator_ownership.resume_run)(actor_id, run_id)
-            else:
-                values = form.get("task_ids", "").split(",")
-                if not 1 <= len(values) <= 100 or len(values) != len(set(values)):
-                    raise ValueError("请选择 1 至 100 位不重复的达人。")
-                try:
-                    task_ids = [UUID(value) for value in values]
-                except ValueError as exc:
-                    raise ValueError("所选记录无效，请刷新后重试。") from exc
-                count = creator_ownership.defer_tasks(actor_id, run_id, task_ids)
-        except (ValueError, LookupError, PermissionError) as exc:
-            return ownership_error(exc)
-        return ownership_json({"run_id": run_id, "count": count})
-
-    @router.get("/admin/ai/creator-ownership/tasks/{task_id}/evidence")
-    def admin_creator_ownership_evidence(request: Request, task_id: UUID) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        try:
-            data = creator_ownership.task_evidence(access_context["authorization"]["id"], task_id)
-        except (ValueError, LookupError, PermissionError) as exc:
-            return ownership_error(exc)
-        return ownership_json(data)
 
     @router.get("/admin/contacts")
     def admin_contacts(
@@ -822,7 +669,6 @@ def create_admin_router(
         organization_query = admin_reporting.normalize_organization_query(organization_query)
         q = admin_reporting.normalize_organization_query(q)
         can_view_conversations = bool({"chats", "messages"} & access_context["admin_permissions"])
-        is_owner = access_context["admin_role"] == "owner"
         detail = admin_reporting.contact_detail(open_id, conversations_page,
                                                 include_conversations=can_view_conversations)
         if not detail:
@@ -833,9 +679,6 @@ def create_admin_router(
                 404,
             )
         conversations = detail["conversations"]
-        latest_assessment = (
-            contact_assessments.latest_contact_assessment(detail["contact"]["contact_id"]) if is_owner else None
-        )
         response = render_template(
             request,
             "admin/contact_detail.html",
@@ -856,9 +699,6 @@ def create_admin_router(
                     organization_query=organization_query,
                     q=q,
                 ),
-                "assessment": latest_assessment,
-                "identity_policy": contact_assessments.POLICY_VERSION,
-                "assessment_available": contact_assessments.assessment_available() if is_owner else False,
                 "can_view_conversations": can_view_conversations,
                 "conversations": conversations["items"],
                 "conversation_page": pagination(
@@ -876,38 +716,6 @@ def create_admin_router(
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 
-    @router.post("/admin/contacts/{open_id}/assessments")
-    def admin_continue_contact_assessment(
-        request: Request, open_id: str, *, form: Annotated[dict[str, str], Depends(form_fields)],
-    ) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
-            response = render_template(request, "error.html", {
-                "title": "请求校验失败", "detail": "请返回人员详情页后重试。",
-            }, 400)
-        else:
-            with connection() as conn:
-                contact = conn.execute(
-                    "SELECT contact_id FROM lark_identities WHERE open_id=%s AND identity_type='user'",
-                    (open_id,),
-                ).fetchone()
-            if not contact:
-                response = render_template(request, "error.html", {
-                    "title": "未找到人员", "detail": "此 Lark 用户尚未关联在库人员。",
-                }, 404)
-            else:
-                try:
-                    contact_assessments.requeue_contact_assessment(contact["contact_id"])
-                    response = RedirectResponse(url=f"/admin/contacts/{open_id}", status_code=303)
-                except contact_assessments.ContactAssessmentInputError as exc:
-                    response = render_template(request, "error.html", {
-                        "title": "无法继续识别", "detail": str(exc),
-                    }, 400)
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-        return response
 
     @router.post("/admin/contacts/{open_id}/organization")
     def admin_confirm_contact_organization(
@@ -980,167 +788,6 @@ def create_admin_router(
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 
-    @router.get("/admin/contacts/{open_id}/assessments/{assessment_id}")
-    def admin_contact_assessment(
-        request: Request,
-        open_id: str,
-        assessment_id: UUID,
-        page: int = 1,
-        category: str = "all",
-        organization_status: str = "all",
-        organization_query: str = "",
-    ) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        category = admin_reporting.normalize_contact_category(category)
-        organization_status = admin_reporting.normalize_organization_status(organization_status)
-        organization_query = admin_reporting.normalize_organization_query(organization_query)
-        return render_contact_assessment(
-            request,
-            access_context,
-            open_id=open_id,
-            assessment_id=assessment_id,
-            source_page=page,
-            source_category=category,
-            source_organization_status=organization_status,
-            source_organization_query=organization_query,
-        )
-
-    @router.post("/admin/contacts/{open_id}/assessments/{assessment_id}/roles")
-    def admin_confirm_assessment_role(
-        request: Request,
-        open_id: str,
-        assessment_id: UUID,
-        page: int = 1,
-        category: str = "all",
-        organization_status: str = "all",
-        organization_query: str = "",
-        *, form: Annotated[dict[str, str], Depends(form_fields)],
-    ) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        category = admin_reporting.normalize_contact_category(category)
-        organization_status = admin_reporting.normalize_organization_status(organization_status)
-        organization_query = admin_reporting.normalize_organization_query(organization_query)
-        if not contact_assessments.assessment_matches_contact(assessment_id, open_id):
-            response = render_template(
-                request,
-                "error.html",
-                {"title": "未找到 AI 判定", "detail": "该判定不存在，或不属于当前联系人。"},
-                404,
-            )
-            response.headers["Cache-Control"] = "no-store, max-age=0"
-            return response
-        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
-            return render_contact_assessment(
-                request,
-                access_context,
-                open_id=open_id,
-                assessment_id=assessment_id,
-                source_page=page,
-                source_category=category,
-                source_organization_status=organization_status,
-                source_organization_query=organization_query,
-                error="请求校验失败，请返回此页面后重试。",
-                status_code=400,
-            )
-        try:
-            contact_assessments.confirm_assessment_role(
-                access_context["authorization"]["id"], assessment_id, form.get("role", "")
-            )
-        except contact_assessments.ContactAssessmentInputError as exc:
-            return render_contact_assessment(
-                request,
-                access_context,
-                open_id=open_id,
-                assessment_id=assessment_id,
-                source_page=page,
-                source_category=category,
-                source_organization_status=organization_status,
-                source_organization_query=organization_query,
-                error=str(exc),
-                status_code=400,
-            )
-        query = contact_query(
-            page=page,
-            category=category,
-            organization_status=organization_status,
-            organization_query=organization_query,
-        )
-        response = RedirectResponse(
-            url=f"/admin/contacts/{open_id}/assessments/{assessment_id}?{query}", status_code=303
-        )
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-        return response
-
-    @router.post("/admin/contacts/{open_id}/assessments/{assessment_id}/dismiss")
-    def admin_dismiss_contact_assessment(
-        request: Request,
-        open_id: str,
-        assessment_id: UUID,
-        page: int = 1,
-        category: str = "all",
-        organization_status: str = "all",
-        organization_query: str = "",
-        *, form: Annotated[dict[str, str], Depends(form_fields)],
-    ) -> Response:
-        access_context, denied = owner_access(request)
-        if denied is not None:
-            return denied
-        assert access_context is not None
-        category = admin_reporting.normalize_contact_category(category)
-        organization_status = admin_reporting.normalize_organization_status(organization_status)
-        organization_query = admin_reporting.normalize_organization_query(organization_query)
-        if not contact_assessments.assessment_matches_contact(assessment_id, open_id):
-            response = render_template(
-                request,
-                "error.html",
-                {"title": "未找到 AI 判定", "detail": "该判定不存在，或不属于当前联系人。"},
-                404,
-            )
-            response.headers["Cache-Control"] = "no-store, max-age=0"
-            return response
-        if not _csrf_matches(form, csrf_token(access_context["authorization"])):
-            return render_contact_assessment(
-                request,
-                access_context,
-                open_id=open_id,
-                assessment_id=assessment_id,
-                source_page=page,
-                source_category=category,
-                source_organization_status=organization_status,
-                source_organization_query=organization_query,
-                error="请求校验失败，请返回此页面后重试。",
-                status_code=400,
-            )
-        try:
-            contact_assessments.dismiss_assessment(access_context["authorization"]["id"], assessment_id)
-        except contact_assessments.ContactAssessmentInputError as exc:
-            return render_contact_assessment(
-                request,
-                access_context,
-                open_id=open_id,
-                assessment_id=assessment_id,
-                source_page=page,
-                source_category=category,
-                source_organization_status=organization_status,
-                source_organization_query=organization_query,
-                error=str(exc),
-                status_code=400,
-            )
-        query = contact_query(
-            page=page,
-            category=category,
-            organization_status=organization_status,
-            organization_query=organization_query,
-        )
-        response = RedirectResponse(url=f"/admin/contacts/{open_id}?{query}", status_code=303)
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-        return response
 
     @router.post("/admin/ai")
     def admin_save_ai_config(request: Request, *, form: Annotated[dict[str, str], Depends(form_fields)]) -> Response:
@@ -1161,15 +808,7 @@ def create_admin_router(
         if feature not in AI_FEATURES:
             return render_ai_config(request, access_context, error="未知的 AI 功能配置。", status_code=400)
         try:
-            threshold = form.get("auto_confirm_threshold", "0.95" if feature == "contact_assessment" else
-                                 str(ai_feature_config.DEFAULT_AUTO_CONFIRM_THRESHOLD))
-            if feature == "contact_assessment":
-                try:
-                    valid_threshold = 0.95 <= float(threshold) <= 1
-                except (TypeError, ValueError):
-                    valid_threshold = False
-                if not valid_threshold:
-                    raise ai_feature_config.FeatureConfigInputError("全员身份识别阈值必须为 0.95 到 1.00。")
+            threshold = str(ai_feature_config.DEFAULT_AUTO_CONFIRM_THRESHOLD)
             with connection() as conn, conn.transaction():
                 key_rotated = bool(form.get("api_key", "").strip())
                 ai_feature_config.save_feature_config(
@@ -1179,7 +818,7 @@ def create_admin_router(
                     provider="openai",
                     project_id=form.get("project_id", ""),
                     model=form.get("model", ""),
-                    enabled=form.get("enabled") == "1",
+                    enabled=feature == offhours_summary.FEATURE and form.get("enabled") == "1",
                     api_key=form.get("api_key", ""),
                     updated_by_authorization_id=access_context["authorization"]["id"],
                     auto_confirm_threshold=threshold,
@@ -1188,13 +827,6 @@ def create_admin_router(
                     offhours_summary.save_settings_and_enqueue(
                         conn, access_context["authorization"]["id"], form,
                     )
-                if feature == "contact_assessment" and form.get("enabled") != "1":
-                    conn.execute("""
-                        UPDATE contact_assessments SET status='cancelled',finished_at=NOW(),lease_until=NULL,
-                            outcome='no_action',review_status='not_required',
-                            error_message='已暂停；可在人员详情继续识别。'
-                        WHERE policy_version=%s AND status='running'
-                        """, (contact_assessments.POLICY_VERSION,))
                 conn.execute(
                     "INSERT INTO audit_events (id, authorization_id, action, metadata) VALUES (%s, %s, %s, %s::jsonb)",
                     (
@@ -1207,7 +839,7 @@ def create_admin_router(
                                 "provider": "openai",
                                 "project_id": form.get("project_id", "").strip(),
                                 "model": form.get("model", "").strip(),
-                                "enabled": form.get("enabled") == "1",
+                                "enabled": feature == offhours_summary.FEATURE and form.get("enabled") == "1",
                                 "auto_confirm_threshold": threshold.strip(),
                                 "key_rotated": key_rotated,
                             }
@@ -1218,7 +850,7 @@ def create_admin_router(
             return render_ai_config(request, access_context, error=str(exc), status_code=400)
         saved_url = (
             "/admin/ai?saved=offhours-summary#offhours-summary" if feature == offhours_summary.FEATURE else
-            "/admin/ai?saved=people-identity#contact-assessment" if feature == "contact_assessment" else "/admin/ai"
+            "/admin/ai"
         )
         response = RedirectResponse(url=saved_url, status_code=303)
         response.headers["Cache-Control"] = "no-store, max-age=0"

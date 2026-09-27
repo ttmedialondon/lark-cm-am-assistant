@@ -16,7 +16,6 @@ from psycopg.rows import dict_row
 from app import (
     creator_import_evidence,
     creator_imports,
-    creator_ownership,
     openai_client,
     summary_dialogues,
     summary_periods,
@@ -511,12 +510,22 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
         assert input_pack["users"]["U1"]["handles"] == ["@alice"]
         if input_pack["chat_name"] == groups["group_ai"][0]:
             assert input_pack["unique_group_user"] is None
-            return {"text": json.dumps({"events": [], "processed_refs": input_pack["core_refs"]}), "usage": {"input_tokens": 1}}
+            return {
+                "text": json.dumps({"events": [], "processed_refs": input_pack["core_refs"]}),
+                "usage": {"input_tokens": 1},
+            }
         if not input_pack["is_private"]:
             assert input_pack["unique_group_user"] == "U1"
         message = next(m for m in input_pack["messages"] if m["in_window"])
-        return {"text": json.dumps({"processed_refs": input_pack.get("core_refs", []), "events": [sample_event(evidence_refs=[message["ref"]])]}),
-                "usage": {"input_tokens": 1}}
+        return {
+            "text": json.dumps(
+                {
+                    "processed_refs": input_pack.get("core_refs", []),
+                    "events": [sample_event(evidence_refs=[message["ref"]])],
+                }
+            ),
+            "usage": {"input_tokens": 1},
+        }
 
     monkeypatch.setattr(openai_client, "call_openai", model)
     assert s.save()["queued"] == 4
@@ -884,8 +893,10 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
     s.add('ancient', text='too old secret', at=s.start - timedelta(days=8))
     s.add('history', text='Earlier sample ABC-123', at=s.start - timedelta(days=6))
     pg.execute("UPDATE chat_messages SET parent_id='history' WHERE message_id='m1'")
-    pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) VALUES(%s,%s,%s,'manual')",
-               (uuid4(), s.ids['other'], s.ids['cm']))
+    pg.execute(
+        "INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) VALUES(%s,%s,%s,'manual')",
+        (uuid4(), s.ids["other"], s.ids["cm"]),
+    )
     pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('second','Related campaign group','group')")
     pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,backfill_complete,
         backfill_window_start_at,last_incremental_at,sync_status) VALUES(%s,'second',TRUE,%s,%s,'succeeded')""",
@@ -897,8 +908,11 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
                    (who, 'ou_' + who, s.cipher.encrypt(json.dumps({'text':
                     'Sample order ABC-123 arrived' if who == 'person' else 'unrelated other creator secret'})),
                     s.start + timedelta(hours=6)))
-        pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) VALUES(%s,'second',%s)",
-                   (s.ids['cm'], who))
+        pg.execute(
+            "INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+            "VALUES(%s,'second',%s)",
+            (s.ids["cm"], who),
+        )
     calls, failed = [], False
 
     def model(_cfg, _key, pack, _cm, **kwargs):

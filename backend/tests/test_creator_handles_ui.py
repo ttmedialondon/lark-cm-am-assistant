@@ -1,7 +1,6 @@
 """Frontend CM review stays separate from owner-only scan management."""
 
 import asyncio
-import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -11,7 +10,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from app import admin_permissions, creator_handles, creator_handles_routes, creator_imports, creator_roster
+from app import admin_permissions, creator_handles_routes, creator_imports
 
 
 def browser(monkeypatch, *, owner=False, active=True):
@@ -34,90 +33,41 @@ def browser(monkeypatch, *, owner=False, active=True):
     return TestClient(app), actor
 
 
-def test_cm_can_read_review_own_handles_without_admin_and_cannot_cross_scope(monkeypatch):
-    client, actor = browser(monkeypatch)
-    task, foreign = uuid4(), uuid4()
-    calls = []
-
-    def page_data(actor_id, *, cm_id, **_kwargs):
-        assert actor_id == actor["id"]
-        if cm_id not in (None, actor_id):
-            raise PermissionError("只能查看自己的达人。")
-        return {"cms": [], "selected_cm_id": str(actor_id), "can_manage": False,
-                "run": None, "counts": {}, "usage": {}, "items": [], "page": 1, "total_count": 0,
-                "total_pages": 0}
-
-    def scoped(actor_id, task_id, *args):
-        assert actor_id == actor["id"]
-        if task_id != task:
-            raise PermissionError("不能查看或操作其他 CM 的达人。")
-        calls.append((task_id, *args))
-        return {"messages": [{"ref": "G1", "text": "Authorized group name"}]}
-
-    monkeypatch.setattr(creator_roster, "page_data", page_data)
-    for name in ("confirm_task", "defer_task", "task_evidence"):
-        monkeypatch.setattr(creator_handles, name, scoped)
-    html = client.get("/creators")
-    assert html.status_code == 200
-    assert actor["session_reads"] == 1
-    assert "候选达人" in html.text and "我的达人" in html.text
-    assert "导入 CAP 达人账号名单" in html.text and "整份名单的属性固定为 CAP" in html.text
-    assert 'data-tab="mine"' in html.text
-    assert 'id="creators-type-column" hidden' not in html.text
-    candidates = client.get("/creators?tab=candidates").text
-    assert 'data-tab="candidates"' in candidates
-    assert 'id="creators-type-column" hidden' in candidates
-    assert 'id="creators-status-column"' not in html.text + candidates
-    assert '<th scope="col">来源</th>' not in html.text + candidates
-    assert html.text.index('id="creators-mine"') < html.text.index('id="creators-candidates"')
-    assert 'id="creators-preview"' not in html.text
-    assert client.get("/creators/data").status_code == 200
-    assert client.get(f"/creators/data?cm_id={foreign}").status_code == 403
-    handles = ["example.one", "example_two"]
-    assert client.post(f"/creators/tasks/{task}/confirm", data={
-        "csrf_token": "csrf", "handles": json.dumps(handles), "actor_id": str(foreign),
-    }).status_code == 200
-    assert calls == [(task, handles)]
-    assert client.post(f"/creators/tasks/{task}/defer", data={"csrf_token": "csrf"}).status_code == 200
-    evidence = client.get(f"/creators/tasks/{task}/evidence")
-    assert evidence.headers["cache-control"] == "no-store, max-age=0"
-    assert evidence.json()["messages"][0]["ref"] == "G1"
-    for suffix in ("confirm", "defer"):
-        assert client.post(f"/creators/tasks/{foreign}/{suffix}", data={
-            "csrf_token": "csrf", "handles": json.dumps(handles),
-        }).status_code == 403
-    assert client.get(f"/creators/tasks/{foreign}/evidence").status_code == 403
-    type_url = f"/creators/people/{task}/type"
-    assert client.post(type_url, data={"cm_id": str(actor["id"]), "creator_type": "cap"}).status_code == 400
-    assert client.post(type_url, data={
-        "csrf_token": "csrf", "cm_id": str(actor["id"]), "creator_type": "non_cap", "actor_id": str(foreign),
-    }).status_code == 410
-    assert not any(len(call) == 4 and call[-1] == "non_cap" for call in calls)
 
 
 def test_retired_handle_ai_and_type_actions_still_require_active_auth_and_csrf(monkeypatch):
     client, actor = browser(monkeypatch)
     run, task = uuid4(), uuid4()
-    calls = []
-    for name in ("confirm_task", "defer_task"):
-        monkeypatch.setattr(creator_handles, name, lambda *args: calls.append(args) or run)
-    actions = ["/creators/preview", *(f"/creators/runs/{run}/{name}" for name in (
-        "start", "pause", "resume", "auto-admit",
-    )), f"/creators/tasks/{task}/recheck", f"/creators/people/{task}/type"]
+    actions = [
+        "/creators/preview",
+        *(
+            f"/creators/runs/{run}/{name}"
+            for name in (
+                "start",
+                "pause",
+                "resume",
+                "auto-admit",
+            )
+        ),
+        *(f"/creators/tasks/{task}/{name}" for name in ("recheck", "confirm", "defer")),
+        f"/creators/people/{task}/type",
+    ]
     for path in actions:
         assert client.post(path, data={
             "csrf_token": "csrf", "cm_id": str(actor["id"]), "enabled": "1",
         }).status_code == 410
-    for invalid in ({}, {"csrf_token": "wrong", "handles": '["valid"]'},
-                    {"csrf_token": "csrf", "handles": '"not-array"'}, {"csrf_token": "csrf", "handles": "[]"}):
+    for invalid in ({}, {"csrf_token": "wrong"}):
         assert client.post(f"/creators/tasks/{task}/confirm", data=invalid).status_code == 400
     owner, _admin = browser(monkeypatch, owner=True)
     for path in actions:
         assert owner.post(path, data={"cm_id": str(actor["id"]), "enabled": "1"}).status_code == 400
         assert owner.post(path, data={"csrf_token": "csrf", "enabled": "1"}).status_code == 410
-    assert not calls
+    evidence = client.get(f"/creators/tasks/{task}/evidence")
+    assert evidence.status_code == 410
+    assert evidence.headers["cache-control"] == "no-store, max-age=0"
     revoked, _ = browser(monkeypatch, active=False)
     assert revoked.get("/creators").status_code == 403
+    assert revoked.get(f"/creators/tasks/{task}/evidence").status_code == 403
     for path in actions:
         assert revoked.post(path, data={"csrf_token": "csrf"}).status_code == 403
     assert revoked.post(f"/creators/tasks/{task}/defer", data={"csrf_token": "csrf"}).status_code == 403

@@ -5,28 +5,6 @@
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
     <div class="d-flex align-items-center mb-3"><div><div class="d-flex flex-wrap align-items-center gap-2"><h2 class="page-title mb-0">{% if contact.private_chat_url %}<a href="{{ contact.private_chat_url }}" target="_blank" rel="noopener noreferrer" title="在 Lark 中打开你与此人的私聊">{{ contact.display_name }}</a>{% else %}{{ contact.display_name }}{% endif %}</h2><span class="badge bg-{{ contact.category_badge }}-lt">{{ contact.category_label }}</span>{% for label in contact.confirmed_role_labels[1:] %}<span class="badge bg-secondary-lt">辅助：{{ label }}</span>{% endfor %}</div></div><a class="btn btn-outline-secondary ms-auto" href="/admin/contacts?{{ source_query }}">返回人员目录</a></div>
-    <div class="alert alert-info">身份识别只使用此人本人的重要历史发言，不判断 CM 负责人或 handle。人工已确认资料、已核实的同事身份会保留；分类不等于进入“我的达人”。</div>
-    <div class="card mb-4"><div class="card-body"><div class="row g-3">
-      <div class="col-sm-6 col-lg-3"><div class="subheader">分类来源</div><div>{{ contact.classification_source_label or '—' }}</div></div>
-      <div class="col-sm-6 col-lg-3"><div class="subheader">本轮状态</div><div>{{ contact.identity_ai_status_label or '本轮未处理' }}</div></div>
-      <div class="col-sm-6 col-lg-3"><div class="subheader">AI 置信度</div><div>{{ contact.identity_ai_confidence_label or '—' }}</div></div>
-      <div class="col-sm-6 col-lg-3"><div class="subheader">完成时间</div><div>{{ contact.identity_ai_finished_at_label or '—' }}</div></div>
-    </div>{% if contact.identity_ai_reason_label %}<div class="text-secondary small mt-3">{{ contact.identity_ai_reason_label }}</div>{% endif %}</div></div>
-    {% if admin_role == 'owner' %}<div class="card mb-4">
-      <div class="card-header"><div><h3 class="card-title mb-1">本轮身份识别</h3><div class="text-secondary small">开启后按当前规则检查全部在库人员；类别唯一、置信度至少 95% 且有本人发言支持时才自动分类。无材料或低置信结果保留待识别；刷新不会重新调用 AI。</div></div></div>
-      <div class="card-body d-flex flex-wrap align-items-center gap-3">
-        {% if assessment and assessment.policy_version == identity_policy %}
-        <div><span class="badge bg-{{ assessment.status_badge }}-lt">{{ contact.identity_ai_status_label or assessment.status_label }}</span>{% if assessment.reason_label %}<span class="text-secondary small ms-2">{{ assessment.reason_label }}</span>{% endif %}<span class="text-secondary small ms-2">{{ assessment.created_at_label }}{% if assessment.model %} · {{ assessment.model }}{% endif %}</span>{% if assessment.error_label %}<div class="text-danger small mt-1">{{ assessment.error_label }}</div>{% endif %}</div>
-        {% if assessment.status == 'succeeded' %}<a class="btn btn-outline-primary ms-auto" href="/admin/contacts/{{ contact.open_id }}/assessments/{{ assessment.id }}?{{ source_query }}">查看建议与证据</a>{% endif %}
-        {% elif assessment_available %}
-        <div class="text-secondary small">本轮尚未安排此人。开启后后台会按当前规则依次检查在库人员；旧规则结果不计入本轮。</div>
-        {% else %}
-        <div class="text-secondary">全员身份识别尚未启用。请先在 <a href="/admin/ai#contact-assessment">全员身份识别配置</a> 中保存有效配置并开启。</div>
-        {% endif %}
-      </div>
-      {% if assessment_available and (not assessment or (assessment.status not in ('queued','running') and assessment.reason_code not in ('classified','protected_manual','verified_internal'))) %}<div class="card-body border-top"><form action="/admin/contacts/{{ contact.open_id }}/assessments" method="post" class="d-flex flex-wrap align-items-center gap-3"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-outline-primary" type="submit">继续识别</button><span class="text-secondary small">仅继续此人的当前任务；每人累计最多 2 次处理尝试，不会重置预算。材料补齐后可继续，次数耗尽仍保留待识别。</span></form></div>{% endif %}
-    </div>
-    {% endif %}
     <div class="card mb-4">
       <div class="card-header"><div><h3 class="card-title mb-1">所属组织</h3><div class="text-secondary small">“Lark 租户关联”仅说明稳定身份与该组织租户相关，不自动等同于员工、机构负责人或达人归属。</div></div></div>
       {% if organizations %}

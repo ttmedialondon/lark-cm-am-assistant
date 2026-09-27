@@ -15,9 +15,9 @@ from psycopg.types.json import Jsonb
 from . import ai_dispatch, creator_access, creator_data, creator_import_evidence, openai_client
 from .ai_feature_config import api_key_cipher
 from .config import get_settings
-from .creator_handle_evidence import normalize_handle
 from .creator_import_xlsx import MAX_FILE_BYTES, parse_xlsx  # noqa: F401 - routes share the upload bound
 from .db import connection
+from .handle_evidence import normalize_handle
 
 POLICY_VERSION = "creator-import-v2"
 LOGGER = logging.getLogger(__name__)

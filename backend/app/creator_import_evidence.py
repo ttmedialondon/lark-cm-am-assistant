@@ -9,9 +9,9 @@ from difflib import SequenceMatcher
 from uuid import uuid4
 
 from . import admin_reporting
-from . import contact_assessments as people
-from . import creator_handle_evidence as handles
-from . import creator_ownership_evidence as ownership
+from . import evidence_access as ownership
+from . import evidence_text as people
+from . import handle_evidence as handles
 from .crypto import message_body_cipher
 from .message_mentions import mention_targets
 

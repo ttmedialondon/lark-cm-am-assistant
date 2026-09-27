@@ -12,16 +12,13 @@ from zipfile import ZipFile
 
 import psycopg
 import pytest
+from cap_fixtures import _snapshot
+from cap_fixtures import pilot as parent_pilot
 from psycopg.rows import dict_row
-from test_creator_ownership import _snapshot
-from test_creator_ownership import pilot as parent_pilot
 
 from app import (
     admin_reporting,
-    contact_assessments,
     creator_data,
-    creator_handles,
-    creator_ownership,
     creator_roster,
     openai_client,
 )
@@ -29,6 +26,63 @@ from app import creator_imports as imports
 from app.crypto import message_body_cipher
 
 pilot = parent_pilot
+
+
+def test_retirement_preserves_cap_and_stops_every_old_queue(pg, pilot, monkeypatch):
+    prepare(pg, pilot, monkeypatch)
+    owner, cm, creator = (pilot.ids[k] for k in ("owner", "cm", "creator"))
+    batch = imports.preview_import(owner, cm, "cap.xlsx", workbook("creator_one"))
+    imports.start_import(owner, batch["id"])
+    imports.confirm_row(cm, row_for(pg, batch, "creator_one")["id"], "creator_one", creator)
+    protected = ("contacts", "contact_roles", "contact_assignments", "creator_account_assignments",
+                 "social_accounts", "contact_social_accounts", "creator_import_batches", "creator_import_rows",
+                 "authorizations", "chat_messages", "authorization_message_observations")
+    before = _snapshot(pg, protected)
+    config = creator_data.config(pg)
+    pg.execute(
+        "INSERT INTO ai_feature_configs(feature,provider,project_id,model,api_key_ciphertext,key_suffix,enabled) "
+        "SELECT 'contact_assessment',provider,project_id,model,api_key_ciphertext,key_suffix,TRUE "
+        "FROM ai_feature_configs WHERE feature='creator_import' ON CONFLICT(feature) DO UPDATE SET "
+        "provider=EXCLUDED.provider,project_id=EXCLUDED.project_id,model=EXCLUDED.model,"
+        "api_key_ciphertext=EXCLUDED.api_key_ciphertext,key_suffix=EXCLUDED.key_suffix,enabled=TRUE"
+    )
+    pg.execute("DELETE FROM ai_feature_configs WHERE feature='creator_import'")
+    pg.execute("UPDATE contact_assessments SET status='running',lease_until=NOW()+INTERVAL '1 hour'")
+    pg.execute("INSERT INTO contact_assignment_assessments(id,contact_id,status) VALUES(%s,%s,'queued')",
+               (uuid4(), creator))
+    run, task, handle_run, workflow_run = (uuid4() for _ in range(4))
+    pg.execute("INSERT INTO creator_ownership_runs(id,cm_authorization_id,requested_by,policy_version,status) "
+               "VALUES(%s,%s,%s,'legacy','running')", (run, cm, owner))
+    pg.execute("INSERT INTO creator_ownership_tasks(id,run_id,contact_id,cm_authorization_id,policy_version,status) "
+               "VALUES(%s,%s,%s,%s,'legacy','ready')", (task, run, creator, cm))
+    pg.execute("INSERT INTO creator_handle_runs(id,ownership_run_id,cm_authorization_id,requested_by,"
+               "policy_version,status,auto_admit) VALUES(%s,%s,%s,%s,'legacy','running',TRUE)",
+               (handle_run, run, cm, owner))
+    pg.execute("INSERT INTO creator_handle_tasks(id,run_id,ownership_task_id,contact_id,cm_authorization_id,"
+               "policy_version,status) VALUES(%s,%s,%s,%s,%s,'legacy','queued')",
+               (uuid4(), handle_run, task, creator, cm))
+    pg.execute("INSERT INTO creator_workflow_ai_runs(id,responsible_authorization_id,requested_by_authorization_id,"
+               "status,history_days,chat_limit,continuous,window_start,window_end) "
+               "VALUES(%s,%s,%s,'running',30,10,TRUE,NOW()-INTERVAL '30 days',NOW())", (workflow_run,cm,owner))
+    pg.execute("INSERT INTO creator_workflow_ai_tasks(id,run_id,chat_id,input_fingerprint,initial_fingerprint,status) "
+               "VALUES(%s,%s,'chat_creator','legacy','legacy','queued')", (uuid4(),workflow_run))
+    pg.execute("INSERT INTO creator_workflow_onboarding(authorization_id,status) VALUES(%s,'waiting_sync')", (cm,))
+    migration = (Path(__file__).parents[1]/"migrations/070_retire_non_cap_recognition.sql").read_text()
+    pg.execute(migration)
+    assert _snapshot(pg, protected) == before
+    assert creator_data.config(pg) == config
+    for table in ("contact_assessments", "contact_assignment_assessments", "creator_ownership_tasks",
+                  "creator_handle_tasks", "creator_workflow_ai_tasks"):
+        assert not pg.execute(f"SELECT 1 FROM {table} WHERE status IN "
+                              "('pending','preparing','ready','queued','running')").fetchone()
+    assert not pg.execute("SELECT 1 FROM creator_workflow_onboarding WHERE status IN "
+                          "('waiting_sync','ready','scanning')").fetchone()
+    assert not pg.execute("SELECT 1 FROM creator_handle_runs WHERE auto_admit").fetchone()
+    assert not pg.execute("SELECT 1 FROM creator_workflow_ai_runs WHERE continuous").fetchone()
+    after = _snapshot(pg, (*protected, "creator_handle_runs", "creator_ownership_tasks", "audit_events"))
+    pg.execute(migration)
+    assert _snapshot(pg, (*protected, "creator_handle_runs", "creator_ownership_tasks", "audit_events")) == after
+    assert creator_roster.page_data(cm, tab="mine")["total_count"] == 1
 
 
 def workbook(*values, formula=False):
@@ -64,9 +118,7 @@ def group(pg, pilot, chat, handle, *members):
 def prepare(pg, pilot, monkeypatch):
     monkeypatch.setattr(imports, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(imports, "get_settings", lambda: pilot.settings)
-    monkeypatch.setattr(creator_handles, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(creator_roster, "connection", lambda: nullcontext(pg))
-    monkeypatch.setattr(creator_handles, "get_settings", lambda: pilot.settings)
     calls, callbacks = [], []
 
     def respond(_config, _key, pack, _row_id, **kwargs):
@@ -292,7 +344,10 @@ def test_shared_creator_reuses_identity_without_sharing_message_permissions(pg, 
     assert saved["review_status"] == "confirmed" and saved["reason_code"] == "existing"
     assert saved["api_requests"] == 0 and not calls
     assert pg.execute("SELECT count(*) n FROM contact_assignments WHERE contact_id=%s", (person,)).fetchone()["n"] == 2
-    assert pg.execute("SELECT count(*) n FROM social_accounts WHERE normalized_handle='shared_handle'").fetchone()["n"] == 1
+    assert (
+        pg.execute("SELECT count(*) n FROM social_accounts WHERE normalized_handle='shared_handle'").fetchone()["n"]
+        == 1
+    )
     link = pg.execute("SELECT * FROM contact_social_accounts WHERE contact_id=%s", (person,)).fetchone()
     assert link["import_row_id"] == link_before["import_row_id"]  # Preserve original identity evidence.
     for target in (cm, other):
@@ -387,7 +442,12 @@ def test_manual_import_concurrent_confirmations_create_one_person_and_account_li
         with connected() as conn:
             assert conn.execute("SELECT count(*) n FROM contact_assignments WHERE contact_id=%s AND ended_at IS NULL",
                                 (creator,)).fetchone()["n"] == 2
-            assert conn.execute("SELECT count(*) n FROM social_accounts WHERE normalized_handle='concurrent_shared'").fetchone()["n"] == 1
+            assert (
+                conn.execute(
+                    "SELECT count(*) n FROM social_accounts WHERE normalized_handle='concurrent_shared'"
+                ).fetchone()["n"]
+                == 1
+            )
     finally:
         pg.rollback()
         with psycopg.connect(dsn, autocommit=True) as cleanup:
@@ -692,7 +752,9 @@ def test_import_workbook_rejects_unsafe_or_ambiguous_input():
             imports.parse_xlsx(name, content)
     parsed = imports.parse_xlsx("roster.xlsx", workbook("handle", "https://www.tiktok.com/@Account.One", "account.one"))
     assert parsed["counts"] == {"valid": 1, "duplicates": 1, "invalid": 0}
-    parsed = imports.parse_xlsx("roster.xlsx", workbook("handle", ".horsegirlatheart", "@.horsegirlatheart", "horsegirlatheart"))
+    parsed = imports.parse_xlsx(
+        "roster.xlsx", workbook("handle", ".horsegirlatheart", "@.horsegirlatheart", "horsegirlatheart")
+    )
     assert parsed["counts"] == {"valid": 2, "duplicates": 1, "invalid": 0}
     assert [row["handle"] for row in parsed["rows"]] == [".horsegirlatheart", ".horsegirlatheart", "horsegirlatheart"]
     groups, _ = imports.creator_import_evidence._candidate_groups([
@@ -720,16 +782,22 @@ def test_leading_dot_repair_preserves_preview_and_existing_decisions(pg, pilot, 
         original = batch["preview_rows"][0]["handle"][1:]
         assert batch["counts"] == {"valid": 2, "duplicates": 0, "invalid": 0}
         assert batch["status"] == ("running" if original == "completed" else original)
-        rows = pg.execute("SELECT handle,status,contact_id FROM creator_import_rows WHERE batch_id=%s", (batch["id"],)).fetchall()
+        rows = pg.execute(
+            "SELECT handle,status,contact_id FROM creator_import_rows WHERE batch_id=%s", (batch["id"],)
+        ).fetchall()
         assert len(rows) == (0 if original == "preview" else 1)
         if rows:
             assert rows[0] == {"handle": "." + original, "status": "pending", "contact_id": None}
-    assert pg.execute("SELECT count(*) n FROM audit_events WHERE action='creator_import_leading_dot_repaired'").fetchone()["n"] == 4
+    assert (
+        pg.execute("SELECT count(*) n FROM audit_events WHERE action='creator_import_leading_dot_repaired'").fetchone()[
+            "n"
+        ]
+        == 4
+    )
 
 
 def test_creator_library_reset_preserves_sources_history_and_new_data_on_replay(pg, pilot, monkeypatch):
     prepare(pg, pilot, monkeypatch)
-    monkeypatch.setattr(contact_assessments, "connection", lambda: nullcontext(pg))
     cm, owner, creator = pilot.ids["cm"], pilot.ids["owner"], pilot.ids["creator"]
     data = workbook("creator_one", "not_found")
     batch = imports.preview_import(owner, cm, "original.xlsx", data)
@@ -753,7 +821,7 @@ def test_creator_library_reset_preserves_sources_history_and_new_data_on_replay(
                "VALUES(%s,'merchant_contact','confirmed','ai_auto_confirmed',TRUE)", (merchant,))
     pg.execute("INSERT INTO contact_assessments(id,contact_id,status,policy_version,result,created_at) "
                "VALUES(%s,%s,'succeeded',%s,%s::jsonb,NOW()+INTERVAL '1 second')", (
-                   merchant_assessment, merchant, contact_assessments.POLICY_VERSION,
+                   merchant_assessment, merchant, "people-identity-v1",
                    json.dumps({"reason_code": "classified", "roles": [
                        {"role": "merchant_contact", "confidence": .99}]}),
                ))
@@ -774,18 +842,18 @@ def test_creator_library_reset_preserves_sources_history_and_new_data_on_replay(
                "WHERE contact_id=%s", (pilot.ids["silent"],))
     ownership_run, ownership_task, handle_run, handle_task, workflow_run = (uuid4() for _ in range(5))
     pg.execute("INSERT INTO creator_ownership_runs(id,cm_authorization_id,requested_by,policy_version,status) "
-               "VALUES(%s,%s,%s,%s,'running')", (ownership_run, cm, owner, creator_ownership.POLICY_VERSION))
+               "VALUES(%s,%s,%s,%s,'running')", (ownership_run, cm, owner, "ownership-v1"))
     pg.execute("INSERT INTO creator_ownership_tasks(id,run_id,contact_id,cm_authorization_id,policy_version,"
                "status,api_requests,input_tokens,output_tokens,result_ciphertext,lease_until) "
                "VALUES(%s,%s,%s,%s,%s,'running',1,21,9,'historical-ownership',NOW()+INTERVAL '1 hour')",
-               (ownership_task, ownership_run, creator, cm, creator_ownership.POLICY_VERSION))
+               (ownership_task, ownership_run, creator, cm, "ownership-v1"))
     pg.execute("INSERT INTO creator_handle_runs(id,ownership_run_id,cm_authorization_id,requested_by,"
                "policy_version,status,auto_admit) VALUES(%s,%s,%s,%s,%s,'running',TRUE)",
-               (handle_run, ownership_run, cm, owner, creator_handles.POLICY_VERSION))
+               (handle_run, ownership_run, cm, owner, "handles-v1"))
     pg.execute("INSERT INTO creator_handle_tasks(id,run_id,ownership_task_id,contact_id,cm_authorization_id,"
                "policy_version,status,api_requests,input_tokens,output_tokens,result_ciphertext,lease_until) "
                "VALUES(%s,%s,%s,%s,%s,%s,'running',1,22,8,'historical-handle',NOW()+INTERVAL '1 hour')",
-               (handle_task, handle_run, ownership_task, creator, cm, creator_handles.POLICY_VERSION))
+               (handle_task, handle_run, ownership_task, creator, cm, "handles-v1"))
     pg.execute("INSERT INTO creator_workflow_ai_runs(id,responsible_authorization_id,requested_by_authorization_id,"
                "status,history_days,chat_limit,continuous,window_start,window_end) "
                "VALUES(%s,%s,%s,'ready',30,10,TRUE,NOW()-INTERVAL '30 days',NOW())", (workflow_run, cm, owner))
@@ -859,7 +927,7 @@ def test_creator_library_reset_preserves_sources_history_and_new_data_on_replay(
         assert not pg.execute(f"SELECT 1 FROM {table} WHERE policy_version NOT LIKE %s",
                               ("%:reset-20260914",)).fetchone()
     for assessment in pg.execute("SELECT id,policy_version FROM contact_assessments").fetchall():
-        assert assessment["policy_version"] == contact_assessments.POLICY_VERSION + (
+        assert assessment["policy_version"] == "people-identity-v1" + (
             "" if assessment["id"] == merchant_assessment else ":reset-20260914"
         )
     assert not pg.execute("SELECT 1 FROM creator_handle_runs WHERE auto_admit").fetchone()
@@ -872,9 +940,6 @@ def test_creator_library_reset_preserves_sources_history_and_new_data_on_replay(
             "api_requests": 1, "input_tokens": tokens, "output_tokens": output}
     assert not pg.execute("SELECT 1 FROM ai_feature_configs WHERE enabled "
                           "AND feature IN ('contact_assessment','contact_assignment','creator_workflow')").fetchone()
-    assert not creator_ownership.prepare_next_preview(pilot.settings) and not creator_ownership.claim_next_ownership()
-    assert not contact_assessments.queue_eligible_contact_assessments()
-    assert not contact_assessments.claim_next_contact_assessment()
     assert row_for(pg, queued, "new_handle")["status"] == "invalid"
     with pytest.raises(ValueError):
         imports.start_import(cm, batch["id"])

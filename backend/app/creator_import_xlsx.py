@@ -7,7 +7,7 @@ from pathlib import PurePosixPath
 from xml.etree import ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
-from .creator_handle_evidence import normalize_handle
+from .handle_evidence import normalize_handle
 
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_ROWS = 2000

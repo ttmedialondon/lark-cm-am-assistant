@@ -55,10 +55,10 @@ def _client(current_authorization, contexts=None):
 
 def _config():
     return {
-        "feature": "contact_assessment",
+        "feature": "offhours_summary",
         "provider": "openai",
         "provider_label": "OpenAI",
-        "project_id": "proj_contact_assessment",
+        "project_id": "proj_summary",
         "model": "gpt-5.6-luna",
         "auto_confirm_threshold": 0.9,
         "auto_confirm_threshold_label": "90%",
@@ -109,8 +109,8 @@ def test_owner_can_view_only_safe_ai_config_fields(monkeypatch):
     assert "api_key_ciphertext" not in contexts[-1][1]["config"]
     assert contexts[-1][1]["ai_dispatch"]["state"] == "paused"
     assert contexts[-1][1]["summary_settings"]["status_label"] == "未开启"
-    assert [item["feature"] for item in contexts[-1][1]["configs"]] == ["contact_assessment", "offhours_summary"]
-    for feature in ("contact_assignment", "creator_workflow"):
+    assert [item["feature"] for item in contexts[-1][1]["configs"]] == ["creator_import", "offhours_summary"]
+    for feature in ("contact_assessment", "contact_assignment", "creator_workflow"):
         response = browser.post("/admin/ai", data={"csrf_token": "csrf", "feature": feature, "enabled": "1"})
         assert response.status_code == 400
         assert "未知的 AI 功能配置" in contexts[-1][1]["form_error"]
@@ -133,47 +133,41 @@ def test_owner_post_passes_key_to_encrypted_store_without_rendering_it(monkeypat
     monkeypatch.setattr(admin, "get_settings", lambda: SimpleNamespace(token_encryption_key=b"k" * 32))
     monkeypatch.setattr(ai_feature_config, "api_key_cipher", lambda master_key: ("cipher", master_key))
     monkeypatch.setattr(ai_feature_config, "save_feature_config", lambda *args, **kwargs: saved.append((args, kwargs)))
+    monkeypatch.setattr(admin.offhours_summary, "save_settings_and_enqueue", lambda *args: None)
 
     response = _client(lambda _request: {"id": owner_id, "status": "active"}).post(
         "/admin/ai",
         data={
             "csrf_token": "csrf",
-            "feature": "contact_assessment",
-            "project_id": "proj_contact_assessment",
+            "feature": "offhours_summary",
+            "project_id": "proj_summary",
             "model": "gpt-5.6-luna",
             "enabled": enabled,
-            "auto_confirm_threshold": "0.95",
+            "auto_confirm_threshold": "0.900",
             "api_key": "sk-secret-never-rendered",
         },
         follow_redirects=False,
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/admin/ai?saved=people-identity#contact-assessment"
+    assert response.headers["location"] == "/admin/ai?saved=offhours-summary#offhours-summary"
     assert response.headers["cache-control"] == "no-store, max-age=0"
     assert len(saved) == 1
     args, kwargs = saved[0]
-    assert args[1:] == (("cipher", b"k" * 32), "contact_assessment")
+    assert args[1:] == (("cipher", b"k" * 32), "offhours_summary")
     assert kwargs == {
         "provider": "openai",
-        "project_id": "proj_contact_assessment",
+        "project_id": "proj_summary",
         "model": "gpt-5.6-luna",
         "enabled": enabled == "1",
         "api_key": "sk-secret-never-rendered",
         "updated_by_authorization_id": owner_id,
-        "auto_confirm_threshold": "0.95",
+        "auto_confirm_threshold": "0.900",
     }
     audit = connections[0].calls[-1][1]
     assert audit[2] == "ai_feature_config_updated"
     assert "sk-secret-never-rendered" not in audit[3]
     assert '"key_rotated": true' in audit[3]
-    cancellations = [(query, params) for query, params in connections[0].calls
-                     if "UPDATE contact_assessments" in query]
-    assert bool(cancellations) == (enabled != "1")
-    if cancellations:
-        assert "status='running'" in cancellations[0][0]
-        assert "attempts=" not in cancellations[0][0] and "result=" not in cancellations[0][0]
-        assert cancellations[0][1] == (admin.contact_assessments.POLICY_VERSION,)
 
 
 def test_owner_can_resume_the_shared_ai_queue(monkeypatch):

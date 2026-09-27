@@ -23,7 +23,6 @@ from cryptography.exceptions import InvalidTag
 
 from .admin_permissions import PAGE_KEYS
 from .config import get_settings
-from .contact_assessments import POLICY_VERSION as CONTACT_IDENTITY_POLICY
 from .contact_taxonomy import CONTACT_ROLE_CODES, ORGANIZATION_KIND_LABELS, ROLE_LABELS, role_label
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
@@ -32,6 +31,7 @@ from .lark_api import private_chat_url
 from .message_mentions import mention_names
 from .message_text import display_body as _readable_body
 
+CONTACT_IDENTITY_POLICY = "people-identity-v1"  # Historical classification provenance, read-only.
 LONDON_TIME_ZONE = ZoneInfo("Europe/London")
 LIST_PAGE_SIZE = 25
 DETAIL_PAGE_SIZE = 10
@@ -801,16 +801,6 @@ CONTACT_DIRECTORY_SQL = f"""
             identity_counts.last_seen_at,
             primary_role.role AS primary_role,
             primary_role.source AS classification_source,
-            COALESCE((SELECT enabled FROM ai_feature_configs WHERE feature='contact_assessment'),FALSE)
-                AS identity_ai_enabled,
-            assessment.status AS identity_ai_status,
-            assessment.result->>'reason_code' AS identity_ai_reason,
-            CASE WHEN assessment.result->'roles'->0->>'role' IN
-                ('creator','partner_contact','internal_colleague','merchant_contact',
-                 'platform_contact','other_external_contact')
-                AND assessment.result->>'reason_code' IN ('classified','low_confidence')
-                THEN assessment.result->'roles'->0->>'confidence' END AS identity_ai_confidence,
-            assessment.finished_at AS identity_ai_finished_at,
             COALESCE(primary_role.role, 'unclassified') AS category,
             COALESCE(organization.status, 'unresolved') AS organization_status,
             organization.canonical_name AS organization_name,
@@ -889,8 +879,8 @@ def contacts(
             f"""
             {CONTACT_DIRECTORY_SQL}
             , counts AS (
-                SELECT category,identity_ai_status,identity_ai_reason,identity_ai_enabled,COUNT(*) AS count
-                FROM directory GROUP BY category,identity_ai_status,identity_ai_reason,identity_ai_enabled
+                SELECT category,COUNT(*) AS count
+                FROM directory GROUP BY category
             ), filtered AS MATERIALIZED (
             SELECT * FROM directory
             WHERE (%s = 'all' OR category = %s)
@@ -956,30 +946,10 @@ def contacts(
 
 
 def _identity_summary(rows: list[dict]) -> dict[str, Any]:
-    summary = {key: 0 for key in ("total", "queued", "running", "processed", "ai_results", "no_material",
-                                  "exceptions", "paused", "not_started")}
-    summary["categories"] = dict.fromkeys(("unclassified", *CONTACT_ROLE_CODES), 0)
-    summary["enabled"] = any(row.get("identity_ai_enabled") for row in rows)
+    categories = dict.fromkeys(("unclassified", *CONTACT_ROLE_CODES), 0)
     for row in rows:
-        count = int(row["count"])
-        summary["total"] += count
-        summary["categories"][row["category"]] += count
-        status, reason = row["identity_ai_status"], row["identity_ai_reason"]
-        if status in {"queued", "running"}:
-            summary[status] += count
-        elif status == "succeeded":
-            summary["processed"] += count
-            if reason in {"classified", "low_confidence"}:
-                summary["ai_results"] += count
-            elif reason in {"no_readable_messages", "no_substantive_messages"}:
-                summary["no_material"] += count
-        elif status in {"failed", "invalid"}:
-            summary["exceptions"] += count
-        elif status == "cancelled":
-            summary["paused"] += count
-        else:
-            summary["not_started"] += count
-    return summary
+        categories[row["category"]] += int(row["count"])
+    return {"total": sum(categories.values()), "categories": categories}
 
 
 def organization_sync_status() -> dict[str, Any]:
@@ -1531,31 +1501,6 @@ def _decorate_contact(row: dict[str, Any]) -> dict[str, Any]:
         "已核实同事" if source == "lark_internal_tenant" else
         "AI" if source == "ai_auto_confirmed" else "人工 / 已确认资料" if source else "—"
     )
-    status, reason = item.get("identity_ai_status"), item.get("identity_ai_reason")
-    item["identity_ai_reason_label"] = {
-        "classified": "本人发言支持明确类别",
-        "low_confidence": "置信度不足，保留待识别",
-        "no_readable_messages": "没有当前授权可读的本人消息",
-        "no_substantive_messages": "只有简短寒暄等信息，无法判断身份",
-        "verified_internal": "保留已核实的同事身份",
-        "protected_manual": "保留人工处理结果，不由 AI 覆盖",
-    }.get(reason, "")
-    item["identity_ai_status_label"] = {
-        "queued": "排队中", "running": "分析中", "succeeded": "已处理",
-        "failed": "分析异常", "invalid": "结果未通过校验", "cancelled": "已暂停",
-    }.get(status, "本轮未处理")
-    if not item.get("identity_ai_enabled") and status in {"queued", "running"}:
-        item["identity_ai_status_label"] = "已暂停，队列保留" if status == "queued" else "已暂停，等待在途任务收尾"
-    item["identity_ai_badge"] = {
-        "queued": "azure", "running": "primary", "succeeded": "success",
-        "failed": "danger", "invalid": "danger", "cancelled": "secondary",
-    }.get(status, "secondary")
-    try:
-        confidence = float(item.get("identity_ai_confidence"))
-    except (TypeError, ValueError):
-        confidence = -1
-    item["identity_ai_confidence_label"] = f"{confidence:.1%}" if 0 <= confidence <= 1 else "—"
-    item["identity_ai_finished_at_label"] = _format_time(item.get("identity_ai_finished_at"))
     item["organization_name"] = item.get("organization_name") or "未解析"
     item["organization_status"] = item.get("organization_status") or "unresolved"
     item["organization_status_label"], item["organization_status_badge"] = _organization_status(

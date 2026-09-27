@@ -1,6 +1,5 @@
 """Session-scoped creator candidates; CM review is a frontend permission, not an admin grant."""
 
-import json
 from urllib.parse import unquote
 from uuid import UUID
 
@@ -9,7 +8,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import creator_handles, creator_imports, creator_roster
+from . import creator_imports, creator_roster
 from .http_helpers import (
     csrf_matches as _csrf_matches,
 )
@@ -68,6 +67,8 @@ def create_router(*, current_authorization, render_template, csrf_token):
     @router.post("/runs/{run_id}/auto-admit")
     @router.post("/tasks/{task_id}/recheck")
     @router.post("/people/{contact_id}/type")
+    @router.post("/tasks/{task_id}/confirm")
+    @router.post("/tasks/{task_id}/defer")
     async def retired_action(request: Request):
         try:
             await form_for(request)
@@ -75,34 +76,14 @@ def create_router(*, current_authorization, render_template, csrf_token):
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
 
-    @router.post("/tasks/{task_id}/confirm")
-    @router.post("/tasks/{task_id}/defer")
-    async def review(request: Request, task_id: UUID):
+    @router.get("/tasks/{task_id}/evidence")
+    def retired_evidence(request: Request):
         try:
-            auth, form = await form_for(request)
-            if request.url.path.endswith("/confirm"):
-                try:
-                    handles = json.loads(form.get("handles", "[]"))
-                except ValueError as exc:
-                    raise ValueError("请输入或选择有效的 handle。") from exc
-                if not isinstance(handles, list) or not 1 <= len(handles) <= 20 or any(
-                    not isinstance(handle, str) or not handle.strip() or len(handle) > 160 for handle in handles
-                ):
-                    raise ValueError("请填写 1 至 20 个 handle，每个单独一行。")
-                await run_in_threadpool(creator_handles.confirm_task, auth["id"], task_id, handles)
-            else:
-                await run_in_threadpool(creator_handles.defer_task, auth["id"], task_id)
-            return payload({"ok": True})
-        except (ValueError, LookupError, PermissionError) as exc:
+            actor(current_authorization(request))
+            return payload({"error": "旧识别证据入口已退役。"}, 410)
+        except PermissionError as exc:
             return error(exc)
 
-    @router.get("/tasks/{task_id}/evidence")
-    def evidence(request: Request, task_id: UUID):
-        try:
-            auth = actor(current_authorization(request))
-            return payload(creator_handles.task_evidence(auth["id"], task_id))
-        except (ValueError, LookupError, PermissionError) as exc:
-            return error(exc)
 
     @router.post("/imports/preview")
     async def import_preview(request: Request, cm_id: UUID, creator_type: str = "cap"):

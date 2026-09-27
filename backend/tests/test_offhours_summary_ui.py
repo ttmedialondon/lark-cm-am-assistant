@@ -46,8 +46,10 @@ def render_admin(role="owner"):
 def test_admin_summary_form_has_native_window_inputs_and_disabled_default_without_identity_threshold():
     html = render_admin()
     forms = re.findall(r'<form action="/admin/ai".*?</form>', html, re.S)
-    assert 'name="feature" value="contact_assessment"' in forms[0]
-    assert 'min="0.95"' in forms[0] and 'name="enabled" value="1" checked' not in forms[0]
+    assert 'name="feature" value="contact_assessment"' not in html
+    assert 'name="auto_confirm_threshold"' not in html
+    assert 'name="feature" value="creator_import"' in forms[0]
+    assert 'name="enabled"' not in forms[0]
     summary_form = next(form for form in forms if 'name="feature" value="offhours_summary"' in form)
     assert 'name="csrf_token" value="fixture-csrf"' in summary_form
     assert ('type="datetime-local" id="summary-window-start" name="window_start" value="2026-09-09T18:00"'

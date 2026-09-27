@@ -15,8 +15,6 @@ from app import (
     admin,
     admin_permissions,
     admin_reporting,
-    contact_assessments,
-    creator_ownership,
     main,
     organization_sync,
 )
@@ -33,23 +31,13 @@ GET_ROUTES = (
     ("contacts", "/admin/contacts"),
     ("contacts", "/admin/contacts/ou_contact"),
     ("ai", "/admin/ai"),
-    ("ai", "/admin/ai/creator-ownership"),
-    ("ai", "/admin/ai/creator-ownership/data"),
     ("jobs", "/admin/jobs"),
 )
-ASSESSMENT_ROUTE = f"/admin/contacts/ou_contact/assessments/{TARGET}"
-OWNERSHIP_EVIDENCE_ROUTE = f"/admin/ai/creator-ownership/tasks/{TARGET}/evidence"
-PRIVATE_ROUTES = (ASSESSMENT_ROUTE, OWNERSHIP_EVIDENCE_ROUTE)
+PRIVATE_ROUTES = ()
 POST_ROUTES = (
     f"/admin/users/{TARGET}/permissions",
     "/admin/contacts/ou_contact/organization",
-    "/admin/contacts/ou_contact/assessments",
-    f"{ASSESSMENT_ROUTE}/roles",
-    f"{ASSESSMENT_ROUTE}/dismiss",
-    "/admin/ai",
-    "/admin/ai/resume",
-    "/admin/ai/creator-ownership/preview",
-    *(f"/admin/ai/creator-ownership/{TARGET}/{action}" for action in ("start", "pause", "resume", "confirm", "defer")),
+    "/admin/ai", "/admin/ai/resume",
 )
 
 
@@ -63,11 +51,10 @@ def data_fence(monkeypatch):
         raise _DataQueryReached
 
     for module in (
-        admin, admin_permissions, admin_reporting, contact_assessments,
-        organization_sync, creator_ownership,
+        admin, admin_permissions, admin_reporting,
+        organization_sync,
     ):
         monkeypatch.setattr(module, "connection", forbidden_query)
-    monkeypatch.setattr(creator_ownership, "get_settings", lambda: None)
 
 
 def _client(monkeypatch, *, permissions=(), owner=False, status="active", contexts=None):

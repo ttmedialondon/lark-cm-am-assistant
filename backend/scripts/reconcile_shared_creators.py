@@ -60,7 +60,7 @@ def library_check(conn):
 
 
 def main():
-    from app import creator_ownership
+    from app import creator_access
     from app.db import connection
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -68,7 +68,7 @@ def main():
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
     with connection() as conn:
-        creator_ownership._owner(conn, args.actor)
+        creator_access.require_owner(conn, args.actor)
         before = library_check(conn)
         rows = conn.execute("""SELECT r.id,r.handle,r.reason_code,a.display_name cm FROM creator_import_rows r
           JOIN creator_import_batches b ON b.id=r.batch_id JOIN authorizations a ON a.id=r.cm_authorization_id
@@ -78,7 +78,7 @@ def main():
     for row in rows:
         try:
             with connection() as conn, conn.transaction(force_rollback=not args.apply):
-                creator_ownership._owner(conn, args.actor)
+                creator_access.require_owner(conn, args.actor)
                 outcome = reconcile_row(conn, args.actor, row['id'])
         except (ValueError, PermissionError) as exc:
             outcome = 'still_blocked'

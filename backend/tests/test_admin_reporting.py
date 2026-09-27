@@ -140,16 +140,8 @@ def test_people_directory_all_contacts_current_policy_priority_and_unfiltered_pr
     assert by_name["manual"]["category"] == "merchant_contact"
     assert by_name["internal"]["classification_source_label"] == "已核实同事"
     assert by_name["old"]["category"] == by_name["low"]["category"] == "unclassified"
-    for name in ("manual", "internal", "old", "low", "orphan"):
-        assert by_name[name]["identity_ai_confidence_label"] == "—"
-    assert by_name["AI"]["identity_ai_confidence_label"] == "97.0%"
-    assert by_name["queued"]["identity_ai_status_label"] == "已暂停，队列保留"
     summary = directory["identity_summary"]
-    assert {key: summary[key] for key in ("total", "processed", "ai_results", "no_material", "exceptions",
-                                         "queued", "not_started")} == {
-        "total": 8, "processed": 5, "ai_results": 2, "no_material": 1, "exceptions": 1,
-        "queued": 1, "not_started": 1,
-    }
+    assert summary["total"] == 8 and summary["categories"]["creator"] == 1
     filtered = admin_reporting.contacts(category="creator", query=" AI ")
     assert [row["display_name"] for row in filtered["items"]] == ["AI"]
     assert filtered["identity_summary"] == summary and filtered["total_count"] == 1

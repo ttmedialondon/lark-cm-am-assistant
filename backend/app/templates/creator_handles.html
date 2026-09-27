@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}我的达人 · TT Media{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-ownership.css?v=20260911">{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-roster.css?v=20260927">{% endblock %}
 {% block body %}
 <div class="page" id="creators-app" data-csrf="{{ csrf_token }}" data-tab="{{ creator_tab }}">
   <header class="navbar navbar-expand-md"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media</a><div class="navbar-nav flex-row gap-2"><a class="nav-link" href="/dashboard">消息提醒</a><span class="nav-link text-secondary">{{ authorization.display_name or 'CM' }}</span></div></div></header>
@@ -20,8 +20,8 @@
     </section>
     <noscript><div class="alert alert-warning mt-3">请开启浏览器 JavaScript 后核对达人。</div></noscript>
   </div></div></main>
-  <dialog id="creators-evidence" class="ownership-evidence" aria-labelledby="creators-evidence-title"><div class="d-flex align-items-center gap-3 mb-3"><h3 id="creators-evidence-title" class="mb-0 me-auto">证据链</h3><button type="button" id="creators-evidence-close" class="btn btn-sm btn-outline-secondary">关闭</button></div><div id="creators-evidence-body" aria-live="polite"></div></dialog>
-  <dialog id="creators-import-dialog" class="ownership-evidence" aria-labelledby="creators-import-title"><div class="d-flex align-items-center gap-3 mb-3"><h3 id="creators-import-title" class="mb-0 me-auto">导入 CAP 达人账号名单</h3><button type="button" id="creators-import-close" class="btn btn-sm btn-outline-secondary">关闭</button></div>
+  <dialog id="creators-evidence" class="creator-evidence" aria-labelledby="creators-evidence-title"><div class="d-flex align-items-center gap-3 mb-3"><h3 id="creators-evidence-title" class="mb-0 me-auto">证据链</h3><button type="button" id="creators-evidence-close" class="btn btn-sm btn-outline-secondary">关闭</button></div><div id="creators-evidence-body" aria-live="polite"></div></dialog>
+  <dialog id="creators-import-dialog" class="creator-evidence" aria-labelledby="creators-import-title"><div class="d-flex align-items-center gap-3 mb-3"><h3 id="creators-import-title" class="mb-0 me-auto">导入 CAP 达人账号名单</h3><button type="button" id="creators-import-close" class="btn btn-sm btn-outline-secondary">关闭</button></div>
     <p>这份名单的负责人：<strong id="creators-import-cm"></strong></p>
     <p class="text-secondary">仅上传一列 handle，每行一个，可带 handle 表头。整份名单的属性固定为 CAP，上传者单独记录。</p>
     <p class="text-secondary small">确认导入后自动开始：找对应群 → 找用户 → 检查冲突 → 入库或待核对。每个 handle 单独匹配，支持查看完整证据链；不确定的账号可以修改、人工选择用户或暂缓。</p>

@@ -18,10 +18,10 @@ def encode(value):
 
 
 def config(conn):
-    # Sharing credentials does not couple this batch to the identity feature's on/off switch.
+    # CAP work is explicitly started per batch; saving credentials never starts a scan.
     return conn.execute(
         """SELECT provider,project_id,model,api_key_ciphertext FROM ai_feature_configs
-           WHERE feature='contact_assessment' AND provider='openai' AND api_key_ciphertext IS NOT NULL"""
+           WHERE feature='creator_import' AND provider='openai' AND api_key_ciphertext IS NOT NULL"""
     ).fetchone()
 
 
