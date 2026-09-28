@@ -93,10 +93,8 @@ def main():
     args = parser.parse_args()
     rows = json.loads(args.input.read_text())
     catalog = catalog_handles(args.catalog)
-    with connection() as conn:
+    with connection() as conn, conn.transaction(force_rollback=not args.apply):
         result = admit(conn, args.actor, rows, catalog)
-        if not args.apply:
-            conn.rollback()
     print(json.dumps(dict(result, applied=args.apply)))
 
 
