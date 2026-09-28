@@ -43,6 +43,7 @@ REASONS = {
     "ai_confirmed": "AI 已确认群和用户，证据及冲突检查通过，已自动入库。",
     "group_uncertain": "群对应关系尚未确定，请查看证据链。",
     "person_uncertain": "群已定位，但这个 handle 对应的用户尚未确定。",
+    "catalog_review_required": "账号关系有候选依据，但尚未核验 Curva 收录，需人工核对。",
     "group_unavailable": "对应群当前不可访问，请检查授权。",
     "no_readable_material": "负责人当前没有有效的可读聊天授权。",
     "account_conflict": "存在账号归属或人员身份冲突，未覆盖原资料",
@@ -518,7 +519,7 @@ def _review_reason(row, visible):
     if row["contact_id"] and not visible:
         return "对应用户当前不可访问，请重新选择可访问的 Lark 用户。"
     if row["status"] in {"pending", "preparing", "queued", "running"}:
-        return "系统正在找群、找人；证据充分且无冲突时会自动入库。"
+        return "系统正在核对群聊及账号归属；Curva 未核验的结果保留待核对。"
     return REASONS.get(row["reason_code"], REASONS["manual_review"])
 
 
@@ -715,6 +716,7 @@ def row_evidence(actor_id, row_id):
             ai_outcome = decision.get("outcome")
             # Historical decisions retain the rules under which they were admitted.
             if (pack.get("policy_version") == creator_import_evidence.POLICY_VERSION
+                    and pack.get("prompt_version") == creator_import_evidence.PROMPT_VERSION
                     and (decision.get("response") or {}).get("text")):
                 validator = (
                     creator_import_evidence.group_validate
@@ -1202,9 +1204,13 @@ def _finish(job, settings, *, response=None, result=None, reason=""):
         if matched and stage == "person":
             contact_id = creator_import_evidence.resolve_contact(chain["person"]["refs"], result.get("user_ref"))
             matched = bool(contact_id and not result.get("conflicts"))
+        catalog_verified = bool(stage == "person" and
+            chain.get("person", {}).get("pack", {}).get("catalog_check", {}).get("status") == "verified")
         next_stage = "person" if matched and stage == "group" else "completed"
         status = "pending" if next_stage == "person" else "invalid" if reason else "succeeded"
         reason = reason or ("" if matched else (result or {}).get("reason_code") or f"{stage}_review")
+        if matched and stage == "person" and not catalog_verified:
+            reason = "catalog_review_required"
         if reason == "person_not_found" and any(
             g.get("member_snapshot_status") != "succeeded" for g in chain["person"]["pack"]["groups"]
         ):
@@ -1230,7 +1236,7 @@ def _finish(job, settings, *, response=None, result=None, reason=""):
                 row["id"],
             ),
         )
-        if matched and stage == "person":
+        if matched and stage == "person" and catalog_verified:
             try:
                 with conn.transaction():
                     saved = conn.execute("SELECT * FROM creator_import_rows WHERE id=%s", (row["id"],)).fetchone()
@@ -1273,7 +1279,8 @@ def run_claimed_import(job, settings):
             key = api_key_cipher(settings.token_encryption_key).decrypt(config["api_key_ciphertext"])
             pack = chain[_stage(row)]["pack"]
             # Historical packs may contain retired classification metadata.
-            pack = {**pack, "roster": {"responsibility_confirmed": True}}
+            pack = {**pack, "roster": {"responsibility_confirmed": False, "purpose": "candidate_handles"},
+                    "catalog_check": {"source": "curva", "status": "not_provided"}}
             conn.execute("UPDATE creator_import_rows SET api_requests=api_requests+1 WHERE id=%s", (row["id"],))
         group = _stage(job) == "group"
         response = openai_client.call_openai(

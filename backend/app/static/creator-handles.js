@@ -238,7 +238,7 @@
       }
       else if (path.endsWith("/start")) {
         page = 1; clearRows();
-        notice("名单已导入，系统正在找群、找人。确定且无冲突的自动入库，其余保留待核对。");
+        notice("名单已导入，系统正在找群、找人。结果保留待核对，确认前请核验 Curva 收录及本人账号证据。");
       }
       else if (path.endsWith("/recheck")) notice("未确认的账号已重新排队，可在候选行查看进度和证据链。");
       else if (path.endsWith("/pause")) notice("已暂停，已发出的请求完成后不再开始下一步。");
@@ -263,7 +263,7 @@
       const nextStep = importPreview.status !== "preview" ? "这份表已导入，请查看导入记录及候选达人。" : counts.valid ? "请核对后确认导入。" : "请修改表格后重新上传。";
       importMessage(`有效 handle ${counts.valid || 0} · 重复 ${counts.duplicates || 0} · 无效 ${counts.invalid || 0}。${nextStep}`);
       const preview = el("import-preview"); preview.replaceChildren();
-      preview.append(node("p", `负责人：${selectedCMName()}。确认导入后，系统自动找群、找人并检查冲突；确定的入库，其余待核对。`, "small"));
+      preview.append(node("p", `负责人：${selectedCMName()}。确认导入后，系统自动找群、找人并检查冲突；结果保留待核对。`, "small"));
       const list = node("div", "", "border rounded p-2"); list.style.maxHeight = "240px"; list.style.overflowY = "auto";
       for (const item of (importPreview.rows || []).slice(0, 100)) {
         list.append(node("div", `第 ${item.row_number} 行 · ${item.handle || "—"}${item.error ? ` · ${item.error}` : ""}`, `small py-1 ${item.error ? "text-danger" : ""}`));
@@ -282,7 +282,7 @@
       await read(await fetch(`/creators/imports/${importPreview.id}/start`, {method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: new URLSearchParams({csrf_token: app.dataset.csrf})}));
       importPreview = null; el("import-dialog").close();
       page = 1; clearRows();
-      notice("名单已导入，系统正在找群、找人。确定且无冲突的自动入库，其余保留待核对。");
+      notice("名单已导入，系统正在找群、找人。结果保留待核对，确认前请核验 Curva 收录及本人账号证据。");
       void refresh();
     } catch (error) { importMessage(error.message, true); }
     finally { busy = false; render(); }

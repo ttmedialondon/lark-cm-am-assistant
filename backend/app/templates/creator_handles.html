@@ -5,7 +5,7 @@
 <div class="page" id="creators-app" data-csrf="{{ csrf_token }}" data-tab="{{ creator_tab }}">
   <header class="navbar navbar-expand-md"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media</a><div class="navbar-nav flex-row gap-2"><a class="nav-link" href="/dashboard">消息提醒</a><span class="nav-link text-secondary">{{ authorization.display_name or 'CM' }}</span></div></div></header>
   <main class="page-wrapper"><div class="page-body"><div class="container-xl">
-    <div class="d-flex align-items-center justify-content-between flex-wrap gap-3 mb-3"><div><h2 class="page-title">我的达人</h2><p class="text-secondary mb-0">导入 Excel 达人名单后，AI 依次找群、找人；通过冲突检查的入库，其余保留待核对。</p></div><div class="btn-list"><button type="button" id="creators-import-open" class="btn btn-primary">Excel 导入</button><button type="button" id="creators-refresh" class="btn btn-outline-secondary">刷新</button></div></div>
+    <div class="d-flex align-items-center justify-content-between flex-wrap gap-3 mb-3"><div><h2 class="page-title">我的达人</h2><p class="text-secondary mb-0">导入 Excel 达人名单后，AI 依次找群、找人；结果保留待核对，确认前核验 Curva 和本人账号证据。</p></div><div class="btn-list"><button type="button" id="creators-import-open" class="btn btn-primary">Excel 导入</button><button type="button" id="creators-refresh" class="btn btn-outline-secondary">刷新</button></div></div>
     <p class="text-secondary small">点击达人姓名可打开 Lark 私聊；请使用正确的 Lark 登录账号，只能打开该账号可访问的会话。</p>
     <div id="creators-notice" class="alert d-none" role="status"></div>
     {% if creator_data.can_select_cm %}<section class="card mb-3" aria-label="名单负责人"><div class="card-body">
@@ -24,7 +24,7 @@
   <dialog id="creators-import-dialog" class="creator-evidence" aria-labelledby="creators-import-title"><div class="d-flex align-items-center gap-3 mb-3"><h3 id="creators-import-title" class="mb-0 me-auto">导入达人账号名单</h3><button type="button" id="creators-import-close" class="btn btn-sm btn-outline-secondary">关闭</button></div>
     <p>这份名单的负责人：<strong id="creators-import-cm"></strong></p>
     <p class="text-secondary">仅上传一列 handle，每行一个，可带 handle 表头。上传者和负责人分别记录。</p>
-    <p class="text-secondary small">确认导入后自动开始：找对应群 → 找用户 → 检查冲突 → 入库或待核对。每个 handle 单独匹配，支持查看完整证据链；不确定的账号可以修改、人工选择用户或暂缓。</p>
+    <p class="text-secondary small">确认导入后自动开始：找对应群 → 找用户 → 检查冲突 → 入库或待核对。每个 handle 单独匹配，支持查看完整证据链；需人工核验账号证据和 Curva 收录后确认，也可暂缓。</p>
     <label for="creators-import-file" class="form-label">Excel 文件（.xlsx，最多 2 MB）</label><input type="file" id="creators-import-file" class="form-control" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
     <div id="creators-import-message" class="small mt-3" role="status" aria-live="polite"></div>
     <div id="creators-import-preview" class="mt-3" hidden></div>
@@ -32,5 +32,5 @@
   </dialog>
 </div>
 <script id="creators-initial" type="application/json">{{ creator_data|tojson }}</script>
-<script src="/static/creator-handles.js?v=20260928-unified-creators" defer></script>
+<script src="/static/creator-handles.js?v=20260928-research-prompt" defer></script>
 {% endblock %}
