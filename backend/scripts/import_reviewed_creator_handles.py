@@ -49,7 +49,7 @@ def admit(conn, actor, rows, catalog):
     with conn.transaction():
         for row in sorted(rows, key=lambda r: r['handle']):
             contact, handle = UUID(row['contact_id']), row['handle']
-            conn.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,137034))', (handle,))
+            conn.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,137034))', ('tiktok:' + handle,))
             if not conn.execute('SELECT id FROM contacts WHERE id=%s FOR UPDATE', (contact,)).fetchone():
                 raise ValueError('Contact not found')
             if creator_imports._identity_conflict(conn, contact):
