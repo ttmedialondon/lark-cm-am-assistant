@@ -1,4 +1,4 @@
-"""Single-CM CAP rosters: scoped evidence, AI group/person decisions and admission."""
+"""Single-CM creator rosters: scoped evidence, AI group/person decisions and admission."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ REASONS = {
     "person_uncertain": "群已定位，但这个 handle 对应的用户尚未确定。",
     "group_unavailable": "对应群当前不可访问，请检查授权。",
     "no_readable_material": "负责人当前没有有效的可读聊天授权。",
-    "account_conflict": "存在账号归属、人员分类或 CAP 属性冲突，未覆盖原资料",
+    "account_conflict": "存在账号归属或人员身份冲突，未覆盖原资料",
 }
 BATCH_LABELS = {"preview": "待确认导入", "running": "正在识别", "paused": "已暂停", "completed": "识别完成"}
 PHASE_LABELS = {"group": "AI 找群", "person": "AI 找人", "completed": "已完成"}
@@ -87,7 +87,6 @@ def _row(conn, actor, row_id):
     row = conn.execute(
         "SELECT * FROM creator_import_rows WHERE id=%s FOR UPDATE", (creator_access.parse_id(row_id),)
     ).fetchone()
-    row["batch_creator_type"] = batch["creator_type"]
     return row, batch
 
 
@@ -180,10 +179,7 @@ def _conflicts(conn, items):
         return []
     rows = conn.execute(
         """SELECT (
-            (x.roster_type<>'pending' AND EXISTS (
-                SELECT 1 FROM contacts c WHERE c.id=x.contact_id
-                  AND c.creator_type NOT IN ('pending',x.roster_type)))
-            OR EXISTS (SELECT 1 FROM contact_roles r WHERE r.contact_id=x.contact_id AND (
+            EXISTS (SELECT 1 FROM contact_roles r WHERE r.contact_id=x.contact_id AND (
                 r.status='confirmed' AND r.role<>'creator'
                   AND r.source NOT IN ('ai_auto_confirmed','lark_internal_tenant')
                 OR r.status='rejected' AND r.role='creator'))
@@ -196,10 +192,9 @@ def _conflicts(conn, items):
                             OR l.contact_id=x.contact_id AND l.status='rejected'))
                     OR EXISTS (SELECT 1 FROM creator_account_assignments a WHERE a.social_account_id=s.id
                         AND a.ended_at IS NULL AND a.contact_id<>x.contact_id)))
-        ) AS conflict FROM unnest(%s::uuid[],%s::text[],%s::text[])
-          WITH ORDINALITY AS x(contact_id,roster_type,handle,position) ORDER BY x.position""",
+        ) AS conflict FROM unnest(%s::uuid[],%s::text[])
+          WITH ORDINALITY AS x(contact_id,handle,position) ORDER BY x.position""",
         ([contact_id for _, contact_id, _ in items],
-         [row.get("batch_creator_type", "pending") for row, _, _ in items],
          [handle for _, _, handle in items]),
     ).fetchall()
     return [bool(row["conflict"]) for row in rows]
@@ -303,9 +298,6 @@ def _admit(conn, row, actor, handle, contact_id, *, automatic=False):
 
 def _record_roster_identity(conn, actor, contact_id, *, automatic=False):
     """Called only after account/person locks and all admission conflict checks."""
-    conn.execute(
-        "UPDATE contacts SET creator_type='cap',updated_at=NOW() WHERE id=%s AND creator_type<>'cap'", (contact_id,)
-    )
     if (
         automatic
         and conn.execute(
@@ -324,19 +316,21 @@ def _record_roster_identity(conn, actor, contact_id, *, automatic=False):
     )
 
 
-def preview_import(actor_id, cm_id, filename, content, creator_type="cap"):
-    if creator_type != "cap":
-        raise ValueError("本次仅支持 CAP 达人名单。")
+def preview_import(actor_id, cm_id, filename, content):
     parsed = parse_xlsx(filename, content)
     actor_id = creator_access.parse_id(actor_id)
     with connection() as conn, conn.transaction():
         cm_id, _ = creator_access.access(conn, actor_id, cm_id)
         fingerprint = hashlib.sha256(content).hexdigest()
-        batch = conn.execute(
+        # Reuse historical batches irrespective of their retired classification.
+        batch = conn.execute("""SELECT * FROM creator_import_batches WHERE cm_authorization_id=%s
+            AND uploaded_by=%s AND file_fingerprint=%s AND policy_version=%s
+            ORDER BY created_at,id LIMIT 1""", (cm_id, actor_id, fingerprint, POLICY_VERSION)).fetchone()
+        batch = batch or conn.execute(
             """INSERT INTO creator_import_batches
-            (id,cm_authorization_id,uploaded_by,filename,file_fingerprint,policy_version,preview_rows,counts,creator_type)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT(cm_authorization_id,uploaded_by,file_fingerprint,policy_version,creator_type)
+            (id,cm_authorization_id,uploaded_by,filename,file_fingerprint,policy_version,preview_rows,counts)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT ON CONSTRAINT creator_import_batch_identity
             DO UPDATE SET filename=EXCLUDED.filename RETURNING *""",
             (
                 uuid4(),
@@ -347,14 +341,12 @@ def preview_import(actor_id, cm_id, filename, content, creator_type="cap"):
                 POLICY_VERSION,
                 Jsonb(parsed["rows"]),
                 Jsonb(parsed["counts"]),
-                creator_type,
             ),
         ).fetchone()
         return {
             "id": str(batch["id"]),
             "status": batch["status"],
             "filename": batch["filename"],
-            "creator_type": batch["creator_type"],
             "counts": parsed["counts"],
             "rows": parsed["rows"],
         }
@@ -383,7 +375,6 @@ def start_import(actor_id, batch_id):
                         entry["handle"],
                     ),
                 ).fetchone()
-                row["batch_creator_type"] = "cap"
                 try:
                     with conn.transaction():
                         contact_id = _existing(conn, row)
@@ -391,12 +382,12 @@ def start_import(actor_id, batch_id):
                             if _conflict(conn, row, contact_id, row["handle"]):
                                 raise ValueError(REASONS["account_conflict"])
                             person = conn.execute(
-                                "SELECT creator_type FROM contacts WHERE id=%s", (contact_id,)
+                                "SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed'",
+                                (contact_id,),
                             ).fetchone()
                             # Reuse the verified identity; add only this CM's missing
                             # responsibility through the normal admission checks.
-                            # A previous pending CAP attribute needs manual confirmation.
-                            if person["creator_type"] == "cap":
+                            if person:
                                 if not _accessible(conn, row["cm_authorization_id"], contact_id):
                                     raise PermissionError("该用户不在这位负责人的可访问联系人范围内。")
                                 if not conn.execute(
@@ -511,7 +502,6 @@ def batch_summaries(conn, cm_id):
             {
                 "id": str(batch["id"]),
                 "filename": batch["filename"],
-                "creator_type": batch["creator_type"],
                 "status": batch["status"],
                 "status_label": BATCH_LABELS[batch["status"]],
                 "counts": counts,
@@ -594,7 +584,6 @@ def candidate_items(conn, cm_id, rows):
             "handle": r["handle"],
             "contact_id": str(r["contact_id"]) if r["contact_id"] in visible_ids else None,
             "display_name": (r["display_name"] or "—") if r["contact_id"] in visible_ids else "—",
-            "creator_type": r.get("batch_creator_type", "pending"),
             "kind": "import",
             "sources": source_labels(r),
             "source": " + ".join(source_labels(r)),
@@ -649,10 +638,10 @@ def _page_data(conn, cm_id, q="", page=1, *, include_candidates=True):
         return {"batches": decorated, "total": total}
     # Paginate before checking identity access; a refresh must never enumerate all CM-visible users.
     rows = conn.execute(
-        "WITH page_rows AS MATERIALIZED (SELECT r.*,b.creator_type batch_creator_type "
+        "WITH page_rows AS MATERIALIZED (SELECT r.* "
         + base
         + " ORDER BY r.created_at DESC,r.id LIMIT 25 OFFSET %s) "
-        "SELECT r.*,c.display_name,c.creator_type FROM page_rows r "
+        "SELECT r.*,c.display_name FROM page_rows r "
         "LEFT JOIN contacts c ON c.id=r.contact_id "
         "ORDER BY r.created_at DESC,r.id",
         (*params, (page - 1) * 25),
@@ -807,7 +796,7 @@ def row_evidence(actor_id, row_id):
                             "display_name": names["CM1"],
                             "classification": "本批负责人",
                             "status_label": "已排除",
-                            "reason": "由此人负责本批 CAP 名单。",
+                            "reason": "由此人负责本批达人名单。",
                         }
                     ]
                     for label in group["member_refs"]:
@@ -1133,7 +1122,7 @@ def claim_next_import():
 def _current(conn, job):
     conn.execute("SELECT id FROM creator_import_batches WHERE id=%s FOR UPDATE", (job["batch_id"],))
     row = conn.execute(
-        """SELECT r.*,b.status batch_status,b.uploaded_by,b.creator_type batch_creator_type
+        """SELECT r.*,b.status batch_status,b.uploaded_by
         FROM creator_import_rows r JOIN creator_import_batches b ON b.id=r.batch_id
         WHERE r.id=%s AND b.policy_version=%s FOR UPDATE OF r""",
         (job["id"], POLICY_VERSION),
@@ -1247,7 +1236,7 @@ def _finish(job, settings, *, response=None, result=None, reason=""):
                     saved = conn.execute("SELECT * FROM creator_import_rows WHERE id=%s", (row["id"],)).fetchone()
                     _admit(
                         conn,
-                        {**saved, "batch_creator_type": "cap"},
+                        saved,
                         row["uploaded_by"],
                         row["handle"],
                         contact_id,
@@ -1283,6 +1272,8 @@ def run_claimed_import(job, settings):
                 raise ValueError("configuration_changed")
             key = api_key_cipher(settings.token_encryption_key).decrypt(config["api_key_ciphertext"])
             pack = chain[_stage(row)]["pack"]
+            # Historical packs may contain retired classification metadata.
+            pack = {**pack, "roster": {"responsibility_confirmed": True}}
             conn.execute("UPDATE creator_import_rows SET api_requests=api_requests+1 WHERE id=%s", (row["id"],))
         group = _stage(job) == "group"
         response = openai_client.call_openai(

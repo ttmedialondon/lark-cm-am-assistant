@@ -1,6 +1,6 @@
 """Import owner-reviewed research links, restricted to a verified Curva archive.
 
-Dry-run by default. Never assigns a CM, changes CAP status or calls a model.
+Dry-run by default. Never assigns a CM, changes historical classification fields or calls a model.
 """
 import argparse
 import csv

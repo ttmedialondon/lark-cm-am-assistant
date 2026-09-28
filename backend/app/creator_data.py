@@ -18,7 +18,7 @@ def encode(value):
 
 
 def config(conn):
-    # CAP work is explicitly started per batch; saving credentials never starts a scan.
+    # Creator matching is explicitly started per batch; saving credentials never starts a scan.
     return conn.execute(
         """SELECT provider,project_id,model,api_key_ciphertext FROM ai_feature_configs
            WHERE feature='creator_import' AND provider='openai' AND api_key_ciphertext IS NOT NULL"""

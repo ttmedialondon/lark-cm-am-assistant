@@ -1,4 +1,4 @@
-"""Current CAP roster and import candidates, independent of the retired handle scanner."""
+"""Current creator roster and import candidates, independent of the retired handle scanner."""
 
 from . import contact_handles, creator_access, creator_imports
 from .db import connection
@@ -7,7 +7,7 @@ from .lark_api import private_chat_url
 
 
 def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
-    """Current library: Excel CAP candidates and confirmed people."""
+    """Current library: Excel import candidates and confirmed people."""
     query = str(query or "").strip()[:120]
     page = max(1, min(int(page), 10000))
     with connection() as conn:
@@ -31,7 +31,8 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
                                                include_candidates=tab == "candidates"))
         # Person-level and older account-level assignments describe the same
         # library. UNION ensures that a person with several handles appears once.
-        formal_base = """FROM contacts c WHERE c.creator_type='cap' AND c.id IN (
+        formal_base = """FROM contacts c WHERE EXISTS(SELECT 1 FROM contact_roles r
+            WHERE r.contact_id=c.id AND r.role='creator' AND r.status='confirmed') AND c.id IN (
             SELECT contact_id FROM contact_assignments
             WHERE responsible_authorization_id=%s AND ended_at IS NULL
             UNION SELECT contact_id FROM creator_account_assignments
@@ -60,7 +61,7 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
             total = conn.execute("SELECT count(*) n " + formal_base, args).fetchone()["n"] if query else confirmed
             pages = max(1,(total+24)//25)
             page = min(page,pages)
-            people = conn.execute("SELECT c.id,c.display_name,c.creator_type " + formal_base
+            people = conn.execute("SELECT c.id,c.display_name " + formal_base
                                   + " ORDER BY c.display_name,c.id LIMIT 25 OFFSET %s", [*args,(page-1)*25]).fetchall()
             imports_by_person = {person["id"]: [] for person in people}
             for row in conn.execute(
@@ -94,7 +95,7 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
                         evidence_rows.setdefault(row["handle"], {"id": str(row["id"]), "handle": row["handle"]})
                 items.append({
                     "id": str(person["id"]), "kind": "confirmed", "contact_id": str(person["id"]),
-                    "display_name": person["display_name"] or "未命名用户", "creator_type": person['creator_type'],
+                    "display_name": person["display_name"] or "未命名用户",
                     "open_id": identity["open_id"] if identity else None,
                     "avatar_url": safe_avatar_url(identity["avatar_url"]) if identity else None,
                     "private_chat_url": private_chat_url(identity["open_id"] if identity else None),

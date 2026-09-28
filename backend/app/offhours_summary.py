@@ -241,7 +241,8 @@ def _roster(conn, cm_id=REMI_ID):
                SELECT social_account_id FROM owners WHERE contact_id=c.id
                UNION SELECT social_account_id FROM legacy WHERE contact_id=c.id
            )
-           WHERE c.creator_type='cap'
+           WHERE EXISTS(SELECT 1 FROM contact_roles r WHERE r.contact_id=c.id
+             AND r.role='creator' AND r.status='confirmed')
              AND c.id IN (SELECT contact_id FROM people UNION SELECT contact_id FROM legacy)
            ORDER BY c.id,sa.id,i.open_id FOR SHARE OF c,i""",
         (cm_id, cm_id),
@@ -300,7 +301,7 @@ def _related_chats(conn, roster, *, settings=None, cm_id=REMI_ID):
     # Only a current formal account link can supply an admitted AI relationship.
     # Raw import refs include rejected candidates, so always resolve selected refs.
     rows = conn.execute(
-        """SELECT r.*,b.creator_type AS batch_creator_type
+        """SELECT r.*
            FROM contact_social_accounts l JOIN social_accounts s ON s.id=l.social_account_id
            JOIN creator_import_rows r ON r.id=l.import_row_id
            JOIN creator_import_batches b ON b.id=r.batch_id
@@ -308,7 +309,7 @@ def _related_chats(conn, roster, *, settings=None, cm_id=REMI_ID):
              AND l.contact_id=ANY(%s::uuid[]) AND s.id=ANY(%s::uuid[])
              AND s.platform='tiktok' AND lower(s.normalized_handle)=r.handle
              AND r.contact_id=l.contact_id AND r.cm_authorization_id=%s
-             AND b.cm_authorization_id=%s AND b.policy_version=%s AND b.creator_type='cap'
+             AND b.cm_authorization_id=%s AND b.policy_version=%s
              AND r.review_status='confirmed' AND r.status='succeeded' AND r.outcome='matched'
              AND r.pack_ciphertext IS NOT NULL AND r.result_ciphertext IS NOT NULL
            ORDER BY r.id FOR SHARE OF l,s,r,b""",

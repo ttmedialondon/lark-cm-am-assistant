@@ -78,10 +78,10 @@ def test_excel_upload_is_bounded_scoped_and_requires_explicit_start_and_confirma
     batch, row, person, foreign = uuid4(), uuid4(), uuid4(), uuid4()
     calls = []
 
-    def preview(actor_id, cm_id, filename, content, creator_type="cap"):
+    def preview(actor_id, cm_id, filename, content):
         if cm_id != actor_id:
             raise PermissionError("只能导入自己的名单。")
-        calls.append(("preview", actor_id, filename, content, creator_type))
+        calls.append(("preview", actor_id, filename, content))
         return {"id": str(batch), "status": "preview", "counts": {"valid": 1, "duplicates": 0, "invalid": 0},
                 "rows": [{"row_number": 2, "handle": "example", "error": ""}]}
 
@@ -101,10 +101,10 @@ def test_excel_upload_is_bounded_scoped_and_requires_explicit_start_and_confirma
     result = client.post(url, content=b"xlsx", headers=headers)
     assert result.status_code == 200 and result.json()["counts"]["valid"] == 1
     assert result.headers["cache-control"] == "no-store, max-age=0"
-    assert calls == [("preview", actor["id"], "CAP handles.xlsx", b"xlsx", "cap")]
-    for creator_type in ("non_cap", "pending"):
-        assert client.post(url + "&creator_type=" + creator_type, content=b"xlsx", headers=headers).status_code == 400
-    assert len(calls) == 1
+    assert calls == [("preview", actor["id"], "CAP handles.xlsx", b"xlsx")]
+    for creator_type in ("cap", "non_cap", "pending"):
+        assert client.post(url + "&creator_type=" + creator_type, content=b"xlsx", headers=headers).status_code == 200
+    assert len(calls) == 4
     assert client.post(f"/creators/imports/{batch}/start").status_code == 400
     assert client.post(f"/creators/imports/{batch}/start", data={"csrf_token": "csrf"}).status_code == 200
     assert calls[-1] == ("start", actor["id"], batch)

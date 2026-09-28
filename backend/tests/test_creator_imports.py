@@ -215,13 +215,12 @@ def test_cap_excel_two_stage_matching_manual_confirmation_and_replays_preserve_p
     batch = imports.preview_import(owner, cm, "roster.xlsx", data)
     assert batch["counts"] == {"valid": 3, "duplicates": 1, "invalid": 1}
     saved = pg.execute("SELECT * FROM creator_import_batches WHERE id=%s", (batch["id"],)).fetchone()
-    assert saved["uploaded_by"] == owner and saved["cm_authorization_id"] == cm and saved["creator_type"] == "cap"
+    assert saved["uploaded_by"] == owner and saved["cm_authorization_id"] == cm and saved["creator_type"] == "pending"
     assert not pg.execute("SELECT 1 FROM creator_import_rows").fetchone()
     assert not calls
     assert imports.preview_import(owner, cm, "roster.xlsx", data)["id"] == batch["id"]
-    for invalid_type in ("non_cap", "pending"):
-        with pytest.raises(ValueError):
-            imports.preview_import(owner, cm, "wrong.xlsx", data, creator_type=invalid_type)
+    pg.execute("UPDATE creator_import_batches SET creator_type='non_cap' WHERE id=%s", (batch["id"],))
+    assert imports.preview_import(owner, cm, "roster.xlsx", data)["id"] == batch["id"]
     imports.start_import(owner, batch["id"])
     imports.start_import(cm, batch["id"])
     rows = pg.execute("SELECT * FROM creator_import_rows ORDER BY handle").fetchall()
@@ -232,7 +231,7 @@ def test_cap_excel_two_stage_matching_manual_confirmation_and_replays_preserve_p
         "status"] == "running"
     candidates = imports.page_data(cm, cm)["candidates"]
     assert len(candidates) == 3
-    assert all(r["display_name"] == "—" and r["creator_type"] == "cap" and r["sources"] == ["Excel"]
+    assert all(r["display_name"] == "—" and "creator_type" not in r and r["sources"] == ["Excel"]
                for r in candidates)
     first, second, missing = (row_for(pg, batch, h) for h in ("beauty.one_12", "second_02", "missing"))
     drain(pilot)
@@ -240,12 +239,13 @@ def test_cap_excel_two_stage_matching_manual_confirmation_and_replays_preserve_p
     assert matched["contact_id"] == creator and matched["review_status"] == "confirmed"
     assert matched["api_requests"] == 2 and imports.source_labels(matched) == ["Excel", "AI"]
     assert [p["stage"] for p in calls if p["imported_handle"] == "beauty.one_12"] == ["group", "person"]
+    assert all(p['roster'] == {'responsibility_confirmed': True} for p in calls)
     imports.confirm_row(cm, first["id"], "beauty.one_12", creator)
     imports.confirm_row(cm, first["id"], "@Beauty.One_12", creator)
     imports.confirm_row(cm, second["id"], "corrected_02", creator)
     imports.defer_row(cm, missing["id"])
     assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 1
-    assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (creator,)).fetchone()["creator_type"] == "cap"
+    assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (creator,)).fetchone()["creator_type"] == "pending"
     assert pg.execute("SELECT status FROM contact_roles WHERE contact_id=%s AND role='creator'",
                       (creator,)).fetchone()["status"] == "confirmed"
     formal = creator_roster.page_data(cm, tab="mine")["items"]
@@ -263,7 +263,7 @@ def test_cap_excel_two_stage_matching_manual_confirmation_and_replays_preserve_p
     assert row_for(pg, again, "beauty.one_12")["reason_code"] == "existing"
     assert _snapshot(pg, facts) == facts
     conflict = row_for(pg, again, "legacy_account")
-    assert conflict["status"] == "pending" and conflict["contact_id"] == pilot.ids["legacy"]
+    assert conflict["status"] == "skipped" and conflict["reason_code"] == "authorization_changed"
     assert set(creator_roster.page_data(cm, tab="mine")["items"][0]["handles"]) == {"beauty.one_12", "corrected_02"}
     assert pg.execute("SELECT id,display_name FROM contacts ORDER BY id").fetchall() == before_people
     assert row_for(pg, batch, "corrected_02")["api_requests"] == 1
@@ -275,15 +275,8 @@ def test_cap_excel_two_stage_matching_manual_confirmation_and_replays_preserve_p
             review = imports.preview_import(owner, cm, "review.xlsx", workbook("beauty.one_12"))
             imports.start_import(owner, review["id"])
             row = row_for(pg, review, "beauty.one_12")
-            assert row["review_status"] == "pending" and _snapshot(pg, facts) == unchanged
-            if creator_type == "pending":
-                assert row["contact_id"] == creator and row["status"] == "pending"
-                assert row["stats"]["analysis_stage"] == "group"
-                imports.confirm_row(cm, row["id"], "beauty.one_12", creator)
-                assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (creator,)).fetchone()[
-                    "creator_type"] == "cap"
-            else:
-                assert row["contact_id"] is None and row["reason_code"] == "account_conflict"
+            assert row["review_status"] == "confirmed" and _snapshot(pg, facts) == unchanged
+            assert any(p["contact_id"] == str(creator) for p in creator_roster.page_data(cm)["items"])
 
 
 def test_manual_import_scope_identity_account_and_type_conflicts_are_atomic(pg, pilot, monkeypatch):
@@ -319,11 +312,9 @@ def test_manual_import_scope_identity_account_and_type_conflicts_are_atomic(pg, 
         imports.confirm_row(cm, row["id"], "creator_one", uuid4())
     with pytest.raises(ValueError):
         imports.confirm_row(cm, row["id"], "occupied", creator)
-    for conflict in ("account", "type", "merchant", "rejected"):
+    for conflict in ("account", "merchant", "rejected"):
         with pg.transaction(force_rollback=True):
-            if conflict == "type":
-                pg.execute("UPDATE contacts SET creator_type='non_cap' WHERE id=%s", (creator,))
-            elif conflict == "merchant":
+            if conflict == "merchant":
                 pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) "
                            "VALUES(%s,'merchant_contact','confirmed','manual')", (creator,))
             elif conflict == "rejected":
@@ -340,8 +331,11 @@ def test_manual_import_scope_identity_account_and_type_conflicts_are_atomic(pg, 
                                   (row["id"],)).fetchone()
     pg.execute("UPDATE creator_import_rows SET contact_id=%s,pack_ciphertext=%s WHERE id=%s",
                (creator, creator_data.cipher(pilot.settings).encrypt("{}"), row["id"]))
+    pg.execute("UPDATE contacts SET creator_type='non_cap' WHERE id=%s", (creator,))
     imports.confirm_row(cm, row["id"], "corrected_handle", creator)
     assert row_for(pg, batch, "corrected_handle")["review_status"] == "confirmed"
+    assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (creator,)).fetchone()['creator_type'] == 'non_cap'
+    assert creator_roster.page_data(cm)['items'][0]['contact_id'] == str(creator)
     prior = pg.execute("SELECT metadata->'previous' previous FROM audit_events "
                        "WHERE action='creator_import_evidence_invalidated' AND metadata->>'row_id'=%s",
                        (str(row["id"]),)).fetchone()["previous"]
@@ -758,7 +752,7 @@ def test_import_pages_and_user_search_only_expose_currently_accessible_identitie
             assert imports._accessible(pg, cm, contact)
             assert imports.search_users(cm, cm, "creator")[0]["id"] == str(contact)
             page = imports.page_data(cm, cm, q="creator")
-            assert page["total"] == 1 and page["candidates"][0]["creator_type"] == "cap"
+            assert page["total"] == 1 and "creator_type" not in page["candidates"][0]
 
     # A visible sender requires a readable observation after the CM's consent.
     with pg.transaction(force_rollback=True):
@@ -771,7 +765,7 @@ def test_import_pages_and_user_search_only_expose_currently_accessible_identitie
     assert imports.page_data(cm, cm, q="creator")["total"] == 0
     candidate = imports.page_data(cm, cm)["candidates"][0]
     assert candidate["handle"] == "roster_entry" and candidate["contact_id"] is None
-    assert candidate["display_name"] == "—" and candidate["creator_type"] == "cap"
+    assert candidate["display_name"] == "—" and "creator_type" not in candidate
     with pytest.raises(PermissionError):
         imports.confirm_row(cm, row["id"], "roster_entry", contact)
 
@@ -808,7 +802,7 @@ def test_leading_dot_repair_preserves_preview_and_existing_decisions(pg, pilot, 
         batch = imports.preview_import(cm, cm, "dots.xlsx", workbook("handle", "." + status, "regular_" + status))
         entries = batch["rows"]
         entries[0]["error"] = "handle 格式不正确"
-        pg.execute("UPDATE creator_import_batches SET status=%s,preview_rows=%s::jsonb WHERE id=%s",
+        pg.execute("UPDATE creator_import_batches SET creator_type='cap',status=%s,preview_rows=%s::jsonb WHERE id=%s",
                    (status, json.dumps(entries), batch["id"]))
     pg.execute(migration)
     pg.execute(migration)  # Replays must not duplicate rows or audits.
@@ -985,7 +979,7 @@ def test_creator_library_reset_preserves_sources_history_and_new_data_on_replay(
     pg.execute(migration)
     assert creator_roster.page_data(cm, tab="mine")["total_count"] == 1
     assert row_for(pg, new_batch, "creator_one")["review_status"] == "confirmed"
-    assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (creator,)).fetchone()["creator_type"] == "cap"
+    assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (creator,)).fetchone()["creator_type"] == "pending"
     assert pg.execute("SELECT count(*) n FROM audit_events WHERE action=%s", (action,)).fetchone()["n"] == 1
 
 

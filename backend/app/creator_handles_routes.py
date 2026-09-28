@@ -72,7 +72,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
     async def retired_action(request: Request):
         try:
             await form_for(request)
-            return payload({"error": "此操作已停用，请通过 Excel CAP 名单匹配和核对。"}, 410)
+            return payload({"error": "此操作已停用，请通过 Excel 达人名单匹配和核对。"}, 410)
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
 
@@ -86,13 +86,11 @@ def create_router(*, current_authorization, render_template, csrf_token):
 
 
     @router.post("/imports/preview")
-    async def import_preview(request: Request, cm_id: UUID, creator_type: str = "cap"):
+    async def import_preview(request: Request, cm_id: UUID):
         try:
             auth = actor(await run_in_threadpool(current_authorization, request))
             if not _csrf_matches({"csrf_token": request.headers.get("X-CSRF-Token", "")}, csrf_token(auth)):
                 raise ValueError("请求校验失败，请刷新页面后重试。")
-            if creator_type != "cap":
-                raise ValueError("当前导入仅支持 CAP 达人名单。")
             if request.headers.get("content-type", "").split(";", 1)[0] != "application/octet-stream":
                 raise ValueError("请上传 .xlsx 文件。")
             limit = creator_imports.MAX_FILE_BYTES
@@ -106,7 +104,6 @@ def create_router(*, current_authorization, render_template, csrf_token):
             filename = unquote(request.headers.get("X-Filename", "")[:512])
             result = await run_in_threadpool(
                 creator_imports.preview_import, auth["id"], cm_id, filename, bytes(content),
-                creator_type="cap",
             )
             return payload(result)
         except (ValueError, LookupError, PermissionError) as exc:

@@ -177,7 +177,10 @@ def seeded(pg, monkeypatch):
         )
     pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (ids["owner"],))
     for name in ("cm", "person", "other"):
-        pg.execute("INSERT INTO contacts(id,display_name,creator_type) VALUES(%s,%s,'cap')", (ids[name], name))
+        pg.execute("INSERT INTO contacts(id,display_name,creator_type) VALUES(%s,%s,'non_cap')", (ids[name], name))
+        if name != "cm":
+            pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) VALUES(%s,'creator','confirmed','manual')",
+                       (ids[name],))
         pg.execute(
             """INSERT INTO lark_identities(open_id,contact_id,display_name,tenant_classification)
                    VALUES(%s,%s,%s,%s)""",
@@ -342,7 +345,7 @@ def test_save_enabled_immediately_queues_claims_and_stores_encrypted_summary(pg,
     assert "future CM reply" not in json.dumps(s.calls)
     record = pg.execute("SELECT * FROM offhours_summary_tasks").fetchone()
     assert record["status"] == "succeeded" and "申请样品" not in record["result_ciphertext"]
-    assert not pg.execute("SELECT 1 FROM contact_roles").fetchone()
+    assert pg.execute("SELECT count(*) n FROM contact_roles").fetchone()["n"] == 2
     assert pg.execute("SELECT COUNT(*) AS n FROM creator_workflow_candidates").fetchone()["n"] == 1
     s.save(key="")
     ai.schedule_if_due(pg, force=True)
@@ -365,7 +368,7 @@ def test_acl_owner_remi_and_explicit_test_grant_not_arbitrary_roster_reviewer(pg
         ai.get_summary_view(pg, s.ids["tester"])
 
 
-@pytest.mark.parametrize("change", ["hide", "delete", "reassign", "non_cap", "consent"])
+@pytest.mark.parametrize("change", ["hide", "delete", "reassign", "rejected_identity", "consent"])
 def test_revocation_or_edit_before_provider_exports_nothing(pg, seeded, change):
     s = seeded
     s.save()
@@ -376,8 +379,8 @@ def test_revocation_or_edit_before_provider_exports_nothing(pg, seeded, change):
         pg.execute("UPDATE chat_messages SET is_deleted=TRUE WHERE message_id='m1'")
     elif change == "reassign":
         pg.execute("UPDATE contact_assignments SET ended_at=NOW()")
-    elif change == "non_cap":
-        pg.execute("UPDATE contacts SET creator_type='non_cap' WHERE id=%s", (s.ids["person"],))
+    elif change == "rejected_identity":
+        pg.execute("UPDATE contact_roles SET status='rejected' WHERE contact_id=%s", (s.ids["person"],))
     else:
         pg.execute("UPDATE authorizations SET body_consent_at=NULL WHERE id=%s", (s.ids["cm"],))
     ai.run_claimed_summary(job, s.settings)

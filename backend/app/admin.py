@@ -53,8 +53,8 @@ CurrentAuthorization = Callable[[Request], dict[str, Any] | None]
 CsrfToken = Callable[[dict[str, Any]], str]
 AI_FEATURES = {
     "creator_import": {
-        "title": "CAP 名单匹配",
-        "description": "仅处理手动启动的 CAP 导入批次，不扫描全员或推断负责人。",
+        "title": "达人名单匹配",
+        "description": "仅处理手动启动的 达人导入批次，不扫描全员或推断负责人。",
         "enabled_label": "按导入批次手动启动",
     },
     "offhours_summary": {

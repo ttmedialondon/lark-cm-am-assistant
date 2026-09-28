@@ -36,9 +36,8 @@
     handleCell.style.minWidth = "200px"; userCell.style.minWidth = "240px";
     const handle = node("input", "", "form-control"); handle.maxLength = 160;
     handle.setAttribute("aria-label", "达人 handle"); handle.placeholder = "—";
-    const creatorType = node("div", "", "small text-secondary mt-1");
     const groups = node("div", "", "small text-secondary mt-1");
-    handleCell.append(handle, creatorType, groups);
+    handleCell.append(handle, groups);
     const searchLine = node("div", "", "d-flex gap-1");
     const user = node("input", "", "form-control"); user.maxLength = 120; user.placeholder = "— 搜索对应用户";
     user.setAttribute("aria-label", "搜索当前负责人可访问的用户");
@@ -53,9 +52,8 @@
     const evidence = node("button", "查看证据链", "btn btn-sm btn-outline-secondary"); evidence.type = "button";
     evidence.addEventListener("click", () => showEvidence(item.id, parts.dirty));
     actionsList.append(confirm, defer, evidence); actions.append(actionsList, editNote);
-    const typeCell = node("td"); typeCell.hidden = true;
-    row.append(handleCell, userCell, typeCell, actions);
-    const parts = {row, handle, creatorType, groups, user, search, choices, editNote, confirm, defer, evidence, contactId: "", dirty: false, searchVersion: 0};
+    row.append(handleCell, userCell, actions);
+    const parts = {row, handle, groups, user, search, choices, editNote, confirm, defer, evidence, contactId: "", dirty: false, searchVersion: 0};
     const check = () => {
       confirm.disabled = busy || !parts.canConfirm || !handle.value.trim() || !parts.contactId;
       editNote.hidden = !parts.dirty;
@@ -98,7 +96,7 @@
     for (const batch of batches) {
       const line = node("div", "", "d-flex flex-wrap align-items-center gap-2 mb-2");
       const label = node("div", "", "me-auto");
-      label.append(node("strong", batch.filename || "Excel 名单"), node("span", ` · CAP · ${batch.status_label || batch.status}`, "text-secondary"));
+      label.append(node("strong", batch.filename || "Excel 名单"), node("span", ` · ${batch.status_label || batch.status}`, "text-secondary"));
       const counts = batch.counts || {};
       label.append(node("div", batch.status === "preview" ? `有效 handle ${counts.valid || 0}` : `已入库 ${counts.confirmed || 0} · 待核对 ${counts.review || 0} · 待处理 ${(counts.pending || 0) + (counts.queued || 0)} · 分析中 ${(counts.preparing || 0) + (counts.running || 0)}${counts.failed ? ` · 异常 ${counts.failed}` : ""}`, "small text-secondary"));
       if (batch.error) label.append(node("div", batch.error, "small text-danger"));
@@ -118,7 +116,6 @@
       parts.contactId = item.contact_id || "";
     }
     parts.canConfirm = !!item.can_confirm;
-    parts.creatorType.textContent = "CAP 属性：CAP";
     parts.groups.textContent = item.group_names?.length ? `群：${item.group_names.join("、")}` : "群：—";
     parts.editNote.hidden = !parts.dirty;
     parts.handle.disabled = busy || !parts.canConfirm; parts.user.disabled = busy || !parts.canConfirm;
@@ -141,14 +138,12 @@
     personWrap.append(avatar, name); person.append(personWrap);
     const handleCell = node("td"); handleCell.style.minWidth = "250px";
     const saved = node("div", "", "mb-2"); handleCell.append(saved);
-    const typeCell = node("td", "CAP");
     const actions = node("td");
-    const parts = {row, name, avatar, initial, saved, typeCell, actions};
-    row.append(handleCell, person, typeCell, actions);
+    const parts = {row, name, avatar, initial, saved, actions};
+    row.append(handleCell, person, actions);
     return parts;
   }
   function render() {
-    el("type-column").hidden = tab === "candidates";
     el("unassigned").hidden = !data.can_view_unassigned;
     el("import-open").hidden = Boolean(data.read_only);
     el("candidates").hidden = Boolean(data.read_only);
@@ -190,8 +185,6 @@
         parts.saved.append(node("span", `@${handle.replace(/^@/, "")}`));
       }
       if (!item.handles?.length) parts.saved.textContent = "—";
-      parts.typeCell.hidden = tab === "candidates";
-      parts.typeCell.textContent = ({cap: "CAP", non_cap: "非 CAP", pending: "待定"})[item.creator_type] || "待定";
       parts.actions.replaceChildren();
       for (const evidenceRow of item.evidence_rows || []) {
         const button = node("button", `@${evidenceRow.handle} · 查看证据链`, "btn btn-sm btn-outline-secondary d-block mb-1");
@@ -263,14 +256,14 @@
     busy = true; importPreview = null; render(); importMessage("正在检查表格…");
     el("import-preview").hidden = true;
     try {
-      importPreview = await read(await fetch(`/creators/imports/preview?${new URLSearchParams({cm_id: selectedCM(), creator_type: "cap"})}`, {
+      importPreview = await read(await fetch(`/creators/imports/preview?${new URLSearchParams({cm_id: selectedCM()})}`, {
         method: "POST", headers: {"Content-Type": "application/octet-stream", "X-CSRF-Token": app.dataset.csrf, "X-Filename": encodeURIComponent(file.name)}, body: file,
       }));
       const counts = importPreview.counts || {};
       const nextStep = importPreview.status !== "preview" ? "这份表已导入，请查看导入记录及候选达人。" : counts.valid ? "请核对后确认导入。" : "请修改表格后重新上传。";
       importMessage(`有效 handle ${counts.valid || 0} · 重复 ${counts.duplicates || 0} · 无效 ${counts.invalid || 0}。${nextStep}`);
       const preview = el("import-preview"); preview.replaceChildren();
-      preview.append(node("p", `负责人：${selectedCMName()} · CAP 属性：CAP。确认导入后，系统自动找群、找人并检查冲突；确定的入库，其余待核对。`, "small"));
+      preview.append(node("p", `负责人：${selectedCMName()}。确认导入后，系统自动找群、找人并检查冲突；确定的入库，其余待核对。`, "small"));
       const list = node("div", "", "border rounded p-2"); list.style.maxHeight = "240px"; list.style.overflowY = "auto";
       for (const item of (importPreview.rows || []).slice(0, 100)) {
         list.append(node("div", `第 ${item.row_number} 行 · ${item.handle || "—"}${item.error ? ` · ${item.error}` : ""}`, `small py-1 ${item.error ? "text-danger" : ""}`));

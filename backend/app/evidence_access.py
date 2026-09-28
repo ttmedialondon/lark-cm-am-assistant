@@ -1,4 +1,4 @@
-"""Shared CAP evidence helpers; no identity or ownership scanning."""
+"""Shared creator evidence helpers; no identity or ownership scanning."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Recheck existing CAP imports against verified identities; dry-run unless --apply.
+"""Recheck existing creator imports against verified identities; dry-run unless --apply.
 
 Never infer an identity, send messages, grant chat access, or undo a deferred review.
 """
@@ -28,8 +28,9 @@ def reconcile_row(conn, actor, row_id):
         return 'needs_identity_evidence'
     if row['contact_id'] and row['contact_id'] != person:
         return 'different_person'
-    if conn.execute('SELECT creator_type FROM contacts WHERE id=%s', (person,)).fetchone()['creator_type'] != 'cap':
-        return 'needs_cap_review'
+    if not conn.execute("SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed'",
+                        (person,)).fetchone():
+        return 'needs_identity_review'
     # Reuses the same locks, current visibility, identity and account conflict checks as admission.
     imports._admit(conn, row, actor, row['handle'], person, automatic=True)
     conn.execute("UPDATE creator_import_rows SET reason_code='existing' WHERE id=%s", (row_id,))

@@ -1,4 +1,4 @@
-"""Shared CAP evidence helpers; no identity or ownership scanning."""
+"""Shared creator evidence helpers; no identity or ownership scanning."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import re
 
 from cryptography.exceptions import InvalidTag
 
-from .message_text import evidence_body as _readable_body  # noqa: F401 - shared CAP reader
+from .message_text import evidence_body as _readable_body  # noqa: F401 - shared creator reader
 from .openai_client import ModelOutputError as _ModelOutputError
 
 _IMPORTANT = re.compile(

@@ -5,7 +5,7 @@
 <div class="page" id="creators-app" data-csrf="{{ csrf_token }}" data-tab="{{ creator_tab }}">
   <header class="navbar navbar-expand-md"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media</a><div class="navbar-nav flex-row gap-2"><a class="nav-link" href="/dashboard">消息提醒</a><span class="nav-link text-secondary">{{ authorization.display_name or 'CM' }}</span></div></div></header>
   <main class="page-wrapper"><div class="page-body"><div class="container-xl">
-    <div class="d-flex align-items-center justify-content-between flex-wrap gap-3 mb-3"><div><h2 class="page-title">我的达人</h2><p class="text-secondary mb-0">导入 Excel CAP 名单后，AI 依次找群、找人；通过冲突检查的入库，其余保留待核对。</p></div><div class="btn-list"><button type="button" id="creators-import-open" class="btn btn-primary">Excel 导入</button><button type="button" id="creators-refresh" class="btn btn-outline-secondary">刷新</button></div></div>
+    <div class="d-flex align-items-center justify-content-between flex-wrap gap-3 mb-3"><div><h2 class="page-title">我的达人</h2><p class="text-secondary mb-0">导入 Excel 达人名单后，AI 依次找群、找人；通过冲突检查的入库，其余保留待核对。</p></div><div class="btn-list"><button type="button" id="creators-import-open" class="btn btn-primary">Excel 导入</button><button type="button" id="creators-refresh" class="btn btn-outline-secondary">刷新</button></div></div>
     <p class="text-secondary small">点击达人姓名可打开 Lark 私聊；请使用正确的 Lark 登录账号，只能打开该账号可访问的会话。</p>
     <div id="creators-notice" class="alert d-none" role="status"></div>
     {% if creator_data.can_select_cm %}<section class="card mb-3" aria-label="名单负责人"><div class="card-body">
@@ -14,16 +14,16 @@
     </div></section>{% endif %}
     <section class="card mb-3" id="creators-import-batches" hidden aria-label="Excel 导入记录"><div class="card-header"><h3 class="card-title">Excel 导入记录</h3></div><div id="creators-import-batch-list" class="card-body"></div></section>
     <section class="card"><div class="card-header d-flex align-items-center flex-wrap gap-3"><div class="btn-list me-auto" role="group" aria-label="达人列表"><button type="button" id="creators-mine" class="btn">我的达人</button><button type="button" id="creators-candidates" class="btn">候选达人</button><button type="button" id="creators-unassigned" class="btn" hidden>未分配达人</button></div><form id="creators-search" class="d-flex gap-2" role="search"><label class="visually-hidden" for="creators-query">姓名或 handle</label><input class="form-control" id="creators-query" type="search" value="{{ creator_query }}" maxlength="120" placeholder="搜索姓名或 handle"><button class="btn btn-outline-secondary" type="submit">搜索</button></form></div>
-      <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th scope="col">达人 handle</th><th scope="col">Lark 用户</th><th scope="col" id="creators-type-column"{% if creator_tab != 'mine' %} hidden{% endif %}>CAP 属性</th><th scope="col">操作</th></tr></thead><tbody id="creators-rows"></tbody></table></div>
+      <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th scope="col">达人 handle</th><th scope="col">Lark 用户</th><th scope="col">操作</th></tr></thead><tbody id="creators-rows"></tbody></table></div>
       <div class="card-body text-secondary" id="creators-empty">{% if creator_tab == 'mine' %}还没有已入库的达人。{% else %}暂无候选达人。{% endif %}</div>
       <div class="card-footer d-flex align-items-center justify-content-between"><span id="creators-page-label" class="text-secondary"></span><div class="btn-list"><button type="button" id="creators-previous" class="btn btn-sm btn-outline-secondary">上一页</button><button type="button" id="creators-next" class="btn btn-sm btn-outline-secondary">下一页</button></div></div>
     </section>
     <noscript><div class="alert alert-warning mt-3">请开启浏览器 JavaScript 后核对达人。</div></noscript>
   </div></div></main>
   <dialog id="creators-evidence" class="creator-evidence" aria-labelledby="creators-evidence-title"><div class="d-flex align-items-center gap-3 mb-3"><h3 id="creators-evidence-title" class="mb-0 me-auto">证据链</h3><button type="button" id="creators-evidence-close" class="btn btn-sm btn-outline-secondary">关闭</button></div><div id="creators-evidence-body" aria-live="polite"></div></dialog>
-  <dialog id="creators-import-dialog" class="creator-evidence" aria-labelledby="creators-import-title"><div class="d-flex align-items-center gap-3 mb-3"><h3 id="creators-import-title" class="mb-0 me-auto">导入 CAP 达人账号名单</h3><button type="button" id="creators-import-close" class="btn btn-sm btn-outline-secondary">关闭</button></div>
+  <dialog id="creators-import-dialog" class="creator-evidence" aria-labelledby="creators-import-title"><div class="d-flex align-items-center gap-3 mb-3"><h3 id="creators-import-title" class="mb-0 me-auto">导入达人账号名单</h3><button type="button" id="creators-import-close" class="btn btn-sm btn-outline-secondary">关闭</button></div>
     <p>这份名单的负责人：<strong id="creators-import-cm"></strong></p>
-    <p class="text-secondary">仅上传一列 handle，每行一个，可带 handle 表头。整份名单的属性固定为 CAP，上传者单独记录。</p>
+    <p class="text-secondary">仅上传一列 handle，每行一个，可带 handle 表头。上传者和负责人分别记录。</p>
     <p class="text-secondary small">确认导入后自动开始：找对应群 → 找用户 → 检查冲突 → 入库或待核对。每个 handle 单独匹配，支持查看完整证据链；不确定的账号可以修改、人工选择用户或暂缓。</p>
     <label for="creators-import-file" class="form-label">Excel 文件（.xlsx，最多 2 MB）</label><input type="file" id="creators-import-file" class="form-control" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
     <div id="creators-import-message" class="small mt-3" role="status" aria-live="polite"></div>
@@ -32,5 +32,5 @@
   </dialog>
 </div>
 <script id="creators-initial" type="application/json">{{ creator_data|tojson }}</script>
-<script src="/static/creator-handles.js?v=20260928-curva" defer></script>
+<script src="/static/creator-handles.js?v=20260928-unified-creators" defer></script>
 {% endblock %}
