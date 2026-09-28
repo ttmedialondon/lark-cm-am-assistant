@@ -28,6 +28,41 @@ from app.crypto import message_body_cipher
 pilot = parent_pilot
 
 
+def test_reviewed_curva_admission_and_unassigned_visibility(pg, pilot, monkeypatch):
+    from scripts.import_reviewed_creator_handles import admit
+
+    prepare(pg, pilot, monkeypatch)
+    owner, cm = pilot.ids['owner'], pilot.ids['cm']
+    contact = uuid4()
+    pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,'Reviewed person')", (contact,))
+    rows = [{'contact_id': str(contact), 'handle': 'curva_reviewed', 'message_ids': ['reviewed-message']}]
+    protected = _snapshot(pg, ('contact_assignments', 'creator_account_assignments'))
+    with pytest.raises(ValueError, match='Curva'):
+        admit(pg, owner, rows, set())
+    with pytest.raises(PermissionError):
+        admit(pg, cm, rows, {'curva_reviewed'})
+    assert admit(pg, owner, rows, {'curva_reviewed'})['new_links'] == 1
+    after = _snapshot(pg, ('contact_roles', 'contact_social_accounts', 'audit_events'))
+    assert admit(pg, owner, rows, {'curva_reviewed'})['new_links'] == 0
+    assert _snapshot(pg, ('contact_roles', 'contact_social_accounts', 'audit_events')) == after
+    assert _snapshot(pg, ('contact_assignments', 'creator_account_assignments')) == protected
+    assert pg.execute('SELECT creator_type FROM contacts WHERE id=%s', (contact,)).fetchone()['creator_type'] == 'pending'
+    data = creator_roster.page_data(owner, tab='unassigned', query='curva_reviewed')
+    assert data['total_count'] == 1 and data['read_only']
+    assert data['items'][0]['handles'] == ['curva_reviewed']
+    assert not creator_roster.page_data(cm)['items']
+    with pytest.raises(PermissionError):
+        creator_roster.page_data(cm, tab='unassigned')
+    monkeypatch.setattr(admin_reporting, 'connection', lambda: nullcontext(pg))
+    directory = admin_reporting.contacts(query='curva_reviewed')
+    assert directory['total_count'] == 1
+    assert directory['items'][0]['handles'] == ['curva_reviewed']
+    other = uuid4()
+    pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,'Other person')", (other,))
+    with pytest.raises(ValueError, match='relationship conflict'):
+        admit(pg, owner, [dict(rows[0], contact_id=str(other))], {'curva_reviewed'})
+
+
 def test_retirement_preserves_cap_and_stops_every_old_queue(pg, pilot, monkeypatch):
     prepare(pg, pilot, monkeypatch)
     owner, cm, creator = (pilot.ids[k] for k in ("owner", "cm", "creator"))

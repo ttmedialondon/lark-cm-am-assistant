@@ -12,15 +12,16 @@
         </div>
         <form action="/admin/contacts" method="get" class="d-flex align-items-center gap-2 ms-xl-auto" role="search">
           <input type="hidden" name="category" value="{{ category }}">
-          <label class="visually-hidden" for="people-query">姓名</label><input id="people-query" class="form-control form-control-sm" type="search" name="q" value="{{ q }}" maxlength="120" size="16" placeholder="搜索姓名">
+          <label class="visually-hidden" for="people-query">姓名或 handle</label><input id="people-query" class="form-control form-control-sm" type="search" name="q" value="{{ q }}" maxlength="120" size="16" placeholder="搜索姓名或 handle">
           <button class="btn btn-sm btn-outline-primary" type="submit">搜索</button>{% if q %}<a class="btn btn-sm btn-link" href="/admin/contacts?category={{ category }}">清除</a>{% endif %}
         </form>
       </div>
       {% if contacts %}
       <div class="table-responsive admin-directory__table"><table class="table table-vcenter card-table">
-        <thead><tr><th>人员</th><th>类别</th><th>会话 / 本人消息</th><th></th></tr></thead>
+        <thead><tr><th>人员</th><th>TikTok handle</th><th>类别</th><th>会话 / 本人消息</th><th></th></tr></thead>
         <tbody>{% for contact in contacts %}<tr>
           <td><div class="d-flex align-items-center gap-2"><span class="avatar avatar-sm rounded-circle flex-shrink-0 position-relative overflow-hidden" aria-hidden="true">{{ (contact.display_name or '?')[:1]|upper }}{% if contact.avatar_url %}<img data-contact-avatar="{{ contact.avatar_url }}" alt="" loading="lazy" referrerpolicy="no-referrer" width="32" height="32" class="position-absolute top-0 start-0 w-100 h-100" style="object-fit:cover;visibility:hidden">{% endif %}</span><div><div class="fw-medium">{% if contact.private_chat_url %}<a href="{{ contact.private_chat_url }}" target="_blank" rel="noopener noreferrer" title="在 Lark 中打开你与此人的私聊">{{ contact.display_name }}</a>{% else %}{{ contact.display_name }}{% endif %}</div>{% if contact.lark_identity_count > 1 %}<div class="text-secondary small">{{ contact.lark_identity_count }} 个 Lark 身份，合计为 1 人</div>{% endif %}</div></div></td>
+          <td>{% for handle in contact.handles %}<div>@{{ handle }}</div>{% else %}<span class="text-secondary">—</span>{% endfor %}</td>
           <td><span class="badge bg-{{ contact.category_badge }}-lt">{{ contact.category_label }}</span></td>
           <td>{{ contact.conversation_count }} / {{ contact.message_count }}</td>
           <td class="text-end">{% if contact.open_id %}<a class="btn btn-sm btn-outline-primary" href="/admin/contacts/{{ contact.open_id }}?page={{ contact_page.page }}&amp;category={{ category }}{% if name_query_param %}&amp;{{ name_query_param }}{% endif %}">查看</a>{% else %}<span class="text-secondary">—</span>{% endif %}</td>

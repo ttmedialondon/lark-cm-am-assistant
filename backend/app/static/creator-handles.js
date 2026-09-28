@@ -148,11 +148,12 @@
     return parts;
   }
   function render() {
-    el("type-column").hidden = tab !== "mine";
+    el("type-column").hidden = tab === "candidates";
+    el("unassigned").hidden = !data.can_view_unassigned;
     el("import-open").hidden = Boolean(data.read_only);
     el("candidates").hidden = Boolean(data.read_only);
     if (data.can_select_cm) el("cm").disabled = busy;
-    for (const key of ["mine", "candidates"]) {
+    for (const key of ["mine", "candidates", "unassigned"]) {
       el(key).className = `btn ${key === tab ? "btn-primary" : "btn-outline-secondary"}`;
       el(key).setAttribute("aria-pressed", String(key === tab));
       el(key).disabled = busy;
@@ -189,7 +190,8 @@
         parts.saved.append(node("span", `@${handle.replace(/^@/, "")}`));
       }
       if (!item.handles?.length) parts.saved.textContent = "—";
-      parts.typeCell.hidden = tab !== "mine";
+      parts.typeCell.hidden = tab === "candidates";
+      parts.typeCell.textContent = ({cap: "CAP", non_cap: "非 CAP", pending: "待定"})[item.creator_type] || "待定";
       parts.actions.replaceChildren();
       for (const evidenceRow of item.evidence_rows || []) {
         const button = node("button", `@${evidenceRow.handle} · 查看证据链`, "btn btn-sm btn-outline-secondary d-block mb-1");
@@ -201,8 +203,8 @@
     }
     page = data.page || 1;
     el("empty").hidden = !!data.items?.length;
-    el("empty").textContent = tab === "mine" ? "还没有已入库的达人。" : "暂无候选达人。";
-    el("page-label").textContent = `共 ${data.total_count || 0} ${tab === "mine" ? "人" : "条"} · 第 ${page} / ${Math.max(1, data.total_pages || 0)} 页`;
+    el("empty").textContent = tab === "candidates" ? "暂无候选达人。" : "暂无达人。";
+    el("page-label").textContent = `共 ${data.total_count || 0} ${tab === "candidates" ? "条" : "人"} · 第 ${page} / ${Math.max(1, data.total_pages || 0)} 页`;
     el("previous").disabled = busy || page <= 1; el("next").disabled = busy || page >= (data.total_pages || 1);
     renderImports();
   }
@@ -368,7 +370,7 @@
       list(conclusion, evidence.conflicts, "text-danger");
     } catch (error) { if (token === evidenceVersion) body.textContent = error.message; }
   }
-  for (const key of ["mine", "candidates"]) el(key).addEventListener("click", () => { tab = key; page = 1; clearRows(); refresh(); });
+  for (const key of ["mine", "candidates", "unassigned"]) el(key).addEventListener("click", () => { tab = key; page = 1; clearRows(); refresh(); });
   el("search").addEventListener("submit", event => { event.preventDefault(); query = el("query").value.trim(); page = 1; clearRows(); refresh(); });
   el("refresh").addEventListener("click", () => refresh());
   el("previous").addEventListener("click", () => { page--; clearRows(); refresh(); });

@@ -1,6 +1,6 @@
 """Current CAP roster and import candidates, independent of the retired handle scanner."""
 
-from . import creator_access, creator_imports
+from . import contact_handles, creator_access, creator_imports
 from .db import connection
 from .identity_profiles import safe_avatar_url
 from .lark_api import private_chat_url
@@ -11,9 +11,13 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
     query = str(query or "").strip()[:120]
     page = max(1, min(int(page), 10000))
     with connection() as conn:
+        unassigned = tab == 'unassigned'
+        if unassigned:
+            creator_access.require_owner(conn, actor_id)
         cm_id, can_manage = creator_access.access(conn, actor_id, cm_id, read_only=tab != "candidates")
+        can_view_unassigned = creator_access.is_owner(conn, actor_id)
         can_select_cm = creator_access.can_view_all(conn, actor_id)
-        read_only = not can_manage and creator_access.parse_id(actor_id) != cm_id
+        read_only = unassigned or (not can_manage and creator_access.parse_id(actor_id) != cm_id)
         cms = [
             {"id": str(r["id"]), "name": r["display_name"] or "未命名用户"}
             for r in conn.execute(
@@ -33,6 +37,12 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
             UNION SELECT contact_id FROM creator_account_assignments
             WHERE responsible_authorization_id=%s AND ended_at IS NULL)"""
         args = [cm_id, cm_id]
+        if unassigned:
+            formal_base = """FROM contacts c WHERE EXISTS(SELECT 1 FROM contact_roles r
+                WHERE r.contact_id=c.id AND r.role='creator' AND r.status='confirmed')
+                AND NOT EXISTS(SELECT 1 FROM contact_assignments a WHERE a.contact_id=c.id AND a.ended_at IS NULL)
+                AND NOT EXISTS(SELECT 1 FROM creator_account_assignments a WHERE a.contact_id=c.id AND a.ended_at IS NULL)"""
+            args = []
         confirmed = conn.execute("SELECT count(*) n " + formal_base, args).fetchone()["n"]
         counts = dict.fromkeys(("pending", "preparing", "ready", "queued", "running", "succeeded", "skipped",
                                 "failed", "invalid", "total", "completed", "candidates", "confirmed"), 0)
@@ -70,18 +80,7 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
                     FROM lark_identities WHERE contact_id=ANY(%s::uuid[]) AND identity_type='user'
                     ORDER BY contact_id,last_seen_at DESC,open_id""", (ids,),
             ).fetchall()}
-            handles = {person_id: [] for person_id in ids}
-            for account in conn.execute(
-                """WITH links AS (
-                    SELECT contact_id,social_account_id FROM contact_social_accounts
-                    WHERE contact_id=ANY(%s::uuid[]) AND status='confirmed' AND relationship='owner'
-                    UNION SELECT contact_id,social_account_id FROM creator_account_assignments
-                    WHERE contact_id=ANY(%s::uuid[]) AND responsible_authorization_id=%s AND ended_at IS NULL
-                ) SELECT links.contact_id,s.display_handle FROM links
-                  JOIN social_accounts s ON s.id=links.social_account_id ORDER BY s.normalized_handle""",
-                (ids, ids, cm_id),
-            ).fetchall():
-                handles[account["contact_id"]].append(account["display_handle"])
+            handles = contact_handles.for_contacts(conn, ids, cm_id)
             items = []
             for person in people:
                 identity = identities.get(person["id"])
@@ -95,7 +94,7 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
                         evidence_rows.setdefault(row["handle"], {"id": str(row["id"]), "handle": row["handle"]})
                 items.append({
                     "id": str(person["id"]), "kind": "confirmed", "contact_id": str(person["id"]),
-                    "display_name": person["display_name"] or "未命名用户", "creator_type": "cap",
+                    "display_name": person["display_name"] or "未命名用户", "creator_type": person['creator_type'],
                     "open_id": identity["open_id"] if identity else None,
                     "avatar_url": safe_avatar_url(identity["avatar_url"]) if identity else None,
                     "private_chat_url": private_chat_url(identity["open_id"] if identity else None),
@@ -107,6 +106,7 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
         return {
             "cms": cms, "selected_cm_id": str(cm_id), "can_manage": can_manage,
             "can_select_cm": can_select_cm, "read_only": read_only,
+            "can_view_unassigned": can_view_unassigned,
             "run": None, "counts": counts, "usage": {"api_requests": 0, "input_tokens": 0, "output_tokens": 0},
             "import_batches": imported["batches"], "items": items,
             "total_count": total, "total_pages": pages, "page": page,

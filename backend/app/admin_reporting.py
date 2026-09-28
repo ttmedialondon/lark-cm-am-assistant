@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 from cryptography.exceptions import InvalidTag
 
+from . import contact_handles
 from .admin_permissions import PAGE_KEYS
 from .config import get_settings
 from .contact_taxonomy import CONTACT_ROLE_CODES, ORGANIZATION_KIND_LABELS, ROLE_LABELS, role_label
@@ -870,7 +871,7 @@ def contacts(
     organization_query = normalize_organization_query(organization_query)
     query = normalize_organization_query(query)
     filters = (category, category, organization_status, organization_status, organization_query, organization_query,
-               query, query)
+               query, query, query)
     with connection() as conn:
         # Materialize once: global category totals and the filtered page share
         # the same identity/classification snapshot without a cross-request cache.
@@ -896,7 +897,10 @@ def contacts(
                         AND POSITION(LOWER(%s) IN LOWER(organization_filter.canonical_name)) > 0
                   )
               )
-              AND (%s='' OR POSITION(LOWER(%s) IN LOWER(COALESCE(display_name,'')))>0)
+              AND (%s='' OR POSITION(LOWER(%s) IN LOWER(COALESCE(display_name,'')))>0
+                OR EXISTS(SELECT 1 FROM contact_social_accounts l JOIN social_accounts s ON s.id=l.social_account_id
+                  WHERE l.contact_id=directory.contact_id AND l.status='confirmed' AND l.relationship='owner'
+                  AND s.platform='tiktok' AND POSITION(LOWER(%s) IN LOWER(s.normalized_handle))>0))
             ), totals AS (
                 SELECT COUNT(*) AS total_count FROM filtered
             ), page_rows AS (
@@ -918,6 +922,7 @@ def contacts(
         rows = [row for row in rows if row["contact_id"] is not None]
         # Conversation/message counts are metadata, not model input. Count only this page's people.
         ids = [row["contact_id"] for row in rows]
+        handles = contact_handles.for_contacts(conn, ids)
         activity = conn.execute("""
             WITH identities AS (SELECT contact_id,open_id FROM lark_identities WHERE contact_id=ANY(%s::uuid[])),
             messages AS MATERIALIZED (
@@ -939,7 +944,8 @@ def contacts(
             FROM (SELECT DISTINCT contact_id FROM identities) person
             """, (ids,)).fetchall() if ids else []
     activity_by_id = {row["contact_id"]: row for row in activity}
-    result = _page_result([_decorate_contact({**row, **activity_by_id.get(row["contact_id"], {})})
+    result = _page_result([_decorate_contact({**row, **activity_by_id.get(row["contact_id"], {}),
+                                             'handles': handles.get(row['contact_id'], [])})
                            for row in rows], page, total_count=total_count)
     result["identity_summary"] = _identity_summary(counts)
     return result

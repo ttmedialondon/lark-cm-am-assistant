@@ -13,7 +13,7 @@
       <p class="text-secondary small mb-0 mt-2">选择 CM 查看对应的达人名单。</p>
     </div></section>{% endif %}
     <section class="card mb-3" id="creators-import-batches" hidden aria-label="Excel 导入记录"><div class="card-header"><h3 class="card-title">Excel 导入记录</h3></div><div id="creators-import-batch-list" class="card-body"></div></section>
-    <section class="card"><div class="card-header d-flex align-items-center flex-wrap gap-3"><div class="btn-list me-auto" role="group" aria-label="达人列表"><button type="button" id="creators-mine" class="btn">我的达人</button><button type="button" id="creators-candidates" class="btn">候选达人</button></div><form id="creators-search" class="d-flex gap-2" role="search"><label class="visually-hidden" for="creators-query">姓名或 handle</label><input class="form-control" id="creators-query" type="search" value="{{ creator_query }}" maxlength="120" placeholder="搜索姓名或 handle"><button class="btn btn-outline-secondary" type="submit">搜索</button></form></div>
+    <section class="card"><div class="card-header d-flex align-items-center flex-wrap gap-3"><div class="btn-list me-auto" role="group" aria-label="达人列表"><button type="button" id="creators-mine" class="btn">我的达人</button><button type="button" id="creators-candidates" class="btn">候选达人</button><button type="button" id="creators-unassigned" class="btn" hidden>未分配达人</button></div><form id="creators-search" class="d-flex gap-2" role="search"><label class="visually-hidden" for="creators-query">姓名或 handle</label><input class="form-control" id="creators-query" type="search" value="{{ creator_query }}" maxlength="120" placeholder="搜索姓名或 handle"><button class="btn btn-outline-secondary" type="submit">搜索</button></form></div>
       <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th scope="col">达人 handle</th><th scope="col">Lark 用户</th><th scope="col" id="creators-type-column"{% if creator_tab != 'mine' %} hidden{% endif %}>CAP 属性</th><th scope="col">操作</th></tr></thead><tbody id="creators-rows"></tbody></table></div>
       <div class="card-body text-secondary" id="creators-empty">{% if creator_tab == 'mine' %}还没有已入库的达人。{% else %}暂无候选达人。{% endif %}</div>
       <div class="card-footer d-flex align-items-center justify-content-between"><span id="creators-page-label" class="text-secondary"></span><div class="btn-list"><button type="button" id="creators-previous" class="btn btn-sm btn-outline-secondary">上一页</button><button type="button" id="creators-next" class="btn btn-sm btn-outline-secondary">下一页</button></div></div>
@@ -32,5 +32,5 @@
   </dialog>
 </div>
 <script id="creators-initial" type="application/json">{{ creator_data|tojson }}</script>
-<script src="/static/creator-handles.js?v=20260914-cm-view" defer></script>
+<script src="/static/creator-handles.js?v=20260928-curva" defer></script>
 {% endblock %}

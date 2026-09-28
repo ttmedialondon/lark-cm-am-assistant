@@ -49,7 +49,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
             return secure(RedirectResponse("/", status_code=303))
         try:
             auth = actor(auth)
-            tab = "candidates" if tab == "candidates" else "mine"
+            tab = tab if tab in ('candidates', 'unassigned') else 'mine'
             data = creator_roster.page_data(auth["id"], cm_id=cm_id, tab=tab, query=q[:120], page=max(1, page))
             if request.url.path.endswith("/data"):
                 return payload(data)
