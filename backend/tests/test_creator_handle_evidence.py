@@ -118,6 +118,14 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot):
     pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='answer'", (cipher.encrypt(raw),))
     assert matcher.build(pg, pilot.settings, contact, catalog)["fingerprint"] == material["fingerprint"]
     assert matcher.still_valid(pg, material["refs"], pilot.settings)
+    # JSON-container formatting is not new evidence. Old source hashes still fail freshness checks.
+    compact_raw = json.dumps({"text": "Yes correct"}, separators=(",", ":"))
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='answer'", (cipher.encrypt(compact_raw),))
+    refreshed = matcher.build(pg, pilot.settings, contact, catalog)
+    assert refreshed["pack"] == pack and refreshed["fingerprint"] == material["fingerprint"]
+    assert not matcher.still_valid(pg, material["refs"], pilot.settings)
+    assert matcher.still_valid(pg, refreshed["refs"], pilot.settings)
+    material = refreshed
     # A dense positive history cannot hide an earlier No or later account transfer.
     pilot.person("different")
     message("pair", "ou_creator", "I have multiple accounts: first.handle and backup_2. Both are mine.", 5)
@@ -155,6 +163,13 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot):
     assert not matcher.still_valid(pg, material["refs"], pilot.settings)
     assert matcher.build(pg, pilot.settings, contact, catalog)["reason"] == "no_text"
     assert matcher.build(pg, pilot.settings, next(iter(matcher.RESTRICTED_CONTACTS)), catalog)["reason"] == "restricted"
+    # A known creator and Curva-named group are not account-ownership evidence.
+    pg.execute("UPDATE authorizations SET status='active' WHERE id=%s", (cm,))
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE chat_id=%s",
+               (cipher.encrypt(json.dumps({"text": "Thanks for sending the sample"})), chat))
+    group_only = matcher.build(pg, pilot.settings, contact, catalog)
+    assert group_only["reason"] == "no_account_evidence" and group_only["pack"] is None
+    assert group_only["stats"]["readable_messages"] > 0
 
 
 def test_contact_matching_rejects_disconnected_and_third_party_claims():
@@ -176,6 +191,11 @@ def test_contact_matching_rejects_disconnected_and_third_party_claims():
         matcher.validate(pack, result)
     pack["messages"][0]["text"] = "My account is .creator_1"
     assert matcher.validate(pack, result) == result
+    pack["messages"].append({"id": "M3", "speaker": "unknown", "chat": "G1",
+                             "at": "2026-10-01T01:02:00Z", "reply": None,
+                             "text": "My account is .creator_1"})
+    assert matcher.validate(pack, result)["links"][0]["decision"] == "review"
+    pack["messages"].pop()
     pack["handles"][0]["catalog_verified"] = False
     with pytest.raises(ModelOutputError):
         matcher.validate(pack, result)

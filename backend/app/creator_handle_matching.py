@@ -51,7 +51,7 @@ def _load_catalog(directory, _modified):
 def _config(conn, *, lock=False):
     return conn.execute(
         """SELECT provider,project_id,model,enabled,api_key_ciphertext,updated_at,
-        rpm_limit,tpm_limit,daily_token_budget,matching_catalog_version,
+        rpm_limit,daily_token_budget,matching_catalog_version,
         automatic_queue_checked_at<NOW()-INTERVAL '1 minute' AS reconcile_due
         FROM ai_feature_configs WHERE feature=%s"""
         + (" FOR UPDATE" if lock else ""),
@@ -185,14 +185,16 @@ def prepare_next(settings):
             _invalidate(conn, current)
             return True
         pack = prepared["pack"]
-        fingerprint = evidence_hash([prepared["fingerprint"], config_hash, evidence.PROMPT_VERSION])
+        fingerprint = evidence_hash([
+            prepared["fingerprint"], config["provider"], config["project_id"], config["model"], evidence.PROMPT_VERSION,
+        ])
         cached = conn.execute(
             """SELECT result_ciphertext,status,stats,attempts,reason_code FROM creator_handle_jobs
             WHERE contact_id=%s AND fingerprint=%s AND (
               result_ciphertext IS NOT NULL AND (status IN ('completed','review_required') OR id=%s)
-              OR status='failed' AND attempts>0 AND %s<>'manual')
+              OR status='failed' AND attempts>0 AND %s<>'manual' AND config_fingerprint=%s)
             ORDER BY updated_at DESC LIMIT 1""",
-            (job["contact_id"], fingerprint, job["id"], job["source"]),
+            (job["contact_id"], fingerprint, job["id"], job["source"], config_hash),
         ).fetchone()
         storage = creator_data.cipher(settings)
         if cached:
@@ -258,19 +260,18 @@ def _needs_review(result, stats):
 
 
 def _reserve(conn, config, job, tokens):
-    """Atomic project/model limits for this feature; external project traffic remains provider-controlled."""
+    """Reserve daily usage and request cadence; do not impose a local TPM cap."""
     scope = evidence_hash([config["provider"], config["project_id"], config["model"]])
     conn.execute("SELECT pg_advisory_xact_lock(%s)", (ai_dispatch._ADMISSION_LOCK,))
     used = conn.execute(
         """SELECT count(*) FILTER(WHERE created_at>NOW()-INTERVAL '1 minute') rpm,
-        COALESCE(sum(reserved_tokens) FILTER(WHERE created_at>NOW()-INTERVAL '1 minute'),0) tpm,
         COALESCE(sum(COALESCE(billed_tokens,reserved_tokens)) FILTER(WHERE
           created_at>=date_trunc('day',NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'),0) daily
         FROM creator_handle_requests WHERE quota_scope=%s AND created_at>=LEAST(
           date_trunc('day',NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',NOW()-INTERVAL '1 minute')""",
         (scope,),
     ).fetchone()
-    if tokens > config["tpm_limit"] or tokens > config["daily_token_budget"]:
+    if tokens > config["daily_token_budget"]:
         conn.execute(
             "UPDATE creator_handle_jobs SET status='failed',reason_code='request_exceeds_budget' WHERE id=%s",
             (job["id"],),
@@ -279,7 +280,7 @@ def _reserve(conn, config, job, tokens):
     if used["daily"] + tokens > config["daily_token_budget"]:
         delay = "date_trunc('day',NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'+INTERVAL '1 day'"
         reason = "daily_budget"
-    elif used["rpm"] >= config["rpm_limit"] or used["tpm"] + tokens > config["tpm_limit"]:
+    elif used["rpm"] >= config["rpm_limit"]:
         delay, reason = "NOW()+INTERVAL '1 minute'", "rate_budget"
     else:
         reservation = uuid4()

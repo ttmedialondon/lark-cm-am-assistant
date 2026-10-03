@@ -259,7 +259,11 @@ def build(conn, settings, contact_id, catalog):
     stats = {"messages": len(messages), "body_chars": chars, "readable_messages": len(own),
              "history_truncated": truncated, "candidates_omitted": max(0, len(scores) - len(candidates)),
              "critical_evidence_omitted": any(_key(i["row"]) not in seen for i in changes)}
-    return {"pack": pack, "refs": refs, "fingerprint": access._hash([PROMPT_VERSION, pack, refs]),
+    # Group names alone cannot satisfy any supported relation; wait without paying for a guess.
+    if not any(_mentions(m["text"], h) for m in messages for h in candidates):
+        return {**empty, "reason": "no_account_evidence", "stats": stats}
+    # Cache semantic input only. Fresh grant/body references remain mandatory before use.
+    return {"pack": pack, "refs": refs, "fingerprint": access._hash([PROMPT_VERSION, pack]),
             "reason": "ready", "stats": stats}
 
 
@@ -381,7 +385,7 @@ def _counterevidence(pack, handle, claims):
                 conflicts.append(message["id"])
                 if denial_reply:
                     conflicts.append(parent["id"])
-        elif (actors.get(message["speaker"]) == "external" and exact_parts
+        elif (actors.get(message["speaker"], "unknown") in {"external", "unknown"} and exact_parts
               and _SELF.search(body) and not _NOT_OWNER.search(body) and not _DENIAL.search(body)):
             conflicts.append(message["id"])
     return list(dict.fromkeys(conflicts))

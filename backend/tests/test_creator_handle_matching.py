@@ -25,6 +25,7 @@ def matching_flow(pg, pilot, monkeypatch):
         error=None,
         review=False,
         material_version=1,
+        reference_version=1,
     )
     monkeypatch.setattr(matching, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(config, "get_settings", lambda: state.settings)
@@ -63,7 +64,7 @@ def matching_flow(pg, pilot, monkeypatch):
         }
         return {
             "pack": pack,
-            "refs": [{"kind": "message", "label": "M1"}],
+            "refs": [{"kind": "message", "label": "M1", "synthetic_version": state.reference_version}],
             "fingerprint": f"synthetic-{contact}-{state.material_version}",
             "reason": "ready",
             "stats": {"messages": 2},
@@ -107,7 +108,7 @@ def matching_flow(pg, pilot, monkeypatch):
     monkeypatch.setattr(matching.evidence, "build", prepare)
     monkeypatch.setattr(matching.api, "call_openai", respond)
 
-    def enable():
+    def enable(api_key="sk-synthetic-test-only"):
         ai_feature_config.save_feature_config(
             pg,
             ai_feature_config.api_key_cipher(state.settings.token_encryption_key),
@@ -116,7 +117,7 @@ def matching_flow(pg, pilot, monkeypatch):
             project_id="proj_synthetic",
             model="gpt-5.6-luna",
             enabled=True,
-            api_key="sk-synthetic-test-only",
+            api_key=api_key,
             updated_by_authorization_id=pilot.ids["owner"],
         )
         # The fallback reconciliation is covered separately; keep this test to one chosen contact.
@@ -165,11 +166,17 @@ def test_opt_in_coalescing_multi_handle_suggestions_and_exact_cache(pg, matching
     view = json.loads(creator_data.cipher(flow.settings).decrypt(row["result_ciphertext"]))
     assert len(view["result"]["links"]) == 2
     assert flow.calls[0]["reasoning_effort"] == "none" and flow.calls[0]["total_timeout"] == 45
+    # Rotating credentials or a readable grant does not change the model's semantic input.
+    flow.enable("sk-success-cache-replacement")
+    flow.reference_version += 1
     new_id = _enqueue(pg, flow.contact)
     assert new_id != identifier and matching.prepare_next(flow.settings)
     cached = pg.execute("SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s", (new_id,)).fetchone()
     assert cached == {"status": "completed", "reason_code": "cached"}
     assert matching.claim() is None and len(flow.calls) == 1
+    assert pg.execute("SELECT refs FROM creator_handle_jobs WHERE id=%s", (new_id,)).fetchone()["refs"] == [
+        {"kind": "message", "label": "M1", "synthetic_version": 2}
+    ]
     assert _snapshot(pg, before.keys()) == before
 
 
@@ -237,8 +244,11 @@ def test_budget_and_restart_lease_fence_bound_paid_work(pg, matching_flow):
         "reason_code": "request_exceeds_budget",
     }
     assert pg.execute("SELECT count(*) n FROM creator_handle_requests").fetchone()["n"] == 0
-    pg.execute("UPDATE ai_feature_configs SET daily_token_budget=1000000 WHERE feature=%s", (matching.FEATURE,))
+    # The retained historical TPM column must not reject a larger valid request.
+    pg.execute("UPDATE ai_feature_configs SET daily_token_budget=1000000,tpm_limit=1000 WHERE feature=%s",
+               (matching.FEATURE,))
     job = _prepared_job(pg, flow)
+    assert pg.execute("SELECT reserved_tokens FROM creator_handle_requests").fetchone()["reserved_tokens"] > 1000
     pg.execute("UPDATE creator_handle_jobs SET lease_until=NOW()-INTERVAL '1 second' WHERE id=%s", (job["id"],))
     recovered = matching.claim()
     assert recovered["attempts"] == 2 and recovered["claim_token"] != job["claim_token"]
@@ -274,6 +284,18 @@ def test_budget_and_restart_lease_fence_bound_paid_work(pg, matching_flow):
         pg.execute("SELECT reason_code FROM creator_handle_jobs WHERE id=%s", (cached_id,)).fetchone()["reason_code"]
         == "failure_cached"
     )
+    # A new credential may fix a provider failure: do not reuse the old Key's failed request.
+    flow.enable("sk-replacement-test-only")
+    flow.error = None
+    refreshed_id = pg.execute("SELECT enqueue_creator_handle(%s,'incremental',TRUE) id",
+                              (flow.contact,)).fetchone()["id"]
+    assert matching.prepare_next(flow.settings)
+    refreshed = matching.claim()
+    assert refreshed is not None and refreshed["id"] == refreshed_id
+    matching.run(refreshed, flow.settings)
+    assert len(flow.calls) == previous_calls + 1
+    assert pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s",
+                      (refreshed_id,)).fetchone()["status"] == "completed"
 
 
 def test_review_result_reuses_its_own_snapshot_when_signal_changes_no_material(pg, matching_flow):

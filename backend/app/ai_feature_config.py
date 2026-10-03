@@ -19,12 +19,11 @@ _KEY_DERIVATION = b"lark-message-stats/ai-feature-config-key/v1"
 _LONDON = ZoneInfo("Europe/London")
 DEFAULT_AUTO_CONFIRM_THRESHOLD = Decimal("0.900")
 DEFAULT_RPM_LIMIT = 30
-DEFAULT_TPM_LIMIT = 60_000
 DEFAULT_DAILY_TOKEN_BUDGET = 1_000_000
 _SAFE_COLUMNS = """
     feature, provider, project_id, model, enabled, key_suffix, key_updated_at,
     last_tested_at, last_test_status, auto_confirm_threshold, created_at, updated_at,
-    rpm_limit, tpm_limit, daily_token_budget
+    rpm_limit, daily_token_budget
 """
 
 
@@ -62,7 +61,6 @@ def save_feature_config(
     updated_by_authorization_id: UUID,
     auto_confirm_threshold: Decimal | float | str = DEFAULT_AUTO_CONFIRM_THRESHOLD,
     rpm_limit: int | str = DEFAULT_RPM_LIMIT,
-    tpm_limit: int | str = DEFAULT_TPM_LIMIT,
     daily_token_budget: int | str = DEFAULT_DAILY_TOKEN_BUDGET,
 ) -> dict[str, Any]:
     """Upsert one feature config; a blank key retains the existing credential."""
@@ -76,7 +74,6 @@ def save_feature_config(
     api_key = _normalize_api_key(api_key)
     auto_confirm_threshold = _normalize_auto_confirm_threshold(auto_confirm_threshold)
     rpm_limit = _normalize_limit(rpm_limit, "每分钟请求数", 1, 10_000)
-    tpm_limit = _normalize_limit(tpm_limit, "每分钟 Token 上限", 1_000, 10_000_000)
     daily_token_budget = _normalize_limit(daily_token_budget, "每日 Token 预算", 1_000, 100_000_000)
 
     current = conn.execute(
@@ -92,13 +89,13 @@ def save_feature_config(
         INSERT INTO ai_feature_configs (
             feature, provider, project_id, model, enabled, auto_confirm_threshold,
             api_key_ciphertext, key_suffix, key_updated_at, key_updated_by_authorization_id,
-            rpm_limit, tpm_limit, daily_token_budget
+            rpm_limit, daily_token_budget
         ) VALUES (
             %s, %s, %s, %s, %s, %s,
             %s, %s,
             CASE WHEN %s THEN NOW() ELSE NULL END,
             CASE WHEN %s THEN %s ELSE NULL END,
-            %s, %s, %s
+            %s, %s
         )
         ON CONFLICT (feature) DO UPDATE SET
             provider = EXCLUDED.provider,
@@ -107,7 +104,6 @@ def save_feature_config(
             enabled = EXCLUDED.enabled,
             auto_confirm_threshold = EXCLUDED.auto_confirm_threshold,
             rpm_limit = EXCLUDED.rpm_limit,
-            tpm_limit = EXCLUDED.tpm_limit,
             daily_token_budget = EXCLUDED.daily_token_budget,
             api_key_ciphertext = COALESCE(EXCLUDED.api_key_ciphertext, ai_feature_configs.api_key_ciphertext),
             key_suffix = COALESCE(EXCLUDED.key_suffix, ai_feature_configs.key_suffix),
@@ -140,7 +136,6 @@ def save_feature_config(
             bool(api_key),
             updated_by_authorization_id,
             rpm_limit,
-            tpm_limit,
             daily_token_budget,
         ),
     ).fetchone()
@@ -179,7 +174,6 @@ def display_config(row: Mapping[str, Any] | None) -> dict[str, Any]:
         "last_test_status_label": {"succeeded": "通过", "failed": "失败"}.get(status, "尚未测试"),
         "last_test_badge": {"succeeded": "success", "failed": "danger"}.get(status, "secondary"),
         "rpm_limit": values.get("rpm_limit") or DEFAULT_RPM_LIMIT,
-        "tpm_limit": values.get("tpm_limit") or DEFAULT_TPM_LIMIT,
         "daily_token_budget": values.get("daily_token_budget") or DEFAULT_DAILY_TOKEN_BUDGET,
     }
 

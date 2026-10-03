@@ -66,7 +66,7 @@ def test_admin_summary_form_has_native_window_inputs_and_disabled_default_withou
     assert 'name="enabled" value="1" checked' not in matching_form
     assert 'name="window_start"' not in matching_form and 'name="window_end"' not in matching_form
     assert 'name="rpm_limit" value="30"' in matching_form
-    assert 'name="tpm_limit" value="60000"' in matching_form
+    assert 'name="tpm_limit"' not in matching_form
     assert 'name="daily_token_budget" value="1000000"' in matching_form
     assert 'href="/admin/ai/creator-handle-matching"' in html
 

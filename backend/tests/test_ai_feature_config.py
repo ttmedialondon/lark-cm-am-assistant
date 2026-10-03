@@ -50,8 +50,7 @@ class _Connection:
                 "created_at": None,
                 "updated_at": None,
                 "rpm_limit": params[11],
-                "tpm_limit": params[12],
-                "daily_token_budget": params[13],
+                "daily_token_budget": params[12],
             }
             return _Result(self.row)
         return _Result(self.row)
@@ -82,6 +81,8 @@ def test_save_encrypts_key_and_only_returns_safe_fields() -> None:
         enabled=True,
         api_key=api_key,
         updated_by_authorization_id=uuid4(),
+        rpm_limit="20",
+        daily_token_budget="500000",
     )
 
     inserted = conn.calls[-1][1]
@@ -91,6 +92,7 @@ def test_save_encrypts_key_and_only_returns_safe_fields() -> None:
     assert saved["key_suffix"] == "1234"
     assert "api_key_ciphertext" not in saved
     assert api_key not in repr(saved)
+    assert (saved["rpm_limit"], saved["daily_token_budget"]) == (20, 500000)
 
 
 def test_blank_key_retains_existing_credential() -> None:
@@ -139,11 +141,13 @@ def test_blank_feature_key_can_be_enabled_on_real_postgres(pg):
                   updated_by_authorization_id=owner)
     cipher = api_key_cipher(b"k" * 32)
     save_feature_config(pg, cipher, "offhours_summary", **values, enabled=False, api_key="sk-test-only-1234")
-    columns = "api_key_ciphertext,key_updated_at,key_updated_by_authorization_id"
+    pg.execute("UPDATE ai_feature_configs SET tpm_limit=1000 WHERE feature='offhours_summary'")
+    columns = "api_key_ciphertext,key_updated_at,key_updated_by_authorization_id,tpm_limit"
     before = pg.execute(f"SELECT {columns} FROM ai_feature_configs WHERE feature='offhours_summary'").fetchone()
     saved = save_feature_config(pg, cipher, "offhours_summary", **values, enabled=True, api_key="")
     after = pg.execute(f"SELECT {columns} FROM ai_feature_configs WHERE feature='offhours_summary'").fetchone()
     assert saved["enabled"] and saved["key_suffix"] == "1234" and after == before
+    assert "tpm_limit" not in saved
 
 
 def test_auto_confirmation_never_allows_a_threshold_below_ninety_percent() -> None:
@@ -175,6 +179,7 @@ def test_get_and_display_never_expose_ciphertext() -> None:
         "last_tested_at": when,
         "last_test_status": "succeeded",
         "api_key_ciphertext": "must-not-leak",
+        "tpm_limit": 60_000,
     }
 
     loaded = get_feature_config(_Connection(row), "contact_assessment")
@@ -183,12 +188,13 @@ def test_get_and_display_never_expose_ciphertext() -> None:
     assert loaded is not None
     assert "api_key_ciphertext" not in loaded
     assert "api_key_ciphertext" not in shown
+    assert "tpm_limit" not in loaded and "tpm_limit" not in shown
     assert "must-not-leak" not in repr(shown)
     assert shown["api_key_label"] == "已配置 · …1234"
     assert shown["last_test_status_label"] == "通过"
     initial = display_config({"feature": "creator_handle_matching", "project_id": "unconfigured"})
     assert not initial["enabled"] and not initial["key_configured"] and initial["project_id"] == ""
-    assert (initial["rpm_limit"], initial["tpm_limit"], initial["daily_token_budget"]) == (30, 60_000, 1_000_000)
+    assert (initial["rpm_limit"], initial["daily_token_budget"]) == (30, 1_000_000)
 
 
 def test_matching_configuration_rejects_invalid_limits_and_placeholder_project_before_saving():

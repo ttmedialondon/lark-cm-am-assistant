@@ -823,7 +823,6 @@ def create_admin_router(
             matching_limits = (
                 {
                     "rpm_limit": form.get("rpm_limit", str(ai_feature_config.DEFAULT_RPM_LIMIT)),
-                    "tpm_limit": form.get("tpm_limit", str(ai_feature_config.DEFAULT_TPM_LIMIT)),
                     "daily_token_budget": form.get(
                         "daily_token_budget", str(ai_feature_config.DEFAULT_DAILY_TOKEN_BUDGET),
                     ),
