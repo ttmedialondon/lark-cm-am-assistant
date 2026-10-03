@@ -80,7 +80,7 @@ def test_readonly_admin_has_no_save_resume_key_or_window_edit_controls():
     assert 'href="/admin/ai/creator-handle-matching"' not in html
 
 
-def test_matching_template_renders_body_escapes_names_and_distinguishes_historical_operator_suggestions():
+def test_matching_template_escapes_names_and_distinguishes_associations_from_historical_operator_suggestions():
     environment = Environment(loader=FileSystemLoader(APP / "templates"), autoescape=select_autoescape())
     hostile = "<script>alert(1)</script>"
     html = environment.get_template("admin/creator_handle_matching.html").render(
@@ -91,14 +91,18 @@ def test_matching_template_renders_body_escapes_names_and_distinguishes_historic
             "jobs": [{"id": uuid4(), "display_name": hostile, "status": "review_required",
                       "reason_code": "suggestions_saved", "input_tokens": 100, "output_tokens": 20,
                       "suggestions": [{"handle": "fixture.handle", "decision": "review", "relation": "operator",
-                                       "code": "operates_for_other", "period": "historical"}]}],
+                                       "code": "operates_for_other", "period": "historical", "associated": False},
+                                      {"handle": "fixture.owned", "decision": "supported", "relation": "self_account",
+                                       "code": "qa_confirm", "period": "at_message", "associated": True}]}],
         },
     )
-    assert "账号建议" in html and 'action="/admin/ai/creator-handle-matching/enqueue"' in html
+    assert "账号匹配" in html and 'action="/admin/ai/creator-handle-matching/enqueue"' in html
+    assert "强证据自动关联，其他待核实" in html
     assert hostile not in html and "&lt;script&gt;" in html
     assert "代运营" in html and "历史关系" in html and "待核实" in html
     assert "operator" not in html and "review_required" not in html
     assert 'href="https://www.tiktok.com/@fixture.handle"' in html
+    assert "@fixture.owned</a> · 已关联" in html and "证据支持" not in html
 
 
 def test_template_never_exposes_admin_to_a_viewer_and_escapes_private_json():

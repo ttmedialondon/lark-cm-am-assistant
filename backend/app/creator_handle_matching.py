@@ -1,4 +1,4 @@
-"""Opt-in, contact-first account suggestions on the existing worker (no business writes)."""
+"""Opt-in account matching; verified self-account evidence can add a formal association."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from uuid import uuid4
 
-from . import ai_dispatch, ai_feature_config, creator_data
+from . import ai_dispatch, ai_feature_config, creator_data, creator_imports
 from . import creator_handle_evidence as evidence
 from . import openai_client as api
 from .creator_access import require_owner
@@ -200,7 +200,22 @@ def prepare_next(settings):
         if cached:
             cached["stats"] = {**cached["stats"], **prepared["stats"]}
         if cached and cached["result_ciphertext"]:
-            saved = json.loads(storage.decrypt(cached["result_ciphertext"]))["result"]
+            if not evidence.still_valid(conn, prepared["refs"], settings) or not conn.execute(
+                "SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed'",
+                (job["contact_id"],),
+            ).fetchone():
+                _invalidate(conn, current)
+                return True
+            saved = evidence.validate(pack, json.loads(storage.decrypt(cached["result_ciphertext"]))["result"])
+            cached["stats"] = _apply_links(
+                conn, current, pack, saved, cached["stats"], prepared["refs"], settings, catalog_version,
+            )
+            if cached["stats"] is None:
+                _invalidate(conn, current)
+                return True
+            cached["result_ciphertext"] = storage.encrypt(creator_data.encode({
+                "handles": {h["id"]: h["handle"] for h in pack["handles"]}, "result": saved,
+            }))
             cached["status"] = "review_required" if _needs_review(saved, cached["stats"]) else "completed"
         conn.execute(
             """UPDATE creator_handle_jobs SET status=%s,reason_code=%s,
@@ -253,10 +268,102 @@ def _invalidate(conn, job):
 def _needs_review(result, stats):
     return any(
         link["decision"] == "review"
+        or link["needed"]
         or link["period"] == "historical"
         or link["relation"] in ("operator", "account_creator")
         for link in result["links"]
     ) or any(stats.get(key) for key in ("history_truncated", "candidates_omitted", "critical_evidence_omitted"))
+
+
+def _apply_links(conn, job, pack, result, stats, refs, settings, catalog_version):
+    """Add only verified self-account links; preserve all existing human decisions."""
+    by_handle = {h["id"]: h["handle"] for h in pack["handles"]}
+    claims = [link for link in result["links"]
+              if link["decision"] == "supported" and link["relation"] == "self_account"]
+    claimed = [by_handle[link["h"]] for link in claims]
+    # Same account -> person lock order as manual roster admission; sort multiple handles.
+    for handle in sorted(claimed):
+        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,137034))", ("tiktok:" + handle,))
+    if claimed:
+        conn.execute("SELECT id FROM contacts WHERE id=%s FOR UPDATE", (job["contact_id"],))
+        # Locks may have waited: recheck catalog, authorization and identity before writing.
+        try:
+            current_handles, version = catalog()
+            if version != catalog_version or any(h["handle"] not in current_handles for h in pack["handles"]):
+                return None
+        except (OSError, ValueError, KeyError):
+            return None
+        if not evidence.still_valid(conn, refs, settings) or not conn.execute(
+            "SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed'",
+            (job["contact_id"],),
+        ).fetchone():
+            return None
+    # Reuse the admission rules read-only: never call its identity/CM-writing _admit.
+    conflicts = dict(zip(claimed, creator_imports._conflicts(
+        conn, [(None, job["contact_id"], handle) for handle in claimed],
+    )))
+    other_claims = {row["handle"] for row in conn.execute(
+        """SELECT handle FROM unnest(%s::text[]) handles(handle) WHERE EXISTS (
+        SELECT 1 FROM creator_handle_jobs j WHERE j.contact_id<>%s
+          AND j.status IN ('completed','review_required') AND j.stats->'claimed_handles' ? handles.handle
+          AND NOT EXISTS (SELECT 1 FROM creator_handle_jobs newer WHERE newer.contact_id=j.contact_id
+            AND (newer.created_at,newer.id)>(j.created_at,j.id)))""",
+        (claimed, job["contact_id"]),
+    ).fetchall()} if claimed else set()
+    accounts = {}
+    for account in conn.execute(
+        """SELECT id,lower(normalized_handle) handle FROM social_accounts
+        WHERE platform='tiktok' AND lower(normalized_handle)=ANY(%s::text[]) ORDER BY id FOR UPDATE""",
+        (claimed,),
+    ).fetchall() if claimed else []:
+        accounts.setdefault(account["handle"], []).append(account["id"])
+    clean = not any(stats.get(k) for k in ("history_truncated", "candidates_omitted", "critical_evidence_omitted"))
+    associated, added = [], []
+    for link in claims:
+        handle = by_handle[link["h"]]
+        if conflicts[handle] or handle in other_claims or len(accounts.get(handle, [])) > 1:
+            link.update(decision="review", relation="uncertain", code="conflict")
+            continue
+        if not (clean and pack["creator_known"] and link["period"] == "at_message"
+                and link["code"] in {"self_claim", "qa_confirm", "own_page"} and not link["needed"]
+                and not set(link["refs"]) & set(pack["coverage"]["missing_reply_ids"])):
+            continue
+        account_id = accounts[handle][0] if accounts.get(handle) else None
+        if account_id is None:
+            account = conn.execute(
+                """INSERT INTO social_accounts(id,platform,normalized_handle,display_handle)
+                VALUES(%s,'tiktok',%s,%s) ON CONFLICT DO NOTHING RETURNING id""",
+                (uuid4(), handle, handle),
+            ).fetchone()
+            if not account:
+                link.update(decision="review", relation="uncertain", code="conflict")
+                continue
+            account_id = account["id"]
+        inserted = conn.execute(
+            """INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source,reviewed_at)
+            VALUES(%s,%s,'owner','confirmed','creator_handle_auto_verified',NOW())
+            ON CONFLICT DO NOTHING RETURNING social_account_id""",
+            (job["contact_id"], account_id),
+        ).fetchone()
+        if inserted:
+            added.append(handle)
+            _audit(conn, None, "creator_handle_auto_linked", {
+                "job_id": str(job["id"]), "contact_id": str(job["contact_id"]),
+                "social_account_id": str(account_id), "handle": handle,
+                "prompt_version": evidence.PROMPT_VERSION, "refs": link["refs"],
+                "evidence_refs": [ref for ref in refs
+                                  if ref["kind"] == "message" and ref["label"] in link["refs"]],
+            })
+        elif not conn.execute(
+            """SELECT 1 FROM contact_social_accounts WHERE contact_id=%s AND social_account_id=%s
+            AND relationship='owner' AND status='confirmed'""", (job["contact_id"], account_id),
+        ).fetchone():
+            link.update(decision="review", relation="uncertain", code="conflict")
+            continue
+        associated.append(handle)
+    supported = [by_handle[link["h"]] for link in claims if link["decision"] == "supported"]
+    return {**stats, "supported_handles": supported, "claimed_handles": claimed,
+            "associated_handles": associated, "auto_linked_handles": added}
 
 
 def claim():
@@ -435,32 +542,14 @@ def run(job, settings):
             )
         else:
             by_handle = {h["id"]: h["handle"] for h in job["pack"]["handles"]}
-            supported = []
-            claimed = []
-            for link in result["links"]:
-                if link["decision"] == "supported" and link["relation"] == "self_account":
-                    handle = by_handle[link["h"]]
-                    claimed.append(handle)
-                    conflict = conn.execute(
-                        """SELECT 1 FROM contact_social_accounts l JOIN social_accounts s ON s.id=l.social_account_id
-                        WHERE s.platform='tiktok' AND s.normalized_handle=%s AND l.relationship='owner'
-                          AND l.status='confirmed' AND l.contact_id<>%s UNION ALL
-                        SELECT 1 FROM creator_handle_jobs WHERE contact_id<>%s
-                          AND status IN ('completed','review_required')
-                          AND stats->'claimed_handles' ? %s
-                          AND NOT EXISTS(SELECT 1 FROM creator_handle_jobs newer
-                            WHERE newer.contact_id=creator_handle_jobs.contact_id
-                              AND (newer.created_at,newer.id)>(creator_handle_jobs.created_at,creator_handle_jobs.id))
-                          LIMIT 1""",
-                        (handle, job["contact_id"], job["contact_id"], handle),
-                    ).fetchone()
-                    if conflict:
-                        link.update(decision="review", relation="uncertain", code="conflict")
-                    else:
-                        supported.append(handle)
+            stats = _apply_links(
+                conn, current, job["pack"], result, current["stats"], current["refs"], settings, job["catalog_version"],
+            )
+            if stats is None:
+                _invalidate(conn, current)
+                return
             review = _needs_review(result, current["stats"])
             view = {"handles": by_handle, "result": result}
-            stats = {**current["stats"], "supported_handles": supported, "claimed_handles": claimed}
             conn.execute(
                 """UPDATE creator_handle_jobs SET status=%s,reason_code='suggestions_saved',
                 result_ciphertext=%s,stats=%s::jsonb,lease_until=NULL,claim_token=NULL,
@@ -510,6 +599,12 @@ def page_data(conn, actor, settings, page=1):
     except (OSError, ValueError, KeyError):
         current_handles = frozenset()
         version = None
+    associations = {(str(row["contact_id"]), row["handle"]) for row in conn.execute(
+        """SELECT l.contact_id,lower(s.normalized_handle) handle FROM contact_social_accounts l
+        JOIN social_accounts s ON s.id=l.social_account_id
+        WHERE l.contact_id=ANY(%s::uuid[]) AND l.relationship='owner' AND l.status='confirmed'
+          AND s.platform='tiktok'""", ([j["contact_id"] for j in jobs],),
+    ).fetchall()}
     for job in jobs:
         job["suggestions"] = []
         if (
@@ -519,7 +614,8 @@ def page_data(conn, actor, settings, page=1):
         ):
             view = json.loads(storage.decrypt(job["result_ciphertext"]))
             job["suggestions"] = [
-                {**link, "handle": view["handles"][link["h"]]}
+                {**link, "handle": view["handles"][link["h"]],
+                 "associated": (str(job["contact_id"]), view["handles"][link["h"]]) in associations}
                 for link in view["result"]["links"]
                 if view["handles"][link["h"]] in current_handles
             ]

@@ -61,9 +61,9 @@ AI_FEATURES = {
     },
     "creator_handle_matching": {
         "title": "达人—handle 匹配",
-        "description": "按授权消息匹配 Curva 收录账号，只保存建议，不自动更改达人、负责人或已有关系。",
+        "description": "按授权消息匹配 Curva 收录账号；强证据自动关联，其余待核实，不修改身份、负责人或已有关系。",
         "enabled_label": "开启自动匹配",
-        "processing_label": "队列匹配，仅生成建议",
+        "processing_label": "队列匹配，强证据自动关联",
     },
     "offhours_summary": {
         "title": "达人消息总结",
