@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -49,14 +50,14 @@ def retry_delay(retry_after_seconds: float | None, attempts: object) -> float:
         provider_delay = float(retry_after_seconds) if retry_after_seconds is not None else None
     except (TypeError, ValueError):
         provider_delay = None
-    if provider_delay is not None and math.isfinite(provider_delay):
+    if provider_delay is not None and math.isfinite(provider_delay) and provider_delay >= 0:
         base = provider_delay
     else:
         try:
             base = min(60.0, 2.0 ** min(max(int(attempts or 0), 0), 5))
         except (TypeError, ValueError):
             base = 2.0
-    return min(max(float(base), 0.0) + random.uniform(0.0, 1.0), 3_600.0)
+    return float(base) + random.uniform(0.0, 1.0)
 
 
 def call_openai(
@@ -68,13 +69,17 @@ def call_openai(
     instructions: str,
     output_format: Mapping[str, Any],
     max_output_tokens: int = 500,
+    reasoning_effort: str = "low",
+    total_timeout: float | None = None,
 ) -> dict[str, Any]:
     """Call Responses once for an evidence-bound internal AI feature."""
 
+    if total_timeout is not None and (not math.isfinite(total_timeout) or total_timeout <= 0):
+        raise AIInputError("AI 请求超时设置无效。")
     payload = {
         "model": config["model"],
         "store": False,
-        "reasoning": {"effort": "low"},
+        "reasoning": {"effort": reasoning_effort},
         "max_output_tokens": max_output_tokens,
         "instructions": instructions,
         "input": json.dumps(pack, ensure_ascii=False, separators=(",", ":")),
@@ -86,21 +91,24 @@ def call_openai(
         headers["OpenAI-Project"] = config["project_id"]
     started = time.perf_counter()
     try:
-        response = httpx.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=45.0)
-    except httpx.HTTPError as exc:
-        raise AIInputError("AI 服务暂时不可用；请稍后重新发起。") from exc
+        if total_timeout is None:
+            response = httpx.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=45.0)
+        else:
+            response = asyncio.run(_post_with_deadline(headers, payload, total_timeout))
+    except (httpx.HTTPError, TimeoutError) as exc:
+        raise OpenAIRequestError(
+            "AI 服务暂时不可用；请稍后重新发起。",
+            retryable=True,
+            telemetry={"response_latency_ms": max(0, round((time.perf_counter() - started) * 1_000))},
+        ) from exc
     telemetry = _openai_telemetry(response, started)
     if response.status_code < 200 or response.status_code >= 300:
-        if response.status_code == 429:
-            raise OpenAIRequestError(
-                "AI 服务请求暂时受限。",
-                retry_after_seconds=_retry_after_header(response),
-                is_quota=_is_quota_response(response),
-                retryable=True,
-                telemetry=telemetry,
-            )
+        is_quota = _is_quota_response(response)
         raise OpenAIRequestError(
             f"AI 服务请求未完成（HTTP {response.status_code}）。",
+            retry_after_seconds=_retry_after_header(response),
+            is_quota=is_quota,
+            retryable=not is_quota and response.status_code in {408, 429, 500, 502, 503, 504},
             telemetry=telemetry,
         )
     try:
@@ -120,6 +128,12 @@ def call_openai(
         },
         "telemetry": telemetry,
     }
+
+
+async def _post_with_deadline(headers: dict, payload: dict, total_timeout: float) -> httpx.Response:
+    # Worker calls this synchronous facade from its existing executor, not an event loop.
+    async with asyncio.timeout(total_timeout), httpx.AsyncClient(timeout=45.0) as client:
+        return await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
 
 
 def _openai_telemetry(response: httpx.Response, started: float) -> dict[str, Any]:
@@ -148,12 +162,12 @@ def _retry_after_header(response: httpx.Response) -> float | None:
         seconds = float(raw)
     except (TypeError, ValueError):
         try:
-            seconds = parsedate_to_datetime(str(raw)).timestamp() - time.time()
+            seconds = max(0.0, parsedate_to_datetime(str(raw)).timestamp() - time.time())
         except (TypeError, ValueError, IndexError, OverflowError):
             return None
-    if not math.isfinite(seconds):
+    if not math.isfinite(seconds) or seconds < 0:
         return None
-    return min(max(seconds, 0.0), 3_600.0)
+    return seconds
 
 
 def _is_quota_response(response: httpx.Response) -> bool:
@@ -176,6 +190,8 @@ def _is_quota_response(response: httpx.Response) -> bool:
             "payment required",
             "hard_limit",
             "quota exceeded",
+            "spend_limit_exceeded",
+            "usage_limit_exceeded",
         )
     )
 
@@ -212,4 +228,3 @@ def _json_list(value: object) -> list[Any]:
     if isinstance(value, tuple):
         return list(value)
     return []
-

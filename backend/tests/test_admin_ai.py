@@ -1,4 +1,4 @@
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -8,6 +8,7 @@ from fastapi.responses import PlainTextResponse
 from fastapi.testclient import TestClient
 
 from app import admin, admin_permissions, admin_reporting, ai_feature_config
+from app import creator_handle_matching_routes as matching_routes
 
 
 @pytest.fixture(autouse=True)
@@ -109,7 +110,9 @@ def test_owner_can_view_only_safe_ai_config_fields(monkeypatch):
     assert "api_key_ciphertext" not in contexts[-1][1]["config"]
     assert contexts[-1][1]["ai_dispatch"]["state"] == "paused"
     assert contexts[-1][1]["summary_settings"]["status_label"] == "未开启"
-    assert [item["feature"] for item in contexts[-1][1]["configs"]] == ["creator_import", "offhours_summary"]
+    assert [item["feature"] for item in contexts[-1][1]["configs"]] == [
+        "creator_import", "creator_handle_matching", "offhours_summary",
+    ]
     for feature in ("contact_assessment", "contact_assignment", "creator_workflow"):
         response = browser.post("/admin/ai", data={"csrf_token": "csrf", "feature": feature, "enabled": "1"})
         assert response.status_code == 400
@@ -229,3 +232,71 @@ def test_summary_csrf_failure_does_not_save_or_schedule(monkeypatch):
         "csrf_token": "wrong", "feature": "offhours_summary", "enabled": "1",
     })
     assert response.status_code == 400
+
+
+def test_matching_save_keeps_configuration_and_queue_invalidation_in_one_transaction(monkeypatch):
+    owner_id = uuid4()
+    called = []
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _: "owner")
+    monkeypatch.setattr(admin, "connection", _connection)
+    monkeypatch.setattr(admin, "get_settings", lambda: SimpleNamespace(token_encryption_key=b"k" * 32))
+    monkeypatch.setattr(ai_feature_config, "save_feature_config", lambda conn, *a, **kw: called.append(
+        ("config", conn, kw)))
+    monkeypatch.setattr(admin.creator_handle_matching, "configuration_changed", lambda conn: called.append(
+        ("queue", conn)))
+    response = _client(lambda _: {"id": owner_id, "status": "active"}).post("/admin/ai", data={
+        "csrf_token": "csrf", "feature": "creator_handle_matching", "project_id": "proj_matching",
+        "model": "gpt-5.6-luna", "enabled": "1", "rpm_limit": "20", "tpm_limit": "40000",
+        "daily_token_budget": "500000", "api_key": "sk-test-only-1234",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/ai?saved=creator-handle-matching#creator-handle-matching"
+    assert [item[0] for item in called] == ["config", "queue"]
+    assert called[0][1] is called[1][1]
+    assert called[0][2]["enabled"] is True
+    assert {name: called[0][2][name] for name in ("rpm_limit", "tpm_limit", "daily_token_budget")} == {
+        "rpm_limit": "20", "tpm_limit": "40000", "daily_token_budget": "500000",
+    }
+
+
+def test_matching_routes_recheck_live_owner_and_csrf_before_queue_writes(pg, monkeypatch):
+    owner, member = uuid4(), uuid4()
+    for actor in (owner, member):
+        pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,%s,'test')",
+                   (actor, "ou_" + actor.hex))
+    pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (owner,))
+    session = {"auth": {"id": owner, "status": "active"}}
+    connections, contexts = [], []
+
+    def connection():
+        connections.append(pg)
+        return nullcontext(pg)
+
+    monkeypatch.setattr(matching_routes, "connection", connection)
+    monkeypatch.setattr(matching_routes, "get_settings", lambda: SimpleNamespace(token_encryption_key=b"k" * 32))
+    app = FastAPI()
+    app.include_router(matching_routes.create_router(
+        current_authorization=lambda _: session["auth"], csrf_token=lambda _: "csrf",
+        render_template=lambda request, name, context: contexts.append(context) or PlainTextResponse("rendered"),
+    ))
+    client = TestClient(app)
+    path = "/admin/ai/creator-handle-matching"
+    response = client.get(path)
+    assert response.status_code == 200 and contexts[-1]["matching"]["enabled"] is False
+    assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert contexts[-1]["admin_permissions"] == admin_permissions.PAGE_KEYS
+    before = len(connections)
+    assert client.post(path + "/enqueue", data={"csrf_token": "wrong"}).status_code == 400
+    session["auth"] = None
+    assert client.get(path).status_code == 403
+    assert client.post(path + "/enqueue", data={"csrf_token": "csrf"}).status_code == 403
+    assert len(connections) == before
+    session["auth"] = {"id": member, "status": "active"}
+    assert client.get(path).status_code == 403
+    assert client.post(path + "/enqueue", data={"csrf_token": "csrf"}).status_code == 403
+    assert client.post(path + f"/jobs/{uuid4()}/cancel", data={"csrf_token": "csrf"}).status_code == 403
+    session["auth"] = {"id": owner, "status": "active"}
+    assert client.post(path + "/enqueue", data={"csrf_token": "csrf"}).status_code == 400  # Disabled.
+    pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (owner,))
+    assert client.get(path).status_code == 403  # Session does not retain an obsolete Owner grant.
+    assert pg.execute("SELECT count(*) n FROM creator_handle_jobs").fetchone()["n"] == 0

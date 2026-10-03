@@ -17,6 +17,7 @@ import psycopg
 
 from . import (
     ai_dispatch,
+    creator_handle_matching,
     creator_imports,
     identity_profiles,
     offhours_summary,
@@ -209,6 +210,7 @@ def _dispatch_ai_turn(
         ),
         (creator_imports.claim_next_import, creator_imports.run_claimed_import),
         (summary_replies.claim, summary_replies.run),
+        (creator_handle_matching.claim, creator_handle_matching.run),
     )
     for offset in range(len(queues)):
         index = (next_queue + offset) % len(queues)
@@ -260,7 +262,8 @@ def _prepare_creator_preview(settings: Settings, next_queue: int) -> tuple[bool,
 
     # Retired handle scanning is not produced or dispatched; historical review stays available.
     queues = (creator_imports.prepare_next_import,
-              offhours_summary.prepare_next_summary)
+              offhours_summary.prepare_next_summary,
+              creator_handle_matching.prepare_next)
     for offset in range(len(queues)):
         index = (next_queue + offset) % len(queues)
         try:
@@ -2170,6 +2173,8 @@ def _record_claimed_page(
             ).fetchone()
         if not updated:
             raise StaleSyncJob
+        if inserted:
+            creator_handle_matching.touch_chats(conn, [claim.chat_id])
     return PageCommit(True, inserted, own_inserted)
 
 

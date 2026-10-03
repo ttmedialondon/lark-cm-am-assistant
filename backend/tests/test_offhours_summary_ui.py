@@ -61,6 +61,14 @@ def test_admin_summary_form_has_native_window_inputs_and_disabled_default_withou
     secret_field = re.search(r'<input[^>]*name="api_key"[^>]*>', summary_form).group(0)
     assert 'type="password"' in secret_field
     assert ' value=' not in secret_field
+    matching_form = next(form for form in forms if 'name="feature" value="creator_handle_matching"' in form)
+    assert 'name="enabled" value="1"' in matching_form
+    assert 'name="enabled" value="1" checked' not in matching_form
+    assert 'name="window_start"' not in matching_form and 'name="window_end"' not in matching_form
+    assert 'name="rpm_limit" value="30"' in matching_form
+    assert 'name="tpm_limit" value="60000"' in matching_form
+    assert 'name="daily_token_budget" value="1000000"' in matching_form
+    assert 'href="/admin/ai/creator-handle-matching"' in html
 
 
 def test_readonly_admin_has_no_save_resume_key_or_window_edit_controls():
@@ -69,6 +77,28 @@ def test_readonly_admin_has_no_save_resume_key_or_window_edit_controls():
     assert '<input ' not in html
     assert "只读配置" in html
     assert 'id="offhours-summary"' in html
+    assert 'href="/admin/ai/creator-handle-matching"' not in html
+
+
+def test_matching_template_renders_body_escapes_names_and_distinguishes_historical_operator_suggestions():
+    environment = Environment(loader=FileSystemLoader(APP / "templates"), autoescape=select_autoescape())
+    hostile = "<script>alert(1)</script>"
+    html = environment.get_template("admin/creator_handle_matching.html").render(
+        authorization={"display_name": "Fixture Reviewer"}, admin_landing_path="/admin", admin_role="owner",
+        admin_permissions=admin.admin_permissions.PAGE_KEYS, permission_pages=admin.admin_permissions.PAGES,
+        active_page="ai", csrf_token="fixture-csrf", matching={
+            "enabled": False, "counts": [{"status": "review_required", "n": 1}], "page": 1,
+            "jobs": [{"id": uuid4(), "display_name": hostile, "status": "review_required",
+                      "reason_code": "suggestions_saved", "input_tokens": 100, "output_tokens": 20,
+                      "suggestions": [{"handle": "fixture.handle", "decision": "review", "relation": "operator",
+                                       "code": "operates_for_other", "period": "historical"}]}],
+        },
+    )
+    assert "账号建议" in html and 'action="/admin/ai/creator-handle-matching/enqueue"' in html
+    assert hostile not in html and "&lt;script&gt;" in html
+    assert "代运营" in html and "历史关系" in html and "待核实" in html
+    assert "operator" not in html and "review_required" not in html
+    assert 'href="https://www.tiktok.com/@fixture.handle"' in html
 
 
 def test_template_never_exposes_admin_to_a_viewer_and_escapes_private_json():

@@ -16,6 +16,7 @@
     {% if form_error %}<div class="alert alert-danger" role="alert">{{ form_error }}</div>{% endif %}
     {% if summary_saved %}<div class="alert alert-success" role="status">配置已保存。<a href="/dashboard/offhours-summary" class="alert-link">查看总结</a></div>{% endif %}
     {% if identity_saved %}<div class="alert alert-success" role="status">配置已保存。<a href="/admin/contacts" class="alert-link">查看识别进度</a></div>{% endif %}
+    {% if matching_saved and admin_role == 'owner' %}<div class="alert alert-success" role="status">配置已保存。<a href="/admin/ai/creator-handle-matching" class="alert-link">匹配任务</a></div>{% endif %}
     {% for feature in configs %}{% set config = feature.config %}
     <div class="card mb-4" id="{{ feature.id_suffix }}"><div class="card-header"><div><h3 class="card-title mb-1">{{ feature.title }}</h3><div class="text-secondary small">{{ feature.description }}</div></div></div>
       <div class="card-body">
@@ -29,12 +30,20 @@
         <details class="mb-3 text-secondary"><summary>总结范围与时段</summary><p class="mt-2">按英国时间整理已入库达人的相关群聊和私聊。上班 10:00–18:00，下班 18:00–次日10:00，可查看最近7天。时段未结束或同步不完整时显示部分结果；不自动发送回复。</p></details>
         <div class="d-flex flex-wrap justify-content-between gap-2 mb-3"><span class="text-secondary">{{ summary_settings.status_label }}</span><a href="/dashboard/offhours-summary">查看消息总结 →</a></div>
         {% endif %}
+        {% if feature.feature == 'creator_handle_matching' and admin_role == 'owner' %}
+        <div class="d-flex justify-content-between gap-2 mb-3"><span class="text-secondary">新达人及新增证据自动入队；历史全量需手动启动。</span><a href="/admin/ai/creator-handle-matching">匹配任务 →</a></div>
+        {% endif %}
         {% if admin_role == 'owner' %}<form action="/admin/ai" method="post" class="row g-3">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="feature" value="{{ feature.feature }}">
           <div class="col-md-3"><label class="form-label" for="ai-provider-{{ feature.id_suffix }}">提供商</label><input class="form-control" id="ai-provider-{{ feature.id_suffix }}" value="{{ config.provider_label }}" readonly></div>
           <div class="col-md-3"><label class="form-label" for="ai-project-id-{{ feature.id_suffix }}">Project ID</label><input class="form-control" id="ai-project-id-{{ feature.id_suffix }}" name="project_id" value="{{ config.project_id }}" maxlength="160" required autocomplete="off"></div>
           <div class="col-md-3"><label class="form-label" for="ai-model-{{ feature.id_suffix }}">模型</label><input class="form-control" id="ai-model-{{ feature.id_suffix }}" name="model" value="{{ config.model or 'gpt-5.6-luna' }}" maxlength="160" required autocomplete="off"></div>
-          <div class="col-md-3"><label class="form-label">AI 处理方式</label><div class="form-control-plaintext">{{ '手动启动名单匹配' if feature.feature == 'creator_import' else '直接总结并分级，不自动回复' }}</div></div>
+          <div class="col-md-3"><label class="form-label">AI 处理方式</label><div class="form-control-plaintext">{{ feature.processing_label }}</div></div>
+          {% if feature.feature == 'creator_handle_matching' %}
+          <div class="col-md-4"><label class="form-label" for="matching-rpm">每分钟请求上限（RPM）</label><input class="form-control" type="number" id="matching-rpm" name="rpm_limit" value="{{ config.rpm_limit }}" min="1" max="10000" required></div>
+          <div class="col-md-4"><label class="form-label" for="matching-tpm">每分钟 Token 上限（TPM）</label><input class="form-control" type="number" id="matching-tpm" name="tpm_limit" value="{{ config.tpm_limit }}" min="1000" max="10000000" required></div>
+          <div class="col-md-4"><label class="form-label" for="matching-daily-budget">每日 Token 预算</label><input class="form-control" type="number" id="matching-daily-budget" name="daily_token_budget" value="{{ config.daily_token_budget }}" min="1000" max="100000000" required></div>
+          {% endif %}
           {% if feature.feature == 'offhours_summary' %}
           {% if not summary_settings.recurring_enabled %}
           <div class="col-md-4"><label class="form-label" for="summary-window-start">开始时间（英国时间）</label><input class="form-control" type="datetime-local" id="summary-window-start" name="window_start" value="{{ summary_settings.window_start_input }}" required></div>
@@ -44,7 +53,7 @@
           <details class="col-12 text-secondary small"><summary>更新规则</summary>{% if summary_settings.recurring_enabled %}自动生成最近七天各时段的总结。{% else %}仅更新指定时段。{% endif %}时段结束后继续检查最多 24 小时，补充迟到消息；开启时若时段已结束，从开启起检查 24 小时。已成功的相同输入不重复分析。</details>
           {% endif %}
           <div class="col-md-8"><label class="form-label" for="ai-api-key-{{ feature.id_suffix }}">Service-account API key</label><input class="form-control" id="ai-api-key-{{ feature.id_suffix }}" name="api_key" type="password" maxlength="1024" autocomplete="new-password" spellcheck="false" placeholder="{{ '留空则保留 ' ~ config.api_key_label if config.key_configured else '首次配置时必填' }}"><div class="form-hint">填写即更换密钥；不要使用 Organization Admin Key。</div></div>
-          {% if feature.feature == 'offhours_summary' %}
+          {% if feature.feature != 'creator_import' %}
           <div class="col-md-4 d-flex align-items-end"><label class="form-check form-switch mb-2"><input class="form-check-input" type="checkbox" name="enabled" value="1" {% if config.enabled %}checked{% endif %}><span class="form-check-label">{{ feature.enabled_label }}</span></label></div>
           {% endif %}
           <div class="col-12 d-flex align-items-center justify-content-end gap-3"><span class="text-secondary small">启用后将调用 API，产生费用。</span><button class="btn btn-primary" type="submit">{% if feature.feature == 'offhours_summary' %}保存配置（开启则立即执行）{% else %}保存配置{% if config.key_configured %} / 轮换密钥{% endif %}{% endif %}</button></div>

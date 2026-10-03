@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}达人—handle 匹配{% endblock %}
+{% block body %}
+{% set status_labels = {
+  'queued': '待处理', 'preparing': '整理证据', 'ready': '待调用', 'running': '匹配中',
+  'retry_wait': '等待重试', 'waiting_evidence': '等待证据', 'review_required': '待核实',
+  'completed': '已完成', 'failed': '失败', 'cancelled': '已取消'
+} %}
+{% set reason_labels = {
+  'ready': '证据已准备', 'cached': '复用已有结果', 'suggestions_saved': '建议已保存',
+  'no_text': '没有可读消息', 'no_candidates': '缺少 Curva 账号线索', 'restricted': '不在处理范围',
+  'material_limit': '证据超出处理上限', 'catalog_unavailable': 'Curva 名单暂不可用',
+  'preparation_failed': '证据准备失败', 'snapshot_changed': '证据或配置已更新',
+  'lease_expired': '任务超时，正在恢复', 'identity_removed': '达人身份已取消',
+  'request_exceeds_budget': '单次请求超出预算', 'daily_budget': '等待每日预算恢复',
+  'rate_budget': '等待调用额度', 'quota_paused': 'API 额度不足，队列已暂停',
+  'provider_retry': '服务暂不可用，等待重试', 'invalid_output': '模型结果校验失败',
+  'provider_failed': 'API 调用失败', 'owner_cancelled': '已手动取消'
+} %}
+{% set decision_labels = {'supported': '证据支持', 'review': '待核实', 'not_supported': '不支持关联'} %}
+{% set relation_labels = {
+  'self_account': '本人账号', 'account_creator': '内容创作者', 'operator': '代运营',
+  'other_person': '他人账号', 'mention_only': '仅提及', 'uncertain': '关系不明'
+} %}
+{% set code_labels = {
+  'self_claim': '本人自述', 'qa_confirm': '完整问答', 'own_page': '本人主页', 'own_content': '本人内容',
+  'operates_for_other': '替他人运营', 'third_party': '第三方提及', 'mention_only': '仅提及账号',
+  'no_link_evidence': '缺少关联证据', 'ambiguous_reply': '回复对象不明', 'conflict': '归属冲突',
+  'username_changed': '账号曾更名', 'out_of_catalog': '不在 Curva 名单'
+} %}
+{% set period_labels = {'at_message': '消息时点', 'historical': '历史关系', 'unknown': '时点不明'} %}
+<div class="page">
+  {% include "admin/_nav.html" %}
+<div class="page-wrapper"><div class="container-xl py-4">
+  <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-3">
+    <div><h2 class="mb-1">达人—handle 匹配</h2><div class="text-secondary">{{ '已启用' if matching.enabled else '未启用' }} · 仅保存建议，不修改账号或负责人</div></div>
+    <div class="d-flex gap-2"><a class="btn" href="/admin/ai">API Key 配置</a>
+      <form method="post" action="/admin/ai/creator-handle-matching/enqueue"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary" {% if not matching.enabled %}disabled{% endif %}>补入全部未处理达人</button></form>
+    </div>
+  </div>
+  <div class="d-flex flex-wrap gap-3 mb-3">{% for item in matching.counts %}<span>{{ status_labels.get(item.status, item.status) }}：{{ item.n }}</span>{% else %}<span class="text-secondary">暂无任务</span>{% endfor %}</div>
+  <div class="card table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>达人</th><th>状态</th><th>账号建议</th><th>Token</th><th>操作</th></tr></thead><tbody>
+    {% for job in matching.jobs %}<tr><td>{{ job.display_name or '未命名' }}</td><td>{{ status_labels.get(job.status, job.status) }}{% if job.reason_code %}<div class="text-secondary small">{{ reason_labels.get(job.reason_code, job.reason_code) }}</div>{% endif %}</td>
+      <td>{% for item in job.suggestions %}<div><a href="https://www.tiktok.com/@{{ item.handle }}" rel="noopener noreferrer" target="_blank">@{{ item.handle }}</a> · {{ decision_labels.get(item.decision, item.decision) }}<div class="text-secondary small">{{ relation_labels.get(item.relation, item.relation) }} · {{ code_labels.get(item.code, item.code) }} · {{ period_labels.get(item.period, '时点不明') }}</div></div>{% else %}—{% endfor %}</td>
+      <td>{{ job.input_tokens + job.output_tokens }}</td><td><div class="d-flex gap-2">
+        {% for op,label in [('recheck','重新检查'),('cancel','取消')] %}{% if op != 'cancel' or job.status not in ['completed', 'failed', 'cancelled'] %}<form method="post" action="/admin/ai/creator-handle-matching/jobs/{{ job.id }}/{{ op }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm" type="submit" {% if op == 'recheck' and not matching.enabled %}disabled{% endif %}>{{ label }}</button></form>{% endif %}{% endfor %}
+      </div></td></tr>{% else %}<tr><td colspan="5" class="text-secondary text-center py-4">暂无任务</td></tr>{% endfor %}
+  </tbody></table></div>
+  <div class="d-flex justify-content-end gap-3 mt-3">{% if matching.page>1 %}<a href="?page={{ matching.page-1 }}">上一页</a>{% endif %}{% if matching.jobs|length==50 %}<a href="?page={{ matching.page+1 }}">下一页</a>{% endif %}</div>
+</div></div></div>
+{% endblock %}

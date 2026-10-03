@@ -49,6 +49,9 @@ class _Connection:
                 "last_test_status": "never",
                 "created_at": None,
                 "updated_at": None,
+                "rpm_limit": params[11],
+                "tpm_limit": params[12],
+                "daily_token_budget": params[13],
             }
             return _Result(self.row)
         return _Result(self.row)
@@ -183,3 +186,16 @@ def test_get_and_display_never_expose_ciphertext() -> None:
     assert "must-not-leak" not in repr(shown)
     assert shown["api_key_label"] == "已配置 · …1234"
     assert shown["last_test_status_label"] == "通过"
+    initial = display_config({"feature": "creator_handle_matching", "project_id": "unconfigured"})
+    assert not initial["enabled"] and not initial["key_configured"] and initial["project_id"] == ""
+    assert (initial["rpm_limit"], initial["tpm_limit"], initial["daily_token_budget"]) == (30, 60_000, 1_000_000)
+
+
+def test_matching_configuration_rejects_invalid_limits_and_placeholder_project_before_saving():
+    conn = _Connection()
+    values = dict(provider="openai", project_id="proj_matching", model="gpt-5.6-luna", enabled=True,
+                  api_key="sk-test-only-1234", updated_by_authorization_id=uuid4())
+    for changes in ({"daily_token_budget": "9" * 5000}, {"rpm_limit": "0"}, {"project_id": "unconfigured"}):
+        with pytest.raises(FeatureConfigInputError):
+            save_feature_config(conn, api_key_cipher(b"k" * 32), "creator_handle_matching", **{**values, **changes})
+    assert conn.calls == []

@@ -1302,7 +1302,7 @@ def run_claimed_import(job, settings):
         if exc.is_quota:
             ai_dispatch.pause_for_quota()
         if exc.retryable and not exc.is_quota and job["attempts"] < 2:
-            delay = min(max(exc.retry_after_seconds or 5, 1), 3600)
+            delay = openai_client.retry_delay(exc.retry_after_seconds, job['attempts'])
             ai_dispatch.throttle(delay)
             with connection() as conn, conn.transaction():
                 if _current(conn, job):

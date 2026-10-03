@@ -7,6 +7,7 @@ the small number of paid OpenAI requests it may hand to worker threads.
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
 
 import psycopg
@@ -45,6 +46,9 @@ def can_claim(conn: psycopg.Connection) -> bool:
             UNION ALL
             SELECT id FROM creator_import_rows
             WHERE status = 'running' AND lease_until > NOW()
+            UNION ALL
+            SELECT id FROM creator_handle_jobs
+            WHERE status = 'running' AND lease_until > NOW()
         ) AS active
         """
     ).fetchone()
@@ -60,7 +64,7 @@ def throttle(delay_seconds: float) -> None:
         return
     if not math.isfinite(delay):
         return
-    delay = min(max(delay, 0.0), 3_600.0)
+    delay = max(delay, 0.0)
     with connection() as conn, conn.transaction():
         conn.execute("SELECT pg_advisory_xact_lock(%s)", (_ADMISSION_LOCK,))
         conn.execute(
@@ -73,6 +77,20 @@ def throttle(delay_seconds: float) -> None:
             """,
             (delay, _TEMPORARY_RATE_LIMIT_MESSAGE),
         )
+
+
+def observe_limits(telemetry: dict[str, Any]) -> None:
+    """Provider exhausted-bucket hints supplement the atomic local budget."""
+    delays = []
+    for bucket in ("requests", "tokens"):
+        if telemetry.get("rate_limit_remaining_" + bucket) != 0:
+            continue
+        reset = str(telemetry.get("rate_limit_reset_" + bucket) or "")
+        parts = re.findall(r"(\d+(?:\.\d+)?)(ms|s|m|h)", reset)
+        seconds = sum(float(value) * {"ms": 0.001, "s": 1, "m": 60, "h": 3600}[unit] for value, unit in parts)
+        delays.append(seconds if parts and math.isfinite(seconds) and seconds > 0 else 60)
+    if delays:
+        throttle(max(delays))
 
 
 def pause_for_quota() -> None:

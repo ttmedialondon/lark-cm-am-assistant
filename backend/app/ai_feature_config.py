@@ -18,9 +18,13 @@ _KEY_AAD = b"lark-message-stats/ai-feature-config/v1"
 _KEY_DERIVATION = b"lark-message-stats/ai-feature-config-key/v1"
 _LONDON = ZoneInfo("Europe/London")
 DEFAULT_AUTO_CONFIRM_THRESHOLD = Decimal("0.900")
+DEFAULT_RPM_LIMIT = 30
+DEFAULT_TPM_LIMIT = 60_000
+DEFAULT_DAILY_TOKEN_BUDGET = 1_000_000
 _SAFE_COLUMNS = """
     feature, provider, project_id, model, enabled, key_suffix, key_updated_at,
-    last_tested_at, last_test_status, auto_confirm_threshold, created_at, updated_at
+    last_tested_at, last_test_status, auto_confirm_threshold, created_at, updated_at,
+    rpm_limit, tpm_limit, daily_token_budget
 """
 
 
@@ -57,15 +61,23 @@ def save_feature_config(
     api_key: str | None,
     updated_by_authorization_id: UUID,
     auto_confirm_threshold: Decimal | float | str = DEFAULT_AUTO_CONFIRM_THRESHOLD,
+    rpm_limit: int | str = DEFAULT_RPM_LIMIT,
+    tpm_limit: int | str = DEFAULT_TPM_LIMIT,
+    daily_token_budget: int | str = DEFAULT_DAILY_TOKEN_BUDGET,
 ) -> dict[str, Any]:
     """Upsert one feature config; a blank key retains the existing credential."""
 
     feature = _required_text(feature, "AI 功能", 80)
     provider = _required_text(provider, "服务商", 40).casefold()
     project_id = _required_text(project_id, "Project ID", 160)
+    if feature == "creator_handle_matching" and enabled and project_id.casefold() == "unconfigured":
+        raise FeatureConfigInputError("启用前请填写真实的 OpenAI Project ID。")
     model = _required_text(model, "模型", 160)
     api_key = _normalize_api_key(api_key)
     auto_confirm_threshold = _normalize_auto_confirm_threshold(auto_confirm_threshold)
+    rpm_limit = _normalize_limit(rpm_limit, "每分钟请求数", 1, 10_000)
+    tpm_limit = _normalize_limit(tpm_limit, "每分钟 Token 上限", 1_000, 10_000_000)
+    daily_token_budget = _normalize_limit(daily_token_budget, "每日 Token 预算", 1_000, 100_000_000)
 
     current = conn.execute(
         "SELECT api_key_ciphertext, key_suffix FROM ai_feature_configs WHERE feature = %s FOR UPDATE",
@@ -79,12 +91,14 @@ def save_feature_config(
         f"""
         INSERT INTO ai_feature_configs (
             feature, provider, project_id, model, enabled, auto_confirm_threshold,
-            api_key_ciphertext, key_suffix, key_updated_at, key_updated_by_authorization_id
+            api_key_ciphertext, key_suffix, key_updated_at, key_updated_by_authorization_id,
+            rpm_limit, tpm_limit, daily_token_budget
         ) VALUES (
             %s, %s, %s, %s, %s, %s,
             %s, %s,
             CASE WHEN %s THEN NOW() ELSE NULL END,
-            CASE WHEN %s THEN %s ELSE NULL END
+            CASE WHEN %s THEN %s ELSE NULL END,
+            %s, %s, %s
         )
         ON CONFLICT (feature) DO UPDATE SET
             provider = EXCLUDED.provider,
@@ -92,6 +106,9 @@ def save_feature_config(
             model = EXCLUDED.model,
             enabled = EXCLUDED.enabled,
             auto_confirm_threshold = EXCLUDED.auto_confirm_threshold,
+            rpm_limit = EXCLUDED.rpm_limit,
+            tpm_limit = EXCLUDED.tpm_limit,
+            daily_token_budget = EXCLUDED.daily_token_budget,
             api_key_ciphertext = COALESCE(EXCLUDED.api_key_ciphertext, ai_feature_configs.api_key_ciphertext),
             key_suffix = COALESCE(EXCLUDED.key_suffix, ai_feature_configs.key_suffix),
             key_updated_at = CASE
@@ -122,6 +139,9 @@ def save_feature_config(
             bool(api_key),
             bool(api_key),
             updated_by_authorization_id,
+            rpm_limit,
+            tpm_limit,
+            daily_token_budget,
         ),
     ).fetchone()
     assert row is not None
@@ -141,7 +161,7 @@ def display_config(row: Mapping[str, Any] | None) -> dict[str, Any]:
         "feature": values.get("feature"),
         "provider": values.get("provider") or "openai",
         "provider_label": "OpenAI" if values.get("provider", "openai") == "openai" else values.get("provider"),
-        "project_id": values.get("project_id") or "",
+        "project_id": "" if values.get("project_id") == "unconfigured" else values.get("project_id") or "",
         "model": values.get("model") or "",
         "auto_confirm_threshold": values.get("auto_confirm_threshold") or DEFAULT_AUTO_CONFIRM_THRESHOLD,
         "auto_confirm_threshold_label": (
@@ -158,6 +178,9 @@ def display_config(row: Mapping[str, Any] | None) -> dict[str, Any]:
         "last_tested_at_label": _time_label(last_tested_at, "尚未测试"),
         "last_test_status_label": {"succeeded": "通过", "failed": "失败"}.get(status, "尚未测试"),
         "last_test_badge": {"succeeded": "success", "failed": "danger"}.get(status, "secondary"),
+        "rpm_limit": values.get("rpm_limit") or DEFAULT_RPM_LIMIT,
+        "tpm_limit": values.get("tpm_limit") or DEFAULT_TPM_LIMIT,
+        "daily_token_budget": values.get("daily_token_budget") or DEFAULT_DAILY_TOKEN_BUDGET,
     }
 
 
@@ -167,6 +190,16 @@ def _normalize_api_key(value: str | None) -> str | None:
     if len(key) < 12 or len(key) > 1024 or not key.isascii() or any(character.isspace() for character in key):
         raise FeatureConfigInputError("API Key 格式无效。")
     return key
+
+
+def _normalize_limit(value: int | str, label: str, minimum: int, maximum: int) -> int:
+    text = str(value).strip()
+    if (
+        len(text) > len(str(maximum)) or not text.isascii() or not text.isdecimal()
+        or not minimum <= int(text) <= maximum
+    ):
+        raise FeatureConfigInputError(f"{label}必须是 {minimum:,} 到 {maximum:,} 之间的整数。")
+    return int(text)
 
 
 def _normalize_auto_confirm_threshold(value: Decimal | float | str) -> Decimal:

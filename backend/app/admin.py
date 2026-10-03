@@ -23,6 +23,7 @@ from . import (
     admin_reporting,
     ai_dispatch,
     ai_feature_config,
+    creator_handle_matching,
     message_export,
     offhours_summary,
     organization_sync,
@@ -56,11 +57,19 @@ AI_FEATURES = {
         "title": "达人名单匹配",
         "description": "仅处理手动启动的 达人导入批次，不扫描全员或推断负责人。",
         "enabled_label": "按导入批次手动启动",
+        "processing_label": "手动启动名单匹配",
+    },
+    "creator_handle_matching": {
+        "title": "达人—handle 匹配",
+        "description": "按授权消息匹配 Curva 收录账号，只保存建议，不自动更改达人、负责人或已有关系。",
+        "enabled_label": "开启自动匹配",
+        "processing_label": "队列匹配，仅生成建议",
     },
     "offhours_summary": {
         "title": "达人消息总结",
         "description": "整理已入库达人的群聊和私聊，按上班、下班时段归纳并分级。",
         "enabled_label": "开启达人消息总结",
+        "processing_label": "直接总结分级，不自动回复",
     },
 }
 
@@ -248,6 +257,7 @@ def create_admin_router(
                 "summary_settings": summary_settings,
                 "summary_saved": request.query_params.get("saved") == "offhours-summary",
                 "identity_saved": request.query_params.get("saved") == "people-identity",
+                "matching_saved": request.query_params.get("saved") == "creator-handle-matching",
                 # Retain this template-safe alias while external callers migrate to ``configs``.
                 "config": configs[0]["config"],
                 "form_error": error,
@@ -809,6 +819,17 @@ def create_admin_router(
             return render_ai_config(request, access_context, error="未知的 AI 功能配置。", status_code=400)
         try:
             threshold = str(ai_feature_config.DEFAULT_AUTO_CONFIRM_THRESHOLD)
+            enabled = feature != "creator_import" and form.get("enabled") == "1"
+            matching_limits = (
+                {
+                    "rpm_limit": form.get("rpm_limit", str(ai_feature_config.DEFAULT_RPM_LIMIT)),
+                    "tpm_limit": form.get("tpm_limit", str(ai_feature_config.DEFAULT_TPM_LIMIT)),
+                    "daily_token_budget": form.get(
+                        "daily_token_budget", str(ai_feature_config.DEFAULT_DAILY_TOKEN_BUDGET),
+                    ),
+                }
+                if feature == "creator_handle_matching" else {}
+            )
             with connection() as conn, conn.transaction():
                 key_rotated = bool(form.get("api_key", "").strip())
                 ai_feature_config.save_feature_config(
@@ -818,15 +839,18 @@ def create_admin_router(
                     provider="openai",
                     project_id=form.get("project_id", ""),
                     model=form.get("model", ""),
-                    enabled=feature == offhours_summary.FEATURE and form.get("enabled") == "1",
+                    enabled=enabled,
                     api_key=form.get("api_key", ""),
                     updated_by_authorization_id=access_context["authorization"]["id"],
                     auto_confirm_threshold=threshold,
+                    **matching_limits,
                 )
                 if feature == offhours_summary.FEATURE:
                     offhours_summary.save_settings_and_enqueue(
                         conn, access_context["authorization"]["id"], form,
                     )
+                elif feature == "creator_handle_matching":
+                    creator_handle_matching.configuration_changed(conn)
                 conn.execute(
                     "INSERT INTO audit_events (id, authorization_id, action, metadata) VALUES (%s, %s, %s, %s::jsonb)",
                     (
@@ -839,7 +863,7 @@ def create_admin_router(
                                 "provider": "openai",
                                 "project_id": form.get("project_id", "").strip(),
                                 "model": form.get("model", "").strip(),
-                                "enabled": feature == offhours_summary.FEATURE and form.get("enabled") == "1",
+                                "enabled": enabled,
                                 "auto_confirm_threshold": threshold.strip(),
                                 "key_rotated": key_rotated,
                             }
@@ -850,7 +874,8 @@ def create_admin_router(
             return render_ai_config(request, access_context, error=str(exc), status_code=400)
         saved_url = (
             "/admin/ai?saved=offhours-summary#offhours-summary" if feature == offhours_summary.FEATURE else
-            "/admin/ai"
+            "/admin/ai?saved=creator-handle-matching#creator-handle-matching"
+            if feature == "creator_handle_matching" else "/admin/ai"
         )
         response = RedirectResponse(url=saved_url, status_code=303)
         response.headers["Cache-Control"] = "no-store, max-age=0"

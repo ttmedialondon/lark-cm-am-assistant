@@ -1,0 +1,33 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "creator": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {"type": "string", "enum": ["known", "supported", "review", "not_supported"]},
+        "refs": {"type": "array", "items": {"type": "string"}}
+      },
+      "required": ["state", "refs"]
+    },
+    "links": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "h": {"type": "string"},
+          "decision": {"type": "string", "enum": ["supported", "review", "not_supported"]},
+          "relation": {"type": "string", "enum": ["self_account", "account_creator", "operator", "other_person", "mention_only", "uncertain"]},
+          "period": {"type": "string", "enum": ["at_message", "historical", "unknown"]},
+          "code": {"type": "string", "enum": ["self_claim", "qa_confirm", "own_page", "own_content", "operates_for_other", "third_party", "mention_only", "no_link_evidence", "ambiguous_reply", "conflict", "username_changed", "out_of_catalog"]},
+          "refs": {"type": "array", "items": {"type": "string"}},
+          "needed": {"type": "array", "items": {"type": "string", "enum": ["parent_reply", "identity_context", "account_context", "earlier_username", "other_claimants", "recent_state"]}}
+        },
+        "required": ["h", "decision", "relation", "period", "code", "refs", "needed"]
+      }
+    }
+  },
+  "required": ["creator", "links"]
+}
