@@ -39,9 +39,6 @@
           <div class="col-md-3"><label class="form-label" for="ai-project-id-{{ feature.id_suffix }}">Project ID</label><input class="form-control" id="ai-project-id-{{ feature.id_suffix }}" name="project_id" value="{{ config.project_id }}" maxlength="160" required autocomplete="off"></div>
           <div class="col-md-3"><label class="form-label" for="ai-model-{{ feature.id_suffix }}">模型</label><input class="form-control" id="ai-model-{{ feature.id_suffix }}" name="model" value="{{ config.model or 'gpt-5.6-luna' }}" maxlength="160" required autocomplete="off"></div>
           <div class="col-md-3"><label class="form-label">AI 处理方式</label><div class="form-control-plaintext">{{ feature.processing_label }}</div></div>
-          {% if feature.feature == 'creator_handle_matching' %}
-          <div class="col-md-6"><label class="form-label" for="matching-rpm">每分钟请求上限（RPM）</label><input class="form-control" type="number" id="matching-rpm" name="rpm_limit" value="{{ config.rpm_limit }}" min="1" max="10000" required></div>
-          {% endif %}
           {% if feature.feature == 'offhours_summary' %}
           {% if not summary_settings.recurring_enabled %}
           <div class="col-md-4"><label class="form-label" for="summary-window-start">开始时间（英国时间）</label><input class="form-control" type="datetime-local" id="summary-window-start" name="window_start" value="{{ summary_settings.window_start_input }}" required></div>

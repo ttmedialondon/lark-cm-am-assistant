@@ -51,7 +51,7 @@ def _load_catalog(directory, _modified):
 def _config(conn, *, lock=False):
     return conn.execute(
         """SELECT provider,project_id,model,enabled,api_key_ciphertext,updated_at,
-        rpm_limit,matching_catalog_version,
+        matching_catalog_version,
         automatic_queue_checked_at<NOW()-INTERVAL '1 minute' AS reconcile_due
         FROM ai_feature_configs WHERE feature=%s"""
         + (" FOR UPDATE" if lock else ""),
@@ -259,30 +259,6 @@ def _needs_review(result, stats):
     ) or any(stats.get(key) for key in ("history_truncated", "candidates_omitted", "critical_evidence_omitted"))
 
 
-def _reserve(conn, config, job, tokens):
-    """Check request cadence and record usage; token estimates never block admission."""
-    scope = evidence_hash([config["provider"], config["project_id"], config["model"]])
-    conn.execute("SELECT pg_advisory_xact_lock(%s)", (ai_dispatch._ADMISSION_LOCK,))
-    used = conn.execute(
-        """SELECT count(*) rpm FROM creator_handle_requests
-        WHERE quota_scope=%s AND created_at>NOW()-INTERVAL '1 minute'""",
-        (scope,),
-    ).fetchone()
-    if used["rpm"] >= config["rpm_limit"]:
-        conn.execute(
-            """UPDATE creator_handle_jobs SET not_before=NOW()+INTERVAL '1 minute',
-            reason_code='rate_budget' WHERE id=%s""",
-            (job["id"],),
-        )
-        return None
-    reservation = uuid4()
-    conn.execute(
-        "INSERT INTO creator_handle_requests(id,job_id,quota_scope,reserved_tokens) VALUES(%s,%s,%s,%s)",
-        (reservation, job["id"], scope, tokens),
-    )
-    return reservation
-
-
 def claim():
     with connection() as conn, conn.transaction():
         config = _config(conn, lock=True)
@@ -304,6 +280,7 @@ def claim():
         if job["config_fingerprint"] != _config_hash(config) or job["snapshot_version"] != job["desired_version"]:
             _invalidate(conn, job)
             return None
+        # Usage estimate only: neither tokens nor recent request counts limit admission.
         # UTF-8 bytes are a conservative input-token upper bound, not a price estimate.
         from .config import get_settings
 
@@ -316,9 +293,12 @@ def claim():
             + MAX_OUTPUT
             + 512
         )
-        reservation = _reserve(conn, config, job, tokens)
-        if not reservation:
-            return None
+        reservation = uuid4()
+        scope = evidence_hash([config["provider"], config["project_id"], config["model"]])
+        conn.execute(
+            "INSERT INTO creator_handle_requests(id,job_id,quota_scope,reserved_tokens) VALUES(%s,%s,%s,%s)",
+            (reservation, job["id"], scope, tokens),
+        )
         token = uuid4()
         conn.execute(
             """UPDATE creator_handle_jobs SET status='running',claim_token=%s,

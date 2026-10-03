@@ -820,12 +820,6 @@ def create_admin_router(
         try:
             threshold = str(ai_feature_config.DEFAULT_AUTO_CONFIRM_THRESHOLD)
             enabled = feature != "creator_import" and form.get("enabled") == "1"
-            matching_limits = (
-                {
-                    "rpm_limit": form.get("rpm_limit", str(ai_feature_config.DEFAULT_RPM_LIMIT)),
-                }
-                if feature == "creator_handle_matching" else {}
-            )
             with connection() as conn, conn.transaction():
                 key_rotated = bool(form.get("api_key", "").strip())
                 ai_feature_config.save_feature_config(
@@ -839,7 +833,6 @@ def create_admin_router(
                     api_key=form.get("api_key", ""),
                     updated_by_authorization_id=access_context["authorization"]["id"],
                     auto_confirm_threshold=threshold,
-                    **matching_limits,
                 )
                 if feature == offhours_summary.FEATURE:
                     offhours_summary.save_settings_and_enqueue(

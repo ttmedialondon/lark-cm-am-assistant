@@ -254,8 +254,7 @@ def test_matching_save_keeps_configuration_and_queue_invalidation_in_one_transac
     assert [item[0] for item in called] == ["config", "queue"]
     assert called[0][1] is called[1][1]
     assert called[0][2]["enabled"] is True
-    assert called[0][2]["rpm_limit"] == "20"
-    assert "tpm_limit" not in called[0][2] and "daily_token_budget" not in called[0][2]
+    assert not {"rpm_limit", "tpm_limit", "daily_token_budget"}.intersection(called[0][2])
 
 
 def test_matching_routes_recheck_live_owner_and_csrf_before_queue_writes(pg, monkeypatch):

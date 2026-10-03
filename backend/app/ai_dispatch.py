@@ -80,7 +80,7 @@ def throttle(delay_seconds: float) -> None:
 
 
 def observe_limits(telemetry: dict[str, Any]) -> None:
-    """Provider exhausted-bucket hints supplement the atomic local budget."""
+    """Hold shared admission when the provider reports an exhausted bucket."""
     delays = []
     for bucket in ("requests", "tokens"):
         if telemetry.get("rate_limit_remaining_" + bucket) != 0:

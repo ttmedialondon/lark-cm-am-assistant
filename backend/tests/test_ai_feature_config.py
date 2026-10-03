@@ -49,7 +49,6 @@ class _Connection:
                 "last_test_status": "never",
                 "created_at": None,
                 "updated_at": None,
-                "rpm_limit": params[11],
             }
             return _Result(self.row)
         return _Result(self.row)
@@ -80,7 +79,6 @@ def test_save_encrypts_key_and_only_returns_safe_fields() -> None:
         enabled=True,
         api_key=api_key,
         updated_by_authorization_id=uuid4(),
-        rpm_limit="20",
     )
 
     inserted = conn.calls[-1][1]
@@ -90,7 +88,7 @@ def test_save_encrypts_key_and_only_returns_safe_fields() -> None:
     assert saved["key_suffix"] == "1234"
     assert "api_key_ciphertext" not in saved
     assert api_key not in repr(saved)
-    assert saved["rpm_limit"] == 20
+    assert "rpm_limit" not in saved
     assert "daily_token_budget" not in saved
 
 
@@ -140,13 +138,14 @@ def test_blank_feature_key_can_be_enabled_on_real_postgres(pg):
                   updated_by_authorization_id=owner)
     cipher = api_key_cipher(b"k" * 32)
     save_feature_config(pg, cipher, "offhours_summary", **values, enabled=False, api_key="sk-test-only-1234")
-    pg.execute("UPDATE ai_feature_configs SET tpm_limit=1000,daily_token_budget=1000 WHERE feature='offhours_summary'")
-    columns = "api_key_ciphertext,key_updated_at,key_updated_by_authorization_id,tpm_limit,daily_token_budget"
+    pg.execute("""UPDATE ai_feature_configs SET rpm_limit=1,tpm_limit=1000,daily_token_budget=1000
+                  WHERE feature='offhours_summary'""")
+    columns = "api_key_ciphertext,key_updated_at,key_updated_by_authorization_id,rpm_limit,tpm_limit,daily_token_budget"
     before = pg.execute(f"SELECT {columns} FROM ai_feature_configs WHERE feature='offhours_summary'").fetchone()
     saved = save_feature_config(pg, cipher, "offhours_summary", **values, enabled=True, api_key="")
     after = pg.execute(f"SELECT {columns} FROM ai_feature_configs WHERE feature='offhours_summary'").fetchone()
     assert saved["enabled"] and saved["key_suffix"] == "1234" and after == before
-    assert "tpm_limit" not in saved and "daily_token_budget" not in saved
+    assert not {"rpm_limit", "tpm_limit", "daily_token_budget"}.intersection(saved)
 
 
 def test_auto_confirmation_never_allows_a_threshold_below_ninety_percent() -> None:
@@ -178,6 +177,7 @@ def test_get_and_display_never_expose_ciphertext() -> None:
         "last_tested_at": when,
         "last_test_status": "succeeded",
         "api_key_ciphertext": "must-not-leak",
+        "rpm_limit": 1,
         "tpm_limit": 60_000,
         "daily_token_budget": 1_000,
     }
@@ -188,22 +188,21 @@ def test_get_and_display_never_expose_ciphertext() -> None:
     assert loaded is not None
     assert "api_key_ciphertext" not in loaded
     assert "api_key_ciphertext" not in shown
-    assert "tpm_limit" not in loaded and "tpm_limit" not in shown
-    assert "daily_token_budget" not in loaded and "daily_token_budget" not in shown
+    assert not {"rpm_limit", "tpm_limit", "daily_token_budget"}.intersection(loaded)
+    assert not {"rpm_limit", "tpm_limit", "daily_token_budget"}.intersection(shown)
     assert "must-not-leak" not in repr(shown)
     assert shown["api_key_label"] == "已配置 · …1234"
     assert shown["last_test_status_label"] == "通过"
     initial = display_config({"feature": "creator_handle_matching", "project_id": "unconfigured"})
     assert not initial["enabled"] and not initial["key_configured"] and initial["project_id"] == ""
-    assert initial["rpm_limit"] == 30
-    assert "daily_token_budget" not in initial
+    assert not {"rpm_limit", "tpm_limit", "daily_token_budget"}.intersection(initial)
 
 
-def test_matching_configuration_rejects_invalid_limits_and_placeholder_project_before_saving():
+def test_matching_configuration_rejects_placeholder_project_before_saving():
     conn = _Connection()
     values = dict(provider="openai", project_id="proj_matching", model="gpt-5.6-luna", enabled=True,
                   api_key="sk-test-only-1234", updated_by_authorization_id=uuid4())
-    for changes in ({"rpm_limit": "9" * 5000}, {"rpm_limit": "0"}, {"project_id": "unconfigured"}):
-        with pytest.raises(FeatureConfigInputError):
-            save_feature_config(conn, api_key_cipher(b"k" * 32), "creator_handle_matching", **{**values, **changes})
+    with pytest.raises(FeatureConfigInputError):
+        save_feature_config(conn, api_key_cipher(b"k" * 32), "creator_handle_matching",
+                            **{**values, "project_id": "unconfigured"})
     assert conn.calls == []
