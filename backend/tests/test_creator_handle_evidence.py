@@ -100,19 +100,64 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot):
         {"h": h2, "decision": "review", "relation": "uncertain", "period": "unknown",
          "code": "no_link_evidence", "refs": [], "needed": ["account_context"]},
     ]}
+    dynamic = matcher.output_format(pack)["schema"]
+    fields = dynamic["properties"]["links"]["items"]["properties"]
+    assert fields["h"]["enum"] == [h["id"] for h in pack["handles"]]
+    assert fields["refs"]["items"]["enum"] == [m["id"] for m in pack["messages"]]
+    assert fields["refs"]["maxItems"] == 6
+    assert dynamic["properties"]["links"]["minItems"] == dynamic["properties"]["links"]["maxItems"] == 2
+    assert dynamic["properties"]["creator"]["properties"]["state"]["enum"] == ["known"]
+    assert dynamic["properties"]["creator"]["properties"]["refs"]["maxItems"] == 0
+    assert "enum" not in matcher.output_format()["schema"]["properties"]["links"]["items"]["properties"]["h"]
+    unknown = deepcopy(pack)
+    unknown["creator_known"] = False
+    unknown_creator = matcher.output_format(unknown)["schema"]["properties"]["creator"]["properties"]
+    assert "known" not in unknown_creator["state"]["enum"]
     assert matcher.validate(pack, result) == result
     assert matcher.still_valid(pg, material["refs"], pilot.settings)
     invalid = deepcopy(result)
     invalid["links"][0]["refs"] = [answer["id"]]
-    with pytest.raises(ModelOutputError):
-        matcher.validate(pack, invalid)
+    assert matcher.validate(pack, invalid)["links"][0]["validation_error"] == "unsupported_evidence"
     invalid = deepcopy(result)
     invalid["links"][1] = {**invalid["links"][0], "h": h2}
-    with pytest.raises(ModelOutputError):
-        matcher.validate(pack, invalid)
+    reviewed = matcher.validate(pack, invalid)
+    assert reviewed["links"][0] == result["links"][0]  # Bad second account does not discard valid QA.
+    assert reviewed["links"][1]["decision"] == "review"
+    assert reviewed["links"][1]["validation_error"] == "unsupported_evidence"
+    assert matcher.validate(pack, reviewed) == reviewed  # Local diagnostics survive a safe cache replay.
+    invalid["creator"] = {"state": "supported", "refs": ["nonexistent"]}
+    invalid["links"][1]["refs"] = ["nonexistent", answer["id"], answer["id"]] * 3
+    reviewed = matcher.validate(pack, invalid)
+    assert reviewed["creator"] == {"state": "known", "refs": []}
+    assert reviewed["links"][0] == result["links"][0]
+    assert reviewed["links"][1]["refs"] == [answer["id"]]
+    assert reviewed["links"][1]["decision"] == "review" and reviewed["links"][1]["needed"]
+    assert reviewed["links"][1]["validation_error"] == "references"
+    no_reply = deepcopy(pack)
+    next(m for m in no_reply["messages"] if m["id"] == answer["id"])["reply"] = None
+    assert matcher.validate(no_reply, result)["links"][0]["validation_error"] == "unconnected_owner_evidence"
+    declaration = next(m for m in pack["messages"] if "/video/" in m["text"])
+    for body in ("No worries, my TikTok account is first.handle", "My TikTok is first.handle"):
+        claimed_pack = deepcopy(pack)
+        next(m for m in claimed_pack["messages"] if m["id"] == declaration["id"])["text"] = body
+        claimed_result = deepcopy(result)
+        claimed_result["links"][0].update(code="self_claim", refs=[declaration["id"]])
+        assert matcher.validate(claimed_pack, claimed_result)["links"][0]["decision"] == "supported"
+    for body in ("No worries, not my TikTok account first.handle", "My friend's TikTok is first.handle",
+                 "My TikTok Shop seller account is first.handle"):
+        next(m for m in claimed_pack["messages"] if m["id"] == declaration["id"])["text"] = body
+        assert matcher.validate(claimed_pack, claimed_result)["links"][0]["decision"] == "review"
     invalid = deepcopy(result)
     invalid["links"].append(invalid["links"][0])
     with pytest.raises(ModelOutputError):
+        matcher.validate(pack, invalid)
+    invalid = deepcopy(result)
+    invalid["links"][0]["h"] = "first.handle"
+    with pytest.raises(ModelOutputError, match="candidates"):
+        matcher.validate(pack, invalid)
+    invalid = deepcopy(result)
+    invalid["links"][0]["refs"] = "not an array"
+    with pytest.raises(ModelOutputError, match="array"):
         matcher.validate(pack, invalid)
     raw = json.dumps({"text": "Yes correct"})
     pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='answer'", (cipher.encrypt(raw),))
@@ -184,11 +229,9 @@ def test_contact_matching_rejects_disconnected_and_third_party_claims():
     result = {"creator": {"state": "known", "refs": []}, "links": [
         {"h": "H1", "decision": "supported", "relation": "self_account", "period": "at_message",
          "code": "self_claim", "refs": ["M1", "M2"], "needed": []}]}
-    with pytest.raises(ModelOutputError):
-        matcher.validate(pack, result)
+    assert matcher.validate(pack, result)["links"][0]["decision"] == "review"
     pack["messages"][0]["text"] = "My account is not .creator_1"
-    with pytest.raises(ModelOutputError):
-        matcher.validate(pack, result)
+    assert matcher.validate(pack, result)["links"][0]["decision"] == "review"
     pack["messages"][0]["text"] = "My account is .creator_1"
     assert matcher.validate(pack, result) == result
     pack["messages"].append({"id": "M3", "speaker": "unknown", "chat": "G1",
@@ -197,8 +240,7 @@ def test_contact_matching_rejects_disconnected_and_third_party_claims():
     assert matcher.validate(pack, result)["links"][0]["decision"] == "review"
     pack["messages"].pop()
     pack["handles"][0]["catalog_verified"] = False
-    with pytest.raises(ModelOutputError):
-        matcher.validate(pack, result)
+    assert matcher.validate(pack, result)["links"][0]["code"] == "out_of_catalog"
     assert matcher._tokens("@.Creator_1. / .creator_1 / .creator_10", frozenset({".creator_1"})) == {".creator_1"}
     assert not matcher._tokens("a" * 65, frozenset({"a" * 64, "a"}))
     assert matcher._plain(json.dumps({"content": [[{"tag": "img", "image_key": "hidden-pixels"}]]}),

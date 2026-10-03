@@ -69,8 +69,10 @@ def matching_flow(pg, pilot, monkeypatch):
         }
         return {
             "pack": pack,
-            "refs": [{"kind": "message", "label": label, "synthetic_version": state.reference_version}
-                     for label in ("M1", "M2")],
+            "refs": [
+                {"kind": "message", "label": label, "synthetic_version": state.reference_version}
+                for label in ("M1", "M2")
+            ],
             "fingerprint": f"synthetic-{contact}-{state.material_version}",
             "reason": "ready",
             "stats": {"messages": 2, **state.stats},
@@ -174,18 +176,24 @@ def test_opt_in_coalescing_multi_handle_auto_links_and_exact_cache(pg, matching_
     assert len(view["result"]["links"]) == 2
     assert flow.calls[0]["reasoning_effort"] == "none" and flow.calls[0]["total_timeout"] == 45
     assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == ["backup_2", "first.handle"]
-    links = pg.execute("SELECT relationship,status,source FROM contact_social_accounts WHERE contact_id=%s",
-                       (flow.contact,)).fetchall()
+    links = pg.execute(
+        "SELECT relationship,status,source FROM contact_social_accounts WHERE contact_id=%s", (flow.contact,)
+    ).fetchall()
     assert links == [{"relationship": "owner", "status": "confirmed", "source": "creator_handle_auto_verified"}] * 2
     audits = pg.execute("SELECT metadata FROM audit_events WHERE action='creator_handle_auto_linked'").fetchall()
     assert {row["metadata"]["handle"] for row in audits} == {"first.handle", "backup_2"}
-    assert all(row["metadata"]["job_id"] == str(identifier) and
-               row["metadata"]["contact_id"] == str(flow.contact) for row in audits)
-    assert all(row["metadata"]["refs"] == ["M1" if row["metadata"]["handle"] == "first.handle" else "M2"]
-               and row["metadata"]["prompt_version"] == matching.evidence.PROMPT_VERSION
-               and row["metadata"]["evidence_refs"] == [{"kind": "message", "label": row["metadata"]["refs"][0],
-                                                        "synthetic_version": 1}]
-               and "text" not in row["metadata"] for row in audits)
+    assert all(
+        row["metadata"]["job_id"] == str(identifier) and row["metadata"]["contact_id"] == str(flow.contact)
+        for row in audits
+    )
+    assert all(
+        row["metadata"]["refs"] == ["M1" if row["metadata"]["handle"] == "first.handle" else "M2"]
+        and row["metadata"]["prompt_version"] == matching.evidence.PROMPT_VERSION
+        and row["metadata"]["evidence_refs"]
+        == [{"kind": "message", "label": row["metadata"]["refs"][0], "synthetic_version": 1}]
+        and "text" not in row["metadata"]
+        for row in audits
+    )
     # Rotating credentials or a readable grant does not change the model's semantic input.
     flow.enable("sk-success-cache-replacement")
     flow.reference_version += 1
@@ -195,19 +203,31 @@ def test_opt_in_coalescing_multi_handle_auto_links_and_exact_cache(pg, matching_
     assert cached == {"status": "completed", "reason_code": "cached"}
     assert matching.claim() is None and len(flow.calls) == 1
     assert pg.execute("SELECT refs FROM creator_handle_jobs WHERE id=%s", (new_id,)).fetchone()["refs"] == [
-        {"kind": "message", "label": label, "synthetic_version": 2} for label in ("M1", "M2")]
-    assert pg.execute("SELECT count(*) n FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()["n"] == 2
-    assert pg.execute("SELECT metadata FROM audit_events WHERE action='creator_handle_auto_linked'").fetchall() == audits
+        {"kind": "message", "label": label, "synthetic_version": 2} for label in ("M1", "M2")
+    ]
+    assert (
+        pg.execute("SELECT count(*) n FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()["n"] == 2
+    )
+    assert (
+        pg.execute("SELECT metadata FROM audit_events WHERE action='creator_handle_auto_linked'").fetchall() == audits
+    )
     assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == ["backup_2", "first.handle"]
     # Simulate a pre-upgrade suggestion-only cache using isolated fixture data.
-    pg.execute("DELETE FROM contact_social_accounts WHERE contact_id=%s AND source='creator_handle_auto_verified'",
-               (flow.contact,))
+    pg.execute(
+        "DELETE FROM contact_social_accounts WHERE contact_id=%s AND source='creator_handle_auto_verified'",
+        (flow.contact,),
+    )
     pg.execute("DELETE FROM audit_events WHERE action='creator_handle_auto_linked'")
     migrated_id = _enqueue(pg, flow.contact)
     assert matching.prepare_next(flow.settings) and matching.claim() is None and len(flow.calls) == 1
     assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == ["backup_2", "first.handle"]
-    assert pg.execute("SELECT count(*) n FROM audit_events WHERE action='creator_handle_auto_linked' "
-                      "AND metadata->>'job_id'=%s", (str(migrated_id),)).fetchone()["n"] == 2
+    assert (
+        pg.execute(
+            "SELECT count(*) n FROM audit_events WHERE action='creator_handle_auto_linked' AND metadata->>'job_id'=%s",
+            (str(migrated_id),),
+        ).fetchone()["n"]
+        == 2
+    )
     assert all(row in _snapshot(pg, ("contact_social_accounts",))["contact_social_accounts"] for row in original_links)
     assert _snapshot(pg, before.keys()) == before
 
@@ -242,8 +262,12 @@ def test_stale_version_and_revoked_evidence_never_publish_suggestions(pg, matchi
     after_network = _prepared_job(pg, flow)
     matching.run(after_network, flow.settings)
     assert len(flow.calls) == 2
-    assert pg.execute("SELECT result_ciphertext FROM creator_handle_jobs WHERE id=%s",
-                      (after_network["id"],)).fetchone()["result_ciphertext"] is None
+    assert (
+        pg.execute("SELECT result_ciphertext FROM creator_handle_jobs WHERE id=%s", (after_network["id"],)).fetchone()[
+            "result_ciphertext"
+        ]
+        is None
+    )
     # A grant can disappear while waiting for writer locks, after the post-response check passed.
     flow.valid, flow.before_response = True, None
     at_write = _prepared_job(pg, flow)
@@ -251,10 +275,18 @@ def test_stale_version_and_revoked_evidence_never_publish_suggestions(pg, matchi
     monkeypatch.setattr(matching.evidence, "still_valid", lambda *_: next(validity))
     matching.run(at_write, flow.settings)
     assert len(flow.calls) == 3
-    assert pg.execute("SELECT result_ciphertext FROM creator_handle_jobs WHERE id=%s",
-                      (at_write["id"],)).fetchone()["result_ciphertext"] is None
-    assert pg.execute("SELECT billed_tokens FROM creator_handle_requests WHERE id=%s",
-                      (at_write["reservation_id"],)).fetchone()["billed_tokens"] == 150
+    assert (
+        pg.execute("SELECT result_ciphertext FROM creator_handle_jobs WHERE id=%s", (at_write["id"],)).fetchone()[
+            "result_ciphertext"
+        ]
+        is None
+    )
+    assert (
+        pg.execute(
+            "SELECT billed_tokens FROM creator_handle_requests WHERE id=%s", (at_write["reservation_id"],)
+        ).fetchone()["billed_tokens"]
+        == 150
+    )
     assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
     assert not pg.execute("SELECT 1 FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
 
@@ -289,8 +321,10 @@ def test_legacy_limits_do_not_block_restart_and_retry_fences(pg, matching_flow):
     flow = matching_flow
     flow.enable()
     # Historical limits must not reject requests or delay them until the next minute/day.
-    pg.execute("UPDATE ai_feature_configs SET rpm_limit=1,daily_token_budget=1000,tpm_limit=1000 WHERE feature=%s",
-               (matching.FEATURE,))
+    pg.execute(
+        "UPDATE ai_feature_configs SET rpm_limit=1,daily_token_budget=1000,tpm_limit=1000 WHERE feature=%s",
+        (matching.FEATURE,),
+    )
     job = _prepared_job(pg, flow)
     assert pg.execute("SELECT reserved_tokens FROM creator_handle_requests").fetchone()["reserved_tokens"] > 1000
     pg.execute("UPDATE creator_handle_jobs SET lease_until=NOW()-INTERVAL '1 second' WHERE id=%s", (job["id"],))
@@ -333,15 +367,18 @@ def test_legacy_limits_do_not_block_restart_and_retry_fences(pg, matching_flow):
     # A new credential may fix a provider failure: do not reuse the old Key's failed request.
     flow.enable("sk-replacement-test-only")
     flow.error = None
-    refreshed_id = pg.execute("SELECT enqueue_creator_handle(%s,'incremental',TRUE) id",
-                              (flow.contact,)).fetchone()["id"]
+    refreshed_id = pg.execute("SELECT enqueue_creator_handle(%s,'incremental',TRUE) id", (flow.contact,)).fetchone()[
+        "id"
+    ]
     assert matching.prepare_next(flow.settings)
     refreshed = matching.claim()
     assert refreshed is not None and refreshed["id"] == refreshed_id
     matching.run(refreshed, flow.settings)
     assert len(flow.calls) == previous_calls + 1
-    assert pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s",
-                      (refreshed_id,)).fetchone()["status"] == "completed"
+    assert (
+        pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (refreshed_id,)).fetchone()["status"]
+        == "completed"
+    )
 
 
 def test_review_and_incomplete_evidence_never_auto_link_and_cache_can_reuse(pg, matching_flow):
@@ -372,7 +409,9 @@ def test_review_and_incomplete_evidence_never_auto_link_and_cache_can_reuse(pg, 
     )
     # Weak evidence for the backup account does not block an independently proven primary account.
     assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == ["first.handle"]
-    original_audit = pg.execute("SELECT metadata FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
+    original_audit = pg.execute(
+        "SELECT metadata FROM audit_events WHERE action='creator_handle_auto_linked'"
+    ).fetchone()
     assert original_audit["metadata"]["evidence_refs"] == [{"kind": "message", "label": "M1", "synthetic_version": 1}]
     flow.reference_version += 1
     assert _enqueue(pg, flow.contact) == job["id"]
@@ -383,10 +422,16 @@ def test_review_and_incomplete_evidence_never_auto_link_and_cache_can_reuse(pg, 
     }
     previous_calls = len(flow.calls)
     assert matching.claim() is None
-    assert pg.execute("SELECT count(*) n FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()["n"] == 1
-    assert pg.execute("SELECT metadata FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone() == original_audit
+    assert (
+        pg.execute("SELECT count(*) n FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()["n"] == 1
+    )
+    assert (
+        pg.execute("SELECT metadata FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
+        == original_audit
+    )
     assert pg.execute("SELECT refs FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone()["refs"] == [
-        {"kind": "message", "label": label, "synthetic_version": 2} for label in ("M1", "M2")]
+        {"kind": "message", "label": label, "synthetic_version": 2} for label in ("M1", "M2")
+    ]
     # Coverage alone still requires review, even if the model's selected links all support ownership.
     flow.review = False
     flow.material_version += 1
@@ -411,46 +456,66 @@ def test_auto_link_preserves_rejections_non_owner_links_and_other_account_claims
     flow.enable()
     accounts = {handle: uuid4() for handle in ("first.handle", "backup_2")}
     for handle, account in accounts.items():
-        pg.execute("INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) "
-                   "VALUES(%s,'tiktok',%s,%s)", (account, handle, handle))
-    pg.execute("INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source) "
-               "VALUES(%s,%s,'owner','rejected','manual'),(%s,%s,'representative','confirmed','manual')",
-               (flow.contact, accounts["first.handle"], flow.contact, accounts["backup_2"]))
+        pg.execute(
+            "INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) VALUES(%s,'tiktok',%s,%s)",
+            (account, handle, handle),
+        )
+    pg.execute(
+        "INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source) "
+        "VALUES(%s,%s,'owner','rejected','manual'),(%s,%s,'representative','confirmed','manual')",
+        (flow.contact, accounts["first.handle"], flow.contact, accounts["backup_2"]),
+    )
     before = _snapshot(pg, ("contact_social_accounts", "creator_account_assignments"))
     job = _prepared_job(pg, flow)
     matching.run(job, flow.settings)
     assert _snapshot(pg, before.keys()) == before
-    assert pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone()["status"] == "review_required"
+    assert (
+        pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone()["status"]
+        == "review_required"
+    )
     assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
     assert not pg.execute("SELECT 1 FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
     # The alternate non-owner relation must be protected on the cached-result path too.
-    pg.execute("UPDATE contact_social_accounts SET relationship='associated' WHERE contact_id=%s "
-               "AND social_account_id=%s", (flow.contact, accounts["backup_2"]))
+    pg.execute(
+        "UPDATE contact_social_accounts SET relationship='associated' WHERE contact_id=%s AND social_account_id=%s",
+        (flow.contact, accounts["backup_2"]),
+    )
     cached = pg.execute("SELECT result_ciphertext FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone()
     view = json.loads(creator_data.cipher(flow.settings).decrypt(cached["result_ciphertext"]))
     for link in view["result"]["links"]:
         link.update(decision="supported", relation="self_account", code="self_claim")
-    pg.execute("UPDATE creator_handle_jobs SET result_ciphertext=%s WHERE id=%s",
-               (creator_data.cipher(flow.settings).encrypt(creator_data.encode(view)), job["id"]))
+    pg.execute(
+        "UPDATE creator_handle_jobs SET result_ciphertext=%s WHERE id=%s",
+        (creator_data.cipher(flow.settings).encrypt(creator_data.encode(view)), job["id"]),
+    )
     before = _snapshot(pg, before.keys())
     _enqueue(pg, flow.contact)
     assert matching.prepare_next(flow.settings) and matching.claim() is None and len(flow.calls) == 1
     assert _snapshot(pg, before.keys()) == before
     # Replace only fixture-created blockers: a different owner and a separate active account assignment.
     pg.execute("DELETE FROM contact_social_accounts WHERE contact_id=%s", (flow.contact,))
-    pg.execute("INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source) "
-               "VALUES(%s,%s,'owner','confirmed','manual')", (pilot.ids["legacy"], accounts["first.handle"]))
-    candidate = pg.execute("SELECT id FROM creator_workflow_candidates WHERE contact_id=%s",
-                           (pilot.ids["legacy"],)).fetchone()["id"]
-    pg.execute("INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,"
-               "contact_id,relationship,source,candidate_id,created_by_authorization_id) "
-               "VALUES(%s,%s,%s,%s,'associated','cm_confirmation',%s,%s)",
-               (uuid4(), accounts["backup_2"], pilot.ids["cm"], pilot.ids["legacy"], candidate, pilot.ids["owner"]))
+    pg.execute(
+        "INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source) "
+        "VALUES(%s,%s,'owner','confirmed','manual')",
+        (pilot.ids["legacy"], accounts["first.handle"]),
+    )
+    candidate = pg.execute(
+        "SELECT id FROM creator_workflow_candidates WHERE contact_id=%s", (pilot.ids["legacy"],)
+    ).fetchone()["id"]
+    pg.execute(
+        "INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,"
+        "contact_id,relationship,source,candidate_id,created_by_authorization_id) "
+        "VALUES(%s,%s,%s,%s,'associated','cm_confirmation',%s,%s)",
+        (uuid4(), accounts["backup_2"], pilot.ids["cm"], pilot.ids["legacy"], candidate, pilot.ids["owner"]),
+    )
     before = _snapshot(pg, before.keys())
     flow.material_version += 1
     job = _prepared_job(pg, flow)
     matching.run(job, flow.settings)
-    assert pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone()["status"] == "review_required"
+    assert (
+        pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone()["status"]
+        == "review_required"
+    )
     assert _snapshot(pg, before.keys()) == before
     assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
     assert not pg.execute("SELECT 1 FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
@@ -505,3 +570,55 @@ def test_role_and_chat_events_shared_slots_and_catalog_changes(pg, matching_flow
     }
     assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
     assert not pg.execute("SELECT 1 FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
+
+
+def test_failed_diagnostics_partial_results_and_queue_cleanup_preserve_data(pg, matching_flow, monkeypatch):
+    flow = matching_flow
+    flow.enable()
+    respond = matching.api.call_openai
+    secret = "synthetic private message must never enter diagnostics"
+    broken = True
+
+    def reply(*args, **kwargs):
+        response = respond(*args, **kwargs)
+        value = json.loads(response["text"])
+        value["links"][1]["refs"] = [secret]
+        if broken:
+            value["links"][1]["h"] = "H1"
+        response["text"] = json.dumps(value)
+        return response
+
+    monkeypatch.setattr(matching.api, "call_openai", reply)
+    job = _prepared_job(pg, flow)
+    matching.run(job, flow.settings)
+    assert (
+        pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone()["status"] == "failed"
+    )
+    logged = pg.execute("SELECT * FROM creator_handle_requests WHERE job_id=%s", (job["id"],)).fetchone()
+    assert logged["error_code"] == "candidates"
+    assert (logged["input_tokens"], logged["output_tokens"], logged["billed_tokens"]) == (100, 50, 150)
+    assert logged["response_id"] == "resp_synthetic" and logged["request_id"] == "req_synthetic"
+    assert secret not in creator_data.cipher(flow.settings).decrypt(logged["response_ciphertext"])
+    broken = False
+    flow.material_version += 1
+    partial = _prepared_job(pg, flow)
+    matching.run(partial, flow.settings)
+    row = pg.execute(
+        "SELECT status,result_ciphertext FROM creator_handle_jobs WHERE id=%s", (partial["id"],)
+    ).fetchone()
+    assert row["status"] == "review_required"
+    result = json.loads(creator_data.cipher(flow.settings).decrypt(row["result_ciphertext"]))["result"]
+    assert [link["decision"] for link in result["links"]] == ["supported", "review"]
+    assert result["links"][1]["validation_error"] == "references"
+    assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == ["first.handle"]
+    assert not matching.claim()
+    # The worker can safely re-use a downgraded cached result without another paid call.
+    _enqueue(pg, flow.contact)
+    assert matching.prepare_next(flow.settings) and matching.claim() is None and len(flow.calls) == 2
+    before = _snapshot(pg, ("contacts", "contact_roles", "contact_social_accounts", "creator_account_assignments"))
+    pg.execute("DELETE FROM creator_handle_jobs WHERE contact_id=%s", (flow.contact,))
+    assert _snapshot(pg, before.keys()) == before
+    retained = pg.execute(
+        "SELECT count(*) n,sum(billed_tokens) tokens FROM creator_handle_requests WHERE job_id IS NULL"
+    ).fetchone()
+    assert retained == {"n": 2, "tokens": 300}

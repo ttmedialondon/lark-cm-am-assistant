@@ -75,6 +75,17 @@ def test_single_request_transport_preserves_retry_hints_and_safe_failure_metadat
     assert calls[-1][1]["json"]["reasoning"] == {"effort": "none"}
     assert calls[-1][1]["json"]["store"] is False
 
+    result = httpx.Response(200, headers={"x-request-id": "req_incomplete"}, json={
+        "status": "incomplete", "id": "resp_incomplete", "output_text": "PRIVATE BODY",
+        "usage": {"input_tokens": 80, "output_tokens": 20},
+    })
+    with pytest.raises(openai_client.ModelOutputError) as stopped:
+        request()
+    assert stopped.value.telemetry["usage"] == {"input_tokens": 80, "output_tokens": 20}
+    assert stopped.value.telemetry["response_id"] == "resp_incomplete"
+    assert stopped.value.telemetry["openai_request_id"] == "req_incomplete"
+    assert "PRIVATE BODY" not in str(stopped.value) + str(stopped.value.telemetry)
+
     result = httpx.Response(503, headers={"Retry-After": "7200", "x-request-id": "req_test"},
                             json={"error": {"code": "server_is_overloaded", "message": "PRIVATE BODY"}})
     with pytest.raises(openai_client.OpenAIRequestError) as stopped:
@@ -83,6 +94,7 @@ def test_single_request_transport_preserves_retry_hints_and_safe_failure_metadat
     assert stopped.value.retry_after_seconds == 7200
     assert openai_client.retry_delay(stopped.value.retry_after_seconds, 1) == 7200.5
     assert stopped.value.telemetry["openai_request_id"] == "req_test"
+    assert stopped.value.telemetry["http_status"] == 503
     assert "PRIVATE BODY" not in str(stopped.value) + str(stopped.value.telemetry)
 
     date = format_datetime(datetime.fromtimestamp(1_700_007_200, UTC), usegmt=True)

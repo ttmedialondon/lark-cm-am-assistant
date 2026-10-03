@@ -16,13 +16,14 @@ from . import handle_evidence as handles
 from .crypto import message_body_cipher
 from .openai_client import ModelOutputError
 
-PROMPT_VERSION = "creator-handle-research-v1.2"
+PROMPT_VERSION = "creator-handle-research-v1.3"
 MAX_MESSAGES, MAX_CHARS, MAX_HANDLES, SEARCH_LIMIT = 48, 20_000, 12, 20_000
 # A research hold is an explicit access restriction, not a negative identity finding.
 RESTRICTED_CONTACTS = frozenset({"6abf6bf9-12dc-4a22-9654-2010aa4c7785"})
 _TOKEN = re.compile(r"(?<![A-Za-z0-9._])[A-Za-z0-9._]{1,64}(?![A-Za-z0-9._])", re.ASCII)
 _SELF = re.compile(
     r"\b(?:my\s+(?:(?:own|other|second|backup|new|old|tiktok|tt)\s+)*(?:account|page|handle|username)|"
+    r"my\s+(?:tiktok|tt)(?=\s+(?:is\b|https?://|@)|\s*[:=])|"
     r"(?:both|these|they|that|this|it)(?:\s+(?:are|is)|['’]s)?\s+(?:mine|my)|"
     r"mine\b|i\s+(?:have|own|use)\s+(?:\w+\s+){0,3}accounts?)\b|"
     r"我的(?:抖音|TikTok|账号|帐号|主页)|都是我的|这是我的|我(?:有|用的|的)账号",
@@ -39,6 +40,11 @@ _CONFIRM = re.compile(r"\b(?:yes|yep|yeah|correct|right|mine)\b|是的|正确|�
 _QUESTION = re.compile(r"\b(?:tiktok|tt|handle|username|account|page)\b|账号|用户名|主页", re.I)
 _THIRD_PARTY = re.compile(r"\b(?:friend|client|referred|manage|operate|approve|approval)\b|朋友|转发|审批|代运营", re.I)
 _DENIAL = re.compile(r"\b(?:no|not|isn't|isn’t|incorrect|wrong)\b|不是|不对", re.I)
+_COURTESY = re.compile(r"\bno\s+(?:worries|problem)\b", re.I)
+VALIDATION_ERRORS = frozenset({
+    "references", "needed", "unsupported_evidence", "supported_relation", "excerpted_support",
+    "owner_code", "unconnected_owner_evidence", "counterevidence", "out_of_catalog",
+})
 _TRANSFER = re.compile(
     r"\b(?:transfer\w*|sold|deleted|shared|banned|suspended)\b.*\b(?:account|page)\b|"
     r"\b(?:account|page)\b.*\b(?:transfer\w*|sold|deleted|shared|banned|suspended)\b|转让|封禁|注销", re.I)
@@ -56,10 +62,29 @@ def instructions():
 
 
 @lru_cache(maxsize=1)
-def output_format():
-    schema = json.loads((Path(__file__).resolve().parents[2]
-                         / "docs/specs/creator-handle-association_v1.2.schema.json").read_text())
-    return {"type": "json_schema", "name": "creator_handle_v1_2", "strict": True, "schema": schema}
+def _schema():
+    return json.loads((Path(__file__).resolve().parents[2]
+                       / "docs/specs/creator-handle-association_v1.2.schema.json").read_text())
+
+
+def output_format(pack=None):
+    schema = deepcopy(_schema())
+    if pack is not None:
+        creator = schema["properties"]["creator"]["properties"]
+        links = schema["properties"]["links"]
+        fields = links["items"]["properties"]
+        fields["h"]["enum"] = [h["id"] for h in pack["handles"]]
+        links.update(minItems=len(pack["handles"]), maxItems=len(pack["handles"]))
+        for refs in (creator["refs"], fields["refs"]):
+            refs["items"]["enum"] = [m["id"] for m in pack["messages"]]
+        creator["state"]["enum"] = ["known"] if pack["creator_known"] else ["supported", "review", "not_supported"]
+        if pack["creator_known"]:
+            creator["refs"]["maxItems"] = 0
+    return {"type": "json_schema", "name": "creator_handle_v1_3", "strict": True, "schema": schema}
+
+
+def _denied(value):
+    return _DENIAL.search(_COURTESY.sub("", value))
 
 
 def _rows(conn, condition, params, limit=SEARCH_LIMIT + 1):
@@ -176,7 +201,7 @@ def build(conn, settings, contact_id, catalog):
         bool(_SELF.search(i["text"])), bool(text._IMPORTANT.search(i["text"])),
         str(i["row"]["message_create_time"])), reverse=True)
     changes = [i for i in ranked if handles._CHANGE.search(i["text"]) or _NOT_OWNER.search(i["text"])
-               or _TRANSFER.search(i["text"]) or _DENIAL.search(i["text"]) and (
+               or _TRANSFER.search(i["text"]) or _denied(i["text"]) and (
                    i["handles"] & candidate_set or _QUESTION.search(i["text"]) or
                    by_key.get((i["row"]["chat_id"], i["row"].get("parent_id")), {})
                    .get("handles", set()) & candidate_set)]
@@ -298,41 +323,63 @@ def _near_messages(left, right):
 
 def validate(pack, result):
     """Validate protocol and minimum connected evidence; model semantics still require review."""
-    _shape(result, output_format()["schema"])
     result = deepcopy(result)
+    # Cached, locally downgraded items carry only a safe diagnostic code, never model prose.
+    diagnostics = {}
+    if isinstance(result, dict) and isinstance(result.get("links"), list):
+        for index, link in enumerate(result["links"]):
+            if isinstance(link, dict) and "validation_error" in link:
+                error = link.pop("validation_error")
+                if not isinstance(error, str) or error not in VALIDATION_ERRORS or link.get("decision") != "review":
+                    raise ModelOutputError("shape")
+                diagnostics[index] = error
+    _shape(result, output_format()["schema"])
     messages = {m["id"]: m for m in pack["messages"]}
     candidates = {h["id"]: h for h in pack["handles"]}
     if len(result["links"]) != len(candidates) or {link["h"] for link in result["links"]} != set(candidates):
         raise ModelOutputError("candidates")
-    if pack["creator_known"] and result["creator"]["state"] != "known":
-        raise ModelOutputError("known identity")
-    if not pack["creator_known"] and result["creator"]["state"] == "known":
-        raise ModelOutputError("unknown identity")
-    for item in [result["creator"], *result["links"]]:
-        if (len(item["refs"]) > 6 or len(item["refs"]) != len(set(item["refs"]))
-                or not set(item["refs"]) <= messages.keys()):
-            raise ModelOutputError("references")
-    for link in result["links"]:
+    if pack["creator_known"]:
+        result["creator"] = {"state": "known", "refs": []}
+    else:
+        creator = result["creator"]
+        if (creator["state"] == "known" or len(creator["refs"]) > 6
+                or len(creator["refs"]) != len(set(creator["refs"]))
+                or not set(creator["refs"]) <= messages.keys()):
+            creator.update(state="review", refs=list(dict.fromkeys(r for r in creator["refs"] if r in messages))[:6])
+    for index, link in enumerate(result["links"]):
+        if index in diagnostics:
+            link["validation_error"] = diagnostics[index]
+        if (len(link["refs"]) > 6 or len(link["refs"]) != len(set(link["refs"]))
+                or not set(link["refs"]) <= messages.keys()):
+            _review(link, "references", messages)
+            continue
         if len(link["needed"]) != len(set(link["needed"])):
-            raise ModelOutputError("needed")
+            _review(link, "needed", messages)
+            continue
         if link["decision"] != "supported":
             continue
         candidate = candidates[link["h"]]
         cited = [messages[ref] for ref in link["refs"]]
         own = [m for m in cited if m["speaker"] == pack["target"]]
-        if (not candidate["catalog_verified"] or not own
-                or not any(_mentions(m["text"], candidate["handle"]) for m in cited)):
-            raise ModelOutputError("unsupported evidence")
+        if not candidate["catalog_verified"]:
+            _review(link, "out_of_catalog", messages)
+            continue
+        if not own or not any(_mentions(m["text"], candidate["handle"]) for m in cited):
+            _review(link, "unsupported_evidence", messages)
+            continue
         if link["relation"] not in {"self_account", "account_creator", "operator"} or link["period"] == "unknown":
-            raise ModelOutputError("supported relation")
+            _review(link, "supported_relation", messages)
+            continue
         if set(link["refs"]) & set(pack["coverage"]["excerpted_ids"]):
-            raise ModelOutputError("excerpted support")
+            _review(link, "excerpted_support", messages)
+            continue
         if link["relation"] != "self_account":
             continue
         if link["code"] not in {"self_claim", "qa_confirm", "own_page"}:
-            raise ModelOutputError("owner code")
+            _review(link, "owner_code", messages)
+            continue
         affirmative = [m for m in own if _SELF.search(m["text"]) and not _NOT_OWNER.search(m["text"])
-                       and not _DENIAL.search(m["text"])]
+                       and not _denied(m["text"])]
         explicit = any(_mentions(m["text"], candidate["handle"]) for m in affirmative)
         split = any(_near_messages(a, b) for a in affirmative for b in own
                     if not any(_mentions(a["text"], other["handle"]) for other in candidates.values()
@@ -341,11 +388,11 @@ def validate(pack, result):
                     and not _NOT_OWNER.search(b["text"]))
         qa = any(m["reply"] in link["refs"]
                  and (_CONFIRM.search(m["text"]) or _mentions(m["text"], candidate["handle"]))
-                 and not _DENIAL.search(m["text"]) and not _NOT_OWNER.search(m["text"])
+                 and not _denied(m["text"]) and not _NOT_OWNER.search(m["text"])
                  and _QUESTION.search(messages[m["reply"]]["text"])
                  and re.search(r"\b(?:your|yours)\b|你的|您的", messages[m["reply"]]["text"], re.I)
                  and not _THIRD_PARTY.search(messages[m["reply"]]["text"])
-                 and not _DENIAL.search(messages[m["reply"]]["text"])
+                 and not _denied(messages[m["reply"]]["text"])
                  and (_mentions(m["text"], candidate["handle"]) or not any(
                      _mentions(m["text"], other["handle"]) for other in candidates.values()
                      if other["id"] != link["h"]))
@@ -355,15 +402,27 @@ def validate(pack, result):
                  and messages[m["reply"]]["speaker"] != pack["target"]
                  for m in own if m["reply"])
         if link["code"] == "qa_confirm" and not qa or not (explicit or split or qa):
-            raise ModelOutputError("unconnected owner evidence")
+            _review(link, "unconnected_owner_evidence", messages)
+            continue
         counter_refs = _counterevidence(pack, candidate["handle"], affirmative or own)
         if counter_refs and link["period"] != "historical":
             # A model cannot select only a positive quote and ignore a later provided denial.
             own_counter = any(messages[ref]["speaker"] == pack["target"] for ref in counter_refs)
             link.update(decision="review", relation="uncertain", period="historical" if own_counter else "unknown",
                         code="conflict", refs=list(dict.fromkeys([*counter_refs, *link["refs"]]))[:6],
-                        needed=["recent_state" if own_counter else "other_claimants"])
+                        needed=["recent_state" if own_counter else "other_claimants"],
+                        validation_error="counterevidence")
     return result
+
+
+def _review(link, error, messages):
+    """An invalid item cannot become writable by trimming its bad references."""
+    needed = "parent_reply" if link["code"] == "qa_confirm" else "account_context"
+    link.update(decision="review", relation="uncertain", period="unknown",
+                code="out_of_catalog" if error == "out_of_catalog" else
+                     "ambiguous_reply" if needed == "parent_reply" else "no_link_evidence",
+                refs=list(dict.fromkeys(r for r in link["refs"] if r in messages))[:6],
+                needed=list(dict.fromkeys([*link["needed"], needed])), validation_error=error)
 
 
 def _counterevidence(pack, handle, claims):
@@ -376,17 +435,17 @@ def _counterevidence(pack, handle, claims):
         parts = re.split(r"[\n,;!?]|\.\s+|\b(?:but|however|and\s+(?:my|i|now|the|it))\b", body, flags=re.I)
         exact_parts = [part for part in parts if _mentions(part, handle)]
         parent = messages.get(message.get("reply"))
-        denial_reply = (parent and _mentions(parent["text"], handle) and _DENIAL.search(body)
+        denial_reply = (parent and _mentions(parent["text"], handle) and _denied(body)
                         and not _mentions(body, handle))
         if message["speaker"] == pack["target"]:
             negative = denial_reply or any(_NOT_OWNER.search(part) or _TRANSFER.search(part)
-                                          or _DENIAL.search(part) for part in exact_parts)
+                                          or _denied(part) for part in exact_parts)
             if negative and (_timestamp(message) >= claim_time or not message.get("at")):
                 conflicts.append(message["id"])
                 if denial_reply:
                     conflicts.append(parent["id"])
         elif (actors.get(message["speaker"], "unknown") in {"external", "unknown"} and exact_parts
-              and _SELF.search(body) and not _NOT_OWNER.search(body) and not _DENIAL.search(body)):
+              and _SELF.search(body) and not _NOT_OWNER.search(body) and not _denied(body)):
             conflicts.append(message["id"])
     return list(dict.fromkeys(conflicts))
 

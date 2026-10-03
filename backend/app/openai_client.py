@@ -42,6 +42,10 @@ class OpenAIRequestError(AIInputError):
 class ModelOutputError(ValueError):
     """The model did not return the constrained review shape."""
 
+    def __init__(self, message: str, *, telemetry: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.telemetry = dict(telemetry or {})
+
 
 def retry_delay(retry_after_seconds: float | None, attempts: object) -> float:
     """Respect a provider retry deadline; only use a small fallback if absent."""
@@ -113,19 +117,27 @@ def call_openai(
         )
     try:
         data = response.json()
+        if not isinstance(data, Mapping):
+            raise TypeError("response object")
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ModelOutputError("invalid response", telemetry=telemetry) from exc
+    usage = data.get("usage") if isinstance(data.get("usage"), Mapping) else {}
+    safe_usage = {
+        "input_tokens": _nonnegative_int(usage.get("input_tokens")),
+        "output_tokens": _nonnegative_int(usage.get("output_tokens")),
+    }
+    response_id = _bounded_text(data.get("id"), 160)
+    telemetry = {**telemetry, "usage": safe_usage, "response_id": response_id}
+    if data.get("status") not in {None, "completed"}:
+        raise ModelOutputError("unfinished response", telemetry=telemetry)
+    try:
         text = _response_text(data)
     except (TypeError, ValueError, KeyError) as exc:
-        raise ModelOutputError("invalid response") from exc
-    if data.get("status") not in {None, "completed"}:
-        raise ModelOutputError("unfinished response")
-    usage = data.get("usage") if isinstance(data.get("usage"), Mapping) else {}
+        raise ModelOutputError("invalid response", telemetry=telemetry) from exc
     return {
         "text": text,
-        "response_id": _bounded_text(data.get("id"), 160),
-        "usage": {
-            "input_tokens": _nonnegative_int(usage.get("input_tokens")),
-            "output_tokens": _nonnegative_int(usage.get("output_tokens")),
-        },
+        "response_id": response_id,
+        "usage": safe_usage,
         "telemetry": telemetry,
     }
 
@@ -146,6 +158,7 @@ def _openai_telemetry(response: httpx.Response, started: float) -> dict[str, Any
         return _bounded_text(value, 160) or None
 
     return {
+        "http_status": response.status_code,
         "openai_request_id": header("x-request-id"),
         "response_latency_ms": max(0, round((time.perf_counter() - started) * 1_000)),
         "rate_limit_remaining_requests": _header_nonnegative_int(header("x-ratelimit-remaining-requests")),

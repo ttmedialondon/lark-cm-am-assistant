@@ -20,6 +20,29 @@ FEATURE = "creator_handle_matching"
 LEASE_SECONDS = 120
 MAX_OUTPUT = 3000
 CATALOG_PATH = "/var/lib/lark-message-stats/reference-data/curva/2026-09-21-import-20260928"
+OUTPUT_ERRORS = (
+    frozenset(
+        {
+            "shape",
+            "array",
+            "enum",
+            "candidates",
+            "known_identity",
+            "unknown_identity",
+            "references",
+            "needed",
+            "unsupported_evidence",
+            "supported_relation",
+            "excerpted_support",
+            "owner_code",
+            "unconnected_owner_evidence",
+            "invalid_response",
+            "unfinished_response",
+            "invalid_json",
+        }
+    )
+    | evidence.VALIDATION_ERRORS
+)
 
 
 def catalog():
@@ -185,9 +208,15 @@ def prepare_next(settings):
             _invalidate(conn, current)
             return True
         pack = prepared["pack"]
-        fingerprint = evidence_hash([
-            prepared["fingerprint"], config["provider"], config["project_id"], config["model"], evidence.PROMPT_VERSION,
-        ])
+        fingerprint = evidence_hash(
+            [
+                prepared["fingerprint"],
+                config["provider"],
+                config["project_id"],
+                config["model"],
+                evidence.PROMPT_VERSION,
+            ]
+        )
         cached = conn.execute(
             """SELECT result_ciphertext,status,stats,attempts,reason_code FROM creator_handle_jobs
             WHERE contact_id=%s AND fingerprint=%s AND (
@@ -200,22 +229,37 @@ def prepare_next(settings):
         if cached:
             cached["stats"] = {**cached["stats"], **prepared["stats"]}
         if cached and cached["result_ciphertext"]:
-            if not evidence.still_valid(conn, prepared["refs"], settings) or not conn.execute(
-                "SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed'",
-                (job["contact_id"],),
-            ).fetchone():
+            if (
+                not evidence.still_valid(conn, prepared["refs"], settings)
+                or not conn.execute(
+                    "SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed'",
+                    (job["contact_id"],),
+                ).fetchone()
+            ):
                 _invalidate(conn, current)
                 return True
             saved = evidence.validate(pack, json.loads(storage.decrypt(cached["result_ciphertext"]))["result"])
             cached["stats"] = _apply_links(
-                conn, current, pack, saved, cached["stats"], prepared["refs"], settings, catalog_version,
+                conn,
+                current,
+                pack,
+                saved,
+                cached["stats"],
+                prepared["refs"],
+                settings,
+                catalog_version,
             )
             if cached["stats"] is None:
                 _invalidate(conn, current)
                 return True
-            cached["result_ciphertext"] = storage.encrypt(creator_data.encode({
-                "handles": {h["id"]: h["handle"] for h in pack["handles"]}, "result": saved,
-            }))
+            cached["result_ciphertext"] = storage.encrypt(
+                creator_data.encode(
+                    {
+                        "handles": {h["id"]: h["handle"] for h in pack["handles"]},
+                        "result": saved,
+                    }
+                )
+            )
             cached["status"] = "review_required" if _needs_review(saved, cached["stats"]) else "completed"
         conn.execute(
             """UPDATE creator_handle_jobs SET status=%s,reason_code=%s,
@@ -278,8 +322,9 @@ def _needs_review(result, stats):
 def _apply_links(conn, job, pack, result, stats, refs, settings, catalog_version):
     """Add only verified self-account links; preserve all existing human decisions."""
     by_handle = {h["id"]: h["handle"] for h in pack["handles"]}
-    claims = [link for link in result["links"]
-              if link["decision"] == "supported" and link["relation"] == "self_account"]
+    claims = [
+        link for link in result["links"] if link["decision"] == "supported" and link["relation"] == "self_account"
+    ]
     claimed = [by_handle[link["h"]] for link in claims]
     # Same account -> person lock order as manual roster admission; sort multiple handles.
     for handle in sorted(claimed):
@@ -293,29 +338,50 @@ def _apply_links(conn, job, pack, result, stats, refs, settings, catalog_version
                 return None
         except (OSError, ValueError, KeyError):
             return None
-        if not evidence.still_valid(conn, refs, settings) or not conn.execute(
-            "SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed'",
-            (job["contact_id"],),
-        ).fetchone():
+        if (
+            not evidence.still_valid(conn, refs, settings)
+            or not conn.execute(
+                "SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed'",
+                (job["contact_id"],),
+            ).fetchone()
+        ):
             return None
     # Reuse the admission rules read-only: never call its identity/CM-writing _admit.
-    conflicts = dict(zip(claimed, creator_imports._conflicts(
-        conn, [(None, job["contact_id"], handle) for handle in claimed],
-    )))
-    other_claims = {row["handle"] for row in conn.execute(
-        """SELECT handle FROM unnest(%s::text[]) handles(handle) WHERE EXISTS (
+    conflicts = dict(
+        zip(
+            claimed,
+            creator_imports._conflicts(
+                conn,
+                [(None, job["contact_id"], handle) for handle in claimed],
+            ),
+            strict=True,
+        )
+    )
+    other_claims = (
+        {
+            row["handle"]
+            for row in conn.execute(
+                """SELECT handle FROM unnest(%s::text[]) handles(handle) WHERE EXISTS (
         SELECT 1 FROM creator_handle_jobs j WHERE j.contact_id<>%s
           AND j.status IN ('completed','review_required') AND j.stats->'claimed_handles' ? handles.handle
           AND NOT EXISTS (SELECT 1 FROM creator_handle_jobs newer WHERE newer.contact_id=j.contact_id
             AND (newer.created_at,newer.id)>(j.created_at,j.id)))""",
-        (claimed, job["contact_id"]),
-    ).fetchall()} if claimed else set()
+                (claimed, job["contact_id"]),
+            ).fetchall()
+        }
+        if claimed
+        else set()
+    )
     accounts = {}
-    for account in conn.execute(
-        """SELECT id,lower(normalized_handle) handle FROM social_accounts
+    for account in (
+        conn.execute(
+            """SELECT id,lower(normalized_handle) handle FROM social_accounts
         WHERE platform='tiktok' AND lower(normalized_handle)=ANY(%s::text[]) ORDER BY id FOR UPDATE""",
-        (claimed,),
-    ).fetchall() if claimed else []:
+            (claimed,),
+        ).fetchall()
+        if claimed
+        else []
+    ):
         accounts.setdefault(account["handle"], []).append(account["id"])
     clean = not any(stats.get(k) for k in ("history_truncated", "candidates_omitted", "critical_evidence_omitted"))
     associated, added = [], []
@@ -324,9 +390,14 @@ def _apply_links(conn, job, pack, result, stats, refs, settings, catalog_version
         if conflicts[handle] or handle in other_claims or len(accounts.get(handle, [])) > 1:
             link.update(decision="review", relation="uncertain", code="conflict")
             continue
-        if not (clean and pack["creator_known"] and link["period"] == "at_message"
-                and link["code"] in {"self_claim", "qa_confirm", "own_page"} and not link["needed"]
-                and not set(link["refs"]) & set(pack["coverage"]["missing_reply_ids"])):
+        if not (
+            clean
+            and pack["creator_known"]
+            and link["period"] == "at_message"
+            and link["code"] in {"self_claim", "qa_confirm", "own_page"}
+            and not link["needed"]
+            and not set(link["refs"]) & set(pack["coverage"]["missing_reply_ids"])
+        ):
             continue
         account_id = accounts[handle][0] if accounts.get(handle) else None
         if account_id is None:
@@ -347,23 +418,36 @@ def _apply_links(conn, job, pack, result, stats, refs, settings, catalog_version
         ).fetchone()
         if inserted:
             added.append(handle)
-            _audit(conn, None, "creator_handle_auto_linked", {
-                "job_id": str(job["id"]), "contact_id": str(job["contact_id"]),
-                "social_account_id": str(account_id), "handle": handle,
-                "prompt_version": evidence.PROMPT_VERSION, "refs": link["refs"],
-                "evidence_refs": [ref for ref in refs
-                                  if ref["kind"] == "message" and ref["label"] in link["refs"]],
-            })
+            _audit(
+                conn,
+                None,
+                "creator_handle_auto_linked",
+                {
+                    "job_id": str(job["id"]),
+                    "contact_id": str(job["contact_id"]),
+                    "social_account_id": str(account_id),
+                    "handle": handle,
+                    "prompt_version": evidence.PROMPT_VERSION,
+                    "refs": link["refs"],
+                    "evidence_refs": [ref for ref in refs if ref["kind"] == "message" and ref["label"] in link["refs"]],
+                },
+            )
         elif not conn.execute(
             """SELECT 1 FROM contact_social_accounts WHERE contact_id=%s AND social_account_id=%s
-            AND relationship='owner' AND status='confirmed'""", (job["contact_id"], account_id),
+            AND relationship='owner' AND status='confirmed'""",
+            (job["contact_id"], account_id),
         ).fetchone():
             link.update(decision="review", relation="uncertain", code="conflict")
             continue
         associated.append(handle)
     supported = [by_handle[link["h"]] for link in claims if link["decision"] == "supported"]
-    return {**stats, "supported_handles": supported, "claimed_handles": claimed,
-            "associated_handles": associated, "auto_linked_handles": added}
+    return {
+        **stats,
+        "supported_handles": supported,
+        "claimed_handles": claimed,
+        "associated_handles": associated,
+        "auto_linked_handles": added,
+    }
 
 
 def claim():
@@ -396,7 +480,7 @@ def claim():
         tokens = (
             len(raw.encode())
             + len(evidence.instructions().encode())
-            + len(creator_data.encode(evidence.output_format()).encode())
+            + len(creator_data.encode(evidence.output_format(json.loads(raw))).encode())
             + MAX_OUTPUT
             + 512
         )
@@ -447,6 +531,105 @@ def _current(conn, job):
     return row
 
 
+def _output_error(error):
+    if isinstance(error, api.ModelOutputError):
+        code = str(error).replace(" ", "_")
+        return code if code in OUTPUT_ERRORS else "invalid_output"
+    if isinstance(error, api.OpenAIRequestError):
+        status = error.telemetry.get("http_status")
+        if isinstance(status, int) and 100 <= status <= 599:
+            return f"http_{status}"
+        return "quota_paused" if error.is_quota else "provider_retry" if error.retryable else "provider_failed"
+    return "" if error is None else "internal_error"
+
+
+def _compact_result(pack, value):
+    """Whitelist protocol fields: never persist model prose, quotations or arbitrary strings."""
+    if not isinstance(value, dict):
+        return {"parseable": False}
+    schema = evidence.output_format()["schema"]["properties"]
+    handle_ids = {h["id"] for h in pack["handles"]}
+    message_ids = {m["id"] for m in pack["messages"]}
+
+    def fields(item, properties):
+        if not isinstance(item, dict):
+            return {"invalid_shape": True}
+        clean = {}
+        for key, spec in properties.items():
+            child = item.get(key)
+            if key in {"refs", "needed"}:
+                allowed = message_ids if key == "refs" else set(spec["items"]["enum"])
+                clean[key] = (
+                    [v if isinstance(v, str) and v in allowed else "[invalid]" for v in child[:7]]
+                    if isinstance(child, list)
+                    else "[invalid]"
+                )
+            elif key == "h":
+                clean[key] = child if isinstance(child, str) and child in handle_ids else "[invalid]"
+            else:
+                clean[key] = child if isinstance(child, str) and child in spec["enum"] else "[invalid]"
+        code = item.get("validation_error")
+        if isinstance(code, str) and code in OUTPUT_ERRORS:
+            clean["validation_error"] = code
+        return clean
+
+    links = value.get("links")
+    return {
+        "creator": fields(value.get("creator"), schema["creator"]["properties"]),
+        "links": [fields(link, schema["links"]["items"]["properties"]) for link in links[:12]]
+        if isinstance(links, list)
+        else "[invalid]",
+    }
+
+
+def review(pack, config, contact_id, settings):
+    """One paid call, shared by the worker and the bounded, no-write probe."""
+    result, telemetry, error, diagnostic = None, {}, None, None
+    try:
+        key = ai_feature_config.api_key_cipher(settings.token_encryption_key).decrypt(config["api_key_ciphertext"])
+        response = api.call_openai(
+            config,
+            key,
+            pack,
+            str(contact_id),
+            instructions=evidence.instructions(),
+            output_format=evidence.output_format(pack),
+            max_output_tokens=MAX_OUTPUT,
+            reasoning_effort="none",
+            total_timeout=45,
+        )
+        telemetry = {**response["telemetry"], "usage": response["usage"], "response_id": response["response_id"]}
+        try:
+            parsed = json.loads(response["text"])
+        except (ValueError, TypeError) as exc:
+            diagnostic = {"returned": {"parseable": False}}
+            raise api.ModelOutputError("invalid_json") from exc
+        diagnostic = {"returned": _compact_result(pack, parsed)}
+        result = evidence.validate(pack, parsed)
+        diagnostic["validated"] = _compact_result(pack, result)
+    except Exception as exc:
+        error = exc
+        telemetry = getattr(exc, "telemetry", {}) or telemetry
+    return result, telemetry, error, diagnostic
+
+
+def record_response(conn, reservation_id, pack, telemetry, error, diagnostic, settings):
+    usage = telemetry.get("usage", {})
+    conn.execute(
+        """UPDATE creator_handle_requests SET error_code=%s,request_id=%s,response_id=%s,
+        input_tokens=%s,output_tokens=%s,response_ciphertext=%s WHERE id=%s""",
+        (
+            _output_error(error),
+            telemetry.get("openai_request_id"),
+            telemetry.get("response_id"),
+            usage.get("input_tokens"),
+            usage.get("output_tokens"),
+            creator_data.cipher(settings).encrypt(creator_data.encode(diagnostic)) if diagnostic else None,
+            reservation_id,
+        ),
+    )
+
+
 def run(job, settings):
     with connection() as conn, conn.transaction():
         current = _current(conn, job)
@@ -458,29 +641,17 @@ def run(job, settings):
             _invalidate(conn, current)
             conn.execute("UPDATE creator_handle_requests SET billed_tokens=0 WHERE id=%s", (job["reservation_id"],))
             return
-    result, telemetry, error = None, {}, None
+    result, telemetry, error, diagnostic = None, {}, None, None
     network_started = False
     try:
         handles, version = catalog()
         if version != job["catalog_version"] or any(h["handle"] not in handles for h in job["pack"]["handles"]):
             raise ValueError("catalog_changed")
-        config = job["config"]
-        key = ai_feature_config.api_key_cipher(settings.token_encryption_key).decrypt(config["api_key_ciphertext"])
         network_started = True
-        response = api.call_openai(
-            config,
-            key,
-            job["pack"],
-            str(job["contact_id"]),
-            instructions=evidence.instructions(),
-            output_format=evidence.output_format(),
-            max_output_tokens=MAX_OUTPUT,
-            reasoning_effort="none",
-            total_timeout=45,
-        )
-        telemetry = {**response["telemetry"], "usage": response["usage"], "response_id": response["response_id"]}
-        ai_dispatch.observe_limits(response["telemetry"])
-        result = evidence.validate(job["pack"], json.loads(response["text"]))
+        result, telemetry, error, diagnostic = review(job["pack"], job["config"], job["contact_id"], settings)
+        ai_dispatch.observe_limits(telemetry)
+        if error:
+            raise error
     except Exception as exc:
         error = exc
         telemetry = getattr(exc, "telemetry", {}) or telemetry
@@ -492,6 +663,7 @@ def run(job, settings):
     with connection() as conn, conn.transaction():
         # Same lock order as settings saves: config, then jobs.
         _config(conn, lock=True)
+        record_response(conn, job["reservation_id"], job["pack"], telemetry, error, diagnostic, settings)
         usage = telemetry.get("usage", {})
         input_tokens = int(usage.get("input_tokens", telemetry.get("input_tokens", 0)) or 0)
         output_tokens = int(usage.get("output_tokens", telemetry.get("output_tokens", 0)) or 0)
@@ -543,19 +715,26 @@ def run(job, settings):
         else:
             by_handle = {h["id"]: h["handle"] for h in job["pack"]["handles"]}
             stats = _apply_links(
-                conn, current, job["pack"], result, current["stats"], current["refs"], settings, job["catalog_version"],
+                conn,
+                current,
+                job["pack"],
+                result,
+                current["stats"],
+                current["refs"],
+                settings,
+                job["catalog_version"],
             )
             if stats is None:
                 _invalidate(conn, current)
                 return
-            review = _needs_review(result, current["stats"])
+            needs_review = _needs_review(result, current["stats"])
             view = {"handles": by_handle, "result": result}
             conn.execute(
                 """UPDATE creator_handle_jobs SET status=%s,reason_code='suggestions_saved',
                 result_ciphertext=%s,stats=%s::jsonb,lease_until=NULL,claim_token=NULL,
                 response_id=%s,request_id=%s,finished_at=NOW(),updated_at=NOW() WHERE id=%s""",
                 (
-                    "review_required" if review else "completed",
+                    "review_required" if needs_review else "completed",
                     creator_data.cipher(settings).encrypt(creator_data.encode(view)),
                     creator_data.encode(stats),
                     telemetry.get("response_id"),
@@ -589,7 +768,9 @@ def page_data(conn, actor, settings, page=1):
         SELECT DISTINCT ON(contact_id) status FROM creator_handle_jobs
         ORDER BY contact_id,created_at DESC,id DESC) latest GROUP BY status""").fetchall()
     jobs = conn.execute(
-        """SELECT j.*,c.display_name FROM creator_handle_jobs j JOIN contacts c ON c.id=j.contact_id
+        """SELECT j.*,c.display_name,(SELECT r.error_code FROM creator_handle_requests r
+        WHERE r.job_id=j.id ORDER BY r.created_at DESC,r.id DESC LIMIT 1) AS validation_error
+        FROM creator_handle_jobs j JOIN contacts c ON c.id=j.contact_id
         ORDER BY j.updated_at DESC,j.id LIMIT 50 OFFSET %s""",
         ((page - 1) * 50,),
     ).fetchall()
@@ -599,12 +780,16 @@ def page_data(conn, actor, settings, page=1):
     except (OSError, ValueError, KeyError):
         current_handles = frozenset()
         version = None
-    associations = {(str(row["contact_id"]), row["handle"]) for row in conn.execute(
-        """SELECT l.contact_id,lower(s.normalized_handle) handle FROM contact_social_accounts l
+    associations = {
+        (str(row["contact_id"]), row["handle"])
+        for row in conn.execute(
+            """SELECT l.contact_id,lower(s.normalized_handle) handle FROM contact_social_accounts l
         JOIN social_accounts s ON s.id=l.social_account_id
         WHERE l.contact_id=ANY(%s::uuid[]) AND l.relationship='owner' AND l.status='confirmed'
-          AND s.platform='tiktok'""", ([j["contact_id"] for j in jobs],),
-    ).fetchall()}
+          AND s.platform='tiktok'""",
+            ([j["contact_id"] for j in jobs],),
+        ).fetchall()
+    }
     for job in jobs:
         job["suggestions"] = []
         if (
@@ -614,8 +799,11 @@ def page_data(conn, actor, settings, page=1):
         ):
             view = json.loads(storage.decrypt(job["result_ciphertext"]))
             job["suggestions"] = [
-                {**link, "handle": view["handles"][link["h"]],
-                 "associated": (str(job["contact_id"]), view["handles"][link["h"]]) in associations}
+                {
+                    **link,
+                    "handle": view["handles"][link["h"]],
+                    "associated": (str(job["contact_id"]), view["handles"][link["h"]]) in associations,
+                }
                 for link in view["result"]["links"]
                 if view["handles"][link["h"]] in current_handles
             ]
