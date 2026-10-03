@@ -51,7 +51,7 @@ def _load_catalog(directory, _modified):
 def _config(conn, *, lock=False):
     return conn.execute(
         """SELECT provider,project_id,model,enabled,api_key_ciphertext,updated_at,
-        rpm_limit,daily_token_budget,matching_catalog_version,
+        rpm_limit,matching_catalog_version,
         automatic_queue_checked_at<NOW()-INTERVAL '1 minute' AS reconcile_due
         FROM ai_feature_configs WHERE feature=%s"""
         + (" FOR UPDATE" if lock else ""),
@@ -101,7 +101,7 @@ def touch_chats(conn, chat_ids):
 
 
 def _recover(conn):
-    # Uncertain requests retain their budget reservation. A late response cannot pass its token fence.
+    # Uncertain requests retain their usage estimate. A late response cannot pass its token fence.
     conn.execute("""UPDATE creator_handle_jobs SET
         status=CASE WHEN desired_version<>snapshot_version THEN 'queued'
           WHEN status='preparing' THEN 'queued' WHEN attempts<3 THEN 'retry_wait' ELSE 'failed' END,
@@ -260,37 +260,27 @@ def _needs_review(result, stats):
 
 
 def _reserve(conn, config, job, tokens):
-    """Reserve daily usage and request cadence; do not impose a local TPM cap."""
+    """Check request cadence and record usage; token estimates never block admission."""
     scope = evidence_hash([config["provider"], config["project_id"], config["model"]])
     conn.execute("SELECT pg_advisory_xact_lock(%s)", (ai_dispatch._ADMISSION_LOCK,))
     used = conn.execute(
-        """SELECT count(*) FILTER(WHERE created_at>NOW()-INTERVAL '1 minute') rpm,
-        COALESCE(sum(COALESCE(billed_tokens,reserved_tokens)) FILTER(WHERE
-          created_at>=date_trunc('day',NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'),0) daily
-        FROM creator_handle_requests WHERE quota_scope=%s AND created_at>=LEAST(
-          date_trunc('day',NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',NOW()-INTERVAL '1 minute')""",
+        """SELECT count(*) rpm FROM creator_handle_requests
+        WHERE quota_scope=%s AND created_at>NOW()-INTERVAL '1 minute'""",
         (scope,),
     ).fetchone()
-    if tokens > config["daily_token_budget"]:
+    if used["rpm"] >= config["rpm_limit"]:
         conn.execute(
-            "UPDATE creator_handle_jobs SET status='failed',reason_code='request_exceeds_budget' WHERE id=%s",
+            """UPDATE creator_handle_jobs SET not_before=NOW()+INTERVAL '1 minute',
+            reason_code='rate_budget' WHERE id=%s""",
             (job["id"],),
         )
         return None
-    if used["daily"] + tokens > config["daily_token_budget"]:
-        delay = "date_trunc('day',NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'+INTERVAL '1 day'"
-        reason = "daily_budget"
-    elif used["rpm"] >= config["rpm_limit"]:
-        delay, reason = "NOW()+INTERVAL '1 minute'", "rate_budget"
-    else:
-        reservation = uuid4()
-        conn.execute(
-            "INSERT INTO creator_handle_requests(id,job_id,quota_scope,reserved_tokens) VALUES(%s,%s,%s,%s)",
-            (reservation, job["id"], scope, tokens),
-        )
-        return reservation
-    conn.execute(f"UPDATE creator_handle_jobs SET not_before={delay},reason_code=%s WHERE id=%s", (reason, job["id"]))
-    return None
+    reservation = uuid4()
+    conn.execute(
+        "INSERT INTO creator_handle_requests(id,job_id,quota_scope,reserved_tokens) VALUES(%s,%s,%s,%s)",
+        (reservation, job["id"], scope, tokens),
+    )
+    return reservation
 
 
 def claim():

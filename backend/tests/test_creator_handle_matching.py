@@ -206,7 +206,7 @@ def test_stale_version_and_revoked_evidence_never_publish_suggestions(pg, matchi
     )
 
 
-def test_provider_delay_quota_pause_and_uncertain_budget_survive_retries(pg, matching_flow):
+def test_provider_delay_quota_pause_and_uncertain_usage_survive_retries(pg, matching_flow):
     flow = matching_flow
     flow.enable()
     job = _prepared_job(pg, flow)
@@ -232,26 +232,18 @@ def test_provider_delay_quota_pause_and_uncertain_budget_survive_retries(pg, mat
     assert len(flow.calls) == 2
 
 
-def test_budget_and_restart_lease_fence_bound_paid_work(pg, matching_flow):
+def test_legacy_token_limits_do_not_block_restart_and_retry_fences(pg, matching_flow):
     flow = matching_flow
     flow.enable()
-    _enqueue(pg, flow.contact)
-    assert matching.prepare_next(flow.settings)
-    pg.execute("UPDATE ai_feature_configs SET daily_token_budget=1000 WHERE feature=%s", (matching.FEATURE,))
-    assert matching.claim() is None
-    assert pg.execute("SELECT status,reason_code FROM creator_handle_jobs").fetchone() == {
-        "status": "failed",
-        "reason_code": "request_exceeds_budget",
-    }
-    assert pg.execute("SELECT count(*) n FROM creator_handle_requests").fetchone()["n"] == 0
-    # The retained historical TPM column must not reject a larger valid request.
-    pg.execute("UPDATE ai_feature_configs SET daily_token_budget=1000000,tpm_limit=1000 WHERE feature=%s",
+    # Historical token settings must not reject a larger request or delay cumulative usage until tomorrow.
+    pg.execute("UPDATE ai_feature_configs SET daily_token_budget=1000,tpm_limit=1000 WHERE feature=%s",
                (matching.FEATURE,))
     job = _prepared_job(pg, flow)
     assert pg.execute("SELECT reserved_tokens FROM creator_handle_requests").fetchone()["reserved_tokens"] > 1000
     pg.execute("UPDATE creator_handle_jobs SET lease_until=NOW()-INTERVAL '1 second' WHERE id=%s", (job["id"],))
     recovered = matching.claim()
     assert recovered["attempts"] == 2 and recovered["claim_token"] != job["claim_token"]
+    assert pg.execute("SELECT sum(reserved_tokens) n FROM creator_handle_requests").fetchone()["n"] > 1000
     matching.run(job, flow.settings)
     assert not flow.calls
     matching.run(recovered, flow.settings)
@@ -296,6 +288,18 @@ def test_budget_and_restart_lease_fence_bound_paid_work(pg, matching_flow):
     assert len(flow.calls) == previous_calls + 1
     assert pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s",
                       (refreshed_id,)).fetchone()["status"] == "completed"
+    # Removing token budgets must not remove the independent request-frequency guard.
+    pg.execute("UPDATE ai_feature_configs SET rpm_limit=1 WHERE feature=%s", (matching.FEATURE,))
+    flow.material_version += 1
+    limited_id = _enqueue(pg, flow.contact)
+    assert matching.prepare_next(flow.settings)
+    requests = pg.execute("SELECT count(*) n FROM creator_handle_requests").fetchone()["n"]
+    assert matching.claim() is None
+    limited = pg.execute("SELECT status,reason_code,not_before>NOW() AS waiting FROM creator_handle_jobs WHERE id=%s",
+                         (limited_id,)).fetchone()
+    assert limited == {"status": "ready", "reason_code": "rate_budget", "waiting": True}
+    assert pg.execute("SELECT count(*) n FROM creator_handle_requests").fetchone()["n"] == requests
+    assert len(flow.calls) == previous_calls + 1
 
 
 def test_review_result_reuses_its_own_snapshot_when_signal_changes_no_material(pg, matching_flow):

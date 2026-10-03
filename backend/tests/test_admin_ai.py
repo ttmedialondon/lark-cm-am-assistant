@@ -254,10 +254,8 @@ def test_matching_save_keeps_configuration_and_queue_invalidation_in_one_transac
     assert [item[0] for item in called] == ["config", "queue"]
     assert called[0][1] is called[1][1]
     assert called[0][2]["enabled"] is True
-    assert {name: called[0][2][name] for name in ("rpm_limit", "daily_token_budget")} == {
-        "rpm_limit": "20", "daily_token_budget": "500000",
-    }
-    assert "tpm_limit" not in called[0][2]  # Old form submissions no longer set this limit.
+    assert called[0][2]["rpm_limit"] == "20"
+    assert "tpm_limit" not in called[0][2] and "daily_token_budget" not in called[0][2]
 
 
 def test_matching_routes_recheck_live_owner_and_csrf_before_queue_writes(pg, monkeypatch):
