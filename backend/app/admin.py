@@ -24,6 +24,7 @@ from . import (
     ai_dispatch,
     ai_feature_config,
     creator_handle_matching,
+    creator_responsibility_matching,
     message_export,
     offhours_summary,
     organization_sync,
@@ -64,6 +65,12 @@ AI_FEATURES = {
         "description": "按授权消息匹配 Curva 收录账号；强证据自动关联，其余待核实，不修改身份、负责人或已有关系。",
         "enabled_label": "开启自动匹配",
         "processing_label": "队列匹配，强证据自动关联",
+    },
+    "creator_responsibility_matching": {
+        "title": "达人负责人建议",
+        "description": "每位已确认达人一次分析多个内部候选，只保存建议和证据，不修改正式负责人。",
+        "enabled_label": "启用负责人建议队列",
+        "processing_label": "手动入队，只生成建议",
     },
     "offhours_summary": {
         "title": "达人消息总结",
@@ -264,6 +271,7 @@ def create_admin_router(
                 "summary_saved": request.query_params.get("saved") == "offhours-summary",
                 "identity_saved": request.query_params.get("saved") == "people-identity",
                 "matching_saved": request.query_params.get("saved") == "creator-handle-matching",
+                "responsibility_saved": request.query_params.get("saved") == "creator-responsibility-matching",
                 # Retain this template-safe alias while external callers migrate to ``configs``.
                 "config": configs[0]["config"],
                 "form_error": error,
@@ -846,6 +854,8 @@ def create_admin_router(
                     )
                 elif feature == "creator_handle_matching":
                     creator_handle_matching.configuration_changed(conn)
+                elif feature == creator_responsibility_matching.FEATURE:
+                    creator_responsibility_matching.configuration_changed(conn)
                 conn.execute(
                     "INSERT INTO audit_events (id, authorization_id, action, metadata) VALUES (%s, %s, %s, %s::jsonb)",
                     (
@@ -870,7 +880,9 @@ def create_admin_router(
         saved_url = (
             "/admin/ai?saved=offhours-summary#offhours-summary" if feature == offhours_summary.FEATURE else
             "/admin/ai?saved=creator-handle-matching#creator-handle-matching"
-            if feature == "creator_handle_matching" else "/admin/ai"
+            if feature == "creator_handle_matching" else
+            "/admin/ai?saved=creator-responsibility-matching#creator-responsibility-matching"
+            if feature == creator_responsibility_matching.FEATURE else "/admin/ai"
         )
         response = RedirectResponse(url=saved_url, status_code=303)
         response.headers["Cache-Control"] = "no-store, max-age=0"

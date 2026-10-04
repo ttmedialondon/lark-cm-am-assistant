@@ -862,7 +862,7 @@ def _mentions(body, handle):
     return bool(re.search(r"(?<![A-Za-z0-9_.])" + re.escape(handle) + r"(?=\.*(?:[^A-Za-z0-9_.]|$))", body, re.I))
 
 
-def still_valid(conn, refs, settings=None):
+def still_valid(conn, refs, settings=None, *, ciphertext_only=False):
     """Recheck original grants, identities, plaintext and reply relations before use."""
     if settings is None:
         from .config import get_settings
@@ -892,8 +892,13 @@ def still_valid(conn, refs, settings=None):
     previous = _previous_ids(conn, [r for r in messages if "previous_id" in r])
     for ref in messages:
         row = current.get((ref["chat_id"], ref["message_id"], ref["authorization_id"]))
-        raw = text._decrypt_body(cipher, row["body_ciphertext"]) if row else None
-        if not row or raw is None or (_scope_hash(row) != ref["scope_hash"] or access._hash(raw) != ref["body_hash"]
+        if ciphertext_only:
+            body_valid = bool(row and ref.get("ciphertext_hash")
+                              and access._hash(row["body_ciphertext"]) == ref["ciphertext_hash"])
+        else:
+            raw = text._decrypt_body(cipher, row["body_ciphertext"]) if row else None
+            body_valid = raw is not None and access._hash(raw) == ref["body_hash"]
+        if not row or not body_valid or (_scope_hash(row) != ref["scope_hash"]
                        or access._relation_hash(row) != ref["relation_hash"]
                        or "previous_id" in ref
                        and previous.get((ref["chat_id"], ref["message_id"])) != ref["previous_id"]):

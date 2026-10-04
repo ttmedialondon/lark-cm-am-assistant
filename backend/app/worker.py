@@ -19,6 +19,7 @@ from . import (
     ai_dispatch,
     creator_handle_matching,
     creator_imports,
+    creator_responsibility_matching,
     identity_profiles,
     offhours_summary,
     organization_sync,
@@ -211,6 +212,7 @@ def _dispatch_ai_turn(
         (creator_imports.claim_next_import, creator_imports.run_claimed_import),
         (summary_replies.claim, summary_replies.run),
         (creator_handle_matching.claim, creator_handle_matching.run),
+        (creator_responsibility_matching.claim, creator_responsibility_matching.run),
     )
     for offset in range(len(queues)):
         index = (next_queue + offset) % len(queues)
@@ -263,7 +265,8 @@ def _prepare_creator_preview(settings: Settings, next_queue: int) -> tuple[bool,
     # Retired handle scanning is not produced or dispatched; historical review stays available.
     queues = (creator_imports.prepare_next_import,
               offhours_summary.prepare_next_summary,
-              creator_handle_matching.prepare_next)
+              creator_handle_matching.prepare_next,
+              creator_responsibility_matching.prepare_next)
     for offset in range(len(queues)):
         index = (next_queue + offset) % len(queues)
         try:

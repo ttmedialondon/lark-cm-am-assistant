@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block title %}达人负责人建议{% endblock %}
+{% block body %}
+{% set base = '/admin/ai/creator-responsibility' %}
+{% set status_labels = {
+  'queued': '待处理', 'preparing': '整理证据', 'ready': '待调用', 'running': '分析中',
+  'retry_wait': '等待重试', 'waiting_evidence': '等待证据', 'review_required': '待核实',
+  'completed': '已完成', 'failed': '失败', 'cancelled': '已取消'
+} %}
+{% set reason_labels = {
+  'ready': '证据已准备', 'cached': '复用已有结果', 'suggestions_saved': '建议已保存',
+  'no_text': '没有可读消息', 'no_candidates': '未找到内部候选人员',
+  'restricted': '不在授权处理范围', 'no_interaction': '缺少实际互动',
+  'preparation_failed': '证据准备失败', 'snapshot_changed': '证据或配置已更新',
+  'lease_expired': '任务超时，正在恢复', 'identity_removed': '达人身份已取消',
+  'quota_paused': 'API 额度不足，队列已暂停',
+  'provider_retry': '服务暂不可用，等待重试', 'invalid_output': '模型返回格式无效',
+  'provider_failed': 'API 调用失败', 'owner_cancelled': '已手动取消'
+} %}
+{% set decision_labels = {
+  'responsible': '明确负责', 'strong_candidate': '强负责人候选',
+  'assist': '业务协助', 'historical': '历史负责', 'insufficient': '证据不足'
+} %}
+{% set period_labels = {'current': '当前', 'historical': '历史', 'uncertain': '时点未确定', 'at_message': '消息时点'} %}
+{% macro coverage_notes(stats) %}
+  {% if stats %}
+    {% if 'messages' in stats %}<div class="text-secondary small">本次证据 {{ stats.messages }} 条{% if 'selected_candidates' in stats %} · 纳入 {{ stats.selected_candidates }} 位候选{% endif %}</div>{% endif %}
+    {% if stats.get('candidates_omitted') %}<div class="text-secondary small">还有 {{ stats.candidates_omitted }} 位候选未纳入本次材料。</div>{% endif %}
+    {% if stats.get('history_truncated') or stats.get('historical_context_omitted') or stats.get('critical_evidence_omitted') %}<div class="text-secondary small">本次材料未覆盖全部上下文，结论不代表全量审阅。</div>{% endif %}
+    {% if stats.get('missing_reply_ids') %}<div class="text-secondary small">{{ stats.missing_reply_ids|length }} 条消息缺少被回复内容。</div>{% endif %}
+  {% endif %}
+{% endmacro %}
+{% macro confirmed_assignments(assignments) %}
+  <div class="card-body py-2 border-bottom"><span class="text-secondary">当前已确认：</span>{% for assignment in assignments %}{{ assignment.name or '未命名' }}{% if assignment.scope_label %}（{{ assignment.scope_label }}）{% endif %}{{ '、' if not loop.last else '' }}{% else %}<span class="text-secondary">暂无</span>{% endfor %}</div>
+{% endmacro %}
+{% macro candidate_rows(results, evidence_link) %}
+  {% for result in results %}
+    <tr>
+      <td>{{ result.name or '未命名' }}{% if result.existing %}<div class="text-secondary small">现有关联</div>{% endif %}{% if not result.authorized %}<div class="text-secondary small">未接入</div>{% endif %}</td>
+      <td>{{ result.label or decision_labels.get(result.decision, result.decision) }}{% if result.reason %}<div class="text-secondary small">{{ result.reason }}</div>{% endif %}</td>
+      <td>{{ result.scope or '—' }}{% if result.scope_note %}<div class="small">{{ result.scope_note }}</div>{% endif %}{% if result.period %}<div class="text-secondary small">{{ period_labels.get(result.period, result.period) }}</div>{% endif %}</td>
+      <td>
+        {% if result.support_refs %}<div>支持：{% for ref in result.support_refs %}<a href="{{ evidence_link }}#evidence-{{ ref }}">{{ ref }}</a>{{ '、' if not loop.last else '' }}{% endfor %}</div>{% endif %}
+        {% if result.counter_refs %}<div>反证：{% for ref in result.counter_refs %}<a href="{{ evidence_link }}#evidence-{{ ref }}">{{ ref }}</a>{{ '、' if not loop.last else '' }}{% endfor %}</div>{% endif %}
+        {% if not result.support_refs and not result.counter_refs %}<span class="text-secondary">无引用</span>{% endif %}
+      </td>
+    </tr>
+  {% else %}<tr><td colspan="4" class="text-secondary">尚无判断结果</td></tr>{% endfor %}
+{% endmacro %}
+<div class="page">
+  {% include "admin/_nav.html" %}
+  <div class="page-wrapper"><div class="container-xl py-4">
+    {% if evidence is not none %}
+      <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-3">
+        <h2 class="mb-0">{{ evidence.creator_name or '达人' }} · 负责人证据</h2>
+        <a class="btn" href="{{ base }}">返回建议列表</a>
+      </div>
+      {{ coverage_notes(evidence.coverage) }}
+      <div class="card table-responsive mt-3 mb-3">{{ confirmed_assignments(evidence.existing_assignments) }}<table class="table table-vcenter card-table"><thead><tr><th>内部人员</th><th>本轮结论</th><th>职责范围</th><th>证据引用</th></tr></thead><tbody>{{ candidate_rows(evidence.results, '') }}</tbody></table></div>
+      {% for message in evidence.messages %}
+        <div class="card mb-2" id="evidence-{{ message.ref }}">
+          <div class="card-header py-2"><div>
+            <span class="fw-medium">{{ message.ref }} · {{ message.sender_name or '未命名' }}</span>
+            <span class="text-secondary ms-2">{{ message.sent_at or '' }}</span>
+            <div class="text-secondary small">{{ message.chat_name or '未命名会话' }}{% if message.reply_to %} · 回复 {{ message.reply_to }}{% endif %}</div>
+          </div></div>
+          <div class="card-body py-3"><pre class="mb-0 text-wrap" style="white-space:pre-wrap;font-family:inherit">{{ message.body }}</pre></div>
+        </div>
+      {% else %}<div class="card card-body text-secondary">没有可展示的消息证据。</div>{% endfor %}
+    {% else %}
+      <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-3">
+        <div><h2 class="mb-1">达人负责人建议</h2><div class="text-secondary">{{ '已启用' if matching.enabled else '未启用' }} · 仅生成建议，不修改负责人关系</div></div>
+        <a class="btn" href="/admin/ai">API Key 配置</a>
+      </div>
+      <div class="card card-body mb-3">
+        <div class="d-flex flex-wrap justify-content-between align-items-start gap-3">
+          <form method="post" action="{{ base }}/enqueue">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="mode" value="sample">
+            <div class="d-flex flex-wrap align-items-end gap-2">
+              <div><label class="form-label" for="sample-limit">样本人数</label><input class="form-control" id="sample-limit" name="limit" type="number" min="1" max="10" value="5" style="width:7rem" required></div>
+              <button class="btn btn-primary" type="submit" {% if not matching.enabled %}disabled{% endif %}>小样本分析</button>
+            </div>
+            <details class="mt-2"><summary class="text-secondary small">指定达人</summary><label class="form-label small mt-2" for="sample-contacts">联系人 ID（最多 10 个，空格或逗号分隔）</label><textarea class="form-control" id="sample-contacts" name="contact_ids" rows="2" maxlength="400"></textarea></details>
+          </form>
+          <details>
+            <summary class="text-secondary">历史达人分析</summary>
+            <form class="mt-2" method="post" action="{{ base }}/enqueue"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="mode" value="history"><button class="btn" type="submit" {% if not matching.enabled %}disabled{% endif %}>补入全部未处理达人</button></form>
+          </details>
+        </div>
+      </div>
+      <div class="d-flex flex-wrap gap-3 mb-3">{% for status, count in matching.counts.items() %}<span>{{ status_labels.get(status, status) }}：{{ count }}</span>{% else %}<span class="text-secondary">暂无任务</span>{% endfor %}</div>
+      {% for job in matching.jobs %}
+        <div class="card mb-3">
+          <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+            <div><span class="fw-medium">{{ job.name or '未命名' }}</span><span class="text-secondary ms-2">{{ job.status_label or status_labels.get(job.status, job.status) }}</span>{% if job.reason %}<div class="text-secondary small">{{ reason_labels.get(job.reason, job.reason) }}</div>{% endif %}</div>
+            <div class="d-flex flex-wrap align-items-center gap-2">
+              {% if job.stats.get('messages') and not job.stale %}<a class="btn btn-sm" href="{{ base }}/jobs/{{ job.id }}/evidence">查看原文</a>{% endif %}
+              {% if job.status in ['failed', 'retry_wait'] %}<form method="post" action="{{ base }}/jobs/{{ job.id }}/retry"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="page" value="{{ matching.page }}"><button class="btn btn-sm" type="submit" {% if not matching.enabled %}disabled{% endif %}>重试</button></form>{% endif %}
+              {% if job.status not in ['queued', 'preparing', 'ready', 'running', 'retry_wait'] %}<form method="post" action="{{ base }}/jobs/{{ job.id }}/recheck"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="page" value="{{ matching.page }}"><button class="btn btn-sm" type="submit" {% if not matching.enabled %}disabled{% endif %}>重新检查</button></form>{% endif %}
+              {% if job.status not in ['completed', 'failed', 'cancelled'] %}<form method="post" action="{{ base }}/jobs/{{ job.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="page" value="{{ matching.page }}"><button class="btn btn-sm" type="submit">取消</button></form>{% endif %}
+            </div>
+          </div>
+          {{ confirmed_assignments(job.existing_assignments) }}
+          <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>内部人员</th><th>本轮结论</th><th>职责范围</th><th>证据引用</th></tr></thead><tbody>{{ candidate_rows(job.results, base ~ '/jobs/' ~ job.id ~ '/evidence') }}</tbody></table></div>
+          <div class="card-footer py-2 text-secondary small">候选 {{ job.candidate_count }} 人{% if job.stats.get('input_tokens') or job.stats.get('output_tokens') %} · Token {{ job.stats.get('input_tokens', 0) + job.stats.get('output_tokens', 0) }}{% endif %}{{ coverage_notes(job.stats) }}</div>
+        </div>
+      {% else %}<div class="card card-body text-secondary text-center">暂无任务</div>{% endfor %}
+      <div class="d-flex justify-content-end gap-3 mt-3">{% if matching.page > 1 %}<a href="?page={{ matching.page - 1 }}">上一页</a>{% endif %}{% if matching.has_more %}<a href="?page={{ matching.page + 1 }}">下一页</a>{% endif %}</div>
+    {% endif %}
+  </div></div>
+</div>
+{% endblock %}

@@ -111,7 +111,8 @@ def test_owner_can_view_only_safe_ai_config_fields(monkeypatch):
     assert contexts[-1][1]["ai_dispatch"]["state"] == "paused"
     assert contexts[-1][1]["summary_settings"]["status_label"] == "未开启"
     assert [item["feature"] for item in contexts[-1][1]["configs"]] == [
-        "creator_import", "creator_handle_matching", "offhours_summary", "desktop_reply",
+        "creator_import", "creator_handle_matching", "creator_responsibility_matching",
+        "offhours_summary", "desktop_reply",
     ]
     for feature in ("contact_assessment", "contact_assignment", "creator_workflow"):
         response = browser.post("/admin/ai", data={"csrf_token": "csrf", "feature": feature, "enabled": "1"})
@@ -234,7 +235,8 @@ def test_summary_csrf_failure_does_not_save_or_schedule(monkeypatch):
     assert response.status_code == 400
 
 
-def test_matching_save_keeps_configuration_and_queue_invalidation_in_one_transaction(monkeypatch):
+@pytest.mark.parametrize("feature", ["creator_handle_matching", "creator_responsibility_matching"])
+def test_matching_save_keeps_configuration_and_queue_invalidation_in_one_transaction(monkeypatch, feature):
     owner_id = uuid4()
     called = []
     monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _: "owner")
@@ -242,15 +244,17 @@ def test_matching_save_keeps_configuration_and_queue_invalidation_in_one_transac
     monkeypatch.setattr(admin, "get_settings", lambda: SimpleNamespace(token_encryption_key=b"k" * 32))
     monkeypatch.setattr(ai_feature_config, "save_feature_config", lambda conn, *a, **kw: called.append(
         ("config", conn, kw)))
-    monkeypatch.setattr(admin.creator_handle_matching, "configuration_changed", lambda conn: called.append(
+    matching = getattr(admin, feature)
+    monkeypatch.setattr(matching, "configuration_changed", lambda conn: called.append(
         ("queue", conn)))
     response = _client(lambda _: {"id": owner_id, "status": "active"}).post("/admin/ai", data={
-        "csrf_token": "csrf", "feature": "creator_handle_matching", "project_id": "proj_matching",
+        "csrf_token": "csrf", "feature": feature, "project_id": "proj_matching",
         "model": "gpt-5.6-luna", "enabled": "1", "rpm_limit": "20", "tpm_limit": "40000",
         "daily_token_budget": "500000", "api_key": "sk-test-only-1234",
     }, follow_redirects=False)
     assert response.status_code == 303
-    assert response.headers["location"] == "/admin/ai?saved=creator-handle-matching#creator-handle-matching"
+    anchor = feature.replace("_", "-")
+    assert response.headers["location"] == f"/admin/ai?saved={anchor}#{anchor}"
     assert [item[0] for item in called] == ["config", "queue"]
     assert called[0][1] is called[1][1]
     assert called[0][2]["enabled"] is True
