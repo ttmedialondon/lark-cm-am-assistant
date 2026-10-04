@@ -1,12 +1,11 @@
 {% extends "base.html" %}
 {% block title %}我的达人 · TT Media{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-roster.css?v=20260927">{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-roster.css?v=20261004-lark-icon">{% endblock %}
 {% block body %}
 <div class="page" id="creators-app" data-csrf="{{ csrf_token }}" data-tab="{{ creator_tab }}">
   <header class="navbar navbar-expand-md"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media</a><div class="navbar-nav flex-row gap-2"><a class="nav-link" href="/dashboard">消息提醒</a><span class="nav-link text-secondary">{{ authorization.display_name or 'CM' }}</span></div></div></header>
   <main class="page-wrapper"><div class="page-body"><div class="container-xl">
     <div class="d-flex align-items-center justify-content-between flex-wrap gap-3 mb-3"><div><h2 class="page-title">我的达人</h2><p class="text-secondary mb-0">导入 Excel 达人名单后，AI 依次找群、找人；结果保留待核对，确认前核验 Curva 和本人账号证据。</p></div><div class="btn-list"><button type="button" id="creators-import-open" class="btn btn-primary">Excel 导入</button><button type="button" id="creators-refresh" class="btn btn-outline-secondary">刷新</button></div></div>
-    <p class="text-secondary small">点击达人姓名可打开 Lark 私聊；请使用正确的 Lark 登录账号，只能打开该账号可访问的会话。</p>
     <div id="creators-notice" class="alert d-none" role="status"></div>
     {% if creator_data.can_select_cm %}<section class="card mb-3" aria-label="名单负责人"><div class="card-body">
       <label for="creators-cm" class="form-label">负责人</label><select id="creators-cm" class="form-select"><option value="">暂无可用负责人</option></select>
@@ -32,5 +31,5 @@
   </dialog>
 </div>
 <script id="creators-initial" type="application/json">{{ creator_data|tojson }}</script>
-<script src="/static/creator-handles.js?v=20260928-research-prompt" defer></script>
+<script src="/static/creator-handles.js?v=20261004-lark-icon" defer></script>
 {% endblock %}

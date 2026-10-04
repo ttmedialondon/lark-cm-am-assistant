@@ -133,13 +133,17 @@
     const avatar = node("span", "", "avatar avatar-sm bg-blue-lt rounded-circle flex-shrink-0 position-relative overflow-hidden");
     avatar.setAttribute("aria-hidden", "true");
     const initial = node("span"); avatar.append(initial);
-    const name = node("a", "", "fw-bold");
-    name.target = "_blank"; name.rel = "noopener noreferrer";
-    personWrap.append(avatar, name); person.append(personWrap);
+    const name = node("span", "", "fw-bold");
+    const lark = node("a", "", "creator-lark-link text-secondary");
+    const icon = node("span", "↗"); icon.setAttribute("aria-hidden", "true"); lark.append(icon);
+    lark.target = "_blank"; lark.rel = "noopener noreferrer";
+    lark.title = "在 Lark 中打开私聊";
+    const label = node("div", "", "d-flex align-items-center"); label.append(name, lark);
+    personWrap.append(avatar, label); person.append(personWrap);
     const handleCell = node("td"); handleCell.style.minWidth = "250px";
     const saved = node("div", "", "mb-2"); handleCell.append(saved);
     const actions = node("td");
-    const parts = {row, name, avatar, initial, saved, actions};
+    const parts = {row, name, lark, avatar, initial, saved, actions};
     row.append(handleCell, person, actions);
     return parts;
   }
@@ -176,9 +180,10 @@
           image.src = item.avatar_url; parts.avatar.append(image);
         }
       }
-      if (item.private_chat_url) parts.name.href = item.private_chat_url;
-      else parts.name.removeAttribute("href");
-      parts.name.title = item.private_chat_url ? "在 Lark 中打开你与此人的私聊" : "缺少有效 Lark 用户，暂不能跳转";
+      parts.lark.hidden = !item.private_chat_url;
+      if (item.private_chat_url) parts.lark.href = item.private_chat_url;
+      else parts.lark.removeAttribute("href");
+      parts.lark.setAttribute("aria-label", `在 Lark 中与 ${item.display_name || "此人"} 私聊（新窗口）`);
       parts.saved.replaceChildren();
       for (const [index, handle] of (item.handles || []).entries()) {
         if (index) parts.saved.append(document.createTextNode(" · "));

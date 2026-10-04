@@ -69,6 +69,87 @@ test("bilingual user labels are displayed literally in evidence", async t => {
   assert.deepEqual(errors, []);
 });
 
+test("creator names stay plain text while a separate accessible icon opens Lark", async t => {
+  const attack = '<img src=x onerror="window.compromised=true">';
+  const data = {cms: [{id: "cm-1", name: "CM"}], selected_cm_id: "cm-1", can_select_cm: false,
+    can_view_unassigned: false, read_only: false, import_batches: [], page: 1, total_count: 3, total_pages: 1,
+    items: [
+      {id: "person-1", kind: "confirmed", display_name: "Creator One", open_id: "ou_creator_one", handles: ["one"]},
+      {id: "person-2", kind: "confirmed", display_name: "No identity", open_id: null, handles: ["two"]},
+      {id: "person-3", kind: "confirmed", display_name: attack, open_id: "javascript:alert(1)", handles: ["three"]},
+    ]};
+  const rendered = spawnSync(path.join(backend, ".venv/bin/python"), ["-c",
+    "import json,sys; from app.lark_api import private_chat_url; from jinja2 import Environment,FileSystemLoader,select_autoescape; data=json.load(sys.stdin); [item.update(private_chat_url=private_chat_url(item['open_id'])) for item in data['items']]; html=Environment(loader=FileSystemLoader('app/templates'),autoescape=select_autoescape()).get_template('creator_handles.html').render(authorization={'display_name':'CM'},creator_data=data,creator_tab='mine',creator_query='',csrf_token='fixture-csrf'); print(json.dumps({'data':data,'html':html}))"],
+    {cwd: backend, input: JSON.stringify(data), encoding: "utf8"});
+  assert.equal(rendered.status, 0, rendered.stderr);
+  const fixture = JSON.parse(rendered.stdout), state = {data: fixture.data, calls: [], larkRequests: []};
+  const url = "https://applink.larksuite.com/client/chat/open?openId=ou_creator_one";
+  assert.equal(state.data.items[0].private_chat_url, url);
+  assert.deepEqual(state.data.items.slice(1).map(item => item.private_chat_url), [null, null]);
+  const browser = await chromium.launch({headless: true, channel: "chrome"});
+  t.after(() => browser.close());
+  const context = await browser.newContext(), page = await context.newPage();
+  const errors = []; page.on("pageerror", error => errors.push(error.message));
+  await context.route("**/*", route => {
+    const request = route.request(), target = new URL(request.url());
+    if (target.origin !== "http://localhost") {
+      if (target.origin === "https://applink.larksuite.com") state.larkRequests.push(request.url());
+      return route.abort();
+    }
+    if (target.pathname === "/creators") return route.fulfill({contentType: "text/html", body: fixture.html});
+    if (target.pathname.startsWith("/static/")) return route.fulfill({contentType: target.pathname.endsWith(".js") ? "text/javascript" : "text/css", body: fs.readFileSync(path.join(backend, "app", target.pathname))});
+    state.calls.push({method: request.method(), url: target.pathname, search: target.search});
+    if (target.pathname === "/creators/data") return route.fulfill({json: state.data});
+    return route.abort();
+  });
+  await page.goto("http://localhost/creators");
+  const rows = page.locator("#creators-rows tr");
+  await rows.nth(2).waitFor();
+  const names = rows.locator("td:nth-child(2) .fw-bold");
+  assert.deepEqual(await names.allTextContents(), data.items.map(item => item.display_name));
+  assert(await names.evaluateAll(elements => elements.every(element => element.tagName === "SPAN" && !element.closest("a"))));
+  assert.equal(await rows.locator("img").count(), 0);
+  assert.equal(await page.evaluate(() => window.compromised), undefined);
+  assert.deepEqual(await rows.locator("td:first-child").allTextContents(), ["@one", "@two", "@three"]);
+  await names.first().click();
+  assert.equal(context.pages().length, 1);
+  assert.equal(page.url(), "http://localhost/creators");
+  const link = rows.first().getByRole("link", {name: "在 Lark 中与 Creator One 私聊（新窗口）", exact: true});
+  assert.equal(await link.textContent(), "↗");
+  assert.equal(await link.getAttribute("href"), url);
+  assert.equal(await link.getAttribute("title"), "在 Lark 中打开私聊");
+  assert.equal(await link.getAttribute("target"), "_blank");
+  assert.equal(await link.getAttribute("rel"), "noopener noreferrer");
+  assert.equal(await link.locator('span[aria-hidden="true"]').textContent(), "↗");
+  for (const index of [1, 2]) {
+    assert.equal(await rows.nth(index).getByRole("link").count(), 0);
+    assert.equal(await rows.nth(index).locator("a[href]").count(), 0);
+  }
+  await link.focus();
+  assert(await link.evaluate(element => element === document.activeElement));
+  const [popup, request] = await Promise.all([
+    page.waitForEvent("popup"), context.waitForEvent("request", {predicate: request => request.url() === url}), link.press("Enter"),
+  ]);
+  assert.equal(request.url(), url);
+  await popup.close();
+  assert.deepEqual(state.larkRequests, [url]);
+  state.data.items[0].private_chat_url = null;
+  await page.locator("#creators-refresh").click();
+  await page.waitForFunction(() => !document.querySelector("#creators-rows a[href]"));
+  assert.equal(await rows.getByRole("link").count(), 0);
+  assert.deepEqual(await names.allTextContents(), data.items.map(item => item.display_name));
+  await page.locator("#creators-query").fill("Creator");
+  await Promise.all([
+    page.waitForResponse(response => response.url().includes("/creators/data?") && new URL(response.url()).searchParams.get("q") === "Creator"),
+    page.locator("#creators-search button").click(),
+  ]);
+  const search = new URLSearchParams(state.calls.at(-1).search);
+  assert.equal(search.get("tab"), "mine");
+  assert.equal(search.get("q"), "Creator");
+  assert(state.calls.every(call => call.method === "GET"));
+  assert.deepEqual(errors, []);
+});
+
 test("grades are sorted and filters/search/evidence work without writes", async t => {
   const {page, state, errors} = await fixture(t);
   assert.deepEqual(await page.locator(".oh-handling").allTextContents(), ["已处理", "没有处理", "待核实", "无需处理", "待分析"]);
