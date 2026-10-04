@@ -90,10 +90,15 @@ def test_matching_template_escapes_names_and_distinguishes_associations_from_his
             "enabled": False, "counts": [{"status": "review_required", "n": 1}], "page": 1,
             "jobs": [{"id": uuid4(), "display_name": hostile, "status": "review_required",
                       "reason_code": "suggestions_saved", "input_tokens": 100, "output_tokens": 20,
+                      "associations": [{"handle": "fixture.owned", "human_confirmed": True},
+                                       {"handle": "fixture.conflicted", "human_confirmed": False}],
                       "suggestions": [{"handle": "fixture.handle", "decision": "review", "relation": "operator",
-                                       "code": "operates_for_other", "period": "historical", "associated": False},
+                                       "code": "operates_for_other", "period": "historical", "conflict": False},
                                       {"handle": "fixture.owned", "decision": "supported", "relation": "self_account",
-                                       "code": "qa_confirm", "period": "at_message", "associated": True}]}],
+                                       "code": "qa_confirm", "period": "at_message", "conflict": False},
+                                      {"handle": "fixture.conflicted", "decision": "review", "relation": "uncertain",
+                                       "code": "conflict", "period": "historical", "conflict": True,
+                                       "validation_error": "counterevidence"}]}],
         },
     )
     assert "账号匹配" in html and 'action="/admin/ai/creator-handle-matching/enqueue"' in html
@@ -102,7 +107,15 @@ def test_matching_template_escapes_names_and_distinguishes_associations_from_his
     assert "代运营" in html and "历史关系" in html and "待核实" in html
     assert "operator" not in html and "review_required" not in html
     assert 'href="https://www.tiktok.com/@fixture.handle"' in html
-    assert "@fixture.owned</a> · 已关联" in html and "证据支持" not in html
+    assert "当前关联" in html and "本轮核验" in html
+    assert "@fixture.owned</a> · 人工已核准" in html and "@fixture.owned</a> · 支持" in html
+    assert "@fixture.conflicted</a> · 已关联" in html and "@fixture.conflicted</a> · 待核实" in html
+    assert ('<div class="text-secondary"><a class="text-reset" '
+            'href="https://www.tiktok.com/@fixture.handle"' in html)
+    assert ('<div class="text-danger"><a class="text-reset" '
+            'href="https://www.tiktok.com/@fixture.conflicted"' in html)
+    assert html.count('class="text-danger"') == 1
+    assert "归属冲突" in html and "账号归属存在反证" in html and "counterevidence" not in html
 
 
 def test_template_never_exposes_admin_to_a_viewer_and_escapes_private_json():

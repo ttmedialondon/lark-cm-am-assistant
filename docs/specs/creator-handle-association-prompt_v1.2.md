@@ -1,10 +1,10 @@
-# 达人—Handle 关联 Prompt v1.5
+# 达人—Handle 关联 Prompt v1.6
 
-版本：`creator-handle-research-v1.5`（沿用原文件路径）
+版本：`creator-handle-research-v1.6`（沿用原文件路径）
 
 日期：2026-10-04
 
-状态：用于按联系人匹配队列，强证据可自动关联；功能默认关闭。v1.5 增加短引用定位，明确完整问答、已知身份和消息时点的判定边界；保留逐候选校验、授权和冲突门槛。旧名单导入的 v1.1 协议不在本轮替换范围。
+状态：用于按联系人匹配队列，强证据可自动关联；功能当前暂停。v1.6 补充 TikTok 语境的本人自我介绍、人工核准精确关联的免重复匹配，以及当前关联和本轮结果的区分；保留逐候选校验、授权和冲突门槛。旧名单导入的 v1.1 协议不在本轮替换范围。
 
 ## 1. 用途与变化
 
@@ -25,6 +25,7 @@
 | `target` | 本次判断的联系人短编号，例如 U1 |
 | `creator_known` | 系统是否已经确认其达人身份；仅复用身份，不证明任何账号关联 |
 | `handles` | 候选编号、精确 handle、服务端核验的 Curva 收录状态 |
+| `confirmed_handles` | 已人工核准的精确 handle，仅用于语境消歧；可包含当前 Curva 未收录账号，不是本轮候选 |
 | `evidence_hints` | 按候选分组的短消息引用，仅帮助定位可能的自述、问答等片段，不是关联结论 |
 | `people` | 发言者短编号及角色；不根据姓名判断是否同一个自然人 |
 | `chats` | 会话短编号、名称及服务端类型 `mode`；群名仅是辅助线索 |
@@ -43,6 +44,7 @@
     {"id": "H1", "handle": "chanwinginglife", "catalog_verified": true},
     {"id": "H2", "handle": "budgetfindsedituk", "catalog_verified": true}
   ],
+  "confirmed_handles": [],
   "evidence_hints": [{"h": "H1", "groups": [{"kind": "qa", "refs": ["M1", "M2"]}]}],
   "people": [{"id": "U1", "role": "external"}, {"id": "U2", "role": "staff"}],
   "chats": [{"id": "G1", "name": "chanwinginglife / budgetfindsedituk & TT Media", "mode": "group"}],
@@ -72,12 +74,12 @@
 1. supported/self_account：target 明确称该精确 handle 为自己的 TikTok/TT 账号；或完整问答明确确认账号；或发送该主页并明确说是自己的。“My user name is xxx”“My TT xxx”等自然表达可作自述，不要求固定句式。允许账号和“是我的”分在同会话连续消息里，引用两者。明确说“两个都是我的”可分别支持两个账号。声明仅证明当时自认使用/拥有，不证明实名、法律所有权或今天仍控制账号。
 2. supported/account_creator：可证明 target 本人在该精确账号创作/直播，但无法证明账号归属。supported/operator：明确代他人管理该账号。“our/team/company account”不单独证明个人 owner，即使是在回答“你的账号是什么”；结合完整业务语境证明本人/共同创作可判 account_creator，团队、助理或共同所有权无法区分则 review。不得把这些关系写成个人本人账号。
 3. not_supported/other_person：明确是朋友、介绍人、商家或其他人的账号。not_supported/mention_only：只是转发/举例/提及。其余返回 review/uncertain，不能猜。
-4. 群名、固定群格式、唯一外部联系人、相似姓名、已有达人/账号标签和 Curva 收录均不单独证明账号归属；可帮助理解已有直接证据。Lark 加好友开场“I'm X”没有 TikTok 身份语境时，不等于 TikTok 账号声明。
+4. 群名、固定群格式、唯一外部联系人、相似姓名、已有达人/账号标签和 Curva 收录均不单独证明账号归属；可帮助理解已有直接证据。creator_known=true、包内有 target 本人创作或直播证据时，本人明确说“I'm HANDLE on TikTok”或“I'm NAME from HANDLE on TikTok”，精确介绍自己的账号，可作 self_claim；代表商家、公司、机构、助理或共享账号的语义仍须排除。没有账号语境的 Lark 加好友开场“I'm Daisy”不等于 TikTok 账号声明；也不能用别人的介绍替代本人确认。
 5. 邮箱前缀、商品链接 unique_id、分享者参数、银行 account、Lark @、短链接和单独 AD code 都不能单独证明本人 handle。视频链接保留 handle 与 video_id，并结合本人对具体作品的说明。裸链接或裸 handle 需完整上下文。
 6. at_message 证明消息当时的声明，旧消息也可使用；不能仅因时间久而标 historical 或要求 recent_state。确有旧名、转让、删除或控制权冲突时再区分历史关系与所需补证。“my other/backup account”表示另一个账号，不是改名。“changed username”区分旧名、新名和昵称；未明确的旧→新关系不可补猜。转让、封禁、删除、退出机构分别处理；unlink 机构不等于账号不属于本人。历史关联标 historical，不自动覆盖现有关系。
 7. qa_confirm 同时引用明确索取/核对账号的问题和本人回答。问题可以是“Please drop your username below”，无需问号或先写具体 handle；须结合本人答案，不混入样品、领奖等业务问题。本人回答仅含裸 handle 时，应使用 qa_confirm 并引用问题和回答，不能用 self_claim 只引用裸 handle。真实 reply 优先；没有 reply 时仅允许 mode=p2p、该私聊在输入中恰有两位已知发言者、本人 previous 指向该问题，且回答晚于问题并在5分钟内。previous 必须是服务端提供的真实数据库前驱，不能按选段顺序猜测。群聊不能按相邻消息猜谁在回答；无实际前驱、夹杂其他消息、缺关键问题则 review/ambiguous_reply。完整本人自述不依赖无关父消息。
 8. 反证必须否认该账号归属、说明代理或账号转让；“Not yet”“Not sure”对领奖、样品、邀请的答复，或样品说明里的“did NOT receive”，不等于否认本人账号。“No worries”“No problem”是礼貌表达。退出/unlink 机构不是账号转让；共享链接不是共享所有权。核对反证针对的账号和时点，不能因任何一句 not 否决整包。
-9. 一个联系人可以有多个 handle，逐个给结论；同一个 handle 的多人声明、共享登录、助理/本人不清或转让冲突返回 review，不合并联系人，不按显示姓名挑人。不要将一个账号的证据扩散给同群其他账号。
+9. 一个联系人可以有多个 handle，逐个给结论；同一个 handle 的多人声明、共享登录、助理/本人不清或转让冲突返回 review，不合并联系人，不按显示姓名挑人。不要将一个账号的证据扩散给同群其他账号。confirmed_handles 仅帮助辨认已核准账号的语境，不重判、不输出，也不支持其他候选；“My account is OLD_HANDLE”只指该旧账号，即使它已从本轮候选中移除，也不能作为新候选的泛化“是我的”证据。每个新候选仍须独立、精确连接本人的账号声明。
 10. catalog_verified=false 的候选不得 supported，返回 review/out_of_catalog；true 时不得因模型不认识该账号而判 out_of_catalog，缺关联证据应 review/no_link_evidence。这不是否认其达人身份。只输出输入候选，不纠正点号/下划线/数字，不编造 handle。需要额外候选时由服务端重建证据包。
 11. refs 只填写输入实际消息编号（如 M1），最多6条且不得重复，不填群编号、handle、消息原文或不存在的编号。引用须与 code 对应：self_claim 引本人账号声明，qa_confirm 引完整问答，分开的账号和本人确认须都引用；否认/改名/冲突也引用。self_account 必须有 target 本人的明确确认。读到用于本条结论的消息时，review 也保留相关 refs；确无消息证据才 refs=[]。缺失/截断确实影响该账号时返回 review，并列 needed；其他账号或无关父消息的缺失不否决完整自述。没有文本或证据不足不能当作明确反例。
 
@@ -104,6 +106,8 @@ needed: parent_reply|identity_context|account_context|earlier_username|other_cla
 
 `supported` 是“证据支持该种关系”，不是“一律可入正式达人账号”。只有 `self_account` 才是本人账号候选；`operator`、`account_creator` 不得写成 `owner`。`known` 复用系统身份，其他输出不自动取消既有达人身份。
 
+已有精确「联系人＋Curva handle」的 `owner / confirmed` 关联，只有来源为 `cm_confirmation` 或 `owner_reviewed_curva`、`reviewed_by_authorization_id` 和 `reviewed_at` 均非空时，才视为人工已核准，不再为这一对重复付费匹配。仍检查新 handle、有效授权、目录和真实冲突；人工核准一个账号不代表其余账号也已核准。全部人工核准 handle（包括当前 Curva 未收录的）记录在服务端快照中，用于资料变化检查；不因此放宽 Curva 候选范围。旧 AI 自动导入或缺少审核记录的历史关联不改标为人工核准，也不作为免匹配依据。
+
 功能启用后，服务端只对已确认达人中的 `supported / self_account / at_message`、理由为 `self_claim / qa_confirm / own_page` 且 `needed=[]` 的条目尝试正式关联。须有真实本人声明、完整账号问答或明确本人主页证据，已检出的该账号关键否认、改名和他人归属声明未被遗漏，授权和版本仍有效，且不存在账号或人工结论冲突。这个门槛没有置信度分数或匹配百分比；不是模型给出 `supported` 就直接入库。
 
 服务端必须检查：
@@ -126,7 +130,7 @@ needed: parent_reply|identity_context|account_context|earlier_username|other_cla
 
 逐个 handle 处理，同包另一个账号待核实不影响本账号无关键缺口的强证据条目。新响应与有效缓存使用相同门槛；一人可新增多个 `owner / confirmed` 关系。只新增无冲突关系，不覆盖人工拒绝、既有非 owner、其他人的 owner 或当前账号级 CM/AM 关系，不修改达人身份或负责人。已有人工来源保留，新自动关系带来源、任务和审计引用，重复处理不重复创建。
 
-页面「已关联」以实时正式关系为准，未通过门槛的条目保留判定供核实。后续反证不会自动撤销或转让既有关系；`at_message` 仅代表消息时点的声明，不证明平台实名、法律所有权或当前控制权。
+页面分开显示「当前关联」和「本轮核验」：前者来自实时正式关系，标注「人工已核准」或「已关联」；后者保留本轮模型的支持、待核实及校验原因，不因已有关系改成「已关联」。普通待核实不是系统错误；真实冲突即使发生在已有关联上也保留提示。全部候选均已人工核准且无新候选或冲突时，显示「已核准关联，无需重复匹配」。后续反证不会自动撤销或转让既有关系；`at_message` 仅代表消息时点的声明，不证明平台实名、法律所有权或当前控制权。
 
 当前迁移文件中，确认的 `owner` 仍有“一个账号一个 owner”唯一索引；多 CM/AM 关联不是多 owner。若未来支持同一 handle 对多个联系人，必须先定义“同一自然人的多个 Lark 身份 / 共同使用 / 代理”及写库方式。本版研究结果可表达多个候选，不绕过数据库约束。
 
@@ -148,6 +152,7 @@ needed: parent_reply|identity_context|account_context|earlier_username|other_cla
 | Helene → `thepixiepicks` | 退出机构与仍有其他账号分别处理，不据 unlink 删除身份或推断账号转让 |
 | Autimn → `autumnmagic_6` | 本人说新名 `autumn_villianera`，群名括号里的旧名不是完整改名证明，旧关联标待核对历史 |
 | Adaora → `adauju13` | “名字 Adaora，username Adauju13”，区分昵称和 handle |
+| Daisy → `fashionbeautyfindsuk` | 本人私聊“I'm Daisy from fashionbeautyfindsuk on tik tok :)”，并有本人剪辑 TikTok 视频、发布付费合作视频的记录；已确认达人身份下可作自述。群名仅辅助，单独 Lark“I'm Daisy”、代理介绍或共享账号不适用 |
 | Lamide 的介绍人 | `oladiaries_03` 与“omololaaa1 referred me”分开，介绍人账号不得归给本人；自身开场也须补 TikTok 语境 |
 | `ladyhawks041` / `roxannefreeman` 的邮箱 | 邮箱前缀不能作为 TikTok 自报证据，即使人与样品业务确有联系 |
 | Devin → `devinjadex` | 商品分享链接的 `unique_id` 只能作低强度检索线索，不直接确认归属 |

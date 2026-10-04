@@ -15,16 +15,18 @@
   'lease_expired': '任务超时，正在恢复', 'identity_removed': '达人身份已取消',
   'quota_paused': 'API 额度不足，队列已暂停',
   'provider_retry': '服务暂不可用，等待重试', 'invalid_output': '模型结果校验失败',
-  'provider_failed': 'API 调用失败', 'owner_cancelled': '已手动取消'
+  'provider_failed': 'API 调用失败', 'owner_cancelled': '已手动取消',
+  'already_confirmed': '已核准关联，无需重复匹配'
 } %}
-{% set decision_labels = {'supported': '证据支持', 'review': '待核实', 'not_supported': '不支持关联'} %}
+{% set decision_labels = {'supported': '支持', 'review': '待核实', 'not_supported': '不支持关联'} %}
 {% set error_labels = {
   'shape': '结构不完整', 'array': '列表格式错误', 'enum': '判定值无效', 'candidates': '候选编号不完整',
   'references': '证据引用无效', 'needed': '补充证据字段无效', 'invalid_json': '返回不是有效 JSON',
   'invalid_response': '缺少有效响应', 'unfinished_response': '响应未完成',
   'unsupported_evidence': '缺少本人或账号证据', 'supported_relation': '账号关系待核实',
   'excerpted_support': '证据不完整', 'owner_code': '缺少本人归属证据',
-  'unconnected_owner_evidence': '本人归属证据未连接', 'internal_error': '内部处理异常'
+  'unconnected_owner_evidence': '本人归属证据未连接', 'counterevidence': '账号归属存在反证',
+  'out_of_catalog': '不在 Curva 名单', 'internal_error': '内部处理异常'
 } %}
 {% set relation_labels = {
   'self_account': '本人账号', 'account_creator': '内容创作者', 'operator': '代运营',
@@ -49,7 +51,11 @@
   <div class="d-flex flex-wrap gap-3 mb-3">{% for item in matching.counts %}<span>{{ status_labels.get(item.status, item.status) }}：{{ item.n }}</span>{% else %}<span class="text-secondary">暂无任务</span>{% endfor %}</div>
   <div class="card table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>达人</th><th>状态</th><th>账号匹配</th><th>Token</th><th>操作</th></tr></thead><tbody>
     {% for job in matching.jobs %}<tr><td>{{ job.display_name or '未命名' }}</td><td>{{ status_labels.get(job.status, job.status) }}{% if job.reason_code %}<div class="text-secondary small">{{ reason_labels.get(job.reason_code, job.reason_code) }}</div>{% endif %}{% if job.validation_error %}<div class="text-secondary small">{{ error_labels.get(job.validation_error, job.validation_error) }}</div>{% endif %}</td>
-      <td>{% for item in job.suggestions %}<div><a href="https://www.tiktok.com/@{{ item.handle }}" rel="noopener noreferrer" target="_blank">@{{ item.handle }}</a> · {{ '已关联' if item.associated else decision_labels.get(item.decision, item.decision) }}<div class="text-secondary small">{{ relation_labels.get(item.relation, item.relation) }} · {{ code_labels.get(item.code, item.code) }} · {{ period_labels.get(item.period, '时点不明') }}</div></div>{% else %}—{% endfor %}</td>
+      <td>
+        {% if job.associations %}<div class="text-secondary small">当前关联</div>{% for item in job.associations %}<div><a href="https://www.tiktok.com/@{{ item.handle }}" rel="noopener noreferrer" target="_blank">@{{ item.handle }}</a> · {{ '人工已核准' if item.human_confirmed else '已关联' }}</div>{% endfor %}{% endif %}
+        {% if job.suggestions %}<div class="text-secondary small{% if job.associations %} mt-2{% endif %}">本轮核验</div>{% for item in job.suggestions %}<div class="{{ 'text-danger' if item.conflict else 'text-secondary' }}"><a class="text-reset" href="https://www.tiktok.com/@{{ item.handle }}" rel="noopener noreferrer" target="_blank">@{{ item.handle }}</a> · {{ decision_labels.get(item.decision, item.decision) }}<div class="small">{{ relation_labels.get(item.relation, item.relation) }} · {{ code_labels.get(item.code, item.code) }} · {{ period_labels.get(item.period, '时点不明') }}{% if item.validation_error %} · {{ error_labels.get(item.validation_error, item.validation_error) }}{% endif %}</div></div>{% endfor %}{% endif %}
+        {% if not job.associations and not job.suggestions %}—{% endif %}
+      </td>
       <td>{{ job.input_tokens + job.output_tokens }}</td><td><div class="d-flex gap-2">
         {% for op,label in [('recheck','重新检查'),('cancel','取消')] %}{% if op != 'cancel' or job.status not in ['completed', 'failed', 'cancelled'] %}<form method="post" action="/admin/ai/creator-handle-matching/jobs/{{ job.id }}/{{ op }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm" type="submit" {% if op == 'recheck' and not matching.enabled %}disabled{% endif %}>{{ label }}</button></form>{% endif %}{% endfor %}
       </div></td></tr>{% else %}<tr><td colspan="5" class="text-secondary text-center py-4">暂无任务</td></tr>{% endfor %}

@@ -3,6 +3,7 @@
 import json
 import sys
 from contextlib import nullcontext
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -12,6 +13,7 @@ from cap_fixtures import pilot as parent_pilot
 
 from app import ai_dispatch, ai_feature_config, config, contact_handles, creator_data, openai_client
 from app import creator_handle_matching as matching
+from app.crypto import message_body_cipher
 
 pilot = parent_pilot
 
@@ -33,6 +35,8 @@ def matching_flow(pg, pilot, monkeypatch):
         missing_reply_ids=[],
         material_version=1,
         reference_version=1,
+        real_build=matching.evidence.build,
+        real_still_valid=matching.evidence.still_valid,
     )
     monkeypatch.setattr(matching, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(config, "get_settings", lambda: state.settings)
@@ -405,8 +409,12 @@ def test_review_and_incomplete_evidence_never_auto_link_and_cache_can_reuse(pg, 
         assert not pg.execute("SELECT 1 FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
     # Typed coverage limits only the affected handle; other strong claims are not collateral damage.
     flow.period, flow.needed, flow.legacy_stats = "at_message", [], False
-    flow.stats = {"history_truncated": True, "candidates_omitted": 1, "critical_evidence_omitted": True,
-                  "critical_evidence_omitted_handles": ["backup_2"]}
+    flow.stats = {
+        "history_truncated": True,
+        "candidates_omitted": 1,
+        "critical_evidence_omitted": True,
+        "critical_evidence_omitted_handles": ["backup_2"],
+    }
     # This message independently names its own account: an unrelated unavailable reply is unnecessary.
     flow.missing_reply_ids = ["M1"]
     flow.material_version += 1
@@ -586,10 +594,45 @@ def test_role_and_chat_events_shared_slots_and_catalog_changes(pg, matching_flow
         "status": "queued",
         "result_ciphertext": None,
     }
-    assert pg.execute("SELECT billed_tokens FROM creator_handle_requests WHERE id=%s",
-                      (job["reservation_id"],)).fetchone()["billed_tokens"] == 150
+    assert (
+        pg.execute(
+            "SELECT billed_tokens FROM creator_handle_requests WHERE id=%s", (job["reservation_id"],)
+        ).fetchone()["billed_tokens"]
+        == 150
+    )
     assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
     assert not pg.execute("SELECT 1 FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
+
+    # Manual history admission upgrades only prior-version completed contacts; the page shows latest jobs only.
+    monkeypatch.setattr(matching, "catalog", lambda: (frozenset({"first.handle", "backup_2"}), "catalog-v4"))
+    pg.execute(
+        "UPDATE creator_handle_jobs SET stats=jsonb_build_object('prompt_version','retired-prompt'),"
+        "created_at=NOW()-INTERVAL '1 minute' WHERE contact_id=%s",
+        (pilot.ids["legacy"],),
+    )
+    pg.execute(
+        "UPDATE creator_handle_jobs SET stats=jsonb_build_object('prompt_version',%s::text) WHERE contact_id=%s",
+        (matching.evidence.PROMPT_VERSION, pilot.ids["silent"]),
+    )
+    old_id = pg.execute("SELECT id FROM creator_handle_jobs WHERE contact_id=%s", (pilot.ids["legacy"],)).fetchone()[
+        "id"
+    ]
+    assert matching.enqueue_history(pg, pilot.ids["owner"]) == 1
+    assert (
+        pg.execute("SELECT count(*) n FROM creator_handle_jobs WHERE contact_id=%s", (pilot.ids["legacy"],)).fetchone()[
+            "n"
+        ]
+        == 2
+    )
+    assert (
+        pg.execute("SELECT count(*) n FROM creator_handle_jobs WHERE contact_id=%s", (pilot.ids["silent"],)).fetchone()[
+            "n"
+        ]
+        == 1
+    )
+    latest = matching.page_data(pg, pilot.ids["owner"], flow.settings)["jobs"]
+    assert len({row["contact_id"] for row in latest}) == len(latest)
+    assert old_id not in {row["id"] for row in latest}
 
 
 def test_failed_diagnostics_partial_results_and_queue_cleanup_preserve_data(pg, matching_flow, monkeypatch):
@@ -652,8 +695,14 @@ def test_disabled_probe_retains_paid_diagnostics_when_postcall_catalog_fails(pg,
     pg.execute("UPDATE ai_feature_configs SET enabled=FALSE WHERE feature=%s", (matching.FEATURE,))
     before = _snapshot(
         pg,
-        ("contacts", "contact_roles", "contact_assignments", "social_accounts",
-         "contact_social_accounts", "creator_account_assignments"),
+        (
+            "contacts",
+            "contact_roles",
+            "contact_assignments",
+            "social_accounts",
+            "contact_social_accounts",
+            "creator_account_assignments",
+        ),
     )
 
     def execute(sql, params=None):
@@ -692,3 +741,180 @@ def test_disabled_probe_retains_paid_diagnostics_when_postcall_catalog_fails(pg,
         "enabled"
     ]
     assert not pg.execute("SELECT 1 FROM creator_handle_jobs").fetchone()
+
+
+def test_human_confirmed_pairs_skip_paid_matching_without_freezing_other_handles(pg, matching_flow, pilot, monkeypatch):
+    flow = matching_flow
+    flow.enable()
+    monkeypatch.setattr(matching.evidence, "build", flow.real_build)
+    monkeypatch.setattr(matching.evidence, "still_valid", flow.real_still_valid)
+    respond = matching.api.call_openai
+
+    def real_references(*args, **kwargs):
+        response = respond(*args, **kwargs)
+        pack = args[2]
+        value = json.loads(response["text"])
+        by_handle = {h["id"]: h["handle"] for h in pack["handles"]}
+        for link in value["links"]:
+            link["refs"] = [
+                next(
+                    m["id"]
+                    for m in pack["messages"]
+                    if m["speaker"] == pack["target"] and by_handle[link["h"]] in m["text"]
+                )
+            ]
+        response["text"] = json.dumps(value)
+        return response
+
+    monkeypatch.setattr(matching.api, "call_openai", real_references)
+    before = _snapshot(pg, ("contacts", "contact_roles", "contact_assignments", "creator_account_assignments"))
+    cipher = message_body_cipher(flow.settings.token_encryption_key)
+    start = datetime.now(UTC)
+
+    def message(handle, minute):
+        message_id = f"{handle}-{minute}"
+        pg.execute(
+            "INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,"
+            "body_ciphertext,message_create_time) VALUES('chat_creator',%s,'ou_creator','user','text',%s,%s)",
+            (
+                message_id,
+                cipher.encrypt(json.dumps({"text": "My TikTok account is " + handle})),
+                start + timedelta(minutes=minute),
+            ),
+        )
+        pg.execute(
+            "INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+            "VALUES(%s,'chat_creator',%s)",
+            (pilot.ids["cm"], message_id),
+        )
+
+    first = uuid4()
+    pg.execute(
+        "INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) "
+        "VALUES(%s,'tiktok','first.handle','first.handle')",
+        (first,),
+    )
+    pg.execute(
+        "INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source,"
+        "reviewed_by_authorization_id,reviewed_at) "
+        "VALUES(%s,%s,'owner','confirmed','owner_reviewed_curva',%s,NOW())",
+        (flow.contact, first, pilot.ids["owner"]),
+    )
+    message("first.handle", 0)
+    all_confirmed = _enqueue(pg, flow.contact)
+    assert matching.prepare_next(flow.settings) and matching.claim() is None
+    assert pg.execute(
+        "SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s", (all_confirmed,)
+    ).fetchone() == {"status": "completed", "reason_code": "already_confirmed"}
+    assert not flow.calls and not pg.execute("SELECT 1 FROM creator_handle_requests").fetchone()
+    page = matching.page_data(pg, pilot.ids["owner"], flow.settings)
+    assert page["jobs"][0]["associations"] == [{"handle": "first.handle", "human_confirmed": True}]
+    assert page["jobs"][0]["suggestions"] == []
+    pg.execute("UPDATE creator_handle_jobs SET created_at=NOW()-INTERVAL '1 minute' WHERE id=%s", (all_confirmed,))
+
+    # The trusted exact pair is excluded, not the entire contact.
+    message("backup_2", 1)
+    job = _prepared_job(pg, flow)
+    assert [h["handle"] for h in job["pack"]["handles"]] == ["backup_2"]
+    assert job["stats"]["prompt_version"] == matching.evidence.PROMPT_VERSION
+    matching.run(job, flow.settings)
+    assert len(flow.calls) == 1 and contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == [
+        "backup_2",
+        "first.handle",
+    ]
+    pairs = {row["handle"]: row for row in contact_handles.confirmed_pairs(pg, [flow.contact])}
+    assert pairs["first.handle"]["human_confirmed"] and not pairs["backup_2"]["human_confirmed"]
+    assert pairs["backup_2"]["source"] == "creator_handle_auto_verified"
+    pg.execute(
+        "UPDATE contact_social_accounts SET source='excel_ai_verified',reviewed_by_authorization_id=%s,"
+        "reviewed_at=NOW() WHERE contact_id=%s AND social_account_id=(SELECT id FROM social_accounts "
+        "WHERE platform='tiktok' AND normalized_handle='backup_2')",
+        (pilot.ids["owner"], flow.contact),
+    )
+    assert not next(row for row in contact_handles.confirmed_pairs(pg, [flow.contact]) if row["handle"] == "backup_2")[
+        "human_confirmed"
+    ]
+    assert [
+        h["handle"]
+        for h in flow.real_build(pg, flow.settings, flow.contact, frozenset({"first.handle", "backup_2"}))["pack"][
+            "handles"
+        ]
+    ] == ["backup_2"]
+    pg.execute(
+        "UPDATE contact_social_accounts SET source='creator_handle_auto_verified' WHERE contact_id=%s "
+        "AND social_account_id=(SELECT id FROM social_accounts WHERE normalized_handle='backup_2')",
+        (flow.contact,),
+    )
+    assert not next(row for row in contact_handles.confirmed_pairs(pg, [flow.contact]) if row["handle"] == "backup_2")[
+        "human_confirmed"
+    ]
+
+    # Formal relationships and this round's AI conclusion are independent page fields.
+    saved = pg.execute("SELECT result_ciphertext FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone()
+    view = json.loads(creator_data.cipher(flow.settings).decrypt(saved["result_ciphertext"]))
+    link = view["result"]["links"][0]
+    link.update(
+        decision="review", relation="uncertain", period="unknown", code="no_link_evidence", needed=["account_context"]
+    )
+    for code, validation_error, conflict in (
+        ("no_link_evidence", None, False),
+        ("conflict", None, True),
+        ("no_link_evidence", "counterevidence", True),
+    ):
+        link["code"] = code
+        if validation_error:
+            link["validation_error"] = validation_error
+        else:
+            link.pop("validation_error", None)
+        pg.execute(
+            "UPDATE creator_handle_jobs SET result_ciphertext=%s,status='review_required' WHERE id=%s",
+            (creator_data.cipher(flow.settings).encrypt(creator_data.encode(view)), job["id"]),
+        )
+        row = next(
+            row for row in matching.page_data(pg, pilot.ids["owner"], flow.settings)["jobs"] if row["id"] == job["id"]
+        )
+        assert {p["handle"]: p["human_confirmed"] for p in row["associations"]} == {
+            "first.handle": True,
+            "backup_2": False,
+        }
+        assert row["suggestions"][0]["decision"] == "review" and row["suggestions"][0]["conflict"] is conflict
+        assert "associated" not in row["suggestions"][0]
+
+    # A human review arriving between preparation and admission invalidates the snapshot before billing.
+    message("backup_2", 2)
+    job_id = _enqueue(pg, flow.contact)
+    assert matching.prepare_next(flow.settings)
+    pg.execute(
+        "UPDATE contact_social_accounts SET source='cm_confirmation' WHERE contact_id=%s "
+        "AND social_account_id=(SELECT id FROM social_accounts WHERE normalized_handle='backup_2')",
+        (flow.contact,),
+    )
+    assert matching.claim() is None and len(flow.calls) == 1
+    assert pg.execute("SELECT count(*) n FROM creator_handle_requests").fetchone()["n"] == 1
+    assert matching.prepare_next(flow.settings) and matching.claim() is None
+    assert pg.execute("SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s", (job_id,)).fetchone() == {
+        "status": "completed",
+        "reason_code": "already_confirmed",
+    }
+
+    # Removing previously trusted evidence also invalidates a ready snapshot, reopening that exact pair.
+    pg.execute(
+        "UPDATE contact_social_accounts SET source='creator_handle_auto_verified' WHERE contact_id=%s "
+        "AND social_account_id=%s",
+        (flow.contact, first),
+    )
+    job_id = _enqueue(pg, flow.contact)
+    assert matching.prepare_next(flow.settings)
+    pg.execute(
+        "UPDATE contact_social_accounts SET source='excel_ai_verified' WHERE contact_id=%s "
+        "AND social_account_id=(SELECT id FROM social_accounts WHERE normalized_handle='backup_2')",
+        (flow.contact,),
+    )
+    assert matching.claim() is None and len(flow.calls) == 1
+    assert matching.prepare_next(flow.settings)
+    ready = pg.execute("SELECT pack_ciphertext FROM creator_handle_jobs WHERE id=%s", (job_id,)).fetchone()
+    assert {
+        h["handle"] for h in json.loads(creator_data.cipher(flow.settings).decrypt(ready["pack_ciphertext"]))["handles"]
+    } == {"first.handle", "backup_2"}
+    assert pg.execute("SELECT count(*) n FROM creator_handle_requests").fetchone()["n"] == 1
+    assert _snapshot(pg, before.keys()) == before

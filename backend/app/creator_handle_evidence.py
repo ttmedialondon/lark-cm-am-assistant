@@ -10,13 +10,14 @@ from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
+from . import contact_handles
 from . import evidence_access as access
 from . import evidence_text as text
 from . import handle_evidence as handles
 from .crypto import message_body_cipher
 from .openai_client import ModelOutputError
 
-PROMPT_VERSION = "creator-handle-research-v1.5"
+PROMPT_VERSION = "creator-handle-research-v1.6"
 MAX_MESSAGES, MAX_CHARS, MAX_HANDLES, SEARCH_LIMIT = 48, 20_000, 12, 20_000
 # A research hold is an explicit access restriction, not a negative identity finding.
 RESTRICTED_CONTACTS = frozenset({"6abf6bf9-12dc-4a22-9654-2010aa4c7785"})
@@ -64,6 +65,13 @@ _SHARED_ACCOUNT = re.compile(
     r"\bour\s+(?:tiktok|tt)(?=\s+(?:is\b|https?://|@)|\s*[:=])|"
     r"\b(?:account|page)(?:\s+(?!link\b|url\b)@?[A-Za-z0-9._]{1,64})?\s+(?:is|was)\s+(?:shared|joint)\b|"
     r"我们的(?:账号|帐号|主页)|共同(?:账号|帐号)|团队(?:账号|帐号)", re.I)
+_INTRO_PROXY = re.compile(
+    r"\b(?:assistant|representative|represent\w*|manager|agency|company|merchant|seller|business|brand)\b|"
+    r"on\s+behalf|助理|代理|商家|公司|代表", re.I)
+_CREATOR_ACTIVITY = re.compile(
+    r"\b(?:filmed|filming|editing|posted|posting|uploaded|uploading|created|creating)\s+"
+    r"(?:(?:my|a|the|three|two|one|new|latest|first|\d+)\s+){0,3}(?:videos?|content)\b|"
+    r"\b(?:livestreaming|streaming)\s+on\s+(?:tik\s*tok|tt)\b|我.*(?:发了视频|正在剪辑|直播)", re.I)
 _COMPANY_READABLE = access._READABLE.replace("WHERE a.id=%s", "WHERE TRUE") + """ AND NOT EXISTS (
     SELECT 1 FROM lark_identities blocked WHERE blocked.open_id=m.sender_open_id
       AND blocked.contact_id='6abf6bf9-12dc-4a22-9654-2010aa4c7785'::uuid)"""
@@ -96,7 +104,7 @@ def output_format(pack=None):
         creator["state"]["enum"] = ["known"] if pack["creator_known"] else ["supported", "review", "not_supported"]
         if pack["creator_known"]:
             creator["refs"]["maxItems"] = 0
-    return {"type": "json_schema", "name": "creator_handle_v1_5", "strict": True, "schema": schema}
+    return {"type": "json_schema", "name": "creator_handle_v1_6", "strict": True, "schema": schema}
 
 
 def _denied(value):
@@ -174,6 +182,9 @@ def build(conn, settings, contact_id, catalog):
                               (contact_id,)).fetchall()
     if not identities or any(i["tenant_classification"] == "internal" for i in identities):
         return empty
+    human_handles = sorted({r["handle"] for r in contact_handles.confirmed_pairs(conn, [contact_id])
+                            if r["human_confirmed"]})
+    empty["stats"] = {"human_confirmed_handles": human_handles}
     open_ids = [i["open_id"] for i in identities]
     chats = conn.execute(
         """SELECT DISTINCT c.chat_id,c.name,c.chat_mode FROM chats c
@@ -205,7 +216,7 @@ def build(conn, settings, contact_id, catalog):
 
     own = readable(own_rows)
     if not own:
-        return {**empty, "reason": "no_text", "stats": {"history_truncated": truncated}}
+        return {**empty, "reason": "no_text", "stats": {**empty["stats"], "history_truncated": truncated}}
     parent_keys = {_key(r) for r in own_rows if r.get("parent_id")}
     parent_rows = _rows(conn,
         "EXISTS (SELECT 1 FROM chat_messages child WHERE child.chat_id=m.chat_id AND child.parent_id=m.message_id "
@@ -227,9 +238,12 @@ def build(conn, settings, contact_id, catalog):
     for chat in chats:
         for handle in _tokens(chat["name"] or "", catalog):
             scores[handle] += 1
+    recalled = bool(scores)
+    scores = Counter({h: score for h, score in scores.items() if h not in human_handles})
     candidates = sorted(scores, key=lambda h: (-scores[h], h))[:MAX_HANDLES]
     if not candidates:
-        return {**empty, "reason": "no_candidates", "stats": {"readable_messages": len(own)}}
+        return {**empty, "reason": "already_confirmed" if recalled else "no_candidates",
+                "stats": {**empty["stats"], "readable_messages": len(own)}}
     candidate_set = set(candidates)
     previous_answers = dict(denial_previous)
     by_key = {_key(i["row"]): i for i in [*own, *parents]}
@@ -293,7 +307,7 @@ def build(conn, settings, contact_id, catalog):
         seen.update(_key(i["row"]) for i in part)
         chars += size
     if not chosen:
-        return {**empty, "reason": "material_limit", "stats": {"readable_messages": len(own)}}
+        return {**empty, "reason": "material_limit", "stats": {**empty["stats"], "readable_messages": len(own)}}
     chosen.sort(key=lambda i: (str(i["row"]["message_create_time"]), *_key(i["row"])))
     speakers = conn.execute("SELECT " + _SPEAKER_COLUMNS
                             + " FROM lark_identities WHERE open_id=ANY(%s::text[]) ORDER BY open_id",
@@ -339,7 +353,7 @@ def build(conn, settings, contact_id, catalog):
     known = bool(conn.execute("SELECT 1 FROM contact_roles WHERE contact_id=%s "
                               "AND role='creator' AND status='confirmed'",
                               (contact_id,)).fetchone())
-    pack = {"target": "U1", "creator_known": known,
+    pack = {"target": "U1", "creator_known": known, "confirmed_handles": human_handles,
             "handles": [{"id": f"H{i}", "handle": h, "catalog_verified": True} for i, h in enumerate(candidates, 1)],
             "people": people, "chats": [{"id": groups[c["chat_id"]], "name": c["name"] or "",
                                           "mode": c["chat_mode"] or "unknown"} for c in used_chats],
@@ -358,8 +372,8 @@ def build(conn, settings, contact_id, catalog):
             or item["row"]["sender_open_id"] not in open_ids
                and speaker_types.get(item["row"]["sender_open_id"], {}).get("tenant_classification") != "internal"
                and speaker_types.get(item["row"]["sender_open_id"], {}).get("identity_type", "user") == "user"
-               and _self_claim(item["text"], h))})
-    stats = {"messages": len(messages), "body_chars": chars, "readable_messages": len(own),
+               and _self_claim(item["text"], h, allow_intro=True))})
+    stats = {**empty["stats"], "messages": len(messages), "body_chars": chars, "readable_messages": len(own),
              "history_truncated": truncated, "candidates_omitted": max(0, len(scores) - len(candidates)),
              "critical_evidence_omitted": bool(omitted_handles),
              "critical_evidence_omitted_handles": omitted_handles}
@@ -409,9 +423,14 @@ def _parts(body):
     return re.split(r"[\n,;!?]|\.\s+|\b(?:but|however|and\s+(?:my|i|now|the|it))\b", body, flags=re.I)
 
 
-def _self_claim(body, handle=None):
+def _self_claim(body, handle=None, *, allow_intro=False):
     return any((_SELF.search(part) or handle is not None and re.search(
-                   r"\bmy\s+(?:tiktok|tt)\s+@?" + re.escape(handle) + r"(?=\.*(?:[^A-Za-z0-9_.]|$))", part, re.I))
+                   r"\bmy\s+(?:tiktok|tt)\s+@?" + re.escape(handle) + r"(?=\.*(?:[^A-Za-z0-9_.]|$))", part, re.I)
+               or allow_intro and handle is not None and not _INTRO_PROXY.search(body)
+               and not _THIRD_PARTY.search(body) and not _OWNER_NEGATION.search(body)
+               and not _SHARED_ACCOUNT.search(body) and re.search(
+                   r"\b(?:i['’]m|i\s+am)\s+(?:(?:[A-Za-z][A-Za-z'’-]*\s+){1,3}from\s+)?@?"
+                   + re.escape(handle) + r"\s+on\s+tik\s*tok\b", part, re.I))
                and not _NOT_OWNER.search(part) and not _SHARED_ACCOUNT.search(part) and not _denied(part)
                and (handle is None or _mentions(part, handle)) for part in _parts(body))
 
@@ -485,7 +504,16 @@ def _support_groups(pack, candidate, refs=None):
     own = sorted((m for m in pack["messages"] if m["speaker"] == pack["target"] and m["id"] in allowed),
                  key=_timestamp, reverse=True)
     handle = candidate["handle"]
-    others = [h for h in pack["handles"] if h["id"] != candidate["id"]]
+    # Confirmed pairs are not output candidates, but their claims cannot be inherited by a new handle.
+    contexts = [*pack["handles"], *({"handle": h} for h in pack.get("confirmed_handles", []))]
+    others = [h for h in contexts if h["handle"] != handle]
+    allow_intro = pack["creator_known"] and any(
+        not _NOT_OWNER.search(part) and not _THIRD_PARTY.search(part) and not _SHARED_ACCOUNT.search(part)
+        and not re.search(r"\b(?:not|never|haven't|haven’t|didn't|didn’t)\s+(?:\w+\s+)*$",
+                          part[:activity.start()], re.I)
+        and not re.search(r"\b(?:you|he|she|they)\b", part[:activity.start()], re.I)
+        for m in pack["messages"] if m["speaker"] == pack["target"]
+        for part in _parts(m["text"]) if (activity := _CREATOR_ACTIVITY.search(part)))
     groups, claims = [], {}
 
     def add(kind, references, claim):
@@ -495,11 +523,11 @@ def _support_groups(pack, candidate, refs=None):
         claims[claim["id"]] = claim
 
     for message in own:
-        if _self_claim(message["text"], handle):
+        if _self_claim(message["text"], handle, allow_intro=allow_intro):
             add("self_claim", [message["id"]], message)
     for answer in own:
         parent = answer.get("reply") or answer.get("previous")
-        if parent in messages and _qa(pack, answer, messages[parent], handle, pack["handles"], allowed,
+        if parent in messages and _qa(pack, answer, messages[parent], handle, contexts, allowed,
                                       continuous=not bool(answer.get("reply"))):
             add("qa", [parent, answer["id"]], answer)
     for claim in own:
@@ -619,7 +647,8 @@ def _counterevidence(pack, handle, claims):
                 conflicts.append(message["id"])
                 if parent and not _mentions(body, handle):
                     conflicts.append(parent["id"])
-        elif (actors.get(message["speaker"], "unknown") in {"external", "unknown"} and _self_claim(body, handle)):
+        elif (actors.get(message["speaker"], "unknown") in {"external", "unknown"}
+              and _self_claim(body, handle, allow_intro=True)):
             conflicts.append(message["id"])
     return list(dict.fromkeys(conflicts))
 

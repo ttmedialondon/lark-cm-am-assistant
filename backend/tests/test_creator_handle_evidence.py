@@ -2,6 +2,7 @@
 import json
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import pytest
 from cap_fixtures import pilot as parent_pilot
@@ -219,6 +220,55 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
     assert next(link for link in matcher.validate(core["pack"], core_result)["links"]
                 if link["h"] == backup["id"])["validation_error"] == "unconnected_owner_evidence"
     pg.execute("ROLLBACK TO SAVEPOINT core_packing")
+    pg.execute("SAVEPOINT human_pairs")
+    pg.execute("INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) "
+               "VALUES(%s,'tiktok','first.handle','first.handle'),(%s,'tiktok','outside_catalog','outside_catalog')",
+               (uuid4(), uuid4()))
+    pg.execute("INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source,"
+               "reviewed_by_authorization_id,reviewed_at) SELECT %s,id,'owner','confirmed','cm_confirmation',%s,NOW() "
+               "FROM social_accounts WHERE normalized_handle IN ('first.handle','outside_catalog')", (contact, cm))
+    only_known = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))
+    assert only_known['pack'] is None and only_known['reason'] == 'already_confirmed'
+    assert only_known['stats']['human_confirmed_handles'] == ['first.handle', 'outside_catalog']
+    message("human_claim", "ou_creator", "My TikTok account is first.handle", 93)
+    message("unbound_new", "ou_creator", "Here is backup_2", 94)
+    message("new_handle", "ou_creator", "My backup account is backup_2", 95)
+    with monkeypatch.context() as limits:
+        limits.setattr(matcher, 'MAX_HANDLES', 1)
+        new_handle = matcher.build(pg, pilot.settings, contact, catalog)
+    assert new_handle['reason'] == 'ready'
+    assert [h['handle'] for h in new_handle['pack']['handles']] == ['backup_2']  # Filter human pairs before top-N.
+    assert new_handle['pack']['confirmed_handles'] == ['first.handle', 'outside_catalog']
+    human_ids = {r['message_id']: r['label'] for r in new_handle['refs'] if r['kind'] == 'message'}
+    wrong_claim = {'creator': {'state': 'known', 'refs': []}, 'links': [
+        {'h': 'H1', 'decision': 'supported', 'relation': 'self_account', 'period': 'at_message',
+         'code': 'self_claim', 'refs': [human_ids['human_claim'], human_ids['unbound_new']], 'needed': []}]}
+    assert matcher.validate(new_handle['pack'], wrong_claim)['links'][0]['decision'] == 'review'
+    assert matcher._support_groups(new_handle['pack'], new_handle['pack']['handles'][0],
+                                   wrong_claim['links'][0]['refs']) == ([], [])
+    wrong_claim['links'][0]['refs'] = [human_ids['new_handle']]
+    assert matcher.validate(new_handle['pack'], wrong_claim)['links'][0]['decision'] == 'supported'
+    pg.execute("UPDATE contact_social_accounts SET source='excel_ai_verified',reviewed_by_authorization_id=NULL "
+               "WHERE contact_id=%s AND social_account_id=(SELECT id FROM social_accounts "
+               "WHERE normalized_handle='first.handle')", (contact,))
+    ai_import = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))
+    assert ai_import['reason'] == 'ready' and ai_import['pack']['handles'][0]['handle'] == 'first.handle'
+    assert ai_import['stats']['human_confirmed_handles'] == ['outside_catalog']  # Upload is not human review.
+    pg.execute("ROLLBACK TO SAVEPOINT human_pairs")
+    pg.execute("SAVEPOINT intro_counter")
+    pilot.person("intro_peer")
+    message("peer_intro", "ou_intro_peer", "I'm Alex from first.handle on tik tok :)", 2.2)
+    peer_material = matcher.build(pg, pilot.settings, contact, catalog)
+    peer_question = next(m['id'] for m in peer_material['pack']['messages'] if m['text'] == question['text'])
+    peer_answer = next(m['id'] for m in peer_material['pack']['messages'] if m['text'] == answer['text'])
+    peer_result = deepcopy(result)
+    peer_result['links'][0]['refs'] = [peer_question, peer_answer]
+    assert matcher.validate(peer_material['pack'], peer_result)['links'][0]['validation_error'] == 'counterevidence'
+    with monkeypatch.context() as limits:
+        limits.setattr(matcher, 'MAX_CHARS', 55)
+        omitted_peer = matcher.build(pg, pilot.settings, contact, catalog)
+    assert omitted_peer['stats']['critical_evidence_omitted_handles'] == ['first.handle']
+    pg.execute("ROLLBACK TO SAVEPOINT intro_counter")
     # A skipped unauthorized/non-text predecessor must not create fake private adjacency.
     pg.execute("SAVEPOINT adjacency_check")
     message("unreadable_between", "ou_cm", "Unrelated topic", 0.5, observed=start - timedelta(days=2))
@@ -317,6 +367,37 @@ def test_contact_matching_rejects_disconnected_and_third_party_claims():
     assert matcher.validate(pack, result)["links"][0]["decision"] == "review"
     pack["messages"][0]["text"] = "My account is .creator_1"
     assert matcher.validate(pack, result) == result
+    natural = deepcopy(pack)
+    natural['messages'] = [
+        {"id": "M1", "speaker": "U1", "chat": "G1", "at": "2026-10-01T01:00:00Z", "reply": None,
+         "text": "I'm Daisy from .creator_1 on tik tok :)"},
+        {"id": "M2", "speaker": "U1", "chat": "G1", "at": "2026-10-01T01:01:00Z", "reply": None,
+         "text": "I posted the three videos for the collaboration, I'm not stopping there"}]
+    natural_result = deepcopy(result)
+    natural_result['links'][0]['refs'] = ['M1']
+    assert matcher.validate(natural, natural_result) == natural_result
+    assert matcher._support_groups(natural, natural['handles'][0])[0] == [{'kind': 'self_claim', 'refs': ['M1']}]
+    natural['messages'][1]['text'] = 'I have not posted the three videos'
+    assert matcher.validate(natural, natural_result)['links'][0]['decision'] == 'review'
+    natural['messages'][1]['text'] = 'I didn’t get around to posting a video'
+    assert matcher.validate(natural, natural_result)['links'][0]['decision'] == 'review'
+    natural['messages'][1]['text'] = "I posted the three videos for the collaboration, I'm not stopping there"
+    natural['creator_known'] = False
+    assert matcher.validate(natural, natural_result)['links'][0]['decision'] == 'review'
+    natural['creator_known'] = True
+    natural['messages'][1]['speaker'] = 'U2'
+    assert matcher.validate(natural, natural_result)['links'][0]['decision'] == 'review'  # Staff's activity is not本人.
+    natural['messages'][1]['speaker'] = 'U1'
+    for intro in ("I'm .creator_1", "I'm Daisy from .creator_1 on tik tok as their assistant",
+                  "I'm a representative from .creator_1 on TikTok", "I'm Daisy from .creator_1 on TikTok for my client",
+                  "I'm Daisy from .creator_1 on TikTok, but not my account"):
+        natural['messages'][0]['text'] = intro
+        assert matcher.validate(natural, natural_result)['links'][0]['decision'] == 'review'
+    natural['messages'][0]['text'] = "I'm Daisy from .creator_1 on tik tok :)"
+    natural['messages'].append({"id": "M3", "speaker": "unknown", "chat": "G1",
+                                "at": "2026-10-01T01:02:00Z", "reply": None,
+                                "text": "I'm another person from .creator_1 on TikTok"})
+    assert matcher.validate(natural, natural_result)['links'][0]['validation_error'] == 'counterevidence'
     pack["messages"].append({"id": "M3", "speaker": "unknown", "chat": "G1",
                              "at": "2026-10-01T01:02:00Z", "reply": None,
                              "text": "My account is .creator_1"})

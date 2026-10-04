@@ -10,7 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from uuid import uuid4
 
-from . import ai_dispatch, ai_feature_config, creator_data, creator_imports
+from . import ai_dispatch, ai_feature_config, contact_handles, creator_data, creator_imports
 from . import creator_handle_evidence as evidence
 from . import openai_client as api
 from .creator_access import require_owner
@@ -89,6 +89,16 @@ def _enabled(config):
 def _config_hash(config):
     # Credential rotation invalidates a frozen request, without exposing the credential.
     return evidence_hash({k: config[k] for k in ("provider", "project_id", "model", "api_key_ciphertext")})
+
+
+def _human_confirmation_changed(conn, job, pack):
+    current = {
+        row["handle"] for row in contact_handles.confirmed_pairs(conn, [job["contact_id"]]) if row["human_confirmed"]
+    }
+    snapshot = job["stats"].get("human_confirmed_handles")
+    return bool(current & {h["handle"] for h in (pack or {}).get("handles", [])}) or (
+        snapshot is not None and set(snapshot) != current
+    )
 
 
 def evidence_hash(value):
@@ -192,6 +202,7 @@ def prepare_next(settings):
         with connection() as conn, conn.transaction():
             conn.execute("SET LOCAL statement_timeout='90s'")
             prepared = evidence.build(conn, settings, job["contact_id"], handles)
+            prepared["stats"] = {**prepared["stats"], "prompt_version": evidence.PROMPT_VERSION}
     except (OSError, ValueError, KeyError):
         _finish_preparation(job["id"], token, version, "waiting_evidence", "catalog_unavailable")
         return True
@@ -208,6 +219,9 @@ def prepare_next(settings):
             _invalidate(conn, current)
             return True
         pack = prepared["pack"]
+        if _human_confirmation_changed(conn, {**current, "stats": prepared["stats"]}, pack):
+            _invalidate(conn, current)
+            return True
         fingerprint = evidence_hash(
             [
                 prepared["fingerprint"],
@@ -268,7 +282,13 @@ def prepare_next(settings):
             attempts=%s,claim_token=NULL,lease_until=NULL,prepared_at=NOW(),updated_at=NOW(),
             debounce_started_at=NOW(),finished_at=CASE WHEN %s THEN NOW() ELSE NULL END WHERE id=%s""",
             (
-                cached["status"] if cached else "ready" if pack else "waiting_evidence",
+                cached["status"]
+                if cached
+                else "ready"
+                if pack
+                else "completed"
+                if prepared["reason"] == "already_confirmed"
+                else "waiting_evidence",
                 "failure_cached"
                 if cached and cached["status"] == "failed"
                 else "cached"
@@ -283,7 +303,7 @@ def prepare_next(settings):
                 creator_data.encode(cached["stats"] if cached else prepared["stats"]),
                 cached["result_ciphertext"] if cached else None,
                 cached["attempts"] if cached and cached["status"] == "failed" else 0,
-                bool(cached),
+                bool(cached) or prepared["reason"] == "already_confirmed",
                 job["id"],
             ),
         )
@@ -487,10 +507,14 @@ def claim():
 
         storage = creator_data.cipher(get_settings())
         raw = storage.decrypt(job["pack_ciphertext"])
+        pack = json.loads(raw)
+        if _human_confirmation_changed(conn, job, pack):
+            _invalidate(conn, job)
+            return None
         tokens = (
             len(raw.encode())
             + len(evidence.instructions().encode())
-            + len(creator_data.encode(evidence.output_format(json.loads(raw))).encode())
+            + len(creator_data.encode(evidence.output_format(pack)).encode())
             + MAX_OUTPUT
             + 512
         )
@@ -512,7 +536,7 @@ def claim():
             "attempts": job["attempts"] + 1,
             "reservation_id": reservation,
             "config": config,
-            "pack": json.loads(raw),
+            "pack": pack,
         }
 
 
@@ -525,6 +549,7 @@ def _current(conn, job):
         row["desired_version"] != job["snapshot_version"]
         or not _enabled(config)
         or _config_hash(config) != job["config_fingerprint"]
+        or _human_confirmation_changed(conn, row, job["pack"])
     ):
         _invalidate(conn, row)
         return None
@@ -762,10 +787,15 @@ def enqueue_history(conn, actor):
     require_owner(conn, actor)
     if not _enabled(_config(conn)):
         raise ValueError("请先在 API Key 列表配置并启用达人—handle 匹配。")
-    rows = conn.execute("""SELECT DISTINCT r.contact_id FROM contact_roles r
+    rows = conn.execute(
+        """SELECT DISTINCT r.contact_id FROM contact_roles r
         WHERE r.role='creator' AND r.status='confirmed'
         AND NOT EXISTS(SELECT 1 FROM creator_handle_jobs j WHERE j.contact_id=r.contact_id
-           AND j.status NOT IN ('cancelled','failed')) ORDER BY r.contact_id""").fetchall()
+           AND (j.status NOT IN ('completed','review_required','cancelled','failed')
+             OR j.status IN ('completed','review_required') AND j.stats->>'prompt_version'=%s))
+        ORDER BY r.contact_id""",
+        (evidence.PROMPT_VERSION,),
+    ).fetchall()
     for row in rows:
         conn.execute("SELECT enqueue_creator_handle(%s,'history',TRUE)", (row["contact_id"],))
     _audit(conn, actor, "creator_handle_history_enqueued", {"contacts": len(rows)})
@@ -780,7 +810,8 @@ def page_data(conn, actor, settings, page=1):
     jobs = conn.execute(
         """SELECT j.*,c.display_name,(SELECT r.error_code FROM creator_handle_requests r
         WHERE r.job_id=j.id ORDER BY r.created_at DESC,r.id DESC LIMIT 1) AS validation_error
-        FROM creator_handle_jobs j JOIN contacts c ON c.id=j.contact_id
+        FROM (SELECT DISTINCT ON(contact_id) * FROM creator_handle_jobs
+              ORDER BY contact_id,created_at DESC,id DESC) j JOIN contacts c ON c.id=j.contact_id
         ORDER BY j.updated_at DESC,j.id LIMIT 50 OFFSET %s""",
         ((page - 1) * 50,),
     ).fetchall()
@@ -790,17 +821,13 @@ def page_data(conn, actor, settings, page=1):
     except (OSError, ValueError, KeyError):
         current_handles = frozenset()
         version = None
-    associations = {
-        (str(row["contact_id"]), row["handle"])
-        for row in conn.execute(
-            """SELECT l.contact_id,lower(s.normalized_handle) handle FROM contact_social_accounts l
-        JOIN social_accounts s ON s.id=l.social_account_id
-        WHERE l.contact_id=ANY(%s::uuid[]) AND l.relationship='owner' AND l.status='confirmed'
-          AND s.platform='tiktok'""",
-            ([j["contact_id"] for j in jobs],),
-        ).fetchall()
-    }
+    associations = {}
+    for row in contact_handles.confirmed_pairs(conn, [j["contact_id"] for j in jobs]):
+        associations.setdefault(str(row["contact_id"]), []).append(
+            {"handle": row["handle"], "human_confirmed": row["human_confirmed"]}
+        )
     for job in jobs:
+        job["associations"] = associations.get(str(job["contact_id"]), [])
         job["suggestions"] = []
         if (
             job["result_ciphertext"]
@@ -812,7 +839,6 @@ def page_data(conn, actor, settings, page=1):
                 {
                     **link,
                     "handle": view["handles"][link["h"]],
-                    "associated": (str(job["contact_id"]), view["handles"][link["h"]]) in associations,
                 }
                 for link in view["result"]["links"]
                 if view["handles"][link["h"]] in current_handles
@@ -834,6 +860,7 @@ def page_data(conn, actor, settings, page=1):
                     ).fetchone()
                 ):
                     link.update(decision="review", relation="uncertain", code="conflict")
+                link["conflict"] = link["code"] == "conflict" or link.get("validation_error") == "counterevidence"
         for field in ("pack_ciphertext", "result_ciphertext", "refs"):
             job.pop(field, None)
     return {"jobs": jobs, "counts": counts, "enabled": _enabled(_config(conn)), "page": page}
