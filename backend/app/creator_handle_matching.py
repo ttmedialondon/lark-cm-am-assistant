@@ -160,6 +160,23 @@ def _recover(conn):
         SELECT 1 FROM contact_roles r WHERE r.contact_id=j.contact_id AND r.role='creator' AND r.status='confirmed')""")
 
 
+def _reuse_history_association(conn, job):
+    """A bulk history pass fills missing people; existing formal owners are already done."""
+    if job["source"] != "history":
+        return False
+    pairs = contact_handles.confirmed_pairs(conn, [job["contact_id"]])
+    if not pairs:
+        return False
+    conn.execute("""UPDATE creator_handle_jobs SET status='completed',reason_code='already_confirmed',
+        desired_version=desired_version+1,snapshot_version=desired_version+1,
+        stats=stats||%s::jsonb,claim_token=NULL,lease_until=NULL,finished_at=NOW(),updated_at=NOW()
+        WHERE id=%s""", (creator_data.encode({
+            "history_association_reused": True,
+            "confirmed_handles": sorted({p["handle"] for p in pairs}),
+        }), job["id"]))
+    return True
+
+
 def prepare_next(settings):
     with connection() as conn, conn.transaction():
         config = _config(conn, lock=True)
@@ -200,6 +217,8 @@ def prepare_next(settings):
         ).fetchone()
         if not job:
             return False
+        if _reuse_history_association(conn, job):
+            return True
         token = uuid4()
         conn.execute(
             """UPDATE creator_handle_jobs SET status='preparing',snapshot_version=desired_version,
@@ -225,6 +244,8 @@ def prepare_next(settings):
         config = _config(conn, lock=True)
         current = conn.execute("SELECT * FROM creator_handle_jobs WHERE id=%s FOR UPDATE", (job["id"],)).fetchone()
         if not current or current["claim_token"] != token or current["status"] != "preparing":
+            return True
+        if _reuse_history_association(conn, current):
             return True
         if current["desired_version"] != version or not _enabled(config) or _config_hash(config) != config_hash:
             _invalidate(conn, current)
@@ -511,6 +532,8 @@ def claim():
         ).fetchone()
         if not job:
             return None
+        if _reuse_history_association(conn, job):
+            return None
         if job["config_fingerprint"] != _config_hash(config) or job["snapshot_version"] != job["desired_version"]:
             _invalidate(conn, job)
             return None
@@ -557,6 +580,8 @@ def _current(conn, job):
     config = _config(conn, lock=True)
     row = conn.execute("SELECT * FROM creator_handle_jobs WHERE id=%s FOR UPDATE", (job["id"],)).fetchone()
     if not row or row["status"] != "running" or row["claim_token"] != job["claim_token"]:
+        return None
+    if _reuse_history_association(conn, row):
         return None
     if (
         row["desired_version"] != job["snapshot_version"]
@@ -798,15 +823,18 @@ def enqueue_history(conn, actor):
     rows = conn.execute(
         """SELECT DISTINCT r.contact_id FROM contact_roles r
         WHERE r.role='creator' AND r.status='confirmed'
+        AND NOT EXISTS(SELECT 1 FROM contact_social_accounts l JOIN social_accounts s ON s.id=l.social_account_id
+           WHERE l.contact_id=r.contact_id AND l.relationship='owner' AND l.status='confirmed'
+             AND s.platform='tiktok')
         AND NOT EXISTS(SELECT 1 FROM creator_handle_jobs j WHERE j.contact_id=r.contact_id
            AND (j.status NOT IN ('completed','review_required','cancelled','failed')
+             OR j.source='manual' AND j.status='review_required'
              OR j.status IN ('completed','review_required') AND j.stats->>'prompt_version'=%s))
         ORDER BY r.contact_id""",
         (evidence.PROMPT_VERSION,),
     ).fetchall()
     for row in rows:
-        enqueued = conn.execute("SELECT enqueue_creator_handle(%s,'history',TRUE) id", (row["contact_id"],)).fetchone()
-        conn.execute("UPDATE creator_handle_jobs SET source='history' WHERE id=%s", (enqueued["id"],))
+        conn.execute("SELECT enqueue_creator_handle(%s,'history',TRUE)", (row["contact_id"],))
     _audit(conn, actor, "creator_handle_history_enqueued", {"contacts": len(rows)})
     return len(rows)
 
@@ -834,8 +862,11 @@ def page_data(conn, actor, settings, page=1):
     for job in jobs:
         job["associations"] = associations.get(str(job["contact_id"]), [])
         job["suggestions"] = []
+        reused = job["source"] == "history" and job["reason_code"] == "already_confirmed"
+        if reused:
+            job["validation_error"] = None
         if (
-            job["result_ciphertext"]
+            not reused and job["result_ciphertext"]
             and job["catalog_version"] == version
             and evidence.still_valid(conn, job["refs"], settings)
         ):

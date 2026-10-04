@@ -4,6 +4,7 @@ import json
 import sys
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -676,7 +677,7 @@ def test_role_and_chat_events_shared_slots_and_catalog_changes(pg, matching_flow
     assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
     assert not pg.execute("SELECT 1 FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
 
-    # Manual history admission upgrades only prior-version completed contacts; the page shows latest jobs only.
+    # History admission upgrades unlinked prior-version contacts, never existing formal owners.
     monkeypatch.setattr(matching, "catalog", lambda: (frozenset({"first.handle", "backup_2"}), "catalog-v4"))
     pg.execute(
         "UPDATE creator_handle_jobs SET stats=jsonb_build_object('prompt_version','retired-prompt'),"
@@ -684,10 +685,11 @@ def test_role_and_chat_events_shared_slots_and_catalog_changes(pg, matching_flow
         (pilot.ids["legacy"],),
     )
     pg.execute(
-        "UPDATE creator_handle_jobs SET stats=jsonb_build_object('prompt_version',%s::text) WHERE contact_id=%s",
-        (matching.evidence.PROMPT_VERSION, pilot.ids["silent"]),
+        "UPDATE creator_handle_jobs SET stats=jsonb_build_object('prompt_version','retired-prompt'),"
+        "created_at=NOW()-INTERVAL '1 minute' WHERE contact_id=%s",
+        (pilot.ids["silent"],),
     )
-    old_id = pg.execute("SELECT id FROM creator_handle_jobs WHERE contact_id=%s", (pilot.ids["legacy"],)).fetchone()[
+    old_id = pg.execute("SELECT id FROM creator_handle_jobs WHERE contact_id=%s", (pilot.ids["silent"],)).fetchone()[
         "id"
     ]
     assert matching.enqueue_history(pg, pilot.ids["owner"]) == 1
@@ -695,18 +697,18 @@ def test_role_and_chat_events_shared_slots_and_catalog_changes(pg, matching_flow
         pg.execute("SELECT count(*) n FROM creator_handle_jobs WHERE contact_id=%s", (pilot.ids["legacy"],)).fetchone()[
             "n"
         ]
-        == 2
+        == 1
     )
     assert (
         pg.execute("SELECT count(*) n FROM creator_handle_jobs WHERE contact_id=%s", (pilot.ids["silent"],)).fetchone()[
             "n"
         ]
-        == 1
+        == 2
     )
     latest = matching.page_data(pg, pilot.ids["owner"], flow.settings)["jobs"]
     assert len({row["contact_id"] for row in latest}) == len(latest)
     assert old_id not in {row["id"] for row in latest}
-    # Bulk history restart must not retain an old manual request's force-recheck policy.
+    # Bulk history admission skips formal owners and preserves explicit manual review.
     for handle in ("first.handle", "backup_2"):
         account = uuid4()
         pg.execute(
@@ -723,14 +725,13 @@ def test_role_and_chat_events_shared_slots_and_catalog_changes(pg, matching_flow
         "stats=jsonb_build_object('prompt_version','retired-prompt') WHERE id=%s",
         (job_id,),
     )
-    assert matching.enqueue_history(pg, pilot.ids["owner"]) == 1
-    assert pg.execute("SELECT source FROM creator_handle_jobs WHERE id=%s", (job_id,)).fetchone()["source"] == "history"
-    for _ in range(2):  # The earlier legacy history item and the requeued existing-pair item.
-        assert matching.prepare_next(flow.settings)
+    assert matching.enqueue_history(pg, pilot.ids["owner"]) == 0
+    assert matching.prepare_next(flow.settings)  # Only the earlier, unlinked silent history item.
     assert pg.execute("SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s", (job_id,)).fetchone() == {
-        "status": "completed",
-        "reason_code": "already_confirmed",
+        "status": "review_required",
+        "reason_code": "snapshot_changed",
     }
+    assert pg.execute("SELECT source FROM creator_handle_jobs WHERE id=%s", (job_id,)).fetchone()["source"] == "manual"
     assert len(flow.calls) == 2
 
 
@@ -1021,8 +1022,13 @@ def test_formal_pairs_skip_paid_matching_without_freezing_new_handles_or_manual_
         (flow.contact, first, pilot.ids["owner"]),
     )
     message("first.handle", 0)
+    message("backup_2", 1)
+    existing_pairs = _snapshot(pg, ("contact_social_accounts",))
     all_confirmed = _enqueue(pg, flow.contact, "history")
-    assert matching.prepare_next(flow.settings) and matching.claim() is None
+    with monkeypatch.context() as no_material:
+        no_material.setattr(matching.evidence, "build",
+                            lambda *_a, **_k: pytest.fail("Linked history needs no material"))
+        assert matching.prepare_next(flow.settings) and matching.claim() is None
     assert pg.execute(
         "SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s", (all_confirmed,)
     ).fetchone() == {"status": "completed", "reason_code": "already_confirmed"}
@@ -1030,10 +1036,59 @@ def test_formal_pairs_skip_paid_matching_without_freezing_new_handles_or_manual_
     page = matching.page_data(pg, pilot.ids["owner"], flow.settings)
     assert page["jobs"][0]["associations"] == [{"handle": "first.handle", "human_confirmed": True}]
     assert page["jobs"][0]["suggestions"] == []
+    assert {r["status"]: r["n"] for r in page["counts"]} == {"completed": 1}
+    assert _snapshot(pg, existing_pairs.keys()) == existing_pairs
+
+    # A formal association gained after preparation/admission closes history before networking.
+    for after_claim in (False, True):
+        pg.execute("SAVEPOINT late_formal")
+        pg.execute("UPDATE contact_social_accounts SET status='rejected' WHERE contact_id=%s", (flow.contact,))
+        late = _enqueue(pg, flow.contact, "history")
+        assert matching.prepare_next(flow.settings)
+        running = matching.claim() if after_claim else None
+        pg.execute("UPDATE contact_social_accounts SET status='confirmed' WHERE contact_id=%s", (flow.contact,))
+        if running:
+            matching.run(running, flow.settings)
+            assert pg.execute("SELECT billed_tokens FROM creator_handle_requests WHERE id=%s",
+                              (running["reservation_id"],)).fetchone()["billed_tokens"] == 0
+        else:
+            assert matching.claim() is None
+            assert not pg.execute("SELECT 1 FROM creator_handle_requests").fetchone()
+        assert not flow.calls
+        assert pg.execute("SELECT status,reason_code,claim_token,lease_until FROM creator_handle_jobs WHERE id=%s",
+                          (late,)).fetchone() == {"status": "completed", "reason_code": "already_confirmed",
+                                                "claim_token": None, "lease_until": None}
+        pg.execute("ROLLBACK TO SAVEPOINT late_formal")
+
+    # The rollout repairs existing latest history jobs without rewriting business/billing records.
+    pg.execute("SAVEPOINT history_rollout")
+    pg.execute("UPDATE creator_handle_jobs SET status='queued',result_ciphertext='preserved-old-result',"
+               "input_tokens=123 WHERE id=%s", (all_confirmed,))
+    protected = _snapshot(pg, (*before.keys(), "contact_social_accounts", "creator_handle_requests"))
+    migration = Path(__file__).parents[1] / "migrations/079_complete_linked_creator_history.sql"
+    pg.execute(migration.read_text())
+    assert pg.execute("SELECT status,reason_code,result_ciphertext,input_tokens FROM creator_handle_jobs WHERE id=%s",
+                      (all_confirmed,)).fetchone() == {"status": "completed", "reason_code": "already_confirmed",
+                                                     "result_ciphertext": "preserved-old-result", "input_tokens": 123}
+    assert _snapshot(pg, protected.keys()) == protected
+    page = matching.page_data(pg, pilot.ids["owner"], flow.settings)
+    assert page["jobs"][0]["suggestions"] == [] and page["jobs"][0]["validation_error"] is None
+    assert {r["status"]: r["n"] for r in page["counts"]} == {"completed": 1}
+    pg.execute("UPDATE creator_handle_jobs SET source='manual',status='queued' WHERE id=%s", (all_confirmed,))
+    obsolete = uuid4()
+    pg.execute("INSERT INTO creator_handle_jobs(id,contact_id,source,status,created_at) "
+               "VALUES(%s,%s,'history','failed',NOW()-INTERVAL '1 minute')", (obsolete, flow.contact))
+    pg.execute(migration.read_text())
+    assert pg.execute("SELECT status,source FROM creator_handle_jobs WHERE id=%s", (all_confirmed,)).fetchone() == {
+        "status": "queued", "source": "manual"}
+    assert pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s",
+                      (obsolete,)).fetchone()["status"] == "failed"
+    assert pg.execute("SELECT metadata->>'jobs_completed' n FROM audit_events "
+                      "WHERE action='creator_handle_history_associations_reused'").fetchall() == [{"n": "1"}]
+    pg.execute("ROLLBACK TO SAVEPOINT history_rollout")
     pg.execute("UPDATE creator_handle_jobs SET created_at=NOW()-INTERVAL '1 minute' WHERE id=%s", (all_confirmed,))
 
     # The formal exact pair is excluded, not the entire contact.
-    message("backup_2", 1)
     job = _prepared_job(pg, flow, "incremental")
     assert [h["handle"] for h in job["pack"]["handles"]] == ["backup_2"]
     assert job["stats"]["prompt_version"] == matching.evidence.PROMPT_VERSION
