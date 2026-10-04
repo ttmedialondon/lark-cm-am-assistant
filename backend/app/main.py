@@ -23,6 +23,7 @@ from . import (
     admin_permissions,
     creator_handle_matching_routes,
     creator_handles_routes,
+    desktop_reply_routes,
     offhours_summary_routes,
 )
 from .admin_reporting import sync_summary
@@ -542,4 +543,7 @@ app.include_router(creator_handles_routes.create_router(
 ))
 app.include_router(creator_handle_matching_routes.create_router(
     current_authorization=_current_authorization,render_template=_template,csrf_token=_admin_csrf_token,
+))
+app.include_router(desktop_reply_routes.create_router(
+    current_authorization=_current_authorization, csrf_token=_admin_csrf_token,
 ))

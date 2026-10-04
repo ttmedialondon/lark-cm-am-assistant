@@ -78,6 +78,48 @@ def call_openai(
 ) -> dict[str, Any]:
     """Call Responses once for an evidence-bound internal AI feature."""
 
+    headers, payload = _request_parts(
+        config, api_key, pack, contact_id, instructions, output_format,
+        max_output_tokens, reasoning_effort, total_timeout,
+    )
+    started = time.perf_counter()
+    try:
+        if total_timeout is None:
+            response = httpx.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=45.0)
+        else:
+            response = asyncio.run(_post_with_deadline(headers, payload, total_timeout))
+    except (httpx.HTTPError, TimeoutError) as exc:
+        raise _transport_error(started) from exc
+    return _read_response(response, started)
+
+
+async def call_openai_async(
+    config: Mapping[str, Any],
+    api_key: str,
+    pack: Mapping[str, Any],
+    contact_id: UUID,
+    *,
+    instructions: str,
+    output_format: Mapping[str, Any],
+    max_output_tokens: int = 500,
+    reasoning_effort: str = "low",
+    total_timeout: float = 45.0,
+) -> dict[str, Any]:
+    """The same Responses transport, cancellable by an interactive HTTP request."""
+    headers, payload = _request_parts(
+        config, api_key, pack, contact_id, instructions, output_format,
+        max_output_tokens, reasoning_effort, total_timeout,
+    )
+    started = time.perf_counter()
+    try:
+        response = await _post_with_deadline(headers, payload, total_timeout)
+    except (httpx.HTTPError, TimeoutError) as exc:
+        raise _transport_error(started) from exc
+    return _read_response(response, started)
+
+
+def _request_parts(config, api_key, pack, contact_id, instructions, output_format,
+                   max_output_tokens, reasoning_effort, total_timeout):
     if total_timeout is not None and (not math.isfinite(total_timeout) or total_timeout <= 0):
         raise AIInputError("AI 请求超时设置无效。")
     payload = {
@@ -93,18 +135,18 @@ def call_openai(
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     if config.get("project_id"):
         headers["OpenAI-Project"] = config["project_id"]
-    started = time.perf_counter()
-    try:
-        if total_timeout is None:
-            response = httpx.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=45.0)
-        else:
-            response = asyncio.run(_post_with_deadline(headers, payload, total_timeout))
-    except (httpx.HTTPError, TimeoutError) as exc:
-        raise OpenAIRequestError(
-            "AI 服务暂时不可用；请稍后重新发起。",
-            retryable=True,
-            telemetry={"response_latency_ms": max(0, round((time.perf_counter() - started) * 1_000))},
-        ) from exc
+    return headers, payload
+
+
+def _transport_error(started):
+    return OpenAIRequestError(
+        "AI 服务暂时不可用；请稍后重新发起。",
+        retryable=True,
+        telemetry={"response_latency_ms": max(0, round((time.perf_counter() - started) * 1_000))},
+    )
+
+
+def _read_response(response, started):
     telemetry = _openai_telemetry(response, started)
     if response.status_code < 200 or response.status_code >= 300:
         is_quota = _is_quota_response(response)

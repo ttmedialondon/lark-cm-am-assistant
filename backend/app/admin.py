@@ -71,6 +71,12 @@ AI_FEATURES = {
         "enabled_label": "开启达人消息总结",
         "processing_label": "直接总结分级，不自动回复",
     },
+    "desktop_reply": {
+        "title": "桌面回复建议",
+        "description": "仅按桌面主动提交的屏幕文字生成回复和中文翻译；独立调用，不进入后台匹配或总结队列。",
+        "enabled_label": "开启桌面回复建议",
+        "processing_label": "按需生成回复和中文对照",
+    },
 }
 
 

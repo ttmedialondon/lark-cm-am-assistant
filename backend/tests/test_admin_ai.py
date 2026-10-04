@@ -111,7 +111,7 @@ def test_owner_can_view_only_safe_ai_config_fields(monkeypatch):
     assert contexts[-1][1]["ai_dispatch"]["state"] == "paused"
     assert contexts[-1][1]["summary_settings"]["status_label"] == "未开启"
     assert [item["feature"] for item in contexts[-1][1]["configs"]] == [
-        "creator_import", "creator_handle_matching", "offhours_summary",
+        "creator_import", "creator_handle_matching", "offhours_summary", "desktop_reply",
     ]
     for feature in ("contact_assessment", "contact_assignment", "creator_workflow"):
         response = browser.post("/admin/ai", data={"csrf_token": "csrf", "feature": feature, "enabled": "1"})

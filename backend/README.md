@@ -30,6 +30,38 @@ python3 -m venv .venv
 
 另开终端，用同一开发环境运行 `.venv/bin/python -m app.worker`。worker 会领取同步及已启用的 AI 任务；不要把生产授权或 API Key 放进普通本地测试。
 
+## 桌面回复接口（schema 1.1）
+
+`POST /v1/reply-suggestions`，JSON。正式地址为 `https://larkbot.ttapp.help/v1/reply-suggestions`。
+桌面可通过 `Authorization: Bearer <现有本站登录会话>` 使用已连接 CM；此凭据是本站
+`web_sessions` 对应的原始不透明会话，不是 Lark access token 或 OpenAI Key。校验复用登录会话的
+哈希、有效期和 CM active 状态，不新增 OAuth 或桌面配对流程。网页 Cookie 调用还必须提供现有 `X-CSRF-Token`。
+
+必填请求字段：`schema_version: "1.1"`、UUID `request_id`、带时区的 `captured_at`、
+`conversation: {label, label_source, identity_verified: false}`、`reply_scope`、
+`selected_message_text`、`selected_messages`、`selection_source`、`conversation_context`。
+正式服务拒绝未知字段及 synthetic 来源。
+
+- `selected_messages` 模式要求非空选区、连续 ordinal 和非空 text；合并正文必须等于各条 text 用换行拼接，来源为 `clipboard_html`。
+- `recent_context` 模式要求空选区和空合并正文，来源为 `none`。
+- 两种模式均提交 `conversation_context: {capture_id, captured_at, source: "lark_accessibility", scope: "visible_text", complete_history: false, messages}`；片段保留顺序、重复文字和未验证的文字 hint。
+- 请求最多 1 MiB，响应最多 256 KiB；不截断。采集时间不是发送时间，片段不保证完整消息或已验证发言人；没有真实会话/用户 ID，后端不据此查询其他聊天、更新身份、负责人或事件。
+
+成功原样回传 `request_id`、非空 `suggestion`、对应 `chinese_translation`、
+`english_translation: null` 和 `is_mock: false`。生成与中文对照来自一次模型调用。
+资料无法支持安全回复时返回 422，而不是把内部分析写入可回填草稿。
+错误采用非 2xx 与 `{"error": {"code": "…", "message": "…"}}`，不重定向。
+
+`desktop_reply` 有独立功能配置，迁移复制消息总结的加密凭据、Project 和模型并默认关闭；
+启用或关闭仅影响桌面主动请求。调用不进入 worker、不使用 `ai_dispatch` 的共享并发、限速或暂停状态。
+服务端总期限为 55 秒，单次上游总期限至多 45 秒；客户端断开会取消上游请求，但不能据此保证上游未计费。
+
+去重键为当前 CM + UUID request_id；相同编号不同内容返回 409，进行中重复返回 409，
+成功重复返回加密缓存，失败/取消/超期重复返回原安全错误，不重新付费调用。
+需要重新生成时使用新编号。回执有效期 24 小时，按该 CM 后续请求清理过期记录；
+这不是严格在第 24 小时物理删除。仅保存 hash、加密结果、安全错误与用量耗时，不保存输入正文或凭据。
+编辑后的重新翻译不属于此接口。
+
 ## 修改与发布
 
 - 页面在 `app/templates/`、`app/static/`，不是仓库外的旧原型或独立写作助手。

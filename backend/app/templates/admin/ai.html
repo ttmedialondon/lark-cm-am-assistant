@@ -4,14 +4,14 @@
 <div class="page">
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
-    <details class="mb-3 text-secondary"><summary>配置说明</summary><p class="mt-2">每项功能可使用独立 Project 与 service-account key，按功能核算费用。密钥加密保存，完整值不回显；各功能共用并发和限速控制。</p></details>
+    <details class="mb-3 text-secondary"><summary>配置说明</summary><p class="mt-2">每项功能可使用独立 Project 与 service-account key，按功能核算费用。密钥加密保存，完整值不回显；后台功能共用并发和限速控制。桌面回复独立调用，由自己的功能开关控制。</p></details>
     {% if ai_dispatch.state == 'paused' %}
     <div class="alert alert-danger d-flex align-items-center justify-content-between" role="alert">
-      <div><strong>{{ ai_dispatch.label }}</strong><div class="small">{{ ai_dispatch.message }} 所有 AI 功能都会停止领取新任务。</div></div>
+      <div><strong>{{ ai_dispatch.label }}</strong><div class="small">{{ ai_dispatch.message }} 后台功能停止领取新任务；桌面回复仍由其独立开关控制。</div></div>
       {% if admin_role == 'owner' %}<form action="/admin/ai/resume" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger" type="submit">处理后恢复队列</button></form>{% endif %}
     </div>
     {% elif ai_dispatch.state == 'throttled' %}
-    <div class="alert alert-warning" role="alert"><strong>{{ ai_dispatch.label }}</strong>：{{ ai_dispatch.message }} 已启用的 AI 功能会自动恢复，无需人工操作。</div>
+    <div class="alert alert-warning" role="alert"><strong>{{ ai_dispatch.label }}</strong>：{{ ai_dispatch.message }} 后台功能会自动恢复；桌面回复不使用此队列。</div>
     {% endif %}
     {% if form_error %}<div class="alert alert-danger" role="alert">{{ form_error }}</div>{% endif %}
     {% if summary_saved %}<div class="alert alert-success" role="status">配置已保存。<a href="/dashboard/offhours-summary" class="alert-link">查看总结</a></div>{% endif %}

@@ -128,7 +128,8 @@ def test_single_request_transport_preserves_retry_hints_and_safe_failure_metadat
     assert openai_client.retry_delay(-1, 2) == 4.5
 
 
-def test_worker_total_deadline_cancels_network_request_without_background_retry(monkeypatch) -> None:
+@pytest.mark.parametrize("interactive", [False, True])
+def test_total_deadline_cancels_network_request_without_background_retry(monkeypatch, interactive) -> None:
     calls = []
     stopped = []
     closed = []
@@ -156,6 +157,11 @@ def test_worker_total_deadline_cancels_network_request_without_background_retry(
     monkeypatch.setattr(openai_client.httpx, "AsyncClient", Client)
 
     def request():
+        if interactive:
+            return asyncio.run(openai_client.call_openai_async(
+                {"model": "test-model"}, "test-key", {}, UUID(int=1),
+                instructions="test", output_format={"type": "json_object"}, total_timeout=0.01,
+            ))
         return openai_client.call_openai(
             {"model": "test-model"}, "test-key", {}, UUID(int=1),
             instructions="test", output_format={"type": "json_object"}, total_timeout=0.01,
