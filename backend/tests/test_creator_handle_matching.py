@@ -253,7 +253,24 @@ def test_opt_in_coalescing_multi_handle_auto_links_and_exact_cache(pg, matching_
 def test_stale_version_and_revoked_evidence_never_publish_suggestions(pg, matching_flow, monkeypatch):
     flow = matching_flow
     flow.enable()
-    job = _prepared_job(pg, flow)
+    version = matching.evidence.PROMPT_VERSION
+    # A ready pack built under retired rules must reprepare before reserving or sending a request.
+    with monkeypatch.context() as rules:
+        rules.setattr(matching.evidence, "PROMPT_VERSION", version + "-retired")
+        old_id = _enqueue(pg, flow.contact)
+        assert matching.prepare_next(flow.settings)
+        old_hash = pg.execute("SELECT config_fingerprint FROM creator_handle_jobs WHERE id=%s", (old_id,)).fetchone()[
+            "config_fingerprint"
+        ]
+    assert matching.claim() is None and not flow.calls
+    assert not pg.execute("SELECT 1 FROM creator_handle_requests").fetchone()
+    assert pg.execute("SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s", (old_id,)).fetchone() == {
+        "status": "queued", "reason_code": "snapshot_changed"
+    }
+    assert matching.prepare_next(flow.settings)
+    job = matching.claim()
+    assert job is not None and job["stats"]["prompt_version"] == version
+    assert job["config_fingerprint"] != old_hash
     flow.before_response = lambda: _enqueue(pg, flow.contact)
     matching.run(job, flow.settings)
     current = pg.execute(
@@ -307,6 +324,22 @@ def test_stale_version_and_revoked_evidence_never_publish_suggestions(pg, matchi
     )
     assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
     assert not pg.execute("SELECT 1 FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
+    # Rules changed during a paid request fence publication, but preserve the billed response ledger.
+    with monkeypatch.context() as rules:
+        rules.setattr(matching.evidence, "still_valid", lambda *_: True)
+        changed_rules = _prepared_job(pg, flow)
+        flow.before_response = lambda: rules.setattr(matching.evidence, "PROMPT_VERSION", version + "-next")
+        matching.run(changed_rules, flow.settings)
+        assert len(flow.calls) == 4
+        assert pg.execute(
+            "SELECT status,result_ciphertext,reason_code FROM creator_handle_jobs WHERE id=%s", (changed_rules["id"],)
+        ).fetchone() == {"status": "queued", "result_ciphertext": None, "reason_code": "snapshot_changed"}
+        response = pg.execute("SELECT billed_tokens,response_ciphertext FROM creator_handle_requests WHERE id=%s",
+                              (changed_rules["reservation_id"],)).fetchone()
+        assert response["billed_tokens"] == 150 and response["response_ciphertext"] is not None
+        assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
+        assert not pg.execute("SELECT 1 FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
+    flow.before_response = None
 
 
 def test_provider_delay_quota_pause_and_uncertain_usage_survive_retries(pg, matching_flow):

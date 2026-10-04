@@ -87,8 +87,9 @@ def _enabled(config):
 
 
 def _config_hash(config):
-    # Credential rotation invalidates a frozen request, without exposing the credential.
-    return evidence_hash({k: config[k] for k in ("provider", "project_id", "model", "api_key_ciphertext")})
+    # Credentials or rules invalidate frozen requests, without exposing the credential.
+    return evidence_hash({**{k: config[k] for k in ("provider", "project_id", "model", "api_key_ciphertext")},
+                          "prompt_version": evidence.PROMPT_VERSION})
 
 
 def _confirmation_changed(conn, job, pack):
