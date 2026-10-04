@@ -18,7 +18,7 @@ from .crypto import message_body_cipher
 from .message_mentions import mention_targets
 from .openai_client import ModelOutputError
 
-PROMPT_VERSION = "creator-responsibility-v1.2"
+PROMPT_VERSION = "creator-responsibility-v1.3"
 MAX_CANDIDATES, MAX_MESSAGES, MAX_CHARS, SEARCH_LIMIT = 24, 96, 32_000, 20_000
 DECISIONS = ("responsible", "strong_candidate", "assist", "historical", "insufficient")
 PERIODS = ("current", "historical", "uncertain")
@@ -49,6 +49,8 @@ def output_format(pack=None):
         "cm": {"type": "string"},
         "decision": {"type": "string", "enum": list(DECISIONS)},
         "period": {"type": "string", "enum": list(PERIODS)},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "relation_level": {"type": "string", "enum": ["person", "account", "unknown"]},
         "scope": strings(SCOPES, 4),
         "scope_note": {"type": "string", "maxLength": 120},
         "support_refs": strings(),
@@ -100,14 +102,16 @@ def _state(conn, contact_id):
            ORDER BY a.id"""
     ).fetchall()
     assignments = conn.execute(
-        """SELECT 'person' AS level,id,responsible_authorization_id,source,started_at,NULL::uuid AS account_id,
+        """SELECT 'person' AS level,id,responsible_authorization_id,source,started_at,ended_at,
+             ended_by_authorization_id,NULL::uuid AS account_id,
              NULL::text AS handle,NULL::text AS platform
-           FROM contact_assignments WHERE contact_id=%s AND ended_at IS NULL
+           FROM contact_assignments WHERE contact_id=%s
            UNION ALL SELECT CASE WHEN a.social_account_id IS NULL THEN 'person' ELSE 'account' END,
-             a.id,a.responsible_authorization_id,a.source,a.started_at,a.social_account_id,
+             a.id,a.responsible_authorization_id,a.source,a.started_at,a.ended_at,
+             NULL::uuid AS ended_by_authorization_id,a.social_account_id,
              s.normalized_handle,s.platform
            FROM creator_account_assignments a LEFT JOIN social_accounts s ON s.id=a.social_account_id
-           WHERE a.contact_id=%s AND a.ended_at IS NULL
+           WHERE a.contact_id=%s
            ORDER BY level,id""",
         (contact_id, contact_id),
     ).fetchall()
@@ -144,7 +148,7 @@ def build(conn, settings, contact_id):
     known = {
         authorization_people[str(a["responsible_authorization_id"])]
         for a in state["assignments"]
-        if authorization_people.get(str(a["responsible_authorization_id"])) in roster
+        if a["ended_at"] is None and authorization_people.get(str(a["responsible_authorization_id"])) in roster
     }
     chats = conn.execute(
         """SELECT DISTINCT c.chat_id,c.name,c.chat_mode FROM chats c
@@ -452,7 +456,7 @@ def build(conn, settings, contact_id):
     assignments = []
     for assignment in state["assignments"]:
         cid = authorization_people.get(str(assignment["responsible_authorization_id"]))
-        if cid in selected_contacts:
+        if assignment["ended_at"] is None and cid in selected_contacts:
             assignments.append(
                 {
                     "cm": candidate_alias[cid],
@@ -517,7 +521,8 @@ def validate(pack, result):
     for item in value["suggestions"]:
         if not isinstance(item, dict):
             raise ModelOutputError("shape")
-        item.pop("validation_error", None)
+        for key in ("validation_error", "association_status", "association_reason"):
+            item.pop(key, None)
         source._shape(item, schema)
         if item["cm"] not in candidates or item["cm"] in seen:
             raise ModelOutputError("candidates")
@@ -543,6 +548,8 @@ def validate(pack, result):
                 period="uncertain",
                 scope=["unknown"],
                 scope_note="",
+                confidence=0,
+                relation_level="unknown",
                 support_refs=[r for r in item["support_refs"] if r in messages],
                 counter_refs=[r for r in item["counter_refs"] if r in messages],
                 reason="引用无效，需重新核实。" if invalid_refs else "缺少可核验的负责人证据。",

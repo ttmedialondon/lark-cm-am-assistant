@@ -251,6 +251,7 @@ def test_matching_save_keeps_configuration_and_queue_invalidation_in_one_transac
         "csrf_token": "csrf", "feature": feature, "project_id": "proj_matching",
         "model": "gpt-5.6-luna", "enabled": "1", "rpm_limit": "20", "tpm_limit": "40000",
         "daily_token_budget": "500000", "api_key": "sk-test-only-1234",
+        "auto_confirm_threshold": "0.970",
     }, follow_redirects=False)
     assert response.status_code == 303
     anchor = feature.replace("_", "-")
@@ -258,6 +259,9 @@ def test_matching_save_keeps_configuration_and_queue_invalidation_in_one_transac
     assert [item[0] for item in called] == ["config", "queue"]
     assert called[0][1] is called[1][1]
     assert called[0][2]["enabled"] is True
+    assert called[0][2]["auto_confirm_threshold"] == (
+        "0.970" if feature == "creator_responsibility_matching" else "0.900"
+    )
     assert not {"rpm_limit", "tpm_limit", "daily_token_budget"}.intersection(called[0][2])
 
 

@@ -1,4 +1,4 @@
-"""Opt-in, multi-CM suggestions: synthetic provider, isolated database, no formal writes."""
+"""Formal multi-CM matching: synthetic provider, isolated database, fenced writes."""
 
 import json
 from contextlib import nullcontext
@@ -31,6 +31,8 @@ def _suggestion(cm, refs, **changes):
     return {
         "cm": cm,
         "decision": "strong_candidate",
+        "confidence": 0.99,
+        "relation_level": "person",
         "period": "current",
         "scope": ["account_ops"],
         "scope_note": "Follow-up for this creator's campaign",
@@ -186,7 +188,61 @@ def test_shared_evidence_uses_connected_cm_roster_and_keeps_other_staff_as_conte
     )
     scopes = matching._existing_assignments(pg, [creator])[str(creator)]
     assert {row["scope_label"] for row in scopes} == {"达人本人", "@creator.one"}
-    pg.execute("ROLLBACK TO SAVEPOINT assignment_change")
+    pg.execute(
+        "UPDATE contact_assignments SET ended_at=NOW(),ended_by_authorization_id=%s WHERE contact_id=%s",
+        (pilot.ids["owner"], creator),
+    )
+    account_facts = _snapshot(pg, ("creator_account_assignments",))
+    # Real source fingerprints remain valid after OUR additions, not after unrelated manual changes.
+    monkeypatch.setattr(matching, "connection", lambda: nullcontext(pg))
+    monkeypatch.setattr(config, "get_settings", lambda: pilot.settings)
+    ai_feature_config.save_feature_config(
+        pg,
+        ai_feature_config.api_key_cipher(pilot.settings.token_encryption_key),
+        matching.FEATURE,
+        provider="openai",
+        project_id="test-project",
+        model="test-model",
+        enabled=True,
+        auto_confirm_threshold=0.95,
+        api_key="sk-synthetic-only",
+        updated_by_authorization_id=pilot.ids["owner"],
+    )
+
+    def respond(_config, _key, pack, _contact, **_kwargs):
+        return {
+            "text": json.dumps(
+                {
+                    "suggestions": [
+                        _suggestion(
+                            candidate["id"],
+                            [m["id"] for m in pack["messages"] if m["speaker"] == candidate["id"]][:8],
+                            decision="responsible",
+                        )
+                        for candidate in pack["candidates"]
+                    ]
+                }
+            ),
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+            "telemetry": {},
+            "response_id": "resp_real_evidence_synthetic",
+        }
+
+    monkeypatch.setattr(matching.api, "call_openai", respond)
+    _enqueue(pg, creator)
+    assert matching.prepare_next(pilot.settings)
+    job = matching.claim()
+    matching.run(job, pilot.settings)
+    applied = pg.execute("SELECT refs FROM creator_responsibility_jobs WHERE id=%s", (job["id"],)).fetchone()
+    assert (
+        pg.execute(
+            "SELECT count(*) n FROM contact_assignments WHERE contact_id=%s AND ended_at IS NULL", (creator,)
+        ).fetchone()["n"]
+        == 1
+    )  # An account-scoped CM is not widened to person-level responsibility.
+    assert _snapshot(pg, account_facts.keys()) == account_facts
+    assert evidence.still_valid(pg, applied["refs"], pilot.settings)
+    assert evidence.still_valid(pg, applied["refs"], pilot.settings, lightweight=True)
     pg.execute("UPDATE contact_roles SET status='rejected' WHERE contact_id=%s AND role='creator'", (creator,))
     assert not evidence.still_valid(pg, material["refs"], pilot.settings)
     assert evidence.build(pg, pilot.settings, creator)["pack"] is None
@@ -263,6 +319,8 @@ def test_factual_validation_preserves_independent_cm_results_without_lexical_vet
     known_result["suggestions"][0]["counter_refs"] = ["M2"]
     assert evidence.validate(known, known_result)["suggestions"][0]["decision"] == "historical"
     fields = evidence.output_format(pack)["schema"]["properties"]["suggestions"]
+    assert fields["items"]["properties"]["confidence"] == {"type": "number", "minimum": 0, "maximum": 1}
+    assert fields["items"]["properties"]["relation_level"]["enum"] == ["person", "account", "unknown"]
     assert fields["minItems"] == fields["maxItems"] == 2
     assert fields["items"]["properties"]["cm"]["enum"] == ["CM1", "CM2"]
     for key in ("support_refs", "counter_refs"):
@@ -271,11 +329,39 @@ def test_factual_validation_preserves_independent_cm_results_without_lexical_vet
     malformed["suggestions"][1]["cm"] = "CM1"
     with pytest.raises(openai_client.ModelOutputError):
         evidence.validate(pack, malformed)
+    for confidence in (True, -0.001, 1.001, float("nan"), float("inf")):
+        malformed = deepcopy(result)
+        malformed["suggestions"][0]["confidence"] = confidence
+        with pytest.raises(openai_client.ModelOutputError):
+            evidence.validate(pack, malformed)
 
 
 @pytest.fixture
 def responsibility_flow(pg, pilot, monkeypatch):
     helper = _internal(pg, "helper", connected=True)
+    real_build = matching.evidence.build
+    cipher = message_body_cipher(pilot.settings.token_encryption_key)
+    raw_messages = (
+        (
+            "synthetic_creator",
+            "ou_creator",
+            None,
+            "PRIVATE TEST BODY: <script>alert(1)</script> Can you help tomorrow?",
+        ),
+        ("synthetic_cm", "ou_cm", "synthetic_creator", "I will arrange your samples and commission adjustment."),
+        ("synthetic_helper", "ou_helper", "synthetic_creator", "I'll handle the live schedule and follow up with you."),
+    )
+    for message_id, sender, parent, body in raw_messages:
+        pg.execute(
+            "INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,"
+            "body_ciphertext,message_create_time,parent_id) VALUES('chat_creator',%s,%s,'user','text',%s,NOW(),%s)",
+            (message_id, sender, cipher.encrypt(json.dumps({"text": body})), parent),
+        )
+        pg.execute(
+            "INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+            "VALUES(%s,'chat_creator',%s)",
+            (pilot.ids["cm"], message_id),
+        )
     state = SimpleNamespace(
         settings=pilot.settings,
         contact=pilot.ids["creator"],
@@ -285,6 +371,8 @@ def responsibility_flow(pg, pilot, monkeypatch):
         error=None,
         material_version=1,
         review=False,
+        suggestions=None,
+        coverage={},
         helper=helper,
     )
     monkeypatch.setattr(matching, "connection", lambda: nullcontext(pg))
@@ -292,6 +380,12 @@ def responsibility_flow(pg, pilot, monkeypatch):
     monkeypatch.setattr(matching.evidence, "still_valid", lambda *_, **__: state.valid)
 
     def prepare(_conn, _settings, contact):
+        actual = real_build(_conn, _settings, contact)
+        refs = [ref for ref in actual["refs"] if ref["kind"] != "message"]
+        actual_messages = {ref["message_id"]: ref for ref in actual["refs"] if ref["kind"] == "message"}
+        refs += [
+            {**actual_messages[message_id], "label": f"M{n}"} for n, (message_id, *_rest) in enumerate(raw_messages, 1)
+        ]
         pack = {
             "target": "U1",
             "creator_known": True,
@@ -338,15 +432,15 @@ def responsibility_flow(pg, pilot, monkeypatch):
                     "text": "I'll handle the live schedule and follow up with you.",
                 },
             ],
-            "coverage": {"full_history": False},
+            "coverage": {"full_history": False, **state.coverage},
         }
         return {
             "pack": pack,
             "candidate_ids": {"CM1": pilot.ids["cm"], "CM2": state.helper},
-            "refs": [{"kind": "message", "label": f"M{i}"} for i in (1, 2, 3)],
+            "refs": refs,
             "fingerprint": f"synthetic-{contact}-{state.material_version}",
             "reason": "",
-            "stats": {"messages": 3, "candidates": 2},
+            "stats": {"messages": 3, "candidate_count": 2},
         }
 
     def respond(feature_config, key, pack, contact, **kwargs):
@@ -355,7 +449,14 @@ def responsibility_flow(pg, pilot, monkeypatch):
             state.before_response()
         if state.error:
             raise state.error
-        result = {"suggestions": [_suggestion("CM1", ["M1", "M2"]), _suggestion("CM2", ["M1", "M3"])]}
+        result = {
+            "suggestions": deepcopy(state.suggestions)
+            if state.suggestions is not None
+            else [
+                _suggestion("CM1", ["M1", "M2"], decision="responsible"),
+                _suggestion("CM2", ["M1", "M3"], decision="responsible"),
+            ]
+        }
         if state.review:
             result["suggestions"][1].update(decision="insufficient", support_refs=[], reason="Incomplete context")
         return {
@@ -368,7 +469,7 @@ def responsibility_flow(pg, pilot, monkeypatch):
     monkeypatch.setattr(matching.evidence, "build", prepare)
     monkeypatch.setattr(matching.api, "call_openai", respond)
 
-    def enable(api_key="sk-responsibility-test-only", enabled=True):
+    def enable(api_key="sk-responsibility-test-only", enabled=True, threshold=0.95):
         ai_feature_config.save_feature_config(
             pg,
             ai_feature_config.api_key_cipher(state.settings.token_encryption_key),
@@ -377,6 +478,7 @@ def responsibility_flow(pg, pilot, monkeypatch):
             project_id="proj_responsibility",
             model="gpt-5.6-luna",
             enabled=enabled,
+            auto_confirm_threshold=threshold,
             api_key=api_key,
             updated_by_authorization_id=pilot.ids["owner"],
         )
@@ -397,8 +499,12 @@ def _prepared_job(pg, flow):
     return result
 
 
-def test_opt_in_one_creator_one_call_multi_cm_suggestions_only_and_exact_cache(pg, pilot, responsibility_flow):
+def test_one_creator_one_call_formal_multi_cm_idempotency_and_cache_gates(pg, pilot, responsibility_flow):
     flow = responsibility_flow
+    initial = pg.execute(
+        "SELECT auto_confirm_threshold FROM ai_feature_configs WHERE feature=%s", (matching.FEATURE,)
+    ).fetchone()
+    assert float(initial["auto_confirm_threshold"]) == 0.95
     assert _enqueue(pg, flow.contact) is None
     assert not matching.prepare_next(flow.settings) and matching.claim() is None and not flow.calls
     flow.enable()
@@ -408,7 +514,7 @@ def test_opt_in_one_creator_one_call_multi_cm_suggestions_only_and_exact_cache(p
     assert _enqueue(pg, unconfirmed) is None
     before = _snapshot(
         pg,
-        ("contacts", "contact_roles", "contact_assignments", "creator_account_assignments", "contact_social_accounts"),
+        ("contacts", "contact_roles", "creator_account_assignments", "contact_social_accounts"),
     )
     identifier = _enqueue(pg, flow.contact)
     assert _enqueue(pg, flow.contact) == identifier
@@ -431,12 +537,33 @@ def test_opt_in_one_creator_one_call_multi_cm_suggestions_only_and_exact_cache(p
     assert usage == {"input_tokens": 100, "output_tokens": 50, "key_feature": matching.FEATURE}
     saved = json.loads(creator_data.cipher(flow.settings).decrypt(row["result_ciphertext"]))
     assert {s["cm"] for s in saved["result"]["suggestions"]} == {"CM1", "CM2"}
+    assignments = pg.execute(
+        "SELECT a.id,a.responsible_authorization_id,a.source,a.confidence,i.contact_id "
+        "FROM contact_assignments a JOIN authorizations auth ON auth.id=a.responsible_authorization_id "
+        "JOIN lark_identities i ON i.open_id=auth.open_id WHERE a.contact_id=%s AND a.ended_at IS NULL",
+        (flow.contact,),
+    ).fetchall()
+    assert len(assignments) == 2 and {a["contact_id"] for a in assignments} == {pilot.ids["cm"], flow.helper}
+    assert all(a["source"] == "ai" and float(a["confidence"]) == 0.99 for a in assignments)
+    assert next(a for a in assignments if a["contact_id"] == flow.helper)["responsible_authorization_id"] != flow.helper
+    assert {s["association_status"] for s in saved["result"]["suggestions"]} == {"auto_linked"}
     assert _snapshot(pg, before.keys()) == before
     assert "PRIVATE TEST BODY" not in creator_data.encode(_snapshot(pg, ("audit_events",)))
-    # A semantically identical new directory identity must not reuse stale candidate IDs.
+    formal = _snapshot(pg, ("contact_assignments",))
+    next_id = _enqueue(pg, flow.contact)
+    assert next_id != identifier and matching.prepare_next(flow.settings)
+    assert matching.claim() is None and len(flow.calls) == 1
+    assert _snapshot(pg, formal.keys()) == formal
+    assert (
+        pg.execute("SELECT reason_code FROM creator_responsibility_jobs WHERE id=%s", (next_id,)).fetchone()[
+            "reason_code"
+        ]
+        == "cached"
+    )
+    # A cache hit still applies the CURRENT threshold and current contact-to-authorization mapping.
     flow.helper = _internal(pg, "replacement", connected=True)
     before = _snapshot(pg, before.keys())
-    flow.enable("sk-responsibility-cache-replacement")
+    flow.enable("sk-responsibility-cache-replacement", threshold=0.999)
     matching.configuration_changed(pg)
     next_id = _enqueue(pg, flow.contact)
     assert next_id != identifier and matching.prepare_next(flow.settings)
@@ -448,12 +575,14 @@ def test_opt_in_one_creator_one_call_multi_cm_suggestions_only_and_exact_cache(p
         == "cached"
     )
     assert _snapshot(pg, before.keys()) == before
+    assert _snapshot(pg, formal.keys()) == formal
     cached = pg.execute("SELECT result_ciphertext FROM creator_responsibility_jobs WHERE id=%s", (next_id,)).fetchone()
     refreshed = json.loads(creator_data.cipher(flow.settings).decrypt(cached["result_ciphertext"]))
     assert UUID(refreshed["candidate_ids"]["CM2"]) == flow.helper
+    assert refreshed["result"]["suggestions"][1]["association_status"] == "review_required"
 
 
-def test_stale_queue_version_prompt_and_revocation_fence_publication(pg, responsibility_flow, monkeypatch):
+def test_stale_queue_version_prompt_and_revocation_fence_publication(pg, pilot, responsibility_flow, monkeypatch):
     flow = responsibility_flow
     flow.enable()
     version = evidence.PROMPT_VERSION
@@ -507,6 +636,99 @@ def test_stale_queue_version_prompt_and_revocation_fence_publication(pg, respons
             (changed_rules["id"],),
         ).fetchone() == {"status": "queued", "result_ciphertext": None, "reason_code": "snapshot_changed"}
         assert len(flow.calls) == 3
+    assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 0
+    flow.before_response = None
+    # Confidence alone never turns a suggestion, old responsibility, uncertain scope or conflict into a write.
+    for first, second in (
+        ({"decision": "strong_candidate"}, {"decision": "assist"}),
+        ({"decision": "historical", "period": "historical"}, {"period": "uncertain"}),
+        ({"relation_level": "account"}, {"relation_level": "unknown"}),
+        ({"counter_refs": ["M1"]}, {"support_refs": []}),
+    ):
+        flow.material_version += 1
+        flow.suggestions = [
+            _suggestion("CM1", ["M1", "M2"], **{"decision": "responsible", **first}),
+            _suggestion("CM2", ["M1", "M3"], **{"decision": "responsible", **second}),
+        ]
+        matching.run(_prepared_job(pg, flow), flow.settings)
+        assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 0
+    flow.suggestions = None
+    pg.execute("SAVEPOINT coverage_guards")
+    flow.coverage = {"critical_evidence_omitted": True}
+    flow.material_version += 1
+    incomplete = _prepared_job(pg, flow)
+    matching.run(incomplete, flow.settings)
+    incomplete_result = pg.execute(
+        "SELECT result_ciphertext FROM creator_responsibility_jobs WHERE id=%s", (incomplete["id"],)
+    ).fetchone()
+    results = json.loads(creator_data.cipher(flow.settings).decrypt(incomplete_result["result_ciphertext"]))["result"][
+        "suggestions"
+    ]
+    assert all(result["association_status"] == "review_required" and result["association_reason"] for result in results)
+    assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 0
+    flow.coverage = {"missing_reply_ids": ["M2"]}
+    flow.material_version += 1
+    partial = _prepared_job(pg, flow)
+    matching.run(partial, flow.settings)
+    partial_result = pg.execute(
+        "SELECT result_ciphertext FROM creator_responsibility_jobs WHERE id=%s", (partial["id"],)
+    ).fetchone()
+    results = json.loads(creator_data.cipher(flow.settings).decrypt(partial_result["result_ciphertext"]))["result"][
+        "suggestions"
+    ]
+    assert results[0]["association_status"] == "review_required" and results[0]["association_reason"]
+    assert results[1]["association_status"] == "auto_linked"  # M2 is irrelevant to CM2's M1/M3 support.
+    formal = _snapshot(pg, ("contact_assignments",))
+    flow.coverage = {"critical_evidence_omitted": True}
+    flow.material_version += 1
+    existing = _prepared_job(pg, flow)
+    matching.run(existing, flow.settings)
+    existing_result = pg.execute(
+        "SELECT result_ciphertext FROM creator_responsibility_jobs WHERE id=%s", (existing["id"],)
+    ).fetchone()
+    results = json.loads(creator_data.cipher(flow.settings).decrypt(existing_result["result_ciphertext"]))["result"][
+        "suggestions"
+    ]
+    assert (
+        results[0]["association_status"] == "review_required" and results[1]["association_status"] == "already_linked"
+    )
+    assert _snapshot(pg, formal.keys()) == formal
+    pg.execute("ROLLBACK TO SAVEPOINT coverage_guards")
+    flow.coverage = {}
+    flow.material_version += 1
+    candidate_auths = [
+        row["id"]
+        for row in pg.execute(
+            "SELECT a.id FROM authorizations a JOIN lark_identities i ON i.open_id=a.open_id "
+            "WHERE i.contact_id=ANY(%s::uuid[])",
+            ([pilot.ids["cm"], flow.helper],),
+        ).fetchall()
+    ]
+    # The writer independently checks live grants even when a cached/validated response reaches it.
+    flow.before_response = lambda: pg.execute(
+        "UPDATE authorizations SET status=CASE WHEN id=%s THEN 'revoked' ELSE status END,"
+        "body_consent_at=CASE WHEN id=%s THEN NULL ELSE body_consent_at END WHERE id=ANY(%s::uuid[])",
+        (candidate_auths[0], candidate_auths[1], candidate_auths),
+    )
+    matching.run(_prepared_job(pg, flow), flow.settings)
+    assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 0
+    pg.execute(
+        "UPDATE authorizations SET status='active',body_consent_at=NOW() WHERE id=ANY(%s::uuid[])", (candidate_auths,)
+    )
+    flow.material_version += 1
+
+    def manual_end():
+        for authorization in candidate_auths:
+            pg.execute(
+                "INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source,"
+                "ended_at,ended_by_authorization_id) VALUES(%s,%s,%s,'manual',NOW(),%s)",
+                (uuid4(), flow.contact, authorization, pilot.ids["owner"]),
+            )
+
+    flow.before_response = manual_end
+    matching.run(_prepared_job(pg, flow), flow.settings)
+    assert pg.execute("SELECT count(*) n FROM contact_assignments WHERE ended_at IS NULL").fetchone()["n"] == 0
+    assert pg.execute("SELECT count(*) n FROM contact_assignments WHERE ended_at IS NOT NULL").fetchone()["n"] == 2
 
 
 def test_retry_ledger_and_disabled_config_keep_suggestions_isolated(pg, responsibility_flow):
@@ -532,58 +754,17 @@ def test_retry_ledger_and_disabled_config_keep_suggestions_isolated(pg, responsi
         "SELECT status,result_ciphertext FROM creator_responsibility_jobs WHERE id=%s", (job["id"],)
     ).fetchone()
     saved = json.loads(creator_data.cipher(flow.settings).decrypt(row["result_ciphertext"]))["result"]["suggestions"]
-    assert saved[0]["decision"] == "strong_candidate" and saved[1]["decision"] == "insufficient"
+    assert saved[0]["decision"] == "responsible" and saved[1]["decision"] == "insufficient"
+    assert saved[0]["association_status"] == "auto_linked"
+    assert (
+        pg.execute("SELECT count(*) n FROM contact_assignments WHERE contact_id=%s", (flow.contact,)).fetchone()["n"]
+        == 1
+    )
     flow.enable(enabled=False)
     matching.configuration_changed(pg)
     assert _enqueue(pg, flow.contact) is None and matching.claim() is None
     import_config = pg.execute("SELECT enabled FROM ai_feature_configs WHERE feature='creator_import'").fetchone()
     assert import_config["enabled"] is False
-
-
-def test_explicit_borrowed_key_probe_is_bounded_no_copy_no_enable_no_formal_writes(pg, pilot, responsibility_flow):
-    flow = responsibility_flow
-    ai_feature_config.save_feature_config(
-        pg,
-        ai_feature_config.api_key_cipher(flow.settings.token_encryption_key),
-        "creator_handle_matching",
-        provider="openai",
-        project_id="proj_handle_test",
-        model="gpt-5.6-luna",
-        enabled=False,
-        api_key="sk-borrowed-synthetic-test",
-        updated_by_authorization_id=pilot.ids["owner"],
-    )
-    before = _snapshot(
-        pg,
-        (
-            "ai_feature_configs",
-            "contacts",
-            "contact_roles",
-            "contact_assignments",
-            "creator_account_assignments",
-            "contact_social_accounts",
-        ),
-    )
-    for ids in ([], [uuid4() for _ in range(6)]):
-        with pytest.raises(ValueError):
-            matching.probe_sample(flow.settings, pilot.ids["owner"], ids, key_feature="creator_handle_matching")
-    with pytest.raises(ValueError):
-        matching.probe_sample(flow.settings, pilot.ids["owner"], [flow.contact], key_feature="creator_import")
-    with pytest.raises(PermissionError):
-        matching.probe_sample(flow.settings, pilot.ids["cm"], [flow.contact], key_feature="creator_handle_matching")
-    assert not flow.calls and not pg.execute("SELECT 1 FROM creator_responsibility_jobs").fetchone()
-    outcomes = matching.probe_sample(
-        flow.settings, pilot.ids["owner"], [flow.contact], key_feature="creator_handle_matching"
-    )
-    assert len(outcomes) == len(flow.calls) == 1 and outcomes[0]["status"] == "completed"
-    assert flow.calls[0]["key"] == "sk-borrowed-synthetic-test"
-    assert pg.execute("SELECT key_feature FROM creator_responsibility_requests").fetchone()["key_feature"] == (
-        "creator_handle_matching"
-    )
-    # The temporary use leaves every encrypted key and feature enable flag unchanged.
-    assert _snapshot(pg, before.keys()) == before
-    assert _enqueue(pg, flow.contact) is None
-    assert matching.claim() is None
 
 
 def test_post_response_sql_failure_keeps_usage_and_never_redispatches_unknown_or_sample_tasks(
@@ -688,19 +869,17 @@ def test_owner_only_routes_csrf_lazy_evidence_and_safe_audit(pg, pilot, responsi
     assert client.post(path + "/enqueue", data={"csrf_token": "csrf"}).status_code == 400
     assert pg.execute("SELECT count(*) n FROM creator_responsibility_jobs").fetchone()["n"] == 0
     flow.enable()
+    pg.execute("UPDATE contact_roles SET status='rejected' WHERE contact_id<>%s", (flow.contact,))
     for payload in (
         {"csrf_token": "wrong"},
-        {"csrf_token": "csrf", "limit": "11"},
-        {"csrf_token": "csrf", "contact_ids": "not-a-uuid"},
+        {"csrf_token": "csrf", "page": "not-a-number"},
+        {"csrf_token": "csrf", "mode": "sample"},
+        {"csrf_token": "csrf", "limit": "5"},
+        {"csrf_token": "csrf", "contact_ids": str(flow.contact)},
     ):
         assert client.post(path + "/enqueue", data=payload).status_code == 400
     assert pg.execute("SELECT count(*) n FROM creator_responsibility_jobs").fetchone()["n"] == 0
-    assert (
-        client.post(
-            path + "/enqueue", data={"csrf_token": "csrf", "contact_ids": str(flow.contact)}, follow_redirects=False
-        ).status_code
-        == 303
-    )
+    assert client.post(path + "/enqueue", data={"csrf_token": "csrf"}, follow_redirects=False).status_code == 303
     assert matching.prepare_next(flow.settings)
     job = matching.claim()
     matching.run(job, flow.settings)
@@ -708,6 +887,9 @@ def test_owner_only_routes_csrf_lazy_evidence_and_safe_audit(pg, pilot, responsi
     response = client.get(path)
     assert response.status_code == 200 and response.headers["cache-control"] == "no-store, max-age=0"
     assert "PRIVATE TEST BODY" not in response.text and "未接入" not in response.text
+    assert 'name="limit"' not in response.text and 'name="contact_ids"' not in response.text
+    assert 'name="mode"' not in response.text and "小样本" not in response.text
+    assert "99%" in response.text and "已自动关联" in response.text
     assert "helper" in response.text  # CM contact ID differs from the current authorization ID.
     assert "/confirm" not in response.text and "/apply" not in response.text
     read_path = path + f"/jobs/{job['id']}/evidence"

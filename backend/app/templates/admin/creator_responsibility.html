@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}达人负责人建议{% endblock %}
+{% block title %}达人负责人匹配{% endblock %}
 {% block body %}
 {% set base = '/admin/ai/creator-responsibility' %}
 {% set status_labels = {
@@ -8,7 +8,7 @@
   'completed': '已完成', 'failed': '失败', 'cancelled': '已取消'
 } %}
 {% set reason_labels = {
-  'ready': '证据已准备', 'cached': '复用已有结果', 'suggestions_saved': '建议已保存',
+  'ready': '证据已准备', 'cached': '复用已有结果', 'suggestions_saved': '结果已保存',
   'no_text': '没有可读消息', 'no_candidates': '未找到已接入的 CM/AM',
   'restricted': '不在授权处理范围', 'no_interaction': '缺少实际互动',
   'preparation_failed': '证据准备失败', 'snapshot_changed': '证据或配置已更新',
@@ -38,6 +38,8 @@
     <tr>
       <td>{{ result.name or '未命名' }}{% if result.existing %}<div class="text-secondary small">现有关联</div>{% endif %}</td>
       <td>{{ result.label or decision_labels.get(result.decision, result.decision) }}{% if result.reason %}<div class="text-secondary small">{{ result.reason }}</div>{% endif %}</td>
+      <td>{{ result.confidence_label or '—' }}</td>
+      <td>{{ result.association_label or '仅展示' }}{% if result.association_reason %}<div class="text-secondary small">{{ result.association_reason }}</div>{% endif %}</td>
       <td>{{ result.scope or '—' }}{% if result.scope_note %}<div class="small">{{ result.scope_note }}</div>{% endif %}{% if result.period %}<div class="text-secondary small">{{ period_labels.get(result.period, result.period) }}</div>{% endif %}</td>
       <td>
         {% if result.support_refs %}<div>支持：{% for ref in result.support_refs %}<a href="{{ evidence_link }}#evidence-{{ ref }}">{{ ref }}</a>{{ '、' if not loop.last else '' }}{% endfor %}</div>{% endif %}
@@ -45,7 +47,7 @@
         {% if not result.support_refs and not result.counter_refs %}<span class="text-secondary">无引用</span>{% endif %}
       </td>
     </tr>
-  {% else %}<tr><td colspan="4" class="text-secondary">尚无判断结果</td></tr>{% endfor %}
+  {% else %}<tr><td colspan="6" class="text-secondary">尚无判断结果</td></tr>{% endfor %}
 {% endmacro %}
 <div class="page">
   {% include "admin/_nav.html" %}
@@ -53,10 +55,10 @@
     {% if evidence is not none %}
       <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-3">
         <h2 class="mb-0">{{ evidence.creator_name or '达人' }} · 负责人证据{% if evidence.outdated %}<span class="badge bg-yellow-lt ms-2">旧版结果</span>{% endif %}</h2>
-        <a class="btn" href="{{ base }}">返回建议列表</a>
+        <a class="btn" href="{{ base }}">返回匹配列表</a>
       </div>
       {{ coverage_notes(evidence.coverage) }}
-      <div class="card table-responsive mt-3 mb-3">{{ confirmed_assignments(evidence.existing_assignments) }}<table class="table table-vcenter card-table"><thead><tr><th>CM/AM</th><th>本轮结论</th><th>职责范围</th><th>证据引用</th></tr></thead><tbody>{{ candidate_rows(evidence.results, '') }}</tbody></table></div>
+      <div class="card table-responsive mt-3 mb-3">{{ confirmed_assignments(evidence.existing_assignments) }}<table class="table table-vcenter card-table"><thead><tr><th>CM/AM</th><th>本轮结论</th><th>置信度</th><th>关联结果</th><th>职责范围</th><th>证据引用</th></tr></thead><tbody>{{ candidate_rows(evidence.results, '') }}</tbody></table></div>
       {% for message in evidence.messages %}
         <div class="card mb-2" id="evidence-{{ message.ref }}">
           <div class="card-header py-2"><div>
@@ -69,23 +71,10 @@
       {% else %}<div class="card card-body text-secondary">没有可展示的消息证据。</div>{% endfor %}
     {% else %}
       <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-3">
-        <div><h2 class="mb-1">达人负责人建议</h2><div class="text-secondary">{{ '已启用' if matching.enabled else '未启用' }} · 仅生成建议，不修改负责人关系</div></div>
-        <a class="btn" href="/admin/ai">API Key 配置</a>
-      </div>
-      <div class="card card-body mb-3">
-        <div class="d-flex flex-wrap justify-content-between align-items-start gap-3">
-          <form method="post" action="{{ base }}/enqueue">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="mode" value="sample">
-            <div class="d-flex flex-wrap align-items-end gap-2">
-              <div><label class="form-label" for="sample-limit">样本人数</label><input class="form-control" id="sample-limit" name="limit" type="number" min="1" max="10" value="5" style="width:7rem" required></div>
-              <button class="btn btn-primary" type="submit" {% if not matching.enabled %}disabled{% endif %}>小样本分析</button>
-            </div>
-            <details class="mt-2"><summary class="text-secondary small">指定达人</summary><label class="form-label small mt-2" for="sample-contacts">联系人 ID（最多 10 个，空格或逗号分隔）</label><textarea class="form-control" id="sample-contacts" name="contact_ids" rows="2" maxlength="400"></textarea></details>
-          </form>
-          <details>
-            <summary class="text-secondary">历史达人分析</summary>
-            <form class="mt-2" method="post" action="{{ base }}/enqueue"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="mode" value="history"><button class="btn" type="submit" {% if not matching.enabled %}disabled{% endif %}>补入全部未处理达人</button></form>
-          </details>
+        <div><h2 class="mb-1">达人负责人匹配</h2><div class="text-secondary">{{ '已启用' if matching.enabled else '未启用' }} · 高置信度自动关联，其余待核实</div></div>
+        <div class="d-flex flex-wrap gap-2">
+          <a class="btn" href="/admin/ai">API Key 配置</a>
+          <form method="post" action="{{ base }}/enqueue"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary" type="submit" {% if not matching.enabled %}disabled{% endif %}>开始匹配（全部待处理）</button></form>
         </div>
       </div>
       <div class="d-flex flex-wrap gap-3 mb-3">{% for status, count in matching.counts.items() %}<span>{{ status_labels.get(status, status) }}：{{ count }}</span>{% else %}<span class="text-secondary">暂无任务</span>{% endfor %}</div>
@@ -101,7 +90,7 @@
             </div>
           </div>
           {{ confirmed_assignments(job.existing_assignments) }}
-          <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>CM/AM</th><th>本轮结论</th><th>职责范围</th><th>证据引用</th></tr></thead><tbody>{{ candidate_rows(job.results, base ~ '/jobs/' ~ job.id ~ '/evidence') }}</tbody></table></div>
+          <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>CM/AM</th><th>本轮结论</th><th>置信度</th><th>关联结果</th><th>职责范围</th><th>证据引用</th></tr></thead><tbody>{{ candidate_rows(job.results, base ~ '/jobs/' ~ job.id ~ '/evidence') }}</tbody></table></div>
           {% if not job.stale %}<div class="card-footer py-2 text-secondary small">候选 {{ job.candidate_count }} 人{% if job.stats.get('input_tokens') or job.stats.get('output_tokens') %} · Token {{ job.stats.get('input_tokens', 0) + job.stats.get('output_tokens', 0) }}{% endif %}{{ coverage_notes(job.stats) }}</div>{% endif %}
         </div>
       {% else %}<div class="card card-body text-secondary text-center">暂无任务</div>{% endfor %}

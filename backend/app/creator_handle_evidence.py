@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import Counter
 from copy import deepcopy
@@ -520,6 +521,11 @@ def _shape(value, schema):
             raise ModelOutputError("array")
         for child in value:
             _shape(child, schema["items"])
+    elif kind == "number":
+        if (type(value) not in (int, float) or not math.isfinite(value)
+                or value < schema.get("minimum", float("-inf"))
+                or value > schema.get("maximum", float("inf"))):
+            raise ModelOutputError("number")
     elif not isinstance(value, str) or "enum" in schema and value not in schema["enum"]:
         raise ModelOutputError("enum")
 

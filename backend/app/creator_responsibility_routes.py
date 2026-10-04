@@ -1,6 +1,5 @@
-"""Owner-only responsibility suggestions and on-demand audited evidence."""
+"""Owner-only formal matching queue and on-demand audited evidence."""
 
-import re
 from uuid import UUID
 
 from fastapi import APIRouter, Request
@@ -72,32 +71,17 @@ def create_router(*, current_authorization, render_template, csrf_token):
                 raise ValueError("请求校验失败，请刷新页面。")
             try:
                 page_number = max(1, int(form.get("page", "1")))
-                limit = int(form.get("limit", "5"))
-                ids = list(
-                    dict.fromkeys(
-                        UUID(value) for value in re.split(r"[\s,]+", form.get("contact_ids", "").strip()) if value
-                    )
-                )
             except ValueError as exc:
-                raise ValueError("请填写有效的样本数量或联系人 ID。") from exc
-            if not 1 <= limit <= 10 or len(ids) > 10:
-                raise ValueError("小样本每次最多处理 10 位达人。")
-            mode = form.get("mode", "sample")
-            if mode not in {"sample", "history"} or (mode == "history" and ids):
-                raise ValueError("入队方式无效。")
+                raise ValueError("页码无效。") from exc
+            if any(name in form for name in ("mode", "limit", "contact_ids")):
+                raise ValueError("小样本入口已停用，请使用正式匹配。")
             if job_id is not None and operation not in {"retry", "recheck", "cancel"}:
                 raise ValueError("操作无效。")
 
             def save():
                 with connection() as conn, conn.transaction():
                     if job_id is None:
-                        matching.enqueue(
-                            conn,
-                            auth["id"],
-                            contact_ids=ids or None,
-                            limit=limit,
-                            all_contacts=mode == "history",
-                        )
+                        matching.enqueue(conn, auth["id"])
                     else:
                         matching.action(conn, auth["id"], job_id, operation)
 

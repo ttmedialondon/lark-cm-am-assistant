@@ -67,10 +67,10 @@ AI_FEATURES = {
         "processing_label": "队列匹配，强证据自动关联",
     },
     "creator_responsibility_matching": {
-        "title": "达人负责人建议",
-        "description": "从已接入的 CM/AM 中判断达人负责人；只保存建议和证据，不修改正式关系。",
-        "enabled_label": "启用负责人建议队列",
-        "processing_label": "手动入队，只生成建议",
+        "title": "达人负责人匹配",
+        "description": "从已接入的 CM/AM 中匹配负责人，支持多位共同负责；高置信度结果自动关联，其余待核实。",
+        "enabled_label": "启用负责人匹配队列",
+        "processing_label": "正式队列，高置信度自动关联",
     },
     "offhours_summary": {
         "title": "达人消息总结",
@@ -833,6 +833,8 @@ def create_admin_router(
             return render_ai_config(request, access_context, error="未知的 AI 功能配置。", status_code=400)
         try:
             threshold = str(ai_feature_config.DEFAULT_AUTO_CONFIRM_THRESHOLD)
+            if feature == creator_responsibility_matching.FEATURE:
+                threshold = form.get("auto_confirm_threshold", "0.950")
             enabled = feature != "creator_import" and form.get("enabled") == "1"
             with connection() as conn, conn.transaction():
                 key_rotated = bool(form.get("api_key", "").strip())

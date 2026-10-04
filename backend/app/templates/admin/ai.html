@@ -17,7 +17,7 @@
     {% if summary_saved %}<div class="alert alert-success" role="status">配置已保存。<a href="/dashboard/offhours-summary" class="alert-link">查看总结</a></div>{% endif %}
     {% if identity_saved %}<div class="alert alert-success" role="status">配置已保存。<a href="/admin/contacts" class="alert-link">查看识别进度</a></div>{% endif %}
     {% if matching_saved and admin_role == 'owner' %}<div class="alert alert-success" role="status">配置已保存。<a href="/admin/ai/creator-handle-matching" class="alert-link">匹配任务</a></div>{% endif %}
-    {% if responsibility_saved and admin_role == 'owner' %}<div class="alert alert-success" role="status">配置已保存。<a href="/admin/ai/creator-responsibility" class="alert-link">负责人建议</a></div>{% endif %}
+    {% if responsibility_saved and admin_role == 'owner' %}<div class="alert alert-success" role="status">配置已保存。<a href="/admin/ai/creator-responsibility" class="alert-link">负责人匹配</a></div>{% endif %}
     {% for feature in configs %}{% set config = feature.config %}
     <div class="card mb-4" id="{{ feature.id_suffix }}"><div class="card-header"><div><h3 class="card-title mb-1">{{ feature.title }}</h3><div class="text-secondary small">{{ feature.description }}</div></div></div>
       <div class="card-body">
@@ -35,7 +35,7 @@
         <div class="d-flex justify-content-between gap-2 mb-3"><span class="text-secondary">新达人及新增证据自动入队；历史全量需手动启动。</span><a href="/admin/ai/creator-handle-matching">匹配任务 →</a></div>
         {% endif %}
         {% if feature.feature == 'creator_responsibility_matching' and admin_role == 'owner' %}
-        <div class="d-flex justify-content-between gap-2 mb-3"><span class="text-secondary">手动启动小样本或全量；只展示建议。</span><a href="/admin/ai/creator-responsibility">负责人建议 →</a></div>
+        <div class="d-flex justify-content-between gap-2 mb-3"><span class="text-secondary">独立配置密钥后启用，从匹配页面启动全部待处理达人。</span><a href="/admin/ai/creator-responsibility">负责人匹配 →</a></div>
         {% endif %}
         {% if admin_role == 'owner' %}<form action="/admin/ai" method="post" class="row g-3">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="feature" value="{{ feature.feature }}">
@@ -52,6 +52,9 @@
           <details class="col-12 text-secondary small"><summary>更新规则</summary>{% if summary_settings.recurring_enabled %}自动生成最近七天各时段的总结。{% else %}仅更新指定时段。{% endif %}时段结束后继续检查最多 24 小时，补充迟到消息；开启时若时段已结束，从开启起检查 24 小时。已成功的相同输入不重复分析。</details>
           {% endif %}
           <div class="col-md-8"><label class="form-label" for="ai-api-key-{{ feature.id_suffix }}">Service-account API key</label><input class="form-control" id="ai-api-key-{{ feature.id_suffix }}" name="api_key" type="password" maxlength="1024" autocomplete="new-password" spellcheck="false" placeholder="{{ '留空则保留 ' ~ config.api_key_label if config.key_configured else '首次配置时必填' }}"><div class="form-hint">填写即更换密钥；不要使用 Organization Admin Key。</div></div>
+          {% if feature.feature == 'creator_responsibility_matching' %}
+          <div class="col-md-4"><label class="form-label" for="ai-threshold-{{ feature.id_suffix }}">自动关联置信度阈值</label><input class="form-control" id="ai-threshold-{{ feature.id_suffix }}" name="auto_confirm_threshold" type="number" min="0.90" max="1.00" step="0.001" value="{{ config.auto_confirm_threshold }}" required><div class="form-hint">仅明确、当前、达人本人级负责人关系可自动关联。</div></div>
+          {% endif %}
           {% if feature.feature != 'creator_import' %}
           <div class="col-md-4 d-flex align-items-end"><label class="form-check form-switch mb-2"><input class="form-check-input" type="checkbox" name="enabled" value="1" {% if config.enabled %}checked{% endif %}><span class="form-check-label">{{ feature.enabled_label }}</span></label></div>
           {% endif %}

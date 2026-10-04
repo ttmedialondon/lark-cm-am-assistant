@@ -1,10 +1,12 @@
-"""One creator, one shared evidence request, many CM suggestions; never assigns a CM."""
+"""One creator, one evidence request; verified high-confidence CMs are added independently."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from uuid import UUID, uuid4
+from copy import deepcopy
+from decimal import Decimal
+from uuid import uuid4
 
 from . import ai_dispatch, ai_feature_config, creator_data
 from . import creator_responsibility_evidence as evidence
@@ -30,6 +32,12 @@ SCOPES = {
     "technical_support": "技术支持",
     "other": "其他",
     "unknown": "范围待核实",
+}
+ASSOCIATIONS = {
+    "auto_linked": "已自动关联",
+    "already_linked": "现有关联保留",
+    "review_required": "待核实",
+    "blocked": "未自动关联",
 }
 STATUSES = {
     "queued": "排队中",
@@ -60,7 +68,7 @@ REASONS = {
     "lease_expired": "任务租约已过期",
     "request_unknown": "请求结果未知，需手动复查",
     "cached": "复用相同材料的结果",
-    "suggestions_saved": "建议已保存",
+    "suggestions_saved": "结果已保存",
     "failure_cached": "相同材料上次调用失败",
 }
 
@@ -69,11 +77,11 @@ def _hash(value):
     return hashlib.sha256(creator_data.encode(value).encode()).hexdigest()
 
 
-def _config(conn, *, lock=False, feature=FEATURE):
+def _config(conn, *, lock=False):
     return conn.execute(
-        "SELECT provider,project_id,model,enabled,api_key_ciphertext FROM ai_feature_configs "
+        "SELECT provider,project_id,model,enabled,api_key_ciphertext,auto_confirm_threshold FROM ai_feature_configs "
         "WHERE feature=%s" + (" FOR UPDATE" if lock else ""),
-        (feature,),
+        (FEATURE,),
     ).fetchone()
 
 
@@ -84,7 +92,8 @@ def _enabled(config):
 def _config_hash(config):
     return _hash(
         {
-            **{k: config[k] for k in ("provider", "project_id", "model", "api_key_ciphertext")},
+            **{k: config[k] for k in
+               ("provider", "project_id", "model", "api_key_ciphertext", "auto_confirm_threshold")},
             "prompt_version": evidence.PROMPT_VERSION,
         }
     )
@@ -104,41 +113,28 @@ def configuration_changed(conn):
         not_before=NOW(),updated_at=NOW() WHERE status NOT IN ('completed','failed','cancelled')""")
 
 
-def enqueue(conn, actor, contact_ids=None, limit=5, all_contacts=False):
+def enqueue(conn, actor):
     require_owner(conn, actor)
     if not _enabled(_config(conn)):
-        raise ValueError("请先配置并启用达人负责人建议。")
-    if not all_contacts and not 1 <= int(limit) <= 10:
-        raise ValueError("小样本数量须为 1–10。")
-    ids = list(dict.fromkeys(UUID(str(cid)) for cid in contact_ids)) if contact_ids else None
-    if ids and len(ids) > 10:
-        raise ValueError("一次最多指定 10 位达人。")
+        raise ValueError("请先配置并启用达人负责人匹配。")
     rows = conn.execute(
         """SELECT DISTINCT r.contact_id FROM contact_roles r
-        WHERE r.role='creator' AND r.status='confirmed' AND (%s::uuid[] IS NULL OR r.contact_id=ANY(%s::uuid[]))
+        WHERE r.role='creator' AND r.status='confirmed'
         AND NOT EXISTS(SELECT 1 FROM creator_responsibility_jobs j WHERE j.contact_id=r.contact_id
           AND (j.status NOT IN ('completed','failed','cancelled') OR j.status='completed'
-            AND j.stats->>'prompt_version'=%s)) ORDER BY r.contact_id LIMIT %s""",
-        (ids, ids, evidence.PROMPT_VERSION, None if all_contacts or ids else int(limit)),
+            AND j.stats->>'prompt_version'=%s)) ORDER BY r.contact_id""",
+        (evidence.PROMPT_VERSION,),
     ).fetchall()
-    if ids and len(
-        conn.execute(
-            "SELECT DISTINCT contact_id FROM contact_roles WHERE contact_id=ANY(%s::uuid[]) "
-            "AND role='creator' AND status='confirmed'",
-            (ids,),
-        ).fetchall()
-    ) != len(ids):
-        raise ValueError("只能选择已确认达人。")
     for row in rows:
         conn.execute(
-            "SELECT enqueue_creator_responsibility(%s,%s)", (row["contact_id"], "history" if all_contacts else "manual")
+            "SELECT enqueue_creator_responsibility(%s,'history')", (row["contact_id"],)
         )
-    counts = {"queued": len(rows), "skipped": len(ids) - len(rows) if ids else 0}
+    counts = {"queued": len(rows)}
     _audit(
         conn,
         actor,
         "creator_responsibility_enqueued",
-        {**counts, "all_contacts": all_contacts, "prompt_version": evidence.PROMPT_VERSION},
+        {**counts, "all_contacts": True, "prompt_version": evidence.PROMPT_VERSION},
     )
     return counts
 
@@ -189,6 +185,11 @@ def _store_prepared(conn, job, material, config, settings):
         cached = json.loads(storage.decrypt(cache["result_ciphertext"]))
         cached["result"] = evidence.validate(pack, cached["result"])
         cached["candidate_ids"] = material["candidate_ids"]
+        applied = _apply_assignments(conn, job, material, cached["result"], config, settings)
+        if applied is None:
+            _invalidate(conn, job)
+            return
+        cached["result"], material["refs"], stats["auto_linked"] = applied
         cache["result_ciphertext"] = storage.encrypt(creator_data.encode(cached))
     conn.execute(
         """UPDATE creator_responsibility_jobs SET status=%s,reason_code=%s,
@@ -304,28 +305,17 @@ def claim():
 
 
 def _current(conn, job):
-    config = _config(conn, lock=True, feature=job.get("key_feature", FEATURE))
+    config = _config(conn, lock=True)
     row = conn.execute("SELECT * FROM creator_responsibility_jobs WHERE id=%s FOR UPDATE", (job["id"],)).fetchone()
     if not row or row["status"] != "running" or row["claim_token"] != job["claim_token"]:
         return None
-    enabled = bool(config and config["api_key_ciphertext"]) if job.get("sample_only") else _enabled(config)
     if (
         row["desired_version"] != job["snapshot_version"]
-        or not enabled
+        or not _enabled(config)
         or _config_hash(config) != job["config_fingerprint"]
     ):
         _invalidate(conn, row)
         return None
-    if job.get("actor_id"):
-        try:
-            require_owner(conn, job["actor_id"])
-        except PermissionError:
-            conn.execute(
-                "UPDATE creator_responsibility_jobs SET status='cancelled',claim_token=NULL,lease_until=NULL,"
-                "reason_code='owner_cancelled',updated_at=NOW() WHERE id=%s",
-                (job["id"],),
-            )
-            return None
     return row
 
 
@@ -369,6 +359,109 @@ def review(pack, config, contact_id, settings):
     return result, telemetry, error, diagnostic
 
 
+def _apply_assignments(conn, job, material, result, config, settings):
+    """Append verified person-level pairs; lock and recheck the original evidence first."""
+    refs = material["refs"]
+    state_refs = [ref for ref in refs if ref.get("kind") == "responsibility_state"]
+    if len(state_refs) != 1 or str(job["contact_id"]) in evidence.source.RESTRICTED_CONTACTS:
+        return None
+    before = evidence._state(conn, job["contact_id"])
+    # OAuth writers lock authorization before identity/contact; retain that order.
+    conn.execute("SELECT id FROM authorizations WHERE id=ANY(%s::uuid[]) ORDER BY id FOR SHARE",
+                 ([str(row["id"]) for row in before["authorizations"]],)).fetchall()
+    conn.execute("SELECT id FROM contacts WHERE id=%s FOR UPDATE", (job["contact_id"],)).fetchone()
+    identity_ids = {row["open_id"] for row in before["directory"]}
+    identity_ids.update(row["open_id"] for ref in refs for row in ref.get("identities", []))
+    conn.execute("SELECT open_id FROM lark_identities WHERE open_id=ANY(%s::text[]) ORDER BY open_id FOR SHARE",
+                 (sorted(identity_ids),)).fetchall()
+    conn.execute("SELECT contact_id FROM contact_roles WHERE contact_id=%s ORDER BY role FOR SHARE",
+                 (job["contact_id"],)).fetchall()
+    for table in ("contact_assignments", "creator_account_assignments"):
+        conn.execute(f"SELECT id FROM {table} WHERE contact_id=%s ORDER BY id FOR SHARE",
+                     (job["contact_id"],)).fetchall()
+    messages = [ref for ref in refs if ref.get("kind") == "message"]
+    if not messages or any(not all(key in ref for key in ("chat_id", "message_id", "authorization_id"))
+                           for ref in messages):
+        return None
+    locked = conn.execute("""SELECT m.chat_id,m.message_id,o.authorization_id
+        FROM unnest(%s::text[],%s::text[],%s::uuid[]) ref(chat_id,message_id,authorization_id)
+        JOIN chat_messages m ON m.chat_id=ref.chat_id AND m.message_id=ref.message_id
+        JOIN authorization_message_observations o ON o.chat_id=m.chat_id AND o.message_id=m.message_id
+          AND o.authorization_id=ref.authorization_id
+        JOIN authorizations a ON a.id=o.authorization_id
+        JOIN authorization_chats ac ON ac.authorization_id=a.id AND ac.chat_id=m.chat_id
+        JOIN chats c ON c.chat_id=m.chat_id
+        ORDER BY a.id,m.chat_id,m.message_id FOR SHARE OF m,o,a,ac,c""",
+        ([ref["chat_id"] for ref in messages], [ref["message_id"] for ref in messages],
+         [ref["authorization_id"] for ref in messages])).fetchall()
+    if len(locked) != len(messages) or not evidence.still_valid(conn, refs, settings):
+        return None
+    state = evidence._state(conn, job["contact_id"])
+    if (evidence.access._hash(state) != state_refs[0]["state_hash"]
+            or not any(row["status"] == "confirmed" for row in state["role"])):
+        return None
+    people = {str(row["id"]): str(row["contact_id"]) for row in state["authorizations"] if row["contact_id"]}
+    admitted = {}
+    for row in state["authorizations"]:
+        if row["contact_id"] and row["status"] == "active" and row["body_consent_at"] is not None:
+            admitted.setdefault(str(row["contact_id"]), []).append(row["id"])
+    value = evidence.validate(material["pack"], result)
+    coverage = material["pack"].get("coverage", {})
+    threshold = Decimal(str(config["auto_confirm_threshold"]))
+    added = 0
+    for suggestion in value["suggestions"]:
+        cm = str(material["candidate_ids"][suggestion["cm"]])
+        history = [row for row in state["assignments"] if people.get(str(row["responsible_authorization_id"])) == cm]
+        active = any(row["ended_at"] is None for row in history)
+        suggestion.update(association_status="review_required", association_reason="")
+        if active:
+            suggestion["association_status"] = "already_linked"
+            continue
+        if (suggestion["decision"] != "responsible" or suggestion["period"] != "current"
+                or suggestion["relation_level"] != "person" or suggestion.get("validation_error")
+                or not suggestion["support_refs"] or suggestion["counter_refs"]
+                or Decimal(str(suggestion["confidence"])) < threshold):
+            continue
+        if coverage.get("critical_evidence_omitted"):
+            suggestion["association_reason"] = "材料遗漏了关键交接或解除记录，需要核实。"
+            continue
+        if set(suggestion["support_refs"]) & set(coverage.get("missing_reply_ids", [])):
+            suggestion["association_reason"] = "支撑消息缺少实际回复上下文，需要核实。"
+            continue
+        if len(admitted.get(cm, [])) != 1:
+            suggestion.update(association_status="blocked", association_reason="有效接入身份缺失或存在重复，需要核实。")
+            continue
+        if any(row["ended_at"] is not None and (row["ended_by_authorization_id"]
+               or row["source"] in {"manual", "cm_confirmation", "excel_verified"}) for row in history):
+            suggestion.update(association_status="blocked", association_reason="存在人工解除记录，不自动重新关联。")
+            continue
+        inserted = conn.execute("""INSERT INTO contact_assignments
+            (id,contact_id,responsible_authorization_id,source,confidence)
+            VALUES(%s,%s,%s,'ai',%s)
+            ON CONFLICT(contact_id,responsible_authorization_id) WHERE ended_at IS NULL DO NOTHING
+            RETURNING 'person' AS level,id,responsible_authorization_id,source,started_at,ended_at,
+                ended_by_authorization_id,NULL::uuid AS account_id,NULL::text AS handle,NULL::text AS platform""",
+            (uuid4(), job["contact_id"], admitted[cm][0], Decimal(str(suggestion["confidence"])))).fetchone()
+        suggestion["association_status"] = "auto_linked" if inserted else "already_linked"
+        if inserted:
+            added += 1
+            state["assignments"].append(inserted)
+            _audit(conn, None, "creator_responsibility_auto_linked", {
+                "job_id": str(job["id"]), "assignment_id": str(inserted["id"]),
+                "contact_id": str(job["contact_id"]), "cm_contact_id": cm,
+                "responsible_authorization_id": str(admitted[cm][0]),
+                "confidence": suggestion["confidence"], "threshold": str(threshold),
+                "support_refs": suggestion["support_refs"],
+            })
+    refreshed = deepcopy(refs)
+    if added:
+        # Refresh only our own additions, never bless concurrent source/directory changes.
+        state["assignments"].sort(key=lambda row: (row["level"], str(row["id"])))
+        state_ref = next(ref for ref in refreshed if ref["kind"] == "responsibility_state")
+        state_ref["state_hash"] = evidence.access._hash(state)
+    return value, refreshed, added
+
+
 def run(job, settings):
     with connection() as conn, conn.transaction():
         current = _current(conn, job)
@@ -381,7 +474,7 @@ def run(job, settings):
             return
     result, telemetry, error, diagnostic = review(job["pack"], job["config"], job["contact_id"], settings)
     with connection() as conn, conn.transaction():
-        _config(conn, lock=True, feature=job.get("key_feature", FEATURE))
+        _config(conn, lock=True)
         usage = telemetry.get("usage", {})
         input_tokens, output_tokens = usage.get("input_tokens"), usage.get("output_tokens")
         conn.execute(
@@ -421,7 +514,6 @@ def run(job, settings):
                 isinstance(error, api.OpenAIRequestError)
                 and error.retryable
                 and job["attempts"] < 3
-                and not job.get("sample_only")
             )
             reason = (
                 "quota_paused"
@@ -443,18 +535,23 @@ def run(job, settings):
                 ),
             )
         else:
+            applied = _apply_assignments(conn, current, job, result, _config(conn), settings)
+            if applied is None:
+                _invalidate(conn, current)
+                return
+            result, refs, added = applied
             view = {"candidate_ids": job["candidate_ids"], "result": result}
             conn.execute(
                 """UPDATE creator_responsibility_jobs SET status='completed',reason_code='suggestions_saved',
-                result_ciphertext=%s,claim_token=NULL,lease_until=NULL,
+                result_ciphertext=%s,refs=%s::jsonb,stats=stats||%s::jsonb,claim_token=NULL,lease_until=NULL,
                 finished_at=NOW(),updated_at=NOW() WHERE id=%s""",
-                (creator_data.cipher(settings).encrypt(creator_data.encode(view)), job["id"]),
+                (creator_data.cipher(settings).encrypt(creator_data.encode(view)), creator_data.encode(refs),
+                 creator_data.encode({"auto_linked": added}), job["id"]),
             )
-        if not job.get("sample_only"):
-            conn.execute(
-                "UPDATE ai_feature_configs SET last_tested_at=NOW(),last_test_status=%s WHERE feature=%s",
-                ("failed" if error else "succeeded", FEATURE),
-            )
+        conn.execute(
+            "UPDATE ai_feature_configs SET last_tested_at=NOW(),last_test_status=%s WHERE feature=%s",
+            ("failed" if error else "succeeded", FEATURE),
+        )
 
 
 def _no_request(conn, job):
@@ -512,6 +609,8 @@ def _results(conn, view, existing=()):
                 **suggestion,
                 "name": person.get("display_name") or suggestion["cm"],
                 "existing": person_id in known,
+                "confidence_label": f"{suggestion['confidence']:.0%}" if 'confidence' in suggestion else "—",
+                "association_label": ASSOCIATIONS.get(suggestion.get("association_status"), "旧版建议"),
                 "label": DECISIONS[suggestion["decision"]],
                 "scope_codes": suggestion["scope"],
                 "scope": "、".join(SCOPES[scope] for scope in suggestion["scope"]),
@@ -523,6 +622,7 @@ def _results(conn, view, existing=()):
 
 def page_data(conn, actor, settings, page=1):
     require_owner(conn, actor)
+    config = _config(conn)
     _recover(conn)
     latest = (
         "WITH latest AS (SELECT DISTINCT ON(contact_id) * FROM creator_responsibility_jobs "
@@ -570,7 +670,8 @@ def page_data(conn, actor, settings, page=1):
     return {
         "jobs": jobs,
         "counts": counts,
-        "enabled": _enabled(_config(conn)),
+        "enabled": _enabled(config),
+        "threshold_label": f"{config['auto_confirm_threshold']:.0%}",
         "page": page,
         "has_more": has_more,
         "prompt_version": evidence.PROMPT_VERSION,
@@ -651,128 +752,8 @@ def action(conn, actor, job_id, operation):
         )
     elif operation in {"retry", "recheck"}:
         if not _enabled(_config(conn)):
-            raise ValueError("请先配置并启用达人负责人建议。")
+            raise ValueError("请先配置并启用达人负责人匹配。")
         conn.execute("SELECT enqueue_creator_responsibility(%s,'manual')", (row["contact_id"],))
     else:
         raise ValueError("操作无效。")
     _audit(conn, actor, "creator_responsibility_job_" + operation, {"job_id": str(job_id)})
-
-
-def probe_sample(settings, actor, contact_ids, *, key_feature=FEATURE):
-    """Explicit owner diagnostic, at most five creators; never copies or enables credentials."""
-    ids = list(dict.fromkeys(UUID(str(cid)) for cid in contact_ids))
-    if not 1 <= len(ids) <= 5 or key_feature not in {FEATURE, "creator_handle_matching"}:
-        raise ValueError("测试最多 5 位已确认达人，必须明确选择现有功能凭证。")
-    outcomes = []
-    for cid in ids:
-        with connection() as conn, conn.transaction():
-            require_owner(conn, actor)
-            config = _config(conn, lock=True, feature=key_feature)
-            if not (
-                config
-                and config["provider"] == "openai"
-                and config["api_key_ciphertext"]
-                and config["project_id"] != "unconfigured"
-            ):
-                raise ValueError("所选功能尚未配置有效凭证。")
-            if not conn.execute(
-                "SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed'", (cid,)
-            ).fetchone():
-                raise ValueError("只能测试已确认达人。")
-            if conn.execute(
-                "SELECT 1 FROM creator_responsibility_jobs WHERE contact_id=%s "
-                "AND status NOT IN ('completed','failed','cancelled')",
-                (cid,),
-            ).fetchone():
-                raise ValueError("该达人已有未结束的负责人任务，请先处理已有任务。")
-            job = conn.execute(
-                """INSERT INTO creator_responsibility_jobs(contact_id,source,status,snapshot_version,
-                claim_token,lease_until) VALUES(%s,'sample','preparing',1,%s,NOW()+INTERVAL '10 minutes')
-                RETURNING *""",
-                (cid, uuid4()),
-            ).fetchone()
-            _audit(
-                conn,
-                actor,
-                "creator_responsibility_sample_started",
-                {
-                    "job_id": str(job["id"]),
-                    "contact_id": str(cid),
-                    "key_feature": key_feature,
-                    "suggestions_only": True,
-                },
-            )
-        try:
-            with connection() as conn, conn.transaction():
-                conn.execute("SET LOCAL statement_timeout='90s'")
-                material = evidence.build(conn, settings, cid)
-            with connection() as conn, conn.transaction():
-                require_owner(conn, actor)
-                current_config = _config(conn, lock=True, feature=key_feature)
-                current = conn.execute(
-                    "SELECT * FROM creator_responsibility_jobs WHERE id=%s FOR UPDATE", (job["id"],)
-                ).fetchone()
-                if current["claim_token"] != job["claim_token"] or current["status"] != "preparing":
-                    raise ValueError("测试任务已变化。")
-                if _config_hash(current_config) != _config_hash(config):
-                    raise ValueError("测试凭证已变化，请重新测试。")
-                material["stats"] = {**material["stats"], "sample_key_feature": key_feature}
-                _store_prepared(conn, current, material, config, settings)
-            with connection() as conn, conn.transaction():
-                require_owner(conn, actor)
-                _config(conn, lock=True, feature=key_feature)
-                current = conn.execute("SELECT * FROM creator_responsibility_jobs WHERE id=%s", (job["id"],)).fetchone()
-                if current["status"] == "ready":
-                    if not ai_dispatch.can_claim(conn):
-                        raise ValueError("AI 调度目前暂停或全部槽位忙；本次测试未发送请求。")
-                    # Same config -> admission -> job lock order as native worker claims.
-                    current = conn.execute(
-                        "SELECT * FROM creator_responsibility_jobs WHERE id=%s FOR UPDATE", (job["id"],)
-                    ).fetchone()
-                    if current["status"] != "ready":
-                        raise ValueError("测试任务已变化。")
-                    token, reservation = uuid4(), uuid4()
-                    conn.execute(
-                        "INSERT INTO creator_responsibility_requests(id,job_id,key_feature) VALUES(%s,%s,%s)",
-                        (reservation, job["id"], key_feature),
-                    )
-                    conn.execute(
-                        """UPDATE creator_responsibility_jobs SET status='running',claim_token=%s,
-                        lease_until=NOW()+(%s*INTERVAL '1 second'),attempts=1 WHERE id=%s""",
-                        (token, LEASE_SECONDS, job["id"]),
-                    )
-                    request = {
-                        **current,
-                        "pack": material["pack"],
-                        "candidate_ids": material["candidate_ids"],
-                        "claim_token": token,
-                        "attempts": 1,
-                        "reservation_id": reservation,
-                        "config": config,
-                        "key_feature": key_feature,
-                        "sample_only": True,
-                        "actor_id": actor,
-                    }
-                else:
-                    request = None
-            if request:
-                run(request, settings)
-            with connection() as conn:
-                outcome = conn.execute(
-                    "SELECT id,contact_id,status,reason_code,input_tokens,output_tokens,stats "
-                    "FROM creator_responsibility_jobs WHERE id=%s",
-                    (job["id"],),
-                ).fetchone()
-            outcomes.append(outcome)
-            if outcome["status"] == "failed":
-                break  # First error stops the bounded diagnostic, never silently retries with another key.
-        except Exception:
-            with connection() as conn, conn.transaction():
-                conn.execute(
-                    """UPDATE creator_responsibility_jobs SET status='failed',reason_code='preparation_failed',
-                    claim_token=NULL,lease_until=NULL,updated_at=NOW()
-                    WHERE id=%s AND status IN ('preparing','ready')""",
-                    (job["id"],),
-                )
-            raise
-    return outcomes

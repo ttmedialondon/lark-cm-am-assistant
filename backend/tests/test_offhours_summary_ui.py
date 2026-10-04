@@ -47,7 +47,13 @@ def test_admin_summary_form_has_native_window_inputs_and_disabled_default_withou
     html = render_admin()
     forms = re.findall(r'<form action="/admin/ai".*?</form>', html, re.S)
     assert 'name="feature" value="contact_assessment"' not in html
-    assert 'name="auto_confirm_threshold"' not in html
+    responsibility_form = next(
+        form for form in forms if 'name="feature" value="creator_responsibility_matching"' in form
+    )
+    assert 'name="auto_confirm_threshold"' in responsibility_form
+    assert all(
+        'name="auto_confirm_threshold"' not in form for form in forms if form != responsibility_form
+    )
     assert 'name="feature" value="creator_import"' in forms[0]
     assert 'name="enabled"' not in forms[0]
     summary_form = next(form for form in forms if 'name="feature" value="offhours_summary"' in form)
