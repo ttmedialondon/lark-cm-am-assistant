@@ -35,7 +35,11 @@ python3 -m venv .venv
 `POST /v1/reply-suggestions`，JSON。正式地址为 `https://larkbot.ttapp.help/v1/reply-suggestions`。
 桌面可通过 `Authorization: Bearer <现有本站登录会话>` 使用已连接 CM；此凭据是本站
 `web_sessions` 对应的原始不透明会话，不是 Lark access token 或 OpenAI Key。校验复用登录会话的
-哈希、有效期和 CM active 状态，不新增 OAuth 或桌面配对流程。网页 Cookie 调用还必须提供现有 `X-CSRF-Token`。
+哈希、有效期和 CM active 状态，不新增 Lark OAuth。网页 Cookie 调用还必须提供现有 `X-CSRF-Token`。
+桌面设置可打开 `/auth/desktop/start`，由现有网页登录账号进行 CSRF 确认。
+60 秒一次性码绑定 S256 PKCE 与严格 loopback 回调，经 `/auth/desktop/exchange` 换回同一网页会话；
+不新建会话或延长期限，原会话过期、删除或 CM 撤销后立即失效。
+桌面使用系统加密存储保存会话并限定正式域名；本机退出只清理密文，网页登录不受影响。
 
 必填请求字段：`schema_version: "1.1"`、UUID `request_id`、带时区的 `captured_at`、
 `conversation: {label, label_source, identity_verified: false}`、`reply_scope`、
