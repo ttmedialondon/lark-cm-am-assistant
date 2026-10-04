@@ -28,6 +28,7 @@ def matching_flow(pg, pilot, monkeypatch):
         before_response=None,
         error=None,
         review=False,
+        relation="self_account",
         period="at_message",
         needed=[],
         stats={},
@@ -35,12 +36,13 @@ def matching_flow(pg, pilot, monkeypatch):
         missing_reply_ids=[],
         material_version=1,
         reference_version=1,
+        catalog_handles=frozenset({"first.handle", "backup_2"}),
         real_build=matching.evidence.build,
         real_still_valid=matching.evidence.still_valid,
     )
     monkeypatch.setattr(matching, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(config, "get_settings", lambda: state.settings)
-    monkeypatch.setattr(matching, "catalog", lambda: (frozenset({"first.handle", "backup_2"}), "catalog-v1"))
+    monkeypatch.setattr(matching, "catalog", lambda: (state.catalog_handles, "catalog-v1"))
     monkeypatch.setattr(matching.evidence, "still_valid", lambda *_: state.valid)
 
     def prepare(_conn, _settings, contact, _catalog, *, recheck=False):
@@ -50,8 +52,8 @@ def matching_flow(pg, pilot, monkeypatch):
             "target": "U1",
             "creator_known": True,
             "handles": [
-                {"id": "H1", "handle": "first.handle", "catalog_verified": True},
-                {"id": "H2", "handle": "backup_2", "catalog_verified": True},
+                {"id": "H1", "handle": "first.handle", "catalog_verified": "first.handle" in _catalog},
+                {"id": "H2", "handle": "backup_2", "catalog_verified": "backup_2" in _catalog},
             ],
             "people": [{"id": "U1", "role": "external"}],
             "chats": [{"id": "G1", "name": "Synthetic test conversation", "mode": "group"}],
@@ -108,7 +110,7 @@ def matching_flow(pg, pilot, monkeypatch):
                 {
                     "h": handle["id"],
                     "decision": "supported",
-                    "relation": "self_account",
+                    "relation": state.relation,
                     "period": state.period,
                     "code": "self_claim",
                     "refs": ["M" + handle["id"][1:]],
@@ -439,6 +441,7 @@ def test_legacy_limits_do_not_block_restart_and_retry_fences(pg, matching_flow):
 
 def test_review_and_incomplete_evidence_never_auto_link_and_cache_can_reuse(pg, matching_flow):
     flow = matching_flow
+    flow.catalog_handles = frozenset()
     flow.enable()
     # A supported answer is not enough if it describes historical ownership or still needs evidence.
     for period, needed, stats, legacy in (
@@ -453,7 +456,14 @@ def test_review_and_incomplete_evidence_never_auto_link_and_cache_can_reuse(pg, 
         matching.run(_prepared_job(pg, flow), flow.settings)
         assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
         assert not pg.execute("SELECT 1 FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
+    for relation in ("operator", "account_creator", "other_person"):
+        flow.relation, flow.period, flow.needed, flow.stats, flow.legacy_stats = relation, "at_message", [], {}, False
+        flow.material_version += 1
+        matching.run(_prepared_job(pg, flow), flow.settings)
+        assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
+        assert not pg.execute("SELECT 1 FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
     # Typed coverage limits only the affected handle; other strong claims are not collateral damage.
+    flow.relation = "self_account"
     flow.period, flow.needed, flow.legacy_stats = "at_message", [], False
     flow.stats = {
         "history_truncated": True,
@@ -513,6 +523,7 @@ def test_review_and_incomplete_evidence_never_auto_link_and_cache_can_reuse(pg, 
 
 def test_auto_link_preserves_rejections_non_owner_links_and_other_account_claims(pg, matching_flow, pilot):
     flow = matching_flow
+    flow.catalog_handles = frozenset()
     flow.enable()
     accounts = {handle: uuid4() for handle in ("first.handle", "backup_2")}
     for handle, account in accounts.items():
@@ -581,8 +592,16 @@ def test_auto_link_preserves_rejections_non_owner_links_and_other_account_claims
     assert not pg.execute("SELECT 1 FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
 
 
-def test_role_and_chat_events_shared_slots_and_catalog_changes(pg, matching_flow, pilot, monkeypatch):
+def test_role_and_chat_events_shared_slots_and_catalog_changes(pg, matching_flow, pilot, monkeypatch, tmp_path):
     flow = matching_flow
+    (tmp_path / "handles.csv").write_text("handle\nfirst.handle\n", encoding="utf-8")
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"files": [{"name": "handles.csv", "sha256": "0" * 64}]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        matching._load_catalog(str(tmp_path), 0)  # Optional reference must not weaken archive integrity.
+    with monkeypatch.context() as reference:
+        reference.setattr(matching, "catalog", lambda: matching._load_catalog(str(tmp_path), 0))
+        assert matching.reference_catalog() == (frozenset(), "unavailable")
     flow.enable()
     # Role confirmation from any SQL writer is durable in the same transaction.
     pg.execute("UPDATE contact_roles SET status='rejected' WHERE contact_id=%s", (flow.contact,))
@@ -767,7 +786,7 @@ def test_failed_diagnostics_partial_results_and_queue_cleanup_preserve_data(pg, 
     assert retained == {"n": 2, "tokens": 300}
 
 
-def test_disabled_probe_retains_paid_diagnostics_when_postcall_catalog_fails(pg, matching_flow, monkeypatch):
+def test_disabled_probe_retains_paid_diagnostics_when_postcall_catalog_fails(pg, matching_flow, monkeypatch, capsys):
     from scripts import probe_creator_handle_matching as probe
 
     flow = matching_flow
@@ -805,10 +824,12 @@ def test_disabled_probe_retains_paid_diagnostics_when_postcall_catalog_fails(pg,
 
     monkeypatch.setattr(matching, "catalog", catalog)
     try:
-        with pytest.raises(OSError, match="synthetic postcall catalog failure"):
-            probe.main()
+        assert probe.main() == 0
     finally:
         pg.execute("SELECT pg_advisory_unlock(%s)", (ai_dispatch._ADMISSION_LOCK,))
+    output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert output[0]["evidence_fresh"] is False and output[0]["evidence_eligible_candidates"] == []
+    assert output[-1]["business_links_written"] == 0 and output[-1]["matching_enabled_by_probe"] is False
     assert len(flow.calls) == 1 and len(catalogs) == 3
     logged = pg.execute("SELECT * FROM creator_handle_requests").fetchone()
     assert logged["job_id"] is None
@@ -825,6 +846,11 @@ def test_disabled_probe_retains_paid_diagnostics_when_postcall_catalog_fails(pg,
 
 def test_fixed_group_context_auto_links_with_live_scope_and_auditable_title(pg, matching_flow, pilot, monkeypatch):
     flow = matching_flow
+    flow.catalog_handles = frozenset()  # A dedicated group can prove an account absent from Curva.
+    def unavailable_catalog():
+        raise OSError("synthetic reference unavailable")
+
+    monkeypatch.setattr(matching, "catalog", unavailable_catalog)
     flow.enable()
     monkeypatch.setattr(matching.evidence, "build", flow.real_build)
     monkeypatch.setattr(matching.evidence, "still_valid", flow.real_still_valid)
@@ -854,8 +880,14 @@ def test_fixed_group_context_auto_links_with_live_scope_and_auditable_title(pg, 
         return response
 
     monkeypatch.setattr(matching.api, "call_openai", contextual_response)
-    material = flow.real_build(pg, flow.settings, flow.contact, frozenset({"first.handle", "backup_2"}))
+    pg.execute("SAVEPOINT ordinary_group_name")
+    pg.execute("UPDATE chats SET name='MAC Creators' WHERE chat_id='chat_creator'")
+    ordinary = flow.real_build(pg, flow.settings, flow.contact, flow.catalog_handles)
+    assert ordinary["reason"] == "no_candidates" and ordinary["pack"] is None
+    pg.execute("ROLLBACK TO SAVEPOINT ordinary_group_name")
+    material = flow.real_build(pg, flow.settings, flow.contact, flow.catalog_handles)
     assert material["reason"] == "ready" and [h["handle"] for h in material["pack"]["handles"]] == ["first.handle"]
+    assert material["pack"]["handles"][0]["catalog_verified"] is False
     assert all("first.handle" not in m["text"] for m in material["pack"]["messages"])
 
     # A title edited during a paid response invalidates the old context, but keeps the usage ledger.
@@ -898,6 +930,11 @@ def test_fixed_group_context_auto_links_with_live_scope_and_auditable_title(pg, 
     assert chat_ref in audit["evidence_refs"]
     assert any(ref["kind"] == "message" and ref["label"] == reference for ref in audit["evidence_refs"])
     assert all("text" not in ref and "body" not in ref for ref in audit["evidence_refs"])
+    row = next(
+        row for row in matching.page_data(pg, pilot.ids["owner"], flow.settings)["jobs"] if row["id"] == job["id"])
+    assert [item["handle"] for item in row["handle_rows"]] == ["first.handle"]
+    assert row["handle_rows"][0]["associated"] and row["handle_rows"][0]["check"] is None
+    assert row["suggestions"][0]["handle"] == "first.handle" and row["suggestions"][0]["decision"] == "supported"
     assert _snapshot(pg, before.keys()) == before
 
     # The same contextual signal from another person is a claimant conflict, not a second owner.
@@ -913,7 +950,7 @@ def test_fixed_group_context_auto_links_with_live_scope_and_auditable_title(pg, 
         "VALUES(%s,'chat_creator','group_peer_control')",
         (pilot.ids["cm"],),
     )
-    competing = flow.real_build(pg, flow.settings, flow.contact, frozenset({"first.handle"}), recheck=True)
+    competing = flow.real_build(pg, flow.settings, flow.contact, flow.catalog_handles, recheck=True)
     reference = next(m["id"] for m in competing["pack"]["messages"] if m["text"] == body)
     result = {"creator": {"state": "known", "refs": []}, "links": [
         {"h": competing["pack"]["handles"][0]["id"], "decision": "supported", "relation": "self_account",

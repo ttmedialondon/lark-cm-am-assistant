@@ -1,10 +1,10 @@
-# 达人—Handle 关联 Prompt v1.10
+# 达人—Handle 关联 Prompt v1.11
 
-版本：`creator-handle-research-v1.10`（沿用原文件路径）
+版本：`creator-handle-research-v1.11`（沿用原文件路径）
 
 日期：2026-10-04
 
-状态：用于按联系人匹配队列，强证据可自动关联；功能开关由 Owner 控制，普通规则发布不改变开关或主动重扫历史。v1.10 将聊天含义统一交给模型判断，移除后端对自报账号、否定、代理、反证和问答意图的固定句式复判。精确合作群与本人业务仍由模型联合判断。保留同人正式账号默认跳过、逐候选校验、授权和冲突门槛。旧名单导入的 v1.1 协议不在本轮替换范围。
+状态：用于按联系人匹配队列，强证据可自动关联；功能开关由 Owner 控制，普通规则发布不改变开关或主动重扫历史。v1.11 将 Curva 改为辅助目录：精确合作群名、明确 TikTok 账号表达或主页链接可召回未收录账号，仍须独立证明本人关系。保留 v1.10 的模型语义判断、同人正式账号默认跳过、逐候选校验、授权和冲突门槛。旧名单导入的 v1.1 协议不在本轮替换范围。
 
 ## 1. 用途与变化
 
@@ -24,7 +24,7 @@
 | --- | --- |
 | `target` | 本次判断的联系人短编号，例如 U1 |
 | `creator_known` | 系统是否已经确认其达人身份；仅复用身份，不证明任何账号关联 |
-| `handles` | 候选编号、精确 handle、服务端核验的 Curva 收录状态 |
+| `handles` | 候选编号、精确 handle、服务端核验的 Curva 收录状态；未收录不否定关联 |
 | `confirmed_handles` | 已正式关联且本轮跳过的精确 handle，仅用于语境消歧；可包含当前 Curva 未收录账号，不是本轮候选 |
 | `evidence_hints` | 按候选分组的短消息引用，仅帮助定位可能的自述、问答等片段，不是关联结论 |
 | `people` | 发言者短编号及角色；不根据姓名判断是否同一个自然人 |
@@ -82,7 +82,7 @@
 7. qa_confirm 同时引用账号问题和本人回答。“May I know your id”“Please drop your username below”“comment: Affiliate Live | Your Username”和“TikTok official can't find ur uid”均可能构成索取/纠正本人账号的语境；由你根据上下文判断，不要求固定疑问句或“my account”。裸 handle 回答须引用问题。真实 reply 优先；无 reply 时使用两位已知发言者的 p2p 和完整服务端 previous 链，可跨最多三步，问题须早于回答；中间补充句是否改变问答语境由你判断，不套5分钟规则或固定补充词。链缺口、截断或回复到其他问题时不得编造连接；群聊不按选段邻接猜回复对象。完整自述不依赖无关父消息。
 8. 反证必须否认该账号归属、说明代理或账号转让；“not my main account”只否认主号角色，可能仍是本人备用号，不能当归属冲突或历史转让，须结合独立账号证据。“Not yet”“Not sure”对领奖、样品、邀请的答复，或样品说明里的“did NOT receive”，不等于否认本人账号。“No worries”“No problem”是礼貌表达。退出/unlink 机构不是账号转让；共享链接不是共享所有权。核对反证针对的账号和时点，不能因任何一句 not 否决整包。
 9. 一个联系人可以有多个 handle，逐个给结论；同一个 handle 的多人声明、共享登录、助理/本人不清或转让冲突返回 review，不合并联系人，不按显示姓名挑人。不要将一个账号的证据扩散给同群其他账号。confirmed_handles 仅帮助辨认已核准账号的语境，不重判、不输出，也不支持其他候选；“My account is OLD_HANDLE”只指该旧账号，即使它已从本轮候选中移除，也不能作为新候选的泛化“是我的”证据。同一精确合作群中本人明确否认、表示代理/共享或改名时，即使未重复handle也须审查；普通“not my main”不是归属否认。其他外部人员在该群给出同等本人账号证据时不能忽略。每个新候选仍须独立、精确连接本人，不必须依赖主动声明。
-10. catalog_verified=false 的候选不得 supported，返回 review/out_of_catalog；true 时不得因模型不认识该账号而判 out_of_catalog，缺关联证据应 review/no_link_evidence。这不是否认其达人身份。只输出输入候选，不纠正点号/下划线/数字，不编造 handle。需要额外候选时由服务端重建证据包。
+10. catalog_verified 只表示 Curva 是否收录，不证明或否定账号归属。true 和 false 均按同样的本人证据判定，可 supported；不得仅因未收录或不认识账号而返回 out_of_catalog。缺关联证据返回 review/no_link_evidence。候选已由服务端从精确群名或账号线索召回；只输出输入候选，不纠正点号/下划线/数字，不编造 handle。需要额外候选时由服务端重建证据包。
 11. refs 只填写输入实际消息编号（如 M1），最多6条且不得重复，不填群编号、handle、消息原文或不存在的编号。引用须与 code 对应：self_claim 引本人账号声明，qa_confirm 引完整问答，group_context 必须引 target 在该精确群的本人账号/创作语境，群名从消息所属会话读取；用到跨消息业务回复时同时引用。分开的账号和本人确认须都引用；否认/改名/冲突也引用。self_account 必须有可连接到target本人的证据，不要求主动自报。读到用于本条结论的消息时，review 也保留相关 refs；确无消息证据才 refs=[]。缺失/截断确实影响该账号时返回 review，并列 needed；其他账号或无关父消息的缺失不否决完整证据。没有文本或证据不足不能当作明确反例。
 
 输出：creator={state,refs}；links 每个候选恰好一项={h,decision,relation,period,code,refs,needed}。h 只填输入候选短编号（如 H1），不能填真实 handle；证据弱的候选也必须逐项返回，不能跳过。needed 不得重复。只输出这些字段，服务端诊断字段不由模型填写。
@@ -108,7 +108,7 @@ needed: parent_reply|identity_context|account_context|earlier_username|other_cla
 
 `supported` 是“证据支持该种关系”，不是“一律可入正式达人账号”。只有 `self_account` 才是本人账号候选；`operator`、`account_creator` 不得写成 `owner`。`known` 复用系统身份，其他输出不自动取消既有达人身份。
 
-已有精确「联系人＋TikTok handle」的 `owner / confirmed` 关联默认不重复付费核验，包括旧 Excel 导入、自动确认和人工确认；只过滤这一对，不跳过整个人或其新账号。默认重查例外仅为数据库已有的实际身份或归属冲突；聊天中的否认、代理、共享或转让不再通过关键词自动触发重查，也不会撤销正式关系。需要审查此类变化时由 Owner 主动复核，模型在复核中判断原文。点击「重新检查」是主动复核，可以包含该人的已关联账号。全部正式 handle（包括当前 Curva 未收录的）记录在服务端快照中，在准备、领取、调用前后检查变化，旧快照先重建、不照旧付费。新候选仍限 Curva 收录。
+已有精确「联系人＋TikTok handle」的 `owner / confirmed` 关联默认不重复付费核验，包括旧 Excel 导入、自动确认和人工确认；只过滤这一对，不跳过整个人或其新账号。默认重查例外仅为数据库已有的实际身份或归属冲突；聊天中的否认、代理、共享或转让不再通过关键词自动触发重查，也不会撤销正式关系。需要审查此类变化时由 Owner 主动复核，模型在复核中判断原文。点击「重新检查」是主动复核，可以包含该人的已关联账号。全部正式 handle（包括当前 Curva 未收录的）记录在服务端快照中，在准备、领取、调用前后检查变化，旧快照先重建、不照旧付费。新候选不要求 Curva 收录，但必须有可追溯的精确账号来源；普通正文单词不能因取消目录门槛全部成为候选。
 
 免重复匹配不等于人工核准：仅 `cm_confirmation` 或 `owner_reviewed_curva` 且审核人、审核时间均非空的关系显示「人工已核准」。旧导入和自动确认继续显示「已关联」，不补造人工审核记录，不更改来源。
 
@@ -120,8 +120,8 @@ needed: parent_reply|identity_context|account_context|earlier_username|other_cla
 - 结构损坏、候选遗漏/重复或非法候选编号仍是请求级错误；合法候选中的错误引用、证据不足或不连贯只降级该账号为待核实，不影响其他通过校验的账号。
 - 支持本人账号时，引用内确有该联系人发言和精确账号；group_context 的精确账号可来自该本人引用所属的固定合作群主名。问答仅检查已引用的真实父消息或完整有界私聊前驱链、发言者、会话和先后时点，不解析问题句式、回答含义或否定词。是否为本人业务、代理、共享、转发、改名或归属反证，完全由模型判断。
 - `evidence_hints` 只定位原文，不改变校验或自动关联资格；模型漏引问题、本人声明或关键反证时，不从提示中自动补引用并升级。
-- 引用仍在有效授权范围，正文/会话关系未变化，Curva 精确成员核验仍通过。
-- `catalog_verified` 以服务器核验为准，模型不能用 `out_of_catalog` 推翻 true；若关联证据不足，只将该账号降级待核实。
+- 引用仍在有效授权范围，正文/会话关系未变化；Curva 收录状态与输入快照一致，未收录不是失败理由。目录不可用时以空参考目录继续处理其他明确来源，不使用损坏归档的内容。
+- `catalog_verified` 以服务器核验为准，仅为参考事实；不因 true 直接关联，也不因 false 降级。模型仍返回旧 `out_of_catalog` 时只纠正为待核实，不替模型补造支持结论。
 - 逐 handle 检查因数量或字符容量限制丢失的核心取证组合及已选外部账号片段；受影响账号不得自动关联。这是材料完整性检查，不按词句判定是否否认归属。无关父消息缺失、历史检索截断或其他候选未纳入本包，不作为所有账号的全局否决条件；这些统计仍保留，不能宣称已读完整历史。缺少逐 handle 覆盖标记的旧快照保留原有全局保守门槛。
 - 同 handle 的不同联系人结果统一交叉检查。冲突、历史关系和出库候选进入复核，不自动抢占或覆盖。
 - `store:false`、结构化输出、置信度都不等于内容已正确；拒答、截断、校验失败按未完成处理。
@@ -149,7 +149,7 @@ needed: parent_reply|identity_context|account_context|earlier_username|other_cla
 | Pascal → `pjay4911` | 本人主页链接＋“Here is my page”连续消息，支持；不需要先在线访问主页 |
 | Chantelle → `chanwinginglife` | CM 问具体 handle，本人按回复链确认，支持 |
 | Chantelle → `budgetfindsedituk` | 同一选段只证明有备用账号，没有给其名称，不能因群名含两个 handle 就确认两个 |
-| Genevieve 的两个账号 | “I have 2 accounts”明确列名；分别核验 Curva，分别判断，不合并为改名 |
+| Genevieve 的两个账号 | “I have 2 accounts”明确列名；分别判断本人关系，Curva 仅记录收录状态，不合并为改名 |
 | Gillian → `gillian_tts` | 明确“my backup which is…”，备用账号，不是主账号改名 |
 | Mary Ann 的三个账号 | 主号、新小号、已删除的旧小号区分；不能把所有名字作为当前可用账号 |
 | Shane 的账号 | “Both are mine”支持两条已列主页；另有将旧共同主号转给 Dan 的声明，不把历史主号默认归回本人 |
@@ -160,7 +160,7 @@ needed: parent_reply|identity_context|account_context|earlier_username|other_cla
 | Lamide 的介绍人 | `oladiaries_03` 与“omololaaa1 referred me”分开，介绍人账号不得归给本人；自身开场也须补 TikTok 语境 |
 | `ladyhawks041` / `roxannefreeman` 的邮箱 | 邮箱前缀不能作为 TikTok 自报证据，即使人与样品业务确有联系 |
 | Devin → `devinjadex` | 商品分享链接的 `unique_id` 只能作低强度检索线索，不直接确认归属 |
-| Tom → `portialouise0` | 明确本人第二账号，但当前归档未收录，返回 out_of_catalog，不新增正式关系 |
+| Tom → `portialouise0` | 本人第二账号有精确来源与完整声明时可支持，不因 Curva 未收录否决；仍须核对授权、冲突和历史关系 |
 | Sabiha → `sabihaara` | “My Handel is sabihaara”是本人账号声明；容忍账号词错拼，不修改 handle |
 | Robin → `robc825` | 合作群主名精确命中；本人“my main…both accounts”后4秒发送“Robc825”，引用两条支持主号，括号副号不继承 |
 | Carla → `shop.with.carla` | 两人私聊中 TikTok 查不到其 UID，本人答“It’s shop.with.Carla”；两条员工补充可沿完整真实前驱链连接，不用选段顺序猜问答 |

@@ -24,7 +24,7 @@ def main():
     if not 1 <= len(contacts) <= 5 or any(str(c) in matching.evidence.RESTRICTED_CONTACTS for c in contacts):
         raise SystemExit("Select one to five unrestricted confirmed creators.")
     settings = get_settings()
-    handles, version = matching.catalog()
+    handles, version = matching.reference_catalog()
     with connection() as conn:
         config = matching._config(conn)
         if not config or config["enabled"] or config["provider"] != "openai" or not config["api_key_ciphertext"]:
@@ -58,13 +58,13 @@ def main():
             with conn.transaction():
                 # Do not reverse the worker's config-before-admission lock order.
                 current = matching._config(conn)
-                current_handles, current_version = matching.catalog()
+                current_handles, current_version = matching.reference_catalog()
                 if (
                     not current
                     or current["enabled"]
                     or matching._config_hash(current) != matching._config_hash(config)
                     or current_version != version
-                    or any(h["handle"] not in current_handles for h in pack["handles"])
+                    or not matching._catalog_matches(pack, current_handles)
                     or not matching.evidence.still_valid(conn, refs, settings)
                     or not pack["creator_known"]
                     or not conn.execute(
@@ -108,13 +108,13 @@ def main():
             with conn.transaction():
                 conn.execute("SET TRANSACTION READ ONLY")
                 current = matching._config(conn)
-                current_handles, current_version = matching.catalog()
+                current_handles, current_version = matching.reference_catalog()
                 fresh = bool(
                     current
                     and not current["enabled"]
                     and matching._config_hash(current) == matching._config_hash(config)
                     and current_version == version
-                    and all(h["handle"] in current_handles for h in pack["handles"])
+                    and matching._catalog_matches(pack, current_handles)
                     and matching.evidence.still_valid(conn, refs, settings)
                     and conn.execute(
                         "SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed'",

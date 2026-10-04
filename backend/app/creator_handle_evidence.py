@@ -18,7 +18,7 @@ from . import handle_evidence as handles
 from .crypto import message_body_cipher
 from .openai_client import ModelOutputError
 
-PROMPT_VERSION = "creator-handle-research-v1.10"
+PROMPT_VERSION = "creator-handle-research-v1.11"
 MAX_MESSAGES, MAX_CHARS, MAX_HANDLES, SEARCH_LIMIT = 48, 20_000, 12, 20_000
 # A research hold is an explicit access restriction, not a negative identity finding.
 RESTRICTED_CONTACTS = frozenset({"6abf6bf9-12dc-4a22-9654-2010aa4c7785"})
@@ -120,7 +120,7 @@ def output_format(pack=None):
         creator["state"]["enum"] = ["known"] if pack["creator_known"] else ["supported", "review", "not_supported"]
         if pack["creator_known"]:
             creator["refs"]["maxItems"] = 0
-    return {"type": "json_schema", "name": "creator_handle_v1_10", "strict": True, "schema": schema}
+    return {"type": "json_schema", "name": "creator_handle_v1_11", "strict": True, "schema": schema}
 
 
 def _denied(value):
@@ -166,12 +166,34 @@ def _tokens(value, catalog):
     return {token.casefold().rstrip(".") for token in _TOKEN.findall(value)} & catalog
 
 
+def _body_handles(body, catalog):
+    """Recall explicit accounts outside Curva, never arbitrary conversation words."""
+    found = _tokens(body, catalog)
+    account_context = bool(re.search(r"\btik\s*tok\b|\btt\b|抖音", body, re.I)
+                           or _SELF.search(body) and not re.search(
+                               r"\b(?:bank|seller|shop|business|payment)\s+account\b", body, re.I))
+    for clue in handles._clues(body):
+        raw = body[slice(*clue["span"])]
+        if raw.casefold().startswith(("http://", "https://")):
+            try:
+                handles.normalize_handle(raw.rstrip(".,!?)"))
+            except ValueError:
+                continue  # A video URL is not an exact profile link.
+        elif not account_context:
+            continue
+        found.add(clue["handle"])
+    return found
+
+
 def _group_handle(chat):
     """Only the exact primary account in an established company cooperation title."""
     match = handles._GROUP_NAME.match(re.sub(r"\([^()\r\n]*\)", "", chat.get("name") or ""))
     if (chat.get("mode", chat.get("chat_mode")) == "group" and match
             and re.search(r"[xX×*＊&|·。]\s*(?:TT(?:\s*Media)?|Trutonic\s*Media)\b", match[0], re.I)):
-        return match[1].casefold()
+        try:
+            return handles.normalize_handle(match[1])
+        except ValueError:
+            return None
     return None
 
 
@@ -289,7 +311,7 @@ def build(conn, settings, contact_id, catalog, *, recheck=False):
             raw = text._decrypt_body(cipher, row["body_ciphertext"])
             body = _plain(raw, row) if raw is not None else ""
             if body and "消息没有可展示的文本" not in body:
-                items.append({"row": row, "text": body, "handles": _tokens(body, catalog),
+                items.append({"row": row, "text": body, "handles": _body_handles(body, catalog),
                               "body_hash": access._hash(raw)})
         return items
 
@@ -332,8 +354,9 @@ def build(conn, settings, contact_id, catalog, *, recheck=False):
         for handle in item["handles"]:
             scores[handle] += 4 if item["row"]["sender_open_id"] in open_ids else 2
     for chat in chats:
-        for handle in _tokens(chat["name"] or "", catalog):
-            scores[handle] += 8 if _group_handle(chat) == handle else 1
+        primary = _group_handle(chat)
+        for handle in _tokens(chat["name"] or "", catalog) | ({primary} if primary else set()):
+            scores[handle] += 8 if primary == handle else 1
     previous_answers = dict(denial_previous)
     by_key = {_key(i["row"]): i for i in [*own, *parents]}
     answer_chains = {}
@@ -470,7 +493,8 @@ def build(conn, settings, contact_id, catalog, *, recheck=False):
     refs.extend({"kind": "chat", "label": groups[c["chat_id"]], "chat_id": c["chat_id"],
                  "name_hash": access._hash(c["name"])} for c in used_chats)
     pack = {"target": "U1", "creator_known": known, "confirmed_handles": sorted(confirmed - candidate_set),
-            "handles": [{"id": f"H{i}", "handle": h, "catalog_verified": True} for i, h in enumerate(candidates, 1)],
+            "handles": [{"id": f"H{i}", "handle": h, "catalog_verified": h in catalog}
+                        for i, h in enumerate(candidates, 1)],
             "people": people, "chats": [{"id": groups[c["chat_id"]], "name": c["name"] or "",
                                           "mode": c["chat_mode"] or "unknown"} for c in used_chats],
             "messages": messages, "coverage": {"full_history": False,
@@ -782,8 +806,8 @@ def validate(pack, result):
             _review(link, "needed", messages)
             continue
         candidate = candidates[link["h"]]
-        if candidate["catalog_verified"] and link["code"] == "out_of_catalog":
-            # Curva membership is a server fact. Correct the reason without upgrading evidence.
+        if link["code"] == "out_of_catalog":
+            # Directory coverage is not an ownership verdict; do not upgrade old refusals.
             _review(link, "unsupported_evidence", messages)
             link["code"] = "no_link_evidence"
             continue
@@ -791,9 +815,6 @@ def validate(pack, result):
             continue
         cited = [messages[ref] for ref in link["refs"]]
         own = [m for m in cited if m["speaker"] == pack["target"]]
-        if not candidate["catalog_verified"]:
-            _review(link, "out_of_catalog", messages)
-            continue
         if not own or (link["code"] != "group_context"
                        and not any(_mentions(m["text"], candidate["handle"]) for m in cited)):
             _review(link, "unsupported_evidence", messages)

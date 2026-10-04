@@ -8,7 +8,7 @@
 } %}
 {% set reason_labels = {
   'ready': '证据已准备', 'cached': '复用已有结果', 'suggestions_saved': '匹配结果已保存',
-  'no_text': '没有可读消息', 'no_candidates': '缺少 Curva 账号线索', 'restricted': '不在处理范围',
+  'no_text': '没有可读消息', 'no_candidates': '未找到新的账号线索', 'restricted': '不在处理范围',
   'no_account_evidence': '缺少可用关联证据',
   'material_limit': '证据超出处理上限', 'catalog_unavailable': 'Curva 名单暂不可用',
   'preparation_failed': '证据准备失败', 'snapshot_changed': '证据或配置已更新',
@@ -27,7 +27,7 @@
   'excerpted_support': '证据不完整', 'owner_code': '缺少本人归属证据',
   'unconnected_owner_evidence': '本人归属证据未连接', 'counterevidence': '账号归属存在反证',
   'reply_relation': '引用未连接到真实回复链',
-  'out_of_catalog': '不在 Curva 名单', 'internal_error': '内部处理异常'
+  'out_of_catalog': '旧版目录限制', 'internal_error': '内部处理异常'
 } %}
 {% set relation_labels = {
   'self_account': '本人账号', 'account_creator': '内容创作者', 'operator': '代运营',
@@ -38,7 +38,7 @@
   'group_context': '群名与本人业务证据',
   'operates_for_other': '替他人运营', 'third_party': '第三方提及', 'mention_only': '仅提及账号',
   'no_link_evidence': '缺少关联证据', 'ambiguous_reply': '回复对象不明', 'conflict': '账号关系待核实',
-  'username_changed': '账号曾更名', 'out_of_catalog': '不在 Curva 名单'
+  'username_changed': '账号曾更名', 'out_of_catalog': '旧版目录限制'
 } %}
 {% set period_labels = {'at_message': '消息时点', 'historical': '历史关系', 'unknown': '时点不明'} %}
 <div class="page">

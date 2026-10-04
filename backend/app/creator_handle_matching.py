@@ -50,6 +50,18 @@ def catalog():
     return _load_catalog(str(path), (path / "manifest.json").stat().st_mtime_ns)
 
 
+def reference_catalog():
+    """Curva is an optional reference, never permission to associate an account."""
+    try:
+        return catalog()
+    except (OSError, ValueError, KeyError):
+        return frozenset(), "unavailable"
+
+
+def _catalog_matches(pack, handles):
+    return all(h["catalog_verified"] == (h["handle"] in handles) for h in pack["handles"])
+
+
 @lru_cache(maxsize=2)
 def _load_catalog(directory, _modified):
     root = Path(directory)
@@ -156,10 +168,7 @@ def prepare_next(settings):
         _recover(conn)
         # Trigger is primary. This low-frequency indexed check covers clients that predate the hook.
         if config["reconcile_due"]:
-            try:
-                _, catalog_version = catalog()
-            except (OSError, ValueError, KeyError):
-                catalog_version = None
+            _, catalog_version = reference_catalog()
             if catalog_version and catalog_version != config["matching_catalog_version"]:
                 # Reprepare only previously enrolled contacts; unchanged selected evidence is cached.
                 conn.execute("""SELECT enqueue_creator_handle(contact_id,'incremental',TRUE)
@@ -200,7 +209,7 @@ def prepare_next(settings):
         version = job["desired_version"]
         config_hash = _config_hash(config)
     try:
-        handles, catalog_version = catalog()
+        handles, catalog_version = reference_catalog()
         with connection() as conn, conn.transaction():
             conn.execute("SET LOCAL statement_timeout='90s'")
             prepared = evidence.build(conn, settings, job["contact_id"], handles, recheck=job["source"] == "manual")
@@ -373,12 +382,9 @@ def _apply_links(conn, job, pack, result, stats, refs, settings, catalog_version
         conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,137034))", ("tiktok:" + handle,))
     if claimed:
         conn.execute("SELECT id FROM contacts WHERE id=%s FOR UPDATE", (job["contact_id"],))
-        # Locks may have waited: recheck catalog, authorization and identity before writing.
-        try:
-            current_handles, version = catalog()
-            if version != catalog_version or any(h["handle"] not in current_handles for h in pack["handles"]):
-                return None
-        except (OSError, ValueError, KeyError):
+        # Locks may have waited: recheck reference facts, authorization and identity.
+        current_handles, version = reference_catalog()
+        if version != catalog_version or not _catalog_matches(pack, current_handles):
             return None
         if (
             not evidence.still_valid(conn, refs, settings)
@@ -686,8 +692,8 @@ def run(job, settings):
     result, telemetry, error, diagnostic = None, {}, None, None
     network_started = False
     try:
-        handles, version = catalog()
-        if version != job["catalog_version"] or any(h["handle"] not in handles for h in job["pack"]["handles"]):
+        handles, version = reference_catalog()
+        if version != job["catalog_version"] or not _catalog_matches(job["pack"], handles):
             raise ValueError("catalog_changed")
         network_started = True
         result, telemetry, error, diagnostic = review(job["pack"], job["config"], job["contact_id"], settings)
@@ -726,13 +732,8 @@ def run(job, settings):
         if not evidence.still_valid(conn, current["refs"], settings):
             _invalidate(conn, current)
             return
-        try:
-            current_handles, version = catalog()
-            catalog_valid = version == job["catalog_version"] and all(
-                h["handle"] in current_handles for h in job["pack"]["handles"]
-            )
-        except (OSError, ValueError, KeyError):
-            catalog_valid = False
+        current_handles, version = reference_catalog()
+        catalog_valid = version == job["catalog_version"] and _catalog_matches(job["pack"], current_handles)
         if not catalog_valid or (isinstance(error, ValueError) and str(error) == "catalog_changed"):
             _invalidate(conn, current)
             return
@@ -824,11 +825,7 @@ def page_data(conn, actor, settings, page=1):
         ((page - 1) * 50,),
     ).fetchall()
     storage = creator_data.cipher(settings)
-    try:
-        current_handles, version = catalog()
-    except (OSError, ValueError, KeyError):
-        current_handles = frozenset()
-        version = None
+    _, version = reference_catalog()
     associations = {}
     for row in contact_handles.confirmed_pairs(conn, [j["contact_id"] for j in jobs]):
         associations.setdefault(str(row["contact_id"]), []).append(
@@ -849,7 +846,6 @@ def page_data(conn, actor, settings, page=1):
                     "handle": view["handles"][link["h"]],
                 }
                 for link in view["result"]["links"]
-                if view["handles"][link["h"]] in current_handles
             ]
             conflicts = creator_imports._conflicts(
                 conn, [(None, job["contact_id"], link["handle"]) for link in job["suggestions"]]

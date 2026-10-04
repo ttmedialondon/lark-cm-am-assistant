@@ -282,7 +282,8 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
                "WHERE contact_id=%s AND social_account_id=(SELECT id FROM social_accounts "
                "WHERE normalized_handle='first.handle')", (contact,))
     ai_import = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))
-    assert ai_import['reason'] == 'already_confirmed' and ai_import['pack'] is None
+    assert ai_import['reason'] == 'ready'
+    assert [h['handle'] for h in ai_import['pack']['handles']] == ['backup_2']
     assert ai_import['stats']['human_confirmed_handles'] == ['outside_catalog']  # Upload is not human review.
     assert ai_import['stats']['confirmed_handles'] == ['first.handle', 'outside_catalog']
     manual = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}), recheck=True)
@@ -290,7 +291,8 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
     assert manual['stats']['manual_recheck'] and manual['stats']['recheck_handles'] == ['first.handle']
     message('ownership_denial', 'ou_creator', 'first.handle is not my account', 97)
     skipped = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))
-    assert skipped['reason'] == 'already_confirmed'  # No regex-based paid rechecks of formal pairs.
+    assert skipped['reason'] == 'ready'
+    assert [h['handle'] for h in skipped['pack']['handles']] == ['backup_2']  # Only the new account is rechecked.
     assert matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}), recheck=True)['reason'] == 'ready'
     pg.execute("ROLLBACK TO SAVEPOINT human_pairs")
     pg.execute("SAVEPOINT intro_counter")
@@ -381,6 +383,21 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
     group_only = matcher.build(pg, pilot.settings, contact, catalog)
     assert group_only["reason"] == "ready" and group_only["pack"] is not None
     assert group_only["stats"]["readable_messages"] > 0
+    # Explicit TikTok account evidence can introduce a precise handle without a Curva row.
+    pg.execute("SAVEPOINT non_catalog_claim")
+    pg.execute("UPDATE chats SET name='MAC Creators',chat_mode='group' WHERE chat_id=%s", (chat,))
+    assert matcher.build(pg, pilot.settings, contact, frozenset())["reason"] == "no_candidates"
+    message("outside_self_claim", "ou_creator", "My TikTok username is outside.creator", 200)
+    outside = matcher.build(pg, pilot.settings, contact, frozenset())
+    assert outside["reason"] == "ready"
+    assert outside["pack"]["handles"] == [
+        {"id": "H1", "handle": "outside.creator", "catalog_verified": False}]
+    own_reference = next(m["id"] for m in outside["pack"]["messages"] if "outside.creator" in m["text"])
+    outside_result = {"creator": {"state": "known", "refs": []}, "links": [
+        {"h": "H1", "decision": "supported", "relation": "self_account", "period": "at_message",
+         "code": "self_claim", "refs": [own_reference], "needed": []}]}
+    assert matcher.validate(outside["pack"], outside_result) == outside_result
+    pg.execute("ROLLBACK TO SAVEPOINT non_catalog_claim")
 
 
 def test_model_language_judgment_preserved_with_structural_guards():
@@ -461,7 +478,10 @@ def test_model_language_judgment_preserved_with_structural_guards():
     assert matcher.validate(group, grouped)["links"][0]["validation_error"] == "unsupported_evidence"
     group["chats"][0]["name"] = "sarahdisneymum X TT Media"
     group["handles"][0]["catalog_verified"] = False
-    assert matcher.validate(group, grouped)["links"][0]["validation_error"] == "out_of_catalog"
+    assert matcher.validate(group, grouped) == grouped  # Curva supports recall, not ownership eligibility.
+    no_person = deepcopy(group)
+    no_person["messages"][1]["speaker"] = "U2"
+    assert matcher.validate(no_person, grouped)["links"][0]["validation_error"] == "unsupported_evidence"
     assert matcher._tokens("@.Creator_1. / .creator_1 / .creator_10", frozenset({".creator_1"})) == {".creator_1"}
     assert not matcher._tokens("a" * 65, frozenset({"a" * 64, "a"}))
     assert matcher._plain(json.dumps({"content": [[{"tag": "img", "image_key": "hidden-pixels"}]]}),
