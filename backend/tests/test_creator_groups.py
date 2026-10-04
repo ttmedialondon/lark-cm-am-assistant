@@ -45,8 +45,7 @@ def test_creator_group_queue_real_authorization_manual_lock_and_billing_fences(p
     monkeypatch.setattr(config, "get_settings", lambda: settings)
     monkeypatch.setattr(routes, "get_settings", lambda: settings)
     calls = []
-    answer = {"purpose": "support", "confidence": .94, "tags": [],
-              "reason": "Individual creator support", "refs": ["G1", "M1"]}
+    answer = {"purpose": "support", "confidence": .94, "tags": [], "refs": ["G1", "M1"]}
 
     def respond(feature, key, pack, target, **kwargs):
         calls.append({"feature": feature, "key": key, "pack": pack, "kwargs": kwargs})
@@ -73,6 +72,15 @@ def test_creator_group_queue_real_authorization_manual_lock_and_billing_fences(p
 
     assert not matching._enabled(matching._config(pg))
     assert pg.execute("SELECT count(*) n FROM creator_group_jobs").fetchone()["n"] == 0
+    assert pg.execute("SELECT creator_group_is_eligible('oc_p2p') eligible").fetchone()["eligible"] is False
+    pg.execute("SAVEPOINT group_scope")
+    pg.execute("DELETE FROM chat_members WHERE chat_id='oc_topic'")
+    assert pg.execute("SELECT creator_group_is_eligible('oc_topic') eligible").fetchone()["eligible"] is True
+    pg.execute("UPDATE chat_messages SET is_deleted=TRUE WHERE chat_id='oc_topic'")
+    assert pg.execute("SELECT creator_group_is_eligible('oc_topic') eligible").fetchone()["eligible"] is False
+    pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (owner,))
+    assert pg.execute("SELECT creator_group_is_eligible('oc_group') eligible").fetchone()["eligible"] is False
+    pg.execute("ROLLBACK TO SAVEPOINT group_scope")
     assert not any(r["enabled"] for r in pg.execute(
         "SELECT enabled FROM ai_feature_configs WHERE feature IN ('creator_group_classification',"
         "'creator_responsibility_matching','creator_handle_matching')").fetchall())
@@ -84,8 +92,10 @@ def test_creator_group_queue_real_authorization_manual_lock_and_billing_fences(p
     assert matching.enqueue(pg, owner) == {"queued": 0}
     for _ in range(2):
         job = prepared()
+        assert evidence.validate(job["pack"], {**answer, "reason": "Legacy paid result"}) == answer
         answer["confidence"] = .99 if job["chat_id"] == "oc_group" else .94
         matching.run(job, settings)
+    assert all(set(c["kwargs"]["output_format"]["schema"]["required"]) == set(answer) for c in calls)
     assert pg.execute("""SELECT purpose,source,locked FROM chat_group_classifications
         WHERE chat_id='oc_group'""").fetchone() == {
         "purpose": "unknown", "source": "manual", "locked": False,
@@ -103,6 +113,8 @@ def test_creator_group_queue_real_authorization_manual_lock_and_billing_fences(p
     assert len(data["jobs"]) == 2 and all(j["result"]["purpose"] == "support" for j in data["jobs"])
     assert all("pack_ciphertext" not in j for j in data["jobs"])
     first = next(j for j in data["jobs"] if j["chat_id"] == "oc_group")
+    assert first["display_purpose"] == "support" and first["display_confidence"] == "99%"
+    assert first["display_status"] == "待核实"  # Manual unknown must not hide a valid new suggestion.
     material = matching.task_evidence(pg, owner, settings, first["id"])
     assert material["pack"]["messages"][0]["text"] == "Can you fix my sample request?"
     # A normal sync can re-encrypt identical plaintext with a fresh nonce; that is not new evidence.
@@ -160,6 +172,14 @@ def test_creator_group_queue_real_authorization_manual_lock_and_billing_fences(p
     assert formal["source"] == "ai" and formal["purpose"] == "support" and not formal["locked"]
     assert float(formal["confidence"]) == .95 and formal["confirmed_by_authorization_id"] is None
     assert next(j for j in matching.page_data(pg, owner, settings)["jobs"] if j["id"] == high["id"])["auto_linked"]
+    with monkeypatch.context() as no_list_evidence:
+        no_list_evidence.setattr(evidence, "still_valid",
+                                lambda *_a, **_k: pytest.fail("Formal list needs no evidence"))
+        compact_page = matching.page_data(pg, owner, settings)
+    assert all(j["result"] is None for j in compact_page["jobs"])
+    assert compact_page["summary_counts"] == {"classified": 2}
+    assert next(j for j in compact_page["jobs"] if j["id"] == high["id"])["has_evidence"]
+    assert next(j for j in compact_page["jobs"] if j["id"] == high["id"])["display_status"] == "已入库"
     pg.execute("""UPDATE creator_group_jobs SET stats=stats||'{"auto_deferred":true}'::jsonb,
         not_before=NOW()+INTERVAL '1 hour' WHERE id=%s""", (high["id"],))
     reclassify("training", .99)
@@ -189,6 +209,14 @@ def test_creator_group_queue_real_authorization_manual_lock_and_billing_fences(p
                (cipher.encrypt(json.dumps({"text": "Please join this one-off campaign this week."})),))
     reclassify("campaign", .94)
     assert classification() == formal
+    legacy_job = pg.execute("SELECT id,result_ciphertext FROM creator_group_jobs WHERE chat_id='oc_topic' "
+                            "ORDER BY created_at DESC,id DESC LIMIT 1").fetchone()
+    legacy_result = json.loads(matching.creator_data.cipher(settings).decrypt(legacy_job["result_ciphertext"]))
+    legacy_result["reason"] = "Previously paid v1.1 explanation"
+    pg.execute("UPDATE creator_group_jobs SET stats=stats||jsonb_build_object('prompt_version',%s::text),"
+               "result_ciphertext=%s WHERE id=%s", (evidence.CLASSIFICATION_VERSION,
+                   matching.creator_data.cipher(settings).encrypt(json.dumps(legacy_result)), legacy_job["id"]))
+    assert matching.enqueue(pg, owner) == {"queued": 0}  # Output-only upgrades never restart already-paid groups.
     enable(threshold=.93)
     before = len(calls)
     cached_id = pg.execute("SELECT enqueue_creator_group('oc_topic','history',TRUE) id").fetchone()["id"]

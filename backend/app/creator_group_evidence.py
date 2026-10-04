@@ -12,7 +12,9 @@ from . import evidence_text as text
 from .crypto import message_body_cipher
 from .openai_client import ModelOutputError
 
-PROMPT_VERSION = "creator-group-purpose-v1.1"
+CLASSIFICATION_VERSION = "creator-group-purpose-v1.1"
+PROMPT_VERSION = "creator-group-purpose-v1.2"
+COMPATIBLE_PROMPT_VERSIONS = frozenset({CLASSIFICATION_VERSION, PROMPT_VERSION})
 PURPOSES = {"support": "客服群", "community": "机构达人群", "training": "培训群",
             "category": "类目群", "campaign": "活动群", "unknown": "未确认"}
 MAX_MESSAGES, MAX_CHARS, SEARCH_LIMIT = 64, 24_000, 4_000
@@ -168,7 +170,7 @@ def build(conn, settings, chat_id):
             "messages": messages, "coverage": {**stats, "missing_reply_ids": missing,
                 "backfill_complete": any(g["backfill_complete"] for g in grants)}}
     return {"pack": pack, "refs": refs, "stats": stats, "reason": "ready",
-            "fingerprint": access._hash([PROMPT_VERSION, pack, access._hash(snapshot)])}
+            "fingerprint": access._hash([CLASSIFICATION_VERSION, pack, access._hash(snapshot)])}
 
 
 def still_valid(conn, refs, settings, *, lightweight=False):
@@ -188,24 +190,28 @@ def still_valid(conn, refs, settings, *, lightweight=False):
 def output_format(pack):
     references = [pack["chat"]["id"], *(m["id"] for m in pack["messages"])]
     schema = {"type": "object", "additionalProperties": False,
-        "required": ["purpose", "confidence", "tags", "reason", "refs"], "properties": {
+        "required": ["purpose", "confidence", "tags", "refs"], "properties": {
             "purpose": {"type": "string", "enum": list(PURPOSES)},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "tags": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 80}},
-            "reason": {"type": "string", "maxLength": 600},
             "refs": {"type": "array", "maxItems": 8, "items": {"type": "string", "enum": references}}}}
-    return {"type": "json_schema", "name": "creator_group_purpose_v1", "strict": True, "schema": schema}
+    return {"type": "json_schema", "name": "creator_group_purpose_v2", "strict": True, "schema": schema}
 
 
 def validate(pack, result):
     schema = output_format(pack)["schema"]
+    legacy = set(schema["required"]) | {"reason"}
+    if isinstance(result, dict) and set(result) == legacy:
+        if not isinstance(result["reason"], str) or len(result["reason"]) > 600:
+            raise ModelOutputError("reason")
+        result = {key: value for key, value in result.items() if key != "reason"}
     source._shape(result, schema)
     if len(result["tags"]) > 8 or any(not t.strip() or len(t) > 80 for t in result["tags"]):
         raise ModelOutputError("tags")
-    if len(result["reason"]) > 600 or len(result["refs"]) > 8:
+    if len(result["refs"]) > 8:
         raise ModelOutputError("bounds")
     result = {**result, "tags": list(dict.fromkeys(t.strip() for t in result["tags"])),
               "refs": list(dict.fromkeys(result["refs"]))}
     if result["purpose"] != "unknown" and not result["refs"]:
-        result.update(purpose="unknown", reason="分类没有可核对的材料引用，需人工核实。")
+        result["purpose"] = "unknown"
     return result

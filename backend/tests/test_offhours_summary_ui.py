@@ -151,6 +151,52 @@ def test_matching_template_escapes_names_and_distinguishes_associations_from_his
     assert "待核实：2" in html  # The task ledger and controls still use the original status.
 
 
+def test_group_classification_table_keeps_auto_results_final_and_review_controls_folded():
+    from app.creator_group_evidence import PURPOSES
+
+    environment = Environment(loader=FileSystemLoader(APP / "templates"), autoescape=select_autoescape())
+    auto_id, review_id = uuid4(), uuid4()
+    common = {"status": "completed", "stale": False, "locked": False, "confirmed_tags": [],
+              "reason": "Internal diagnostic", "stats": {"included_messages": 42},
+              "input_tokens": 2000, "output_tokens": 100}
+    html = environment.get_template("admin/creator_groups.html").render(
+        authorization={"display_name": "Fixture Reviewer"}, admin_landing_path="/admin", admin_role="owner",
+        admin_permissions=admin.admin_permissions.PAGE_KEYS, permission_pages=admin.admin_permissions.PAGES,
+        active_page="ai", csrf_token="fixture-csrf", evidence=None, purposes=PURPOSES, matching={
+            "enabled": True, "page": 1, "has_more": False,
+            "summary_counts": {"classified": 1, "pending": 0, "review": 1, "error": 0},
+            "jobs": [
+                {**common, "id": auto_id, "chat_id": "oc_auto", "name": "<script>fixture</script>",
+                 "confirmed_purpose": "support", "display_purpose": "support", "display_label": "客服群",
+                 "display_confidence": "98%", "display_status": "已分类", "display_state": "classified",
+                 "result": None, "has_evidence": True},
+                {**common, "id": review_id, "chat_id": "oc_review", "name": "Review group",
+                 "confirmed_purpose": None, "display_purpose": "training", "display_label": "培训群",
+                 "display_confidence": "75%", "display_status": "待核实", "display_state": "review",
+                 "result": {"purpose": "training", "purpose_label": "培训群", "confidence_label": "75%",
+                            "reason": "Long model explanation", "tags": ["writing"], "refs": ["M2"]}},
+            ],
+        },
+    )
+    assert "<script>fixture</script>" not in html and "&lt;script&gt;fixture&lt;/script&gt;" in html
+    assert "<th>群名</th><th>类型</th><th>置信度</th><th>状态</th><th>操作</th>" in html
+    assert "已分类 1" in html and "待核实 1" in html
+    assert "98%" in html and "75%" in html
+    assert "Long model explanation" not in html and "Internal diagnostic" not in html
+    assert "累计 Token" not in html and "证据 42 条" not in html
+    assert "正式分类：" not in html and "AI 建议：" not in html and "确认分类" not in html
+    auto_row = re.search(r"<tr><td class=\"text-break\">&lt;script&gt;.*?</tr>", html, re.S).group(0)
+    assert "采用建议" not in auto_row and "锁定此分类" not in auto_row
+    assert re.search(r"<details>.*?/jobs/" + str(auto_id) + r"/evidence.*?</details>", auto_row, re.S)
+    assert "<details open" not in html
+    review_row = re.search(r'<tr><td class="text-break">Review group.*?</tr>', html, re.S).group(0)
+    adoption = re.search(r"<form.*?采用建议</button></form>", review_row, re.S).group(0)
+    assert f'name="source_job_id" value="{review_id}"' in adoption
+    assert 'name="locked"' not in adoption
+    assert all('name="csrf_token" value="fixture-csrf"' in form
+               for form in re.findall(r"<form .*?</form>", html, re.S))
+
+
 def test_template_never_exposes_admin_to_a_viewer_and_escapes_private_json():
     hostile = "</script><script>alert(1)</script>"
     html = render({"can_manage": False, "events": [{"title": hostile}]})

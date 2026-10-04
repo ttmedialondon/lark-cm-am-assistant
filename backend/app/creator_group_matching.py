@@ -51,7 +51,8 @@ def _enabled(config):
 
 
 def _config_hash(config):
-    return _hash({**dict(config or {}), "prompt_version": evidence.PROMPT_VERSION})
+    # Output-only revisions reuse the same decisions; credentials and admission rules still fence requests.
+    return _hash({**dict(config or {}), "prompt_version": evidence.CLASSIFICATION_VERSION})
 
 
 def _audit(conn, actor, action, metadata):
@@ -148,7 +149,8 @@ def touch_chats(conn, chat_ids, settings=None):
     for chat_id in sorted(set(chat_ids)):
         job = current.get(chat_id)
         if job and (job["reason_code"] == "request_unknown" or (
-                job["status"] == "completed" and job["stats"].get("prompt_version") == evidence.PROMPT_VERSION
+                job["status"] == "completed"
+                and job["stats"].get("prompt_version") in evidence.COMPATIBLE_PROMPT_VERSIONS
                 and job["stats"].get("suggested_purpose") not in {None, "unknown"}
                 and evidence.still_valid(conn, job["refs"], settings, lightweight=True))):
             continue
@@ -162,8 +164,9 @@ def enqueue(conn, actor):
     rows = conn.execute("""SELECT c.chat_id FROM chats c WHERE creator_group_is_eligible(c.chat_id)
         AND NOT EXISTS(SELECT 1 FROM chat_group_classifications f WHERE f.chat_id=c.chat_id AND f.locked)
         AND NOT EXISTS(SELECT 1 FROM creator_group_jobs j WHERE j.chat_id=c.chat_id AND (
-          j.status NOT IN ('completed','failed','cancelled') OR j.status='completed' AND j.stats->>'prompt_version'=%s))
-        ORDER BY c.chat_id""", (evidence.PROMPT_VERSION,)).fetchall()
+          j.status NOT IN ('completed','failed','cancelled') OR j.status='completed'
+          AND j.stats->>'prompt_version'=ANY(%s::text[])))
+        ORDER BY c.chat_id""", (sorted(evidence.COMPATIBLE_PROMPT_VERSIONS),)).fetchall()
     for row in rows:
         conn.execute("SELECT enqueue_creator_group(%s,'history')", (row["chat_id"],))
     _audit(conn, actor, "enqueued", {"queued": len(rows), "prompt_version": evidence.PROMPT_VERSION})
@@ -201,7 +204,7 @@ def prepare_next(settings):
         if deferred:
             storage = creator_data.cipher(settings)
             admitted = False
-            if (deferred["stats"].get("prompt_version") == evidence.PROMPT_VERSION
+            if (deferred["stats"].get("prompt_version") in evidence.COMPATIBLE_PROMPT_VERSIONS
                     and evidence.still_valid(conn, deferred["refs"], settings)):
                 pack = json.loads(storage.decrypt(deferred["pack_ciphertext"]))
                 result = evidence.validate(pack, json.loads(storage.decrypt(deferred["result_ciphertext"])))
@@ -244,7 +247,7 @@ def prepare_next(settings):
             _invalidate(conn, current, current_config)
             return True
         fingerprint = _hash([material["fingerprint"], config["provider"], config["project_id"],
-                             config["model"], evidence.PROMPT_VERSION])
+                             config["model"], evidence.CLASSIFICATION_VERSION])
         cached = conn.execute("""SELECT result_ciphertext FROM creator_group_jobs WHERE chat_id=%s AND fingerprint=%s
             AND status='completed' AND result_ciphertext IS NOT NULL ORDER BY updated_at DESC LIMIT 1""",
                               (job["chat_id"], fingerprint)).fetchone() if pack and job["source"] != "manual" else None
@@ -275,9 +278,11 @@ def claim():
     settings = get_settings()
     with connection() as conn, conn.transaction():
         config = _config(conn, lock=True)
-        if not _enabled(config) or not ai_dispatch.can_claim(conn):
+        if not _enabled(config):
             return None
         _recover(conn)
+        if not ai_dispatch.can_claim(conn):
+            return None
         job = conn.execute("""SELECT * FROM creator_group_jobs WHERE status IN ('ready','retry_wait')
             AND not_before<=NOW() AND attempts<3 ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1""").fetchone()
         if not job:
@@ -383,7 +388,15 @@ def _result(conn, job, settings, *, lightweight=False):
         return None
     if not evidence.still_valid(conn, job["refs"], settings, lightweight=lightweight):
         return None
+    return _decode_result(job, settings)
+
+
+def _decode_result(job, settings):
+    """Only called after current material is checked; formal directory rows need no model payload."""
+    if not job["result_ciphertext"]:
+        return None
     result = json.loads(creator_data.cipher(settings).decrypt(job["result_ciphertext"]))
+    result.pop("reason", None)
     return {**result, "purpose_label": PURPOSES[result["purpose"]], "confidence_label": f"{result['confidence']:.0%}"}
 
 
@@ -393,6 +406,12 @@ def page_data(conn, actor, settings, page=1):
               "ORDER BY chat_id,created_at DESC,id DESC) ")
     counts = {r["status"]: r["n"] for r in conn.execute(
         latest + "SELECT status,count(*) n FROM latest GROUP BY status").fetchall()}
+    summary_counts = {r["state"]: r["n"] for r in conn.execute(latest + """SELECT
+        CASE WHEN j.status='failed' THEN 'error'
+             WHEN j.status IN ('queued','preparing','ready','running','retry_wait')
+               OR j.stats->>'auto_deferred'='true' THEN 'pending'
+             WHEN f.purpose IS NOT NULL AND f.purpose<>'unknown' THEN 'classified' ELSE 'review' END state,count(*) n
+        FROM latest j LEFT JOIN chat_group_classifications f ON f.chat_id=j.chat_id GROUP BY state""").fetchall()}
     rows = conn.execute(latest + """SELECT j.id,j.chat_id,j.status,j.reason_code,j.stats,j.result_ciphertext,j.refs,
         j.source,j.input_tokens,j.output_tokens,j.created_at,j.updated_at,
         c.name,c.chat_mode,f.purpose AS confirmed_purpose,f.tags AS confirmed_tags,
@@ -406,9 +425,24 @@ def page_data(conn, actor, settings, page=1):
         row.update(status_label=STATUSES[row["status"]], reason=REASONS.get(row["reason_code"], row["reason_code"]),
                    confirmed_label=PURPOSES.get(row["confirmed_purpose"]),
                    auto_linked=row["confirmed_source"] == "ai" and row["source_job_id"] == row["id"],
-                   outdated=row["stats"].get("prompt_version") != evidence.PROMPT_VERSION)
-        row["result"] = _result(conn, row, settings, lightweight=True)
-        row["stale"] = bool(row["result_ciphertext"] and row["result"] is None)
+                   outdated=row["stats"].get("prompt_version") not in evidence.COMPATIBLE_PROMPT_VERSIONS)
+        classified = row["confirmed_purpose"] not in (None, "unknown")
+        row["has_evidence"] = bool(row["result_ciphertext"])
+        # A stored classification is a business fact, not a request to reopen its chat evidence on every page.
+        row["result"] = None if classified else _result(conn, row, settings, lightweight=True)
+        row["stale"] = bool(not classified and row["result_ciphertext"] and row["result"] is None)
+        result = row["result"]
+        purpose = row["confirmed_purpose"] if classified else result["purpose"] if result else "unknown"
+        confidence = row["confirmed_confidence"] if classified else result["confidence"] if result else None
+        state = ("error" if row["status"] == "failed" else "pending"
+                 if row["status"] in {"queued", "preparing", "ready", "running", "retry_wait"}
+                 or row["stats"].get("auto_deferred") else "classified" if classified else "review")
+        row.update(display_purpose=purpose, display_label=PURPOSES[purpose], display_state=state,
+                   display_confidence=f"{confidence:.0%}" if confidence is not None else "—",
+                   display_status=("人工分类" if row["confirmed_source"] == "manual" else "已入库")
+                       if state == "classified" else "入库中" if row["stats"].get("auto_deferred")
+                       else "等待证据" if row["status"] == "waiting_evidence"
+                       else {"error": "失败", "pending": "处理中", "review": "待核实"}[state])
         if row["result"]:
             viewed.append(str(row["id"]))
         for key in ("pack_ciphertext", "result_ciphertext", "refs", "config_fingerprint", "claim_token"):
@@ -417,7 +451,7 @@ def page_data(conn, actor, settings, page=1):
         _audit(conn, actor, "results_viewed", {"jobs": viewed})
     config = _config(conn)
     threshold = config["auto_confirm_threshold"]
-    return {"jobs": rows, "counts": counts, "page": page, "has_more": more,
+    return {"jobs": rows, "counts": counts, "summary_counts": summary_counts, "page": page, "has_more": more,
             "enabled": _enabled(config), "purposes": PURPOSES, "prompt_version": evidence.PROMPT_VERSION,
             "threshold": float(threshold), "threshold_label": f"{threshold:.0%}"}
 
@@ -433,7 +467,7 @@ def task_evidence(conn, actor, settings, job_id):
     pack = json.loads(creator_data.cipher(settings).decrypt(job["pack_ciphertext"]))
     _audit(conn, actor, "evidence_viewed", {"job_id": str(job_id), "messages": len(pack["messages"])})
     return {"job_id": str(job_id), "chat_id": job["chat_id"], "name": job["name"], "pack": pack,
-            "result": _result(conn, job, settings), "stats": job["stats"]}
+            "result": _decode_result(job, settings), "stats": job["stats"]}
 
 
 def action(conn, actor, job_id, operation):
