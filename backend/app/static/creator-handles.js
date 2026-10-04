@@ -133,7 +133,7 @@
     const avatar = node("span", "", "avatar avatar-sm bg-blue-lt rounded-circle flex-shrink-0 position-relative overflow-hidden");
     avatar.setAttribute("aria-hidden", "true");
     const initial = node("span"); avatar.append(initial);
-    const name = node("span", "", "fw-bold");
+    const name = node("a", "", "fw-bold");
     const lark = node("a", "", "creator-lark-link text-secondary");
     const icon = node("img"); icon.src = "/static/lark-share.svg"; icon.alt = "";
     icon.width = 16; icon.height = 16; icon.setAttribute("aria-hidden", "true"); lark.append(icon);
@@ -167,6 +167,9 @@
       if (el("rows").children[index] !== parts.row) el("rows").insertBefore(parts.row, el("rows").children[index] || null);
       if (item.kind === "import") { renderImportRow(item, parts); continue; }
       parts.name.textContent = item.display_name || "—";
+      if (item.profile_url) parts.name.href = item.profile_url;
+      else parts.name.removeAttribute("href");
+      parts.name.title = item.profile_url ? "查看个人资料" : "";
       parts.initial.textContent = Array.from((item.display_name || "").trim())[0]?.toUpperCase() || "?";
       if (parts.avatarUrl !== item.avatar_url) {
         parts.avatarUrl = item.avatar_url;

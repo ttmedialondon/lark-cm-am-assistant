@@ -17,6 +17,7 @@ from cap_fixtures import pilot as parent_pilot
 from psycopg.rows import dict_row
 
 from app import (
+    admin_permissions,
     admin_reporting,
     creator_data,
     creator_roster,
@@ -156,6 +157,7 @@ def prepare(pg, pilot, monkeypatch):
     monkeypatch.setattr(imports, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(imports, "get_settings", lambda: pilot.settings)
     monkeypatch.setattr(creator_roster, "connection", lambda: nullcontext(pg))
+    monkeypatch.setattr(admin_permissions, "connection", lambda: nullcontext(pg))
     calls, callbacks = [], []
 
     def respond(_config, _key, pack, _row_id, **kwargs):
@@ -258,6 +260,8 @@ def test_cap_excel_two_stage_matching_manual_confirmation_and_replays_preserve_p
     formal = creator_roster.page_data(cm, tab="mine")["items"]
     assert len(formal) == 1 and set(formal[0]["handles"]) == {"beauty.one_12", "corrected_02"}
     assert formal[0]["sources"] == ["Excel", "AI"]
+    assert formal[0]["profile_url"] is None
+    assert creator_roster.page_data(owner, cm)["items"][0]["profile_url"] == "/admin/contacts/ou_creator"
     imports.preview_import(owner, cm, "roster.xlsx", data)
     imports.start_import(owner, batch["id"])
     assert row_for(pg, batch, "second_02") is None
@@ -1236,6 +1240,29 @@ def test_delegated_creator_manager_can_review_evidence_and_import_across_cms(pg,
     view = creator_roster.page_data(manager, cm)
     assert view['can_manage'] and view['can_select_cm'] and not view['read_only']
     assert view['items'][0]['evidence_rows']
+    assert view['items'][0]['profile_url'] is None
+    lark_url = 'https://applink.larksuite.com/client/chat/open?openId=ou_creator'
+    assert view['items'][0]['private_chat_url'] == lark_url
+    admin_permissions.set_permissions(pilot.ids['owner'], manager, ['creator-manage', 'contacts'])
+    assert creator_roster.page_data(manager, cm)['items'][0]['profile_url'] == '/admin/contacts/ou_creator'
+    with pg.transaction(force_rollback=True):
+        pg.execute("INSERT INTO admin_roles(authorization_id,role,is_active) VALUES(%s,'owner',FALSE)", (manager,))
+        assert creator_roster.page_data(manager, cm)['items'][0]['profile_url'] is None
+    with pg.transaction(force_rollback=True):
+        pg.execute("INSERT INTO lark_identities(open_id,contact_id,display_name,last_seen_at) "
+                   "VALUES('ou_creator_alias',%s,'creator',NOW()+INTERVAL '1 hour')", (creator,))
+        alias = creator_roster.page_data(manager, cm)['items'][0]
+        assert alias['open_id'] == 'ou_creator_alias'
+        assert alias['profile_url'] == '/admin/contacts/ou_creator_alias'
+        pg.execute("UPDATE lark_identities SET open_id='javascript:alert(1)' WHERE open_id='ou_creator_alias'")
+        invalid = creator_roster.page_data(manager, cm)['items'][0]
+        assert invalid['profile_url'] is None and invalid['private_chat_url'] is None
+        pg.execute('UPDATE lark_identities SET contact_id=NULL WHERE contact_id=%s', (creator,))
+        unidentified = creator_roster.page_data(manager, cm)['items'][0]
+        assert unidentified['open_id'] is None and unidentified['profile_url'] is None
+    admin_permissions.set_permissions(pilot.ids['owner'], manager, ['creator-manage'])
+    revoked = creator_roster.page_data(manager, cm)['items'][0]
+    assert revoked['profile_url'] is None and revoked['private_chat_url'] == lark_url
     assert creator_roster.page_data(manager, cm, tab='candidates')['import_batches']
     saved = pg.execute('SELECT uploaded_by,cm_authorization_id FROM creator_import_batches WHERE id=%s',
                        (batch['id'],)).fetchone()

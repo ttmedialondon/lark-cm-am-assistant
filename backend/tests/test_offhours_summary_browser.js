@@ -69,14 +69,14 @@ test("bilingual user labels are displayed literally in evidence", async t => {
   assert.deepEqual(errors, []);
 });
 
-test("creator names stay plain text while a separate accessible icon opens Lark", async t => {
+test("creator names open permitted profiles while a separate accessible icon opens Lark", async t => {
   const attack = '<img src=x onerror="window.compromised=true">';
   const data = {cms: [{id: "cm-1", name: "CM"}], selected_cm_id: "cm-1", can_select_cm: false,
     can_view_unassigned: false, read_only: false, import_batches: [], page: 1, total_count: 3, total_pages: 1,
     items: [
-      {id: "person-1", kind: "confirmed", display_name: "Creator One", open_id: "ou_creator_one", handles: ["one"]},
-      {id: "person-2", kind: "confirmed", display_name: "No identity", open_id: null, handles: ["two"]},
-      {id: "person-3", kind: "confirmed", display_name: attack, open_id: "javascript:alert(1)", handles: ["three"]},
+      {id: "person-1", kind: "confirmed", display_name: "Creator One", open_id: "ou_creator_one", profile_url: "/admin/contacts/ou_creator_one", handles: ["one"]},
+      {id: "person-2", kind: "confirmed", display_name: "No identity", open_id: null, profile_url: null, handles: ["two"]},
+      {id: "person-3", kind: "confirmed", display_name: attack, open_id: "javascript:alert(1)", profile_url: null, handles: ["three"]},
     ]};
   const rendered = spawnSync(path.join(backend, ".venv/bin/python"), ["-c",
     "import json,sys; from app.lark_api import private_chat_url; from jinja2 import Environment,FileSystemLoader,select_autoescape; data=json.load(sys.stdin); [item.update(private_chat_url=private_chat_url(item['open_id'])) for item in data['items']]; html=Environment(loader=FileSystemLoader('app/templates'),autoescape=select_autoescape()).get_template('creator_handles.html').render(authorization={'display_name':'CM'},creator_data=data,creator_tab='mine',creator_query='',csrf_token='fixture-csrf'); print(json.dumps({'data':data,'html':html}))"],
@@ -84,6 +84,7 @@ test("creator names stay plain text while a separate accessible icon opens Lark"
   assert.equal(rendered.status, 0, rendered.stderr);
   const fixture = JSON.parse(rendered.stdout), state = {data: fixture.data, calls: [], larkRequests: []};
   const url = "https://applink.larksuite.com/client/chat/open?openId=ou_creator_one";
+  const profileUrl = "http://localhost/admin/contacts/ou_creator_one";
   assert.equal(state.data.items[0].private_chat_url, url);
   assert.deepEqual(state.data.items.slice(1).map(item => item.private_chat_url), [null, null]);
   const browser = await chromium.launch({headless: true, channel: "chrome"});
@@ -99,6 +100,7 @@ test("creator names stay plain text while a separate accessible icon opens Lark"
     if (target.pathname === "/creators") return route.fulfill({contentType: "text/html", body: fixture.html});
     if (target.pathname.startsWith("/static/")) return route.fulfill({contentType: target.pathname.endsWith(".js") ? "text/javascript" : target.pathname.endsWith(".svg") ? "image/svg+xml" : "text/css", body: fs.readFileSync(path.join(backend, "app", target.pathname))});
     state.calls.push({method: request.method(), url: target.pathname, search: target.search});
+    if (target.pathname === "/admin/contacts/ou_creator_one") return route.fulfill({contentType: "text/html", body: "<p>Creator One profile</p>"});
     if (target.pathname === "/creators/data") return route.fulfill({json: state.data});
     return route.abort();
   });
@@ -107,12 +109,21 @@ test("creator names stay plain text while a separate accessible icon opens Lark"
   await rows.nth(2).waitFor();
   const names = rows.locator("td:nth-child(2) .fw-bold");
   assert.deepEqual(await names.allTextContents(), data.items.map(item => item.display_name));
-  assert(await names.evaluateAll(elements => elements.every(element => element.tagName === "SPAN" && !element.closest("a"))));
+  assert(await names.evaluateAll(elements => elements.every(element => element.tagName === "A")));
   assert.equal(await names.locator("img").count(), 0);
   assert.equal(await page.evaluate(() => window.compromised), undefined);
   assert.deepEqual(await rows.locator("td:first-child").allTextContents(), ["@one", "@two", "@three"]);
-  await names.first().click();
+  assert.equal(await names.first().getAttribute("href"), "/admin/contacts/ou_creator_one");
+  assert.equal(await names.first().getAttribute("title"), "查看个人资料");
+  assert.equal(await names.first().getAttribute("target"), null);
+  assert.equal(await rows.first().getByRole("link", {name: "Creator One", exact: true}).count(), 1);
+  await names.first().focus();
+  assert(await names.first().evaluate(element => element === document.activeElement));
+  await Promise.all([page.waitForURL(profileUrl), names.first().press("Enter")]);
   assert.equal(context.pages().length, 1);
+  assert.equal(page.url(), profileUrl);
+  await page.goBack();
+  await rows.nth(2).waitFor();
   assert.equal(page.url(), "http://localhost/creators");
   const link = rows.first().getByRole("link", {name: "在 Lark 中与 Creator One 私聊（新窗口）", exact: true});
   assert.equal(await link.getAttribute("href"), url);
@@ -132,6 +143,9 @@ test("creator names stay plain text while a separate accessible icon opens Lark"
   for (const index of [1, 2]) {
     assert.equal(await rows.nth(index).getByRole("link").count(), 0);
     assert.equal(await rows.nth(index).locator("a[href]").count(), 0);
+    assert.equal(await names.nth(index).getAttribute("href"), null);
+    assert.equal(await names.nth(index).getAttribute("title"), "");
+    assert(await names.nth(index).evaluate(element => { element.focus(); return element !== document.activeElement; }));
   }
   await link.focus();
   assert(await link.evaluate(element => element === document.activeElement));
@@ -141,7 +155,14 @@ test("creator names stay plain text while a separate accessible icon opens Lark"
   assert.equal(request.url(), url);
   await popup.close();
   assert.deepEqual(state.larkRequests, [url]);
-  state.data.items[0].private_chat_url = null;
+  state.data.items[0].profile_url = null;
+  await page.locator("#creators-refresh").click();
+  await page.waitForFunction(() => !document.querySelector("#creators-rows .fw-bold[href]"));
+  assert.equal(await names.first().getAttribute("title"), "");
+  assert.equal(await link.getAttribute("href"), url);
+  assert.equal(await rows.first().getByRole("link").count(), 1);
+  assert(await names.first().evaluate(element => { element.focus(); return element !== document.activeElement; }));
+  for (const item of state.data.items) item.private_chat_url = null;
   await page.locator("#creators-refresh").click();
   await page.waitForFunction(() => !document.querySelector("#creators-rows a[href]"));
   assert.equal(await rows.getByRole("link").count(), 0);

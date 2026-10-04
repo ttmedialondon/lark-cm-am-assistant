@@ -1,6 +1,6 @@
 """Current creator roster and import candidates, independent of the retired handle scanner."""
 
-from . import contact_handles, creator_access, creator_imports
+from . import admin_permissions, contact_handles, creator_access, creator_imports
 from .db import connection
 from .identity_profiles import safe_avatar_url
 from .lark_api import private_chat_url
@@ -53,6 +53,7 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
             items, total = imported["candidates"], imported["total"]
             pages, page = imported["total_pages"], imported["page"]
         else:
+            can_view_profiles = "contacts" in admin_permissions.permission_keys_for(actor_id)
             if query:
                 formal_base += """ AND (POSITION(lower(%s) IN lower(COALESCE(c.display_name,'')))>0
                     OR EXISTS (SELECT 1 FROM contact_social_accounts l JOIN social_accounts s
@@ -86,6 +87,7 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
             items = []
             for person in people:
                 identity = identities.get(person["id"])
+                chat_url = private_chat_url(identity["open_id"] if identity else None)
                 import_rows = imports_by_person[person["id"]]
                 sources = list(dict.fromkeys(
                     label for row in import_rows for label in creator_imports.source_labels(row)
@@ -99,7 +101,8 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
                     "display_name": person["display_name"] or "未命名用户",
                     "open_id": identity["open_id"] if identity else None,
                     "avatar_url": safe_avatar_url(identity["avatar_url"]) if identity else None,
-                    "private_chat_url": private_chat_url(identity["open_id"] if identity else None),
+                    "private_chat_url": chat_url,
+                    "profile_url": f"/admin/contacts/{identity['open_id']}" if can_view_profiles and chat_url else None,
                     "handles": handles[person["id"]],
                     "sources": sources, "source": " + ".join(sources),
                     "evidence_rows": [] if read_only else list(evidence_rows.values()),
