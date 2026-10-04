@@ -1,10 +1,10 @@
-# 达人—Handle 关联 Prompt v1.8
+# 达人—Handle 关联 Prompt v1.9
 
-版本：`creator-handle-research-v1.8`（沿用原文件路径）
+版本：`creator-handle-research-v1.9`（沿用原文件路径）
 
 日期：2026-10-04
 
-状态：用于按联系人匹配队列，强证据可自动关联；修正期间暂停，待 Owner 手动重启。v1.8 放宽账号词拼写、主账号简称和连续私聊问答，群名辅助连接本人证据，不单独确认归属。保留同人正式账号默认跳过、逐候选校验、授权和冲突门槛。旧名单导入的 v1.1 协议不在本轮替换范围。
+状态：用于按联系人匹配队列，强证据可自动关联；功能开关由 Owner 控制，普通规则发布不改变开关或主动重扫历史。v1.9 将精确达人合作群名提升为强关联证据，结合本人在该群的账号或创作业务语境判断，不要求主动自报账号。保留同人正式账号默认跳过、逐候选校验、授权和冲突门槛。旧名单导入的 v1.1 协议不在本轮替换范围。
 
 ## 1. 用途与变化
 
@@ -28,7 +28,7 @@
 | `confirmed_handles` | 已正式关联且本轮跳过的精确 handle，仅用于语境消歧；可包含当前 Curva 未收录账号，不是本轮候选 |
 | `evidence_hints` | 按候选分组的短消息引用，仅帮助定位可能的自述、问答等片段，不是关联结论 |
 | `people` | 发言者短编号及角色；不根据姓名判断是否同一个自然人 |
-| `chats` | 会话短编号、名称及服务端类型 `mode`；群名仅是辅助线索 |
+| `chats` | 会话短编号、名称及服务端类型 `mode`；精确固定达人合作群名可与本人业务共同构成强证据 |
 | `messages` | 消息短编号、会话、发言者、时间、真实回复 `reply`、实际前驱 `previous` 和原文 |
 | `coverage` | 缺失回复、截断和检索范围；不能默认已提供完整历史 |
 
@@ -68,27 +68,27 @@
 
 任务：creator_known=true 是系统已确认达人身份，必须返回 creator={state:"known",refs:[]}，不重复评判；仍须逐个证明账号关联，不得因缺真实姓名或未重复证明达人业务而索要 identity_context。否则根据 target 本人的直播、创作、带货、GMV/佣金或作品合作证据判断 supported/review/not_supported，不返回 known。拥有账号不等于从事达人业务；商家、助理或运营也可能拥有账号。not_supported 仅指本证据包不支持，不是判为非达人。
 
-先用 evidence_hints 定位片段，再读原文、回复关系及包内所有相关反证；提示的 kind 和 refs 不是证明或结论。每个账号选择最直接、完整的本人声明或账号问答，一组有效证据即可，不要求多次自报或固定句式；提示不适用时按原文判断。不要输出此阅读过程。
+先用 evidence_hints 定位片段，再读原文、回复关系及包内所有相关反证；提示的 kind 和 refs 不是证明或结论。每个账号选择最直接、完整的本人声明、账号问答或固定群业务证据，一组有效证据即可，不要求主动自报、多次自报或固定句式；提示不适用时按原文判断。不要输出此阅读过程。
 
 逐个 handle 判断：
-1. supported/self_account：target 明确称该精确 handle 为自己的 TikTok/TT 账号；或完整问答明确确认账号；或发送该主页并明确说是自己的。“My user name is xxx”“My TT xxx”“My Handel is xxx”等自然表达和账号词拼写错误可作自述，不要求固定句式；实际 handle 必须精确，不修正其拼写。允许账号和“是我的”分在同会话连续消息里，引用两者。明确说“两个都是我的”可分别支持两个账号。声明仅证明当时自认使用/拥有，不证明实名、法律所有权或今天仍控制账号。
+1. supported/self_account 可采用自述、完整账号问答、本人主页，或第4条群名联合业务证据。自述路径包括 target 明确称该精确 handle 为自己的 TikTok/TT 账号；或完整问答明确确认账号；或发送该主页并明确说是自己的。“My user name is xxx”“My TT xxx”“My Handel is xxx”等自然表达和账号词拼写错误可作自述，不要求固定句式；实际 handle 必须精确，不修正其拼写。允许账号和“是我的”分在同会话连续消息里，引用两者。明确说“两个都是我的”可分别支持两个账号。只判断证据时点的业务关系，不证明实名、法律所有权或今天仍控制账号。
 2. supported/account_creator：可证明 target 本人在该精确账号创作/直播，但无法证明账号归属。supported/operator：明确代他人管理该账号。“our/team/company account”不单独证明个人 owner，即使是在回答“你的账号是什么”；结合完整业务语境证明本人/共同创作可判 account_creator，团队、助理或共同所有权无法区分则 review。不得把这些关系写成个人本人账号。
 3. not_supported/other_person：明确是朋友、介绍人、商家或其他人的账号。not_supported/mention_only：只是转发/举例/提及。其余返回 review/uncertain，不能猜。
-4. 群名、固定群格式、唯一外部联系人、相似姓名、已有达人/账号标签和 Curva 收录均不单独证明账号归属。已确认达人在以精确 handle 为主名的 TT/Trutonic Media 合作群里，先用账号语境称“my main”，再于5分钟内本人发送该精确 handle，可结合群名判 self_claim；两条都引用，不接受“my main product”、代理/共享语义或另一个账号的声明，群名括号里的副号不能顺带确认。creator_known=true、包内有 target 本人创作或直播证据时，本人明确说“I'm HANDLE on TikTok”或“I'm NAME from HANDLE on TikTok”，可作 self_claim；商家、机构、助理或共享账号仍须排除。没有账号语境的 Lark 开场“I'm Daisy”不等于 TikTok 账号声明；别人的介绍不替代本人确认。
+4. supported/self_account/group_context：creator_known=true，候选精确 handle 是固定 TT/Trutonic Media 达人合作群的主名，且 target 本人在该群以第一人称讨论自己的账号或创作业务，可联合确认业务上的本人账号关系。例如本人说自己的账号登录异常、账号/主页操作，或自己发视频、创作、直播、管理自己的样品请求/橱窗/商品链接、讨论自己的佣金；正文无需重复 handle，也不必说“我就是xxx”。群名是强关联证据，不只是检索线索；但仅入群、礼貌回复、普通样品问候、裸广告码或别人创作不够。指定该号视频的真实业务回复可进一步增强；引用本人账号/创作语境和所采用的具体业务问答，不能只引索码和发码而漏掉本人业务语境。跨时点的同群证据可以联合，不套账号问答5分钟限制；私聊里不指明账号的业务不能借到该群。群主名必须精确，不能根据姓名或任意含handle的活动群猜测；括号副号、多个号混写、单独cm编号尾缀不继承。谈另一个、备用、新旧账号时，不能把未点名的话归到群主号；代理、商家、共享与多人归属仍复核。群名单独、唯一外部联系人、相似姓名、已有标签及Curva收录不够。原主号简称和自然自报规则保留：本人在精确主名合作群中说“my main”后5分钟内发送精确handle，引用两条可作self_claim；本人有创作语境并明确说“I'm HANDLE on TikTok”也可自述，不能将单独Lark姓名开场当账号声明。
 5. 邮箱前缀、商品链接 unique_id、分享者参数、银行 account、Lark @、短链接和单独 AD code 都不能单独证明本人 handle。视频链接保留 handle 与 video_id，并结合本人对具体作品的说明。裸链接或裸 handle 需完整上下文。
 6. at_message 证明消息当时的声明，旧消息也可使用；不能仅因时间久而标 historical 或要求 recent_state。确有旧名、转让、删除或控制权冲突时再区分历史关系与所需补证。“my other/backup account”表示另一个账号，不是改名。“changed username”区分旧名、新名和昵称；未明确的旧→新关系不可补猜。转让、封禁、删除、退出机构分别处理；unlink 机构不等于账号不属于本人。历史关联标 historical，不自动覆盖现有关系。
 7. qa_confirm 同时引用账号问题和本人回答。“Please drop your username below”或“TikTok official can't find ur uid”均可构成索取/纠正本人账号的语境；本人答“It's HANDLE”可连接，样品/领奖问题不能替代。裸 handle 回答须引用问题，不能仅作 self_claim。真实 reply 优先；无 reply 时仅允许两位已知发言者的 p2p、回答晚于问题且在5分钟内。沿服务端真实 previous 链，可夹最多两条同一员工的非账号、非提问、无反证补充说明；中间条目须完整可读且链不断，不要求模型引用无归属断言的补充句。本人或第三人插话、新账号问题、链缺口或截断则 review。群聊不按邻接猜回复对象。完整自述不依赖无关父消息。
 8. 反证必须否认该账号归属、说明代理或账号转让；“not my main account”只否认主号角色，可能仍是本人备用号，不能当归属冲突或历史转让，须结合独立账号证据。“Not yet”“Not sure”对领奖、样品、邀请的答复，或样品说明里的“did NOT receive”，不等于否认本人账号。“No worries”“No problem”是礼貌表达。退出/unlink 机构不是账号转让；共享链接不是共享所有权。核对反证针对的账号和时点，不能因任何一句 not 否决整包。
-9. 一个联系人可以有多个 handle，逐个给结论；同一个 handle 的多人声明、共享登录、助理/本人不清或转让冲突返回 review，不合并联系人，不按显示姓名挑人。不要将一个账号的证据扩散给同群其他账号。confirmed_handles 仅帮助辨认已核准账号的语境，不重判、不输出，也不支持其他候选；“My account is OLD_HANDLE”只指该旧账号，即使它已从本轮候选中移除，也不能作为新候选的泛化“是我的”证据。每个新候选仍须独立、精确连接本人的账号声明。
+9. 一个联系人可以有多个 handle，逐个给结论；同一个 handle 的多人声明、共享登录、助理/本人不清或转让冲突返回 review，不合并联系人，不按显示姓名挑人。不要将一个账号的证据扩散给同群其他账号。confirmed_handles 仅帮助辨认已核准账号的语境，不重判、不输出，也不支持其他候选；“My account is OLD_HANDLE”只指该旧账号，即使它已从本轮候选中移除，也不能作为新候选的泛化“是我的”证据。同一精确合作群中本人明确否认、表示代理/共享或改名时，即使未重复handle也须审查；普通“not my main”不是归属否认。其他外部人员在该群给出同等本人账号证据时不能忽略。每个新候选仍须独立、精确连接本人，不必须依赖主动声明。
 10. catalog_verified=false 的候选不得 supported，返回 review/out_of_catalog；true 时不得因模型不认识该账号而判 out_of_catalog，缺关联证据应 review/no_link_evidence。这不是否认其达人身份。只输出输入候选，不纠正点号/下划线/数字，不编造 handle。需要额外候选时由服务端重建证据包。
-11. refs 只填写输入实际消息编号（如 M1），最多6条且不得重复，不填群编号、handle、消息原文或不存在的编号。引用须与 code 对应：self_claim 引本人账号声明，qa_confirm 引完整问答，分开的账号和本人确认须都引用；否认/改名/冲突也引用。self_account 必须有 target 本人的明确确认。读到用于本条结论的消息时，review 也保留相关 refs；确无消息证据才 refs=[]。缺失/截断确实影响该账号时返回 review，并列 needed；其他账号或无关父消息的缺失不否决完整自述。没有文本或证据不足不能当作明确反例。
+11. refs 只填写输入实际消息编号（如 M1），最多6条且不得重复，不填群编号、handle、消息原文或不存在的编号。引用须与 code 对应：self_claim 引本人账号声明，qa_confirm 引完整问答，group_context 必须引 target 在该精确群的本人账号/创作语境，群名从消息所属会话读取；用到跨消息业务回复时同时引用。分开的账号和本人确认须都引用；否认/改名/冲突也引用。self_account 必须有可连接到target本人的证据，不要求主动自报。读到用于本条结论的消息时，review 也保留相关 refs；确无消息证据才 refs=[]。缺失/截断确实影响该账号时返回 review，并列 needed；其他账号或无关父消息的缺失不否决完整证据。没有文本或证据不足不能当作明确反例。
 
 输出：creator={state,refs}；links 每个候选恰好一项={h,decision,relation,period,code,refs,needed}。h 只填输入候选短编号（如 H1），不能填真实 handle；证据弱的候选也必须逐项返回，不能跳过。needed 不得重复。只输出这些字段，服务端诊断字段不由模型填写。
 state: known|supported|review|not_supported。
 decision: supported|review|not_supported。
 relation: self_account|account_creator|operator|other_person|mention_only|uncertain。
 period: at_message|historical|unknown；at_message 只指证据当时，不是当前平台验证。
-code: self_claim|qa_confirm|own_page|own_content|operates_for_other|third_party|mention_only|no_link_evidence|ambiguous_reply|conflict|username_changed|out_of_catalog。
+code: self_claim|qa_confirm|own_page|group_context|own_content|operates_for_other|third_party|mention_only|no_link_evidence|ambiguous_reply|conflict|username_changed|out_of_catalog。
 needed: parent_reply|identity_context|account_context|earlier_username|other_claimants|recent_state；不需要时空数组。
 ```
 
@@ -110,13 +110,13 @@ needed: parent_reply|identity_context|account_context|earlier_username|other_cla
 
 免重复匹配不等于人工核准：仅 `cm_confirmation` 或 `owner_reviewed_curva` 且审核人、审核时间均非空的关系显示「人工已核准」。旧导入和自动确认继续显示「已关联」，不补造人工审核记录，不更改来源。
 
-功能启用后，服务端只对已确认达人中的 `supported / self_account / at_message`、理由为 `self_claim / qa_confirm / own_page` 且 `needed=[]` 的条目尝试正式关联。须有真实本人声明、完整账号问答或明确本人主页证据，已检出的该账号关键否认、改名和他人归属声明未被遗漏，授权和版本仍有效，且不存在账号或人工结论冲突。这个门槛没有置信度分数或匹配百分比；不是模型给出 `supported` 就直接入库。
+功能启用后，服务端只对已确认达人中的 `supported / self_account / at_message`、理由为 `self_claim / qa_confirm / own_page / group_context` 且 `needed=[]` 的条目尝试正式关联。须有真实本人声明、完整账号问答、明确本人主页，或精确固定达人合作群与该群本人账号/创作业务的联合证据；后者不要求正文出现 handle。已检出的该账号关键否认、改名和他人归属证据不得遗漏，授权和版本仍有效，且不存在账号或人工结论冲突。这个门槛没有置信度分数或匹配百分比；不是模型给出 `supported` 就直接入库。
 
 服务端必须检查：
 
 - 每次请求的动态 Schema 限定候选编号、消息引用、候选项数和最多6条引用；已确认身份固定为 known，不依赖模型重新确认。
 - 结构损坏、候选遗漏/重复或非法候选编号仍是请求级错误；合法候选中的错误引用、证据不足或不连贯只降级该账号为待核实，不影响其他通过校验的账号。
-- 支持本人账号时，引用内确有该联系人发言和精确账号证据；问答须满足真实回复或上述有界私聊前驱链。主号简称与固定群名辅助也须有本人账号语境和精确账号消息，不能只验证“有人发言＋另一条有 handle”。同样的链式否认、共享和他人声明作为反证，不能只放宽肯定答案。
+- 支持本人账号时，引用内确有该联系人发言和精确账号证据；group_context 的精确账号可来自消息所属固定群名，但本人须在该群有账号或创作业务语境，不能只验证“有人发言＋群里有handle”。问答须满足真实回复或上述有界私聊前驱链，主号简称仍引用两条。群语境、链式否认、代理/共享和他人同等归属证据均参与反证检查。
 - `evidence_hints` 只定位原文，不改变校验或自动关联资格；模型漏引问题、本人声明或关键反证时，不从提示中自动补引用并升级。
 - 引用仍在有效授权范围，正文/会话关系未变化，Curva 精确成员核验仍通过。
 - `catalog_verified` 以服务器核验为准，模型不能用 `out_of_catalog` 推翻 true；若关联证据不足，只将该账号降级待核实。
@@ -162,5 +162,6 @@ needed: parent_reply|identity_context|account_context|earlier_username|other_cla
 | Sabiha → `sabihaara` | “My Handel is sabihaara”是本人账号声明；容忍账号词错拼，不修改 handle |
 | Robin → `robc825` | 合作群主名精确命中；本人“my main…both accounts”后4秒发送“Robc825”，引用两条支持主号，括号副号不继承 |
 | Carla → `shop.with.carla` | 两人私聊中 TikTok 查不到其 UID，本人答“It’s shop.with.Carla”；两条员工补充可沿完整真实前驱链连接，不用选段顺序猜问答 |
+| Jessica → `jessyrice94` | 精确固定合作群＋本人谈账号被访问；同群精确视频索码和本人真实回复进一步增强。group_context 引本人账号语境及所采用的业务问答，不要求主动自报，不能只引广告码 |
 
 独立验证按联系人分离，涉及同一账号、群或转让关系的样本保持在同一分组，避免上下文泄漏。还须补充真实助理、代运营、商家及多人声称同一账号的独立样本；本轮没有为这些类别测得准确率。

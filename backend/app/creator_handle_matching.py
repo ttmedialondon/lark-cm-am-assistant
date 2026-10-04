@@ -350,7 +350,7 @@ def auto_link_eligible(pack, link, stats):
         and link["decision"] == "supported"
         and link["relation"] == "self_account"
         and link["period"] == "at_message"
-        and link["code"] in {"self_claim", "qa_confirm", "own_page"}
+        and link["code"] in {"self_claim", "qa_confirm", "own_page", "group_context"}
         and not link["needed"]
     ):
         return False
@@ -463,7 +463,10 @@ def _apply_links(conn, job, pack, result, stats, refs, settings, catalog_version
                     "handle": handle,
                     "prompt_version": evidence.PROMPT_VERSION,
                     "refs": link["refs"],
-                    "evidence_refs": [ref for ref in refs if ref["kind"] == "message" and ref["label"] in link["refs"]],
+                    "evidence_refs": [ref for ref in refs if ref["kind"] == "message" and ref["label"] in link["refs"]
+                        or ref["kind"] == "chat" and ref["chat_id"] in {
+                            r["chat_id"] for r in refs if r["kind"] == "message" and r["label"] in link["refs"]
+                            and "chat_id" in r}],
                 },
             )
         elif not conn.execute(

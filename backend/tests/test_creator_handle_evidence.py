@@ -551,6 +551,79 @@ def test_contact_matching_rejects_disconnected_and_third_party_claims():
     model_review['links'][0].update(decision='review', relation='uncertain', period='unknown',
                                    code='no_link_evidence', needed=['account_context'])
     assert matcher.validate(carla, model_review) == model_review  # Local context cannot promote model review.
+    # Fixed cooperation titles are strong binding evidence; a repeated self-introduction is not required.
+    jessica = deepcopy(pack)
+    jessica['handles'][0]['handle'] = 'jessyrice94'
+    jessica['people'] = [{'id': 'U1', 'role': 'external'}, {'id': 'U2', 'role': 'staff'}]
+    jessica['chats'] = [{'id': 'G3', 'mode': 'group', 'name': '❤️ jessyrice94 X TT Media'}]
+    jessica['messages'] = [
+        {'id': 'M1', 'speaker': 'U1', 'chat': 'G3', 'at': '2026-03-28T06:58:49Z', 'reply': None,
+         'text': 'Hi girls I have just had a notification that my account was accessed in US'},
+        {'id': 'M23', 'speaker': 'U2', 'chat': 'G3', 'at': '2026-05-01T15:41:46Z', 'reply': None,
+         'text': 'May I have the ad code for this video? https://www.tiktok.com/@jessyrice94/video/7627582071690513686'},
+        {'id': 'M24', 'speaker': 'U1', 'chat': 'G3', 'at': '2026-05-01T15:44:44Z', 'reply': 'M23',
+         'text': '#syntheticAuthorizationCodeOnly123456 💕'}]
+    group_result = deepcopy(result)
+    group_result['links'][0].update(code='group_context', refs=['M1', 'M23', 'M24'])
+    assert matcher.validate(jessica, group_result) == group_result
+    mislabeled = deepcopy(group_result)
+    mislabeled['links'][0]['code'] = 'self_claim'
+    assert matcher.validate(jessica, mislabeled)['links'][0]['decision'] == 'review'
+    mislabeled['links'][0].update(code='group_context', relation='operator')
+    assert matcher.validate(jessica, mislabeled)['links'][0]['decision'] == 'review'
+    implicit = deepcopy(group_result)
+    implicit['links'][0]['refs'] = ['M1']
+    assert matcher.validate(jessica, implicit) == implicit  # The exact handle can come from the title.
+    incomplete = deepcopy(group_result)
+    incomplete['links'][0]['refs'] = ['M23', 'M24']
+    assert matcher.validate(jessica, incomplete)['links'][0]['decision'] == 'review'
+    assert matcher._support_groups(jessica, jessica['handles'][0], [])[0] == []
+    for body in ('Thank you 💕', '#syntheticAuthorizationCodeOnly123456',
+                 'I have a second account', "My account is outside_curva_99", 'My TikTok is outside_curva_99',
+                 'I posted a video on the TikTok account outside_curva_99', 'My bank account was accessed',
+                 "I'm her assistant and my account was accessed", 'Our team account was accessed',
+                 'I have not posted the videos', 'She posted the videos'):
+        wrong = deepcopy(jessica)
+        wrong['messages'][0]['text'] = body
+        assert matcher.validate(wrong, group_result)['links'][0]['decision'] == 'review'
+    creative = deepcopy(jessica)
+    for body in ('I posted the three videos for the collaboration', 'I tried to post a video on a sample I have',
+                 'Now all my shop links are gone', 'My commission rate with Merach is considerably higher'):
+        creative['messages'][0]['text'] = body
+        assert matcher.validate(creative, implicit) == implicit
+    for title in ('other_creator X TT Media', 'Team jessyrice94 X TT Media',
+                  'other_creator(jessyrice94) X TT Media', 'jessyrice94 X Unknown Agency', 'jessyrice94。cm1'):
+        wrong = deepcopy(jessica)
+        wrong['chats'][0]['name'] = title
+        assert matcher.validate(wrong, group_result)['links'][0]['decision'] == 'review'
+    wrong = deepcopy(jessica)
+    wrong['creator_known'] = False
+    assert matcher.validate(wrong, group_result)['links'][0]['decision'] == 'review'
+    wrong = deepcopy(jessica)
+    wrong['messages'][0]['chat'] = 'G1'
+    assert matcher.validate(wrong, group_result)['links'][0]['decision'] == 'review'
+    wrong = deepcopy(jessica)
+    wrong['coverage']['excerpted_ids'] = ['M1']
+    assert matcher.validate(wrong, group_result)['links'][0]['decision'] == 'review'
+    uncertain = deepcopy(group_result)
+    uncertain['links'][0].update(decision='review', relation='uncertain', period='unknown',
+                                code='no_link_evidence', needed=['account_context'])
+    assert matcher.validate(jessica, uncertain) == uncertain
+    for body, speaker in (('This is not my TikTok account', 'U1'), ('Our team account is shared', 'U1'),
+                          ("I am her assistant", 'U1'), ('I changed my username yesterday', 'U1'),
+                          ('My account was accessed in US too', 'U3')):
+        conflict = deepcopy(jessica)
+        conflict['messages'].append({'id': 'M25', 'speaker': speaker, 'chat': 'G3',
+                                     'at': '2026-05-02T15:44:44Z', 'reply': None, 'text': body})
+        assert matcher.validate(conflict, group_result)['links'][0]['validation_error'] == 'counterevidence'
+    unrelated = deepcopy(jessica)
+    unrelated['messages'].append({'id': 'M25', 'speaker': 'U1', 'chat': 'G3', 'at': '2026-05-02T15:44:44Z',
+                                  'reply': None, 'text': 'Not yet, I have not received the sample'})
+    assert matcher.validate(unrelated, group_result) == group_result
+    for body in ('My account is fine; this sample is not mine',
+                 'My account is fine. The product in the photo is not mine', 'This is not my main account'):
+        unrelated['messages'][-1]['text'] = body
+        assert matcher.validate(unrelated, group_result) == group_result
     counter = deepcopy(carla)
     counter['messages'].insert(0, {'id': 'M10', 'speaker': 'U1', 'chat': 'G1', 'at': '2025-07-23T10:40:00Z',
                                    'previous': None, 'reply': None, 'text': 'My TikTok account is shop.with.carla'})

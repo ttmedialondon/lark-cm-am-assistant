@@ -1,6 +1,6 @@
 {
   "type": "object",
-  "description": "达人—handle 关联协议 v1.8（creator-handle-research-v1.8）；保留 v1.2 输出字段和枚举。群名和短引用辅助定位及理解本人证据，证据边界由 Prompt 与服务端校验执行。",
+  "description": "达人—handle 关联协议 v1.9（creator-handle-research-v1.9）；保留输出字段，新增 group_context 理由。精确合作群名与本人账号或创作语境共同构成强证据，不要求主动自报 handle。",
   "additionalProperties": false,
   "properties": {
     "creator": {
@@ -22,7 +22,7 @@
           "decision": {"type": "string", "enum": ["supported", "review", "not_supported"]},
           "relation": {"type": "string", "enum": ["self_account", "account_creator", "operator", "other_person", "mention_only", "uncertain"]},
           "period": {"type": "string", "enum": ["at_message", "historical", "unknown"]},
-          "code": {"type": "string", "enum": ["self_claim", "qa_confirm", "own_page", "own_content", "operates_for_other", "third_party", "mention_only", "no_link_evidence", "ambiguous_reply", "conflict", "username_changed", "out_of_catalog"]},
+          "code": {"type": "string", "enum": ["self_claim", "qa_confirm", "own_page", "group_context", "own_content", "operates_for_other", "third_party", "mention_only", "no_link_evidence", "ambiguous_reply", "conflict", "username_changed", "out_of_catalog"]},
           "refs": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
           "needed": {"type": "array", "items": {"type": "string", "enum": ["parent_reply", "identity_context", "account_context", "earlier_username", "other_claimants", "recent_state"]}}
         },

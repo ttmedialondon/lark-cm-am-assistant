@@ -9,7 +9,7 @@
 {% set reason_labels = {
   'ready': '证据已准备', 'cached': '复用已有结果', 'suggestions_saved': '匹配结果已保存',
   'no_text': '没有可读消息', 'no_candidates': '缺少 Curva 账号线索', 'restricted': '不在处理范围',
-  'no_account_evidence': '正文缺少具体账号证据',
+  'no_account_evidence': '缺少可用关联证据',
   'material_limit': '证据超出处理上限', 'catalog_unavailable': 'Curva 名单暂不可用',
   'preparation_failed': '证据准备失败', 'snapshot_changed': '证据或配置已更新',
   'lease_expired': '任务超时，正在恢复', 'identity_removed': '达人身份已取消',
@@ -34,6 +34,7 @@
 } %}
 {% set code_labels = {
   'self_claim': '本人自述', 'qa_confirm': '完整问答', 'own_page': '本人主页', 'own_content': '本人内容',
+  'group_context': '群名与本人业务证据',
   'operates_for_other': '替他人运营', 'third_party': '第三方提及', 'mention_only': '仅提及账号',
   'no_link_evidence': '缺少关联证据', 'ambiguous_reply': '回复对象不明', 'conflict': '账号关系待核实',
   'username_changed': '账号曾更名', 'out_of_catalog': '不在 Curva 名单'

@@ -815,6 +815,107 @@ def test_disabled_probe_retains_paid_diagnostics_when_postcall_catalog_fails(pg,
     assert not pg.execute("SELECT 1 FROM creator_handle_jobs").fetchone()
 
 
+def test_fixed_group_context_auto_links_with_live_scope_and_auditable_title(pg, matching_flow, pilot, monkeypatch):
+    flow = matching_flow
+    flow.enable()
+    monkeypatch.setattr(matching.evidence, "build", flow.real_build)
+    monkeypatch.setattr(matching.evidence, "still_valid", flow.real_still_valid)
+    title = "❤️ first.handle X TT Media"
+    body = "My account was accessed in US. Now all my shop links are gone."
+    cipher = message_body_cipher(flow.settings.token_encryption_key)
+    pg.execute("UPDATE chats SET name=%s,chat_mode='group' WHERE chat_id='chat_creator'", (title,))
+    pg.execute(
+        "UPDATE chat_messages SET body_ciphertext=%s WHERE chat_id='chat_creator'",
+        (cipher.encrypt(json.dumps({"text": "Thanks for the update"})),),
+    )
+    pg.execute(
+        "UPDATE chat_messages SET body_ciphertext=%s,message_create_time=NOW() "
+        "WHERE chat_id='chat_creator' AND message_id='creator_0_question'",
+        (cipher.encrypt(json.dumps({"text": body})),),
+    )
+    before = _snapshot(pg, ("contacts", "contact_roles", "contact_assignments", "creator_account_assignments"))
+    respond = matching.api.call_openai
+
+    def contextual_response(*args, **kwargs):
+        response = respond(*args, **kwargs)
+        pack, value = args[2], json.loads(response["text"])
+        reference = next(m["id"] for m in pack["messages"] if m["speaker"] == pack["target"] and m["text"] == body)
+        for link in value["links"]:
+            link.update(code="group_context", refs=[reference])
+        response["text"] = json.dumps(value)
+        return response
+
+    monkeypatch.setattr(matching.api, "call_openai", contextual_response)
+    material = flow.real_build(pg, flow.settings, flow.contact, frozenset({"first.handle", "backup_2"}))
+    assert material["reason"] == "ready" and [h["handle"] for h in material["pack"]["handles"]] == ["first.handle"]
+    assert all("first.handle" not in m["text"] for m in material["pack"]["messages"])
+
+    # A title edited during a paid response invalidates the old context, but keeps the usage ledger.
+    job = _prepared_job(pg, flow, "incremental")
+    flow.before_response = lambda: pg.execute(
+        "UPDATE chats SET name='Other collaboration' WHERE chat_id='chat_creator'"
+    )
+    matching.run(job, flow.settings)
+    assert len(flow.calls) == 1 and contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
+    assert pg.execute(
+        "SELECT status,result_ciphertext FROM creator_handle_jobs WHERE id=%s", (job["id"],)
+    ).fetchone() == {"status": "queued", "result_ciphertext": None}
+    assert pg.execute(
+        "SELECT billed_tokens FROM creator_handle_requests WHERE id=%s", (job["reservation_id"],)
+    ).fetchone()["billed_tokens"] == 150
+    flow.before_response = None
+    pg.execute("UPDATE chats SET name=%s WHERE chat_id='chat_creator'", (title,))
+
+    # Losing the actual readable grant before calling prevents a second paid request and any relation.
+    job = _prepared_job(pg, flow, "incremental")
+    pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (pilot.ids["cm"],))
+    matching.run(job, flow.settings)
+    assert len(flow.calls) == 1 and contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
+    assert pg.execute(
+        "SELECT billed_tokens FROM creator_handle_requests WHERE id=%s", (job["reservation_id"],)
+    ).fetchone()["billed_tokens"] == 0
+    pg.execute("UPDATE authorizations SET status='active' WHERE id=%s", (pilot.ids["cm"],))
+
+    job = _prepared_job(pg, flow, "incremental")
+    matching.run(job, flow.settings)
+    assert len(flow.calls) == 2 and contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == ["first.handle"]
+    saved = pg.execute("SELECT status,stats FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone()
+    assert saved["status"] == "completed" and saved["stats"]["auto_linked_handles"] == ["first.handle"]
+    audit = pg.execute("SELECT metadata FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()[
+        "metadata"
+    ]
+    reference = next(m["id"] for m in job["pack"]["messages"] if m["text"] == body)
+    chat_ref = next(ref for ref in job["refs"] if ref["kind"] == "chat" and ref["chat_id"] == "chat_creator")
+    assert audit["refs"] == [reference] and audit["prompt_version"] == matching.evidence.PROMPT_VERSION
+    assert chat_ref in audit["evidence_refs"]
+    assert any(ref["kind"] == "message" and ref["label"] == reference for ref in audit["evidence_refs"])
+    assert all("text" not in ref and "body" not in ref for ref in audit["evidence_refs"])
+    assert _snapshot(pg, before.keys()) == before
+
+    # The same contextual signal from another person is a claimant conflict, not a second owner.
+    pg.execute("SAVEPOINT group_competing_owner")
+    pilot.person("group_peer")
+    pg.execute(
+        "INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,body_ciphertext,"
+        "message_create_time) VALUES('chat_creator','group_peer_control','ou_group_peer','user','text',%s,NOW())",
+        (cipher.encrypt(json.dumps({"text": "My account login has a 2FA problem"})),),
+    )
+    pg.execute(
+        "INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+        "VALUES(%s,'chat_creator','group_peer_control')",
+        (pilot.ids["cm"],),
+    )
+    competing = flow.real_build(pg, flow.settings, flow.contact, frozenset({"first.handle"}), recheck=True)
+    reference = next(m["id"] for m in competing["pack"]["messages"] if m["text"] == body)
+    result = {"creator": {"state": "known", "refs": []}, "links": [
+        {"h": competing["pack"]["handles"][0]["id"], "decision": "supported", "relation": "self_account",
+         "period": "at_message", "code": "group_context", "refs": [reference], "needed": []}]}
+    reviewed = matching.evidence.validate(competing["pack"], result)["links"][0]
+    assert reviewed["decision"] == "review" and reviewed["validation_error"] == "counterevidence"
+    assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == ["first.handle"]
+    pg.execute("ROLLBACK TO SAVEPOINT group_competing_owner")
+
+
 def test_formal_pairs_skip_paid_matching_without_freezing_new_handles_or_manual_review(
     pg, matching_flow, pilot, monkeypatch
 ):
