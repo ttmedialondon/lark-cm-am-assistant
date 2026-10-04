@@ -37,7 +37,7 @@ def payload(scope="selected_messages"):
 
 def model_response(draft="I will check the dates.", language="en", refs=None):
     return {"text": json.dumps({
-        "outcome": "ready", "language": language, "draft": draft,
+        "outcome": "ready", "context_reason": "none", "language": language, "draft": draft,
         "chinese_translation": draft if language == "zh" else "我会核对日期。",
         "explanation": "根据本次可见文字，回应核对日期的诉求。", "checks": [], "evidence_refs": refs or ["C1"],
     }, ensure_ascii=False), "usage": {"input_tokens": 30, "output_tokens": 20}}
@@ -235,13 +235,28 @@ def test_selected_event_requires_selection_evidence_not_only_visible_tail(api):
     assert api.client.post(PATH, json=submitted, headers=api.headers).status_code == 200
 
     api.state.output = {
-        "text": json.dumps({"outcome": "verify", "language": "en", "draft": "", "chinese_translation": "",
-                            "explanation": "需要核对选中事件的订单对应关系。", "checks": [], "evidence_refs": ["S1"]}),
+        "text": json.dumps({"outcome": "verify", "context_reason": "target_unclear", "language": "en",
+                            "draft": "", "chinese_translation": "",
+                            "explanation": "Private selected message and untrusted sk-fixture-only-test",
+                            "checks": [], "evidence_refs": ["S1"]}),
         "usage": {"input_tokens": 30, "output_tokens": 20},
     }
     submitted["request_id"] = str(uuid4())
     uncertain = api.client.post(PATH, json=submitted, headers=api.headers)
     assert uncertain.status_code == 422 and uncertain.json()["error"]["code"] == "context_unavailable"
+    duplicate = api.client.post(PATH, json=submitted, headers=api.headers)
+    assert uncertain.json() == duplicate.json()
+    assert uncertain.json()["error"]["message"] == desktop_replies.CONTEXT_MESSAGES["target_unclear"]
+    row = api.pg.execute("SELECT * FROM desktop_reply_requests WHERE request_id=%s",
+                         (submitted["request_id"],)).fetchone()
+    assert row["error_message"] == uncertain.json()["error"]["message"]
+    assert "Private" not in repr(row) and "sk-fixture" not in repr(row)
+    assert row["result_ciphertext"] is None
+    assert len(api.state.calls) == 3  # Duplicate review errors never trigger another paid call.
+
+    api.state.output["text"] = api.state.output["text"].replace('"target_unclear"', '"untrusted reason"')
+    submitted["request_id"] = str(uuid4())
+    assert api.client.post(PATH, json=submitted, headers=api.headers).status_code == 502
 
 
 def test_server_total_timeout_cancels_model_and_stays_terminal(api, monkeypatch):

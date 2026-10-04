@@ -190,7 +190,13 @@ def create_router(*, current_authorization, csrf_token):
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             if failure is not None and receipt is not None and receipt["claim_status"] == "new":
-                failure.code, failure.message = store.safe_error(failure.code)
+                failure.code, failure.message = store.safe_error(failure.code, failure.message)
+                context_reason = next((key for key, message in store.CONTEXT_MESSAGES.items()
+                                       if failure.code == "context_unavailable" and failure.message == message), None)
+                if context_reason:
+                    logger.warning("desktop_reply_needs_review request_id=%s scope=%s reason=%s selected=%s context=%s",
+                                   payload["request_id"], payload["reply_scope"], context_reason,
+                                   len(payload["selected_messages"]), len(payload["conversation_context"]["messages"]))
                 with suppress(Exception):
                     await run_in_threadpool(
                         finish, actor, payload, receipt, failure=failure, usage=usage,

@@ -12,6 +12,13 @@ from psycopg.types.json import Jsonb
 
 from .crypto import TokenCipher
 
+CONTEXT_MESSAGES = {
+    "target_unclear": "AI 无法确定要回复的具体事项。请选中对方的诉求及必要前后文，再重新生成。",
+    "speaker_unclear": "无法区分选区里谁在提问、谁在回答。请选中对方的诉求及必要前后文，再重新生成。",
+    "conflicting_facts": "当前事项的关键事实相互冲突，且无法安全补问。请核对相关消息后重新生成。",
+    "essential_content_missing": "当前回复必须依赖未读取的内容，暂无法起草。请补充必要文字后重新生成。",
+}
+
 _ERROR_MESSAGES = {
     "provider_error": "AI 服务暂时无法完成请求，请使用新的请求重试。",
     "provider_rate_limit": "AI 服务限流，请稍后使用新的请求生成。",
@@ -27,7 +34,7 @@ _ERROR_MESSAGES = {
     "conversation_not_found": "没有找到当前账号可访问的会话。",
     "conversation_ambiguous": "会话名称对应多个会话，需要明确选择。",
     "conversation_forbidden": "当前账号无权访问此会话。",
-    "context_unavailable": "当前会话的上下文暂不可用。",
+    "context_unavailable": "AI 暂未确定要回复的事项，请选中具体诉求后重新生成。",
 }
 
 
@@ -35,8 +42,10 @@ class ActorInactiveError(PermissionError):
     """A receipt cannot be written or read after its CM's authorization ends."""
 
 
-def safe_error(code):
+def safe_error(code, message=""):
     code = code if code in _ERROR_MESSAGES else "provider_error"
+    if code == "context_unavailable" and message in CONTEXT_MESSAGES.values():
+        return code, message
     return code, _ERROR_MESSAGES[code]
 
 
@@ -144,8 +153,8 @@ def finish_error(conn, actor_id, request_id, fence_token, *, code: str, message:
     _receipt(conn, actor_id, request_id)
     if status not in {"failed", "cancelled"} or type(http_status) is not int or not 400 <= http_status <= 599:
         raise ValueError("invalid terminal error status")
-    # Only fixed messages enter storage; provider errors can contain tokens or prompt text.
-    code, message = safe_error("cancelled" if status == "cancelled" else code)
+    # Only allowlisted messages enter storage; AI explanations may quote private messages.
+    code, message = safe_error("cancelled" if status == "cancelled" else code, message)
     counters, latency_ms = _telemetry(usage, latency_ms)
     return conn.execute(
         """UPDATE desktop_reply_requests SET status=%s,error_code=%s,error_message=%s,error_http_status=%s,
