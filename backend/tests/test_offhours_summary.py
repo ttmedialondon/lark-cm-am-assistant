@@ -645,11 +645,11 @@ def test_relevant_chats_are_filtered_before_limit(pg, seeded):
 
 
 
-def test_shared_admission_limits_summary_claims_to_three(pg, seeded):
+def test_shared_admission_limits_summary_claims_to_five(pg, seeded):
     s = seeded
     s.save()
     run = pg.execute("SELECT run_id FROM offhours_summary_settings").fetchone()["run_id"]
-    for i in range(3):
+    for i in range(5):
         chat = f"parallel-{i}"
         pg.execute("INSERT INTO chats(chat_id) VALUES(%s)", (chat,))
         pg.execute(
@@ -657,7 +657,8 @@ def test_shared_admission_limits_summary_claims_to_three(pg, seeded):
                    VALUES(%s,%s,%s,%s,NOW())""",
             (uuid4(), run, chat, str(i)),
         )
-    assert all(ai.claim_next_summary() is not None for _ in range(3))
+    assert all(ai.claim_next_summary() is not None for _ in range(4))
+    assert ai.claim_next_summary() is not None  # Four running leases permit the fifth, not a sixth.
     assert ai.claim_next_summary() is None
 
 

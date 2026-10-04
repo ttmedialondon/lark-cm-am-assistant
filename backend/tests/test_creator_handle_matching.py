@@ -596,13 +596,21 @@ def test_role_and_chat_events_shared_slots_and_catalog_changes(pg, matching_flow
     pg.execute("UPDATE creator_handle_jobs SET not_before=NOW() WHERE id=%s", (job_id,))
     assert matching.prepare_next(flow.settings)
     # Matching leases consume the shared admission counter, just as summary/reply leases do.
-    for who in ("legacy", "silent", "cm"):
+    for who in ("legacy", "silent", "cm", "owner"):
         pg.execute(
             """INSERT INTO creator_handle_jobs(contact_id,status,lease_until)
             VALUES(%s,'running',NOW()+INTERVAL '2 minutes')""",
             (pilot.ids[who],),
         )
+    assert ai_dispatch.can_claim(pg)  # Four leases still leave one of the five shared slots free.
+    pg.execute("SAVEPOINT admission_slots")
+    fifth = pilot.person("fifth_slot")
+    pg.execute(
+        "UPDATE creator_handle_jobs SET status='running',lease_until=NOW()+INTERVAL '2 minutes' WHERE contact_id=%s",
+        (fifth,),
+    )
     assert matching.claim() is None
+    pg.execute("ROLLBACK TO SAVEPOINT admission_slots")
     pg.execute("UPDATE creator_handle_jobs SET status='completed' WHERE id<>%s", (job_id,))
     job = matching.claim()
     assert job is not None

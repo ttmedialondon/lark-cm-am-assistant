@@ -233,7 +233,7 @@ def _fill_ai_slots(
     futures: set[Future[Any]],
     next_queue: int,
 ) -> int:
-    """Fill up to three AI slots before returning immediately to Lark sync."""
+    """Fill available AI slots before returning immediately to Lark sync."""
 
     while len(futures) < ai_dispatch.MAX_CONCURRENT_REQUESTS:
         submitted, next_queue = _dispatch_ai_turn(settings, executor, futures, next_queue)

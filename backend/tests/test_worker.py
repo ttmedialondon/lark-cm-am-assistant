@@ -230,10 +230,10 @@ def test_full_ai_slots_do_not_attempt_another_claim(monkeypatch) -> None:
         lambda *_args: pytest.fail("a full AI pool must not claim another task"),
     )
 
-    assert worker._fill_ai_slots(object(), object(), {Future(), Future(), Future()}, 2) == 2
+    assert worker._fill_ai_slots(object(), object(), {Future() for _ in range(5)}, 2) == 2
 
 
-def test_dispatch_uses_at_most_three_slots_and_fairly_rotates_queues(monkeypatch) -> None:
+def test_dispatch_uses_at_most_five_slots_and_fairly_rotates_all_four_queues(monkeypatch) -> None:
     submitted: list[tuple[object, object]] = []
 
     class Future:
@@ -245,28 +245,33 @@ def test_dispatch_uses_at_most_three_slots_and_fairly_rotates_queues(monkeypatch
             submitted.append((runner, job))
             return Future()
 
-    summary_jobs = iter(({"id": "summary-1"}, {"id": "summary-2"}))
+    summary_jobs = iter(({"id": "summary-1"}, {"id": "summary-2"}, {"id": "summary-3"}))
     import_jobs = iter(({"id": "import-1"},))
     reply_jobs = iter(({"id": "reply-1"},))
+    matching_jobs = iter(({"id": "matching-1"},))
     monkeypatch.setattr(worker.summary_replies, "claim", lambda: next(reply_jobs, None))
     monkeypatch.setattr(worker.offhours_summary, "claim_next_summary", lambda: next(summary_jobs, None))
     monkeypatch.setattr(worker.creator_imports, "claim_next_import", lambda: next(import_jobs, None))
+    monkeypatch.setattr(worker.creator_handle_matching, "claim", lambda: next(matching_jobs, None))
 
     futures = set()
-    submitted_one, preference = worker._dispatch_ai_turn(object(), Executor(), futures, 0)
-    submitted_two, preference = worker._dispatch_ai_turn(object(), Executor(), futures, preference)
-    submitted_three, preference = worker._dispatch_ai_turn(object(), Executor(), futures, preference)
-    submitted_four, _ = worker._dispatch_ai_turn(object(), Executor(), futures, preference)
+    turns, preference = [], 0
+    for _ in range(6):
+        dispatched, preference = worker._dispatch_ai_turn(object(), Executor(), futures, preference)
+        turns.append(dispatched)
 
-    assert (submitted_one, submitted_two, submitted_three, submitted_four) == (True, True, True, False)
-    assert [job["id"] for _runner, job in submitted] == ["summary-1", "import-1", "reply-1"]
+    assert turns == [True, True, True, True, True, False] and len(futures) == 5
+    assert [job["id"] for _runner, job in submitted] == [
+        "summary-1", "import-1", "reply-1", "matching-1", "summary-2"
+    ]
+    assert submitted[3][0] is worker.creator_handle_matching.run
     futures.clear()
     preference = worker._fill_ai_slots(object(), Executor(), futures, preference)
     assert preference == 1
-    assert [job["id"] for _runner, job in submitted[3:]] == ["summary-2"]
+    assert [job["id"] for _runner, job in submitted[5:]] == ["summary-3"]
     futures.clear()
     assert worker._fill_ai_slots(object(), Executor(), futures, preference) == 1
-    assert [job["id"] for _runner, job in submitted[4:]] == []
+    assert [job["id"] for _runner, job in submitted[6:]] == []
 
     # Exhausted queues must not query on every busy Lark tick. Completion wakes
     # the dispatcher immediately so a chained summary/reply is not delayed.
@@ -291,8 +296,8 @@ def test_dispatch_uses_at_most_three_slots_and_fairly_rotates_queues(monkeypatch
     assert len(checks) == 3
 
 
-def test_offhours_tasks_fill_three_parallel_slots_without_waiting(monkeypatch) -> None:
-    jobs = iter({"id": index} for index in range(3))
+def test_offhours_tasks_fill_five_parallel_slots_without_waiting(monkeypatch) -> None:
+    jobs = iter({"id": index} for index in range(5))
     submitted = []
 
     class Executor:
@@ -301,13 +306,14 @@ def test_offhours_tasks_fill_three_parallel_slots_without_waiting(monkeypatch) -
             submitted.append(job["id"])
             return object()
 
-    monkeypatch.setattr(worker.offhours_summary, "claim_next_summary", lambda: next(jobs))
+    monkeypatch.setattr(worker.offhours_summary, "claim_next_summary", lambda: next(jobs, None))
     monkeypatch.setattr(worker.creator_imports, "claim_next_import", lambda: None)
     monkeypatch.setattr(worker.summary_replies, "claim", lambda: None)
+    monkeypatch.setattr(worker.creator_handle_matching, "claim", lambda: None)
     futures = set()
     worker._fill_ai_slots(object(), Executor(), futures, 0)
-    assert submitted == [0, 1, 2]
-    assert len(futures) == 3
+    assert submitted == [0, 1, 2, 3, 4]
+    assert len(futures) == 5
 
 
 def test_creator_previews_are_fair_single_flight_and_back_off_without_work(monkeypatch) -> None:

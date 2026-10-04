@@ -14,7 +14,7 @@ import psycopg
 
 from .db import connection
 
-MAX_CONCURRENT_REQUESTS = 3
+MAX_CONCURRENT_REQUESTS = 5
 _ADMISSION_LOCK = 541_195_270
 _TEMPORARY_RATE_LIMIT_MESSAGE = "OpenAI 请求暂时限速；系统将按服务端给出的时间自动重试。"
 _QUOTA_PAUSE_MESSAGE = "OpenAI 项目因配额或账单问题已暂停；请处理后由所有者恢复队列。"
