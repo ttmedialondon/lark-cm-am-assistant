@@ -42,7 +42,8 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
             formal_base = """FROM contacts c WHERE EXISTS(SELECT 1 FROM contact_roles r
                 WHERE r.contact_id=c.id AND r.role='creator' AND r.status='confirmed')
                 AND NOT EXISTS(SELECT 1 FROM contact_assignments a WHERE a.contact_id=c.id AND a.ended_at IS NULL)
-                AND NOT EXISTS(SELECT 1 FROM creator_account_assignments a WHERE a.contact_id=c.id AND a.ended_at IS NULL)"""
+                AND NOT EXISTS(SELECT 1 FROM creator_account_assignments a
+                    WHERE a.contact_id=c.id AND a.ended_at IS NULL)"""
             args = []
         confirmed = conn.execute("SELECT count(*) n " + formal_base, args).fetchone()["n"]
         counts = dict.fromkeys(("pending", "preparing", "ready", "queued", "running", "succeeded", "skipped",

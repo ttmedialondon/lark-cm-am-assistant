@@ -46,7 +46,9 @@ def test_reviewed_curva_admission_and_unassigned_visibility(pg, pilot, monkeypat
     assert admit(pg, owner, rows, {'curva_reviewed'})['new_links'] == 0
     assert _snapshot(pg, ('contact_roles', 'contact_social_accounts', 'audit_events')) == after
     assert _snapshot(pg, ('contact_assignments', 'creator_account_assignments')) == protected
-    assert pg.execute('SELECT creator_type FROM contacts WHERE id=%s', (contact,)).fetchone()['creator_type'] == 'pending'
+    assert pg.execute(
+        'SELECT creator_type FROM contacts WHERE id=%s', (contact,),
+    ).fetchone()['creator_type'] == 'pending'
     data = creator_roster.page_data(owner, tab='unassigned', query='curva_reviewed')
     assert data['total_count'] == 1 and data['read_only']
     assert data['items'][0]['handles'] == ['curva_reviewed']
@@ -248,7 +250,9 @@ def test_cap_excel_two_stage_matching_manual_confirmation_and_replays_preserve_p
     imports.confirm_row(cm, second["id"], "corrected_02", creator)
     imports.defer_row(cm, missing["id"])
     assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 1
-    assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (creator,)).fetchone()["creator_type"] == "pending"
+    assert pg.execute(
+        "SELECT creator_type FROM contacts WHERE id=%s", (creator,),
+    ).fetchone()["creator_type"] == "pending"
     assert pg.execute("SELECT status FROM contact_roles WHERE contact_id=%s AND role='creator'",
                       (creator,)).fetchone()["status"] == "confirmed"
     formal = creator_roster.page_data(cm, tab="mine")["items"]
@@ -337,7 +341,9 @@ def test_manual_import_scope_identity_account_and_type_conflicts_are_atomic(pg, 
     pg.execute("UPDATE contacts SET creator_type='non_cap' WHERE id=%s", (creator,))
     imports.confirm_row(cm, row["id"], "corrected_handle", creator)
     assert row_for(pg, batch, "corrected_handle")["review_status"] == "confirmed"
-    assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (creator,)).fetchone()['creator_type'] == 'non_cap'
+    assert pg.execute(
+        "SELECT creator_type FROM contacts WHERE id=%s", (creator,),
+    ).fetchone()['creator_type'] == 'non_cap'
     assert creator_roster.page_data(cm)['items'][0]['contact_id'] == str(creator)
     prior = pg.execute("SELECT metadata->'previous' previous FROM audit_events "
                        "WHERE action='creator_import_evidence_invalidated' AND metadata->>'row_id'=%s",
@@ -667,7 +673,8 @@ def test_two_person_stages_for_one_creator_do_not_drop_paid_results_after_classi
     cm = pilot.ids["cm"]
     pg.execute("DELETE FROM contact_roles WHERE contact_id=%s", (pilot.ids["creator"],))
     group(pg, pilot, "chat_creator", "first_handle + second_handle", "creator")
-    add_message(pg, pilot, "chat_creator", "creator", "My accounts are first_handle and second_handle. I make videos on both.")
+    add_message(pg, pilot, "chat_creator", "creator",
+                "My accounts are first_handle and second_handle. I make videos on both.")
     batch = imports.preview_import(cm, cm, "parallel.xlsx", workbook("first_handle", "second_handle"))
     imports.start_import(cm, batch["id"])
     people = []
@@ -993,7 +1000,9 @@ def test_creator_library_reset_preserves_sources_history_and_new_data_on_replay(
     pg.execute(migration)
     assert creator_roster.page_data(cm, tab="mine")["total_count"] == 1
     assert row_for(pg, new_batch, "creator_one")["review_status"] == "confirmed"
-    assert pg.execute("SELECT creator_type FROM contacts WHERE id=%s", (creator,)).fetchone()["creator_type"] == "pending"
+    assert pg.execute(
+        "SELECT creator_type FROM contacts WHERE id=%s", (creator,),
+    ).fetchone()["creator_type"] == "pending"
     assert pg.execute("SELECT count(*) n FROM audit_events WHERE action=%s", (action,)).fetchone()["n"] == 1
 
 
@@ -1096,8 +1105,12 @@ def test_group_person_refs_do_not_cross_people_groups_or_current_access(pg, pilo
         labels = {r['message_id']: r['label'] for r in qa['refs'] if r['kind'] == 'message'}
         yes = next(m for m in qa['pack']['messages'] if m['ref'] == labels[answer])
         assert yes['text'] == 'Yes' and yes['reply_to_ref'] == labels[question] and not yes['reply_context_missing']
-        assert evidence.person_validate({**response, 'evidence_refs': [labels[question]]}, qa['pack'])['outcome'] == 'review'
-        assert evidence.person_validate({**response, 'evidence_refs': [labels[question], labels[answer]]}, qa['pack'])['outcome'] == 'matched'
+        assert evidence.person_validate(
+            {**response, 'evidence_refs': [labels[question]]}, qa['pack'],
+        )['outcome'] == 'review'
+        assert evidence.person_validate(
+            {**response, 'evidence_refs': [labels[question], labels[answer]]}, qa['pack'],
+        )['outcome'] == 'matched'
     with pg.transaction(force_rollback=True):
         sole = evidence.build_person_evidence(pg, pilot.settings, cm, "target_account", ["second_group"])
         user = next(u["ref"] for u in sole["pack"]["users"] if u["eligible"])

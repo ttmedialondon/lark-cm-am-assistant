@@ -383,7 +383,8 @@ def start_import(actor_id, batch_id):
                             if _conflict(conn, row, contact_id, row["handle"]):
                                 raise ValueError(REASONS["account_conflict"])
                             person = conn.execute(
-                                "SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed'",
+                                "SELECT 1 FROM contact_roles "
+                                "WHERE contact_id=%s AND role='creator' AND status='confirmed'",
                                 (contact_id,),
                             ).fetchone()
                             # Reuse the verified identity; add only this CM's missing

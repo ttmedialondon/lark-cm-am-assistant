@@ -179,7 +179,8 @@ def seeded(pg, monkeypatch):
     for name in ("cm", "person", "other"):
         pg.execute("INSERT INTO contacts(id,display_name,creator_type) VALUES(%s,%s,'non_cap')", (ids[name], name))
         if name != "cm":
-            pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) VALUES(%s,'creator','confirmed','manual')",
+            pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) "
+                       "VALUES(%s,'creator','confirmed','manual')",
                        (ids[name],))
         pg.execute(
             """INSERT INTO lark_identities(open_id,contact_id,display_name,tenant_classification)
