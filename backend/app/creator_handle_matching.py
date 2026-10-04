@@ -91,13 +91,14 @@ def _config_hash(config):
     return evidence_hash({k: config[k] for k in ("provider", "project_id", "model", "api_key_ciphertext")})
 
 
-def _human_confirmation_changed(conn, job, pack):
-    current = {
-        row["handle"] for row in contact_handles.confirmed_pairs(conn, [job["contact_id"]]) if row["human_confirmed"]
-    }
-    snapshot = job["stats"].get("human_confirmed_handles")
-    return bool(current & {h["handle"] for h in (pack or {}).get("handles", [])}) or (
-        snapshot is not None and set(snapshot) != current
+def _confirmation_changed(conn, job, pack):
+    current = {row["handle"] for row in contact_handles.confirmed_pairs(conn, [job["contact_id"]])}
+    snapshot = job["stats"].get("confirmed_handles")
+    allowed = set(job["stats"].get("recheck_handles", []))
+    return (
+        snapshot is None or set(snapshot) != current
+        or job["stats"].get("manual_recheck", False) != (job["source"] == "manual")
+        or bool((current - allowed) & {h["handle"] for h in (pack or {}).get("handles", [])})
     )
 
 
@@ -201,7 +202,7 @@ def prepare_next(settings):
         handles, catalog_version = catalog()
         with connection() as conn, conn.transaction():
             conn.execute("SET LOCAL statement_timeout='90s'")
-            prepared = evidence.build(conn, settings, job["contact_id"], handles)
+            prepared = evidence.build(conn, settings, job["contact_id"], handles, recheck=job["source"] == "manual")
             prepared["stats"] = {**prepared["stats"], "prompt_version": evidence.PROMPT_VERSION}
     except (OSError, ValueError, KeyError):
         _finish_preparation(job["id"], token, version, "waiting_evidence", "catalog_unavailable")
@@ -219,7 +220,9 @@ def prepare_next(settings):
             _invalidate(conn, current)
             return True
         pack = prepared["pack"]
-        if _human_confirmation_changed(conn, {**current, "stats": prepared["stats"]}, pack):
+        if prepared["reason"] != "restricted" and _confirmation_changed(
+            conn, {**current, "stats": prepared["stats"]}, pack
+        ):
             _invalidate(conn, current)
             return True
         fingerprint = evidence_hash(
@@ -508,7 +511,7 @@ def claim():
         storage = creator_data.cipher(get_settings())
         raw = storage.decrypt(job["pack_ciphertext"])
         pack = json.loads(raw)
-        if _human_confirmation_changed(conn, job, pack):
+        if _confirmation_changed(conn, job, pack):
             _invalidate(conn, job)
             return None
         tokens = (
@@ -549,7 +552,7 @@ def _current(conn, job):
         row["desired_version"] != job["snapshot_version"]
         or not _enabled(config)
         or _config_hash(config) != job["config_fingerprint"]
-        or _human_confirmation_changed(conn, row, job["pack"])
+        or _confirmation_changed(conn, row, job["pack"])
     ):
         _invalidate(conn, row)
         return None
@@ -797,7 +800,8 @@ def enqueue_history(conn, actor):
         (evidence.PROMPT_VERSION,),
     ).fetchall()
     for row in rows:
-        conn.execute("SELECT enqueue_creator_handle(%s,'history',TRUE)", (row["contact_id"],))
+        enqueued = conn.execute("SELECT enqueue_creator_handle(%s,'history',TRUE) id", (row["contact_id"],)).fetchone()
+        conn.execute("UPDATE creator_handle_jobs SET source='history' WHERE id=%s", (enqueued["id"],))
     _audit(conn, actor, "creator_handle_history_enqueued", {"contacts": len(rows)})
     return len(rows)
 
@@ -835,6 +839,7 @@ def page_data(conn, actor, settings, page=1):
             and evidence.still_valid(conn, job["refs"], settings)
         ):
             view = json.loads(storage.decrypt(job["result_ciphertext"]))
+            pack = json.loads(storage.decrypt(job["pack_ciphertext"]))
             job["suggestions"] = [
                 {
                     **link,
@@ -843,7 +848,10 @@ def page_data(conn, actor, settings, page=1):
                 for link in view["result"]["links"]
                 if view["handles"][link["h"]] in current_handles
             ]
-            for link in job["suggestions"]:
+            conflicts = creator_imports._conflicts(
+                conn, [(None, job["contact_id"], link["handle"]) for link in job["suggestions"]]
+            )
+            for link, actual_conflict in zip(job["suggestions"], conflicts, strict=True):
                 if (
                     link["decision"] == "supported"
                     and link["relation"] == "self_account"
@@ -860,7 +868,24 @@ def page_data(conn, actor, settings, page=1):
                     ).fetchone()
                 ):
                     link.update(decision="review", relation="uncertain", code="conflict")
-                link["conflict"] = link["code"] == "conflict" or link.get("validation_error") == "counterevidence"
+                candidate = next(h for h in pack["handles"] if h["handle"] == link["handle"])
+                _, claims = evidence._support_groups(pack, candidate)
+                link["conflict"] = actual_conflict or bool(evidence._counterevidence(pack, link["handle"], claims))
+        rows = {item["handle"]: {**item, "associated": True, "check": None, "conflict": False}
+                for item in job["associations"]}
+        for link in job["suggestions"]:
+            row = rows.setdefault(link["handle"], {"handle": link["handle"], "associated": False,
+                                                  "human_confirmed": False, "check": None, "conflict": False})
+            # Old paid reproof does not override a live formal fact. Explicit manual
+            # reviews and concrete conflicts remain visible on that same handle row.
+            if not row["associated"] or job["source"] == "manual" or link["conflict"]:
+                row.update(check=link, conflict=link["conflict"])
+        job["handle_rows"] = [rows[h] for h in sorted(rows)]
+        if (job["source"] != "manual" and job["status"] in {"completed", "review_required"}
+                and job["suggestions"] and not job["stats"].get("candidates_omitted")
+                and all(rows[link["handle"]]["associated"] and rows[link["handle"]]["check"] is None
+                        for link in job["suggestions"])):
+            job.update(display_status="completed", display_reason_code="already_confirmed")
         for field in ("pack_ciphertext", "result_ciphertext", "refs"):
             job.pop(field, None)
     return {"jobs": jobs, "counts": counts, "enabled": _enabled(_config(conn)), "page": page}

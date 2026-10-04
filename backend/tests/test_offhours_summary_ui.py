@@ -83,22 +83,36 @@ def test_readonly_admin_has_no_save_resume_key_or_window_edit_controls():
 def test_matching_template_escapes_names_and_distinguishes_associations_from_historical_operator_suggestions():
     environment = Environment(loader=FileSystemLoader(APP / "templates"), autoescape=select_autoescape())
     hostile = "<script>alert(1)</script>"
+    display_job = uuid4()
     html = environment.get_template("admin/creator_handle_matching.html").render(
         authorization={"display_name": "Fixture Reviewer"}, admin_landing_path="/admin", admin_role="owner",
         admin_permissions=admin.admin_permissions.PAGE_KEYS, permission_pages=admin.admin_permissions.PAGES,
         active_page="ai", csrf_token="fixture-csrf", matching={
-            "enabled": False, "counts": [{"status": "review_required", "n": 1}], "page": 1,
+            "enabled": False, "counts": [{"status": "review_required", "n": 2}], "page": 1,
             "jobs": [{"id": uuid4(), "display_name": hostile, "status": "review_required",
                       "reason_code": "suggestions_saved", "input_tokens": 100, "output_tokens": 20,
-                      "associations": [{"handle": "fixture.owned", "human_confirmed": True},
-                                       {"handle": "fixture.conflicted", "human_confirmed": False}],
-                      "suggestions": [{"handle": "fixture.handle", "decision": "review", "relation": "operator",
-                                       "code": "operates_for_other", "period": "historical", "conflict": False},
-                                      {"handle": "fixture.owned", "decision": "supported", "relation": "self_account",
-                                       "code": "qa_confirm", "period": "at_message", "conflict": False},
-                                      {"handle": "fixture.conflicted", "decision": "review", "relation": "uncertain",
-                                       "code": "conflict", "period": "historical", "conflict": True,
-                                       "validation_error": "counterevidence"}]}],
+                      "handle_rows": [
+                          {"handle": "fixture.handle", "associated": False, "human_confirmed": False,
+                           "conflict": False, "check": {"decision": "review", "relation": "operator",
+                                                       "code": "operates_for_other", "period": "historical"}},
+                          {"handle": "fixture.owned", "associated": True, "human_confirmed": True,
+                           "conflict": False, "check": {"decision": "supported", "relation": "self_account",
+                                                       "code": "qa_confirm", "period": "at_message"}},
+                          {"handle": "fixture.existing", "associated": True, "human_confirmed": False,
+                           "conflict": False, "check": None},
+                          {"handle": "fixture.guessed", "associated": False, "human_confirmed": False,
+                           "conflict": False, "check": {"decision": "review", "relation": "uncertain",
+                                                       "code": "conflict", "period": "unknown"}},
+                          {"handle": "fixture.conflicted", "associated": True, "human_confirmed": False,
+                           "conflict": True, "check": {"decision": "review", "relation": "uncertain",
+                                                      "code": "conflict", "period": "historical",
+                                                      "validation_error": "counterevidence"}},
+                      ]},
+                     {"id": display_job, "display_name": "Display fixture", "status": "review_required",
+                      "display_status": "completed", "display_reason_code": "already_confirmed",
+                      "reason_code": "suggestions_saved", "input_tokens": 100, "output_tokens": 20,
+                      "handle_rows": [{"handle": "fixture.display", "associated": True,
+                                       "human_confirmed": False, "check": None, "conflict": False}]}],
         },
     )
     assert "账号匹配" in html and 'action="/admin/ai/creator-handle-matching/enqueue"' in html
@@ -107,15 +121,24 @@ def test_matching_template_escapes_names_and_distinguishes_associations_from_his
     assert "代运营" in html and "历史关系" in html and "待核实" in html
     assert "operator" not in html and "review_required" not in html
     assert 'href="https://www.tiktok.com/@fixture.handle"' in html
-    assert "当前关联" in html and "本轮核验" in html
-    assert "@fixture.owned</a> · 人工已核准" in html and "@fixture.owned</a> · 支持" in html
-    assert "@fixture.conflicted</a> · 已关联" in html and "@fixture.conflicted</a> · 待核实" in html
+    assert "@fixture.owned</a> · 人工已核准 · 本轮：支持</div>" in html
+    assert "@fixture.conflicted</a> · 已关联 · 归属冲突 · 本轮：待核实" in html
+    assert "@fixture.existing</a> · 已关联</div>" in html
+    for handle in ("fixture.handle", "fixture.owned", "fixture.existing", "fixture.guessed", "fixture.conflicted"):
+        assert html.count(f'href="https://www.tiktok.com/@{handle}"') == 1
     assert ('<div class="text-secondary"><a class="text-reset" '
             'href="https://www.tiktok.com/@fixture.handle"' in html)
     assert ('<div class="text-danger"><a class="text-reset" '
             'href="https://www.tiktok.com/@fixture.conflicted"' in html)
+    assert ('<div class="text-secondary"><a class="text-reset" '
+            'href="https://www.tiktok.com/@fixture.guessed"' in html)
     assert html.count('class="text-danger"') == 1
-    assert "归属冲突" in html and "账号归属存在反证" in html and "counterevidence" not in html
+    assert html.count("归属冲突") == 1
+    assert "账号关系待核实" in html and "账号归属存在反证" in html and "counterevidence" not in html
+    display_row = re.search(r"<tr><td>Display fixture</td>.*?</tr>", html, re.S).group(0)
+    assert "已完成" in display_row and "已有正式关联，无需重复匹配" in display_row
+    assert f'action="/admin/ai/creator-handle-matching/jobs/{display_job}/cancel"' in display_row
+    assert "待核实：2" in html  # The task ledger and controls still use the original status.
 
 
 def test_template_never_exposes_admin_to_a_viewer_and_escapes_private_json():

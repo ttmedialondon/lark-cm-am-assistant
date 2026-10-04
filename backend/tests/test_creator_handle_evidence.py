@@ -252,8 +252,39 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
                "WHERE contact_id=%s AND social_account_id=(SELECT id FROM social_accounts "
                "WHERE normalized_handle='first.handle')", (contact,))
     ai_import = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))
-    assert ai_import['reason'] == 'ready' and ai_import['pack']['handles'][0]['handle'] == 'first.handle'
+    assert ai_import['reason'] == 'already_confirmed' and ai_import['pack'] is None
     assert ai_import['stats']['human_confirmed_handles'] == ['outside_catalog']  # Upload is not human review.
+    assert ai_import['stats']['confirmed_handles'] == ['first.handle', 'outside_catalog']
+    manual = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}), recheck=True)
+    assert manual['reason'] == 'ready' and manual['pack']['handles'][0]['handle'] == 'first.handle'
+    assert manual['stats']['manual_recheck'] and manual['stats']['recheck_handles'] == ['first.handle']
+    pg.execute("SAVEPOINT formal_counter")
+    for label, body in (
+        ('multiple_accounts', 'My main page is first.handle and my other page is backup_2. Both are mine.'),
+        ('rename_known', 'Changed my username from first.handle to backup_2'),
+        ('never_sold_item', 'I never sold this item on first.handle'),
+        ('different_page_denial', 'first.handle is my account and backup_2 is not my account'),
+        ('voucher_denial', 'first.handle voucher is not my code'),
+        ('no_transfer', 'I did not transfer the first.handle account'),
+    ):
+        message(label, 'ou_creator', body, 96)
+    unchanged = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))
+    assert unchanged['reason'] == 'already_confirmed' and unchanged['pack'] is None
+    message('ownership_denial', 'ou_creator', 'first.handle is not my account', 97)
+    contradicted = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))
+    assert contradicted['reason'] == 'ready' and contradicted['stats']['recheck_handles'] == ['first.handle']
+    assert contradicted['pack']['handles'][0]['handle'] == 'first.handle'
+    message('ownership_clarified', 'ou_creator', 'My TikTok account is first.handle', 98)
+    clarified = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))
+    assert clarified['reason'] == 'already_confirmed' and clarified['pack'] is None
+    message('ownership_question_after_clear', 'ou_cm', 'Is your TikTok handle first.handle?', 99)
+    message('ownership_answer_after_clear', 'ou_creator', 'That is not mine', 100, 'ownership_question_after_clear')
+    parent_denial = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))
+    assert parent_denial['reason'] == 'ready' and parent_denial['stats']['recheck_handles'] == ['first.handle']
+    pg.execute("UPDATE chat_messages SET parent_id=NULL WHERE message_id='ownership_answer_after_clear'")
+    continuous_denial = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))
+    assert continuous_denial['reason'] == 'ready' and continuous_denial['stats']['recheck_handles'] == ['first.handle']
+    pg.execute("ROLLBACK TO SAVEPOINT formal_counter")
     pg.execute("ROLLBACK TO SAVEPOINT human_pairs")
     pg.execute("SAVEPOINT intro_counter")
     pilot.person("intro_peer")

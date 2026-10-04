@@ -43,7 +43,9 @@ def matching_flow(pg, pilot, monkeypatch):
     monkeypatch.setattr(matching, "catalog", lambda: (frozenset({"first.handle", "backup_2"}), "catalog-v1"))
     monkeypatch.setattr(matching.evidence, "still_valid", lambda *_: state.valid)
 
-    def prepare(_conn, _settings, contact, _catalog):
+    def prepare(_conn, _settings, contact, _catalog, *, recheck=False):
+        pairs = contact_handles.confirmed_pairs(_conn, [contact])
+        confirmed = sorted({p["handle"] for p in pairs})
         pack = {
             "target": "U1",
             "creator_known": True,
@@ -73,16 +75,22 @@ def matching_flow(pg, pilot, monkeypatch):
             ],
             "coverage": {"full_history": False, "missing_reply_ids": state.missing_reply_ids, "excerpted_ids": []},
         }
+        if not recheck:
+            pack["handles"] = [h for h in pack["handles"] if h["handle"] not in confirmed]
         return {
-            "pack": pack,
+            "pack": pack if pack["handles"] else None,
             "refs": [
                 {"kind": "message", "label": label, "synthetic_version": state.reference_version}
                 for label in ("M1", "M2")
             ],
-            "fingerprint": f"synthetic-{contact}-{state.material_version}",
-            "reason": "ready",
+            "fingerprint": f"synthetic-{contact}-{state.material_version}-{[h['handle'] for h in pack['handles']]}",
+            "reason": "ready" if pack["handles"] else "already_confirmed",
             "stats": {
                 "messages": 2,
+                "confirmed_handles": confirmed,
+                "human_confirmed_handles": sorted({p["handle"] for p in pairs if p["human_confirmed"]}),
+                "manual_recheck": recheck,
+                "recheck_handles": confirmed if recheck else [],
                 **({"critical_evidence_omitted_handles": []} if not state.legacy_stats else {}),
                 **state.stats,
             },
@@ -103,10 +111,10 @@ def matching_flow(pg, pilot, monkeypatch):
                     "relation": "self_account",
                     "period": state.period,
                     "code": "self_claim",
-                    "refs": [f"M{index}"],
+                    "refs": ["M" + handle["id"][1:]],
                     "needed": state.needed,
                 }
-                for index, handle in enumerate(pack["handles"], 1)
+                for handle in pack["handles"]
             ],
         }
         if state.review:
@@ -147,12 +155,12 @@ def matching_flow(pg, pilot, monkeypatch):
     return state
 
 
-def _enqueue(pg, contact):
-    return pg.execute("SELECT enqueue_creator_handle(%s,'manual',TRUE) id", (contact,)).fetchone()["id"]
+def _enqueue(pg, contact, source="manual"):
+    return pg.execute("SELECT enqueue_creator_handle(%s,%s,TRUE) id", (contact, source)).fetchone()["id"]
 
 
-def _prepared_job(pg, flow):
-    _enqueue(pg, flow.contact)
+def _prepared_job(pg, flow, source="manual"):
+    _enqueue(pg, flow.contact, source)
     assert matching.prepare_next(flow.settings)
     job = matching.claim()
     assert job is not None
@@ -349,6 +357,11 @@ def test_legacy_limits_do_not_block_restart_and_retry_fences(pg, matching_flow):
     assert (
         pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone()["status"]
         == "completed"
+    )
+    # Reopen only fixture-generated pairs to exercise provider failure caching for unlinked candidates.
+    pg.execute(
+        "DELETE FROM contact_social_accounts WHERE contact_id=%s AND source='creator_handle_auto_verified'",
+        (flow.contact,),
     )
     flow.error = openai_client.OpenAIRequestError("synthetic transient failure", retryable=True)
     flow.material_version += 1
@@ -633,6 +646,32 @@ def test_role_and_chat_events_shared_slots_and_catalog_changes(pg, matching_flow
     latest = matching.page_data(pg, pilot.ids["owner"], flow.settings)["jobs"]
     assert len({row["contact_id"] for row in latest}) == len(latest)
     assert old_id not in {row["id"] for row in latest}
+    # Bulk history restart must not retain an old manual request's force-recheck policy.
+    for handle in ("first.handle", "backup_2"):
+        account = uuid4()
+        pg.execute(
+            "INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) VALUES(%s,'tiktok',%s,%s)",
+            (account, handle, handle),
+        )
+        pg.execute(
+            "INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source) "
+            "VALUES(%s,%s,'owner','confirmed','excel_ai_verified')",
+            (flow.contact, account),
+        )
+    pg.execute(
+        "UPDATE creator_handle_jobs SET status='review_required',source='manual',"
+        "stats=jsonb_build_object('prompt_version','retired-prompt') WHERE id=%s",
+        (job_id,),
+    )
+    assert matching.enqueue_history(pg, pilot.ids["owner"]) == 1
+    assert pg.execute("SELECT source FROM creator_handle_jobs WHERE id=%s", (job_id,)).fetchone()["source"] == "history"
+    for _ in range(2):  # The earlier legacy history item and the requeued existing-pair item.
+        assert matching.prepare_next(flow.settings)
+    assert pg.execute("SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s", (job_id,)).fetchone() == {
+        "status": "completed",
+        "reason_code": "already_confirmed",
+    }
+    assert len(flow.calls) == 2
 
 
 def test_failed_diagnostics_partial_results_and_queue_cleanup_preserve_data(pg, matching_flow, monkeypatch):
@@ -743,7 +782,9 @@ def test_disabled_probe_retains_paid_diagnostics_when_postcall_catalog_fails(pg,
     assert not pg.execute("SELECT 1 FROM creator_handle_jobs").fetchone()
 
 
-def test_human_confirmed_pairs_skip_paid_matching_without_freezing_other_handles(pg, matching_flow, pilot, monkeypatch):
+def test_formal_pairs_skip_paid_matching_without_freezing_new_handles_or_manual_review(
+    pg, matching_flow, pilot, monkeypatch
+):
     flow = matching_flow
     flow.enable()
     monkeypatch.setattr(matching.evidence, "build", flow.real_build)
@@ -771,14 +812,14 @@ def test_human_confirmed_pairs_skip_paid_matching_without_freezing_other_handles
     cipher = message_body_cipher(flow.settings.token_encryption_key)
     start = datetime.now(UTC)
 
-    def message(handle, minute):
+    def message(handle, minute, body=None):
         message_id = f"{handle}-{minute}"
         pg.execute(
             "INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,"
             "body_ciphertext,message_create_time) VALUES('chat_creator',%s,'ou_creator','user','text',%s,%s)",
             (
                 message_id,
-                cipher.encrypt(json.dumps({"text": "My TikTok account is " + handle})),
+                cipher.encrypt(json.dumps({"text": body or "My TikTok account is " + handle})),
                 start + timedelta(minutes=minute),
             ),
         )
@@ -801,7 +842,7 @@ def test_human_confirmed_pairs_skip_paid_matching_without_freezing_other_handles
         (flow.contact, first, pilot.ids["owner"]),
     )
     message("first.handle", 0)
-    all_confirmed = _enqueue(pg, flow.contact)
+    all_confirmed = _enqueue(pg, flow.contact, "history")
     assert matching.prepare_next(flow.settings) and matching.claim() is None
     assert pg.execute(
         "SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s", (all_confirmed,)
@@ -812,9 +853,9 @@ def test_human_confirmed_pairs_skip_paid_matching_without_freezing_other_handles
     assert page["jobs"][0]["suggestions"] == []
     pg.execute("UPDATE creator_handle_jobs SET created_at=NOW()-INTERVAL '1 minute' WHERE id=%s", (all_confirmed,))
 
-    # The trusted exact pair is excluded, not the entire contact.
+    # The formal exact pair is excluded, not the entire contact.
     message("backup_2", 1)
-    job = _prepared_job(pg, flow)
+    job = _prepared_job(pg, flow, "incremental")
     assert [h["handle"] for h in job["pack"]["handles"]] == ["backup_2"]
     assert job["stats"]["prompt_version"] == matching.evidence.PROMPT_VERSION
     matching.run(job, flow.settings)
@@ -834,12 +875,15 @@ def test_human_confirmed_pairs_skip_paid_matching_without_freezing_other_handles
     assert not next(row for row in contact_handles.confirmed_pairs(pg, [flow.contact]) if row["handle"] == "backup_2")[
         "human_confirmed"
     ]
-    assert [
+    assert flow.real_build(pg, flow.settings, flow.contact, frozenset({"first.handle", "backup_2"}))["reason"] == (
+        "already_confirmed"
+    )
+    assert {
         h["handle"]
-        for h in flow.real_build(pg, flow.settings, flow.contact, frozenset({"first.handle", "backup_2"}))["pack"][
-            "handles"
-        ]
-    ] == ["backup_2"]
+        for h in flow.real_build(
+            pg, flow.settings, flow.contact, frozenset({"first.handle", "backup_2"}), recheck=True
+        )["pack"]["handles"]
+    } == {"first.handle", "backup_2"}
     pg.execute(
         "UPDATE contact_social_accounts SET source='creator_handle_auto_verified' WHERE contact_id=%s "
         "AND social_account_id=(SELECT id FROM social_accounts WHERE normalized_handle='backup_2')",
@@ -848,6 +892,28 @@ def test_human_confirmed_pairs_skip_paid_matching_without_freezing_other_handles
     assert not next(row for row in contact_handles.confirmed_pairs(pg, [flow.contact]) if row["handle"] == "backup_2")[
         "human_confirmed"
     ]
+    pairs_before = _snapshot(pg, ("contact_social_accounts",))
+    automatic = _enqueue(pg, flow.contact, "incremental")
+    assert matching.prepare_next(flow.settings) and matching.claim() is None and len(flow.calls) == 1
+    assert pg.execute("SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s", (automatic,)).fetchone() == {
+        "status": "completed",
+        "reason_code": "already_confirmed",
+    }
+    # Skipping does not invent a human review or rewrite source.
+    assert _snapshot(pg, pairs_before.keys()) == pairs_before
+    pg.execute(
+        "UPDATE creator_handle_jobs SET created_at=NOW()-INTERVAL '1 minute' WHERE contact_id=%s", (flow.contact,)
+    )
+
+    # Explicit manual review includes existing pairs, but the DB does not add duplicate links or audit events.
+    job = _prepared_job(pg, flow)
+    assert {h["handle"] for h in job["pack"]["handles"]} == {"first.handle", "backup_2"}
+    assert job["stats"]["manual_recheck"] and set(job["stats"]["recheck_handles"]) == {"first.handle", "backup_2"}
+    matching.run(job, flow.settings)
+    assert len(flow.calls) == 2 and _snapshot(pg, pairs_before.keys()) == pairs_before
+    assert (
+        pg.execute("SELECT count(*) n FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()["n"] == 1
+    )
 
     # Formal relationships and this round's AI conclusion are independent page fields.
     saved = pg.execute("SELECT result_ciphertext FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone()
@@ -858,8 +924,8 @@ def test_human_confirmed_pairs_skip_paid_matching_without_freezing_other_handles
     )
     for code, validation_error, conflict in (
         ("no_link_evidence", None, False),
-        ("conflict", None, True),
-        ("no_link_evidence", "counterevidence", True),
+        ("conflict", None, False),
+        ("no_link_evidence", "counterevidence", False),
     ):
         link["code"] = code
         if validation_error:
@@ -879,42 +945,132 @@ def test_human_confirmed_pairs_skip_paid_matching_without_freezing_other_handles
         }
         assert row["suggestions"][0]["decision"] == "review" and row["suggestions"][0]["conflict"] is conflict
         assert "associated" not in row["suggestions"][0]
+        assert len(row["handle_rows"]) == 2
+        assert {item["handle"] for item in row["handle_rows"]} == {"first.handle", "backup_2"}
+        assert all(item["associated"] and item["check"] is not None for item in row["handle_rows"])
+        assert "display_status" not in row  # Explicit manual review is never silently presented as completed.
 
-    # A human review arriving between preparation and admission invalidates the snapshot before billing.
-    message("backup_2", 2)
-    job_id = _enqueue(pg, flow.contact)
-    assert matching.prepare_next(flow.settings)
+    # Historical weak reproof is hidden on the existing handle row, not duplicated or shown as a false conflict.
+    pg.execute("UPDATE creator_handle_jobs SET source='history' WHERE id=%s", (job["id"],))
+    row = next(
+        row for row in matching.page_data(pg, pilot.ids["owner"], flow.settings)["jobs"] if row["id"] == job["id"]
+    )
+    assert len(row["handle_rows"]) == 2 and all(
+        item["associated"] and item["check"] is None and not item["conflict"] for item in row["handle_rows"]
+    )
+    assert row["display_status"] == "completed" and row["display_reason_code"] == "already_confirmed"
+    assert pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone()["status"] == (
+        "review_required"
+    )  # Derived presentation does not rewrite the paid historical outcome.
+    # A real account-specific denial remains visible even on an automatic/history result.
+    pg.execute("SAVEPOINT actual_counter")
+    message("first.handle", 3, "first.handle is not my account")
+    material = flow.real_build(pg, flow.settings, flow.contact, frozenset({"first.handle", "backup_2"}), recheck=True)
+    denial = next(m["id"] for m in material["pack"]["messages"] if "not my account" in m["text"])
+    counter_view = {
+        "handles": {h["id"]: h["handle"] for h in material["pack"]["handles"]},
+        "result": {
+            "creator": {"state": "known", "refs": []},
+            "links": [
+                {
+                    "h": h["id"],
+                    "decision": "review",
+                    "relation": "uncertain",
+                    "period": "unknown",
+                    "code": "no_link_evidence",
+                    "refs": [denial] if h["handle"] == "first.handle" else [],
+                    "needed": ["account_context"],
+                }
+                for h in material["pack"]["handles"]
+            ],
+        },
+    }
     pg.execute(
-        "UPDATE contact_social_accounts SET source='cm_confirmation' WHERE contact_id=%s "
+        "UPDATE creator_handle_jobs SET pack_ciphertext=%s,result_ciphertext=%s,refs=%s::jsonb WHERE id=%s",
+        (
+            creator_data.cipher(flow.settings).encrypt(creator_data.encode(material["pack"])),
+            creator_data.cipher(flow.settings).encrypt(creator_data.encode(counter_view)),
+            creator_data.encode(material["refs"]),
+            job["id"],
+        ),
+    )
+    row = next(
+        row for row in matching.page_data(pg, pilot.ids["owner"], flow.settings)["jobs"] if row["id"] == job["id"]
+    )
+    assert next(item for item in row["handle_rows"] if item["handle"] == "first.handle")["conflict"]
+    assert next(item for item in row["handle_rows"] if item["handle"] == "backup_2")["check"] is None
+    pg.execute("ROLLBACK TO SAVEPOINT actual_counter")
+
+    # Any formal pair gained before admission invalidates the automatic snapshot before billing.
+    message("backup_2", 2)
+    pg.execute(
+        "UPDATE contact_social_accounts SET status='rejected' WHERE contact_id=%s "
         "AND social_account_id=(SELECT id FROM social_accounts WHERE normalized_handle='backup_2')",
         (flow.contact,),
     )
-    assert matching.claim() is None and len(flow.calls) == 1
-    assert pg.execute("SELECT count(*) n FROM creator_handle_requests").fetchone()["n"] == 1
+    job_id = _enqueue(pg, flow.contact, "incremental")
+    assert matching.prepare_next(flow.settings)
+    pg.execute(
+        "UPDATE contact_social_accounts SET status='confirmed' WHERE contact_id=%s "
+        "AND social_account_id=(SELECT id FROM social_accounts WHERE normalized_handle='backup_2')",
+        (flow.contact,),
+    )
+    assert matching.claim() is None and len(flow.calls) == 2
+    assert pg.execute("SELECT count(*) n FROM creator_handle_requests").fetchone()["n"] == 2
     assert matching.prepare_next(flow.settings) and matching.claim() is None
     assert pg.execute("SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s", (job_id,)).fetchone() == {
         "status": "completed",
         "reason_code": "already_confirmed",
     }
 
-    # Removing previously trusted evidence also invalidates a ready snapshot, reopening that exact pair.
+    # Removing a formal pair after admission is fenced before networking, even when it is another handle.
     pg.execute(
-        "UPDATE contact_social_accounts SET source='creator_handle_auto_verified' WHERE contact_id=%s "
-        "AND social_account_id=%s",
-        (flow.contact, first),
-    )
-    job_id = _enqueue(pg, flow.contact)
-    assert matching.prepare_next(flow.settings)
-    pg.execute(
-        "UPDATE contact_social_accounts SET source='excel_ai_verified' WHERE contact_id=%s "
+        "UPDATE contact_social_accounts SET status='rejected' WHERE contact_id=%s "
         "AND social_account_id=(SELECT id FROM social_accounts WHERE normalized_handle='backup_2')",
         (flow.contact,),
     )
-    assert matching.claim() is None and len(flow.calls) == 1
-    assert matching.prepare_next(flow.settings)
-    ready = pg.execute("SELECT pack_ciphertext FROM creator_handle_jobs WHERE id=%s", (job_id,)).fetchone()
-    assert {
-        h["handle"] for h in json.loads(creator_data.cipher(flow.settings).decrypt(ready["pack_ciphertext"]))["handles"]
-    } == {"first.handle", "backup_2"}
-    assert pg.execute("SELECT count(*) n FROM creator_handle_requests").fetchone()["n"] == 1
+    ready = _prepared_job(pg, flow, "incremental")
+    assert [h["handle"] for h in ready["pack"]["handles"]] == ["backup_2"]
+    pg.execute(
+        "UPDATE contact_social_accounts SET status='rejected' WHERE contact_id=%s AND social_account_id=%s",
+        (flow.contact, first),
+    )
+    matching.run(ready, flow.settings)
+    assert len(flow.calls) == 2
+    assert (
+        pg.execute(
+            "SELECT billed_tokens FROM creator_handle_requests WHERE id=%s", (ready["reservation_id"],)
+        ).fetchone()["billed_tokens"]
+        == 0
+    )
+    pg.execute(
+        "UPDATE contact_social_accounts SET status='confirmed' WHERE contact_id=%s AND social_account_id=%s",
+        (flow.contact, first),
+    )
+    # The same full-set fence after networking retains usage without publishing a stale result.
+    after_network = _prepared_job(pg, flow, "incremental")
+    flow.before_response = lambda: pg.execute(
+        "UPDATE contact_social_accounts SET status='confirmed' WHERE contact_id=%s "
+        "AND social_account_id=(SELECT id FROM social_accounts WHERE normalized_handle='backup_2')",
+        (flow.contact,),
+    )
+    matching.run(after_network, flow.settings)
+    assert len(flow.calls) == 3
+    assert (
+        pg.execute(
+            "SELECT billed_tokens FROM creator_handle_requests WHERE id=%s", (after_network["reservation_id"],)
+        ).fetchone()["billed_tokens"]
+        == 150
+    )
+    assert pg.execute(
+        "SELECT status,result_ciphertext FROM creator_handle_jobs WHERE id=%s", (after_network["id"],)
+    ).fetchone() == {"status": "queued", "result_ciphertext": None}
+    assert _snapshot(pg, pairs_before.keys()) == pairs_before
     assert _snapshot(pg, before.keys()) == before
+    # An explicitly restricted contact stops at waiting_evidence, not an endless snapshot-changed requeue.
+    monkeypatch.setattr(matching.evidence, "RESTRICTED_CONTACTS", frozenset({str(flow.contact)}))
+    assert matching.prepare_next(flow.settings)
+    assert pg.execute(
+        "SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s", (after_network["id"],)
+    ).fetchone() == {"status": "waiting_evidence", "reason_code": "restricted"}
+    assert not matching.prepare_next(flow.settings) and len(flow.calls) == 3

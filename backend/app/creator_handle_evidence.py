@@ -10,14 +10,14 @@ from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
-from . import contact_handles
+from . import contact_handles, creator_imports
 from . import evidence_access as access
 from . import evidence_text as text
 from . import handle_evidence as handles
 from .crypto import message_body_cipher
 from .openai_client import ModelOutputError
 
-PROMPT_VERSION = "creator-handle-research-v1.6"
+PROMPT_VERSION = "creator-handle-research-v1.7"
 MAX_MESSAGES, MAX_CHARS, MAX_HANDLES, SEARCH_LIMIT = 48, 20_000, 12, 20_000
 # A research hold is an explicit access restriction, not a negative identity finding.
 RESTRICTED_CONTACTS = frozenset({"6abf6bf9-12dc-4a22-9654-2010aa4c7785"})
@@ -104,7 +104,7 @@ def output_format(pack=None):
         creator["state"]["enum"] = ["known"] if pack["creator_known"] else ["supported", "review", "not_supported"]
         if pack["creator_known"]:
             creator["refs"]["maxItems"] = 0
-    return {"type": "json_schema", "name": "creator_handle_v1_6", "strict": True, "schema": schema}
+    return {"type": "json_schema", "name": "creator_handle_v1_7", "strict": True, "schema": schema}
 
 
 def _denied(value):
@@ -171,7 +171,7 @@ def _previous_ids(conn, rows):
     ).fetchall()}
 
 
-def build(conn, settings, contact_id, catalog):
+def build(conn, settings, contact_id, catalog, *, recheck=False):
     """Prepare bounded material locally. Missing evidence never means a non-creator."""
     contact_id = str(contact_id)
     empty = {"pack": None, "refs": [], "fingerprint": None, "reason": "restricted", "stats": {}}
@@ -182,9 +182,11 @@ def build(conn, settings, contact_id, catalog):
                               (contact_id,)).fetchall()
     if not identities or any(i["tenant_classification"] == "internal" for i in identities):
         return empty
-    human_handles = sorted({r["handle"] for r in contact_handles.confirmed_pairs(conn, [contact_id])
-                            if r["human_confirmed"]})
-    empty["stats"] = {"human_confirmed_handles": human_handles}
+    pairs = contact_handles.confirmed_pairs(conn, [contact_id])
+    confirmed = {r["handle"] for r in pairs}
+    empty["stats"] = {"confirmed_handles": sorted(confirmed), "manual_recheck": recheck,
+                      "recheck_handles": [],
+                      "human_confirmed_handles": sorted({r["handle"] for r in pairs if r["human_confirmed"]})}
     open_ids = [i["open_id"] for i in identities]
     chats = conn.execute(
         """SELECT DISTINCT c.chat_id,c.name,c.chat_mode FROM chats c
@@ -225,7 +227,8 @@ def build(conn, settings, contact_id, catalog):
     parents = readable(parent_rows)
     denial_previous = _previous_ids(conn, [i["row"] for i in own if i["row"].get("chat_mode") == "p2p"
         and not i["row"].get("parent_id")
-        and re.match(r"\s*(?:no\b|not\s+(?:mine|my)\b|不是我的|不对)", i["text"], re.I)])
+        and re.match(r"\s*(?:no\b|(?:that|this|it)\s+(?:is\s+)?not\s+mine\b|"
+                     r"not\s+(?:mine|my)\b|不是我的|不对)", i["text"], re.I)])
     previous_keys = {(chat, previous_id) for (chat, _), previous_id in denial_previous.items() if previous_id}
     if previous_keys:
         parents.extend(readable(_rows(conn, "m.chat_id=ANY(%s::text[]) AND m.message_id=ANY(%s::text[])",
@@ -238,13 +241,6 @@ def build(conn, settings, contact_id, catalog):
     for chat in chats:
         for handle in _tokens(chat["name"] or "", catalog):
             scores[handle] += 1
-    recalled = bool(scores)
-    scores = Counter({h: score for h, score in scores.items() if h not in human_handles})
-    candidates = sorted(scores, key=lambda h: (-scores[h], h))[:MAX_HANDLES]
-    if not candidates:
-        return {**empty, "reason": "already_confirmed" if recalled else "no_candidates",
-                "stats": {**empty["stats"], "readable_messages": len(own)}}
-    candidate_set = set(candidates)
     previous_answers = dict(denial_previous)
     by_key = {_key(i["row"]): i for i in [*own, *parents]}
 
@@ -259,6 +255,26 @@ def build(conn, settings, contact_id, catalog):
                 and (_key(row) in denial_previous or _account_request(previous_item["text"]))):
             return key
         return row["chat_id"], None
+
+    # Existing business facts are not paid-proof candidates. Reopen only for explicit
+    # manual review or concrete account-specific conflicts, never merely a second page.
+    recalled = bool(scores)
+    existing = sorted(confirmed & scores.keys())
+    conflicts = creator_imports._conflicts(conn, [(None, contact_id, h) for h in existing])
+    last_claim = {h: max((i["row"]["message_create_time"] for i in own
+                         if i["row"]["message_create_time"] and _self_claim(i["text"], h, allow_intro=True)),
+                        default=None) for h in existing}
+    rechecks = {h for h, conflict in zip(existing, conflicts, strict=True) if recheck or conflict or any(
+        _negative(item["text"], h, by_key.get(parent_key(item), {}).get("text")) and (
+            last_claim[h] is None or item["row"]["message_create_time"] is None
+            or item["row"]["message_create_time"] >= last_claim[h]) for item in own)}
+    empty["stats"]["recheck_handles"] = sorted(rechecks)
+    scores = Counter({h: score for h, score in scores.items() if h not in confirmed or h in rechecks})
+    candidates = sorted(scores, key=lambda h: (-scores[h], h))[:MAX_HANDLES]
+    if not candidates:
+        return {**empty, "reason": "already_confirmed" if recalled else "no_candidates",
+                "stats": {**empty["stats"], "readable_messages": len(own)}}
+    candidate_set = set(candidates)
 
     ranked = sorted(own, key=lambda i: (
         bool(i["handles"] & candidate_set or by_key.get(parent_key(i), {})
@@ -353,7 +369,7 @@ def build(conn, settings, contact_id, catalog):
     known = bool(conn.execute("SELECT 1 FROM contact_roles WHERE contact_id=%s "
                               "AND role='creator' AND status='confirmed'",
                               (contact_id,)).fetchone())
-    pack = {"target": "U1", "creator_known": known, "confirmed_handles": human_handles,
+    pack = {"target": "U1", "creator_known": known, "confirmed_handles": sorted(confirmed - candidate_set),
             "handles": [{"id": f"H{i}", "handle": h, "catalog_verified": True} for i, h in enumerate(candidates, 1)],
             "people": people, "chats": [{"id": groups[c["chat_id"]], "name": c["name"] or "",
                                           "mode": c["chat_mode"] or "unknown"} for c in used_chats],
@@ -457,15 +473,41 @@ def _account_request(body):
 
 
 def _negative(body, handle, parent=None):
-    direct = any(_OWNER_NEGATION.search(part) or _SHARED_ACCOUNT.search(part)
-                 or _TRANSFER.search(part) and not re.search(
-                     r"\btransfer\w*\s+(?:(?:to|over|another|a|an|the)\s+)*agenc(?:y|ies)\b", part, re.I)
-                 or _NOT_OWNER.search(part) and (_QUESTION.search(part) or re.search(r"['’]s\b", part))
-                 for part in _parts(body) if _mentions(part, handle))
+    # Separate a second account's predicate without changing the shared positive-claim parser.
+    parts = [part for clause in _parts(body) for part in re.split(
+        r"\band\b(?=\s+@?[A-Za-z0-9._]+\s+(?:is|was|isn't|isn’t|wasn't|wasn’t)\b)", clause, flags=re.I)]
+    direct = False
+    for part in parts:
+        if not _mentions(part, handle):
+            continue
+        owner_denial = re.search(
+            r"\b(?:not|isn't|isn’t|wasn't|wasn’t)\s+(?:mine|me|owned|my\s+"
+            r"(?:(?:tiktok|tt)\s+)?(?:account|page|handle|user\s*name))\b|"
+            r"\bi\s+(?:do\s+not|don't|don’t|no\s+longer)\s+(?:own|use|operate|manage)\b|"
+            r"不是我的|不是本人|不属于我", part, re.I) or re.search(
+                r"\bmy\s+(?:(?:tiktok|tt)\s+)?(?:account|page|handle|user\s*name)\s+(?:is|was)\s+not\s+"
+                r"(?:https?://(?:www\.)?tiktok\.com/@|@)?" + re.escape(handle)
+                + r"(?=\.*(?:[^A-Za-z0-9_.]|$))", part, re.I)
+        proxy = re.search(
+            r"\b(?:my\s+(?:friend|client|sister|brother|husband|wife|daughter|son)(?:'s|’s)?|"
+            r"(?:manage|operate|run)\s+(?:\w+\s+){0,3}(?:for|on behalf))\b|朋友的|替.*(?:管理|运营)|代运营",
+            part, re.I)
+        transfer = _TRANSFER.search(part) and not re.search(
+            r"\btransfer\w*\s+(?:(?:to|over|another|a|an|the)\s+)*agenc(?:y|ies)\b", part, re.I) and any(
+                not re.search(r"\b(?:not|never|(?:did|does|do|has|have|had|was|were|is|are)n['’]t)"
+                              r"\s+(?:\w+\s+)*$", part[:verb.start()], re.I)
+                and not re.match(r"\s*[- ]?\s*proof\b", part[verb.end():], re.I)
+                for verb in re.finditer(r"\b(?:transfer\w*|sold|deleted|banned|suspended)\b|转让|封禁|注销",
+                                        part, re.I))
+        direct = bool(owner_denial or _SHARED_ACCOUNT.search(part) or transfer
+                      or proxy and (_QUESTION.search(part) or re.search(r"['’]s\b", part)))
+        if direct:
+            break
     # A bare denial answers an ownership question; "Not yet" about a prize is not one.
     reply = (parent and _mentions(parent, handle) and _account_request(parent)
              and re.search(r"^(?:no\b(?!\s+(?:worries|problem)\b)|(?:that|this|it)\s+(?:is\s+)?not\s+mine\b|"
-                           r"not\s+(?:mine|my)\b|不是我的|不对)", body.strip(), re.I)
+                           r"not\s+(?:mine|my\s+(?:(?:tiktok|tt)\s+)?(?:account|page|handle|user\s*name))\b|"
+                           r"不是我的|不对)", body.strip(), re.I)
              and not re.search(r"\b(?:not\s+(?:yet|sure)|no\s+(?:message|sample|invite|prize))\b", body, re.I))
     return bool(direct or reply)
 
