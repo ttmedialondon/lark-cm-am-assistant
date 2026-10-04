@@ -52,7 +52,7 @@
   <div class="page-wrapper"><div class="container-xl py-4">
     {% if evidence is not none %}
       <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-3">
-        <h2 class="mb-0">{{ evidence.creator_name or '达人' }} · 负责人证据</h2>
+        <h2 class="mb-0">{{ evidence.creator_name or '达人' }} · 负责人证据{% if evidence.outdated %}<span class="badge bg-yellow-lt ms-2">旧版结果</span>{% endif %}</h2>
         <a class="btn" href="{{ base }}">返回建议列表</a>
       </div>
       {{ coverage_notes(evidence.coverage) }}
@@ -92,7 +92,7 @@
       {% for job in matching.jobs %}
         <div class="card mb-3">
           <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
-            <div><span class="fw-medium">{{ job.name or '未命名' }}</span><span class="text-secondary ms-2">{{ job.status_label or status_labels.get(job.status, job.status) }}</span>{% if job.reason %}<div class="text-secondary small">{{ reason_labels.get(job.reason, job.reason) }}</div>{% endif %}</div>
+            <div><span class="fw-medium">{{ job.name or '未命名' }}</span><span class="text-secondary ms-2">{{ job.status_label or status_labels.get(job.status, job.status) }}</span>{% if job.outdated and job.results %}<span class="badge bg-yellow-lt ms-2">旧版结果</span>{% endif %}{% if job.reason %}<div class="text-secondary small">{{ reason_labels.get(job.reason, job.reason) }}</div>{% endif %}</div>
             <div class="d-flex flex-wrap align-items-center gap-2">
               {% if job.stats.get('messages') and not job.stale %}<a class="btn btn-sm" href="{{ base }}/jobs/{{ job.id }}/evidence">查看原文</a>{% endif %}
               {% if job.status in ['failed', 'retry_wait'] %}<form method="post" action="{{ base }}/jobs/{{ job.id }}/retry"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="page" value="{{ matching.page }}"><button class="btn btn-sm" type="submit" {% if not matching.enabled %}disabled{% endif %}>重试</button></form>{% endif %}

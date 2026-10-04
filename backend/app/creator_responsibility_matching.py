@@ -552,6 +552,7 @@ def page_data(conn, actor, settings, page=1):
             status_label=STATUSES[job["status"]],
             reason=REASONS.get(job["reason_code"], job["reason_code"]),
             candidate_count=job["stats"].get("candidate_count", 0),
+            outdated=job["stats"].get("prompt_version") != evidence.PROMPT_VERSION,
             results=[],
         )
         job["existing_assignments"] = existing.get(str(job["contact_id"]), [])
@@ -631,6 +632,7 @@ def task_evidence(conn, actor, settings, job_id):
     existing = _existing_assignments(conn, [job["contact_id"]]).get(str(job["contact_id"]), [])
     return {
         "creator_name": job["display_name"],
+        "outdated": job["stats"].get("prompt_version") != evidence.PROMPT_VERSION,
         "job_id": str(job_id),
         "chats": pack["chats"],
         "messages": messages,

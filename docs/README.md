@@ -20,6 +20,7 @@
 | 文档 | 用途 |
 |---|---|
 | [后端开发入口](../backend/README.md) | 安装、测试、本地运行及配置边界 |
+| [达人负责人建议](specs/creator-responsibility-matching_v1.0.md) | 独立多 CM Prompt、证据边界、队列配置及首轮样本复核；默认关闭、只生成建议 |
 | [部署与回退](runbooks/deploy-mvp.md) | GitHub 发布、数据库备份、迁移、健康检查与恢复 |
 | [AI 协作约定](../AGENTS.md) | 开发与交付授权、数据保护约定 |
 

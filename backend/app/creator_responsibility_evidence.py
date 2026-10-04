@@ -18,7 +18,7 @@ from .crypto import message_body_cipher
 from .message_mentions import mention_targets
 from .openai_client import ModelOutputError
 
-PROMPT_VERSION = "creator-responsibility-v1.0"
+PROMPT_VERSION = "creator-responsibility-v1.1"
 MAX_CANDIDATES, MAX_MESSAGES, MAX_CHARS, SEARCH_LIMIT = 24, 96, 32_000, 20_000
 DECISIONS = ("responsible", "strong_candidate", "assist", "historical", "insufficient")
 PERIODS = ("current", "historical", "uncertain")

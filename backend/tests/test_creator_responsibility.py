@@ -692,6 +692,12 @@ def test_owner_only_routes_csrf_lazy_evidence_and_safe_audit(pg, pilot, responsi
     assert any("evidence" in row["action"] for row in audits)
     assert "PRIVATE TEST BODY" not in creator_data.encode(audits)
     assert _snapshot(pg, before.keys()) == before
+    jobs_before = _snapshot(pg, ("creator_responsibility_jobs", "creator_responsibility_requests"))
+    with monkeypatch.context() as upgraded_prompt:
+        upgraded_prompt.setattr(evidence, "PROMPT_VERSION", evidence.PROMPT_VERSION + "-next")
+        assert "旧版结果" in client.get(path).text and "旧版结果" in client.get(read_path).text
+        assert not matching.prepare_next(flow.settings) and matching.claim() is None
+        assert _snapshot(pg, jobs_before.keys()) == jobs_before and len(flow.calls) == 1
     flow.valid = False
     assert client.get(read_path).status_code in {403, 404, 409}
     flow.valid = True
