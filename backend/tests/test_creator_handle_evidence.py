@@ -471,10 +471,11 @@ def test_contact_matching_rejects_disconnected_and_third_party_claims():
     robin_result = deepcopy(result)
     robin_result['links'][0]['refs'] = ['M35', 'M36']
     assert matcher.validate(robin, robin_result) == robin_result
-    denied_main = deepcopy(robin)
-    denied_main['messages'].append({'id': 'M37', 'speaker': 'U1', 'chat': 'G3', 'at': '2025-11-10T16:34:00Z',
-                                    'reply': None, 'text': 'robc825 is not my main account'})
-    assert matcher.validate(denied_main, robin_result)['links'][0]['validation_error'] == 'counterevidence'
+    backup = deepcopy(robin)
+    backup['messages'][0]['text'] = 'My backup account is robc825; robc825 is not my main account'
+    backup_result = deepcopy(robin_result)
+    backup_result['links'][0]['refs'] = ['M35']
+    assert matcher.validate(backup, backup_result) == backup_result  # Account role is not ownership denial.
     punctuated = deepcopy(robin)
     punctuated['messages'][1]['text'] = '@Robc825.'
     assert matcher.validate(punctuated, robin_result) == robin_result

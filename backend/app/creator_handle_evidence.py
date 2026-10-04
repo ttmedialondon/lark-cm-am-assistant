@@ -51,7 +51,7 @@ _TRANSFER = re.compile(
     r"\b(?:account|page)\b.*\b(?:transfer\w*|sold|deleted|banned|suspended)\b|转让|封禁|注销", re.I)
 _OWNER_NEGATION = re.compile(
     r"\b(?:not|isn't|isn’t|wasn't|wasn’t)\s+(?:mine|my|me|owned)\b|"
-    r"\bmy\s+(?:(?:tiktok|tt|main)\s+)*(?:account|page|handle|handel|user\s*name)\s+(?:is|was)\s+not\b|"
+    r"\bmy\s+(?:(?:tiktok|tt)\s+)?(?:account|page|handle|handel|user\s*name)\s+(?:is|was)\s+not\b|"
     r"\bi\s+(?:do\s+not|don't|don’t|no\s+longer)\s+(?:own|use|operate|manage)\b|"
     r"不是我的|不是本人|不属于我", re.I)
 _ACCOUNT_HISTORY = re.compile(
@@ -534,10 +534,10 @@ def _negative(body, handle, parent=None):
             continue
         owner_denial = re.search(
             r"\b(?:not|isn't|isn’t|wasn't|wasn’t)\s+(?:mine|me|owned|my\s+"
-            r"(?:(?:tiktok|tt|main)\s+)*(?:account|page|handle|handel|user\s*name))\b|"
+            r"(?:(?:tiktok|tt)\s+)?(?:account|page|handle|handel|user\s*name))\b|"
             r"\bi\s+(?:do\s+not|don't|don’t|no\s+longer)\s+(?:own|use|operate|manage)\b|"
             r"不是我的|不是本人|不属于我", part, re.I) or re.search(
-                r"\bmy\s+(?:(?:tiktok|tt|main)\s+)*(?:account|page|handle|handel|user\s*name)\s+(?:is|was)\s+not\s+"
+                r"\bmy\s+(?:(?:tiktok|tt)\s+)?(?:account|page|handle|handel|user\s*name)\s+(?:is|was)\s+not\s+"
                 r"(?:https?://(?:www\.)?tiktok\.com/@|@)?" + re.escape(handle)
                 + r"(?=\.*(?:[^A-Za-z0-9_.]|$))", part, re.I)
         proxy = re.search(
@@ -558,8 +558,7 @@ def _negative(body, handle, parent=None):
     # A bare denial answers an ownership question; "Not yet" about a prize is not one.
     reply = (parent and _mentions(parent, handle) and _account_request(parent)
              and re.search(r"^(?:no\b(?!\s+(?:worries|problem)\b)|(?:that|this|it)\s+(?:is\s+)?not\s+mine\b|"
-                           r"not\s+(?:mine|my\s+(?:(?:tiktok|tt|main)\s+)*"
-                           r"(?:account|page|handle|handel|user\s*name))\b|"
+                           r"not\s+(?:mine|my\s+(?:(?:tiktok|tt)\s+)?(?:account|page|handle|handel|user\s*name))\b|"
                            r"不是我的|不对)", body.strip(), re.I)
              and not re.search(r"\b(?:not\s+(?:yet|sure)|no\s+(?:message|sample|invite|prize))\b", body, re.I))
     return bool(direct or reply)
