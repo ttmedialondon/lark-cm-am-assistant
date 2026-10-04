@@ -1,0 +1,387 @@
+"""One canonical group, one paid request; only the owner writes a formal classification."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from uuid import uuid4
+
+from . import ai_dispatch, ai_feature_config, creator_data
+from . import creator_group_evidence as evidence
+from . import openai_client as api
+from .creator_access import require_owner
+from .db import connection
+
+FEATURE = "creator_group_classification"
+PURPOSES = evidence.PURPOSES
+STATUSES = {
+    "queued": "待处理", "preparing": "整理证据", "ready": "待调用", "running": "分析中",
+    "retry_wait": "等待重试", "waiting_evidence": "等待证据", "completed": "已分析",
+    "failed": "失败", "cancelled": "已取消",
+}
+REASONS = {
+    "no_text": "没有可读消息", "no_access": "没有当前有效的聊天授权", "not_eligible": "不在达人群处理范围",
+    "not_group": "不是有效群聊", "no_creators": "没有相关已确认达人", "no_authorization": "没有有效聊天授权",
+    "restricted": "不在授权处理范围", "material_limit": "材料超过准备范围", "ready": "证据已准备",
+    "cached": "复用相同材料结果", "suggestions_saved": "分类建议已保存", "snapshot_changed": "材料或配置变化",
+    "preparation_failed": "证据准备失败", "invalid_output": "返回格式无效", "provider_failed": "接口调用失败",
+    "provider_retry": "服务暂不可用", "quota_paused": "接口配额暂停", "request_unknown": "请求结果未知，需手动复查",
+    "lease_expired": "准备任务已过期", "owner_cancelled": "已取消", "manual_confirmed": "已人工确认并锁定",
+    "config_paused": "功能已停用", "scope_changed": "群关系或授权已变化",
+}
+
+
+def _hash(value):
+    return hashlib.sha256(creator_data.encode(value).encode()).hexdigest()
+
+
+def _config(conn, *, lock=False):
+    return conn.execute(
+        "SELECT provider,project_id,model,enabled,api_key_ciphertext FROM ai_feature_configs WHERE feature=%s"
+        + (" FOR UPDATE" if lock else ""), (FEATURE,),
+    ).fetchone()
+
+
+def _enabled(config):
+    return bool(config and config["enabled"] and config["api_key_ciphertext"] and config["provider"] == "openai")
+
+
+def _config_hash(config):
+    return _hash({**dict(config or {}), "prompt_version": evidence.PROMPT_VERSION})
+
+
+def _audit(conn, actor, action, metadata):
+    conn.execute("INSERT INTO audit_events(id,authorization_id,action,metadata) VALUES(%s,%s,%s,%s::jsonb)",
+                 (uuid4(), actor, "creator_group_" + action, creator_data.encode(metadata)))
+
+
+def configuration_changed(conn):
+    enabled = _enabled(_config(conn))
+    conn.execute("""UPDATE creator_group_jobs SET desired_version=desired_version+1,
+        status=CASE WHEN NOT %s THEN 'cancelled' WHEN status IN ('preparing','running') THEN status ELSE 'queued' END,
+        reason_code=CASE WHEN %s THEN 'snapshot_changed' ELSE 'config_paused' END,
+        not_before=NOW(),updated_at=NOW() WHERE status NOT IN ('completed','failed','cancelled')""",
+                 (enabled, enabled))
+
+
+def touch_chats(conn, chat_ids, settings=None):
+    """One debounced signal per committed page/snapshot, not per member or message."""
+    if not chat_ids or not _enabled(_config(conn)):
+        return
+    if settings is None:
+        from .config import get_settings
+
+        settings = get_settings()
+    current = {r["chat_id"]: r for r in conn.execute("""SELECT DISTINCT ON(chat_id)
+        chat_id,status,reason_code,stats,refs FROM creator_group_jobs WHERE chat_id=ANY(%s::text[])
+        ORDER BY chat_id,created_at DESC,id DESC""", (sorted(set(chat_ids)),)).fetchall()}
+    for chat_id in sorted(set(chat_ids)):
+        job = current.get(chat_id)
+        if job and (job["reason_code"] == "request_unknown" or (
+                job["status"] == "completed" and job["stats"].get("prompt_version") == evidence.PROMPT_VERSION
+                and job["stats"].get("suggested_purpose") not in {None, "unknown"}
+                and evidence.still_valid(conn, job["refs"], settings, lightweight=True))):
+            continue
+        conn.execute("SELECT enqueue_creator_group(%s)", (chat_id,))
+
+
+def enqueue(conn, actor):
+    require_owner(conn, actor)
+    if not _enabled(_config(conn)):
+        raise ValueError("请先配置并启用达人群用途匹配。")
+    rows = conn.execute("""SELECT c.chat_id FROM chats c WHERE creator_group_is_eligible(c.chat_id)
+        AND NOT EXISTS(SELECT 1 FROM chat_group_classifications f WHERE f.chat_id=c.chat_id AND f.locked)
+        AND NOT EXISTS(SELECT 1 FROM creator_group_jobs j WHERE j.chat_id=c.chat_id AND (
+          j.status NOT IN ('completed','failed','cancelled') OR j.status='completed' AND j.stats->>'prompt_version'=%s))
+        ORDER BY c.chat_id""", (evidence.PROMPT_VERSION,)).fetchall()
+    for row in rows:
+        conn.execute("SELECT enqueue_creator_group(%s,'history')", (row["chat_id"],))
+    _audit(conn, actor, "enqueued", {"queued": len(rows), "prompt_version": evidence.PROMPT_VERSION})
+    return {"queued": len(rows)}
+
+
+def _recover(conn):
+    # Unknown network billing never causes an automatic second request.
+    conn.execute("""UPDATE creator_group_jobs SET status=CASE WHEN status='preparing' THEN 'queued' ELSE 'failed' END,
+        reason_code=CASE WHEN status='preparing' THEN 'lease_expired' ELSE 'request_unknown' END,
+        claim_token=NULL,lease_until=NULL,not_before=NOW(),updated_at=NOW()
+        WHERE status IN ('preparing','running') AND lease_until<NOW()""")
+    conn.execute("""UPDATE creator_group_jobs j SET status='cancelled',desired_version=desired_version+1,
+        reason_code='scope_changed',claim_token=NULL,lease_until=NULL,updated_at=NOW()
+        WHERE status NOT IN ('completed','failed','cancelled') AND NOT creator_group_is_eligible(j.chat_id)""")
+
+
+def _invalidate(conn, job, config):
+    active = _enabled(config) and conn.execute("SELECT creator_group_is_eligible(%s) eligible",
+                                             (job["chat_id"],)).fetchone()["eligible"]
+    conn.execute("""UPDATE creator_group_jobs SET status=%s,reason_code=%s,claim_token=NULL,lease_until=NULL,
+        result_ciphertext=NULL,not_before=NOW(),updated_at=NOW() WHERE id=%s""",
+                 ("queued" if active else "cancelled", "snapshot_changed" if active else "scope_changed", job["id"]))
+
+
+def prepare_next(settings):
+    with connection() as conn, conn.transaction():
+        config = _config(conn, lock=True)
+        if not _enabled(config):
+            return False
+        _recover(conn)
+        if conn.execute("SELECT count(*) n FROM creator_group_jobs WHERE status='ready'").fetchone()["n"] >= 5:
+            return False
+        job = conn.execute("""SELECT * FROM creator_group_jobs WHERE status='queued' AND not_before<=NOW()
+            ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1""").fetchone()
+        if not job:
+            return False
+        token = uuid4()
+        conn.execute("""UPDATE creator_group_jobs SET status='preparing',snapshot_version=desired_version,
+            claim_token=%s,lease_until=NOW()+INTERVAL '10 minutes',updated_at=NOW() WHERE id=%s""", (token, job["id"]))
+    try:
+        with connection() as conn, conn.transaction():
+            conn.execute("SET LOCAL statement_timeout='90s'")
+            material = evidence.build(conn, settings, job["chat_id"])
+    except Exception:
+        with connection() as conn, conn.transaction():
+            conn.execute("""UPDATE creator_group_jobs
+                SET status=CASE WHEN desired_version=%s THEN 'failed' ELSE 'queued' END,
+                reason_code='preparation_failed',claim_token=NULL,lease_until=NULL,updated_at=NOW()
+                WHERE id=%s AND status='preparing' AND claim_token=%s""", (job["desired_version"], job["id"], token))
+        raise
+    with connection() as conn, conn.transaction():
+        current_config = _config(conn, lock=True)
+        current = conn.execute("SELECT * FROM creator_group_jobs WHERE id=%s FOR UPDATE", (job["id"],)).fetchone()
+        if not current or current["status"] != "preparing" or current["claim_token"] != token:
+            return True
+        pack, refs = material["pack"], material["refs"]
+        if (current["desired_version"] != job["desired_version"] or not _enabled(current_config)
+                or _config_hash(config) != _config_hash(current_config)
+                or pack and not evidence.still_valid(conn, refs, settings)):
+            _invalidate(conn, current, current_config)
+            return True
+        fingerprint = _hash([material["fingerprint"], config["provider"], config["project_id"],
+                             config["model"], evidence.PROMPT_VERSION])
+        cached = conn.execute("""SELECT result_ciphertext FROM creator_group_jobs WHERE chat_id=%s AND fingerprint=%s
+            AND status='completed' AND result_ciphertext IS NOT NULL ORDER BY updated_at DESC LIMIT 1""",
+                              (job["chat_id"], fingerprint)).fetchone() if pack and job["source"] != "manual" else None
+        storage = creator_data.cipher(settings)
+        result = evidence.validate(pack, json.loads(storage.decrypt(cached["result_ciphertext"]))) if cached else None
+        conn.execute("""UPDATE creator_group_jobs SET status=%s,reason_code=%s,fingerprint=%s,config_fingerprint=%s,
+            pack_ciphertext=%s,result_ciphertext=%s,refs=%s::jsonb,stats=%s::jsonb,attempts=0,
+            claim_token=NULL,lease_until=NULL,prepared_at=NOW(),finished_at=CASE WHEN %s THEN NOW() ELSE NULL END,
+            updated_at=NOW() WHERE id=%s""", (
+                "completed" if cached else "ready" if pack else "waiting_evidence",
+                "cached" if cached else material["reason"], fingerprint, _config_hash(current_config),
+                storage.encrypt(creator_data.encode(pack)) if pack else None,
+                storage.encrypt(creator_data.encode(result)) if cached else None,
+                creator_data.encode(refs), creator_data.encode({
+                    **material["stats"], "prompt_version": evidence.PROMPT_VERSION,
+                    **({"suggested_purpose": result["purpose"]} if cached else {}),
+                }),
+                bool(cached), job["id"],
+            ))
+    return True
+
+
+def claim():
+    from .config import get_settings
+
+    settings = get_settings()
+    with connection() as conn, conn.transaction():
+        config = _config(conn, lock=True)
+        if not _enabled(config) or not ai_dispatch.can_claim(conn):
+            return None
+        _recover(conn)
+        job = conn.execute("""SELECT * FROM creator_group_jobs WHERE status IN ('ready','retry_wait')
+            AND not_before<=NOW() AND attempts<3 ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1""").fetchone()
+        if not job:
+            return None
+        if (job["desired_version"] != job["snapshot_version"] or job["config_fingerprint"] != _config_hash(config)
+                or not evidence.still_valid(conn, job["refs"], settings)):
+            _invalidate(conn, job, config)
+            return None
+        token, reservation = uuid4(), uuid4()
+        conn.execute("INSERT INTO creator_group_requests(id,job_id) VALUES(%s,%s)", (reservation, job["id"]))
+        conn.execute("""UPDATE creator_group_jobs SET status='running',claim_token=%s,
+            lease_until=NOW()+INTERVAL '180 seconds',attempts=attempts+1,updated_at=NOW() WHERE id=%s""",
+                     (token, job["id"]))
+        return {**job, "pack": json.loads(creator_data.cipher(settings).decrypt(job["pack_ciphertext"])),
+                "claim_token": token, "reservation_id": reservation, "attempts": job["attempts"] + 1, "config": config}
+
+
+def _current(conn, job, settings):
+    config = _config(conn, lock=True)
+    current = conn.execute("SELECT * FROM creator_group_jobs WHERE id=%s FOR UPDATE", (job["id"],)).fetchone()
+    if not current or current["status"] != "running" or current["claim_token"] != job["claim_token"]:
+        return None
+    if (current["desired_version"] != job["snapshot_version"] or not _enabled(config)
+            or _config_hash(config) != job["config_fingerprint"]
+            or not evidence.still_valid(conn, current["refs"], settings)):
+        _invalidate(conn, current, config)
+        return None
+    return current
+
+
+def run(job, settings):
+    with connection() as conn, conn.transaction():
+        if not _current(conn, job, settings):
+            conn.execute("""UPDATE creator_group_requests SET error_code='not_sent',input_tokens=0,output_tokens=0,
+                finished_at=NOW() WHERE id=%s AND finished_at IS NULL""", (job["reservation_id"],))
+            return
+    result, telemetry, error = None, {}, None
+    try:
+        key = ai_feature_config.api_key_cipher(settings.token_encryption_key).decrypt(
+            job["config"]["api_key_ciphertext"])
+        response = api.call_openai(job["config"], key, job["pack"], job["id"], instructions=evidence.instructions(),
+                                   output_format=evidence.output_format(job["pack"]), max_output_tokens=900,
+                                   reasoning_effort="none", total_timeout=70)
+        telemetry = {**response["telemetry"], "usage": response["usage"], "response_id": response["response_id"]}
+        result = evidence.validate(job["pack"], json.loads(response["text"]))
+    except Exception as exc:
+        error = (api.ModelOutputError("invalid_json", telemetry=telemetry)
+                 if isinstance(exc, json.JSONDecodeError) else exc)
+        telemetry = getattr(error, "telemetry", {}) or telemetry
+    status = telemetry.get("http_status")
+    unknown = isinstance(error, api.OpenAIRequestError) and not isinstance(status, int)
+    code = ("" if error is None else "request_unknown" if unknown else "invalid_output"
+            if isinstance(error, api.ModelOutputError) else f"http_{status}"
+            if isinstance(status, int) else "provider_failed")
+    with connection() as conn, conn.transaction():
+        usage = telemetry.get("usage", {})
+        conn.execute("""UPDATE creator_group_requests SET request_id=%s,response_id=%s,error_code=%s,input_tokens=%s,
+            output_tokens=%s,response_ciphertext=%s,finished_at=NOW() WHERE id=%s""", (
+                telemetry.get("openai_request_id"), telemetry.get("response_id"), code,
+                usage.get("input_tokens"), usage.get("output_tokens"),
+                creator_data.cipher(settings).encrypt(creator_data.encode(result)) if result is not None else None,
+                job["reservation_id"],
+            ))
+        conn.execute("""UPDATE creator_group_jobs SET input_tokens=input_tokens+%s,
+            output_tokens=output_tokens+%s WHERE id=%s""",
+                     (usage.get("input_tokens") or 0, usage.get("output_tokens") or 0, job["id"]))
+    # Actual usage commits before any subsequent authorization or admission failure.
+    ai_dispatch.observe_limits(telemetry)
+    retry = isinstance(error, api.OpenAIRequestError) and error.retryable and not unknown and job["attempts"] < 3
+    if isinstance(error, api.OpenAIRequestError):
+        if error.is_quota:
+            ai_dispatch.pause_for_quota()
+        elif retry:
+            ai_dispatch.throttle(api.retry_delay(error.retry_after_seconds, job["attempts"]))
+    with connection() as conn, conn.transaction():
+        if not _current(conn, job, settings):
+            return
+        reason = ("suggestions_saved" if error is None else "request_unknown" if unknown else "quota_paused"
+                  if getattr(error, "is_quota", False) else "provider_retry" if retry else "invalid_output"
+                  if isinstance(error, api.ModelOutputError) else "provider_failed")
+        conn.execute("""UPDATE creator_group_jobs
+            SET status=%s,reason_code=%s,result_ciphertext=%s,stats=stats||%s::jsonb,
+            claim_token=NULL,lease_until=NULL,not_before=NOW()+(%s*INTERVAL '1 second'),
+            finished_at=CASE WHEN %s THEN NOW() ELSE NULL END,updated_at=NOW() WHERE id=%s""", (
+                "completed" if error is None else "retry_wait" if retry else "failed", reason,
+                creator_data.cipher(settings).encrypt(creator_data.encode(result)) if error is None else None,
+                creator_data.encode({"suggested_purpose": result["purpose"]} if error is None else {}),
+                api.retry_delay(error.retry_after_seconds, job["attempts"]) if retry else 0, not retry, job["id"],
+            ))
+        conn.execute("UPDATE ai_feature_configs SET last_tested_at=NOW(),last_test_status=%s WHERE feature=%s",
+                     ("failed" if error else "succeeded", FEATURE))
+
+
+def _result(conn, job, settings, *, lightweight=False):
+    if not job["result_ciphertext"]:
+        return None
+    if not evidence.still_valid(conn, job["refs"], settings, lightweight=lightweight):
+        return None
+    result = json.loads(creator_data.cipher(settings).decrypt(job["result_ciphertext"]))
+    return {**result, "purpose_label": PURPOSES[result["purpose"]], "confidence_label": f"{result['confidence']:.0%}"}
+
+
+def page_data(conn, actor, settings, page=1):
+    require_owner(conn, actor)
+    latest = ("WITH latest AS (SELECT DISTINCT ON(chat_id) * FROM creator_group_jobs "
+              "ORDER BY chat_id,created_at DESC,id DESC) ")
+    counts = {r["status"]: r["n"] for r in conn.execute(
+        latest + "SELECT status,count(*) n FROM latest GROUP BY status").fetchall()}
+    rows = conn.execute(latest + """SELECT j.id,j.chat_id,j.status,j.reason_code,j.stats,j.result_ciphertext,j.refs,
+        j.source,j.input_tokens,j.output_tokens,j.created_at,j.updated_at,
+        c.name,c.chat_mode,f.purpose AS confirmed_purpose,f.tags AS confirmed_tags,
+        f.locked FROM latest j JOIN chats c ON c.chat_id=j.chat_id
+        LEFT JOIN chat_group_classifications f ON f.chat_id=j.chat_id
+        ORDER BY j.updated_at DESC,j.id LIMIT 26 OFFSET %s""", ((page - 1) * 25,)).fetchall()
+    more, rows = len(rows) > 25, rows[:25]
+    viewed = []
+    for row in rows:
+        row.update(status_label=STATUSES[row["status"]], reason=REASONS.get(row["reason_code"], row["reason_code"]),
+                   confirmed_label=PURPOSES.get(row["confirmed_purpose"]),
+                   outdated=row["stats"].get("prompt_version") != evidence.PROMPT_VERSION)
+        row["result"] = _result(conn, row, settings, lightweight=True)
+        row["stale"] = bool(row["result_ciphertext"] and row["result"] is None)
+        if row["result"]:
+            viewed.append(str(row["id"]))
+        for key in ("pack_ciphertext", "result_ciphertext", "refs", "config_fingerprint", "claim_token"):
+            row.pop(key, None)
+    if viewed:
+        _audit(conn, actor, "results_viewed", {"jobs": viewed})
+    return {"jobs": rows, "counts": counts, "page": page, "has_more": more,
+            "enabled": _enabled(_config(conn)), "purposes": PURPOSES, "prompt_version": evidence.PROMPT_VERSION}
+
+
+def task_evidence(conn, actor, settings, job_id):
+    require_owner(conn, actor)
+    job = conn.execute("SELECT j.*,c.name FROM creator_group_jobs j JOIN chats c USING(chat_id) WHERE j.id=%s",
+                       (job_id,)).fetchone()
+    if not job:
+        raise LookupError("任务不存在。")
+    if not job["pack_ciphertext"] or not evidence.still_valid(conn, job["refs"], settings):
+        raise PermissionError("材料或授权已变化，请重新分析。")
+    pack = json.loads(creator_data.cipher(settings).decrypt(job["pack_ciphertext"]))
+    _audit(conn, actor, "evidence_viewed", {"job_id": str(job_id), "messages": len(pack["messages"])})
+    return {"job_id": str(job_id), "chat_id": job["chat_id"], "name": job["name"], "pack": pack,
+            "result": _result(conn, job, settings), "stats": job["stats"]}
+
+
+def action(conn, actor, job_id, operation):
+    require_owner(conn, actor)
+    job = conn.execute("SELECT * FROM creator_group_jobs WHERE id=%s FOR UPDATE", (job_id,)).fetchone()
+    if not job:
+        raise LookupError("任务不存在。")
+    if operation == "cancel":
+        conn.execute("""UPDATE creator_group_jobs SET status='cancelled',desired_version=desired_version+1,
+            reason_code='owner_cancelled',claim_token=NULL,lease_until=NULL,updated_at=NOW() WHERE id=%s""", (job_id,))
+    elif operation in {"retry", "recheck"}:
+        if not _enabled(_config(conn)):
+            raise ValueError("请先配置并启用达人群用途匹配。")
+        if not conn.execute("SELECT enqueue_creator_group(%s,'manual',TRUE) id", (job["chat_id"],)).fetchone()["id"]:
+            raise PermissionError("该群不在当前授权处理范围。")
+    else:
+        raise ValueError("操作无效。")
+    _audit(conn, actor, "job_" + operation, {"job_id": str(job_id)})
+
+
+def confirm(conn, actor, chat_id, purpose, tags, *, locked=True, job_id=None):
+    require_owner(conn, actor)
+    if purpose not in PURPOSES:
+        raise ValueError("群用途无效。")
+    if not isinstance(tags, list) or len(tags) > 8 or any(
+            not isinstance(tag, str) or not tag.strip() or len(tag) > 80 or "\x00" in tag for tag in tags):
+        raise ValueError("最多填写 8 个标签，每个不超过 80 个字符。")
+    tags = list(dict.fromkeys(tag.strip() for tag in tags))
+    if not conn.execute("SELECT chat_id FROM chats WHERE chat_id=%s FOR UPDATE", (chat_id,)).fetchone():
+        raise LookupError("群聊不存在。")
+    if not conn.execute("SELECT creator_group_is_eligible(%s) eligible", (chat_id,)).fetchone()["eligible"]:
+        raise PermissionError("该群不在当前有效的达人群授权范围。")
+    if job_id is not None:
+        from .config import get_settings
+
+        job = conn.execute("SELECT * FROM creator_group_jobs WHERE id=%s FOR UPDATE", (job_id,)).fetchone()
+        if (not job or job["chat_id"] != chat_id or job["status"] != "completed" or not job["result_ciphertext"]
+                or not evidence.still_valid(conn, job["refs"], get_settings())):
+            raise PermissionError("这份建议的材料或授权已经变化，请重新分析或独立人工分类。")
+    conn.execute("""INSERT INTO chat_group_classifications
+        (chat_id,purpose,tags,locked,source_job_id,confirmed_by_authorization_id)
+        VALUES(%s,%s,%s::jsonb,%s,%s,%s) ON CONFLICT(chat_id) DO UPDATE SET
+        purpose=EXCLUDED.purpose,tags=EXCLUDED.tags,locked=EXCLUDED.locked,source_job_id=EXCLUDED.source_job_id,
+        confirmed_by_authorization_id=EXCLUDED.confirmed_by_authorization_id,confirmed_at=NOW(),
+        revision=chat_group_classifications.revision+1,updated_at=NOW()""",
+                 (chat_id, purpose, creator_data.encode(tags), locked, job_id, actor))
+    if locked:
+        conn.execute("""UPDATE creator_group_jobs SET status='cancelled',desired_version=desired_version+1,
+            reason_code='manual_confirmed',claim_token=NULL,lease_until=NULL,updated_at=NOW()
+            WHERE chat_id=%s AND status NOT IN ('completed','failed','cancelled')""", (chat_id,))
+    _audit(conn, actor, "classification_confirmed", {"chat_id": chat_id, "purpose": purpose, "locked": locked,
+                                                  "job_id": str(job_id) if job_id else None})

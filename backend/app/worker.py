@@ -17,6 +17,7 @@ import psycopg
 
 from . import (
     ai_dispatch,
+    creator_group_matching,
     creator_handle_matching,
     creator_imports,
     creator_responsibility_matching,
@@ -213,6 +214,7 @@ def _dispatch_ai_turn(
         (summary_replies.claim, summary_replies.run),
         (creator_handle_matching.claim, creator_handle_matching.run),
         (creator_responsibility_matching.claim, creator_responsibility_matching.run),
+        (creator_group_matching.claim, creator_group_matching.run),
     )
     for offset in range(len(queues)):
         index = (next_queue + offset) % len(queues)
@@ -266,7 +268,8 @@ def _prepare_creator_preview(settings: Settings, next_queue: int) -> tuple[bool,
     queues = (creator_imports.prepare_next_import,
               offhours_summary.prepare_next_summary,
               creator_handle_matching.prepare_next,
-              creator_responsibility_matching.prepare_next)
+              creator_responsibility_matching.prepare_next,
+              creator_group_matching.prepare_next)
     for offset in range(len(queues)):
         index = (next_queue + offset) % len(queues)
         try:
@@ -1451,6 +1454,8 @@ def _store_member_snapshot(
             ),
         )
 
+    creator_group_matching.touch_chats(conn, [chat_id])
+
 
 def _upsert_lark_identity(
     conn: psycopg.Connection,
@@ -2178,6 +2183,7 @@ def _record_claimed_page(
             raise StaleSyncJob
         if inserted:
             creator_handle_matching.touch_chats(conn, [claim.chat_id])
+            creator_group_matching.touch_chats(conn, [claim.chat_id])
     return PageCommit(True, inserted, own_inserted)
 
 

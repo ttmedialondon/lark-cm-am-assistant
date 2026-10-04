@@ -21,6 +21,7 @@ from fastapi.templating import Jinja2Templates
 from . import (
     admin,
     admin_permissions,
+    creator_group_routes,
     creator_handle_matching_routes,
     creator_handles_routes,
     creator_responsibility_routes,
@@ -547,6 +548,9 @@ app.include_router(creator_handle_matching_routes.create_router(
     current_authorization=_current_authorization,render_template=_template,csrf_token=_admin_csrf_token,
 ))
 app.include_router(creator_responsibility_routes.create_router(
+    current_authorization=_current_authorization, render_template=_template, csrf_token=_admin_csrf_token,
+))
+app.include_router(creator_group_routes.create_router(
     current_authorization=_current_authorization, render_template=_template, csrf_token=_admin_csrf_token,
 ))
 app.include_router(desktop_reply_routes.create_router(

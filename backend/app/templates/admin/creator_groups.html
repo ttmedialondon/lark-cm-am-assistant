@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}达人群用途匹配{% endblock %}
+{% block body %}
+{% set base = '/admin/ai/creator-groups' %}
+{% macro coverage(stats) %}
+  {% if stats %}<div class="text-secondary small">证据 {{ stats.included_messages or stats.included or stats.messages or 0 }} 条{% if stats.omitted_messages or stats.omitted %} · {{ stats.omitted_messages or stats.omitted }} 条未纳入{% endif %}{% if stats.history_truncated %} · 历史读取已截断{% endif %}{% if stats.missing_reply_ids or stats.replies_missing %} · 部分回复缺少上下文{% endif %}{% if stats.backfill_complete is defined and not stats.backfill_complete %} · 历史同步未完成{% endif %}</div>{% endif %}
+{% endmacro %}
+<div class="page">
+  {% include "admin/_nav.html" %}
+  <div class="page-wrapper"><div class="container-xl py-4">
+    {% if evidence is not none %}
+      <div class="d-flex justify-content-between align-items-center gap-3 mb-3"><h2 class="mb-0">{{ evidence.name or '未命名群' }} · 分类证据</h2><a class="btn" href="{{ base }}">返回匹配列表</a></div>
+      {{ coverage(evidence.stats) }}
+      <div class="card mt-3 mb-3"><div class="card-body" id="evidence-G1"><div class="subheader">G1 · 群名称与结构</div><div>{{ evidence.pack.chat.name }}</div><div class="text-secondary small">{{ '专题群' if evidence.pack.chat.mode == 'topic' else '群聊' }}{% if evidence.pack.chat.member_count is not none %} · {{ evidence.pack.chat.member_count }} 位成员{% endif %}{% if evidence.pack.chat.member_snapshot_complete is defined and not evidence.pack.chat.member_snapshot_complete %} · 成员记录不完整{% endif %}</div></div></div>
+      {% if evidence.result %}<div class="card mb-3"><div class="card-body"><strong>{{ evidence.result.purpose_label }}</strong> · {{ evidence.result.confidence_label }}<div>{{ evidence.result.reason }}</div>{% if evidence.result.tags %}<div class="text-secondary small">{{ evidence.result.tags|join(' · ') }}</div>{% endif %}</div></div>{% endif %}
+      {% for message in evidence.pack.messages %}<div class="card mb-2" id="evidence-{{ message.id }}"><div class="card-body"><div class="d-flex flex-wrap gap-2 text-secondary small mb-2"><span>{{ message.id }}</span><span>{{ message.speaker }}</span><span>{{ message.at or '时间未记录' }}</span>{% if message.reply %}<span>回复 {{ message.reply }}</span>{% endif %}</div><div style="white-space:pre-wrap;overflow-wrap:anywhere">{{ message.text }}</div></div></div>{% else %}<div class="text-secondary">没有可读消息；本次材料仅包括群名称与结构。</div>{% endfor %}
+    {% else %}
+      <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-3"><div><h2 class="mb-1">达人群用途匹配</h2><div class="text-secondary small">AI 提供分类建议；人工确认后成为正式分类。此处不发送消息。</div></div><form method="post" action="{{ base }}/enqueue"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary" type="submit" {% if not matching.enabled %}disabled{% endif %}>匹配待处理群</button></form></div>
+      <div class="d-flex flex-wrap gap-3 mb-3 text-secondary small">{% for status,label in {'queued':'待处理','ready':'待调用','running':'分析中','waiting_evidence':'等待证据','completed':'已分析','failed':'失败'}.items() %}<span>{{ label }} {{ matching.counts.get(status,0) }}</span>{% endfor %}</div>
+      {% for job in matching.jobs %}
+        <div class="card mb-3">
+          <div class="card-header d-flex flex-wrap justify-content-between gap-2"><div><h3 class="card-title mb-1">{{ job.name or '未命名群' }}</h3><div class="text-secondary small">{{ job.status_label }} · {{ job.reason }}{% if job.outdated %} · 旧版结果{% endif %}</div></div><div class="d-flex flex-wrap align-items-center gap-2">
+            {% if job.result and not job.stale %}<a class="btn btn-sm" href="{{ base }}/jobs/{{ job.id }}/evidence">查看证据</a>{% endif %}
+            {% if job.status not in ['queued','preparing','ready','running','retry_wait'] %}<form method="post" action="{{ base }}/jobs/{{ job.id }}/recheck"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="page" value="{{ matching.page }}"><button class="btn btn-sm" {% if not matching.enabled %}disabled{% endif %}>重新检查</button></form>{% endif %}
+            {% if job.status in ['queued','preparing','ready','running','retry_wait','waiting_evidence'] %}<form method="post" action="{{ base }}/jobs/{{ job.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="page" value="{{ matching.page }}"><button class="btn btn-sm">取消</button></form>{% endif %}
+          </div></div>
+          <div class="card-body">
+            <div class="mb-2"><span class="text-secondary">正式分类：</span>{{ job.confirmed_label or '尚未确认' }}{% if job.locked %}<span class="badge bg-secondary-lt ms-1">人工锁定</span>{% endif %}{% if job.confirmed_tags %}<span class="text-secondary small ms-2">{{ job.confirmed_tags|join(' · ') }}</span>{% endif %}</div>
+            {% if job.stale %}<div class="text-secondary mb-3">材料或授权已变化，旧建议已隐藏。</div>{% elif job.result %}<div class="mb-3"><span class="text-secondary">AI 建议：</span>{{ job.result.purpose_label }} · {{ job.result.confidence_label }}<div class="small mt-1">{{ job.result.reason }}</div>{% if job.result.tags %}<div class="small text-secondary">{{ job.result.tags|join(' · ') }}</div>{% endif %}<div class="small">{% for ref in job.result.refs %}<a href="{{ base }}/jobs/{{ job.id }}/evidence#evidence-{{ ref }}">{{ ref }}</a>{{ '、' if not loop.last else '' }}{% endfor %}</div><form method="post" action="{{ base }}/chats/{{ job.chat_id|urlencode }}/classification" class="mt-2"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="page" value="{{ matching.page }}"><input type="hidden" name="source_job_id" value="{{ job.id }}"><input type="hidden" name="purpose" value="{{ job.result.purpose }}"><input type="hidden" name="tags" value="{{ job.result.tags|join(', ') }}"><input type="hidden" name="locked" value="1"><button class="btn btn-sm btn-outline-primary">采纳建议并锁定</button></form></div>{% endif %}
+            <form class="row g-2 align-items-end" method="post" action="{{ base }}/chats/{{ job.chat_id|urlencode }}/classification">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="page" value="{{ matching.page }}">
+              <div class="col-md-3"><label class="form-label" for="purpose-{{ job.id }}">人工分类</label><select class="form-select" id="purpose-{{ job.id }}" name="purpose">{% set selected = job.confirmed_purpose or (job.result.purpose if job.result else 'unknown') %}{% for code,label in purposes.items() %}<option value="{{ code }}" {% if code == selected %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div>
+              <div class="col-md-4"><label class="form-label" for="tags-{{ job.id }}">补充标签</label><input class="form-control" id="tags-{{ job.id }}" name="tags" maxlength="640" value="{{ (job.confirmed_tags or (job.result.tags if job.result else []))|join(', ') }}" placeholder="类目或活动名称，以逗号分隔"></div>
+              <div class="col-md-3"><label class="form-check mb-2"><input class="form-check-input" type="checkbox" name="locked" value="1" checked><span class="form-check-label">锁定，暂停自动重查</span></label></div><div class="col-md-2"><button class="btn btn-outline-primary w-100" type="submit">确认分类</button></div>
+            </form>
+            {{ coverage(job.stats) }}<div class="text-secondary small">累计 Token {{ job.input_tokens + job.output_tokens }}</div>
+          </div>
+        </div>
+      {% else %}<div class="card card-body text-secondary text-center">暂无匹配任务。配置独立密钥后，可启动待处理群匹配。</div>{% endfor %}
+      <div class="d-flex justify-content-end gap-3 mt-3">{% if matching.page > 1 %}<a href="?page={{ matching.page - 1 }}">上一页</a>{% endif %}{% if matching.has_more %}<a href="?page={{ matching.page + 1 }}">下一页</a>{% endif %}</div>
+    {% endif %}
+  </div></div>
+</div>
+{% endblock %}

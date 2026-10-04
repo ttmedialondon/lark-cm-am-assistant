@@ -727,6 +727,7 @@ def chats(page: int = 1) -> dict[str, Any]:
                 c.name,
                 c.external,
                 c.chat_mode,
+                classification.purpose AS group_purpose,
                 mc.member_count,
                 mc.member_count_status,
                 mc.member_count_checked_at,
@@ -737,6 +738,7 @@ def chats(page: int = 1) -> dict[str, Any]:
                 m.last_synced_at,
                 COALESCE(msg.message_count, 0) AS message_count
             FROM chats c
+            LEFT JOIN chat_group_classifications classification ON classification.chat_id=c.chat_id
             LEFT JOIN memberships m ON m.chat_id = c.chat_id
             LEFT JOIN member_counts mc ON mc.chat_id = c.chat_id
             LEFT JOIN messages msg ON msg.chat_id = c.chat_id
@@ -1077,6 +1079,7 @@ def contact_detail(open_id: str, conversation_page: int = 1, *,
                 chat.name,
                 COALESCE(chat.chat_mode, 'group') AS chat_mode,
                 chat.external,
+                classification.purpose AS group_purpose,
                 member_counts.member_count,
                 member_counts.member_count_status,
                 message_counts.message_count,
@@ -1084,6 +1087,7 @@ def contact_detail(open_id: str, conversation_page: int = 1, *,
                 message_counts.last_message_at
             FROM conversation_ids ids
             JOIN chats chat ON chat.chat_id = ids.chat_id
+            LEFT JOIN chat_group_classifications classification ON classification.chat_id=chat.chat_id
             LEFT JOIN LATERAL (
                 SELECT access.member_count, access.member_count_status
                 FROM authorization_chats access
@@ -1399,7 +1403,10 @@ def _decorate_conversation_membership(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _decorate_chat(row: dict[str, Any]) -> dict[str, Any]:
+    from .creator_group_evidence import PURPOSES as GROUP_PURPOSES
+
     item = dict(row)
+    item["group_purpose_label"] = GROUP_PURPOSES.get(item.get("group_purpose"), "未确认")
     item["name"] = item.get("name") or "未命名群聊"
     item["chat_mode_label"] = _chat_mode_label(item.get("chat_mode"))
     item["member_count_label"] = _member_count(item.get("member_count"), item.get("member_count_status"))
@@ -1558,9 +1565,14 @@ def _decorate_contact_organization(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _decorate_contact_conversation(row: dict[str, Any]) -> dict[str, Any]:
+    from .creator_group_evidence import PURPOSES as GROUP_PURPOSES
+
     item = dict(row)
     item["chat_mode"] = item.get("chat_mode") or "group"
     item["chat_mode_label"] = _chat_mode_label(item["chat_mode"])
+    item["group_purpose_label"] = (
+        "—" if item["chat_mode"] == "p2p" else GROUP_PURPOSES.get(item.get("group_purpose"), "未确认")
+    )
     item["name"] = _conversation_name(item.get("name"), item["chat_mode"], item.get("chat_id"))
     item["member_count_label"] = (
         "—" if item["chat_mode"] == "p2p" else _member_count(item.get("member_count"), item.get("member_count_status"))

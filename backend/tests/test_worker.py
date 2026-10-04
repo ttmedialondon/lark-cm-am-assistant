@@ -233,7 +233,7 @@ def test_full_ai_slots_do_not_attempt_another_claim(monkeypatch) -> None:
     assert worker._fill_ai_slots(object(), object(), {Future() for _ in range(5)}, 2) == 2
 
 
-def test_dispatch_uses_at_most_five_slots_and_fairly_rotates_all_four_queues(monkeypatch) -> None:
+def test_dispatch_uses_at_most_five_slots_and_fairly_rotates_all_six_queues(monkeypatch) -> None:
     submitted: list[tuple[object, object]] = []
 
     class Future:
@@ -249,10 +249,14 @@ def test_dispatch_uses_at_most_five_slots_and_fairly_rotates_all_four_queues(mon
     import_jobs = iter(({"id": "import-1"},))
     reply_jobs = iter(({"id": "reply-1"},))
     matching_jobs = iter(({"id": "matching-1"},))
+    responsibility_jobs = iter(({"id": "responsibility-1"},))
+    group_jobs = iter(({"id": "group-1"},))
     monkeypatch.setattr(worker.summary_replies, "claim", lambda: next(reply_jobs, None))
     monkeypatch.setattr(worker.offhours_summary, "claim_next_summary", lambda: next(summary_jobs, None))
     monkeypatch.setattr(worker.creator_imports, "claim_next_import", lambda: next(import_jobs, None))
     monkeypatch.setattr(worker.creator_handle_matching, "claim", lambda: next(matching_jobs, None))
+    monkeypatch.setattr(worker.creator_responsibility_matching, "claim", lambda: next(responsibility_jobs, None))
+    monkeypatch.setattr(worker.creator_group_matching, "claim", lambda: next(group_jobs, None))
 
     futures = set()
     turns, preference = [], 0
@@ -262,16 +266,18 @@ def test_dispatch_uses_at_most_five_slots_and_fairly_rotates_all_four_queues(mon
 
     assert turns == [True, True, True, True, True, False] and len(futures) == 5
     assert [job["id"] for _runner, job in submitted] == [
-        "summary-1", "import-1", "reply-1", "matching-1", "summary-2"
+        "summary-1", "import-1", "reply-1", "matching-1", "responsibility-1"
     ]
     assert submitted[3][0] is worker.creator_handle_matching.run
+    assert submitted[4][0] is worker.creator_responsibility_matching.run
     futures.clear()
     preference = worker._fill_ai_slots(object(), Executor(), futures, preference)
     assert preference == 1
-    assert [job["id"] for _runner, job in submitted[5:]] == ["summary-3"]
+    assert [job["id"] for _runner, job in submitted[5:]] == ["group-1", "summary-2", "summary-3"]
+    assert submitted[5][0] is worker.creator_group_matching.run
     futures.clear()
     assert worker._fill_ai_slots(object(), Executor(), futures, preference) == 1
-    assert [job["id"] for _runner, job in submitted[6:]] == []
+    assert [job["id"] for _runner, job in submitted[8:]] == []
 
     # Exhausted queues must not query on every busy Lark tick. Completion wakes
     # the dispatcher immediately so a chained summary/reply is not delayed.
@@ -310,6 +316,8 @@ def test_offhours_tasks_fill_five_parallel_slots_without_waiting(monkeypatch) ->
     monkeypatch.setattr(worker.creator_imports, "claim_next_import", lambda: None)
     monkeypatch.setattr(worker.summary_replies, "claim", lambda: None)
     monkeypatch.setattr(worker.creator_handle_matching, "claim", lambda: None)
+    monkeypatch.setattr(worker.creator_responsibility_matching, "claim", lambda: None)
+    monkeypatch.setattr(worker.creator_group_matching, "claim", lambda: None)
     futures = set()
     worker._fill_ai_slots(object(), Executor(), futures, 0)
     assert submitted == [0, 1, 2, 3, 4]
@@ -340,6 +348,9 @@ def test_creator_previews_are_fair_single_flight_and_back_off_without_work(monke
                         lambda _: prepare("summary", summary_jobs))
     monkeypatch.setattr(worker.creator_imports, "prepare_next_import",
                         lambda _: prepare("import", import_jobs))
+    monkeypatch.setattr(worker.creator_handle_matching, "prepare_next", lambda _: False)
+    monkeypatch.setattr(worker.creator_responsibility_matching, "prepare_next", lambda _: False)
+    monkeypatch.setattr(worker.creator_group_matching, "prepare_next", lambda _: False)
     executor = Executor()
     future, next_check, queue = worker._schedule_creator_preview(settings, executor, None, 0, 0)
     assert future is submitted[0][0]

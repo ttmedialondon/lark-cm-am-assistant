@@ -18,6 +18,7 @@
     {% if identity_saved %}<div class="alert alert-success" role="status">配置已保存。<a href="/admin/contacts" class="alert-link">查看识别进度</a></div>{% endif %}
     {% if matching_saved and admin_role == 'owner' %}<div class="alert alert-success" role="status">配置已保存。<a href="/admin/ai/creator-handle-matching" class="alert-link">匹配任务</a></div>{% endif %}
     {% if responsibility_saved and admin_role == 'owner' %}<div class="alert alert-success" role="status">配置已保存。<a href="/admin/ai/creator-responsibility" class="alert-link">负责人匹配</a></div>{% endif %}
+    {% if groups_saved and admin_role == 'owner' %}<div class="alert alert-success" role="status">配置已保存。<a href="/admin/ai/creator-groups" class="alert-link">群用途匹配</a></div>{% endif %}
     {% for feature in configs %}{% set config = feature.config %}
     <div class="card mb-4" id="{{ feature.id_suffix }}"><div class="card-header"><div><h3 class="card-title mb-1">{{ feature.title }}</h3><div class="text-secondary small">{{ feature.description }}</div></div></div>
       <div class="card-body">
@@ -36,6 +37,9 @@
         {% endif %}
         {% if feature.feature == 'creator_responsibility_matching' and admin_role == 'owner' %}
         <div class="d-flex justify-content-between gap-2 mb-3"><span class="text-secondary">独立配置密钥后启用，从匹配页面启动全部待处理达人。</span><a href="/admin/ai/creator-responsibility">负责人匹配 →</a></div>
+        {% endif %}
+        {% if feature.feature == 'creator_group_classification' and admin_role == 'owner' %}
+        <div class="d-flex justify-content-between gap-2 mb-3"><span class="text-secondary">历史群手动启动；新群自动匹配，证据不足时补查。</span><a href="/admin/ai/creator-groups">群用途匹配 →</a></div>
         {% endif %}
         {% if admin_role == 'owner' %}<form action="/admin/ai" method="post" class="row g-3">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="feature" value="{{ feature.feature }}">

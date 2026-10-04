@@ -52,6 +52,9 @@ def can_claim(conn: psycopg.Connection) -> bool:
             UNION ALL
             SELECT id FROM creator_responsibility_jobs
             WHERE status = 'running' AND lease_until > NOW()
+            UNION ALL
+            SELECT id FROM creator_group_jobs
+            WHERE status = 'running' AND lease_until > NOW()
         ) AS active
         """
     ).fetchone()

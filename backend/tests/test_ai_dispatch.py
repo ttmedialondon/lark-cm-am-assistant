@@ -44,6 +44,7 @@ def test_shared_gate_allows_four_and_rejects_five_valid_running_leases() -> None
     assert "creator_import_rows" in combined_query
     assert "creator_handle_jobs" in combined_query
     assert "creator_responsibility_jobs" in combined_query
+    assert "creator_group_jobs" in combined_query
     assert "lease_until > NOW()" in combined_query
 
 
