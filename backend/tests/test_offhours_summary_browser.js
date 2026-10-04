@@ -97,7 +97,7 @@ test("creator names stay plain text while a separate accessible icon opens Lark"
       return route.abort();
     }
     if (target.pathname === "/creators") return route.fulfill({contentType: "text/html", body: fixture.html});
-    if (target.pathname.startsWith("/static/")) return route.fulfill({contentType: target.pathname.endsWith(".js") ? "text/javascript" : "text/css", body: fs.readFileSync(path.join(backend, "app", target.pathname))});
+    if (target.pathname.startsWith("/static/")) return route.fulfill({contentType: target.pathname.endsWith(".js") ? "text/javascript" : target.pathname.endsWith(".svg") ? "image/svg+xml" : "text/css", body: fs.readFileSync(path.join(backend, "app", target.pathname))});
     state.calls.push({method: request.method(), url: target.pathname, search: target.search});
     if (target.pathname === "/creators/data") return route.fulfill({json: state.data});
     return route.abort();
@@ -108,19 +108,27 @@ test("creator names stay plain text while a separate accessible icon opens Lark"
   const names = rows.locator("td:nth-child(2) .fw-bold");
   assert.deepEqual(await names.allTextContents(), data.items.map(item => item.display_name));
   assert(await names.evaluateAll(elements => elements.every(element => element.tagName === "SPAN" && !element.closest("a"))));
-  assert.equal(await rows.locator("img").count(), 0);
+  assert.equal(await names.locator("img").count(), 0);
   assert.equal(await page.evaluate(() => window.compromised), undefined);
   assert.deepEqual(await rows.locator("td:first-child").allTextContents(), ["@one", "@two", "@three"]);
   await names.first().click();
   assert.equal(context.pages().length, 1);
   assert.equal(page.url(), "http://localhost/creators");
   const link = rows.first().getByRole("link", {name: "在 Lark 中与 Creator One 私聊（新窗口）", exact: true});
-  assert.equal(await link.textContent(), "↗");
   assert.equal(await link.getAttribute("href"), url);
   assert.equal(await link.getAttribute("title"), "在 Lark 中打开私聊");
   assert.equal(await link.getAttribute("target"), "_blank");
   assert.equal(await link.getAttribute("rel"), "noopener noreferrer");
-  assert.equal(await link.locator('span[aria-hidden="true"]').textContent(), "↗");
+  const icon = link.locator("img");
+  assert.equal(new URL(await icon.getAttribute("src"), page.url()).pathname, "/static/lark-share.svg");
+  assert.equal(await icon.getAttribute("alt"), "");
+  assert.equal(await icon.getAttribute("aria-hidden"), "true");
+  assert.equal(await icon.getAttribute("width"), "16");
+  assert.equal(await icon.getAttribute("height"), "16");
+  await page.waitForFunction(() => {
+    const image = document.querySelector("#creators-rows .creator-lark-link img");
+    return image.complete && image.naturalWidth > 0;
+  });
   for (const index of [1, 2]) {
     assert.equal(await rows.nth(index).getByRole("link").count(), 0);
     assert.equal(await rows.nth(index).locator("a[href]").count(), 0);

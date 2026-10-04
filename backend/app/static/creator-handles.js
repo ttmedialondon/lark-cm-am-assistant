@@ -135,7 +135,8 @@
     const initial = node("span"); avatar.append(initial);
     const name = node("span", "", "fw-bold");
     const lark = node("a", "", "creator-lark-link text-secondary");
-    const icon = node("span", "↗"); icon.setAttribute("aria-hidden", "true"); lark.append(icon);
+    const icon = node("img"); icon.src = "/static/lark-share.svg"; icon.alt = "";
+    icon.width = 16; icon.height = 16; icon.setAttribute("aria-hidden", "true"); lark.append(icon);
     lark.target = "_blank"; lark.rel = "noopener noreferrer";
     lark.title = "在 Lark 中打开私聊";
     const label = node("div", "", "d-flex align-items-center"); label.append(name, lark);

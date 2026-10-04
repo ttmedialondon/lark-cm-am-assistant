@@ -1,5 +1,6 @@
 .creator-evidence { width: min(720px, calc(100vw - 24px)); max-height: 85vh; border: 1px solid var(--tblr-border-color); border-radius: 12px; padding: 24px; color: inherit; }
 .creator-evidence::backdrop { background: rgb(15 23 42 / 35%); }
 .creator-evidence blockquote { white-space: pre-wrap; overflow-wrap: anywhere; font-size: inherit; }
-.creator-lark-link { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; margin-left: 2px; align-self: flex-start; font-size: 14px; text-decoration: none; flex-shrink: 0; }
+.creator-lark-link { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; margin-left: 2px; align-self: flex-start; border-radius: 4px; text-decoration: none; flex-shrink: 0; }
+.creator-lark-link:hover { background: var(--tblr-bg-surface-secondary, #f3f4f6); }
 .creator-lark-link[hidden] { display: none; }

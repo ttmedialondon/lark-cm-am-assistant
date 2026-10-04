@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}我的达人 · TT Media{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-roster.css?v=20261004-lark-icon">{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-roster.css?v=20261004-lark-share">{% endblock %}
 {% block body %}
 <div class="page" id="creators-app" data-csrf="{{ csrf_token }}" data-tab="{{ creator_tab }}">
   <header class="navbar navbar-expand-md"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media</a><div class="navbar-nav flex-row gap-2"><a class="nav-link" href="/dashboard">消息提醒</a><span class="nav-link text-secondary">{{ authorization.display_name or 'CM' }}</span></div></div></header>
@@ -31,5 +31,5 @@
   </dialog>
 </div>
 <script id="creators-initial" type="application/json">{{ creator_data|tojson }}</script>
-<script src="/static/creator-handles.js?v=20261004-lark-icon" defer></script>
+<script src="/static/creator-handles.js?v=20261004-lark-share" defer></script>
 {% endblock %}
