@@ -51,8 +51,12 @@ def test_admin_summary_form_has_native_window_inputs_and_disabled_default_withou
         form for form in forms if 'name="feature" value="creator_responsibility_matching"' in form
     )
     assert 'name="auto_confirm_threshold"' in responsibility_form
+    group_form = next(form for form in forms if 'name="feature" value="creator_group_classification"' in form)
+    assert 'name="auto_confirm_threshold"' in group_form
+    assert "自动入库置信度阈值" in group_form
     assert all(
-        'name="auto_confirm_threshold"' not in form for form in forms if form != responsibility_form
+        'name="auto_confirm_threshold"' not in form for form in forms
+        if form not in (responsibility_form, group_form)
     )
     assert 'name="feature" value="creator_import"' in forms[0]
     assert 'name="enabled"' not in forms[0]

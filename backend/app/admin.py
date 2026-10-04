@@ -75,9 +75,9 @@ AI_FEATURES = {
     },
     "creator_group_classification": {
         "title": "达人群用途分类",
-        "description": "按群名、成员结构和授权聊天判断用途；共享群只分析一次，人工确认后保留正式分类。",
+        "description": "结合群名、成员结构和授权聊天判断用途；高置信度自动入库，其余待核实，保留人工分类。",
         "enabled_label": "启用群用途匹配队列",
-        "processing_label": "逐群生成分类建议，不发送消息",
+        "processing_label": "逐群分类，高置信度自动入库，不发送消息",
     },
     "offhours_summary": {
         "title": "达人消息总结",
@@ -841,7 +841,7 @@ def create_admin_router(
             return render_ai_config(request, access_context, error="未知的 AI 功能配置。", status_code=400)
         try:
             threshold = str(ai_feature_config.DEFAULT_AUTO_CONFIRM_THRESHOLD)
-            if feature == creator_responsibility_matching.FEATURE:
+            if feature in {creator_responsibility_matching.FEATURE, creator_group_matching.FEATURE}:
                 threshold = form.get("auto_confirm_threshold", "0.950")
             enabled = feature != "creator_import" and form.get("enabled") == "1"
             with connection() as conn, conn.transaction():

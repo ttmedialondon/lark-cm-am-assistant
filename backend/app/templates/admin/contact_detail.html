@@ -25,8 +25,8 @@
     {% if can_view_conversations %}<div class="card mb-4">
       <div class="card-header"><div><h3 class="card-title mb-1">相关会话</h3><div class="text-secondary small">仅展示会话元数据和统计，不在此页读取消息正文。</div></div></div>
       {% if conversations %}
-      <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>会话</th><th>类型</th><th>群用途</th><th>群成员</th><th>会话消息</th><th>该联系人发送</th><th>最近消息</th></tr></thead>
-        <tbody>{% for conversation in conversations %}<tr><td>{{ conversation.name }}</td><td>{{ conversation.chat_mode_label }}</td><td>{{ conversation.group_purpose_label }}</td><td>{{ conversation.member_count_label }}</td><td>{{ conversation.message_count }}</td><td>{{ conversation.contact_message_count }}</td><td class="text-secondary">{{ conversation.last_message_at_label }}</td></tr>{% endfor %}</tbody>
+      <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>会话</th><th>类型</th><th>群成员</th><th>会话消息</th><th>该联系人发送</th><th>最近消息</th></tr></thead>
+        <tbody>{% for conversation in conversations %}<tr><td><div class="d-flex flex-wrap align-items-center gap-2"><span>{{ conversation.name }}</span>{% if conversation.chat_mode != 'p2p' %}<span class="badge bg-{{ conversation.group_purpose_badge }}-lt">{{ conversation.group_purpose_label }}</span>{% endif %}</div></td><td>{{ conversation.chat_mode_label }}</td><td>{{ conversation.member_count_label }}</td><td>{{ conversation.message_count }}</td><td>{{ conversation.contact_message_count }}</td><td class="text-secondary">{{ conversation.last_message_at_label }}</td></tr>{% endfor %}</tbody>
       </table></div>
       {% with pager=conversation_page %}{% include "admin/_pagination.html" %}{% endwith %}
       {% else %}<div class="card-body text-secondary">暂未在同步数据中找到相关会话。</div>{% endif %}

@@ -12,7 +12,7 @@ from . import evidence_text as text
 from .crypto import message_body_cipher
 from .openai_client import ModelOutputError
 
-PROMPT_VERSION = "creator-group-purpose-v1.0"
+PROMPT_VERSION = "creator-group-purpose-v1.1"
 PURPOSES = {"support": "客服群", "community": "机构达人群", "training": "培训群",
             "category": "类目群", "campaign": "活动群", "unknown": "未确认"}
 MAX_MESSAGES, MAX_CHARS, SEARCH_LIMIT = 64, 24_000, 4_000
@@ -21,7 +21,7 @@ _RETENTION_PLACEHOLDER = "The message has exceeded the retention period and has 
 
 @lru_cache(maxsize=1)
 def instructions():
-    return (Path(__file__).resolve().parents[2] / "docs/specs/creator-group-classification-prompt_v1.0.md"
+    return (Path(__file__).resolve().parents[2] / "docs/specs/creator-group-classification-prompt_v1.1.md"
             ).read_text().split("```text\n", 1)[1].split("```", 1)[0].strip()
 
 

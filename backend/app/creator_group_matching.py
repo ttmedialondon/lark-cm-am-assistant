@@ -1,10 +1,13 @@
-"""One canonical group, one paid request; only the owner writes a formal classification."""
+"""One canonical group, one paid request; strong results classify without overriding humans."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+from decimal import Decimal
 from uuid import uuid4
+
+from psycopg.errors import LockNotAvailable
 
 from . import ai_dispatch, ai_feature_config, creator_data
 from . import creator_group_evidence as evidence
@@ -27,7 +30,7 @@ REASONS = {
     "preparation_failed": "证据准备失败", "invalid_output": "返回格式无效", "provider_failed": "接口调用失败",
     "provider_retry": "服务暂不可用", "quota_paused": "接口配额暂停", "request_unknown": "请求结果未知，需手动复查",
     "lease_expired": "准备任务已过期", "owner_cancelled": "已取消", "manual_confirmed": "已人工确认并锁定",
-    "config_paused": "功能已停用", "scope_changed": "群关系或授权已变化",
+    "config_paused": "功能已停用", "scope_changed": "群关系或授权已变化", "auto_linked": "分类已自动入库",
 }
 
 
@@ -37,7 +40,8 @@ def _hash(value):
 
 def _config(conn, *, lock=False):
     return conn.execute(
-        "SELECT provider,project_id,model,enabled,api_key_ciphertext FROM ai_feature_configs WHERE feature=%s"
+        "SELECT provider,project_id,model,enabled,api_key_ciphertext,auto_confirm_threshold "
+        "FROM ai_feature_configs WHERE feature=%s"
         + (" FOR UPDATE" if lock else ""), (FEATURE,),
     ).fetchone()
 
@@ -53,6 +57,72 @@ def _config_hash(config):
 def _audit(conn, actor, action, metadata):
     conn.execute("INSERT INTO audit_events(id,authorization_id,action,metadata) VALUES(%s,%s,%s,%s::jsonb)",
                  (uuid4(), actor, "creator_group_" + action, creator_data.encode(metadata)))
+
+
+def _auto_classify(conn, job, pack, refs, result, config, settings):
+    """The same admission fence for fresh and cached results; never impersonate a human."""
+    threshold = Decimal(str(config["auto_confirm_threshold"]))
+    cited = set(result["refs"])
+    messages = [ref for ref in refs if ref.get("kind") == "message"]
+    if (not _enabled(config) or result["purpose"] == "unknown"
+            or Decimal(str(result["confidence"])) < threshold
+            or not cited.intersection(m["id"] for m in pack["messages"])
+            or cited.intersection(pack["coverage"].get("missing_reply_ids", []))):
+        return False
+    existing = conn.execute("SELECT source,locked FROM chat_group_classifications WHERE chat_id=%s",
+                            (job["chat_id"],)).fetchone()
+    if existing and (existing["source"] == "manual" or existing["locked"]):
+        return False
+    # Revocation/edit triggers also touch jobs. Do not wait on their locks or repeat a paid call.
+    try:
+        with conn.transaction():
+            snapshot = evidence.state(conn, job["chat_id"])
+            conn.execute("SELECT id FROM authorizations WHERE id=ANY(%s::uuid[]) ORDER BY id FOR SHARE NOWAIT",
+                         ([str(g["id"]) for g in snapshot["grants"]],)).fetchall()
+            conn.execute("SELECT chat_id FROM chats WHERE chat_id=%s FOR UPDATE NOWAIT",
+                         (job["chat_id"],)).fetchone()
+            latest = conn.execute("""SELECT id FROM creator_group_jobs WHERE chat_id=%s
+                ORDER BY created_at DESC,id DESC LIMIT 1""", (job["chat_id"],)).fetchone()
+            if not latest or latest["id"] != job["id"]:
+                return False  # A deferred old result must never replace a newer analysis.
+            conn.execute("SELECT open_id FROM chat_members WHERE chat_id=%s ORDER BY open_id FOR SHARE NOWAIT",
+                         (job["chat_id"],)).fetchall()
+            identity_ids = {m["open_id"] for m in snapshot["members"]}
+            identity_ids.update(i["open_id"] for ref in refs for i in ref.get("identities", []))
+            conn.execute("SELECT open_id FROM lark_identities WHERE open_id=ANY(%s::text[]) "
+                         "ORDER BY open_id FOR SHARE NOWAIT", (sorted(identity_ids),)).fetchall()
+            contacts = {str(m["contact_id"]) for m in snapshot["members"] if m["contact_id"]}
+            contacts.update(str(c["contact_id"]) for c in snapshot["creators"])
+            conn.execute("SELECT contact_id FROM contact_roles WHERE contact_id=ANY(%s::uuid[]) "
+                         "ORDER BY contact_id,role FOR SHARE NOWAIT", (sorted(contacts),)).fetchall()
+            locked = conn.execute("""SELECT m.message_id FROM
+                unnest(%s::text[],%s::text[],%s::uuid[]) ref(chat_id,message_id,authorization_id)
+                JOIN chat_messages m ON m.chat_id=ref.chat_id AND m.message_id=ref.message_id
+                JOIN authorization_message_observations o ON o.chat_id=m.chat_id AND o.message_id=m.message_id
+                  AND o.authorization_id=ref.authorization_id
+                JOIN authorizations a ON a.id=o.authorization_id
+                JOIN authorization_chats ac ON ac.authorization_id=a.id AND ac.chat_id=m.chat_id
+                ORDER BY a.id,m.chat_id,m.message_id FOR SHARE OF m,o,a,ac NOWAIT""",
+                ([r["chat_id"] for r in messages], [r["message_id"] for r in messages],
+                 [r["authorization_id"] for r in messages])).fetchall()
+            if len(locked) != len(messages) or not evidence.still_valid(conn, refs, settings):
+                return False
+            saved = conn.execute("""INSERT INTO chat_group_classifications
+                (chat_id,purpose,tags,locked,source,confidence,source_job_id)
+                VALUES(%s,%s,%s::jsonb,FALSE,'ai',%s,%s) ON CONFLICT(chat_id) DO UPDATE SET
+                purpose=EXCLUDED.purpose,tags=EXCLUDED.tags,confidence=EXCLUDED.confidence,
+                source_job_id=EXCLUDED.source_job_id,confirmed_at=NOW(),
+                revision=chat_group_classifications.revision+1,updated_at=NOW()
+                WHERE chat_group_classifications.source='ai' AND NOT chat_group_classifications.locked
+                RETURNING chat_id""", (job["chat_id"], result["purpose"], creator_data.encode(result["tags"]),
+                                        Decimal(str(result["confidence"])), job["id"])).fetchone()
+            if saved:
+                _audit(conn, None, "auto_linked", {"chat_id": job["chat_id"], "job_id": str(job["id"]),
+                    "purpose": result["purpose"], "confidence": result["confidence"],
+                    "threshold": str(threshold), "refs": result["refs"]})
+            return bool(saved)
+    except LockNotAvailable:
+        return None  # The paid result survives; only local admission needs another attempt.
 
 
 def configuration_changed(conn):
@@ -125,6 +195,23 @@ def prepare_next(settings):
         if not _enabled(config):
             return False
         _recover(conn)
+        deferred = conn.execute("""SELECT * FROM creator_group_jobs WHERE status='completed'
+            AND stats->>'auto_deferred'='true' AND not_before<=NOW()
+            ORDER BY updated_at,id FOR UPDATE SKIP LOCKED LIMIT 1""").fetchone()
+        if deferred:
+            storage = creator_data.cipher(settings)
+            admitted = False
+            if (deferred["stats"].get("prompt_version") == evidence.PROMPT_VERSION
+                    and evidence.still_valid(conn, deferred["refs"], settings)):
+                pack = json.loads(storage.decrypt(deferred["pack_ciphertext"]))
+                result = evidence.validate(pack, json.loads(storage.decrypt(deferred["result_ciphertext"])))
+                admitted = _auto_classify(conn, deferred, pack, deferred["refs"], result, config, settings)
+            conn.execute("""UPDATE creator_group_jobs SET stats=stats||%s::jsonb,
+                reason_code=CASE WHEN %s THEN 'auto_linked' ELSE reason_code END,
+                not_before=NOW()+INTERVAL '30 seconds',updated_at=NOW() WHERE id=%s""",
+                (creator_data.encode({"auto_linked": bool(admitted), "auto_deferred": admitted is None}),
+                 bool(admitted), deferred["id"]))
+            return True
         if conn.execute("SELECT count(*) n FROM creator_group_jobs WHERE status='ready'").fetchone()["n"] >= 5:
             return False
         job = conn.execute("""SELECT * FROM creator_group_jobs WHERE status='queued' AND not_before<=NOW()
@@ -163,6 +250,7 @@ def prepare_next(settings):
                               (job["chat_id"], fingerprint)).fetchone() if pack and job["source"] != "manual" else None
         storage = creator_data.cipher(settings)
         result = evidence.validate(pack, json.loads(storage.decrypt(cached["result_ciphertext"]))) if cached else None
+        auto_linked = _auto_classify(conn, current, pack, refs, result, current_config, settings) if cached else False
         conn.execute("""UPDATE creator_group_jobs SET status=%s,reason_code=%s,fingerprint=%s,config_fingerprint=%s,
             pack_ciphertext=%s,result_ciphertext=%s,refs=%s::jsonb,stats=%s::jsonb,attempts=0,
             claim_token=NULL,lease_until=NULL,prepared_at=NOW(),finished_at=CASE WHEN %s THEN NOW() ELSE NULL END,
@@ -173,7 +261,8 @@ def prepare_next(settings):
                 storage.encrypt(creator_data.encode(result)) if cached else None,
                 creator_data.encode(refs), creator_data.encode({
                     **material["stats"], "prompt_version": evidence.PROMPT_VERSION,
-                    **({"suggested_purpose": result["purpose"]} if cached else {}),
+                    **({"suggested_purpose": result["purpose"], "auto_linked": bool(auto_linked),
+                        "auto_deferred": auto_linked is None} if cached else {}),
                 }),
                 bool(cached), job["id"],
             ))
@@ -264,18 +353,25 @@ def run(job, settings):
         elif retry:
             ai_dispatch.throttle(api.retry_delay(error.retry_after_seconds, job["attempts"]))
     with connection() as conn, conn.transaction():
-        if not _current(conn, job, settings):
+        current = _current(conn, job, settings)
+        if not current:
             return
+        auto_linked = _auto_classify(
+            conn, current, job["pack"], current["refs"], result, _config(conn), settings) if error is None else False
         reason = ("suggestions_saved" if error is None else "request_unknown" if unknown else "quota_paused"
                   if getattr(error, "is_quota", False) else "provider_retry" if retry else "invalid_output"
                   if isinstance(error, api.ModelOutputError) else "provider_failed")
+        if auto_linked:
+            reason = "auto_linked"
         conn.execute("""UPDATE creator_group_jobs
             SET status=%s,reason_code=%s,result_ciphertext=%s,stats=stats||%s::jsonb,
             claim_token=NULL,lease_until=NULL,not_before=NOW()+(%s*INTERVAL '1 second'),
             finished_at=CASE WHEN %s THEN NOW() ELSE NULL END,updated_at=NOW() WHERE id=%s""", (
                 "completed" if error is None else "retry_wait" if retry else "failed", reason,
                 creator_data.cipher(settings).encrypt(creator_data.encode(result)) if error is None else None,
-                creator_data.encode({"suggested_purpose": result["purpose"]} if error is None else {}),
+                creator_data.encode({"suggested_purpose": result["purpose"], "auto_linked": bool(auto_linked),
+                                     "auto_deferred": auto_linked is None}
+                                    if error is None else {}),
                 api.retry_delay(error.retry_after_seconds, job["attempts"]) if retry else 0, not retry, job["id"],
             ))
         conn.execute("UPDATE ai_feature_configs SET last_tested_at=NOW(),last_test_status=%s WHERE feature=%s",
@@ -300,7 +396,8 @@ def page_data(conn, actor, settings, page=1):
     rows = conn.execute(latest + """SELECT j.id,j.chat_id,j.status,j.reason_code,j.stats,j.result_ciphertext,j.refs,
         j.source,j.input_tokens,j.output_tokens,j.created_at,j.updated_at,
         c.name,c.chat_mode,f.purpose AS confirmed_purpose,f.tags AS confirmed_tags,
-        f.locked FROM latest j JOIN chats c ON c.chat_id=j.chat_id
+        f.locked,f.source AS confirmed_source,f.confidence AS confirmed_confidence,f.source_job_id
+        FROM latest j JOIN chats c ON c.chat_id=j.chat_id
         LEFT JOIN chat_group_classifications f ON f.chat_id=j.chat_id
         ORDER BY j.updated_at DESC,j.id LIMIT 26 OFFSET %s""", ((page - 1) * 25,)).fetchall()
     more, rows = len(rows) > 25, rows[:25]
@@ -308,6 +405,7 @@ def page_data(conn, actor, settings, page=1):
     for row in rows:
         row.update(status_label=STATUSES[row["status"]], reason=REASONS.get(row["reason_code"], row["reason_code"]),
                    confirmed_label=PURPOSES.get(row["confirmed_purpose"]),
+                   auto_linked=row["confirmed_source"] == "ai" and row["source_job_id"] == row["id"],
                    outdated=row["stats"].get("prompt_version") != evidence.PROMPT_VERSION)
         row["result"] = _result(conn, row, settings, lightweight=True)
         row["stale"] = bool(row["result_ciphertext"] and row["result"] is None)
@@ -317,8 +415,11 @@ def page_data(conn, actor, settings, page=1):
             row.pop(key, None)
     if viewed:
         _audit(conn, actor, "results_viewed", {"jobs": viewed})
+    config = _config(conn)
+    threshold = config["auto_confirm_threshold"]
     return {"jobs": rows, "counts": counts, "page": page, "has_more": more,
-            "enabled": _enabled(_config(conn)), "purposes": PURPOSES, "prompt_version": evidence.PROMPT_VERSION}
+            "enabled": _enabled(config), "purposes": PURPOSES, "prompt_version": evidence.PROMPT_VERSION,
+            "threshold": float(threshold), "threshold_label": f"{threshold:.0%}"}
 
 
 def task_evidence(conn, actor, settings, job_id):
@@ -373,9 +474,10 @@ def confirm(conn, actor, chat_id, purpose, tags, *, locked=True, job_id=None):
                 or not evidence.still_valid(conn, job["refs"], get_settings())):
             raise PermissionError("这份建议的材料或授权已经变化，请重新分析或独立人工分类。")
     conn.execute("""INSERT INTO chat_group_classifications
-        (chat_id,purpose,tags,locked,source_job_id,confirmed_by_authorization_id)
-        VALUES(%s,%s,%s::jsonb,%s,%s,%s) ON CONFLICT(chat_id) DO UPDATE SET
+        (chat_id,purpose,tags,locked,source_job_id,confirmed_by_authorization_id,source,confidence)
+        VALUES(%s,%s,%s::jsonb,%s,%s,%s,'manual',NULL) ON CONFLICT(chat_id) DO UPDATE SET
         purpose=EXCLUDED.purpose,tags=EXCLUDED.tags,locked=EXCLUDED.locked,source_job_id=EXCLUDED.source_job_id,
+        source='manual',confidence=NULL,
         confirmed_by_authorization_id=EXCLUDED.confirmed_by_authorization_id,confirmed_at=NOW(),
         revision=chat_group_classifications.revision+1,updated_at=NOW()""",
                  (chat_id, purpose, creator_data.encode(tags), locked, job_id, actor))

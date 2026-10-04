@@ -43,6 +43,10 @@ MAX_MESSAGE_CONVERSATION_QUERY_LENGTH = 120
 MAX_ORGANIZATION_QUERY_LENGTH = 120
 MESSAGE_CONVERSATION_TYPES = frozenset({"all", "group", "p2p"})
 CONTACT_CATEGORIES = frozenset({"all", "unclassified", *CONTACT_ROLE_CODES})
+GROUP_PURPOSE_BADGES = {
+    "support": "azure", "community": "indigo", "training": "purple",
+    "category": "cyan", "campaign": "orange", "unknown": "secondary",
+}
 ORGANIZATION_STATUSES = frozenset({"all", "verified", "candidate", "unresolved"})
 MESSAGE_CONVERSATION_DIRECTORY_SQL = """
     SELECT
@@ -1407,6 +1411,7 @@ def _decorate_chat(row: dict[str, Any]) -> dict[str, Any]:
 
     item = dict(row)
     item["group_purpose_label"] = GROUP_PURPOSES.get(item.get("group_purpose"), "未确认")
+    item["group_purpose_badge"] = GROUP_PURPOSE_BADGES.get(item.get("group_purpose"), "secondary")
     item["name"] = item.get("name") or "未命名群聊"
     item["chat_mode_label"] = _chat_mode_label(item.get("chat_mode"))
     item["member_count_label"] = _member_count(item.get("member_count"), item.get("member_count_status"))
@@ -1572,6 +1577,9 @@ def _decorate_contact_conversation(row: dict[str, Any]) -> dict[str, Any]:
     item["chat_mode_label"] = _chat_mode_label(item["chat_mode"])
     item["group_purpose_label"] = (
         "—" if item["chat_mode"] == "p2p" else GROUP_PURPOSES.get(item.get("group_purpose"), "未确认")
+    )
+    item["group_purpose_badge"] = (
+        None if item["chat_mode"] == "p2p" else GROUP_PURPOSE_BADGES.get(item.get("group_purpose"), "secondary")
     )
     item["name"] = _conversation_name(item.get("name"), item["chat_mode"], item.get("chat_id"))
     item["member_count_label"] = (
