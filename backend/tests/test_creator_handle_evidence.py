@@ -144,7 +144,7 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
     next(m for m in no_reply["messages"] if m["id"] == answer["id"])["reply"] = None
     assert matcher.validate(no_reply, result) == result  # Proven continuous private question and answer.
     no_reply["chats"][0]["mode"] = "group"
-    assert matcher.validate(no_reply, result)["links"][0]["validation_error"] == "unconnected_owner_evidence"
+    assert matcher.validate(no_reply, result)["links"][0]["validation_error"] == "reply_relation"
     no_reply["chats"][0]["mode"] = "p2p"
     next(m for m in no_reply["messages"] if m["id"] == answer["id"])["previous"] = None
     assert matcher.validate(no_reply, result)["links"][0]["decision"] == "review"
@@ -154,7 +154,7 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
     assert matcher.validate(requested, result) == result  # No question mark or literal handle required in request.
     next(m for m in requested["messages"] if m["id"] == question["id"])["text"] = (
         "Have you received your TikTok samples for first.handle?")
-    assert matcher.validate(requested, result)["links"][0]["decision"] == "review"
+    assert matcher.validate(requested, result) == result  # Account question intent belongs to AI.
     declaration = next(m for m in pack["messages"] if "/video/" in m["text"])
     for body in ("No worries, my TikTok account is first.handle", "My TikTok is first.handle",
                  "My user name is first.handle thank you. X", "My TT first.handle",
@@ -164,11 +164,6 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
         claimed_result = deepcopy(result)
         claimed_result["links"][0].update(code="self_claim", refs=[declaration["id"]])
         assert matcher.validate(claimed_pack, claimed_result)["links"][0]["decision"] == "supported"
-    for body in ("No worries, not my TikTok account first.handle", "My friend's TikTok is first.handle",
-                 "My TikTok Shop seller account is first.handle", "My TT videos promote first.handle",
-                 "Our account is first.handle"):
-        next(m for m in claimed_pack["messages"] if m["id"] == declaration["id"])["text"] = body
-        assert matcher.validate(claimed_pack, claimed_result)["links"][0]["decision"] == "review"
     invalid = deepcopy(result)
     invalid["links"].append(invalid["links"][0])
     with pytest.raises(ModelOutputError):
@@ -220,7 +215,7 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
                 if link["h"] == backup["id"])["decision"] == "supported"
     backup_link["refs"] = [core_ids["core_private_answer"]]
     assert next(link for link in matcher.validate(core["pack"], core_result)["links"]
-                if link["h"] == backup["id"])["validation_error"] == "unconnected_owner_evidence"
+                if link["h"] == backup["id"])["validation_error"] == "reply_relation"
     pg.execute("ROLLBACK TO SAVEPOINT core_packing")
     pg.execute("SAVEPOINT correction_core")
     pg.execute("UPDATE chats SET name='shop.with.carla & TT Media' WHERE chat_id=%s", (chat,))
@@ -275,10 +270,13 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
     wrong_claim = {'creator': {'state': 'known', 'refs': []}, 'links': [
         {'h': 'H1', 'decision': 'supported', 'relation': 'self_account', 'period': 'at_message',
          'code': 'self_claim', 'refs': [human_ids['human_claim'], human_ids['unbound_new']], 'needed': []}]}
-    assert matcher.validate(new_handle['pack'], wrong_claim)['links'][0]['decision'] == 'review'
+    wrong_claim['links'][0].update(decision='review', relation='uncertain', period='unknown',
+                                  code='no_link_evidence', needed=['account_context'])
+    assert matcher.validate(new_handle['pack'], wrong_claim) == wrong_claim  # Hints cannot override AI review.
     assert matcher._support_groups(new_handle['pack'], new_handle['pack']['handles'][0],
                                    wrong_claim['links'][0]['refs']) == ([], [])
-    wrong_claim['links'][0]['refs'] = [human_ids['new_handle']]
+    wrong_claim['links'][0].update(decision='supported', relation='self_account', period='at_message',
+                                  code='self_claim', needed=[], refs=[human_ids['new_handle']])
     assert matcher.validate(new_handle['pack'], wrong_claim)['links'][0]['decision'] == 'supported'
     pg.execute("UPDATE contact_social_accounts SET source='excel_ai_verified',reviewed_by_authorization_id=NULL "
                "WHERE contact_id=%s AND social_account_id=(SELECT id FROM social_accounts "
@@ -290,42 +288,10 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
     manual = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}), recheck=True)
     assert manual['reason'] == 'ready' and manual['pack']['handles'][0]['handle'] == 'first.handle'
     assert manual['stats']['manual_recheck'] and manual['stats']['recheck_handles'] == ['first.handle']
-    pg.execute("SAVEPOINT formal_counter")
-    for label, body in (
-        ('multiple_accounts', 'My main page is first.handle and my other page is backup_2. Both are mine.'),
-        ('rename_known', 'Changed my username from first.handle to backup_2'),
-        ('never_sold_item', 'I never sold this item on first.handle'),
-        ('different_page_denial', 'first.handle is my account and backup_2 is not my account'),
-        ('voucher_denial', 'first.handle voucher is not my code'),
-        ('no_transfer', 'I did not transfer the first.handle account'),
-    ):
-        message(label, 'ou_creator', body, 96)
-    unchanged = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))
-    assert unchanged['reason'] == 'already_confirmed' and unchanged['pack'] is None
     message('ownership_denial', 'ou_creator', 'first.handle is not my account', 97)
-    contradicted = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))
-    assert contradicted['reason'] == 'ready' and contradicted['stats']['recheck_handles'] == ['first.handle']
-    assert contradicted['pack']['handles'][0]['handle'] == 'first.handle'
-    message('ownership_clarified', 'ou_creator', 'My TikTok account is first.handle', 98)
-    clarified = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))
-    assert clarified['reason'] == 'already_confirmed' and clarified['pack'] is None
-    message('ownership_question_after_clear', 'ou_cm', 'Is your TikTok handle first.handle?', 99)
-    message('ownership_answer_after_clear', 'ou_creator', 'That is not mine', 100, 'ownership_question_after_clear')
-    parent_denial = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))
-    assert parent_denial['reason'] == 'ready' and parent_denial['stats']['recheck_handles'] == ['first.handle']
-    pg.execute("UPDATE chat_messages SET parent_id=NULL WHERE message_id='ownership_answer_after_clear'")
-    continuous_denial = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))
-    assert continuous_denial['reason'] == 'ready' and continuous_denial['stats']['recheck_handles'] == ['first.handle']
-    message('clear_before_staff_chain', 'ou_creator', 'My TikTok account is first.handle', 101)
-    assert matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))['reason'] == 'already_confirmed'
-    message('staff_chain_question', 'ou_cm', 'Is your TikTok handle first.handle?', 102)
-    message('staff_chain_supplement', 'ou_cm', 'I was checking the application', 102.1)
-    message('staff_chain_fault', 'ou_cm', 'That is my fault', 102.2)
-    message('staff_chain_no', 'ou_creator', 'No', 102.3)
-    denied_after_staff = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))
-    assert denied_after_staff['reason'] == 'ready'
-    assert denied_after_staff['stats']['recheck_handles'] == ['first.handle']
-    pg.execute("ROLLBACK TO SAVEPOINT formal_counter")
+    skipped = matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}))
+    assert skipped['reason'] == 'already_confirmed'  # No regex-based paid rechecks of formal pairs.
+    assert matcher.build(pg, pilot.settings, contact, frozenset({'first.handle'}), recheck=True)['reason'] == 'ready'
     pg.execute("ROLLBACK TO SAVEPOINT human_pairs")
     pg.execute("SAVEPOINT intro_counter")
     pilot.person("intro_peer")
@@ -335,7 +301,7 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
     peer_answer = next(m['id'] for m in peer_material['pack']['messages'] if m['text'] == answer['text'])
     peer_result = deepcopy(result)
     peer_result['links'][0]['refs'] = [peer_question, peer_answer]
-    assert matcher.validate(peer_material['pack'], peer_result)['links'][0]['validation_error'] == 'counterevidence'
+    assert matcher.validate(peer_material['pack'], peer_result) == peer_result  # Chat conflicts belong to AI.
     with monkeypatch.context() as limits:
         limits.setattr(matcher, 'MAX_CHARS', 55)
         omitted_peer = matcher.build(pg, pilot.settings, contact, catalog)
@@ -377,7 +343,8 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
         limits.setattr(matcher, "MAX_CHARS", 40)
         limited = matcher.build(pg, pilot.settings, contact, catalog)
     assert limited["stats"]["critical_evidence_omitted"]
-    assert limited["stats"]["critical_evidence_omitted_handles"] == ["first.handle"]
+    assert limited["stats"]["critical_evidence_omitted_handles"] == ["backup_2", "first.handle"]
+    assert limited["pack"]["coverage"]["omitted_handle_ids"] == [h["id"] for h in limited["pack"]["handles"]]
     pg.execute("SAVEPOINT omitted_rename")
     message("renamed", "ou_creator", "Changed my username from first.handle to backup_2", 73)
     with monkeypatch.context() as limits:
@@ -392,20 +359,14 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
         {"h": handle["id"], "decision": "supported", "relation": "self_account", "period": "at_message",
          "code": "self_claim", "refs": [real_ids["pair"]], "needed": []}
         for handle in updated_pack["handles"]]}
-    reviewed = matcher.validate(updated_pack, multi_result)
+    assert matcher.validate(updated_pack, multi_result) == multi_result  # No keyword-based transfer veto.
     by_handle = {handle["id"]: handle["handle"] for handle in updated_pack["handles"]}
-    outcomes = {by_handle[link["h"]]: link for link in reviewed["links"]}
-    assert outcomes["first.handle"]["decision"] == "review"
-    assert outcomes["first.handle"]["code"] == "conflict"
-    assert real_ids["transfer"] in outcomes["first.handle"]["refs"]
-    assert outcomes["backup_2"]["decision"] == "supported"
-    unrelated_later_claim = deepcopy(multi_result)
-    next(link for link in unrelated_later_claim["links"] if by_handle[link["h"]] == "first.handle")["refs"].append(
-        real_ids["backup"])
-    first_outcome = next(link for link in matcher.validate(updated_pack, unrelated_later_claim)["links"]
-                         if by_handle[link["h"]] == "first.handle")
-    assert real_ids["transfer"] in first_outcome["refs"]  # A later backup declaration cannot hide this transfer.
-    assert all(link["decision"] == "supported" for link in multi_result["links"])  # Validation does not mutate input.
+    model_review = deepcopy(multi_result)
+    next(link for link in model_review["links"] if by_handle[link["h"]] == "first.handle").update(
+        decision="review", relation="uncertain", period="historical", code="conflict",
+        refs=[real_ids["transfer"]], needed=["recent_state"])
+    assert matcher.validate(updated_pack, model_review) == model_review  # AI review is never promoted.
+    assert all(link["decision"] == "supported" for link in multi_result["links"])
     pg.execute("UPDATE chat_messages SET parent_id=NULL WHERE message_id='answer'")
     assert not matcher.still_valid(pg, material["refs"], pilot.settings)
     pg.execute("UPDATE chat_messages SET parent_id='question' WHERE message_id='answer'")
@@ -413,356 +374,94 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
     assert not matcher.still_valid(pg, material["refs"], pilot.settings)
     assert matcher.build(pg, pilot.settings, contact, catalog)["reason"] == "no_text"
     assert matcher.build(pg, pilot.settings, next(iter(matcher.RESTRICTED_CONTACTS)), catalog)["reason"] == "restricted"
-    # A known creator and Curva-named group are not account-ownership evidence.
+    # A title plus readable text is sent to AI; retrieval hints never decide ownership.
     pg.execute("UPDATE authorizations SET status='active' WHERE id=%s", (cm,))
     pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE chat_id=%s",
                (cipher.encrypt(json.dumps({"text": "Thanks for sending the sample"})), chat))
     group_only = matcher.build(pg, pilot.settings, contact, catalog)
-    assert group_only["reason"] == "no_account_evidence" and group_only["pack"] is None
+    assert group_only["reason"] == "ready" and group_only["pack"] is not None
     assert group_only["stats"]["readable_messages"] > 0
 
 
-def test_contact_matching_rejects_disconnected_and_third_party_claims():
-    pack = {"target": "U1", "creator_known": True, "handles": [
-        {"id": "H1", "handle": ".creator_1", "catalog_verified": True}],
-        "messages": [
-            {"id": "M1", "speaker": "U1", "chat": "G1", "at": "2026-10-01T01:00:00Z",
-             "reply": None, "text": "My friend's account is .creator_1"},
-            {"id": "M2", "speaker": "U1", "chat": "G2", "at": "2026-10-01T01:01:00Z",
-             "reply": None, "text": "That is my page"}],
-        "coverage": {"full_history": False, "missing_reply_ids": [], "excerpted_ids": []}}
-    result = {"creator": {"state": "known", "refs": []}, "links": [
+def test_model_language_judgment_preserved_with_structural_guards():
+    """Sarah's three reply chains: verify sources, not sentence meaning; no model API used."""
+    pack = {"target": "U1", "creator_known": True,
+            "handles": [{"id": "H1", "handle": "sarahdisneymum", "catalog_verified": True}],
+            "chats": [{"id": "G1", "mode": "group", "name": "MAC Creators"}],
+            "people": [{"id": "U1", "role": "external"}, {"id": "U2", "role": "staff"}],
+            "messages": [
+                {"id": "M1", "speaker": "U2", "chat": "G1", "at": "2026-01-22T10:00:00Z",
+                 "reply": None, "text": "May I know your id"},
+                {"id": "M2", "speaker": "U1", "chat": "G1", "at": "2026-01-22T10:00:23Z",
+                 "reply": "M1", "text": "Yes, it’s SarahDisneyMum :)"}],
+            "coverage": {"full_history": False, "missing_reply_ids": [], "excerpted_ids": []}}
+    supported = {"creator": {"state": "known", "refs": []}, "links": [
         {"h": "H1", "decision": "supported", "relation": "self_account", "period": "at_message",
-         "code": "self_claim", "refs": ["M1", "M2"], "needed": []}]}
-    assert matcher.validate(pack, result)["links"][0]["decision"] == "review"
-    pack["messages"][0]["text"] = "My account is not .creator_1"
-    assert matcher.validate(pack, result)["links"][0]["decision"] == "review"
-    pack["messages"][0]["text"] = "My account is .creator_1"
-    assert matcher.validate(pack, result) == result
-    # These three production-shaped cases are development regressions, not an independent accuracy set.
-    sabiha = deepcopy(pack)
-    sabiha['handles'][0]['handle'] = 'sabihaara'
-    sabiha['chats'] = [{'id': 'G1', 'mode': 'group', 'name': 'sabihaara & TT Media'}]
-    sabiha['messages'] = [
-        {'id': 'M5', 'speaker': 'U1', 'chat': 'G1', 'at': '2024-05-03T13:56:49Z', 'reply': None,
-         'text': 'My Handel is sabihaara'},
-        {'id': 'M6', 'speaker': 'U1', 'chat': 'G1', 'at': '2024-05-03T13:57:57Z', 'reply': None,
-         'text': 'I can share my TikTok here with you if you want'}]
-    sabiha_result = deepcopy(result)
-    sabiha_result['links'][0]['refs'] = ['M5', 'M6']
-    assert matcher.validate(sabiha, sabiha_result) == sabiha_result
-    for body in ('My Handel is sabiharaa', "My client's Handel is sabihaara", 'Our Handel is sabihaara'):
-        wrong = deepcopy(sabiha)
-        wrong['messages'][0]['text'] = body
-        assert matcher.validate(wrong, sabiha_result)['links'][0]['decision'] == 'review'
-    shared_typo = deepcopy(sabiha)
-    shared_typo['messages'].append({'id': 'M7', 'speaker': 'U1', 'chat': 'G1', 'at': '2024-05-03T14:00:00Z',
-                                    'reply': None, 'text': 'Our Handel is sabihaara'})
-    assert matcher.validate(shared_typo, sabiha_result)['links'][0]['validation_error'] == 'counterevidence'
+         "code": "qa_confirm", "refs": ["M1", "M2"], "needed": []}]}
+    for question, answer in (
+        ("May I know your id", "Yes, it’s SarahDisneyMum :)"),
+        ("Please drop your username below",
+         "I got my sample but not had a target collab. My name is SarahDisneyMum"),
+        ("Please comment: Affiliate Live | Your Username | The Dates & Times you plan to go live",
+         "Affiliate live, SarahDisneyMum, I’ll be live tonight from around 8pm")):
+        pack["messages"][0]["text"], pack["messages"][1]["text"] = question, answer
+        assert matcher.validate(pack, supported) == supported
 
-    robin = deepcopy(pack)
-    robin['handles'][0]['handle'] = 'robc825'
-    robin['chats'] = [{'id': 'G3', 'mode': 'group', 'name': '💙robc825(tiktokshopdeals_uk)& TT Media'}]
-    robin['messages'] = [
-        {'id': 'M35', 'speaker': 'U1', 'chat': 'G3', 'at': '2025-11-10T16:33:22Z', 'reply': None,
-         'text': 'Please can you check my sample requests on my main to promote across both accounts please'},
-        {'id': 'M36', 'speaker': 'U1', 'chat': 'G3', 'at': '2025-11-10T16:33:26.400Z', 'reply': None,
-         'text': 'Robc825'}]
-    robin_result = deepcopy(result)
-    robin_result['links'][0]['refs'] = ['M35', 'M36']
-    assert matcher.validate(robin, robin_result) == robin_result
-    backup = deepcopy(robin)
-    backup['messages'][0]['text'] = 'My backup account is robc825; robc825 is not my main account'
-    backup_result = deepcopy(robin_result)
-    backup_result['links'][0]['refs'] = ['M35']
-    assert matcher.validate(backup, backup_result) == backup_result  # Account role is not ownership denial.
-    punctuated = deepcopy(robin)
-    punctuated['messages'][1]['text'] = '@Robc825.'
-    assert matcher.validate(punctuated, robin_result) == robin_result
-    for body in ('Thanks for checking the samples', 'Please check our main account for samples',
-                 "Please check my client's main account for samples", 'My main product needs a TikTok sample'):
-        wrong = deepcopy(robin)
-        wrong['messages'][0]['text'] = body
-        assert matcher.validate(wrong, robin_result)['links'][0]['decision'] == 'review'
-    wrong = deepcopy(robin)
-    wrong['chats'][0]['name'] = 'other_creator & TT Media'
-    assert matcher.validate(wrong, robin_result)['links'][0]['decision'] == 'review'
-    wrong['chats'][0]['name'] = 'Team robc825 TikTok campaign with TT Media'
-    assert matcher.validate(wrong, robin_result)['links'][0]['decision'] == 'review'
-    wrong['chats'][0]['name'] = robin['chats'][0]['name']
-    wrong['confirmed_handles'] = ['other_creator']
-    wrong['messages'][0]['text'] = 'Please check my main account other_creator for samples'
-    assert matcher.validate(wrong, robin_result)['links'][0]['decision'] == 'review'
-    wrong['messages'][0]['text'] = robin['messages'][0]['text']
-    wrong['messages'][1]['text'] = 'Robc825 and other_creator'
-    assert matcher.validate(wrong, robin_result)['links'][0]['decision'] == 'review'
-    wrong = deepcopy(robin)
-    wrong['messages'][0]['text'] = 'My main is outside_curva_99; I promote across both accounts'
-    assert matcher.validate(wrong, robin_result)['links'][0]['decision'] == 'review'
-    wrong = deepcopy(robin)
-    wrong['messages'][1]['text'] = 'Please check the sample for Robc825'
-    assert matcher.validate(wrong, robin_result)['links'][0]['decision'] == 'review'
-    wrong = deepcopy(robin)
-    wrong['messages'][1]['at'] = '2025-11-10T16:39:22Z'
-    assert matcher.validate(wrong, robin_result)['links'][0]['decision'] == 'review'
-    wrong['messages'][1]['at'] = '2025-11-10T16:33:20Z'
-    assert matcher.validate(wrong, robin_result)['links'][0]['decision'] == 'review'
-
-    carla = deepcopy(pack)
-    carla['handles'][0]['handle'] = 'shop.with.carla'
-    carla['people'] = [{'id': 'U1', 'role': 'external'}, {'id': 'U2', 'role': 'staff'}]
-    carla['chats'] = [{'id': 'G1', 'mode': 'p2p', 'name': 'Carla and Nero'}]
-    carla['messages'] = [
-        {'id': label, 'speaker': speaker, 'chat': 'G1', 'at': '2025-07-23T' + at + 'Z',
-         'previous': previous, 'reply': reply, 'text': body}
-        for label, speaker, at, previous, reply, body in (
-            ('M12', 'U1', '10:52:40', None, None, "I don't get how it works"),
-            ('M13', 'U2', '10:52:47', 'M12', None, "I applied for u, but tiktok official can't find ur uid"),
-            ('M14', 'U2', '10:53:08', 'M13', None, 'I was appealing...'),
-            ('M15', 'U2', '10:53:36', 'M14', 'M12', 'That is my fault'),
-            ('M16', 'U1', '10:53:46', 'M15', None, 'It’s shop.with.Carla'),
-            ('M20', 'U1', '10:55:27', None, None, 'I did change it on the group message but I should of said'),
-        )]
-    carla_result = deepcopy(result)
-    carla_result['links'][0].update(code='qa_confirm', refs=['M13', 'M16'])
-    assert matcher.validate(carla, carla_result) == carla_result
-    for change in ('group', 'missing_chain', 'excerpted_chain', 'new_account_question',
-                   'account_reply', 'sample_context'):
-        wrong = deepcopy(carla)
-        if change == 'group':
-            wrong['chats'][0]['mode'] = 'group'
-        elif change == 'missing_chain':
-            wrong['messages'] = [m for m in wrong['messages'] if m['id'] != 'M14']
-        elif change == 'excerpted_chain':
-            wrong['coverage']['excerpted_ids'] = ['M14']
-        elif change == 'new_account_question':
-            next(m for m in wrong['messages'] if m['id'] == 'M14')['text'] = 'Is your TikTok handle other_creator?'
-        elif change == 'account_reply':
-            wrong['messages'].append({'id': 'M11', 'speaker': 'U2', 'chat': 'G1', 'at': '2025-07-23T10:50:00Z',
-                                      'reply': None, 'text': 'Is your TikTok handle other_creator?'})
-            next(m for m in wrong['messages'] if m['id'] == 'M14')['reply'] = 'M11'
-        else:
-            next(m for m in wrong['messages'] if m['id'] == 'M13')['text'] = "TikTok can't find ur sample request"
-        assert matcher.validate(wrong, carla_result)['links'][0]['decision'] == 'review'
-    missing_question = deepcopy(carla_result)
-    missing_question['links'][0]['refs'] = ['M16']
-    assert matcher.validate(carla, missing_question)['links'][0]['decision'] == 'review'
-    model_review = deepcopy(carla_result)
-    model_review['links'][0].update(decision='review', relation='uncertain', period='unknown',
-                                   code='no_link_evidence', needed=['account_context'])
-    assert matcher.validate(carla, model_review) == model_review  # Local context cannot promote model review.
-    # Fixed cooperation titles are strong binding evidence; a repeated self-introduction is not required.
-    jessica = deepcopy(pack)
-    jessica['handles'][0]['handle'] = 'jessyrice94'
-    jessica['people'] = [{'id': 'U1', 'role': 'external'}, {'id': 'U2', 'role': 'staff'}]
-    jessica['chats'] = [{'id': 'G3', 'mode': 'group', 'name': '❤️ jessyrice94 X TT Media'}]
-    jessica['messages'] = [
-        {'id': 'M1', 'speaker': 'U1', 'chat': 'G3', 'at': '2026-03-28T06:58:49Z', 'reply': None,
-         'text': 'Hi girls I have just had a notification that my account was accessed in US'},
-        {'id': 'M23', 'speaker': 'U2', 'chat': 'G3', 'at': '2026-05-01T15:41:46Z', 'reply': None,
-         'text': 'May I have the ad code for this video? https://www.tiktok.com/@jessyrice94/video/7627582071690513686'},
-        {'id': 'M24', 'speaker': 'U1', 'chat': 'G3', 'at': '2026-05-01T15:44:44Z', 'reply': 'M23',
-         'text': '#syntheticAuthorizationCodeOnly123456 💕'}]
-    group_result = deepcopy(result)
-    group_result['links'][0].update(code='group_context', refs=['M1', 'M23', 'M24'])
-    assert matcher.validate(jessica, group_result) == group_result
-    mislabeled = deepcopy(group_result)
-    mislabeled['links'][0]['code'] = 'self_claim'
-    assert matcher.validate(jessica, mislabeled)['links'][0]['decision'] == 'review'
-    mislabeled['links'][0].update(code='group_context', relation='operator')
-    assert matcher.validate(jessica, mislabeled)['links'][0]['decision'] == 'review'
-    implicit = deepcopy(group_result)
-    implicit['links'][0]['refs'] = ['M1']
-    assert matcher.validate(jessica, implicit) == implicit  # The exact handle can come from the title.
-    incomplete = deepcopy(group_result)
-    incomplete['links'][0]['refs'] = ['M23', 'M24']
-    assert matcher.validate(jessica, incomplete)['links'][0]['decision'] == 'review'
-    assert matcher._support_groups(jessica, jessica['handles'][0], [])[0] == []
-    for body in ('Thank you 💕', '#syntheticAuthorizationCodeOnly123456',
-                 'I have a second account', "My account is outside_curva_99", 'My TikTok is outside_curva_99',
-                 'I posted a video on the TikTok account outside_curva_99', 'My bank account was accessed',
-                 "I'm her assistant and my account was accessed", 'Our team account was accessed',
-                 'I have not posted the videos', 'She posted the videos'):
-        wrong = deepcopy(jessica)
-        wrong['messages'][0]['text'] = body
-        assert matcher.validate(wrong, group_result)['links'][0]['decision'] == 'review'
-    creative = deepcopy(jessica)
-    for body in ('I posted the three videos for the collaboration', 'I tried to post a video on a sample I have',
-                 'Now all my shop links are gone', 'My commission rate with Merach is considerably higher'):
-        creative['messages'][0]['text'] = body
-        assert matcher.validate(creative, implicit) == implicit
-    for title in ('other_creator X TT Media', 'Team jessyrice94 X TT Media',
-                  'other_creator(jessyrice94) X TT Media', 'jessyrice94 X Unknown Agency', 'jessyrice94。cm1'):
-        wrong = deepcopy(jessica)
-        wrong['chats'][0]['name'] = title
-        assert matcher.validate(wrong, group_result)['links'][0]['decision'] == 'review'
-    wrong = deepcopy(jessica)
-    wrong['creator_known'] = False
-    assert matcher.validate(wrong, group_result)['links'][0]['decision'] == 'review'
-    wrong = deepcopy(jessica)
-    wrong['messages'][0]['chat'] = 'G1'
-    assert matcher.validate(wrong, group_result)['links'][0]['decision'] == 'review'
-    wrong = deepcopy(jessica)
-    wrong['coverage']['excerpted_ids'] = ['M1']
-    assert matcher.validate(wrong, group_result)['links'][0]['decision'] == 'review'
-    uncertain = deepcopy(group_result)
-    uncertain['links'][0].update(decision='review', relation='uncertain', period='unknown',
-                                code='no_link_evidence', needed=['account_context'])
-    assert matcher.validate(jessica, uncertain) == uncertain
-    for body, speaker in (('This is not my TikTok account', 'U1'), ('Our team account is shared', 'U1'),
-                          ("I am her assistant", 'U1'), ('I changed my username yesterday', 'U1'),
-                          ('My account was accessed in US too', 'U3')):
-        conflict = deepcopy(jessica)
-        conflict['messages'].append({'id': 'M25', 'speaker': speaker, 'chat': 'G3',
-                                     'at': '2026-05-02T15:44:44Z', 'reply': None, 'text': body})
-        assert matcher.validate(conflict, group_result)['links'][0]['validation_error'] == 'counterevidence'
-    unrelated = deepcopy(jessica)
-    unrelated['messages'].append({'id': 'M25', 'speaker': 'U1', 'chat': 'G3', 'at': '2026-05-02T15:44:44Z',
-                                  'reply': None, 'text': 'Not yet, I have not received the sample'})
-    assert matcher.validate(unrelated, group_result) == group_result
-    for body in ('My account is fine; this sample is not mine',
-                 'My account is fine. The product in the photo is not mine', 'This is not my main account'):
-        unrelated['messages'][-1]['text'] = body
-        assert matcher.validate(unrelated, group_result) == group_result
-    counter = deepcopy(carla)
-    counter['messages'].insert(0, {'id': 'M10', 'speaker': 'U1', 'chat': 'G1', 'at': '2025-07-23T10:40:00Z',
-                                   'previous': None, 'reply': None, 'text': 'My TikTok account is shop.with.carla'})
-    next(m for m in counter['messages'] if m['id'] == 'M13')['text'] = 'Is your TikTok handle shop.with.carla?'
-    previous_claim = deepcopy(carla_result)
-    previous_claim['links'][0].update(code='self_claim', refs=['M10'])
-    for denial in ('No', 'That is not mine'):
-        next(m for m in counter['messages'] if m['id'] == 'M16')['text'] = denial
-        assert matcher.validate(counter, previous_claim)['links'][0]['validation_error'] == 'counterevidence'
-
-    natural = deepcopy(pack)
-    natural['messages'] = [
-        {"id": "M1", "speaker": "U1", "chat": "G1", "at": "2026-10-01T01:00:00Z", "reply": None,
-         "text": "I'm Daisy from .creator_1 on tik tok :)"},
-        {"id": "M2", "speaker": "U1", "chat": "G1", "at": "2026-10-01T01:01:00Z", "reply": None,
-         "text": "I posted the three videos for the collaboration, I'm not stopping there"}]
-    natural_result = deepcopy(result)
-    natural_result['links'][0]['refs'] = ['M1']
-    assert matcher.validate(natural, natural_result) == natural_result
-    assert matcher._support_groups(natural, natural['handles'][0])[0] == [{'kind': 'self_claim', 'refs': ['M1']}]
-    natural['messages'][1]['text'] = 'I have not posted the three videos'
-    assert matcher.validate(natural, natural_result)['links'][0]['decision'] == 'review'
-    natural['messages'][1]['text'] = 'I didn’t get around to posting a video'
-    assert matcher.validate(natural, natural_result)['links'][0]['decision'] == 'review'
-    natural['messages'][1]['text'] = "I posted the three videos for the collaboration, I'm not stopping there"
-    natural['creator_known'] = False
-    assert matcher.validate(natural, natural_result)['links'][0]['decision'] == 'review'
-    natural['creator_known'] = True
-    natural['messages'][1]['speaker'] = 'U2'
-    assert matcher.validate(natural, natural_result)['links'][0]['decision'] == 'review'  # Staff's activity is not本人.
-    natural['messages'][1]['speaker'] = 'U1'
-    for intro in ("I'm .creator_1", "I'm Daisy from .creator_1 on tik tok as their assistant",
-                  "I'm a representative from .creator_1 on TikTok", "I'm Daisy from .creator_1 on TikTok for my client",
-                  "I'm Daisy from .creator_1 on TikTok, but not my account"):
-        natural['messages'][0]['text'] = intro
-        assert matcher.validate(natural, natural_result)['links'][0]['decision'] == 'review'
-    natural['messages'][0]['text'] = "I'm Daisy from .creator_1 on tik tok :)"
-    natural['messages'].append({"id": "M3", "speaker": "unknown", "chat": "G1",
-                                "at": "2026-10-01T01:02:00Z", "reply": None,
-                                "text": "I'm another person from .creator_1 on TikTok"})
-    assert matcher.validate(natural, natural_result)['links'][0]['validation_error'] == 'counterevidence'
-    pack["messages"].append({"id": "M3", "speaker": "unknown", "chat": "G1",
-                             "at": "2026-10-01T01:02:00Z", "reply": None,
-                             "text": "My account is .creator_1"})
-    assert matcher.validate(pack, result)["links"][0]["decision"] == "review"
-    pack["messages"].pop()
-    # Regression evidence used to develop the rules, not an independent accuracy test.
-    pack["chats"] = [{"id": "G1", "mode": "p2p", "name": "untrusted title"}]
-    pack["people"] = [{"id": "U1", "role": "external"}, {"id": "U2", "role": "staff"}]
-    pack["messages"] = [
-        {"id": "M1", "speaker": "U1", "chat": "G1", "at": "2026-10-01T01:00:00Z", "reply": None,
-         "text": "I joined after this time but mine is .creator_1"},
-        {"id": "M2", "speaker": "U2", "chat": "G1", "at": "2026-10-01T01:01:00Z", "reply": None,
-         "text": "Award list: .creator_1, someone_else. Have the invites gone out?"},
-        {"id": "M3", "speaker": "U1", "chat": "G1", "at": "2026-10-01T01:02:00Z", "reply": "M2",
-         "text": "Not yet xx"},
-        {"id": "M4", "speaker": "U1", "chat": "G1", "at": "2026-10-01T01:03:00Z", "reply": "M2",
-         "text": "Not sure which ones I want lol so much choice! Anyone had a message yet?"},
-        {"id": "M5", "speaker": "U1", "chat": "G1", "at": "2026-10-01T01:04:00Z", "reply": None,
-         "text": "I have unlinked the agency for .creator_1"},
-    ]
-    result["links"][0]["refs"] = ["M1"]
-    assert matcher.validate(pack, result) == result  # Awards and agency membership do not contradict ownership.
-    pack["messages"][1]["text"] = "Is your TikTok handle .creator_1?"
-    pack["messages"][2].update(text="No", reply=None, previous="M2")
-    assert matcher.validate(pack, result)["links"][0]["validation_error"] == "counterevidence"
-    pack["chats"][0]["mode"] = "group"
-    assert matcher.validate(pack, result) == result  # No reply in a group cannot target this ownership question.
-    pack["messages"][2]["reply"] = "M2"
-    assert matcher.validate(pack, result)["links"][0]["validation_error"] == "counterevidence"
-    pack["messages"] = pack["messages"][:2]
-    pack["messages"][0].update(text="Our account is .creator_1", reply=None)
-    assert matcher.validate(pack, result)["links"][0]["decision"] == "review"
-    pack["messages"][0]["text"] = "I make the videos and livestream on our account .creator_1"
-    shared = deepcopy(result)
-    shared["links"][0].update(relation="account_creator", code="own_content")
-    assert matcher.validate(pack, shared) == shared  # Shared creation is not an owner write.
-    pack["messages"][0]["text"] = "My user name is .creator_1 thank you. X"
-    pack["coverage"]["missing_reply_ids"] = ["M1"]
-    assert matcher.validate(pack, result) == result  # Missing unrelated parent does not erase explicit self-claim.
-    pack["coverage"]["missing_reply_ids"] = []
-    pack["messages"][0].update(text="Please drop your username below if you did NOT receive a sample", speaker="U2")
-    pack["messages"][1].update(text=".creator_1", speaker="U1", reply="M1")
-    qa = deepcopy(result)
-    qa["links"][0].update(code="qa_confirm", refs=["M1", "M2"])
-    # A negative sample condition before the actual username request is unrelated.
-    for request in ("Creators who did NOT receive samples please drop your username below",
-                    "Please drop your username below if you did NOT receive a sample",
-                    "Can I have your tiktok handle please?", "Could I get your TT username please?"):
-        pack["messages"][0]["text"] = request
-        assert matcher.validate(pack, qa) == qa
-    pack["chats"][0]["mode"] = "p2p"
-    pack["messages"][1].update(reply=None, previous="M1")
-    assert matcher.validate(pack, qa) == qa
-    pack["messages"][1]["at"] = "2026-10-01T01:35:00Z"
-    assert matcher.validate(pack, qa)["links"][0]["decision"] == "review"
-    pack["messages"][1].update(at="2026-10-01T01:01:00Z", reply="M1")
-    for request in ("Do NOT send your username", "Is this NOT your handle .creator_1?",
-                    "Please tell me your friend's username", "Did your TikTok handle .creator_1 receive samples?"):
-        pack["messages"][0]["text"] = request
-        assert matcher.validate(pack, qa)["links"][0]["decision"] == "review"
-    pack["messages"][0]["text"] = "Can I have your TikTok handle please?"
-    for answer in ("Our account is .creator_1", "Our team account is .creator_1",
-                   "The shared account is .creator_1", "The company account is .creator_1",
-                   "Our TikTok is .creator_1", "Our team's account is .creator_1"):
-        pack["messages"][1]["text"] = answer
-        assert matcher.validate(pack, qa)["links"][0]["decision"] == "review"
-        assert matcher._support_groups(pack, pack["handles"][0])[0] == []
-    pack["messages"][1]["text"] = "My account .creator_1 is shared"
-    self_claim = deepcopy(qa)
+    # Ownership, negation, proxy roles and competing text claims are model judgments.
+    self_claim = deepcopy(supported)
     self_claim["links"][0].update(code="self_claim", refs=["M2"])
-    assert matcher.validate(pack, self_claim)["links"][0]["decision"] == "review"
-    pack["messages"][1]["text"] = "Thanks team, my account is .creator_1"
-    assert matcher.validate(pack, self_claim) == self_claim  # The word team alone is not shared ownership.
-    shared_history = deepcopy(pack)
-    shared_history["handles"].append({"id": "H2", "handle": "another_creator", "catalog_verified": True})
-    shared_history["messages"].extend([
-        {"id": "M3", "speaker": "U1", "chat": "G1", "at": "2026-10-01T01:02:00Z", "reply": None,
-         "text": "Our team account is .creator_1"},
-        {"id": "M4", "speaker": "U1", "chat": "G1", "at": "2026-10-01T01:03:00Z", "reply": None,
-         "text": "My account is another_creator"}])
-    shared_result = deepcopy(self_claim)
-    shared_result["links"].append({**self_claim["links"][0], "h": "H2", "refs": ["M4"]})
-    for statement in ("Our team account is .creator_1", "Our TikTok is .creator_1", "Our team's account is .creator_1"):
-        shared_history["messages"][2]["text"] = statement
-        outcomes = matcher.validate(shared_history, shared_result)["links"]
-        assert outcomes[0]["validation_error"] == "counterevidence" and "M3" in outcomes[0]["refs"]
-        assert outcomes[1]["decision"] == "supported"  # Shared ownership does not spread to a different account.
-    for statement in ("I shared the .creator_1 account link with you", "My account link is shared: .creator_1"):
-        shared_history["messages"][2]["text"] = statement
-        assert matcher.validate(shared_history, shared_result)["links"][0]["decision"] == "supported"
-    contradictory = deepcopy(result)
-    contradictory["links"][0].update(decision="review", relation="uncertain", period="unknown",
-                                    code="out_of_catalog", refs=[], needed=[])
-    normalized = matcher.validate(pack, contradictory)["links"][0]
-    assert normalized["decision"] == "review" and normalized["code"] == "no_link_evidence"
-    assert normalized["needed"] == ["account_context"]
-    pack["handles"][0]["catalog_verified"] = False
-    assert matcher.validate(pack, result)["links"][0]["code"] == "out_of_catalog"
+    pack["messages"][1]["text"] = "My friend's account is sarahdisneymum"
+    assert matcher.validate(pack, self_claim) == self_claim
+    review = deepcopy(self_claim)
+    review["links"][0].update(decision="review", relation="other_person", period="unknown",
+                              code="third_party", needed=["account_context"])
+    assert matcher.validate(pack, review) == review
+    pack["messages"].append({"id": "M3", "speaker": "U1", "chat": "G1",
+                             "at": "2026-01-22T10:01:00Z", "reply": None,
+                             "text": "I transferred the sarahdisneymum account"})
+    assert matcher.validate(pack, supported) == supported  # No second regex-based verdict.
+
+    for change, error in (("refs", "references"), ("speaker", "unsupported_evidence"),
+                          ("handle", "unsupported_evidence"), ("excerpt", "excerpted_support"),
+                          ("parent", "reply_relation"), ("chat", "reply_relation"),
+                          ("time", "reply_relation")):
+        invalid, value = deepcopy(pack), deepcopy(supported)
+        if change == "refs":
+            value["links"][0]["refs"] = ["M1", "nonexistent"]
+        elif change == "speaker":
+            invalid["messages"][1]["speaker"] = "U2"
+        elif change == "handle":
+            invalid["messages"][1]["text"] = "sarahdisneymumm"
+        elif change == "excerpt":
+            invalid["coverage"]["excerpted_ids"] = ["M2"]
+        elif change == "parent":
+            invalid["messages"][1]["reply"] = "M3"
+        elif change == "chat":
+            invalid["messages"][1]["chat"] = "G2"
+        else:
+            invalid["messages"][1]["at"] = "2026-01-22T09:59:00Z"
+        assert matcher.validate(invalid, value)["links"][0]["validation_error"] == error
+
+    private = deepcopy(pack)
+    private["chats"][0]["mode"] = "p2p"
+    private["messages"] = private["messages"][:2]
+    private["messages"][1].update(reply=None, previous="M1", at="2026-01-22T11:00:00Z")
+    assert matcher.validate(private, supported) == supported  # No five-minute semantic expiry.
+    private["messages"][1]["previous"] = None
+    assert matcher.validate(private, supported)["links"][0]["validation_error"] == "reply_relation"
+
+    # The exact title is factual. Personal business meaning remains AI's decision.
+    group = deepcopy(pack)
+    group["chats"][0]["name"] = "sarahdisneymum X TT Media"
+    group["messages"][1]["text"] = "I have just checked my creator account"
+    grouped = deepcopy(supported)
+    grouped["links"][0].update(code="group_context", refs=["M2"])
+    assert matcher.validate(group, grouped) == grouped
+    group["chats"][0]["name"] = "different_creator X TT Media"
+    assert matcher.validate(group, grouped)["links"][0]["validation_error"] == "unsupported_evidence"
+    group["chats"][0]["name"] = "sarahdisneymum X TT Media"
+    group["handles"][0]["catalog_verified"] = False
+    assert matcher.validate(group, grouped)["links"][0]["validation_error"] == "out_of_catalog"
     assert matcher._tokens("@.Creator_1. / .creator_1 / .creator_10", frozenset({".creator_1"})) == {".creator_1"}
     assert not matcher._tokens("a" * 65, frozenset({"a" * 64, "a"}))
     assert matcher._plain(json.dumps({"content": [[{"tag": "img", "image_key": "hidden-pixels"}]]}),

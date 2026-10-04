@@ -843,7 +843,6 @@ def page_data(conn, actor, settings, page=1):
             and evidence.still_valid(conn, job["refs"], settings)
         ):
             view = json.loads(storage.decrypt(job["result_ciphertext"]))
-            pack = json.loads(storage.decrypt(job["pack_ciphertext"]))
             job["suggestions"] = [
                 {
                     **link,
@@ -872,9 +871,7 @@ def page_data(conn, actor, settings, page=1):
                     ).fetchone()
                 ):
                     link.update(decision="review", relation="uncertain", code="conflict")
-                candidate = next(h for h in pack["handles"] if h["handle"] == link["handle"])
-                _, claims = evidence._support_groups(pack, candidate)
-                link["conflict"] = actual_conflict or bool(evidence._counterevidence(pack, link["handle"], claims))
+                link["conflict"] = actual_conflict
         rows = {item["handle"]: {**item, "associated": True, "check": None, "conflict": False}
                 for item in job["associations"]}
         for link in job["suggestions"]:

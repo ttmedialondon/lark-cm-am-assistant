@@ -17,7 +17,7 @@ from . import handle_evidence as handles
 from .crypto import message_body_cipher
 from .openai_client import ModelOutputError
 
-PROMPT_VERSION = "creator-handle-research-v1.9"
+PROMPT_VERSION = "creator-handle-research-v1.10"
 MAX_MESSAGES, MAX_CHARS, MAX_HANDLES, SEARCH_LIMIT = 48, 20_000, 12, 20_000
 # A research hold is an explicit access restriction, not a negative identity finding.
 RESTRICTED_CONTACTS = frozenset({"6abf6bf9-12dc-4a22-9654-2010aa4c7785"})
@@ -42,9 +42,10 @@ _QUESTION = re.compile(r"\b(?:tiktok|tt|handles?|handels?|user\s*names?|accounts
 _THIRD_PARTY = re.compile(r"\b(?:friend|client|referred|manage|operate|approve|approval)\b|朋友|转发|审批|代运营", re.I)
 _DENIAL = re.compile(r"\b(?:no|not|isn't|isn’t|incorrect|wrong)\b|不是|不对", re.I)
 _COURTESY = re.compile(r"\bno\s+(?:worries|problem)\b", re.I)
+# Retired semantic error codes remain readable for historical diagnostics, never generated anew.
 VALIDATION_ERRORS = frozenset({
     "references", "needed", "unsupported_evidence", "supported_relation", "excerpted_support",
-    "owner_code", "unconnected_owner_evidence", "counterevidence", "out_of_catalog",
+    "owner_code", "unconnected_owner_evidence", "counterevidence", "out_of_catalog", "reply_relation",
 })
 _TRANSFER = re.compile(
     r"\b(?:transfer\w*|sold|deleted|banned|suspended)\b.*\b(?:account|page)\b|"
@@ -118,7 +119,7 @@ def output_format(pack=None):
         creator["state"]["enum"] = ["known"] if pack["creator_known"] else ["supported", "review", "not_supported"]
         if pack["creator_known"]:
             creator["refs"]["maxItems"] = 0
-    return {"type": "json_schema", "name": "creator_handle_v1_9", "strict": True, "schema": schema}
+    return {"type": "json_schema", "name": "creator_handle_v1_10", "strict": True, "schema": schema}
 
 
 def _denied(value):
@@ -361,16 +362,7 @@ def build(conn, settings, contact_id, catalog, *, recheck=False):
     recalled = bool(scores)
     existing = sorted(confirmed & scores.keys())
     conflicts = creator_imports._conflicts(conn, [(None, contact_id, h) for h in existing])
-    last_claim = {h: max((i["row"]["message_create_time"] for i in own
-                         if i["row"]["message_create_time"] and (_self_claim(i["text"], h, allow_intro=True)
-                            or known and _group_handle(chats_by_id[i["row"]["chat_id"]]) == h
-                            and _personal_context(i["text"], h, confirmed | scores.keys()))),
-                        default=None) for h in existing}
-    rechecks = {h for h, conflict in zip(existing, conflicts, strict=True) if recheck or conflict or any(
-        (_negative(item["text"], h, by_key.get(parent_key(item), {}).get("text"))
-         or _group_warning(chats_by_id[item["row"]["chat_id"]], item["text"], h, confirmed | scores.keys())) and (
-            last_claim[h] is None or item["row"]["message_create_time"] is None
-            or item["row"]["message_create_time"] >= last_claim[h]) for item in own)}
+    rechecks = {h for h, conflict in zip(existing, conflicts, strict=True) if recheck or conflict}
     empty["stats"]["recheck_handles"] = sorted(rechecks)
     scores = Counter({h: score for h, score in scores.items() if h not in confirmed or h in rechecks})
     candidates = sorted(scores, key=lambda h: (-scores[h], h))[:MAX_HANDLES]
@@ -485,39 +477,14 @@ def build(conn, settings, contact_id, catalog, *, recheck=False):
                                       if i["row"].get("parent_id") and
                                       (i["row"]["chat_id"], i["row"]["parent_id"]) not in labels],
                 "excerpted_ids": []}}
-    # Generic history/candidate limits are not account-specific counterevidence.
-    omitted_handles = sorted({h for h in candidates for item in by_key.values()
-        if _key(item["row"]) not in seen and (
-            item["row"]["sender_open_id"] in open_ids and _negative(item["text"], h,
-                by_key.get(parent_key(item), {}).get("text"))
-            or item["row"]["sender_open_id"] in open_ids
-               and _group_warning(chats_by_id[item["row"]["chat_id"]], item["text"], h, confirmed | candidate_set)
-            or item["row"]["sender_open_id"] in open_ids and any(
-                _mentions(part, h) and _ACCOUNT_HISTORY.search(part) for part in _parts(item["text"]))
-            or item["row"]["sender_open_id"] not in open_ids
-               and speaker_types.get(item["row"]["sender_open_id"], {}).get("tenant_classification") != "internal"
-               and speaker_types.get(item["row"]["sender_open_id"], {}).get("identity_type", "user") == "user"
-               and (_self_claim(item["text"], h, allow_intro=True)
-                    or known and _group_handle(chats_by_id[item["row"]["chat_id"]]) == h
-                    and _personal_context(item["text"], h, confirmed | candidate_set)))})
-    # A dropped half of another person's main-account claim is also account-specific missing counterevidence.
-    other_messages = {}
-    for item in by_key.values():
-        row = item["row"]
-        identity = speaker_types.get(row["sender_open_id"], {})
-        if (row["sender_open_id"] not in open_ids and identity.get("tenant_classification") != "internal"
-                and identity.get("identity_type", "user") == "user"):
-            other_messages.setdefault((row["chat_id"], row["sender_open_id"]), []).append({
-                "id": _key(row), "speaker": row["sender_open_id"], "chat": row["chat_id"],
-                "at": str(row["message_create_time"]), "text": item["text"]})
-    main_context = {"creator_known": known, "chats": [
-        {"id": c["chat_id"], "name": c["name"] or "", "mode": c["chat_mode"]} for c in chats]}
-    for h in candidates:
-        if any(_main_pair(main_context, claim, account, h) and (claim["id"] not in seen or account["id"] not in seen)
-               for group in other_messages.values() for claim in group if _main_claim(main_context, claim, h)
-               for account in group):
-            omitted_handles.append(h)
-    omitted_handles = sorted(set(omitted_handles))
+    # Coverage is a source/budget fact, not a keyword-based ownership verdict.
+    # Track dropped core bundles and external account references in selected context.
+    dropped = [item for bundle in bundles if any(_key(i["row"]) not in seen for i in bundle) for item in bundle]
+    dropped.extend(item for item in extras.values() if _key(item["row"]) not in seen
+                   and item["row"]["sender_open_id"] not in open_ids
+                   and speaker_types.get(item["row"]["sender_open_id"], {}).get("tenant_classification") != "internal")
+    omitted_handles = sorted({h for item in dropped for h in item["handles"] & candidate_set})
+    pack["coverage"]["omitted_handle_ids"] = [h["id"] for h in pack["handles"] if h["handle"] in omitted_handles]
     stats = {**empty["stats"], "messages": len(messages), "body_chars": chars, "readable_messages": len(own),
              "history_truncated": truncated, "candidates_omitted": max(0, len(scores) - len(candidates)),
              "critical_evidence_omitted": bool(omitted_handles),
@@ -527,8 +494,9 @@ def build(conn, settings, contact_id, catalog, *, recheck=False):
         support, _ = _support_groups(pack, candidate)
         if support:
             pack["evidence_hints"].append({"h": candidate["id"], "groups": support[:3]})
-    # An exact cooperation title plus first-person business context needs no repeated handle.
-    if not pack["evidence_hints"] and not any(_mentions(m["text"], h) for m in messages for h in candidates):
+    # Let the model assess title + conversation context even without a recognized self-introduction.
+    if not any(_mentions(m["text"], h) for m in messages for h in candidates) and not any(
+            _tokens(c["name"], candidate_set) for c in pack["chats"]):
         return {**empty, "reason": "no_account_evidence", "stats": stats}
     # Cache semantic input only. Fresh grant/body references remain mandatory before use.
     return {"pack": pack, "refs": refs, "fingerprint": access._hash([PROMPT_VERSION, pack]),
@@ -721,7 +689,7 @@ def _main_pair(pack, claim, account, handle):
 
 
 def _support_groups(pack, candidate, refs=None):
-    """Locate rule-matching references, not semantic truth; validation supplies actual model refs."""
+    """Retrieval hints only; never used to veto or promote model conclusions."""
     messages = {m["id"]: m for m in pack["messages"]}
     allowed = messages.keys() if refs is None else set(refs)
     allowed = set(allowed) - set(pack["coverage"]["excerpted_ids"])
@@ -773,7 +741,7 @@ def _support_groups(pack, candidate, refs=None):
 
 
 def validate(pack, result):
-    """Validate protocol and minimum connected evidence; model semantics still require review."""
+    """Validate source facts and protocol, never reinterpret the model's language judgment."""
     result = deepcopy(result)
     # Cached, locally downgraded items carry only a safe diagnostic code, never model prose.
     diagnostics = {}
@@ -836,20 +804,12 @@ def validate(pack, result):
         if link["code"] not in {"self_claim", "qa_confirm", "own_page", "group_context"}:
             _review(link, "owner_code", messages)
             continue
-        support, claims = _support_groups(pack, candidate, link["refs"])
-        required_kind = {"qa_confirm": "qa", "group_context": "group_context"}.get(link["code"])
-        if (not support or required_kind and not any(g["kind"] == required_kind for g in support)
-                or link["code"] != "group_context" and not any(g["kind"] != "group_context" for g in support)):
-            _review(link, "unconnected_owner_evidence", messages)
-            continue
-        counter_refs = _counterevidence(pack, candidate["handle"], claims)
-        if counter_refs and link["period"] != "historical":
-            # A model cannot select only a positive quote and ignore a later provided denial.
-            own_counter = any(messages[ref]["speaker"] == pack["target"] for ref in counter_refs)
-            link.update(decision="review", relation="uncertain", period="historical" if own_counter else "unknown",
-                        code="conflict", refs=list(dict.fromkeys([*counter_refs, *link["refs"]]))[:6],
-                        needed=["recent_state" if own_counter else "other_claimants"],
-                        validation_error="counterevidence")
+        if link["code"] == "group_context" and (not pack["creator_known"] or not any(
+                c["id"] == m["chat"] and _group_handle(c) == candidate["handle"]
+                for m in own for c in pack.get("chats", []))):
+            _review(link, "unsupported_evidence", messages)
+        elif link["code"] == "qa_confirm" and not _reply_refs(pack, own, cited):
+            _review(link, "reply_relation", messages)
     return result
 
 
@@ -863,40 +823,32 @@ def _review(link, error, messages):
                 needed=list(dict.fromkeys([*link["needed"], needed])), validation_error=error)
 
 
-def _counterevidence(pack, handle, claims):
+def _reply_refs(pack, own, cited):
+    """Check real reply/predecessor metadata; question intent and negation belong to AI."""
     messages = {m["id"]: m for m in pack["messages"]}
-    actors = {p["id"]: p["role"] for p in pack.get("people", [])}
-    claim_time = max((_timestamp(m) for m in claims), default=float("-inf"))
-    other_claims = set()
-    for actor in {m["speaker"] for m in pack["messages"] if m["speaker"] != pack["target"]
-                  and actors.get(m["speaker"], "unknown") in {"external", "unknown"}}:
-        _, other = _support_groups({**pack, "target": actor}, {"handle": handle})
-        other_claims.update(m["id"] for m in other)
-    conflicts = []
-    for message in pack["messages"]:
-        body = message["text"]
-        parent = messages.get(message.get("reply"))
-        if not parent and not message.get("reply"):
-            previous = messages.get(message.get("previous"))
-            if previous and _continuous(pack, message, previous):
-                parent = previous
-            if not parent or not _account_request(parent["text"]):
-                parent = next((question for question in pack["messages"]
-                    if _mentions(question["text"], handle) and _account_request(question["text"])
-                    and _continuous(pack, message, question)), None)
-        if message["speaker"] == pack["target"]:
-            chat = next((c for c in pack.get("chats", []) if c["id"] == message["chat"]), {})
-            negative = (_negative(body, handle, parent["text"] if parent else None)
-                        or _group_warning(chat, body, handle, [
-                            *(h["handle"] for h in pack.get("handles", [])), *pack.get("confirmed_handles", [])]))
-            if negative and (_timestamp(message) >= claim_time or not message.get("at")):
-                conflicts.append(message["id"])
-                if parent and not _mentions(body, handle):
-                    conflicts.append(parent["id"])
-        elif (message["id"] in other_claims or actors.get(message["speaker"], "unknown") in {"external", "unknown"}
-              and _self_claim(body, handle, allow_intro=True)):
-            conflicts.append(message["id"])
-    return list(dict.fromkeys(conflicts))
+    cited_ids = {m["id"] for m in cited}
+    unavailable = set(pack["coverage"]["missing_reply_ids"]) | set(pack["coverage"]["excerpted_ids"])
+    for answer in own:
+        if answer["id"] in unavailable:
+            continue
+        chat = next((c for c in pack.get("chats", []) if c["id"] == answer["chat"]), {})
+        actors = {m["speaker"] for m in pack["messages"] if m["chat"] == answer["chat"]}
+        if not answer.get("reply") and (len(actors) != 2 or "unknown" in actors):
+            continue
+        previous = answer.get("reply") or answer.get("previous")
+        # Actual replies need the cited parent. Private adjacency needs an unbroken source chain.
+        for _ in range(1 if answer.get("reply") else 3):
+            question = messages.get(previous)
+            if (not question or question["chat"] != answer["chat"] or question["id"] in unavailable
+                    or question["speaker"] in {pack["target"], "unknown"}
+                    or _timestamp(question) >= _timestamp(answer)):
+                break
+            if not answer.get("reply") and chat.get("mode") != "p2p":
+                break
+            if question["id"] in cited_ids:
+                return True
+            previous = question.get("previous")
+    return False
 
 
 def _timestamp(message):

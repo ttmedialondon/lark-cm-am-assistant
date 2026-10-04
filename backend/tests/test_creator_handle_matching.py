@@ -911,7 +911,7 @@ def test_fixed_group_context_auto_links_with_live_scope_and_auditable_title(pg, 
         {"h": competing["pack"]["handles"][0]["id"], "decision": "supported", "relation": "self_account",
          "period": "at_message", "code": "group_context", "refs": [reference], "needed": []}]}
     reviewed = matching.evidence.validate(competing["pack"], result)["links"][0]
-    assert reviewed["decision"] == "review" and reviewed["validation_error"] == "counterevidence"
+    assert reviewed == result["links"][0]  # Competing chat text is judged by AI, not backend regex.
     assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == ["first.handle"]
     pg.execute("ROLLBACK TO SAVEPOINT group_competing_owner")
 
@@ -1096,7 +1096,7 @@ def test_formal_pairs_skip_paid_matching_without_freezing_new_handles_or_manual_
     assert pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone()["status"] == (
         "review_required"
     )  # Derived presentation does not rewrite the paid historical outcome.
-    # A real account-specific denial remains visible even on an automatic/history result.
+    # Opening a history page does not reinterpret denial keywords as a verified database conflict.
     pg.execute("SAVEPOINT actual_counter")
     message("first.handle", 3, "first.handle is not my account")
     material = flow.real_build(pg, flow.settings, flow.contact, frozenset({"first.handle", "backup_2"}), recheck=True)
@@ -1131,7 +1131,7 @@ def test_formal_pairs_skip_paid_matching_without_freezing_new_handles_or_manual_
     row = next(
         row for row in matching.page_data(pg, pilot.ids["owner"], flow.settings)["jobs"] if row["id"] == job["id"]
     )
-    assert next(item for item in row["handle_rows"] if item["handle"] == "first.handle")["conflict"]
+    assert not next(item for item in row["handle_rows"] if item["handle"] == "first.handle")["conflict"]
     assert next(item for item in row["handle_rows"] if item["handle"] == "backup_2")["check"] is None
     pg.execute("ROLLBACK TO SAVEPOINT actual_counter")
 

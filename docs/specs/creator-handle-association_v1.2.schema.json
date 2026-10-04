@@ -1,6 +1,6 @@
 {
   "type": "object",
-  "description": "达人—handle 关联协议 v1.9（creator-handle-research-v1.9）；保留输出字段，新增 group_context 理由。精确合作群名与本人账号或创作语境共同构成强证据，不要求主动自报 handle。",
+  "description": "达人—handle 关联协议 v1.10（creator-handle-research-v1.10）；输出字段不变。聊天含义由模型判断，服务端只校验协议、引用、精确账号、真实回复关系、有效授权和实际数据冲突，不以关键词复判语义。",
   "additionalProperties": false,
   "properties": {
     "creator": {
