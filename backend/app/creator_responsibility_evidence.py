@@ -18,7 +18,7 @@ from .crypto import message_body_cipher
 from .message_mentions import mention_targets
 from .openai_client import ModelOutputError
 
-PROMPT_VERSION = "creator-responsibility-v1.1"
+PROMPT_VERSION = "creator-responsibility-v1.2"
 MAX_CANDIDATES, MAX_MESSAGES, MAX_CHARS, SEARCH_LIMIT = 24, 96, 32_000, 20_000
 DECISIONS = ("responsible", "strong_candidate", "assist", "historical", "insufficient")
 PERIODS = ("current", "historical", "uncertain")
@@ -87,9 +87,10 @@ def _state(conn, contact_id):
     directory = conn.execute(
         """SELECT c.id AS contact_id,c.display_name,i.open_id,i.identity_type,i.tenant_classification
            FROM contacts c JOIN lark_identities i ON i.contact_id=c.id
-           WHERE i.identity_type='user' AND EXISTS (
-             SELECT 1 FROM lark_identities trusted WHERE trusted.contact_id=c.id
-               AND trusted.identity_type='user' AND trusted.tenant_classification='internal')
+           WHERE i.identity_type='user' AND EXISTS (SELECT 1 FROM lark_identities admitted
+               JOIN authorizations a ON a.open_id=admitted.open_id
+               WHERE admitted.contact_id=c.id AND admitted.identity_type='user'
+                 AND a.status='active' AND a.body_consent_at IS NOT NULL)
            ORDER BY c.id,i.open_id"""
     ).fetchall()
     directory = [r for r in directory if str(r["contact_id"]) not in source.RESTRICTED_CONTACTS]
@@ -118,7 +119,7 @@ def _state(conn, contact_id):
 
 
 def build(conn, settings, contact_id):
-    """One known creator, all relevant internal candidates, shared authorized messages."""
+    """One known creator, relevant enrolled CMs, shared authorized messages."""
     contact_id = str(contact_id)
     empty = {"pack": None, "candidate_ids": {}, "refs": [], "fingerprint": None, "stats": {}, "reason": ""}
     if contact_id in source.RESTRICTED_CONTACTS:
@@ -356,10 +357,6 @@ def build(conn, settings, contact_id):
             {
                 "id": alias,
                 "name": roster[cid][0]["display_name"] or "",
-                "authorized": any(
-                    str(a["contact_id"]) == cid and a["status"] == "active" and a["body_consent_at"] is not None
-                    for a in state["authorizations"]
-                ),
                 "known_assignment": cid in known,
             }
         )

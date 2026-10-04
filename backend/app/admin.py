@@ -68,7 +68,7 @@ AI_FEATURES = {
     },
     "creator_responsibility_matching": {
         "title": "达人负责人建议",
-        "description": "每位已确认达人一次分析多个内部候选，只保存建议和证据，不修改正式负责人。",
+        "description": "从已接入的 CM/AM 中判断达人负责人；只保存建议和证据，不修改正式关系。",
         "enabled_label": "启用负责人建议队列",
         "processing_label": "手动入队，只生成建议",
     },

@@ -41,7 +41,7 @@ def _suggestion(cm, refs, **changes):
     }
 
 
-def _internal(pg, label):
+def _internal(pg, label, *, connected=False):
     identifier = uuid4()
     pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)", (identifier, label))
     pg.execute(
@@ -49,14 +49,26 @@ def _internal(pg, label):
         "VALUES(%s,%s,%s,'internal')",
         ("ou_" + label, identifier, label),
     )
+    if connected:
+        pg.execute(
+            "INSERT INTO authorizations(id,open_id,display_name,access_token_ciphertext,body_consent_at) "
+            "VALUES(%s,%s,%s,'test-token',NOW()-INTERVAL '1 day')",
+            (uuid4(), "ou_" + label, label),
+        )
     return identifier
 
 
-def test_shared_evidence_includes_unauthorized_internal_cm_without_widening_message_access(pg, pilot, monkeypatch):
-    """Candidate identity is not permission to read that candidate's other chats."""
+def test_shared_evidence_uses_connected_cm_roster_and_keeps_other_staff_as_context(pg, pilot, monkeypatch):
+    """Only connected CM/AMs are candidates; their merged aliases do not widen message access."""
     creator, cm = pilot.ids["creator"], pilot.ids["cm"]
     pg.execute("UPDATE lark_identities SET tenant_classification='internal' WHERE open_id='ou_cm'")
     helper = _internal(pg, "helper")
+    second_cm = _internal(pg, "second_cm", connected=True)
+    pg.execute("UPDATE lark_identities SET tenant_classification='unresolved' WHERE open_id='ou_second_cm'")
+    pg.execute(
+        "INSERT INTO lark_identities(open_id,contact_id,display_name) VALUES('ou_second_cm_alias',%s,'CM alias')",
+        (second_cm,),
+    )
     unrelated = _internal(pg, "unrelated")
     cipher = message_body_cipher(pilot.settings.token_encryption_key)
     start = datetime.now(UTC)
@@ -76,6 +88,8 @@ def test_shared_evidence_includes_unauthorized_internal_cm_without_widening_mess
     message("creator_new", "ou_creator", "Can you help me arrange tomorrow's live campaign?")
     message("helper_new", "ou_helper", "I will coordinate the live campaign with the brand.", parent="creator_new")
     message("creator_reply", "ou_creator", "Thank you, I will send you the completed video.", parent="helper_new")
+    message("second_cm_new", "ou_second_cm_alias", "I will arrange your live campaign.", parent="creator_new")
+    message("second_creator_reply", "ou_creator", "Please send me the live campaign plan.", parent="second_cm_new")
     message("unobserved", "ou_unrelated", "UNOBSERVED SECRET", observed=False)
     pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('unrelated_private','Unrelated private','p2p')")
     message("unrelated_secret", "ou_helper", "UNAUTHORIZED PRIVATE SECRET", chat="unrelated_private", observed=False)
@@ -93,10 +107,17 @@ def test_shared_evidence_includes_unauthorized_internal_cm_without_widening_mess
     material = evidence.build(pg, pilot.settings, creator)
     assert material["pack"] and material["pack"]["creator_known"] is True
     by_id = {UUID(str(identifier)): alias for alias, identifier in material["candidate_ids"].items()}
-    assert {cm, helper} <= by_id.keys() and unrelated not in by_id
+    assert {cm, second_cm} <= by_id.keys() and helper not in by_id and unrelated not in by_id
     candidates = {c["id"]: c for c in material["pack"]["candidates"]}
-    assert candidates[by_id[helper]]["authorized"] is False
-    assert candidates[by_id[cm]]["authorized"] is True
+    assert all("authorized" not in candidate for candidate in candidates.values())
+    assert any(
+        m["text"] == "I will coordinate the live campaign with the brand." and m["speaker"] not in candidates
+        for m in material["pack"]["messages"]
+    )
+    assert any(
+        m["text"] == "I will arrange your live campaign." and m["speaker"] == by_id[second_cm]
+        for m in material["pack"]["messages"]
+    )
     encoded = creator_data.encode(material["pack"])
     assert "UNOBSERVED SECRET" not in encoded
     assert "UNAUTHORIZED PRIVATE SECRET" not in encoded
@@ -120,8 +141,16 @@ def test_shared_evidence_includes_unauthorized_internal_cm_without_widening_mess
     assert not evidence.still_valid(pg, material["refs"], pilot.settings)
     assert not evidence.still_valid(pg, material["refs"], pilot.settings, lightweight=True)
     pg.execute("ROLLBACK TO SAVEPOINT revoked_permission")
+    for change in ("body_consent_at=NULL", "status='revoked'"):
+        pg.execute("SAVEPOINT candidate_revoked")
+        pg.execute(f"UPDATE authorizations SET {change} WHERE open_id='ou_second_cm'")
+        assert not evidence.still_valid(pg, material["refs"], pilot.settings)
+        assert not evidence.still_valid(pg, material["refs"], pilot.settings, lightweight=True)
+        revoked = evidence.build(pg, pilot.settings, creator)
+        assert str(second_cm) not in revoked["candidate_ids"].values()
+        pg.execute("ROLLBACK TO SAVEPOINT candidate_revoked")
     pg.execute("SAVEPOINT candidate_identity")
-    pg.execute("UPDATE lark_identities SET tenant_classification='known_external' WHERE contact_id=%s", (helper,))
+    pg.execute("UPDATE lark_identities SET identity_type='bot' WHERE open_id='ou_second_cm_alias'")
     assert not evidence.still_valid(pg, material["refs"], pilot.settings)
     pg.execute("ROLLBACK TO SAVEPOINT candidate_identity")
     pg.execute("SAVEPOINT assignment_change")
@@ -168,8 +197,8 @@ def test_factual_validation_preserves_independent_cm_results_without_lexical_vet
         "target": "U1",
         "creator_known": True,
         "candidates": [
-            {"id": "CM1", "name": "one", "authorized": True, "known_assignment": False},
-            {"id": "CM2", "name": "two", "authorized": False, "known_assignment": False},
+            {"id": "CM1", "name": "one", "known_assignment": False},
+            {"id": "CM2", "name": "two", "known_assignment": False},
         ],
         "existing_assignments": [],
         "people": [
@@ -246,7 +275,7 @@ def test_factual_validation_preserves_independent_cm_results_without_lexical_vet
 
 @pytest.fixture
 def responsibility_flow(pg, pilot, monkeypatch):
-    helper = _internal(pg, "helper")
+    helper = _internal(pg, "helper", connected=True)
     state = SimpleNamespace(
         settings=pilot.settings,
         contact=pilot.ids["creator"],
@@ -267,8 +296,8 @@ def responsibility_flow(pg, pilot, monkeypatch):
             "target": "U1",
             "creator_known": True,
             "candidates": [
-                {"id": "CM1", "name": "CM one", "authorized": True, "known_assignment": False},
-                {"id": "CM2", "name": "CM two", "authorized": False, "known_assignment": False},
+                {"id": "CM1", "name": "CM one", "known_assignment": False},
+                {"id": "CM2", "name": "CM two", "known_assignment": False},
             ],
             "existing_assignments": [],
             "people": [
@@ -405,7 +434,7 @@ def test_opt_in_one_creator_one_call_multi_cm_suggestions_only_and_exact_cache(p
     assert _snapshot(pg, before.keys()) == before
     assert "PRIVATE TEST BODY" not in creator_data.encode(_snapshot(pg, ("audit_events",)))
     # A semantically identical new directory identity must not reuse stale candidate IDs.
-    flow.helper = _internal(pg, "replacement")
+    flow.helper = _internal(pg, "replacement", connected=True)
     before = _snapshot(pg, before.keys())
     flow.enable("sk-responsibility-cache-replacement")
     matching.configuration_changed(pg)
@@ -678,7 +707,8 @@ def test_owner_only_routes_csrf_lazy_evidence_and_safe_audit(pg, pilot, responsi
     before = _snapshot(pg, ("contact_assignments", "creator_account_assignments"))
     response = client.get(path)
     assert response.status_code == 200 and response.headers["cache-control"] == "no-store, max-age=0"
-    assert "PRIVATE TEST BODY" not in response.text and "未接入" in response.text
+    assert "PRIVATE TEST BODY" not in response.text and "未接入" not in response.text
+    assert "helper" in response.text  # CM contact ID differs from the current authorization ID.
     assert "/confirm" not in response.text and "/apply" not in response.text
     read_path = path + f"/jobs/{job['id']}/evidence"
     response = client.get(read_path)

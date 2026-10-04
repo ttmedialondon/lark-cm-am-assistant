@@ -44,7 +44,7 @@ STATUSES = {
 }
 REASONS = {
     "no_text": "没有可读文字",
-    "no_candidates": "没有找到内部负责人候选",
+    "no_candidates": "没有找到已接入的 CM/AM 候选",
     "not_creator": "不是已确认达人",
     "no_identity": "没有可用的外部人员身份",
     "material_limit": "单条材料超过准备范围",
@@ -498,10 +498,7 @@ def _results(conn, view, existing=()):
     people = {
         str(r["id"]): r
         for r in conn.execute(
-            """SELECT c.id,c.display_name,EXISTS(
-        SELECT 1 FROM lark_identities i JOIN authorizations a ON a.open_id=i.open_id
-        WHERE i.contact_id=c.id AND a.status='active' AND a.body_consent_at IS NOT NULL) authorized
-        FROM contacts c WHERE c.id=ANY(%s::uuid[])""",
+            "SELECT id,display_name FROM contacts WHERE id=ANY(%s::uuid[])",
             (ids,),
         ).fetchall()
     }
@@ -514,7 +511,6 @@ def _results(conn, view, existing=()):
             {
                 **suggestion,
                 "name": person.get("display_name") or suggestion["cm"],
-                "authorized": person.get("authorized", False),
                 "existing": person_id in known,
                 "label": DECISIONS[suggestion["decision"]],
                 "scope_codes": suggestion["scope"],
@@ -566,7 +562,7 @@ def page_data(conn, actor, settings, page=1):
                     conn, json.loads(creator_data.cipher(settings).decrypt(ciphertext)), job["existing_assignments"]
                 )
             else:
-                job.update(reason="材料或授权已变化；旧建议不可查看", stale=True)
+                job.update(reason="规则或材料已更新，请重新分析", stale=True)
     if any(job["results"] for job in jobs):
         _audit(
             conn, actor, "creator_responsibility_results_viewed", {"jobs": [str(j["id"]) for j in jobs if j["results"]]}

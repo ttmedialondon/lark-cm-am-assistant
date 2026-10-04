@@ -9,7 +9,7 @@
 } %}
 {% set reason_labels = {
   'ready': '证据已准备', 'cached': '复用已有结果', 'suggestions_saved': '建议已保存',
-  'no_text': '没有可读消息', 'no_candidates': '未找到内部候选人员',
+  'no_text': '没有可读消息', 'no_candidates': '未找到已接入的 CM/AM',
   'restricted': '不在授权处理范围', 'no_interaction': '缺少实际互动',
   'preparation_failed': '证据准备失败', 'snapshot_changed': '证据或配置已更新',
   'lease_expired': '任务超时，正在恢复', 'identity_removed': '达人身份已取消',
@@ -36,7 +36,7 @@
 {% macro candidate_rows(results, evidence_link) %}
   {% for result in results %}
     <tr>
-      <td>{{ result.name or '未命名' }}{% if result.existing %}<div class="text-secondary small">现有关联</div>{% endif %}{% if not result.authorized %}<div class="text-secondary small">未接入</div>{% endif %}</td>
+      <td>{{ result.name or '未命名' }}{% if result.existing %}<div class="text-secondary small">现有关联</div>{% endif %}</td>
       <td>{{ result.label or decision_labels.get(result.decision, result.decision) }}{% if result.reason %}<div class="text-secondary small">{{ result.reason }}</div>{% endif %}</td>
       <td>{{ result.scope or '—' }}{% if result.scope_note %}<div class="small">{{ result.scope_note }}</div>{% endif %}{% if result.period %}<div class="text-secondary small">{{ period_labels.get(result.period, result.period) }}</div>{% endif %}</td>
       <td>
@@ -56,7 +56,7 @@
         <a class="btn" href="{{ base }}">返回建议列表</a>
       </div>
       {{ coverage_notes(evidence.coverage) }}
-      <div class="card table-responsive mt-3 mb-3">{{ confirmed_assignments(evidence.existing_assignments) }}<table class="table table-vcenter card-table"><thead><tr><th>内部人员</th><th>本轮结论</th><th>职责范围</th><th>证据引用</th></tr></thead><tbody>{{ candidate_rows(evidence.results, '') }}</tbody></table></div>
+      <div class="card table-responsive mt-3 mb-3">{{ confirmed_assignments(evidence.existing_assignments) }}<table class="table table-vcenter card-table"><thead><tr><th>CM/AM</th><th>本轮结论</th><th>职责范围</th><th>证据引用</th></tr></thead><tbody>{{ candidate_rows(evidence.results, '') }}</tbody></table></div>
       {% for message in evidence.messages %}
         <div class="card mb-2" id="evidence-{{ message.ref }}">
           <div class="card-header py-2"><div>
@@ -101,7 +101,7 @@
             </div>
           </div>
           {{ confirmed_assignments(job.existing_assignments) }}
-          <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>内部人员</th><th>本轮结论</th><th>职责范围</th><th>证据引用</th></tr></thead><tbody>{{ candidate_rows(job.results, base ~ '/jobs/' ~ job.id ~ '/evidence') }}</tbody></table></div>
+          <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>CM/AM</th><th>本轮结论</th><th>职责范围</th><th>证据引用</th></tr></thead><tbody>{{ candidate_rows(job.results, base ~ '/jobs/' ~ job.id ~ '/evidence') }}</tbody></table></div>
           <div class="card-footer py-2 text-secondary small">候选 {{ job.candidate_count }} 人{% if job.stats.get('input_tokens') or job.stats.get('output_tokens') %} · Token {{ job.stats.get('input_tokens', 0) + job.stats.get('output_tokens', 0) }}{% endif %}{{ coverage_notes(job.stats) }}</div>
         </div>
       {% else %}<div class="card card-body text-secondary text-center">暂无任务</div>{% endfor %}
