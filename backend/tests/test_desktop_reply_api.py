@@ -68,7 +68,8 @@ def api(pg, monkeypatch):
     async def model(config, api_key, pack, contact_id, **kwargs):
         assert api_key == "sk-fixture-only-test"
         state.calls.append({"pack": pack, "actor": contact_id, "options": kwargs})
-        return state.output or model_response(draft=f"Reply for {contact_id}")
+        refs = [message["ref"] for message in pack["selected_messages"]] or ["C1"]
+        return state.output or model_response(draft=f"Reply for {contact_id}", refs=refs)
 
     monkeypatch.setattr(openai_client, "call_openai_async", model)
     app = FastAPI()
@@ -98,6 +99,8 @@ def test_reply_scopes_translation_cached_id_and_actor_isolation(api):
                                                  for row in selected["selected_messages"]]
     assert call["pack"]["submitted_snapshot"]["messages"] == [dict(row, ref=f"C{row['ordinal']}")
                                                               for row in selected["conversation_context"]["messages"]]
+    assert desktop_replies.SCOPE_INSTRUCTIONS["selected_messages"] in call["options"]["instructions"]
+    assert desktop_replies.SCOPE_INSTRUCTIONS["recent_context"] not in call["options"]["instructions"]
     cached = api.client.post(PATH, json=selected, headers=api.headers)
     assert cached.status_code == 200 and cached.json() == result and len(api.state.calls) == 1
     changed = copy.deepcopy(selected)
@@ -114,6 +117,8 @@ def test_reply_scopes_translation_cached_id_and_actor_isolation(api):
     assert recent.json()["suggestion"] == recent.json()["chinese_translation"] == "我会核对日期。"
     assert api.state.calls[-1]["pack"]["reply_scope"] == "recent_context"
     assert api.state.calls[-1]["pack"]["selected_messages"] == []
+    assert desktop_replies.SCOPE_INSTRUCTIONS["recent_context"] in api.state.calls[-1]["options"]["instructions"]
+    assert desktop_replies.SCOPE_INSTRUCTIONS["selected_messages"] not in api.state.calls[-1]["options"]["instructions"]
     receipts = api.pg.execute("SELECT actor_id,status FROM desktop_reply_requests").fetchall()
     assert len(receipts) == 3 and all(row["status"] == "succeeded" for row in receipts)
 
@@ -190,10 +195,12 @@ def test_paused_background_queue_does_not_admit_or_throttle_desktop(api, monkeyp
 
 @pytest.mark.parametrize("oversized", [False, True])
 def test_invalid_model_output_is_rejected_and_cached_as_terminal_error(api, oversized):
-    api.state.output = model_response("x" * (desktop_replies.MAX_RESPONSE_BYTES + 1)) if oversized else {
-        "text": json.dumps({"suggestion": "unvalidated model output"}),
-        "usage": {"input_tokens": 30, "output_tokens": 20},
-    }
+    api.state.output = (
+        model_response("x" * (desktop_replies.MAX_RESPONSE_BYTES + 1), refs=["S1", "S2"]) if oversized else {
+            "text": json.dumps({"suggestion": "unvalidated model output"}),
+            "usage": {"input_tokens": 30, "output_tokens": 20},
+        }
+    )
     submitted = payload()
     first = api.client.post(PATH, json=submitted, headers=api.headers)
     duplicate = api.client.post(PATH, json=submitted, headers=api.headers)
@@ -202,6 +209,39 @@ def test_invalid_model_output_is_rejected_and_cached_as_terminal_error(api, over
     assert "unvalidated model output" not in first.text and len(api.state.calls) == 1
     row = api.pg.execute("SELECT * FROM desktop_reply_requests").fetchone()
     assert row["status"] == "failed" and row["result_ciphertext"] is None
+
+
+def test_selected_event_requires_selection_evidence_not_only_visible_tail(api):
+    submitted = payload()
+    selected = ["Creator: My order arrived with the wrong colour.", "Creator: Can I exchange it?"]
+    submitted["selected_messages"] = [{"ordinal": i, "text": text} for i, text in enumerate(selected, 1)]
+    submitted["selected_message_text"] = "\n".join(selected)
+    submitted["conversation_context"]["messages"] = [
+        {"ordinal": 1, "text": "CM: Which product was it?"},
+        {"ordinal": 2, "text": "Creator: Also, what time is tomorrow's livestream?"},
+    ]
+    api.state.output = model_response("What time works for your livestream?", refs=["C2"])
+    first = api.client.post(PATH, json=submitted, headers=api.headers)
+    duplicate = api.client.post(PATH, json=submitted, headers=api.headers)
+    assert first.status_code == duplicate.status_code == 502 and first.json() == duplicate.json()
+    assert first.json()["error"]["code"] == "invalid_ai_response"
+    assert len(api.state.calls) == 1  # A failed target check cannot cause a second paid call.
+    assert [row["text"] for row in api.state.calls[-1]["pack"]["selected_messages"]] == selected
+    assert not api.pg.execute("SELECT 1 FROM desktop_reply_requests WHERE status='succeeded'").fetchone()
+
+    api.state.output = model_response("Could you send the order number so I can check the exchange?",
+                                      refs=["S2", "C1"])
+    submitted["request_id"] = str(uuid4())
+    assert api.client.post(PATH, json=submitted, headers=api.headers).status_code == 200
+
+    api.state.output = {
+        "text": json.dumps({"outcome": "verify", "language": "en", "draft": "", "chinese_translation": "",
+                            "explanation": "需要核对选中事件的订单对应关系。", "checks": [], "evidence_refs": ["S1"]}),
+        "usage": {"input_tokens": 30, "output_tokens": 20},
+    }
+    submitted["request_id"] = str(uuid4())
+    uncertain = api.client.post(PATH, json=submitted, headers=api.headers)
+    assert uncertain.status_code == 422 and uncertain.json()["error"]["code"] == "context_unavailable"
 
 
 def test_server_total_timeout_cancels_model_and_stays_terminal(api, monkeypatch):

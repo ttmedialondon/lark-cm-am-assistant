@@ -48,6 +48,7 @@ python3 -m venv .venv
 正式服务拒绝未知字段及 synthetic 来源。
 
 - `selected_messages` 模式要求非空选区、连续 ordinal 和非空 text；合并正文必须等于各条 text 用换行拼接，来源为 `clipboard_html`。
+  全部选区共同构成回复目标，多选按事件整体回应；屏幕上下文只补充相关事实和进展，不以最后一条可见消息替换选区。模型的 ready 结果必须引用选区依据，不能只引用屏幕上下文。
 - `recent_context` 模式要求空选区和空合并正文，来源为 `none`。
 - 两种模式均提交 `conversation_context: {capture_id, captured_at, source: "lark_accessibility", scope: "visible_text", complete_history: false, messages}`；片段保留顺序、重复文字和未验证的文字 hint。
 - 请求最多 1 MiB，响应最多 256 KiB；不截断。采集时间不是发送时间，片段不保证完整消息或已验证发言人；没有真实会话/用户 ID，后端不据此查询其他聊天、更新身份、负责人或事件。
