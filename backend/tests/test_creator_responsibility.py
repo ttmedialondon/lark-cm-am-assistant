@@ -729,6 +729,9 @@ def test_owner_only_routes_csrf_lazy_evidence_and_safe_audit(pg, pilot, responsi
         assert not matching.prepare_next(flow.settings) and matching.claim() is None
         assert _snapshot(pg, jobs_before.keys()) == jobs_before and len(flow.calls) == 1
     flow.valid = False
+    stale_page = client.get(path)
+    assert "规则或材料已更新，请重新分析" in stale_page.text
+    assert "候选 2 人" not in stale_page.text and "本次证据" not in stale_page.text
     assert client.get(read_path).status_code in {403, 404, 409}
     flow.valid = True
     session["auth"] = {"id": pilot.ids["cm"], "status": "active"}

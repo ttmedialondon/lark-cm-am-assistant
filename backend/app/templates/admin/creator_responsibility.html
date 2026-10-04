@@ -102,7 +102,7 @@
           </div>
           {{ confirmed_assignments(job.existing_assignments) }}
           <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>CM/AM</th><th>本轮结论</th><th>职责范围</th><th>证据引用</th></tr></thead><tbody>{{ candidate_rows(job.results, base ~ '/jobs/' ~ job.id ~ '/evidence') }}</tbody></table></div>
-          <div class="card-footer py-2 text-secondary small">候选 {{ job.candidate_count }} 人{% if job.stats.get('input_tokens') or job.stats.get('output_tokens') %} · Token {{ job.stats.get('input_tokens', 0) + job.stats.get('output_tokens', 0) }}{% endif %}{{ coverage_notes(job.stats) }}</div>
+          {% if not job.stale %}<div class="card-footer py-2 text-secondary small">候选 {{ job.candidate_count }} 人{% if job.stats.get('input_tokens') or job.stats.get('output_tokens') %} · Token {{ job.stats.get('input_tokens', 0) + job.stats.get('output_tokens', 0) }}{% endif %}{{ coverage_notes(job.stats) }}</div>{% endif %}
         </div>
       {% else %}<div class="card card-body text-secondary text-center">暂无任务</div>{% endfor %}
       <div class="d-flex justify-content-end gap-3 mt-3">{% if matching.page > 1 %}<a href="?page={{ matching.page - 1 }}">上一页</a>{% endif %}{% if matching.has_more %}<a href="?page={{ matching.page + 1 }}">下一页</a>{% endif %}</div>
