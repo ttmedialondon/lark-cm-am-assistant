@@ -31,6 +31,11 @@ REASONS = {
     "provider_retry": "服务暂不可用", "quota_paused": "接口配额暂停", "request_unknown": "请求结果未知，需手动复查",
     "lease_expired": "准备任务已过期", "owner_cancelled": "已取消", "manual_confirmed": "已人工确认并锁定",
     "config_paused": "功能已停用", "scope_changed": "群关系或授权已变化", "auto_linked": "分类已自动入库",
+    "unknown_purpose": "群用途不明确", "low_confidence": "置信度未达门槛",
+    "no_message_reference": "缺少正文依据", "reply_context_missing": "回复上下文缺失",
+    "invalid_reference": "引用无法核对", "manual_protected": "保留人工分类",
+    "superseded": "已有更新的结果", "admission_busy": "等待本地入库",
+    "evidence_unavailable": "证据或授权已变化",
 }
 
 
@@ -60,19 +65,39 @@ def _audit(conn, actor, action, metadata):
                  (uuid4(), actor, "creator_group_" + action, creator_data.encode(metadata)))
 
 
+def _admission_reason(pack, result, config):
+    if not _enabled(config):
+        return "config_paused"
+    if result["purpose"] == "unknown":
+        return "unknown_purpose"
+    if Decimal(str(result["confidence"])) < Decimal(str(config["auto_confirm_threshold"])):
+        return "low_confidence"
+    cited = set(result["refs"])
+    if not cited.intersection(m["id"] for m in pack["messages"]):
+        return "no_message_reference"
+    allowed = set(evidence.output_format(pack)["schema"]["properties"]["refs"]["items"]["enum"])
+    if cited - allowed:
+        return "reply_context_missing" if cited <= {"G1", *(m["id"] for m in pack["messages"])} else "invalid_reference"
+    return ""
+
+
+def _admission_stats(job, result, admitted):
+    return {"suggested_purpose": result["purpose"], "auto_linked": bool(admitted),
+            "auto_deferred": admitted is None,
+            "admission_reason": "admission_busy" if admitted is None else job.get("admission_reason", "")}
+
+
 def _auto_classify(conn, job, pack, refs, result, config, settings):
     """The same admission fence for fresh and cached results; never impersonate a human."""
     threshold = Decimal(str(config["auto_confirm_threshold"]))
-    cited = set(result["refs"])
-    messages = [ref for ref in refs if ref.get("kind") == "message"]
-    if (not _enabled(config) or result["purpose"] == "unknown"
-            or Decimal(str(result["confidence"])) < threshold
-            or not cited.intersection(m["id"] for m in pack["messages"])
-            or cited.intersection(pack["coverage"].get("missing_reply_ids", []))):
+    job["admission_reason"] = _admission_reason(pack, result, config)
+    if job["admission_reason"]:
         return False
+    messages = [ref for ref in refs if ref.get("kind") == "message"]
     existing = conn.execute("SELECT source,locked FROM chat_group_classifications WHERE chat_id=%s",
                             (job["chat_id"],)).fetchone()
     if existing and (existing["source"] == "manual" or existing["locked"]):
+        job["admission_reason"] = "manual_protected"
         return False
     # Revocation/edit triggers also touch jobs. Do not wait on their locks or repeat a paid call.
     try:
@@ -85,6 +110,7 @@ def _auto_classify(conn, job, pack, refs, result, config, settings):
             latest = conn.execute("""SELECT id FROM creator_group_jobs WHERE chat_id=%s
                 ORDER BY created_at DESC,id DESC LIMIT 1""", (job["chat_id"],)).fetchone()
             if not latest or latest["id"] != job["id"]:
+                job["admission_reason"] = "superseded"
                 return False  # A deferred old result must never replace a newer analysis.
             conn.execute("SELECT open_id FROM chat_members WHERE chat_id=%s ORDER BY open_id FOR SHARE NOWAIT",
                          (job["chat_id"],)).fetchall()
@@ -107,6 +133,7 @@ def _auto_classify(conn, job, pack, refs, result, config, settings):
                 ([r["chat_id"] for r in messages], [r["message_id"] for r in messages],
                  [r["authorization_id"] for r in messages])).fetchall()
             if len(locked) != len(messages) or not evidence.still_valid(conn, refs, settings):
+                job["admission_reason"] = "evidence_unavailable"
                 return False
             saved = conn.execute("""INSERT INTO chat_group_classifications
                 (chat_id,purpose,tags,locked,source,confidence,source_job_id)
@@ -121,8 +148,10 @@ def _auto_classify(conn, job, pack, refs, result, config, settings):
                 _audit(conn, None, "auto_linked", {"chat_id": job["chat_id"], "job_id": str(job["id"]),
                     "purpose": result["purpose"], "confidence": result["confidence"],
                     "threshold": str(threshold), "refs": result["refs"]})
+            job["admission_reason"] = "" if saved else "manual_protected"
             return bool(saved)
     except LockNotAvailable:
+        job["admission_reason"] = "admission_busy"
         return None  # The paid result survives; only local admission needs another attempt.
 
 
@@ -173,6 +202,70 @@ def enqueue(conn, actor):
     return {"queued": len(rows)}
 
 
+def reprocess_unclassified(conn, actor, *, chat_ids=None):
+    """Explicit owner rerun: preserve formal decisions, reuse safe paid results, never replay unknown billing."""
+    from .config import get_settings
+
+    require_owner(conn, actor)
+    config = _config(conn, lock=True)
+    if not _enabled(config):
+        raise ValueError("请先配置并启用达人群用途匹配。")
+    settings = get_settings()
+    storage = creator_data.cipher(settings)
+    rows = conn.execute("""SELECT j.*,c.chat_id AS chat_id,f.purpose AS confirmed_purpose,
+        f.source AS confirmed_source,f.locked AS classification_locked FROM chats c
+        LEFT JOIN LATERAL(SELECT * FROM creator_group_jobs WHERE chat_id=c.chat_id
+            ORDER BY created_at DESC,id DESC LIMIT 1) j ON TRUE
+        LEFT JOIN chat_group_classifications f ON f.chat_id=c.chat_id
+        WHERE creator_group_is_eligible(c.chat_id) AND (%s::text[] IS NULL OR c.chat_id=ANY(%s::text[]))
+        ORDER BY c.chat_id""", (chat_ids, chat_ids)).fetchall()
+    counts = dict.fromkeys(("admitted", "queued", "active", "protected", "request_unknown"), 0)
+    for job in rows:
+        if (job["confirmed_purpose"] not in (None, "unknown")
+                or job["confirmed_source"] == "manual" or job["classification_locked"]):
+            counts["protected"] += 1
+            continue
+        # Manual confirmation locks this same chat first. Recheck after locking, not just the list snapshot.
+        conn.execute("SELECT chat_id FROM chats WHERE chat_id=%s FOR UPDATE", (job["chat_id"],)).fetchone()
+        formal = conn.execute("SELECT purpose,source,locked FROM chat_group_classifications WHERE chat_id=%s",
+                              (job["chat_id"],)).fetchone()
+        if formal and (formal["purpose"] != "unknown" or formal["source"] == "manual" or formal["locked"]):
+            counts["protected"] += 1
+            continue
+        if job["reason_code"] == "request_unknown":
+            counts["request_unknown"] += 1
+            continue
+        if job["id"] and job["status"] not in {"completed", "failed", "cancelled", "waiting_evidence"}:
+            counts["active"] += 1
+            continue
+        admitted, result = False, None
+        if (job["status"] == "completed" and job["pack_ciphertext"] and job["result_ciphertext"]
+                and job["stats"].get("prompt_version") in evidence.COMPATIBLE_PROMPT_VERSIONS
+                and job["config_fingerprint"] == _config_hash(config)
+                and evidence.still_valid(conn, job["refs"], settings)):
+            pack = json.loads(storage.decrypt(job["pack_ciphertext"]))
+            try:
+                result = evidence.validate(pack, json.loads(storage.decrypt(job["result_ciphertext"])))
+            except api.ModelOutputError:
+                pass  # Do not remove an unsupported citation and reuse its old confidence.
+            if result is not None:
+                admitted = _auto_classify(conn, job, pack, job["refs"], result, config, settings)
+        if admitted or admitted is None:
+            conn.execute("""UPDATE creator_group_jobs SET stats=stats||%s::jsonb,
+                reason_code=CASE WHEN %s THEN 'auto_linked' ELSE reason_code END,
+                not_before=NOW()+INTERVAL '30 seconds',updated_at=NOW() WHERE id=%s""",
+                (creator_data.encode(_admission_stats(job, result, admitted)), bool(admitted), job["id"]))
+            counts["admitted" if admitted else "active"] += 1
+            continue
+        queued = conn.execute("SELECT enqueue_creator_group(%s,'history',TRUE) id", (job["chat_id"],)).fetchone()["id"]
+        if queued:
+            conn.execute("UPDATE creator_group_jobs SET stats=stats||'{\"force_reclassify\":true}'::jsonb "
+                         "WHERE id=%s", (queued,))
+            counts["queued"] += 1
+    _audit(conn, actor, "unclassified_reprocessed", {**counts, "prompt_version": evidence.PROMPT_VERSION})
+    return counts
+
+
 def _recover(conn):
     # Unknown network billing never causes an automatic second request.
     conn.execute("""UPDATE creator_group_jobs SET status=CASE WHEN status='preparing' THEN 'queued' ELSE 'failed' END,
@@ -207,12 +300,19 @@ def prepare_next(settings):
             if (deferred["stats"].get("prompt_version") in evidence.COMPATIBLE_PROMPT_VERSIONS
                     and evidence.still_valid(conn, deferred["refs"], settings)):
                 pack = json.loads(storage.decrypt(deferred["pack_ciphertext"]))
-                result = evidence.validate(pack, json.loads(storage.decrypt(deferred["result_ciphertext"])))
-                admitted = _auto_classify(conn, deferred, pack, deferred["refs"], result, config, settings)
+                try:
+                    result = evidence.validate(pack, json.loads(storage.decrypt(deferred["result_ciphertext"])))
+                except api.ModelOutputError:
+                    deferred["admission_reason"] = "reply_context_missing"
+                else:
+                    admitted = _auto_classify(conn, deferred, pack, deferred["refs"], result, config, settings)
+            else:
+                deferred["admission_reason"] = "evidence_unavailable"
             conn.execute("""UPDATE creator_group_jobs SET stats=stats||%s::jsonb,
                 reason_code=CASE WHEN %s THEN 'auto_linked' ELSE reason_code END,
                 not_before=NOW()+INTERVAL '30 seconds',updated_at=NOW() WHERE id=%s""",
-                (creator_data.encode({"auto_linked": bool(admitted), "auto_deferred": admitted is None}),
+                (creator_data.encode({"auto_linked": bool(admitted), "auto_deferred": admitted is None,
+                                     "admission_reason": deferred.get("admission_reason", "")}),
                  bool(admitted), deferred["id"]))
             return True
         if conn.execute("SELECT count(*) n FROM creator_group_jobs WHERE status='ready'").fetchone()["n"] >= 5:
@@ -250,9 +350,15 @@ def prepare_next(settings):
                              config["model"], evidence.CLASSIFICATION_VERSION])
         cached = conn.execute("""SELECT result_ciphertext FROM creator_group_jobs WHERE chat_id=%s AND fingerprint=%s
             AND status='completed' AND result_ciphertext IS NOT NULL ORDER BY updated_at DESC LIMIT 1""",
-                              (job["chat_id"], fingerprint)).fetchone() if pack and job["source"] != "manual" else None
+                              (job["chat_id"], fingerprint)).fetchone() if (
+                                  pack and job["source"] != "manual"
+                                  and not job["stats"].get("force_reclassify")) else None
         storage = creator_data.cipher(settings)
-        result = evidence.validate(pack, json.loads(storage.decrypt(cached["result_ciphertext"]))) if cached else None
+        try:
+            result = (evidence.validate(pack, json.loads(storage.decrypt(cached["result_ciphertext"])))
+                      if cached else None)
+        except api.ModelOutputError:
+            cached, result = None, None
         auto_linked = _auto_classify(conn, current, pack, refs, result, current_config, settings) if cached else False
         conn.execute("""UPDATE creator_group_jobs SET status=%s,reason_code=%s,fingerprint=%s,config_fingerprint=%s,
             pack_ciphertext=%s,result_ciphertext=%s,refs=%s::jsonb,stats=%s::jsonb,attempts=0,
@@ -264,8 +370,8 @@ def prepare_next(settings):
                 storage.encrypt(creator_data.encode(result)) if cached else None,
                 creator_data.encode(refs), creator_data.encode({
                     **material["stats"], "prompt_version": evidence.PROMPT_VERSION,
-                    **({"suggested_purpose": result["purpose"], "auto_linked": bool(auto_linked),
-                        "auto_deferred": auto_linked is None} if cached else {}),
+                    **({"force_reclassify": True} if job["stats"].get("force_reclassify") else {}),
+                    **(_admission_stats(current, result, auto_linked) if cached else {}),
                 }),
                 bool(cached), job["id"],
             ))
@@ -287,7 +393,9 @@ def claim():
             AND not_before<=NOW() AND attempts<3 ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1""").fetchone()
         if not job:
             return None
-        if (job["desired_version"] != job["snapshot_version"] or job["config_fingerprint"] != _config_hash(config)
+        if (job["stats"].get("prompt_version") != evidence.PROMPT_VERSION
+                or job["desired_version"] != job["snapshot_version"]
+                or job["config_fingerprint"] != _config_hash(config)
                 or not evidence.still_valid(conn, job["refs"], settings)):
             _invalidate(conn, job, config)
             return None
@@ -374,9 +482,7 @@ def run(job, settings):
             finished_at=CASE WHEN %s THEN NOW() ELSE NULL END,updated_at=NOW() WHERE id=%s""", (
                 "completed" if error is None else "retry_wait" if retry else "failed", reason,
                 creator_data.cipher(settings).encrypt(creator_data.encode(result)) if error is None else None,
-                creator_data.encode({"suggested_purpose": result["purpose"], "auto_linked": bool(auto_linked),
-                                     "auto_deferred": auto_linked is None}
-                                    if error is None else {}),
+                creator_data.encode(_admission_stats(current, result, auto_linked) if error is None else {}),
                 api.retry_delay(error.retry_after_seconds, job["attempts"]) if retry else 0, not retry, job["id"],
             ))
         conn.execute("UPDATE ai_feature_configs SET last_tested_at=NOW(),last_test_status=%s WHERE feature=%s",
@@ -400,8 +506,34 @@ def _decode_result(job, settings):
     return {**result, "purpose_label": PURPOSES[result["purpose"]], "confidence_label": f"{result['confidence']:.0%}"}
 
 
+def _diagnostics(job, result, config, *, pack=None):
+    stats = job["stats"]
+    reason = stats.get("admission_reason", "")
+    missing = stats.get("missing_reply_ids", [])
+    if job.get("stale"):
+        reason = "evidence_unavailable"
+    elif result and not reason:
+        if pack is not None:
+            reason = _admission_reason(pack, result, config)
+        elif result["purpose"] == "unknown":
+            reason = "unknown_purpose"
+        elif Decimal(str(result["confidence"])) < Decimal(str(config["auto_confirm_threshold"])):
+            reason = "low_confidence"
+        elif set(result["refs"]).intersection(missing):
+            reason = "reply_context_missing"
+        elif not any(ref.startswith("M") for ref in result["refs"]):
+            reason = "no_message_reference"
+    if not reason and job["status"] in {"failed", "waiting_evidence", "cancelled"}:
+        reason = job["reason_code"]
+    return {"admission_reason_label": REASONS.get(reason, "") if reason else "",
+            "admission_details": {"missing_reply_ids": missing,
+                "missing_reply_reasons": {label: code for label, code in
+                    stats.get("missing_reply_reasons", {}).items() if label in missing}}}
+
+
 def page_data(conn, actor, settings, page=1):
     require_owner(conn, actor)
+    config = _config(conn)
     latest = ("WITH latest AS (SELECT DISTINCT ON(chat_id) * FROM creator_group_jobs "
               "ORDER BY chat_id,created_at DESC,id DESC) ")
     counts = {r["status"]: r["n"] for r in conn.execute(
@@ -443,13 +575,14 @@ def page_data(conn, actor, settings, page=1):
                        if state == "classified" else "入库中" if row["stats"].get("auto_deferred")
                        else "等待证据" if row["status"] == "waiting_evidence"
                        else {"error": "失败", "pending": "处理中", "review": "待核实"}[state])
+        row.update(_diagnostics(row, result, config) if state in {"review", "error"} else
+                   {"admission_reason_label": "", "admission_details": {}})
         if row["result"]:
             viewed.append(str(row["id"]))
         for key in ("pack_ciphertext", "result_ciphertext", "refs", "config_fingerprint", "claim_token"):
             row.pop(key, None)
     if viewed:
         _audit(conn, actor, "results_viewed", {"jobs": viewed})
-    config = _config(conn)
     threshold = config["auto_confirm_threshold"]
     return {"jobs": rows, "counts": counts, "summary_counts": summary_counts, "page": page, "has_more": more,
             "enabled": _enabled(config), "purposes": PURPOSES, "prompt_version": evidence.PROMPT_VERSION,
@@ -466,8 +599,9 @@ def task_evidence(conn, actor, settings, job_id):
         raise PermissionError("材料或授权已变化，请重新分析。")
     pack = json.loads(creator_data.cipher(settings).decrypt(job["pack_ciphertext"]))
     _audit(conn, actor, "evidence_viewed", {"job_id": str(job_id), "messages": len(pack["messages"])})
+    result = _decode_result(job, settings)
     return {"job_id": str(job_id), "chat_id": job["chat_id"], "name": job["name"], "pack": pack,
-            "result": _decode_result(job, settings), "stats": job["stats"]}
+            "result": result, "stats": job["stats"], **_diagnostics(job, result, _config(conn), pack=pack)}
 
 
 def action(conn, actor, job_id, operation):

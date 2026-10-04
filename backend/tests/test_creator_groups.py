@@ -293,6 +293,141 @@ def test_creator_group_queue_real_authorization_manual_lock_and_billing_fences(p
     assert manual["source"] == "manual" and manual["confidence"] is None
     reclassify("support", 1)
     assert classification() == manual  # Human override replaces an AI row and remains authoritative unlocked.
+
+    pg.execute("SAVEPOINT group_context_reprocessing")
+
+    def seed_group(chat_id, count=1, parents=None):
+        pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES(%s,'Synthetic context group','group')", (chat_id,))
+        pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,%s)", (owner, chat_id))
+        pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES(%s,'ou_creator')", (chat_id,))
+        for n in range(count):
+            pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,
+                body_ciphertext,message_create_time,parent_id)
+                VALUES(%s,%s,'ou_creator','user','text',%s,NOW()+(%s*INTERVAL '1 second'),%s)""",
+                (chat_id, f"{chat_id}_{n}", cipher.encrypt(json.dumps({"text": f"Synthetic sample service {n}"})),
+                 n, (parents or {}).get(n)))
+            pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+                VALUES(%s,%s,%s)""", (owner, chat_id, f"{chat_id}_{n}"))
+        return pg.execute("SELECT enqueue_creator_group(%s,'history',TRUE) id", (chat_id,)).fetchone()["id"]
+
+    context_chat = "oc_context"
+    seed_group(context_chat, 72, {18: "oc_context_17", 17: "oc_context_16", 16: "oc_context_13",
+                                31: "oc_context_26", 26: "oc_context_23",
+                                65: "oc_context_66", 66: "oc_context_65", 67: "om_unavailable"})
+    context = evidence.build(pg, settings, context_chat)
+    context_pack = context["pack"]
+    labels = {r["message_id"]: r["label"] for r in context["refs"] if r["kind"] == "message"}
+    by_label = {m["id"]: m for m in context_pack["messages"]}
+    # A previous message and a fetched parent both need their own complete parent chains.
+    for child, parent in ((18, 17), (17, 16), (16, 13), (31, 26), (26, 23)):
+        assert by_label[labels[f"oc_context_{child}"]]["reply"] == labels[f"oc_context_{parent}"]
+    assert len(by_label) <= evidence.MAX_MESSAGES
+    assert sum(len(m["text"]) for m in by_label.values()) <= evidence.MAX_CHARS
+    missing_labels = set(context_pack["coverage"]["missing_reply_ids"])
+    assert {labels[f"oc_context_{n}"] for n in (65, 66, 67)} <= missing_labels
+    assert context_pack["coverage"]["missing_reply_reasons"][labels["oc_context_65"]] == "cycle"
+    assert context_pack["coverage"]["missing_reply_reasons"][labels["oc_context_67"]] == "unavailable"
+    allowed = set(evidence.output_format(context_pack)["schema"]["properties"]["refs"]["items"]["enum"])
+    assert not missing_labels.intersection(allowed)
+    complete_label = labels["oc_context_18"]
+    assert complete_label in allowed
+    legacy_missing = {"purpose": "support", "confidence": .98, "tags": [],
+                      "refs": ["G1", complete_label, labels["oc_context_67"]]}
+    assert evidence.validate(context_pack, legacy_missing) == legacy_missing  # Never prune refs and inherit .98.
+    context_job = pg.execute("SELECT * FROM creator_group_jobs WHERE chat_id=%s", (context_chat,)).fetchone()
+    assert matching._auto_classify(pg, context_job, context_pack, context["refs"], legacy_missing,
+                                  matching._config(pg), settings) is False
+    complete_result = {**legacy_missing, "confidence": .95, "refs": ["G1", complete_label]}
+    assert matching._auto_classify(pg, context_job, context_pack, context["refs"], complete_result,
+                                  matching._config(pg), settings) is True  # Uncited incomplete material is harmless.
+    pg.execute("SAVEPOINT group_context_budget")
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE chat_id=%s",
+               (cipher.encrypt(json.dumps({"text": "S" * 900})), context_chat))
+    budget = evidence.build(pg, settings, context_chat)
+    assert budget["stats"]["omitted_messages"] > 0
+    assert len(budget["pack"]["messages"]) <= evidence.MAX_MESSAGES
+    assert sum(len(m["text"]) for m in budget["pack"]["messages"]) <= evidence.MAX_CHARS
+    pg.execute("ROLLBACK TO SAVEPOINT group_context_budget")
+
+    storage = matching.creator_data.cipher(settings)
+
+    def saved_suggestion(chat_id, *, confidence=.98, purpose="support", parent=None):
+        job_id = seed_group(chat_id, parents={0: parent} if parent else None)
+        material = evidence.build(pg, settings, chat_id)
+        result = {"purpose": purpose, "confidence": confidence, "tags": [], "refs": ["G1", "M1"]}
+        pg.execute("""UPDATE creator_group_jobs SET status='completed',reason_code='suggestions_saved',
+            pack_ciphertext=%s,result_ciphertext=%s,refs=%s::jsonb,stats=%s::jsonb,
+            snapshot_version=desired_version,config_fingerprint=%s,finished_at=NOW() WHERE id=%s""",
+            (storage.encrypt(json.dumps(material["pack"])), storage.encrypt(json.dumps(result)),
+             matching.creator_data.encode(material["refs"]), json.dumps({**material["stats"],
+                 "prompt_version": "creator-group-purpose-v1.2", "auto_linked": False, "auto_deferred": False}),
+             matching._config_hash(matching._config(pg)), job_id))
+        return pg.execute("SELECT * FROM creator_group_jobs WHERE id=%s", (job_id,)).fetchone()
+
+    safe = saved_suggestion("oc_local_admit")
+    low = saved_suggestion("oc_low", confidence=.94)
+    unknown = saved_suggestion("oc_unknown", purpose="unknown")
+    stale = saved_suggestion("oc_stale")
+    missing_old = saved_suggestion("oc_missing_old", parent="om_original_question")
+    incompatible = saved_suggestion("oc_incompatible")
+    pg.execute("UPDATE creator_group_jobs SET stats=stats||'{\"prompt_version\":\"unsupported\"}'::jsonb WHERE id=%s",
+               (incompatible["id"],))
+    saved_suggestion("oc_manual_protected")
+    matching.confirm(pg, owner, "oc_manual_protected", "unknown", [], locked=False)
+    active_id = seed_group("oc_active")
+    pg.execute("UPDATE creator_group_jobs SET status='running',claim_token=%s,lease_until=NOW()+INTERVAL '10 minutes' "
+               "WHERE id=%s", (uuid4(), active_id))
+    active_before = pg.execute("SELECT * FROM creator_group_jobs WHERE id=%s", (active_id,)).fetchone()
+    unknown_request_id = seed_group("oc_request_unknown")
+    pg.execute("UPDATE creator_group_jobs SET status='failed',reason_code='request_unknown' WHERE id=%s",
+               (unknown_request_id,))
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE chat_id='oc_stale'",
+               (cipher.encrypt(json.dumps({"text": "Synthetic changed campaign evidence"})),))
+    before = len(calls)
+    before_requests = pg.execute("SELECT count(*) n FROM creator_group_requests").fetchone()["n"]
+    with pytest.raises(PermissionError):
+        matching.reprocess_unclassified(pg, employee)
+    counts = matching.reprocess_unclassified(pg, owner)
+    assert counts["admitted"] == 1 and counts["queued"] == 5
+    assert counts["active"] >= 1 and counts["protected"] >= 3 and counts["request_unknown"] == 1
+    assert len(calls) == before
+    assert pg.execute("SELECT count(*) n FROM creator_group_requests").fetchone()["n"] == before_requests
+    assert classification("oc_local_admit")["source_job_id"] == safe["id"]
+    assert float(classification("oc_local_admit")["confidence"]) == .98
+    assert "creator-group-purpose-v1.2" in evidence.COMPATIBLE_PROMPT_VERSIONS
+    assert classification("oc_manual_protected")["source"] == "manual"
+    assert pg.execute("SELECT * FROM creator_group_jobs WHERE id=%s", (active_id,)).fetchone() == active_before
+    assert pg.execute("SELECT count(*) n FROM creator_group_jobs WHERE chat_id='oc_request_unknown'").fetchone()[
+        "n"] == 1
+    for old in (low, unknown, stale, missing_old, incompatible):
+        latest = pg.execute("SELECT * FROM creator_group_jobs WHERE chat_id=%s "
+                            "ORDER BY created_at DESC,id DESC LIMIT 1", (old["chat_id"],)).fetchone()
+        assert latest["id"] != old["id"] and latest["status"] == "queued" and latest["source"] == "history"
+        assert latest["stats"]["force_reclassify"] and latest["result_ciphertext"] is None
+        assert pg.execute("SELECT result_ciphertext FROM creator_group_jobs WHERE id=%s", (old["id"],)).fetchone()[
+            "result_ciphertext"] == old["result_ciphertext"]
+    missing_latest = pg.execute("SELECT * FROM creator_group_jobs WHERE chat_id='oc_missing_old' "
+                                "ORDER BY created_at DESC,id DESC LIMIT 1").fetchone()
+    pg.execute("UPDATE creator_group_jobs SET not_before=NOW()+INTERVAL '1 day' "
+               "WHERE status='queued' AND id<>%s", (missing_latest["id"],))
+    pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,
+        body_ciphertext,message_create_time) VALUES('oc_missing_old','om_original_question','ou_creator','user','text',
+        %s,NOW()+INTERVAL '1 minute')""", (cipher.encrypt(json.dumps({"text": "Synthetic original sample question"})),))
+    pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+        VALUES(%s,'oc_missing_old','om_original_question')""", (owner,))
+    answer.update(purpose="support", confidence=.96, refs=["G1", "M1", "M2"])
+    assert matching.prepare_next(settings)
+    assert pg.execute("SELECT status,stats FROM creator_group_jobs WHERE id=%s", (missing_latest["id"],)).fetchone()[
+        "stats"]["force_reclassify"]
+    enable(key="sk-synthetic-reprocess-rotation")
+    assert matching.claim() is None  # Invalidation must not lose the explicit request for a new model score.
+    fresh_missing = prepared()
+    assert fresh_missing["chat_id"] == "oc_missing_old" and not fresh_missing["pack"]["coverage"]["missing_reply_ids"]
+    matching.run(fresh_missing, settings)
+    assert len(calls) == before + 1
+    assert float(classification("oc_missing_old")["confidence"]) == .96  # New evidence gets a new score, not old .98.
+    pg.execute("ROLLBACK TO SAVEPOINT group_context_reprocessing")
+
     # The HTTP boundary also applies live owner checks, CSRF and independent manual classification.
     actor = {"id": owner, "status": "active"}
     app = FastAPI()

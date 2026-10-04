@@ -8,11 +8,20 @@
 {% macro coverage(stats) %}
   {% if stats %}<div class="text-secondary small">证据 {{ stats.included_messages or stats.included or stats.messages or 0 }} 条{% if stats.omitted_messages or stats.omitted %} · {{ stats.omitted_messages or stats.omitted }} 条未纳入{% endif %}{% if stats.history_truncated %} · 历史读取已截断{% endif %}{% if stats.missing_reply_ids or stats.replies_missing %} · 部分回复缺少上下文{% endif %}{% if stats.backfill_complete is defined and not stats.backfill_complete %} · 历史同步未完成{% endif %}</div>{% endif %}
 {% endmacro %}
+{% macro admission(label, details) %}
+  {% set reasons = {'unavailable':'原消息未同步或不可读','budget':'上下文超出材料范围','cycle':'引用循环','depth':'引用层级超出范围'} %}
+  {% if label %}<div class="text-secondary small mb-2">{{ label }}</div>{% endif %}
+  {% if details %}
+    {% if details.missing_reply_reasons %}{% for ref,reason in details.missing_reply_reasons.items() %}<div class="text-secondary small">{{ ref }} · {{ reasons.get(reason,'上下文不可用') }}</div>{% endfor %}
+    {% elif details.missing_reply_ids %}<div class="text-secondary small">缺少上下文：{{ details.missing_reply_ids|join('、') }}</div>{% endif %}
+  {% endif %}
+{% endmacro %}
 <div class="page">
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="container-xl py-4">
     {% if evidence is not none %}
       <div class="d-flex justify-content-between align-items-center gap-3 mb-3"><h2 class="mb-0">{{ evidence.name or '未命名群' }} · 分类证据</h2><a class="btn" href="{{ base }}">返回分类列表</a></div>
+      {{ admission(evidence.admission_reason_label, evidence.admission_details|default(evidence.stats)) }}
       {{ coverage(evidence.stats) }}
       <div class="card mt-3 mb-3"><div class="card-body" id="evidence-G1"><div class="subheader">G1 · 群名称与结构</div><div>{{ evidence.pack.chat.name }}</div><div class="text-secondary small">{{ '专题群' if evidence.pack.chat.mode == 'topic' else '群聊' }}{% if evidence.pack.chat.member_count is not none %} · {{ evidence.pack.chat.member_count }} 位成员{% endif %}{% if evidence.pack.chat.member_snapshot_complete is defined and not evidence.pack.chat.member_snapshot_complete %} · 成员记录不完整{% endif %}</div></div></div>
       {% if evidence.result %}<div class="card mb-3"><div class="card-body">{{ purpose_badge(evidence.result.purpose, evidence.result.purpose_label) }} · {{ evidence.result.confidence_label }}{% if evidence.result.tags %}<div class="text-secondary small">{{ evidence.result.tags|join(' · ') }}</div>{% endif %}</div></div>{% endif %}
@@ -29,10 +38,11 @@
         {% set confidence = job.display_confidence|default(result.confidence_label if result and not job.confirmed_purpose else '—') %}
         <tr><td class="text-break">{{ job.name or '未命名群' }}</td><td>{{ purpose_badge(selected, job.display_label|default(purposes.get(selected))) }}</td>
           <td>{{ confidence }}</td>
-          <td><span class="badge bg-{{ {'classified':'green','pending':'blue','review':'yellow','error':'red'}.get(state,'secondary') }}-lt">{{ job.display_status|default({'classified':'已分类','pending':'处理中','review':'待核实','error':'异常'}.get(state,'待处理')) }}</span></td>
+          <td><span class="badge bg-{{ {'classified':'green','pending':'blue','review':'yellow','error':'red'}.get(state,'secondary') }}-lt">{{ job.display_status|default({'classified':'已分类','pending':'处理中','review':'待核实','error':'异常'}.get(state,'待处理')) }}</span>{% if state in ['review','error'] and job.admission_reason_label %}<div class="text-secondary small mt-1">{{ job.admission_reason_label }}</div>{% endif %}</td>
           <td>
             {% if state == 'review' and result and result.purpose != 'unknown' %}<form method="post" action="{{ base }}/chats/{{ job.chat_id|urlencode }}/classification" class="mb-2"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="page" value="{{ matching.page }}"><input type="hidden" name="source_job_id" value="{{ job.id }}"><input type="hidden" name="purpose" value="{{ result.purpose }}"><input type="hidden" name="tags" value="{{ result.tags|join(', ') }}"><button class="btn btn-sm btn-outline-primary" type="submit">采用建议</button></form>{% endif %}
             <details><summary class="text-secondary">调整</summary><div class="mt-3">
+              {{ admission(job.admission_reason_label, job.admission_details) }}
               <form class="d-flex flex-column gap-2" method="post" action="{{ base }}/chats/{{ job.chat_id|urlencode }}/classification">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="page" value="{{ matching.page }}">
                 <label class="form-label mb-0" for="purpose-{{ job.id }}">群类型</label><select class="form-select form-select-sm" id="purpose-{{ job.id }}" name="purpose">{% for code,label in purposes.items() %}<option value="{{ code }}" {% if code == selected %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>

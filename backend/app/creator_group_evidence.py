@@ -13,8 +13,10 @@ from .crypto import message_body_cipher
 from .openai_client import ModelOutputError
 
 CLASSIFICATION_VERSION = "creator-group-purpose-v1.1"
-PROMPT_VERSION = "creator-group-purpose-v1.2"
-COMPATIBLE_PROMPT_VERSIONS = frozenset({CLASSIFICATION_VERSION, PROMPT_VERSION})
+PROMPT_VERSION = "creator-group-purpose-v1.3"
+COMPATIBLE_PROMPT_VERSIONS = frozenset({
+    CLASSIFICATION_VERSION, "creator-group-purpose-v1.2", PROMPT_VERSION,
+})
 PURPOSES = {"support": "客服群", "community": "机构达人群", "training": "培训群",
             "category": "类目群", "campaign": "活动群", "unknown": "未确认"}
 MAX_MESSAGES, MAX_CHARS, SEARCH_LIMIT = 64, 24_000, 4_000
@@ -90,6 +92,7 @@ def build(conn, settings, chat_id):
                 material[source._key(row)] = {"row": row, "text": body, "body_hash": access._hash(raw)}
 
     read(rows.values())
+    looked_up = set(rows)
     ordered = sorted(material.values(), key=lambda i: (str(i["row"]["message_create_time"]), *source._key(i["row"])))
     count = len(ordered)
     # Chronological strata, not keyword pre-filtering. Every message can be an anchor.
@@ -101,6 +104,7 @@ def build(conn, settings, chat_id):
     context_ids = sorted(parent_ids | {mid for mid in predecessors.values() if mid})
     read(source._rows(conn, "m.chat_id=%s AND m.message_id=ANY(%s::text[])",
                       (chat_id, context_ids), len(context_ids)) if context_ids else [])
+    looked_up.update((chat_id, message_id) for message_id in context_ids)
     selected, seen, characters = [], set(), 0
     for anchor in [*anchors[-8:], *anchors[:4], *anchors]:
         row = anchor["row"]
@@ -112,7 +116,63 @@ def build(conn, settings, chat_id):
         selected.extend(bundle)
         seen.update(source._key(i["row"]) for i in bundle)
         characters += length
+    # A sampled reply or predecessor can itself reply to an older message. Complete every selected
+    # parent chain while the same model-input bounds still hold; partial chains remain background only.
+    edge_failures = {}
+    for root in [source._key(i["row"]) for i in selected]:
+        current, trail = root, set()
+        while current not in trail:
+            trail.add(current)
+            row = material[current]["row"]
+            if not row.get("parent_id"):
+                break
+            parent = (chat_id, row["parent_id"])
+            if parent in trail:  # Completeness is resolved below so all descendants inherit the cycle.
+                break
+            if parent not in material and parent not in looked_up:
+                read(source._rows(conn, "m.chat_id=%s AND m.message_id=ANY(%s::text[])",
+                                  (chat_id, [row["parent_id"]]), 1))
+                looked_up.add(parent)
+            if parent not in material:
+                edge_failures[current] = "unavailable"
+                break
+            if parent not in seen:
+                item = material[parent]
+                if len(selected) >= MAX_MESSAGES or characters + len(item["text"]) > MAX_CHARS:
+                    edge_failures[current] = "budget"
+                    break
+                selected.append(item)
+                seen.add(parent)
+                characters += len(item["text"])
+            current = parent
+
     selected.sort(key=lambda i: (str(i["row"]["message_create_time"]), *source._key(i["row"])))
+    selected_by_key = {source._key(i["row"]): i for i in selected}
+    context_status = {}
+    for start in selected_by_key:
+        current, path, path_set = start, [], set()
+        while current not in path_set:
+            if current in context_status:
+                reason = context_status[current]
+                break
+            path.append(current)
+            path_set.add(current)
+            if current in edge_failures:
+                reason = edge_failures[current]
+                break
+            row = selected_by_key[current]["row"]
+            if not row.get("parent_id"):
+                reason = None
+                break
+            parent = (chat_id, row["parent_id"])
+            if parent not in selected_by_key:
+                reason = "unavailable"
+                break
+            current = parent
+        else:
+            reason = "cycle"
+        for key in path:
+            context_status[key] = reason
     stats = {"searched_messages": len(rows), "readable_messages": len(material), "included_messages": len(selected),
              "omitted_messages": max(0, len(material) - len(selected)), "history_truncated": len(recent) > SEARCH_LIMIT,
              "placeholder_messages": len(placeholders),
@@ -132,7 +192,7 @@ def build(conn, settings, chat_id):
         refs.append({"kind": "person", "label": alias, "contact_id": None,
                      "identities": [identity] if identity else [],
                      "identity_hash": access._hash([identity] if identity else [])})
-    missing = []
+    missing, missing_reasons = [], {}
     creator_ids = {str(r["contact_id"]) for r in snapshot["creators"]}
     for item in selected:
         row = item["row"]
@@ -142,10 +202,12 @@ def build(conn, settings, chat_id):
                            "creator" if identity and str(identity["contact_id"]) in creator_ids else
                            "bot" if row.get("sender_type") in {"app", "bot"} else "external_or_unknown",
                    "at": str(row["message_create_time"]), "text": item["text"]}
+        if context_status[source._key(row)] is not None:
+            message["context_complete"] = False
+            missing.append(label)
+            missing_reasons[label] = context_status[source._key(row)]
         if row.get("parent_id"):
             message["reply"] = labels.get((chat_id, row["parent_id"]))
-            if not message["reply"]:
-                missing.append(label)
         if source._key(row) in predecessors:
             message["previous"] = labels.get((chat_id, predecessors[source._key(row)]))
         messages.append(message)
@@ -162,6 +224,8 @@ def build(conn, settings, chat_id):
     counts = {int(g["member_count"]) for g in complete if g["member_count"] is not None}
     role_counts = Counter(role for member in snapshot["members"] for role in member["roles"])
     stats.update(missing_reply_ids=missing, backfill_complete=any(g["backfill_complete"] for g in grants))
+    if missing_reasons:
+        stats["missing_reply_reasons"] = missing_reasons
     pack = {"chat": {"id": "G1", "name": chat["name"] or "未命名群", "mode": chat["chat_mode"],
                      "external": chat["external"], "member_count": next(iter(counts)) if len(counts) == 1 else None,
                      "known_creators": structure["creator"], "internal_members": structure["internal"],
@@ -188,7 +252,36 @@ def still_valid(conn, refs, settings, *, lightweight=False):
 
 
 def output_format(pack):
-    references = [pack["chat"]["id"], *(m["id"] for m in pack["messages"])]
+    messages = {message["id"]: message for message in pack["messages"]}
+    explicitly_incomplete = set(pack.get("coverage", {}).get("missing_reply_ids", []))
+    explicitly_incomplete.update(message_id for message_id, message in messages.items()
+                                 if message.get("context_complete") is False)
+    completeness = {}
+    for start in messages:
+        current, path, path_set = start, [], set()
+        while current not in path_set:
+            if current in explicitly_incomplete:
+                complete = False
+                break
+            if current in completeness:
+                complete = completeness[current]
+                break
+            message = messages.get(current)
+            if message is None:
+                complete = False
+                break
+            path.append(current)
+            path_set.add(current)
+            if "reply" not in message:
+                complete = True
+                break
+            current = message.get("reply")
+        else:
+            complete = False
+        for message_id in path:
+            completeness[message_id] = complete
+    references = [pack["chat"]["id"], *(message_id for message_id in messages
+                  if completeness.get(message_id, False))]
     schema = {"type": "object", "additionalProperties": False,
         "required": ["purpose", "confidence", "tags", "refs"], "properties": {
             "purpose": {"type": "string", "enum": list(PURPOSES)},
@@ -200,6 +293,11 @@ def output_format(pack):
 
 def validate(pack, result):
     schema = output_format(pack)["schema"]
+    # Paid v1.1/v1.2 results may cite a now-known incomplete message. Keep that citation and score
+    # visible to the admission fence; only reject references that are not actual material at all.
+    schema["properties"]["refs"]["items"]["enum"] = [
+        pack["chat"]["id"], *(message["id"] for message in pack["messages"]),
+    ]
     legacy = set(schema["required"]) | {"reason"}
     if isinstance(result, dict) and set(result) == legacy:
         if not isinstance(result["reason"], str) or len(result["reason"]) > 600:
@@ -211,7 +309,7 @@ def validate(pack, result):
     if len(result["refs"]) > 8:
         raise ModelOutputError("bounds")
     result = {**result, "tags": list(dict.fromkeys(t.strip() for t in result["tags"])),
-              "refs": list(dict.fromkeys(result["refs"]))}
+              "refs": list(result["refs"])}
     if result["purpose"] != "unknown" and not result["refs"]:
         result["purpose"] = "unknown"
     return result

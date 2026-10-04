@@ -169,10 +169,14 @@ def test_group_classification_table_keeps_auto_results_final_and_review_controls
                 {**common, "id": auto_id, "chat_id": "oc_auto", "name": "<script>fixture</script>",
                  "confirmed_purpose": "support", "display_purpose": "support", "display_label": "客服群",
                  "display_confidence": "98%", "display_status": "已分类", "display_state": "classified",
-                 "result": None, "has_evidence": True},
+                 "result": None, "has_evidence": True, "admission_reason_label": "已符合自动入库规则",
+                 "admission_details": {}},
                 {**common, "id": review_id, "chat_id": "oc_review", "name": "Review group",
                  "confirmed_purpose": None, "display_purpose": "training", "display_label": "培训群",
                  "display_confidence": "75%", "display_status": "待核实", "display_state": "review",
+                 "admission_reason_label": "回复上下文不完整",
+                 "admission_details": {"missing_reply_ids": ["M2"],
+                                       "missing_reply_reasons": {"M2": "unavailable", "<script>M3</script>": "budget"}},
                  "result": {"purpose": "training", "purpose_label": "培训群", "confidence_label": "75%",
                             "reason": "Long model explanation", "tags": ["writing"], "refs": ["M2"]}},
             ],
@@ -190,11 +194,32 @@ def test_group_classification_table_keeps_auto_results_final_and_review_controls
     assert re.search(r"<details>.*?/jobs/" + str(auto_id) + r"/evidence.*?</details>", auto_row, re.S)
     assert "<details open" not in html
     review_row = re.search(r'<tr><td class="text-break">Review group.*?</tr>', html, re.S).group(0)
+    assert "回复上下文不完整" in review_row.split("<details>", 1)[0]
+    assert "M2 · 原消息未同步或不可读" in review_row
+    assert "&lt;script&gt;M3&lt;/script&gt; · 上下文超出材料范围" in review_row
+    assert "<script>M3</script>" not in html
+    assert "原消息未同步或不可读" not in review_row.split("<details>", 1)[0]
     adoption = re.search(r"<form.*?采用建议</button></form>", review_row, re.S).group(0)
     assert f'name="source_job_id" value="{review_id}"' in adoption
     assert 'name="locked"' not in adoption
     assert all('name="csrf_token" value="fixture-csrf"' in form
                for form in re.findall(r"<form .*?</form>", html, re.S))
+    evidence_html = environment.get_template("admin/creator_groups.html").render(
+        authorization={"display_name": "Fixture Reviewer"}, admin_landing_path="/admin", admin_role="owner",
+        admin_permissions=admin.admin_permissions.PAGE_KEYS, permission_pages=admin.admin_permissions.PAGES,
+        active_page="ai", purposes=PURPOSES, evidence={
+            "name": "Evidence fixture", "admission_reason_label": "回复上下文不完整",
+            "stats": {"included_messages": 1, "missing_reply_ids": ["M2"],
+                      "missing_reply_reasons": {"M2": "unavailable", "<script>M3</script>": "depth"}},
+            "pack": {"chat": {"name": "Evidence fixture", "mode": "group", "member_count": 2},
+                     "messages": []},
+            "result": {"purpose": "training", "purpose_label": "培训群", "confidence_label": "75%",
+                       "reason": "Long model explanation", "tags": []},
+        },
+    )
+    assert "回复上下文不完整" in evidence_html and "M2 · 原消息未同步或不可读" in evidence_html
+    assert "&lt;script&gt;M3&lt;/script&gt; · 引用层级超出范围" in evidence_html
+    assert "Long model explanation" not in evidence_html and "<script>M3</script>" not in evidence_html
 
 
 def test_template_never_exposes_admin_to_a_viewer_and_escapes_private_json():
