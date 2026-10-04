@@ -94,8 +94,11 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
     assert answer["reply"] == question["id"]
     assert answer["previous"] == question["id"]
     assert pack["chats"][0]["mode"] == "p2p"
+    hints = {hint["h"]: hint["groups"] for hint in pack["evidence_hints"]}
     h1 = next(h["id"] for h in pack["handles"] if h["handle"] == "first.handle")
     h2 = next(h["id"] for h in pack["handles"] if h["handle"] == "backup_2")
+    assert {"kind": "qa", "refs": [question["id"], answer["id"]]} in hints[h1]
+    assert h2 not in hints  # The group title alone produces no ownership hint.
     result = {"creator": {"state": "known", "refs": []}, "links": [
         {"h": h1, "decision": "supported", "relation": "self_account", "period": "at_message",
          "code": "qa_confirm", "refs": [question["id"], answer["id"]], "needed": []},
@@ -187,6 +190,35 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
     assert not matcher.still_valid(pg, material["refs"], pilot.settings)
     assert matcher.still_valid(pg, refreshed["refs"], pilot.settings)
     material = refreshed
+    pg.execute("SAVEPOINT core_packing")
+    message("core_claim", "ou_creator", "My user name is first.handle", 80)
+    for index in range(8):
+        message(f"noisy_context_{index}", "ou_cm", f"Shipping update {index}", 80 + index / 100)
+    message("core_private_question", "ou_cm", "Can I have your TikTok handle please?", 90)
+    message("core_private_answer", "ou_creator", "backup_2", 91)
+    with monkeypatch.context() as limits:
+        limits.setattr(matcher, "MAX_MESSAGES", 4)
+        core = matcher.build(pg, pilot.settings, contact, catalog)
+    core_ids = {ref["message_id"]: ref["label"] for ref in core["refs"] if ref["kind"] == "message"}
+    assert {"core_claim", "video", "core_private_question", "core_private_answer"} <= core_ids.keys()
+    assert len(core["pack"]["messages"]) == 4  # Noisy neighbours cannot consume core QA's slots.
+    backup = next(h for h in core["pack"]["handles"] if h["handle"] == "backup_2")
+    core_hints = {hint["h"]: hint["groups"] for hint in core["pack"]["evidence_hints"]}
+    assert {"kind": "qa", "refs": [core_ids["core_private_question"], core_ids["core_private_answer"]]} in (
+        core_hints[backup["id"]])
+    assert matcher._support_groups(core["pack"], backup, []) == ([], [])  # Empty model refs never use all-pack hints.
+    core_result = {"creator": {"state": "known", "refs": []}, "links": [
+        {"h": h["id"], "decision": "review", "relation": "uncertain", "period": "unknown",
+         "code": "no_link_evidence", "refs": [], "needed": ["account_context"]} for h in core["pack"]["handles"]]}
+    backup_link = next(link for link in core_result["links"] if link["h"] == backup["id"])
+    backup_link.update(decision="supported", relation="self_account", period="at_message", code="qa_confirm",
+                       refs=[core_ids["core_private_question"], core_ids["core_private_answer"]], needed=[])
+    assert next(link for link in matcher.validate(core["pack"], core_result)["links"]
+                if link["h"] == backup["id"])["decision"] == "supported"
+    backup_link["refs"] = [core_ids["core_private_answer"]]
+    assert next(link for link in matcher.validate(core["pack"], core_result)["links"]
+                if link["h"] == backup["id"])["validation_error"] == "unconnected_owner_evidence"
+    pg.execute("ROLLBACK TO SAVEPOINT core_packing")
     # A skipped unauthorized/non-text predecessor must not create fake private adjacency.
     pg.execute("SAVEPOINT adjacency_check")
     message("unreadable_between", "ou_cm", "Unrelated topic", 0.5, observed=start - timedelta(days=2))
@@ -213,6 +245,12 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
     assert {"negative_question", "negative_answer", "pair", "transfer"} <= real_ids.keys()
     assert not updated["stats"]["critical_evidence_omitted"]
     assert updated["stats"]["critical_evidence_omitted_handles"] == []
+    assert all(1 <= len(hint["groups"]) <= 3 and all(set(group) == {"kind", "refs"}
+               and 1 <= len(group["refs"]) <= 2 for group in hint["groups"])
+               for hint in updated_pack["evidence_hints"])
+    assert len(next(hint for hint in updated_pack["evidence_hints"]
+                    if hint["h"] == next(h["id"] for h in updated_pack["handles"]
+                                         if h["handle"] == "first.handle"))["groups"]) == 3
     with monkeypatch.context() as limits:
         limits.setattr(matcher, "MAX_CHARS", 40)
         limited = matcher.build(pg, pilot.settings, contact, catalog)
@@ -339,6 +377,36 @@ def test_contact_matching_rejects_disconnected_and_third_party_claims():
                     "Please tell me your friend's username", "Did your TikTok handle .creator_1 receive samples?"):
         pack["messages"][0]["text"] = request
         assert matcher.validate(pack, qa)["links"][0]["decision"] == "review"
+    pack["messages"][0]["text"] = "Can I have your TikTok handle please?"
+    for answer in ("Our account is .creator_1", "Our team account is .creator_1",
+                   "The shared account is .creator_1", "The company account is .creator_1",
+                   "Our TikTok is .creator_1", "Our team's account is .creator_1"):
+        pack["messages"][1]["text"] = answer
+        assert matcher.validate(pack, qa)["links"][0]["decision"] == "review"
+        assert matcher._support_groups(pack, pack["handles"][0])[0] == []
+    pack["messages"][1]["text"] = "My account .creator_1 is shared"
+    self_claim = deepcopy(qa)
+    self_claim["links"][0].update(code="self_claim", refs=["M2"])
+    assert matcher.validate(pack, self_claim)["links"][0]["decision"] == "review"
+    pack["messages"][1]["text"] = "Thanks team, my account is .creator_1"
+    assert matcher.validate(pack, self_claim) == self_claim  # The word team alone is not shared ownership.
+    shared_history = deepcopy(pack)
+    shared_history["handles"].append({"id": "H2", "handle": "another_creator", "catalog_verified": True})
+    shared_history["messages"].extend([
+        {"id": "M3", "speaker": "U1", "chat": "G1", "at": "2026-10-01T01:02:00Z", "reply": None,
+         "text": "Our team account is .creator_1"},
+        {"id": "M4", "speaker": "U1", "chat": "G1", "at": "2026-10-01T01:03:00Z", "reply": None,
+         "text": "My account is another_creator"}])
+    shared_result = deepcopy(self_claim)
+    shared_result["links"].append({**self_claim["links"][0], "h": "H2", "refs": ["M4"]})
+    for statement in ("Our team account is .creator_1", "Our TikTok is .creator_1", "Our team's account is .creator_1"):
+        shared_history["messages"][2]["text"] = statement
+        outcomes = matcher.validate(shared_history, shared_result)["links"]
+        assert outcomes[0]["validation_error"] == "counterevidence" and "M3" in outcomes[0]["refs"]
+        assert outcomes[1]["decision"] == "supported"  # Shared ownership does not spread to a different account.
+    for statement in ("I shared the .creator_1 account link with you", "My account link is shared: .creator_1"):
+        shared_history["messages"][2]["text"] = statement
+        assert matcher.validate(shared_history, shared_result)["links"][0]["decision"] == "supported"
     contradictory = deepcopy(result)
     contradictory["links"][0].update(decision="review", relation="uncertain", period="unknown",
                                     code="out_of_catalog", refs=[], needed=[])

@@ -16,7 +16,7 @@ from . import handle_evidence as handles
 from .crypto import message_body_cipher
 from .openai_client import ModelOutputError
 
-PROMPT_VERSION = "creator-handle-research-v1.4"
+PROMPT_VERSION = "creator-handle-research-v1.5"
 MAX_MESSAGES, MAX_CHARS, MAX_HANDLES, SEARCH_LIMIT = 48, 20_000, 12, 20_000
 # A research hold is an explicit access restriction, not a negative identity finding.
 RESTRICTED_CONTACTS = frozenset({"6abf6bf9-12dc-4a22-9654-2010aa4c7785"})
@@ -57,6 +57,13 @@ _ACCOUNT_HISTORY = re.compile(
     r"\b(?:renam\w*|changed?\s+(?:my\s+)?(?:handle|user\s*name|account)|"
     r"(?:old|previous|former)\s+(?:handle|user\s*name|account)|no\s+longer\s+(?:use|own))\b|"
     r"改名|旧账号|旧帐号|以前的账号", re.I)
+_SHARED_ACCOUNT = re.compile(
+    r"\b(?:our\s+(?:(?:tiktok|tt|team(?:['’]s)?|other|new|main|backup)\s+)*|"
+    r"(?:shared|joint|team(?:['’]s)?|company(?:['’]s)?|business(?:['’]s)?)\s+)"
+    r"(?:account|page|handle|user\s*name)\b|\bours\b|"
+    r"\bour\s+(?:tiktok|tt)(?=\s+(?:is\b|https?://|@)|\s*[:=])|"
+    r"\b(?:account|page)(?:\s+(?!link\b|url\b)@?[A-Za-z0-9._]{1,64})?\s+(?:is|was)\s+(?:shared|joint)\b|"
+    r"我们的(?:账号|帐号|主页)|共同(?:账号|帐号)|团队(?:账号|帐号)", re.I)
 _COMPANY_READABLE = access._READABLE.replace("WHERE a.id=%s", "WHERE TRUE") + """ AND NOT EXISTS (
     SELECT 1 FROM lark_identities blocked WHERE blocked.open_id=m.sender_open_id
       AND blocked.contact_id='6abf6bf9-12dc-4a22-9654-2010aa4c7785'::uuid)"""
@@ -89,7 +96,7 @@ def output_format(pack=None):
         creator["state"]["enum"] = ["known"] if pack["creator_known"] else ["supported", "review", "not_supported"]
         if pack["creator_known"]:
             creator["refs"]["maxItems"] = 0
-    return {"type": "json_schema", "name": "creator_handle_v1_4", "strict": True, "schema": schema}
+    return {"type": "json_schema", "name": "creator_handle_v1_5", "strict": True, "schema": schema}
 
 
 def _denied(value):
@@ -224,16 +231,18 @@ def build(conn, settings, contact_id, catalog):
     if not candidates:
         return {**empty, "reason": "no_candidates", "stats": {"readable_messages": len(own)}}
     candidate_set = set(candidates)
+    previous_answers = dict(denial_previous)
     by_key = {_key(i["row"]): i for i in [*own, *parents]}
 
     def parent_key(item):
         row = item["row"]
         if row.get("parent_id"):
             return row["chat_id"], row["parent_id"]
-        key = row["chat_id"], denial_previous.get(_key(row))
+        key = row["chat_id"], previous_answers.get(_key(row))
         previous_item = by_key.get(key)
         if (previous_item and previous_item["row"]["sender_open_id"] not in open_ids
-                and _near(row, previous_item["row"])):
+                and _near(row, previous_item["row"])
+                and (_key(row) in denial_previous or _account_request(previous_item["text"]))):
             return key
         return row["chat_id"], None
 
@@ -246,6 +255,15 @@ def build(conn, settings, contact_id, catalog):
         _negative(i["text"], h, by_key.get(parent_key(i), {}).get("text"))
         for h in candidates)]
     anchors = list({_key(i["row"]): i for i in [*changes[:8], *ranked]}.values())[:24]
+    # Only selected private handle answers need an extra question lookup (at most 24, not whole history).
+    answer_previous = _previous_ids(conn, [i["row"] for i in anchors if i["row"].get("chat_mode") == "p2p"
+        and not i["row"].get("parent_id") and i["handles"] & candidate_set])
+    previous_answers.update(answer_previous)
+    previous_keys = {(chat, previous_id) for (chat, _), previous_id in answer_previous.items() if previous_id}
+    if previous_keys:
+        previous_rows = _rows(conn, "m.chat_id=ANY(%s::text[]) AND m.message_id=ANY(%s::text[])",
+                              (sorted({c for c, _ in previous_keys}), sorted({m for _, m in previous_keys})))
+        by_key.update({_key(i["row"]): i for i in readable(previous_rows)})
     # Small same-chat context windows preserve split links/statements and negative replies.
     context_rows = []
     for anchor in anchors[:12]:
@@ -256,22 +274,24 @@ def build(conn, settings, contact_id, catalog):
                 (row["chat_id"], row["message_create_time"], row["message_create_time"]), 12))
     for item in readable(context_rows):
         by_key[_key(item["row"])] = item
-    chosen, seen, chars = [], set(), 0
+    bundles, extras = [], {}
     for anchor in anchors:
         row = anchor["row"]
         anchor_parent = parent_key(anchor)
         # Add a parent and answer atomically: never clip one half to fit a token budget.
-        bundle = [by_key[anchor_parent], anchor] if anchor_parent in by_key else [anchor]
-        extras = [i for i in by_key.values() if i["row"]["chat_id"] == row["chat_id"]
-                  and _near(i["row"], row)]
-        for part in (bundle, *([extra] for extra in extras)):
-            part = [i for i in part if _key(i["row"]) not in seen]
-            size = sum(len(i["text"]) for i in part)
-            if len(chosen) + len(part) > MAX_MESSAGES or chars + size > MAX_CHARS:
-                continue
-            chosen.extend(part)
-            seen.update(_key(i["row"]) for i in part)
-            chars += size
+        bundles.append([by_key[anchor_parent], anchor] if anchor_parent in by_key else [anchor])
+        extras.update({_key(i["row"]): i for i in by_key.values() if i["row"]["chat_id"] == row["chat_id"]
+                       and _near(i["row"], row)})
+    chosen, seen, chars = [], set(), 0
+    # Fill core statements/whole QA first. Early anchors' neighbours cannot evict later core evidence.
+    for part in [*bundles, *([extra] for extra in extras.values())]:
+        part = [i for i in part if _key(i["row"]) not in seen]
+        size = sum(len(i["text"]) for i in part)
+        if len(chosen) + len(part) > MAX_MESSAGES or chars + size > MAX_CHARS:
+            continue
+        chosen.extend(part)
+        seen.update(_key(i["row"]) for i in part)
+        chars += size
     if not chosen:
         return {**empty, "reason": "material_limit", "stats": {"readable_messages": len(own)}}
     chosen.sort(key=lambda i: (str(i["row"]["message_create_time"]), *_key(i["row"])))
@@ -346,6 +366,11 @@ def build(conn, settings, contact_id, catalog):
     # Group names alone cannot satisfy any supported relation; wait without paying for a guess.
     if not any(_mentions(m["text"], h) for m in messages for h in candidates):
         return {**empty, "reason": "no_account_evidence", "stats": stats}
+    pack["evidence_hints"] = []
+    for candidate in pack["handles"]:
+        support, _ = _support_groups(pack, candidate)
+        if support:
+            pack["evidence_hints"].append({"h": candidate["id"], "groups": support[:3]})
     # Cache semantic input only. Fresh grant/body references remain mandatory before use.
     return {"pack": pack, "refs": refs, "fingerprint": access._hash([PROMPT_VERSION, pack]),
             "reason": "ready", "stats": stats}
@@ -387,7 +412,7 @@ def _parts(body):
 def _self_claim(body, handle=None):
     return any((_SELF.search(part) or handle is not None and re.search(
                    r"\bmy\s+(?:tiktok|tt)\s+@?" + re.escape(handle) + r"(?=\.*(?:[^A-Za-z0-9_.]|$))", part, re.I))
-               and not _NOT_OWNER.search(part) and not _denied(part)
+               and not _NOT_OWNER.search(part) and not _SHARED_ACCOUNT.search(part) and not _denied(part)
                and (handle is None or _mentions(part, handle)) for part in _parts(body))
 
 
@@ -413,7 +438,8 @@ def _account_request(body):
 
 
 def _negative(body, handle, parent=None):
-    direct = any(_OWNER_NEGATION.search(part) or _TRANSFER.search(part) and not re.search(
+    direct = any(_OWNER_NEGATION.search(part) or _SHARED_ACCOUNT.search(part)
+                 or _TRANSFER.search(part) and not re.search(
                      r"\btransfer\w*\s+(?:(?:to|over|another|a|an|the)\s+)*agenc(?:y|ies)\b", part, re.I)
                  or _NOT_OWNER.search(part) and (_QUESTION.search(part) or re.search(r"['’]s\b", part))
                  for part in _parts(body) if _mentions(part, handle))
@@ -430,6 +456,7 @@ def _qa(pack, answer, question, handle, candidates, refs, *, continuous=False):
             or question["speaker"] in {pack["target"], "unknown"}
             or not _account_request(question["text"])
             or _denied(answer["text"]) or _NOT_OWNER.search(answer["text"])
+            or any(_SHARED_ACCOUNT.search(part) for part in _parts(answer["text"]))
             or not (_CONFIRM.search(answer["text"]) or _mentions(answer["text"], handle))
             or not (_mentions(question["text"], handle) or _mentions(answer["text"], handle))
             or any(_mentions(answer["text"], h["handle"]) or
@@ -448,6 +475,43 @@ def _continuous(pack, answer, question):
             and answer["id"] not in pack["coverage"]["missing_reply_ids"]
             and chat.get("mode") == "p2p" and len(actors) == 2 and "unknown" not in actors
             and 0 < _timestamp(answer) - _timestamp(question) <= 300)
+
+
+def _support_groups(pack, candidate, refs=None):
+    """Locate rule-matching references, not semantic truth; validation supplies actual model refs."""
+    messages = {m["id"]: m for m in pack["messages"]}
+    allowed = messages.keys() if refs is None else set(refs)
+    allowed = set(allowed) - set(pack["coverage"]["excerpted_ids"])
+    own = sorted((m for m in pack["messages"] if m["speaker"] == pack["target"] and m["id"] in allowed),
+                 key=_timestamp, reverse=True)
+    handle = candidate["handle"]
+    others = [h for h in pack["handles"] if h["id"] != candidate["id"]]
+    groups, claims = [], {}
+
+    def add(kind, references, claim):
+        group = {"kind": kind, "refs": list(dict.fromkeys(references))}
+        if group not in groups:
+            groups.append(group)
+        claims[claim["id"]] = claim
+
+    for message in own:
+        if _self_claim(message["text"], handle):
+            add("self_claim", [message["id"]], message)
+    for answer in own:
+        parent = answer.get("reply") or answer.get("previous")
+        if parent in messages and _qa(pack, answer, messages[parent], handle, pack["handles"], allowed,
+                                      continuous=not bool(answer.get("reply"))):
+            add("qa", [parent, answer["id"]], answer)
+    for claim in own:
+        if (not _self_claim(claim["text"]) or _mentions(claim["text"], handle)
+                or any(_mentions(claim["text"], h["handle"]) for h in others)):
+            continue
+        for account in own:
+            if (_near_messages(claim, account) and _mentions(account["text"], handle)
+                    and not _THIRD_PARTY.search(account["text"]) and not _NOT_OWNER.search(account["text"])
+                    and not _denied(account["text"]) and not _SHARED_ACCOUNT.search(account["text"])):
+                add("self_claim", [account["id"], claim["id"]], claim)
+    return groups, list(claims.values())
 
 
 def validate(pack, result):
@@ -512,26 +576,11 @@ def validate(pack, result):
         if link["code"] not in {"self_claim", "qa_confirm", "own_page"}:
             _review(link, "owner_code", messages)
             continue
-        affirmative = [m for m in own if _self_claim(m["text"]) or _self_claim(m["text"], candidate["handle"])]
-        explicit = any(_self_claim(m["text"], candidate["handle"]) for m in affirmative)
-        split = any(_near_messages(a, b) for a in affirmative for b in own
-                    if not any(_mentions(a["text"], other["handle"]) for other in candidates.values()
-                               if other["id"] != link["h"])
-                    if _mentions(b["text"], candidate["handle"]) and not _THIRD_PARTY.search(b["text"])
-                    and not _NOT_OWNER.search(b["text"]))
-        qa_answers = [m for m in own if any(
-            _qa(pack, m, messages[parent], candidate["handle"], candidates.values(), link["refs"],
-                continuous=not bool(m.get("reply")))
-            for parent in [m.get("reply") or m.get("previous")] if parent in messages)]
-        qa = bool(qa_answers)
-        if link["code"] == "qa_confirm" and not qa or not (explicit or split or qa):
+        support, claims = _support_groups(pack, candidate, link["refs"])
+        if not support or link["code"] == "qa_confirm" and not any(g["kind"] == "qa" for g in support):
             _review(link, "unconnected_owner_evidence", messages)
             continue
-        connected_claims = [a for a in affirmative if _self_claim(a["text"], candidate["handle"]) or
-            not any(_mentions(a["text"], h["handle"]) for h in candidates.values() if h["id"] != link["h"])
-            and any(_near_messages(a, b) and _mentions(b["text"], candidate["handle"])
-                    and not _THIRD_PARTY.search(b["text"]) and not _NOT_OWNER.search(b["text"]) for b in own)]
-        counter_refs = _counterevidence(pack, candidate["handle"], [*connected_claims, *qa_answers])
+        counter_refs = _counterevidence(pack, candidate["handle"], claims)
         if counter_refs and link["period"] != "historical":
             # A model cannot select only a positive quote and ignore a later provided denial.
             own_counter = any(messages[ref]["speaker"] == pack["target"] for ref in counter_refs)

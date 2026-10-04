@@ -1,6 +1,6 @@
 {
   "type": "object",
-  "description": "达人—handle 关联协议 v1.4（creator-handle-research-v1.4）；保留 v1.2 输出字段和枚举，证据边界由 Prompt 与服务端校验执行。",
+  "description": "达人—handle 关联协议 v1.5（creator-handle-research-v1.5）；保留 v1.2 输出字段和枚举。输入短引用提示只定位原文，证据边界由 Prompt 与服务端校验执行。",
   "additionalProperties": false,
   "properties": {
     "creator": {
