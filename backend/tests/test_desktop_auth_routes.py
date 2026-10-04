@@ -19,6 +19,7 @@ from app import main
 
 START = "/auth/desktop/start"
 EXCHANGE = "/auth/desktop/exchange"
+POLL = "/auth/desktop/poll"
 
 
 @pytest.fixture
@@ -113,6 +114,7 @@ def test_loopback_pkce_and_state_reject_untrusted_start_parameters(auth_api):
         {"redirect_uri": "http://127.0.0.1:65536/callback"},
         {"redirect_uri": "http://127.0.0.1:54321/%63allback"},
         {"code_challenge_method": "plain"}, {"code_challenge": "x" * 42}, {"state": "short"},
+        {"delivery": "unknown"}, {"delivery": "poll"}, {"redirect_uri": "desktop_poll"},
     ]
     for change in invalid:
         result = api.client.get(START, params=dict(api.params, **change), headers=api.headers)
@@ -189,3 +191,60 @@ def test_exchange_body_is_bounded_strict_and_never_consumes_on_bad_input(auth_ap
     assert api.client.post(EXCHANGE, data=exchange).status_code == 415
     assert api.pg.execute("SELECT count(*) AS n FROM desktop_auth_codes").fetchone()["n"] == 1
     assert api.client.post(EXCHANGE, json=exchange).status_code == 200
+
+
+def test_poll_approval_pkce_pending_strict_body_and_single_delivery(auth_api):
+    api = auth_api
+    params = dict(api.params, delivery="poll", redirect_uri="desktop_poll")
+    body = {"code_verifier": api.verifier, "redirect_uri": "desktop_poll"}
+    pending = api.client.post(POLL, json=body)
+    assert pending.status_code == 202 and pending.json() == {"status": "pending"}
+    assert pending.headers["cache-control"] == "no-store, max-age=0"
+    page = api.client.get(START, params=params, headers=api.headers)
+    assert page.status_code == 200 and "Current &lt;CM&gt;" in page.text
+    assert "http://127.0.0.1" not in page.headers["content-security-policy"]
+    form = dict(params, csrf_token=api.csrf, confirm="yes")
+    assert api.client.post(START, data=dict(form, csrf_token="wrong"), headers=api.headers).status_code == 403
+    for _ in range(2):
+        approved = api.client.post(START, data=form, headers=api.headers, follow_redirects=False)
+        assert approved.status_code == 200 and "location" not in approved.headers
+        assert "身份已确认，请返回桌面助手" in approved.text and api.session not in approved.text
+    assert api.pg.execute("SELECT count(*) AS n FROM desktop_auth_codes").fetchone()["n"] == 1
+    wrong = api.client.post(POLL, json=dict(body, code_verifier="w" * 43))
+    assert wrong.status_code == 202 and wrong.json() == {"status": "pending"}
+    assert api.client.post(POLL, json=dict(body, state=params["state"])).status_code == 400
+    assert api.client.post(POLL, json=dict(body, redirect_uri=api.params["redirect_uri"])).status_code == 400
+    delivered = api.client.post(POLL, json=body)
+    assert delivered.status_code == 200 and delivered.json()["session_token"] == api.session
+    assert delivered.json()["authorization"] == {"id": str(api.actor), "display_name": "Current <CM>"}
+    assert api.client.post(POLL, json=body).status_code == 202
+    assert api.pg.execute("SELECT count(*) AS n FROM desktop_auth_codes").fetchone()["n"] == 0
+    assert api.pg.execute("SELECT count(*) AS n FROM web_sessions").fetchone()["n"] == 1
+    assert api.client.post(START, data=form, headers=api.headers).status_code == 200
+    api.pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (api.actor,))
+    api.pg.commit()
+    assert api.client.post(POLL, json=body).json() == {"status": "pending"}
+
+
+def test_concurrent_poll_approvals_keep_one_grant_and_only_one_poll_consumes(auth_api):
+    api = auth_api
+    form = dict(api.params, delivery="poll", redirect_uri="desktop_poll", csrf_token=api.csrf, confirm="yes")
+    body = {"code_verifier": api.verifier, "redirect_uri": "desktop_poll"}
+
+    def approve_poll(_):
+        with TestClient(api.app, base_url="https://larkbot.ttapp.help") as client:
+            return client.post(START, data=form, headers=api.headers)
+
+    def receive_poll(_):
+        with TestClient(api.app, base_url="https://larkbot.ttapp.help") as client:
+            return client.post(POLL, json=body)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        approvals = list(pool.map(approve_poll, range(2)))
+    assert [result.status_code for result in approvals] == [200, 200]
+    assert api.pg.execute("SELECT count(*) AS n FROM desktop_auth_codes").fetchone()["n"] == 1
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(receive_poll, range(2)))
+    assert sorted(result.status_code for result in results) == [200, 202]
+    assert next(result for result in results if result.status_code == 200).json()["session_token"] == api.session
+    assert api.pg.execute("SELECT count(*) AS n FROM desktop_auth_codes").fetchone()["n"] == 0

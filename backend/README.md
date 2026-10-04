@@ -37,7 +37,8 @@ python3 -m venv .venv
 `web_sessions` 对应的原始不透明会话，不是 Lark access token 或 OpenAI Key。校验复用登录会话的
 哈希、有效期和 CM active 状态，不新增 Lark OAuth。网页 Cookie 调用还必须提供现有 `X-CSRF-Token`。
 桌面设置可打开 `/auth/desktop/start`，由现有网页登录账号进行 CSRF 确认。
-60 秒一次性码绑定 S256 PKCE 与严格 loopback 回调，经 `/auth/desktop/exchange` 换回同一网页会话；
+新版通过 HTTPS `/auth/desktop/poll`，用随机私有 verifier 的 S256 PKCE 领取同一网页会话；
+未确认返回 202，确认记录有效 60 秒且只能领取一次。旧版严格 loopback 与 code/exchange 保留兼容；
 不新建会话或延长期限，原会话过期、删除或 CM 撤销后立即失效。
 桌面使用系统加密存储保存会话并限定正式域名；本机退出只清理密文，网页登录不受影响。
 

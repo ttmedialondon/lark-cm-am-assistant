@@ -62,7 +62,7 @@ def _redirect(value):
 
 def _start_params(value):
     required = {"redirect_uri", "state", "code_challenge"}
-    if not required <= value.keys() or value.keys() - required - {"code_challenge_method"}:
+    if not required <= value.keys() or value.keys() - required - {"code_challenge_method", "delivery"}:
         raise invalid()
     if value.get("code_challenge_method", "S256") != "S256":
         raise invalid()
@@ -70,8 +70,17 @@ def _start_params(value):
         raise invalid()
     if not isinstance(value["code_challenge"], str) or not _PKCE.fullmatch(value["code_challenge"]):
         raise invalid()
-    return {"redirect_uri": _redirect(value["redirect_uri"]), "state": value["state"],
-            "code_challenge": value["code_challenge"]}
+    delivery = value.get("delivery", "loopback")
+    if delivery not in {"loopback", "poll"}:
+        raise invalid()
+    redirect = value["redirect_uri"]
+    if delivery == "poll":
+        if redirect != "desktop_poll":
+            raise invalid()
+    else:
+        redirect = _redirect(redirect)
+    return {"redirect_uri": redirect, "state": value["state"],
+            "code_challenge": value["code_challenge"], "delivery": delivery}
 
 
 def _single_values(value):
@@ -100,6 +109,8 @@ def _issue(actor, raw_session, params):
     code = secrets.token_urlsafe(32)
     sealed = _cipher(get_settings().token_encryption_key).encrypt(raw_session)
     with connection() as conn, conn.transaction():
+        if params["delivery"] == "poll":
+            _poll_lock(conn, params["code_challenge"])
         session = conn.execute(
             """SELECT s.expires_at FROM web_sessions s JOIN authorizations a ON a.id=s.authorization_id
                WHERE s.session_hash=%s AND a.id=%s AND a.status='active' AND s.expires_at>clock_timestamp()
@@ -108,6 +119,9 @@ def _issue(actor, raw_session, params):
         if not session:
             raise DesktopAuthError("unauthorized", "网页登录已失效，请使用有效的现有登录。", 401)
         conn.execute("DELETE FROM desktop_auth_codes WHERE expires_at<=clock_timestamp()")
+        if params["delivery"] == "poll":
+            conn.execute("DELETE FROM desktop_auth_codes WHERE code_challenge=%s AND redirect_uri='desktop_poll'",
+                         (params["code_challenge"],))
         conn.execute(
             """INSERT INTO desktop_auth_codes(code_hash,authorization_id,session_hash,session_ciphertext,
                                               code_challenge,redirect_uri,expires_at)
@@ -118,14 +132,31 @@ def _issue(actor, raw_session, params):
     return code
 
 
+def _challenge(verifier):
+    return base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).decode("ascii").rstrip("=")
+
+
+def _consume(conn, row):
+    failure = DesktopAuthError("invalid_desktop_code", "连接确认已过期或无效，请从桌面助手重新发起。")
+    try:
+        raw_session = _cipher(get_settings().token_encryption_key).decrypt(row["session_ciphertext"])
+    except (InvalidTag, ValueError, UnicodeError):
+        raise failure from None
+    if not hmac.compare_digest(_hash(raw_session), row["session_hash"]):
+        raise failure
+    conn.execute("DELETE FROM desktop_auth_codes WHERE code_hash=%s", (row["code_hash"],))
+    return {"session_token": raw_session,
+            "authorization": {"id": str(row["authorization_id"]), "display_name": row["display_name"]},
+            "expires_at": row["session_expires_at"].isoformat()}
+
+
 def _exchange(value):
     if not isinstance(value, dict) or set(value) != {"code", "code_verifier", "redirect_uri"}:
         raise invalid()
     if any(not isinstance(value[key], str) or not _PKCE.fullmatch(value[key]) for key in ("code", "code_verifier")):
         raise invalid()
     redirect = _redirect(value["redirect_uri"])
-    challenge = base64.urlsafe_b64encode(hashlib.sha256(value["code_verifier"].encode("ascii")).digest())
-    challenge = challenge.decode("ascii").rstrip("=")
+    challenge = _challenge(value["code_verifier"])
     failure = DesktopAuthError("invalid_desktop_code", "连接确认已过期或无效，请从桌面助手重新发起。")
     with connection() as conn, conn.transaction():
         row = conn.execute(
@@ -138,16 +169,31 @@ def _exchange(value):
         ).fetchone()
         if not row or row["redirect_uri"] != redirect or not hmac.compare_digest(row["code_challenge"], challenge):
             raise failure
-        try:
-            raw_session = _cipher(get_settings().token_encryption_key).decrypt(row["session_ciphertext"])
-        except (InvalidTag, ValueError, UnicodeError):
-            raise failure from None
-        if not hmac.compare_digest(_hash(raw_session), row["session_hash"]):
-            raise failure
-        conn.execute("DELETE FROM desktop_auth_codes WHERE code_hash=%s", (_hash(value["code"]),))
-        return {"session_token": raw_session,
-                "authorization": {"id": str(row["authorization_id"]), "display_name": row["display_name"]},
-                "expires_at": row["session_expires_at"].isoformat()}
+        return _consume(conn, row)
+
+
+def _poll_lock(conn, challenge):
+    # One short transaction per flow also serializes duplicate browser approvals.
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", ("desktop_poll:" + challenge,))
+
+
+def _poll(value):
+    if (not isinstance(value, dict) or set(value) != {"code_verifier", "redirect_uri"}
+            or value["redirect_uri"] != "desktop_poll" or not isinstance(value["code_verifier"], str)
+            or not _PKCE.fullmatch(value["code_verifier"])):
+        raise invalid()
+    challenge = _challenge(value["code_verifier"])
+    with connection() as conn, conn.transaction():
+        _poll_lock(conn, challenge)
+        row = conn.execute(
+            """SELECT c.*,s.expires_at AS session_expires_at,a.display_name FROM desktop_auth_codes c
+               JOIN web_sessions s ON s.session_hash=c.session_hash AND s.authorization_id=c.authorization_id
+               JOIN authorizations a ON a.id=c.authorization_id
+               WHERE c.code_challenge=%s AND c.redirect_uri='desktop_poll' AND c.expires_at>clock_timestamp()
+                 AND s.expires_at>clock_timestamp() AND a.status='active'
+               ORDER BY c.created_at DESC LIMIT 1 FOR UPDATE OF c FOR SHARE OF s,a""", (challenge,),
+        ).fetchone()
+        return _consume(conn, row) if row else None
 
 
 async def _body(request, content_type):
@@ -180,6 +226,14 @@ def _unique(pairs):
     return result
 
 
+async def _json_body(request):
+    body = await _body(request, "application/json")
+    try:
+        return json.loads(body, object_pairs_hook=_unique)
+    except (ValueError, RecursionError):
+        raise invalid() from None
+
+
 def create_router(*, current_authorization, csrf_token):
     router = APIRouter(prefix="/auth/desktop", include_in_schema=False)
 
@@ -198,7 +252,7 @@ def create_router(*, current_authorization, csrf_token):
                     '<p>确认后桌面助手将使用此账号生成回复，不会重新授权 Lark。不是您的账号时，请关闭此页。</p>'
                     f'<form method="post" action="/auth/desktop/start">{hidden}'
                     f'<button type="submit">确认使用 {name} 连接桌面助手</button></form></html>')
-            return secure(HTMLResponse(page), params["redirect_uri"])
+            return secure(HTMLResponse(page), params["redirect_uri"] if params["delivery"] == "loopback" else None)
         except DesktopAuthError as exc:
             return denied(exc)
 
@@ -208,7 +262,7 @@ def create_router(*, current_authorization, csrf_token):
             actor = await run_in_threadpool(_actor, request, current_authorization)
             body = await _body(request, "application/x-www-form-urlencoded")
             try:
-                form = _single_values(parse_qs(body, keep_blank_values=True, strict_parsing=True, max_num_fields=6))
+                form = _single_values(parse_qs(body, keep_blank_values=True, strict_parsing=True, max_num_fields=7))
             except ValueError:
                 raise invalid() from None
             if not csrf_matches(form, csrf_token(actor)):
@@ -218,6 +272,9 @@ def create_router(*, current_authorization, csrf_token):
             form.pop("csrf_token", None)
             params = _start_params(form)
             code = await run_in_threadpool(_issue, actor, request.cookies[SESSION_COOKIE], params)
+            if params["delivery"] == "poll":
+                return secure(HTMLResponse('<!doctype html><html lang="zh"><meta charset="utf-8">'
+                                           '<title>身份已确认</title><h1>身份已确认，请返回桌面助手</h1></html>'))
             callback = params["redirect_uri"] + "?" + urlencode({"code": code, "state": params["state"]})
             return secure(RedirectResponse(callback, status_code=303), params["redirect_uri"])
         except DesktopAuthError as exc:
@@ -226,13 +283,17 @@ def create_router(*, current_authorization, csrf_token):
     @router.post("/exchange")
     async def exchange(request: Request):
         try:
-            body = await _body(request, "application/json")
-            try:
-                value = json.loads(body, object_pairs_hook=_unique)
-            except (ValueError, RecursionError):
-                raise invalid() from None
-            result = await run_in_threadpool(_exchange, value)
+            result = await run_in_threadpool(_exchange, await _json_body(request))
             return secure(JSONResponse(result))
+        except DesktopAuthError as exc:
+            return denied(exc)
+
+    @router.post("/poll")
+    async def poll(request: Request):
+        try:
+            result = await run_in_threadpool(_poll, await _json_body(request))
+            return secure(JSONResponse(result if result is not None else {"status": "pending"},
+                                       status_code=200 if result is not None else 202))
         except DesktopAuthError as exc:
             return denied(exc)
 
