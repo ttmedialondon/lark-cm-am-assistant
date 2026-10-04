@@ -16,13 +16,13 @@ from . import handle_evidence as handles
 from .crypto import message_body_cipher
 from .openai_client import ModelOutputError
 
-PROMPT_VERSION = "creator-handle-research-v1.3"
+PROMPT_VERSION = "creator-handle-research-v1.4"
 MAX_MESSAGES, MAX_CHARS, MAX_HANDLES, SEARCH_LIMIT = 48, 20_000, 12, 20_000
 # A research hold is an explicit access restriction, not a negative identity finding.
 RESTRICTED_CONTACTS = frozenset({"6abf6bf9-12dc-4a22-9654-2010aa4c7785"})
 _TOKEN = re.compile(r"(?<![A-Za-z0-9._])[A-Za-z0-9._]{1,64}(?![A-Za-z0-9._])", re.ASCII)
 _SELF = re.compile(
-    r"\b(?:my\s+(?:(?:own|other|second|backup|new|old|tiktok|tt)\s+)*(?:account|page|handle|username)|"
+    r"\b(?:my\s+(?:(?:own|other|second|backup|new|old|tiktok|tt)\s+)*(?:account|page|handle|user\s*name)|"
     r"my\s+(?:tiktok|tt)(?=\s+(?:is\b|https?://|@)|\s*[:=])|"
     r"(?:both|these|they|that|this|it)(?:\s+(?:are|is)|['’]s)?\s+(?:mine|my)|"
     r"mine\b|i\s+(?:have|own|use)\s+(?:\w+\s+){0,3}accounts?)\b|"
@@ -37,7 +37,7 @@ _NOT_OWNER = re.compile(
     re.I,
 )
 _CONFIRM = re.compile(r"\b(?:yes|yep|yeah|correct|right|mine)\b|是的|正确|没错|我的", re.I)
-_QUESTION = re.compile(r"\b(?:tiktok|tt|handle|username|account|page)\b|账号|用户名|主页", re.I)
+_QUESTION = re.compile(r"\b(?:tiktok|tt|handles?|user\s*names?|account|page)\b|账号|用户名|主页", re.I)
 _THIRD_PARTY = re.compile(r"\b(?:friend|client|referred|manage|operate|approve|approval)\b|朋友|转发|审批|代运营", re.I)
 _DENIAL = re.compile(r"\b(?:no|not|isn't|isn’t|incorrect|wrong)\b|不是|不对", re.I)
 _COURTESY = re.compile(r"\bno\s+(?:worries|problem)\b", re.I)
@@ -46,8 +46,17 @@ VALIDATION_ERRORS = frozenset({
     "owner_code", "unconnected_owner_evidence", "counterevidence", "out_of_catalog",
 })
 _TRANSFER = re.compile(
-    r"\b(?:transfer\w*|sold|deleted|shared|banned|suspended)\b.*\b(?:account|page)\b|"
-    r"\b(?:account|page)\b.*\b(?:transfer\w*|sold|deleted|shared|banned|suspended)\b|转让|封禁|注销", re.I)
+    r"\b(?:transfer\w*|sold|deleted|banned|suspended)\b.*\b(?:account|page)\b|"
+    r"\b(?:account|page)\b.*\b(?:transfer\w*|sold|deleted|banned|suspended)\b|转让|封禁|注销", re.I)
+_OWNER_NEGATION = re.compile(
+    r"\b(?:not|isn't|isn’t|wasn't|wasn’t)\s+(?:mine|my|me|owned)\b|"
+    r"\bmy\s+(?:(?:tiktok|tt)\s+)?(?:account|page|handle|user\s*name)\s+(?:is|was)\s+not\b|"
+    r"\bi\s+(?:do\s+not|don't|don’t|no\s+longer)\s+(?:own|use|operate|manage)\b|"
+    r"不是我的|不是本人|不属于我", re.I)
+_ACCOUNT_HISTORY = re.compile(
+    r"\b(?:renam\w*|changed?\s+(?:my\s+)?(?:handle|user\s*name|account)|"
+    r"(?:old|previous|former)\s+(?:handle|user\s*name|account)|no\s+longer\s+(?:use|own))\b|"
+    r"改名|旧账号|旧帐号|以前的账号", re.I)
 _COMPANY_READABLE = access._READABLE.replace("WHERE a.id=%s", "WHERE TRUE") + """ AND NOT EXISTS (
     SELECT 1 FROM lark_identities blocked WHERE blocked.open_id=m.sender_open_id
       AND blocked.contact_id='6abf6bf9-12dc-4a22-9654-2010aa4c7785'::uuid)"""
@@ -80,7 +89,7 @@ def output_format(pack=None):
         creator["state"]["enum"] = ["known"] if pack["creator_known"] else ["supported", "review", "not_supported"]
         if pack["creator_known"]:
             creator["refs"]["maxItems"] = 0
-    return {"type": "json_schema", "name": "creator_handle_v1_3", "strict": True, "schema": schema}
+    return {"type": "json_schema", "name": "creator_handle_v1_4", "strict": True, "schema": schema}
 
 
 def _denied(value):
@@ -134,6 +143,19 @@ def _scope_hash(row):
     return access._hash([str(row["authorization_id"]), row["authorization_open_id"], row["body_consent_at"]])
 
 
+def _previous_ids(conn, rows):
+    """Use the actual conversation predecessor, including unreadable/non-text messages."""
+    if not rows:
+        return {}
+    return {_key(r): r["previous_id"] for r in conn.execute(
+        """SELECT m.chat_id,m.message_id,(SELECT p.message_id FROM chat_messages p
+             WHERE p.chat_id=m.chat_id AND (p.message_create_time,p.message_id)<(m.message_create_time,m.message_id)
+             ORDER BY p.message_create_time DESC,p.message_id DESC LIMIT 1) AS previous_id
+           FROM chat_messages m WHERE m.chat_id=ANY(%s::text[]) AND m.message_id=ANY(%s::text[])""",
+        (sorted({r["chat_id"] for r in rows}), [r["message_id"] for r in rows]),
+    ).fetchall()}
+
+
 def build(conn, settings, contact_id, catalog):
     """Prepare bounded material locally. Missing evidence never means a non-creator."""
     contact_id = str(contact_id)
@@ -147,7 +169,7 @@ def build(conn, settings, contact_id, catalog):
         return empty
     open_ids = [i["open_id"] for i in identities]
     chats = conn.execute(
-        """SELECT DISTINCT c.chat_id,c.name FROM chats c
+        """SELECT DISTINCT c.chat_id,c.name,c.chat_mode FROM chats c
            JOIN authorization_chats ac ON ac.chat_id=c.chat_id JOIN authorizations a ON a.id=ac.authorization_id
            WHERE a.status='active' AND a.body_consent_at IS NOT NULL AND ac.is_visible AND ac.sync_enabled
              AND COALESCE(c.chat_status,'normal')='normal' AND (
@@ -183,6 +205,14 @@ def build(conn, settings, contact_id, catalog):
         "AND child.message_id=ANY(%s::text[]) AND child.sender_open_id=ANY(%s::text[]))",
         ([message_id for _, message_id in parent_keys], open_ids)) if parent_keys else []
     parents = readable(parent_rows)
+    denial_previous = _previous_ids(conn, [i["row"] for i in own if i["row"].get("chat_mode") == "p2p"
+        and not i["row"].get("parent_id")
+        and re.match(r"\s*(?:no\b|not\s+(?:mine|my)\b|不是我的|不对)", i["text"], re.I)])
+    previous_keys = {(chat, previous_id) for (chat, _), previous_id in denial_previous.items() if previous_id}
+    if previous_keys:
+        parents.extend(readable(_rows(conn, "m.chat_id=ANY(%s::text[]) AND m.message_id=ANY(%s::text[])",
+                                      (sorted({c for c, _ in previous_keys}), sorted({m for _, m in previous_keys})))))
+    parents = list({_key(i["row"]): i for i in parents}.values())
     scores = Counter()
     for item in [*own, *parents]:
         for handle in item["handles"]:
@@ -195,16 +225,26 @@ def build(conn, settings, contact_id, catalog):
         return {**empty, "reason": "no_candidates", "stats": {"readable_messages": len(own)}}
     candidate_set = set(candidates)
     by_key = {_key(i["row"]): i for i in [*own, *parents]}
+
+    def parent_key(item):
+        row = item["row"]
+        if row.get("parent_id"):
+            return row["chat_id"], row["parent_id"]
+        key = row["chat_id"], denial_previous.get(_key(row))
+        previous_item = by_key.get(key)
+        if (previous_item and previous_item["row"]["sender_open_id"] not in open_ids
+                and _near(row, previous_item["row"])):
+            return key
+        return row["chat_id"], None
+
     ranked = sorted(own, key=lambda i: (
-        bool(i["handles"] & candidate_set or by_key.get((i["row"]["chat_id"], i["row"].get("parent_id")), {})
+        bool(i["handles"] & candidate_set or by_key.get(parent_key(i), {})
              .get("handles", set()) & candidate_set), bool(handles._CHANGE.search(i["text"])),
         bool(_SELF.search(i["text"])), bool(text._IMPORTANT.search(i["text"])),
         str(i["row"]["message_create_time"])), reverse=True)
-    changes = [i for i in ranked if handles._CHANGE.search(i["text"]) or _NOT_OWNER.search(i["text"])
-               or _TRANSFER.search(i["text"]) or _denied(i["text"]) and (
-                   i["handles"] & candidate_set or _QUESTION.search(i["text"]) or
-                   by_key.get((i["row"]["chat_id"], i["row"].get("parent_id")), {})
-                   .get("handles", set()) & candidate_set)]
+    changes = [i for i in ranked if handles._CHANGE.search(i["text"]) or any(
+        _negative(i["text"], h, by_key.get(parent_key(i), {}).get("text"))
+        for h in candidates)]
     anchors = list({_key(i["row"]): i for i in [*changes[:8], *ranked]}.values())[:24]
     # Small same-chat context windows preserve split links/statements and negative replies.
     context_rows = []
@@ -219,9 +259,9 @@ def build(conn, settings, contact_id, catalog):
     chosen, seen, chars = [], set(), 0
     for anchor in anchors:
         row = anchor["row"]
-        parent_key = (row["chat_id"], row.get("parent_id"))
+        anchor_parent = parent_key(anchor)
         # Add a parent and answer atomically: never clip one half to fit a token budget.
-        bundle = [by_key[parent_key], anchor] if parent_key in by_key else [anchor]
+        bundle = [by_key[anchor_parent], anchor] if anchor_parent in by_key else [anchor]
         extras = [i for i in by_key.values() if i["row"]["chat_id"] == row["chat_id"]
                   and _near(i["row"], row)]
         for part in (bundle, *([extra] for extra in extras)):
@@ -237,15 +277,18 @@ def build(conn, settings, contact_id, catalog):
     chosen.sort(key=lambda i: (str(i["row"]["message_create_time"]), *_key(i["row"])))
     speakers = conn.execute("SELECT " + _SPEAKER_COLUMNS
                             + " FROM lark_identities WHERE open_id=ANY(%s::text[]) ORDER BY open_id",
-                            (sorted({i["row"]["sender_open_id"] for i in chosen if i["row"]["sender_open_id"]}),)
+                            (sorted({i["row"]["sender_open_id"] for i in by_key.values()
+                                     if i["row"]["sender_open_id"]}),)
                             ).fetchall()
+    speaker_types = {s["open_id"]: s for s in speakers}
+    chosen_speakers = {i["row"]["sender_open_id"] for i in chosen}
     aliases = {oid: "U1" for oid in open_ids}
     people = [{"id": "U1", "role": "external"}]
     refs = [{"kind": "person", "label": "U1", "contact_id": contact_id,
              "identities": identities, "identity_hash": access._hash(identities)}]
     for identity in speakers:
         oid = identity["open_id"]
-        if oid in aliases:
+        if oid in aliases or oid not in chosen_speakers:
             continue
         alias = "U" + str(len(people) + 1)
         aliases[oid] = alias
@@ -256,6 +299,7 @@ def build(conn, settings, contact_id, catalog):
         refs.append({"kind": "person", "label": alias, "identities": [identity],
                      "identity_hash": access._hash([identity])})
     labels = {_key(i["row"]): f"M{index}" for index, i in enumerate(chosen, 1)}
+    previous = _previous_ids(conn, [i["row"] for i in chosen if i["row"].get("chat_mode") == "p2p"])
     used_chats = [c for c in chats if c["chat_id"] in {i["row"]["chat_id"] for i in chosen}]
     groups = {c["chat_id"]: f"G{index}" for index, c in enumerate(used_chats, 1)}
     messages = []
@@ -264,10 +308,12 @@ def build(conn, settings, contact_id, catalog):
         messages.append({"id": label, "chat": groups[row["chat_id"]],
                          "speaker": aliases.get(row["sender_open_id"], "unknown"),
                          "at": str(row["message_create_time"]) if row["message_create_time"] else None,
-                         "reply": labels.get((row["chat_id"], row.get("parent_id"))), "text": item["text"]})
+                         "reply": labels.get((row["chat_id"], row.get("parent_id"))),
+                         "previous": labels.get((row["chat_id"], previous.get(_key(row)))), "text": item["text"]})
         refs.append({"kind": "message", "label": label, "chat_id": row["chat_id"], "message_id": row["message_id"],
                      "authorization_id": str(row["authorization_id"]), "scope_hash": _scope_hash(row),
-                     "body_hash": item["body_hash"], "relation_hash": access._relation_hash(row)})
+                     "body_hash": item["body_hash"], "relation_hash": access._relation_hash(row),
+                     **({"previous_id": previous.get(_key(row))} if row.get("chat_mode") == "p2p" else {})})
     refs.extend({"kind": "chat", "label": groups[c["chat_id"]], "chat_id": c["chat_id"],
                  "name_hash": access._hash(c["name"])} for c in used_chats)
     known = bool(conn.execute("SELECT 1 FROM contact_roles WHERE contact_id=%s "
@@ -275,15 +321,28 @@ def build(conn, settings, contact_id, catalog):
                               (contact_id,)).fetchone())
     pack = {"target": "U1", "creator_known": known,
             "handles": [{"id": f"H{i}", "handle": h, "catalog_verified": True} for i, h in enumerate(candidates, 1)],
-            "people": people, "chats": [{"id": groups[c["chat_id"]], "name": c["name"] or ""} for c in used_chats],
+            "people": people, "chats": [{"id": groups[c["chat_id"]], "name": c["name"] or "",
+                                          "mode": c["chat_mode"] or "unknown"} for c in used_chats],
             "messages": messages, "coverage": {"full_history": False,
                 "missing_reply_ids": [labels[_key(i["row"])] for i in chosen
                                       if i["row"].get("parent_id") and
                                       (i["row"]["chat_id"], i["row"]["parent_id"]) not in labels],
                 "excerpted_ids": []}}
+    # Generic history/candidate limits are not account-specific counterevidence.
+    omitted_handles = sorted({h for h in candidates for item in by_key.values()
+        if _key(item["row"]) not in seen and (
+            item["row"]["sender_open_id"] in open_ids and _negative(item["text"], h,
+                by_key.get(parent_key(item), {}).get("text"))
+            or item["row"]["sender_open_id"] in open_ids and any(
+                _mentions(part, h) and _ACCOUNT_HISTORY.search(part) for part in _parts(item["text"]))
+            or item["row"]["sender_open_id"] not in open_ids
+               and speaker_types.get(item["row"]["sender_open_id"], {}).get("tenant_classification") != "internal"
+               and speaker_types.get(item["row"]["sender_open_id"], {}).get("identity_type", "user") == "user"
+               and _self_claim(item["text"], h))})
     stats = {"messages": len(messages), "body_chars": chars, "readable_messages": len(own),
              "history_truncated": truncated, "candidates_omitted": max(0, len(scores) - len(candidates)),
-             "critical_evidence_omitted": any(_key(i["row"]) not in seen for i in changes)}
+             "critical_evidence_omitted": bool(omitted_handles),
+             "critical_evidence_omitted_handles": omitted_handles}
     # Group names alone cannot satisfy any supported relation; wait without paying for a guess.
     if not any(_mentions(m["text"], h) for m in messages for h in candidates):
         return {**empty, "reason": "no_account_evidence", "stats": stats}
@@ -321,6 +380,76 @@ def _near_messages(left, right):
         return False
 
 
+def _parts(body):
+    return re.split(r"[\n,;!?]|\.\s+|\b(?:but|however|and\s+(?:my|i|now|the|it))\b", body, flags=re.I)
+
+
+def _self_claim(body, handle=None):
+    return any((_SELF.search(part) or handle is not None and re.search(
+                   r"\bmy\s+(?:tiktok|tt)\s+@?" + re.escape(handle) + r"(?=\.*(?:[^A-Za-z0-9_.]|$))", part, re.I))
+               and not _NOT_OWNER.search(part) and not _denied(part)
+               and (handle is None or _mentions(part, handle)) for part in _parts(body))
+
+
+def _account_request(body):
+    """A request/confirmation of the person's account, not a sample or award question."""
+    for part in _parts(body):
+        for match in re.finditer(r"\b(?:what|which|send|share|provide|tell|drop|confirm)\b|"
+                                 r"\b(?:can|could|may)\s+i\s+(?:please\s+)?(?:have|get|see)\b|"
+                                 r"\b(?:is|was)\s+(?:your|this|that|it)\b|请|哪个|是", part, re.I):
+            request = re.split(r"\b(?:if|unless|when|because)\b", part[match.start():], maxsplit=1, flags=re.I)[0]
+            if re.match(r"(?:is|was)\b", request, re.I) and re.search(
+                    r"\b(?:receive\w*|samples?|prizes?|awards?|invites?|eligible|messages?)\b", request, re.I):
+                continue
+            if (not re.search(r"\b(?:not|don't|don’t)\s*$", part[:match.start()], re.I)
+                    and re.search(r"\b(?:handles?|user\s*names?)\b|"
+                                  r"\b(?:tiktok|tt)\s+(?:account|page)\b|"
+                                  r"\b(?:is|was)\s+your\s+(?:tiktok|tt)\b|账号|用户名", request, re.I)
+                    and not re.search(r"\b(?:bank|seller|shop|business|payment)\s+account\b", request, re.I)
+                    and not _THIRD_PARTY.search(request) and not _denied(request)
+                    and re.search(r"\b(?:your|yours)\b|你的|您的|\b(?:send|share|provide|tell|drop)\b", request, re.I)):
+                return True
+    return False
+
+
+def _negative(body, handle, parent=None):
+    direct = any(_OWNER_NEGATION.search(part) or _TRANSFER.search(part) and not re.search(
+                     r"\btransfer\w*\s+(?:(?:to|over|another|a|an|the)\s+)*agenc(?:y|ies)\b", part, re.I)
+                 or _NOT_OWNER.search(part) and (_QUESTION.search(part) or re.search(r"['’]s\b", part))
+                 for part in _parts(body) if _mentions(part, handle))
+    # A bare denial answers an ownership question; "Not yet" about a prize is not one.
+    reply = (parent and _mentions(parent, handle) and _account_request(parent)
+             and re.search(r"^(?:no\b(?!\s+(?:worries|problem)\b)|(?:that|this|it)\s+(?:is\s+)?not\s+mine\b|"
+                           r"not\s+(?:mine|my)\b|不是我的|不对)", body.strip(), re.I)
+             and not re.search(r"\b(?:not\s+(?:yet|sure)|no\s+(?:message|sample|invite|prize))\b", body, re.I))
+    return bool(direct or reply)
+
+
+def _qa(pack, answer, question, handle, candidates, refs, *, continuous=False):
+    if (question["id"] not in refs or question["chat"] != answer["chat"]
+            or question["speaker"] in {pack["target"], "unknown"}
+            or not _account_request(question["text"])
+            or _denied(answer["text"]) or _NOT_OWNER.search(answer["text"])
+            or not (_CONFIRM.search(answer["text"]) or _mentions(answer["text"], handle))
+            or not (_mentions(question["text"], handle) or _mentions(answer["text"], handle))
+            or any(_mentions(answer["text"], h["handle"]) or
+                   not _mentions(answer["text"], handle) and _mentions(question["text"], h["handle"])
+                   for h in candidates if h["handle"] != handle)):
+        return False
+    if not continuous:
+        return True
+    return _continuous(pack, answer, question)
+
+
+def _continuous(pack, answer, question):
+    chat = next((c for c in pack.get("chats", []) if c["id"] == answer["chat"]), {})
+    actors = {m["speaker"] for m in pack["messages"] if m["chat"] == answer["chat"]}
+    return (question["chat"] == answer["chat"] and question["speaker"] not in {pack["target"], "unknown"}
+            and answer["id"] not in pack["coverage"]["missing_reply_ids"]
+            and chat.get("mode") == "p2p" and len(actors) == 2 and "unknown" not in actors
+            and 0 < _timestamp(answer) - _timestamp(question) <= 300)
+
+
 def validate(pack, result):
     """Validate protocol and minimum connected evidence; model semantics still require review."""
     result = deepcopy(result)
@@ -356,9 +485,14 @@ def validate(pack, result):
         if len(link["needed"]) != len(set(link["needed"])):
             _review(link, "needed", messages)
             continue
+        candidate = candidates[link["h"]]
+        if candidate["catalog_verified"] and link["code"] == "out_of_catalog":
+            # Curva membership is a server fact. Correct the reason without upgrading evidence.
+            _review(link, "unsupported_evidence", messages)
+            link["code"] = "no_link_evidence"
+            continue
         if link["decision"] != "supported":
             continue
-        candidate = candidates[link["h"]]
         cited = [messages[ref] for ref in link["refs"]]
         own = [m for m in cited if m["speaker"] == pack["target"]]
         if not candidate["catalog_verified"]:
@@ -378,33 +512,26 @@ def validate(pack, result):
         if link["code"] not in {"self_claim", "qa_confirm", "own_page"}:
             _review(link, "owner_code", messages)
             continue
-        affirmative = [m for m in own if _SELF.search(m["text"]) and not _NOT_OWNER.search(m["text"])
-                       and not _denied(m["text"])]
-        explicit = any(_mentions(m["text"], candidate["handle"]) for m in affirmative)
+        affirmative = [m for m in own if _self_claim(m["text"]) or _self_claim(m["text"], candidate["handle"])]
+        explicit = any(_self_claim(m["text"], candidate["handle"]) for m in affirmative)
         split = any(_near_messages(a, b) for a in affirmative for b in own
                     if not any(_mentions(a["text"], other["handle"]) for other in candidates.values()
                                if other["id"] != link["h"])
                     if _mentions(b["text"], candidate["handle"]) and not _THIRD_PARTY.search(b["text"])
                     and not _NOT_OWNER.search(b["text"]))
-        qa = any(m["reply"] in link["refs"]
-                 and (_CONFIRM.search(m["text"]) or _mentions(m["text"], candidate["handle"]))
-                 and not _denied(m["text"]) and not _NOT_OWNER.search(m["text"])
-                 and _QUESTION.search(messages[m["reply"]]["text"])
-                 and re.search(r"\b(?:your|yours)\b|你的|您的", messages[m["reply"]]["text"], re.I)
-                 and not _THIRD_PARTY.search(messages[m["reply"]]["text"])
-                 and not _denied(messages[m["reply"]]["text"])
-                 and (_mentions(m["text"], candidate["handle"]) or not any(
-                     _mentions(m["text"], other["handle"]) for other in candidates.values()
-                     if other["id"] != link["h"]))
-                 and (_mentions(messages[m["reply"]]["text"], candidate["handle"])
-                      or _mentions(m["text"], candidate["handle"]))
-                 and messages[m["reply"]]["chat"] == m["chat"]
-                 and messages[m["reply"]]["speaker"] != pack["target"]
-                 for m in own if m["reply"])
+        qa_answers = [m for m in own if any(
+            _qa(pack, m, messages[parent], candidate["handle"], candidates.values(), link["refs"],
+                continuous=not bool(m.get("reply")))
+            for parent in [m.get("reply") or m.get("previous")] if parent in messages)]
+        qa = bool(qa_answers)
         if link["code"] == "qa_confirm" and not qa or not (explicit or split or qa):
             _review(link, "unconnected_owner_evidence", messages)
             continue
-        counter_refs = _counterevidence(pack, candidate["handle"], affirmative or own)
+        connected_claims = [a for a in affirmative if _self_claim(a["text"], candidate["handle"]) or
+            not any(_mentions(a["text"], h["handle"]) for h in candidates.values() if h["id"] != link["h"])
+            and any(_near_messages(a, b) and _mentions(b["text"], candidate["handle"])
+                    and not _THIRD_PARTY.search(b["text"]) and not _NOT_OWNER.search(b["text"]) for b in own)]
+        counter_refs = _counterevidence(pack, candidate["handle"], [*connected_claims, *qa_answers])
         if counter_refs and link["period"] != "historical":
             # A model cannot select only a positive quote and ignore a later provided denial.
             own_counter = any(messages[ref]["speaker"] == pack["target"] for ref in counter_refs)
@@ -432,20 +559,18 @@ def _counterevidence(pack, handle, claims):
     conflicts = []
     for message in pack["messages"]:
         body = message["text"]
-        parts = re.split(r"[\n,;!?]|\.\s+|\b(?:but|however|and\s+(?:my|i|now|the|it))\b", body, flags=re.I)
-        exact_parts = [part for part in parts if _mentions(part, handle)]
         parent = messages.get(message.get("reply"))
-        denial_reply = (parent and _mentions(parent["text"], handle) and _denied(body)
-                        and not _mentions(body, handle))
+        if not parent and not message.get("reply"):
+            previous = messages.get(message.get("previous"))
+            if previous and _continuous(pack, message, previous):
+                parent = previous
         if message["speaker"] == pack["target"]:
-            negative = denial_reply or any(_NOT_OWNER.search(part) or _TRANSFER.search(part)
-                                          or _denied(part) for part in exact_parts)
+            negative = _negative(body, handle, parent["text"] if parent else None)
             if negative and (_timestamp(message) >= claim_time or not message.get("at")):
                 conflicts.append(message["id"])
-                if denial_reply:
+                if parent and not _mentions(body, handle):
                     conflicts.append(parent["id"])
-        elif (actors.get(message["speaker"], "unknown") in {"external", "unknown"} and exact_parts
-              and _SELF.search(body) and not _NOT_OWNER.search(body) and not _denied(body)):
+        elif (actors.get(message["speaker"], "unknown") in {"external", "unknown"} and _self_claim(body, handle)):
             conflicts.append(message["id"])
     return list(dict.fromkeys(conflicts))
 
@@ -488,10 +613,13 @@ def still_valid(conn, refs, settings=None):
         (sorted({r["authorization_id"] for r in messages}), [r["chat_id"] for r in chats],
          [r["message_id"] for r in messages])).fetchall() if messages else []
     current = {(r["chat_id"], r["message_id"], str(r["authorization_id"])): r for r in rows}
+    previous = _previous_ids(conn, [r for r in messages if "previous_id" in r])
     for ref in messages:
         row = current.get((ref["chat_id"], ref["message_id"], ref["authorization_id"]))
         raw = text._decrypt_body(cipher, row["body_ciphertext"]) if row else None
         if not row or raw is None or (_scope_hash(row) != ref["scope_hash"] or access._hash(raw) != ref["body_hash"]
-                       or access._relation_hash(row) != ref["relation_hash"]):
+                       or access._relation_hash(row) != ref["relation_hash"]
+                       or "previous_id" in ref
+                       and previous.get((ref["chat_id"], ref["message_id"])) != ref["previous_id"]):
             return False
     return bool(messages)

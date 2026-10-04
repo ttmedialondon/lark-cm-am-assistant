@@ -319,6 +319,24 @@ def _needs_review(result, stats):
     ) or any(stats.get(key) for key in ("history_truncated", "candidates_omitted", "critical_evidence_omitted"))
 
 
+def auto_link_eligible(pack, link, stats):
+    """Evidence eligibility; live authorization and account conflicts are checked separately."""
+    if not (
+        pack["creator_known"]
+        and link["decision"] == "supported"
+        and link["relation"] == "self_account"
+        and link["period"] == "at_message"
+        and link["code"] in {"self_claim", "qa_confirm", "own_page"}
+        and not link["needed"]
+    ):
+        return False
+    if "critical_evidence_omitted_handles" not in stats:
+        return not any(stats.get(k) for k in ("history_truncated", "candidates_omitted", "critical_evidence_omitted"))
+    omitted = stats["critical_evidence_omitted_handles"]
+    handle = next(h["handle"] for h in pack["handles"] if h["id"] == link["h"])
+    return isinstance(omitted, list) and handle not in omitted
+
+
 def _apply_links(conn, job, pack, result, stats, refs, settings, catalog_version):
     """Add only verified self-account links; preserve all existing human decisions."""
     by_handle = {h["id"]: h["handle"] for h in pack["handles"]}
@@ -383,21 +401,13 @@ def _apply_links(conn, job, pack, result, stats, refs, settings, catalog_version
         else []
     ):
         accounts.setdefault(account["handle"], []).append(account["id"])
-    clean = not any(stats.get(k) for k in ("history_truncated", "candidates_omitted", "critical_evidence_omitted"))
     associated, added = [], []
     for link in claims:
         handle = by_handle[link["h"]]
         if conflicts[handle] or handle in other_claims or len(accounts.get(handle, [])) > 1:
             link.update(decision="review", relation="uncertain", code="conflict")
             continue
-        if not (
-            clean
-            and pack["creator_known"]
-            and link["period"] == "at_message"
-            and link["code"] in {"self_claim", "qa_confirm", "own_page"}
-            and not link["needed"]
-            and not set(link["refs"]) & set(pack["coverage"]["missing_reply_ids"])
-        ):
+        if not auto_link_eligible(pack, link, stats):
             continue
         account_id = accounts[handle][0] if accounts.get(handle) else None
         if account_id is None:

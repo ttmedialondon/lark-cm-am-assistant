@@ -1,6 +1,7 @@
 """Durable matching workflow on isolated PostgreSQL; provider responses are synthetic."""
 
 import json
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 from uuid import uuid4
@@ -28,6 +29,7 @@ def matching_flow(pg, pilot, monkeypatch):
         period="at_message",
         needed=[],
         stats={},
+        legacy_stats=False,
         missing_reply_ids=[],
         material_version=1,
         reference_version=1,
@@ -46,14 +48,14 @@ def matching_flow(pg, pilot, monkeypatch):
                 {"id": "H2", "handle": "backup_2", "catalog_verified": True},
             ],
             "people": [{"id": "U1", "role": "external"}],
-            "chats": [{"id": "G1", "name": "Synthetic test conversation"}],
+            "chats": [{"id": "G1", "name": "Synthetic test conversation", "mode": "group"}],
             "messages": [
                 {
                     "id": "M1",
                     "chat": "G1",
                     "speaker": "U1",
                     "at": "2026-10-03T10:00:00+00:00",
-                    "reply": None,
+                    "reply": "M_absent" if "M1" in state.missing_reply_ids else None,
                     "text": "My TikTok account is first.handle",
                 },
                 {
@@ -61,7 +63,7 @@ def matching_flow(pg, pilot, monkeypatch):
                     "chat": "G1",
                     "speaker": "U1",
                     "at": "2026-10-03T10:01:00+00:00",
-                    "reply": None,
+                    "reply": "M_absent" if "M2" in state.missing_reply_ids else None,
                     "text": "My backup account is backup_2",
                 },
             ],
@@ -75,7 +77,11 @@ def matching_flow(pg, pilot, monkeypatch):
             ],
             "fingerprint": f"synthetic-{contact}-{state.material_version}",
             "reason": "ready",
-            "stats": {"messages": 2, **state.stats},
+            "stats": {
+                "messages": 2,
+                **({"critical_evidence_omitted_handles": []} if not state.legacy_stats else {}),
+                **state.stats,
+            },
         }
 
     def respond(_config, _key, pack, _contact, **kwargs):
@@ -385,29 +391,32 @@ def test_review_and_incomplete_evidence_never_auto_link_and_cache_can_reuse(pg, 
     flow = matching_flow
     flow.enable()
     # A supported answer is not enough if it describes historical ownership or still needs evidence.
-    for period, needed, stats, missing in (
-        ("historical", [], {}, []),
-        ("at_message", ["recent_state"], {}, []),
-        ("at_message", [], {"history_truncated": True}, []),
-        ("at_message", [], {"candidates_omitted": 1}, []),
-        ("at_message", [], {"critical_evidence_omitted": True}, []),
-        ("at_message", [], {}, ["M1", "M2"]),
+    for period, needed, stats, legacy in (
+        ("historical", [], {}, False),
+        ("at_message", ["recent_state"], {}, False),
+        ("at_message", [], {"history_truncated": True}, True),
+        ("at_message", [], {"candidates_omitted": 1}, True),
+        ("at_message", [], {"critical_evidence_omitted": True}, True),
     ):
-        flow.period, flow.needed, flow.stats, flow.missing_reply_ids = period, needed, stats, missing
+        flow.period, flow.needed, flow.stats, flow.legacy_stats = period, needed, stats, legacy
         flow.material_version += 1
         matching.run(_prepared_job(pg, flow), flow.settings)
         assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
         assert not pg.execute("SELECT 1 FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
-    flow.period, flow.needed, flow.stats, flow.missing_reply_ids = "at_message", [], {}, []
+    # Typed coverage limits only the affected handle; other strong claims are not collateral damage.
+    flow.period, flow.needed, flow.legacy_stats = "at_message", [], False
+    flow.stats = {"history_truncated": True, "candidates_omitted": 1, "critical_evidence_omitted": True,
+                  "critical_evidence_omitted_handles": ["backup_2"]}
+    # This message independently names its own account: an unrelated unavailable reply is unnecessary.
+    flow.missing_reply_ids = ["M1"]
     flow.material_version += 1
-    flow.review = True
     job = _prepared_job(pg, flow)
     matching.run(job, flow.settings)
     assert (
         pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone()["status"]
         == "review_required"
     )
-    # Weak evidence for the backup account does not block an independently proven primary account.
+    # Both model claims are strong, but only the backup account has a critical evidence gap.
     assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == ["first.handle"]
     original_audit = pg.execute(
         "SELECT metadata FROM audit_events WHERE action='creator_handle_auto_linked'"
@@ -432,14 +441,11 @@ def test_review_and_incomplete_evidence_never_auto_link_and_cache_can_reuse(pg, 
     assert pg.execute("SELECT refs FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone()["refs"] == [
         {"kind": "message", "label": label, "synthetic_version": 2} for label in ("M1", "M2")
     ]
-    # Coverage alone still requires review, even if the model's selected links all support ownership.
-    flow.review = False
+    # Legacy snapshots without per-handle coverage retain conservative behavior, including cache reuse.
+    flow.legacy_stats, flow.missing_reply_ids = True, []
+    flow.stats = {"critical_evidence_omitted": True}
     flow.material_version += 1
     job = _prepared_job(pg, flow)
-    pg.execute(
-        "UPDATE creator_handle_jobs SET stats=stats || '{\"critical_evidence_omitted\":true}'::jsonb WHERE id=%s",
-        (job["id"],),
-    )
     matching.run(job, flow.settings)
     _enqueue(pg, flow.contact)
     assert matching.prepare_next(flow.settings)
@@ -568,6 +574,20 @@ def test_role_and_chat_events_shared_slots_and_catalog_changes(pg, matching_flow
         "status": "queued",
         "result_ciphertext": None,
     }
+    # Curva can also change while the final account/person writer lock is being acquired.
+    flow.before_response = None
+    assert matching.prepare_next(flow.settings)
+    job = matching.claim()
+    versions = iter(("catalog-v3", "catalog-v3", "catalog-v4"))
+    monkeypatch.setattr(matching, "catalog", lambda: (frozenset({"first.handle", "backup_2"}), next(versions)))
+    matching.run(job, flow.settings)
+    assert len(flow.calls) == 2
+    assert pg.execute("SELECT status,result_ciphertext FROM creator_handle_jobs WHERE id=%s", (job_id,)).fetchone() == {
+        "status": "queued",
+        "result_ciphertext": None,
+    }
+    assert pg.execute("SELECT billed_tokens FROM creator_handle_requests WHERE id=%s",
+                      (job["reservation_id"],)).fetchone()["billed_tokens"] == 150
     assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
     assert not pg.execute("SELECT 1 FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
 
@@ -622,3 +642,53 @@ def test_failed_diagnostics_partial_results_and_queue_cleanup_preserve_data(pg, 
         "SELECT count(*) n,sum(billed_tokens) tokens FROM creator_handle_requests WHERE job_id IS NULL"
     ).fetchone()
     assert retained == {"n": 2, "tokens": 300}
+
+
+def test_disabled_probe_retains_paid_diagnostics_when_postcall_catalog_fails(pg, matching_flow, monkeypatch):
+    from scripts import probe_creator_handle_matching as probe
+
+    flow = matching_flow
+    flow.enable()
+    pg.execute("UPDATE ai_feature_configs SET enabled=FALSE WHERE feature=%s", (matching.FEATURE,))
+    before = _snapshot(
+        pg,
+        ("contacts", "contact_roles", "contact_assignments", "social_accounts",
+         "contact_social_accounts", "creator_account_assignments"),
+    )
+
+    def execute(sql, params=None):
+        # The fixture owns the outer transaction; probe transactions become isolated savepoints.
+        if isinstance(sql, str) and sql.startswith("SET TRANSACTION"):
+            return None
+        return pg.execute(sql, params)
+
+    proxy = SimpleNamespace(execute=execute, commit=lambda: None, transaction=pg.transaction)
+    monkeypatch.setattr(probe, "connection", lambda: nullcontext(proxy))
+    monkeypatch.setattr(probe, "get_settings", lambda: flow.settings)
+    monkeypatch.setattr(sys, "argv", ["probe_creator_handle_matching", "--contact-id", str(flow.contact)])
+    catalogs = []
+
+    def catalog():
+        catalogs.append(True)
+        if len(catalogs) == 3:
+            raise OSError("synthetic postcall catalog failure")
+        return frozenset({"first.handle", "backup_2"}), "catalog-v1"
+
+    monkeypatch.setattr(matching, "catalog", catalog)
+    try:
+        with pytest.raises(OSError, match="synthetic postcall catalog failure"):
+            probe.main()
+    finally:
+        pg.execute("SELECT pg_advisory_unlock(%s)", (ai_dispatch._ADMISSION_LOCK,))
+    assert len(flow.calls) == 1 and len(catalogs) == 3
+    logged = pg.execute("SELECT * FROM creator_handle_requests").fetchone()
+    assert logged["job_id"] is None
+    assert (logged["input_tokens"], logged["output_tokens"], logged["billed_tokens"]) == (100, 50, 150)
+    assert logged["response_id"] == "resp_synthetic" and logged["request_id"] == "req_synthetic"
+    diagnostic = json.loads(creator_data.cipher(flow.settings).decrypt(logged["response_ciphertext"]))
+    assert diagnostic["probe"]["contact_id"] == str(flow.contact) and diagnostic["validated"]["links"]
+    assert _snapshot(pg, before.keys()) == before
+    assert not pg.execute("SELECT enabled FROM ai_feature_configs WHERE feature=%s", (matching.FEATURE,)).fetchone()[
+        "enabled"
+    ]
+    assert not pg.execute("SELECT 1 FROM creator_handle_jobs").fetchone()
