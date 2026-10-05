@@ -875,7 +875,9 @@ def test_recurring_periods_keep_history_and_cm_scope_separate(pg, seeded):
         summary_periods.selection(pg, s.ids['tester'], second_cm)
 
 
-def test_creator_enrollment_backfills_closed_periods_without_repaying_or_replacing_others(pg, seeded, monkeypatch):
+def test_creator_enrollment_backfills_closed_periods_without_repaying_or_replacing_others(
+    pg, seeded, monkeypatch, caplog,
+):
     s = seeded
 
     def finish():
@@ -903,7 +905,8 @@ def test_creator_enrollment_backfills_closed_periods_without_repaying_or_replaci
 
     def old_tasks():
         return pg.execute('''SELECT id,input_fingerprint,status,is_current,result_ciphertext,
-            checkpoint_ciphertext,processed_messages,total_messages FROM offhours_summary_tasks
+            checkpoint_ciphertext,processed_messages,total_messages,attempts,usage,model,response_id
+            FROM offhours_summary_tasks
             WHERE run_id=%s AND (chat_id='chat' OR contact_id=%s) ORDER BY id''',
             (run['id'], s.ids['person'])).fetchall()
 
@@ -1059,15 +1062,155 @@ def test_creator_enrollment_backfills_closed_periods_without_repaying_or_replaci
     assert pending_merge and pending_merge['status'] == 'queued'
     assert pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
     pg.execute('SAVEPOINT backfill_late_merge_change')
-    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='new-request'",
-               (s.cipher.encrypt(json.dumps({'text': 'A later update before the merge'})),))
+    stale_source = pg.execute('''SELECT id,input_fingerprint,status,result_ciphertext,checkpoint_ciphertext,
+        processed_messages,total_messages,attempts,usage,model,response_id FROM offhours_summary_tasks
+        WHERE id=%s''', (rebuilt['id'],)).fetchone()
+    assert stale_source['status'] == 'succeeded'
+    pg.execute("UPDATE lark_identities SET display_name='Updated creator name' WHERE contact_id=%s",
+               (s.ids['other'],))
+    target_account = uuid4()
+    pg.execute("INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) "
+               "VALUES(%s,'tiktok','updated_creator','@updated_creator')", (target_account,))
+    pg.execute("INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source) "
+               "VALUES(%s,%s,'owner','confirmed','cm_confirmation')", (s.ids['other'], target_account))
     merge_job = ai.claim_next_summary()
     assert merge_job['id'] == pending_merge['id']
     ai.run_claimed_summary(merge_job, s.settings)
     assert len(s.calls) == 2 and pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
     assert pg.execute('SELECT status FROM offhours_summary_tasks WHERE id=%s',
                       (merge_job['id'],)).fetchone()['status'] == 'cancelled'
+    cancelled = pg.execute('SELECT status,attempts,input_fingerprint FROM offhours_summary_tasks WHERE id=%s',
+                           (merge_job['id'],)).fetchone()
+    for _ in range(3):
+        summary_dialogues.schedule_merges(pg, s.settings)
+        assert pg.execute('SELECT status,attempts,input_fingerprint FROM offhours_summary_tasks WHERE id=%s',
+                          (merge_job['id'],)).fetchone() == cancelled
+    fresh_source = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND chat_id='new-creator' "
+                              'AND is_current', (run['id'],)).fetchone()
+    assert fresh_source['id'] != stale_source['id'] and fresh_source['status'] == 'queued'
+    assert fresh_source['input_fingerprint'] != stale_source['input_fingerprint']
+    assert pg.execute('''SELECT id,input_fingerprint,status,result_ciphertext,checkpoint_ciphertext,
+        processed_messages,total_messages,attempts,usage,model,response_id FROM offhours_summary_tasks
+        WHERE id=%s''', (stale_source['id'],)).fetchone() == stale_source
+    assert pg.execute('SELECT next_check_at,refresh_until FROM offhours_summary_runs WHERE id=%s',
+                      (run['id'],)).fetchone() == {'next_check_at': None, 'refresh_until': end}
+    assert old_tasks() == original and len(s.calls) == 2
+    pg.execute('SAVEPOINT backfill_reprepared_source_changed')
+    pg.execute('DELETE FROM offhours_summary_backfills')
+    changed_job = ai.claim_next_summary()
+    assert changed_job['id'] == fresh_source['id']
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='new-request'",
+               (s.cipher.encrypt(json.dumps({'text': 'Changed again after preparation'})),))
+    ai.run_claimed_summary(changed_job, s.settings)
+    assert len(s.calls) == 2
+    changed_cancelled = pg.execute(
+        'SELECT status,attempts,input_fingerprint FROM offhours_summary_tasks WHERE id=%s',
+        (changed_job['id'],),
+    ).fetchone()
+    assert changed_cancelled == {'status': 'cancelled', 'attempts': 1,
+                                 'input_fingerprint': fresh_source['input_fingerprint']}
+    for _ in range(2):
+        summary_dialogues.schedule_merges(pg, s.settings)
+        assert pg.execute('SELECT status,attempts,input_fingerprint FROM offhours_summary_tasks WHERE id=%s',
+                          (changed_job['id'],)).fetchone() == changed_cancelled
+    changed_source = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND chat_id='new-creator' "
+                                'AND is_current', (run['id'],)).fetchone()
+    assert changed_source['id'] != fresh_source['id'] and changed_source['status'] == 'queued'
+    assert changed_source['input_fingerprint'] != fresh_source['input_fingerprint']
+    assert pg.execute('SELECT next_check_at,refresh_until FROM offhours_summary_runs WHERE id=%s',
+                      (run['id'],)).fetchone() == {'next_check_at': None, 'refresh_until': end}
+    changed_job = ai.claim_next_summary()
+    assert changed_job['id'] == changed_source['id']
+    ai.run_claimed_summary(changed_job, s.settings)
+    assert len(s.calls) == 3 and 'Changed again after preparation' in json.dumps(s.calls[-1])
+    finish()
+    changed_merge = pg.execute('SELECT status,input_fingerprint FROM offhours_summary_tasks WHERE run_id=%s '
+                               'AND contact_id=%s AND is_current', (run['id'], s.ids['other'])).fetchone()
+    assert changed_merge['status'] == 'succeeded'
+    assert changed_merge['input_fingerprint'] != cancelled['input_fingerprint']
+    assert old_tasks() == original and len(s.calls) == 3
+    assert pg.execute('SELECT next_check_at,refresh_until FROM offhours_summary_runs WHERE id=%s',
+                      (run['id'],)).fetchone() == {'next_check_at': None, 'refresh_until': end}
+    assert not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
+    pg.execute('ROLLBACK TO SAVEPOINT backfill_reprepared_source_changed')
+    s.calls.pop()
+    pg.execute('SAVEPOINT backfill_reprepared_revoke')
+    fresh_job = ai.claim_next_summary()
+    assert fresh_job['id'] == fresh_source['id']
+    pg.execute('UPDATE authorizations SET body_consent_at=NULL WHERE id=%s', (s.ids['cm'],))
+    ai.run_claimed_summary(fresh_job, s.settings)
+    for _ in range(3):
+        summary_dialogues.schedule_merges(pg, s.settings)
+        assert ai.claim_next_summary() is None
+    assert pg.execute('SELECT status,attempts FROM offhours_summary_tasks WHERE id=%s',
+                      (fresh_job['id'],)).fetchone() == {'status': 'cancelled', 'attempts': 1}
+    assert len(s.calls) == 2 and old_tasks() == original
+    pg.execute('ROLLBACK TO SAVEPOINT backfill_reprepared_revoke')
+    fresh_job = ai.claim_next_summary()
+    assert fresh_job['id'] == fresh_source['id']
+    ai.run_claimed_summary(fresh_job, s.settings)
+    assert len(s.calls) == 3 and old_tasks() == original
+    assert s.calls[-1]['users']['U1'] == {'name': 'Updated creator name', 'handles': ['@updated_creator']}
+    summary_dialogues.schedule_merges(pg, s.settings)
+    fresh_merge = pg.execute('SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND contact_id=%s '
+                             'AND is_current', (run['id'], s.ids['other'])).fetchone()
+    assert fresh_merge['id'] != merge_job['id']
+    assert fresh_merge['status'] == 'queued' and fresh_merge['input_fingerprint'] != cancelled['input_fingerprint']
+    pg.execute('SAVEPOINT backfill_missing_source_chat')
+    missing_source = pg.execute('SELECT * FROM offhours_summary_tasks WHERE id=%s',
+                                (fresh_source['id'],)).fetchone()
+    pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='new-creator'")
+    missing_job = ai.claim_next_summary()
+    assert missing_job['id'] == fresh_merge['id']
+    ai.run_claimed_summary(missing_job, s.settings)
+    load_chat = ai._load_chat
+
+    def do_not_read_removed_chat(conn, state, chat_id, cutoff, **kwargs):
+        assert chat_id != 'new-creator'
+        return load_chat(conn, state, chat_id, cutoff, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ai, '_load_chat', do_not_read_removed_chat)
+        for _ in range(3):
+            summary_dialogues.schedule_merges(pg, s.settings)
+            assert ai.claim_next_summary() is None
+    assert pg.execute('SELECT * FROM offhours_summary_tasks WHERE id=%s',
+                      (fresh_source['id'],)).fetchone() == {**missing_source, 'is_current': False}
+    assert pg.execute('SELECT status,attempts FROM offhours_summary_tasks WHERE id=%s',
+                      (missing_job['id'],)).fetchone() == {'status': 'cancelled', 'attempts': 1}
+    assert old_tasks() == original and len(s.calls) == 3
+    pg.execute('ROLLBACK TO SAVEPOINT backfill_missing_source_chat')
+    pg.execute('SAVEPOINT backfill_merge_db_retry')
+    current = ai._current
+
+    def transient_database_error(conn, job):
+        if job['id'] == fresh_merge['id']:
+            raise psycopg.errors.SerializationFailure('private-message-payload-must-not-be-logged')
+        return current(conn, job)
+
+    with caplog.at_level('INFO', logger=ai.LOGGER.name), monkeypatch.context() as patch:
+        patch.setattr(ai, '_current', transient_database_error)
+        for attempt in range(1, ai.MAX_ATTEMPTS + 1):
+            retry = ai.claim_next_summary()
+            assert retry['id'] == fresh_merge['id'] and retry['attempts'] == attempt
+            ai.run_claimed_summary(retry, s.settings)
+            expected_status = 'queued' if attempt < ai.MAX_ATTEMPTS else 'failed'
+            summary_dialogues.schedule_merges(pg, s.settings)
+            assert pg.execute('SELECT status,attempts FROM offhours_summary_tasks WHERE id=%s',
+                              (retry['id'],)).fetchone() == {'status': expected_status, 'attempts': attempt}
+            pg.execute('UPDATE offhours_summary_tasks SET scheduled_at=NOW() WHERE id=%s', (retry['id'],))
+        assert ai.claim_next_summary() is None and len(s.calls) == 3
+    assert 'SerializationFailure' in caplog.text
+    assert 'private-message-payload-must-not-be-logged' not in caplog.text
+    pg.execute('ROLLBACK TO SAVEPOINT backfill_merge_db_retry')
+    finish()
+    assert pg.execute('SELECT status FROM offhours_summary_tasks WHERE id=%s',
+                      (fresh_merge['id'],)).fetchone()['status'] == 'succeeded'
+    assert pg.execute('SELECT status,attempts,input_fingerprint FROM offhours_summary_tasks WHERE id=%s',
+                      (merge_job['id'],)).fetchone() == cancelled
+    assert old_tasks() == original and len(s.calls) == 3
     pg.execute('ROLLBACK TO SAVEPOINT backfill_late_merge_change')
+    s.calls.pop()  # Roll back the in-memory observation with the isolated stale-material scenario.
     finish()
     summary_periods.backfill_due(pg, now + timedelta(seconds=93))
     finish()

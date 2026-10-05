@@ -7,6 +7,7 @@ contain only successful chunks/pair comparisons and are encrypted like reports.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from cryptography.exceptions import InvalidTag
@@ -125,21 +126,22 @@ def schedule_merges(conn, settings):
         (core.POLICY_VERSION,),
     ).fetchall()
     for run in runs:
+        try:
+            core._authorize(conn, run['requested_by_authorization_id'], owner_only=True,
+                            cm_id=run['responsible_authorization_id'])
+        except (PermissionError, core.SummaryInputError):
+            continue
         tasks = conn.execute(
             """SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND is_current
             AND chat_id IS NOT NULL ORDER BY id""",
             (run["id"],),
         ).fetchall()
         blocked = set()
+        roster, chats = None, None
         if any(task["status"] != "succeeded" for task in tasks):
-            try:
-                core._authorize(conn, run["requested_by_authorization_id"], owner_only=True,
-                                cm_id=run["responsible_authorization_id"])
-                roster = core._roster(conn, run["responsible_authorization_id"])
-                chats = core._related_chats(conn, roster, settings=settings,
-                                           cm_id=run["responsible_authorization_id"])
-            except (PermissionError, core.SummaryInputError):
-                continue
+            roster = core._roster(conn, run["responsible_authorization_id"])
+            chats = core._related_chats(conn, roster, settings=settings,
+                                       cm_id=run["responsible_authorization_id"])
             blocked = _blocked_people(chats, tasks)
         people = {}
         for task in tasks:
@@ -148,6 +150,46 @@ def schedule_merges(conn, settings):
             result = decode(task["result_ciphertext"], settings)
             for user in result["users"].values():
                 people.setdefault(user["contact_id"], []).append(task)
+        existing_merges = {str(row['contact_id']): row for row in conn.execute(
+            "SELECT id,contact_id,input_fingerprint,status FROM offhours_summary_tasks "
+            "WHERE run_id=%s AND is_current AND contact_id IS NOT NULL", (run['id'],),
+        ).fetchall()}
+        fingerprints = {person: core._hash([(str(t['id']), t['input_fingerprint']) for t in sources])
+                        for person, sources in people.items()}
+        candidates = {person: sources for person, sources in people.items() if person not in blocked and (
+            person not in existing_merges or existing_merges[person]['status'] == 'cancelled'
+            or existing_merges[person]['input_fingerprint'] != fingerprints[person])}
+        cancelled_sources = [task for task in tasks if task['status'] == 'cancelled']
+        if candidates or cancelled_sources:
+            if roster is None:
+                roster = core._roster(conn, run['responsible_authorization_id'])
+                chats = core._related_chats(conn, roster, settings=settings,
+                                           cm_id=run['responsible_authorization_id'])
+            current_people = {str(row['contact_id']) for row in roster}
+            related = {chat['chat_id']: chat for chat in chats}
+            blocked.update(set(candidates) - current_people)
+            sources_to_check = {source['id']: source for sources in candidates.values() for source in sources}
+            sources_to_check.update({source['id']: source for source in cancelled_sources})
+            stale_people, missing_sources = set(), set()
+            for source in sources_to_check.values():
+                if source['chat_id'] not in related:
+                    missing_sources.add(source['id'])
+                    continue
+                data = core._load_chat(conn, run, source['chat_id'], source['cutoff'],
+                                       settings=settings, roster=roster, related_chats=chats)
+                if not data or data['fingerprint'] != source['input_fingerprint']:
+                    stale_people.update(related[source['chat_id']]['contact_ids'])
+            if stale_people or missing_sources:
+                # Expired reports also repair only affected conversations. Keep old
+                # payloads/checkpoints/billing, and never revive a stale merge first.
+                if missing_sources:
+                    conn.execute("UPDATE offhours_summary_tasks SET is_current=FALSE "
+                                 "WHERE id=ANY(%s::uuid[]) AND status IN ('succeeded','cancelled')",
+                                 (sorted(missing_sources, key=str),))
+                if stale_people:
+                    inserted += core._schedule_run(conn, {**run, 'run_id': run['id']}, datetime.now(UTC),
+                                                   contact_ids=stale_people, roster=roster, chats=chats) or 0
+                continue
         # Keep blocked results/checkpoints; current-source validation hides them until
         # that person's related chats finish, without cancelling unrelated work.
         selected = [row["id"] for row in conn.execute(
@@ -157,12 +199,8 @@ def schedule_merges(conn, settings):
         for person, sources in people.items():
             if str(person) in blocked:
                 continue
-            fingerprint = core._hash([(str(t["id"]), t["input_fingerprint"]) for t in sources])
-            existing = conn.execute(
-                "SELECT id,input_fingerprint,status FROM offhours_summary_tasks "
-                "WHERE run_id=%s AND contact_id=%s AND is_current",
-                (run["id"], person),
-            ).fetchone()
+            fingerprint = fingerprints[person]
+            existing = existing_merges.get(person)
             if existing and existing["input_fingerprint"] == fingerprint and existing["status"] != "cancelled":
                 selected.append(existing["id"])
                 continue
