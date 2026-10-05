@@ -1207,6 +1207,48 @@ def test_creator_enrollment_backfills_closed_periods_without_repaying_or_replaci
     assert pg.execute('SELECT chat_id FROM offhours_summary_tasks WHERE run_id=%s AND chat_id IS NOT NULL '
                       'AND is_current', (second_run['id'],)).fetchall() == [{'chat_id': 'second-cm-private'}]
     assert old_tasks() == original
+    # Seven-day execution guards cover discovery, ordinary scheduling, claim and an already-held lease.
+    pg.execute('SAVEPOINT backfill_ancient_execution')
+    pg.execute('UPDATE offhours_summary_runs SET next_check_at=NULL')
+    pg.execute('UPDATE offhours_summary_runs SET coverage=%s::jsonb,next_check_at=%s WHERE id=%s',
+               (json.dumps({'policy': ai.POLICY_VERSION}), now, ancient))
+    source = pg.execute("SELECT result_ciphertext,checkpoint_ciphertext FROM offhours_summary_tasks "
+                        "WHERE run_id=%s AND chat_id='chat' AND is_current", (run['id'],)).fetchone()
+    ancient_source = uuid4()
+    pg.execute('''INSERT INTO offhours_summary_tasks(id,run_id,chat_id,input_fingerprint,cutoff,status,
+        result_ciphertext,checkpoint_ciphertext,attempts,usage)
+        VALUES(%s,%s,'chat','ancient-copied-source',%s,'succeeded',%s,%s,1,%s::jsonb)''',
+        (ancient_source, ancient, ancient_end, source['result_ciphertext'], source['checkpoint_ciphertext'],
+         json.dumps({'input_tokens': 9})))
+    summary_dialogues.schedule_merges(pg, s.settings)
+    assert not pg.execute('SELECT 1 FROM offhours_summary_tasks WHERE run_id=%s AND contact_id IS NOT NULL',
+                          (ancient,)).fetchone()
+    assert ai.schedule_if_due(pg, force=True) == 0
+    assert pg.execute('SELECT next_check_at FROM offhours_summary_runs WHERE id=%s',
+                      (ancient,)).fetchone()['next_check_at'] == now
+    ancient_merge = uuid4()
+    pg.execute('''INSERT INTO offhours_summary_tasks(id,run_id,contact_id,input_fingerprint,cutoff,
+        result_ciphertext,checkpoint_ciphertext,attempts,usage)
+        VALUES(%s,%s,%s,'ancient-existing-merge',%s,%s,%s,2,%s::jsonb)''',
+        (ancient_merge, ancient, s.ids['person'], ancient_end, source['result_ciphertext'],
+         source['checkpoint_ciphertext'], json.dumps({'input_tokens': 17, 'output_tokens': 3})))
+    assert ai.claim_next_summary() is None
+    pg.execute("UPDATE offhours_summary_tasks SET status='running',lease_until=NOW()+INTERVAL '10 minutes' WHERE id=%s",
+               (ancient_merge,))
+    with pytest.raises(ai.SummaryInputError):
+        ai._current(pg, {'id': ancient_merge, 'attempts': 2})
+    durable = pg.execute('SELECT result_ciphertext,checkpoint_ciphertext,usage,attempts FROM offhours_summary_tasks '
+                         'WHERE id=%s', (ancient_merge,)).fetchone()
+    pg.execute((Path(__file__).parents[1] / 'migrations' / '082_bound_summary_period_queue.sql').read_text())
+    assert pg.execute('SELECT status FROM offhours_summary_tasks WHERE id=%s',
+                      (ancient_merge,)).fetchone()['status'] == 'cancelled'
+    assert pg.execute('SELECT result_ciphertext,checkpoint_ciphertext,usage,attempts FROM offhours_summary_tasks '
+                      'WHERE id=%s', (ancient_merge,)).fetchone() == durable
+    assert pg.execute('SELECT status,result_ciphertext FROM offhours_summary_tasks WHERE id=%s',
+                      (ancient_source,)).fetchone() == {
+        'status': 'succeeded', 'result_ciphertext': source['result_ciphertext']}
+    assert len(s.calls) == 3 and old_tasks() == original
+    pg.execute('ROLLBACK TO SAVEPOINT backfill_ancient_execution')
 
 
 

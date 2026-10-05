@@ -119,6 +119,7 @@ def schedule_merges(conn, settings):
     runs = conn.execute(
         """SELECT r.* FROM offhours_summary_runs r JOIN offhours_summary_settings s ON s.id
         WHERE (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL))
+        AND (r.period IS NULL OR r.report_date >= (NOW() AT TIME ZONE 'Europe/London')::date-6)
         AND r.coverage->>'policy'=%s AND EXISTS(SELECT 1 FROM offhours_summary_tasks t
             WHERE t.run_id=r.id AND t.is_current AND t.chat_id IS NOT NULL)""",
         (core.POLICY_VERSION,),

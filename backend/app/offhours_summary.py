@@ -607,6 +607,7 @@ def schedule_if_due(conn, *, force=False):
             return 0
         state = conn.execute("""SELECT *,id AS run_id FROM offhours_summary_runs
             WHERE period IS NOT NULL AND next_check_at<=%s
+              AND report_date >= (NOW() AT TIME ZONE 'Europe/London')::date-6
             ORDER BY next_check_at,window_start DESC,id FOR UPDATE SKIP LOCKED LIMIT 1""", (now,)).fetchone()
         if state:
             try:
@@ -786,6 +787,7 @@ def claim_next_summary():
                             JOIN offhours_summary_runs r ON r.id=t.run_id
                             JOIN offhours_summary_settings s ON s.id
                             WHERE (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL))
+                              AND (r.period IS NULL OR r.report_date >= (NOW() AT TIME ZONE 'Europe/London')::date-6)
                               AND t.status='queued' AND t.is_current AND t.scheduled_at<=NOW()
                             ORDER BY t.scheduled_at,t.created_at FOR UPDATE OF t SKIP LOCKED LIMIT 1""").fetchone()
         if not row:
@@ -1007,6 +1009,7 @@ def _current(conn, job):
                         JOIN offhours_summary_runs r ON r.id=t.run_id
                         JOIN offhours_summary_settings s ON s.id WHERE t.id=%s
                         AND t.is_current AND (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL))
+                        AND (r.period IS NULL OR r.report_date >= (NOW() AT TIME ZONE 'Europe/London')::date-6)
                         FOR UPDATE OF t""",
         (job["id"],),
     ).fetchone()
