@@ -596,9 +596,10 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
 
 def schedule_if_due(conn, *, force=False):
     conn.execute("SELECT pg_advisory_xact_lock(hashtextextended('offhours-summary',0))")
-    from .summary_periods import seed_due
+    from .summary_periods import backfill_due, seed_due
 
     now = datetime.now(UTC)
+    backfilled = backfill_due(conn, now)
     seed_due(conn, now)
     recurring = conn.execute("SELECT recurring_enabled FROM offhours_summary_settings WHERE id").fetchone()
     if recurring and recurring["recurring_enabled"]:
@@ -610,13 +611,13 @@ def schedule_if_due(conn, *, force=False):
         if state:
             try:
                 with conn.transaction():
-                    return _schedule_run(conn, dict(state), now)
+                    return backfilled + _schedule_run(conn, dict(state), now)
             except (PermissionError, SummaryInputError):
                 conn.execute("UPDATE offhours_summary_runs SET next_check_at=NULL WHERE id=%s", (state["id"],))
                 conn.execute("""UPDATE offhours_summary_tasks SET status='cancelled',lease_until=NULL,
                     error_message='该 CM 授权已失效。' WHERE run_id=%s AND status IN ('queued','running')""",
                     (state["id"],))
-        return 0
+        return backfilled
     state = conn.execute("""SELECT s.*,r.window_start,r.window_end,r.requested_by_authorization_id,
                          r.responsible_authorization_id FROM offhours_summary_settings s
                          JOIN offhours_summary_runs r ON r.id=s.run_id WHERE s.id FOR UPDATE OF s""").fetchone()
@@ -626,20 +627,22 @@ def schedule_if_due(conn, *, force=False):
     return _schedule_run(conn, dict(state), now)
 
 
-def _schedule_run(conn, state, now):
+def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None):
     inserted = 0
     cm_id = state["responsible_authorization_id"]
     _authorize(conn, state["requested_by_authorization_id"], owner_only=True, cm_id=cm_id)
     cutoff = min(now, state["window_end"])
-    roster = _roster(conn, cm_id)
+    roster = _roster(conn, cm_id) if roster is None else roster
     # Discover every related conversation before applying the bounded content limit.
-    chats = _related_chats(conn, roster, cm_id=cm_id)
+    chats = _related_chats(conn, roster, cm_id=cm_id) if chats is None else chats
+    selected_chats = chats if contact_ids is None else [c for c in chats if c['contact_ids'] & contact_ids]
+    deferred = False
     gaps = []
     count, messages, synced = 0, 0, True
     private_count = 0
     selected_ids, cutoffs = [], []
     run = {**dict(state), "id": state["run_id"]}
-    for chat in chats:
+    for chat in selected_chats:
         previous = conn.execute("""SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND chat_id=%s
             ORDER BY is_current DESC,created_at DESC LIMIT 1""", (state["run_id"], chat["chat_id"])).fetchone()
         active = previous and previous['is_current'] and previous['status'] in ('queued', 'running')
@@ -660,6 +663,10 @@ def _schedule_run(conn, state, now):
             gaps.append("部分附件或正文不可读取；分析仅依据可读消息。")
         cutoffs.append(chat_cutoff)
         if active:
+            if contact_ids is not None and previous['input_fingerprint'] != evidence['fingerprint']:
+                # Do not supersede an in-flight paid request. Its normal source guard
+                # will reject stale material; the admission signal retries afterwards.
+                deferred = True
             selected_ids.append(previous['id'])
             continue
         conn.execute(
@@ -691,9 +698,41 @@ def _schedule_run(conn, state, now):
         """UPDATE offhours_summary_tasks SET is_current=FALSE,
                  status=CASE WHEN status IN ('queued','running') THEN 'cancelled' ELSE status END,
                  lease_until=CASE WHEN status IN ('queued','running') THEN NULL ELSE lease_until END
-                 WHERE run_id=%s AND chat_id IS NOT NULL AND NOT(id=ANY(%s::uuid[]))""",
-        (state["run_id"], selected_ids),
+                 WHERE run_id=%s AND chat_id IS NOT NULL AND NOT(id=ANY(%s::uuid[]))
+                   AND (%s::text[] IS NULL OR chat_id=ANY(%s::text[]))""",
+        (state["run_id"], selected_ids,
+         None if contact_ids is None else [c['chat_id'] for c in selected_chats],
+         None if contact_ids is None else [c['chat_id'] for c in selected_chats]),
     )
+    if contact_ids is not None:
+        # Accurate whole-report totals from authorized IDs/times only; never decrypt
+        # unrelated conversations merely to refresh the coverage counters.
+        opens = sorted({r['open_id'] for r in roster})
+        cm = conn.execute('SELECT open_id FROM authorizations WHERE id=%s', (cm_id,)).fetchone()
+        totals = conn.execute("""SELECT t.chat_id,t.cutoff,count(m.message_id) AS messages
+            FROM offhours_summary_tasks t
+            LEFT JOIN chat_messages m ON m.chat_id=t.chat_id AND NOT m.is_deleted
+              AND m.message_create_time>=%s AND m.message_create_time<t.cutoff
+              AND m.sender_open_id=ANY(%s::text[])
+              AND EXISTS(SELECT 1 FROM authorization_message_observations o
+                JOIN authorizations a ON a.id=o.authorization_id
+                WHERE o.chat_id=m.chat_id AND o.message_id=m.message_id AND a.id=%s
+                  AND a.status='active' AND a.body_consent_at IS NOT NULL AND o.observed_at>=a.body_consent_at)
+            WHERE t.run_id=%s AND t.is_current AND t.chat_id=ANY(%s::text[])
+            GROUP BY t.chat_id,t.cutoff""",
+            (state['window_start'], sorted(set(opens + [cm['open_id']])), cm_id,
+             state['run_id'], [c['chat_id'] for c in chats])).fetchall()
+        totals = [row for row in totals if row['messages']]
+        count, messages = len(totals), sum(row['messages'] for row in totals)
+        by_chat = {c['chat_id']: c for c in chats}
+        private_count = sum(by_chat[row['chat_id']]['p2p_counterpart_open_id'] in opens for row in totals)
+        cutoffs = [row['cutoff'] for row in totals]
+        previous_coverage = state.get('coverage') or {}
+        gaps = [gap for gap in previous_coverage.get('gaps', []) if '正文' in gap or '附件' in gap] + gaps
+        task_cutoffs = {row['chat_id']: row['cutoff'] for row in totals}
+        synced = all(max([t for t in (chat['last_incremental_at'],chat['last_backfill_at']) if t]
+                        or [datetime.min.replace(tzinfo=UTC)]) >= task_cutoffs.get(chat['chat_id'], cutoff)
+                     for chat in chats)
     if not synced:
         gaps.append("部分会话同步进度尚未覆盖所选时段，当前仅总结已同步内容。")
     if now < state["window_end"]:
@@ -720,6 +759,8 @@ def _schedule_run(conn, state, now):
         "UPDATE offhours_summary_runs SET coverage=%s::jsonb,updated_at=NOW() WHERE id=%s",
         (json.dumps(coverage, ensure_ascii=False), state["run_id"]),
     )
+    if contact_ids is not None:
+        return None if deferred else inserted
     continue_checking = now < state["refresh_until"]
     next_check = now + timedelta(minutes=10 if now < state["window_end"] else 60) if continue_checking else None
     if state.get("period"):

@@ -875,6 +875,340 @@ def test_recurring_periods_keep_history_and_cm_scope_separate(pg, seeded):
         summary_periods.selection(pg, s.ids['tester'], second_cm)
 
 
+def test_creator_enrollment_backfills_closed_periods_without_repaying_or_replacing_others(pg, seeded, monkeypatch):
+    s = seeded
+
+    def finish():
+        finish_merges(pg, s)  # Finish newly queued conversations first.
+        finish_merges(pg, s)  # Then schedule their per-creator merges.
+
+    now = datetime.now(UTC)
+    day = now.astimezone(ai.LONDON).date() - timedelta(days=3)
+    start, end = summary_periods.window(day, 'work')
+    pg.execute('DELETE FROM offhours_summary_backfills')
+    pg.execute("DELETE FROM authorization_message_observations WHERE message_id='outside'")
+    pg.execute("DELETE FROM chat_messages WHERE message_id='outside'")
+    pg.execute("UPDATE chat_messages SET message_create_time=%s WHERE message_id='m1'",
+               (start + timedelta(hours=1),))
+    s.save()
+    pg.execute('UPDATE offhours_summary_settings SET recurring_enabled=TRUE,next_period_check_at=NULL')
+    summary_periods.seed_due(pg, now)
+    run = pg.execute("SELECT * FROM offhours_summary_runs WHERE report_date=%s AND period='work' "
+                     'AND responsible_authorization_id=%s', (day, s.ids['cm'])).fetchone()
+    pg.execute('UPDATE offhours_summary_runs SET next_check_at=NULL,refresh_until=window_end')
+    run = {**run, 'run_id': run['id'], 'refresh_until': end}
+    ai._schedule_run(pg, run, now)
+    finish()
+    assert len(s.calls) == 1
+
+    def old_tasks():
+        return pg.execute('''SELECT id,input_fingerprint,status,is_current,result_ciphertext,
+            checkpoint_ciphertext,processed_messages,total_messages FROM offhours_summary_tasks
+            WHERE run_id=%s AND (chat_id='chat' OR contact_id=%s) ORDER BY id''',
+            (run['id'], s.ids['person'])).fetchall()
+
+    original = old_tasks()
+    assert len(original) == 2 and all(t['status'] == 'succeeded' for t in original)
+    missing_day = day - timedelta(days=1)
+    pg.execute("DELETE FROM offhours_summary_runs WHERE responsible_authorization_id=%s "
+               "AND report_date=%s AND period='off'", (s.ids['cm'], missing_day))
+    old_gap = '尚未找到已同步的时段内相关消息；这不代表 Lark 中没有消息。'
+    media_gap = '部分附件或正文不可读取；分析仅依据可读消息。'
+    pg.execute("UPDATE offhours_summary_runs SET coverage=jsonb_set(coverage,'{gaps}',%s::jsonb) WHERE id=%s",
+               (json.dumps([old_gap, media_gap]), run['id']))
+    ancient_day = day - timedelta(days=5)
+    ancient_start, ancient_end = summary_periods.window(ancient_day, 'work')
+    ancient = uuid4()
+    pg.execute('''INSERT INTO offhours_summary_runs(id,requested_by_authorization_id,
+        responsible_authorization_id,window_start,window_end,report_date,period,refresh_until)
+        VALUES(%s,%s,%s,%s,%s,%s,'work',%s)''',
+        (ancient, s.ids['owner'], s.ids['cm'], ancient_start, ancient_end, ancient_day, ancient_end))
+
+    def add_private(chat, cm, message, text='Sample please'):
+        pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES(%s,%s,'p2p')", (chat, chat))
+        pg.execute('''INSERT INTO authorization_chats(authorization_id,chat_id,p2p_counterpart_open_id,
+            p2p_counterpart_type,backfill_complete,backfill_window_start_at,last_incremental_at,sync_status)
+            VALUES(%s,%s,'ou_other','user',TRUE,%s,%s,'succeeded')''',
+            (cm, chat, start - timedelta(days=9), now))
+        pg.execute('''INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,
+            body_ciphertext,message_create_time) VALUES(%s,%s,'ou_other','text',%s,%s)''',
+            (chat, message, s.cipher.encrypt(json.dumps({'text': text})), start + timedelta(hours=2)))
+        pg.execute('''INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+            VALUES(%s,%s,%s)''', (cm, chat, message))
+
+    add_private('new-creator', s.ids['cm'], 'new-request')
+    # Recognition can arrive after responsibility; neither handle nor group classification is required.
+    pg.execute("DELETE FROM contact_roles WHERE contact_id=%s", (s.ids['other'],))
+    assignment = uuid4()
+    pg.execute('''INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source)
+        VALUES(%s,%s,%s,'ai')''', (assignment, s.ids['other'], s.ids['cm']))
+    assert not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
+    pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) VALUES(%s,'creator','confirmed','manual')",
+               (s.ids['other'],))
+    pending = pg.execute('SELECT * FROM offhours_summary_backfills').fetchone()
+    assert pending['contact_id'] == s.ids['other'] and pending['responsible_authorization_id'] == s.ids['cm']
+    # An upsert of the same formal facts is not a new enrollment signal.
+    pg.execute("UPDATE contact_assignments SET source='manual',updated_at=NOW() WHERE id=%s", (assignment,))
+    pg.execute("UPDATE contact_roles SET source='manual',updated_at=NOW() WHERE contact_id=%s",
+               (s.ids['other'],))
+    assert pg.execute('SELECT version FROM offhours_summary_backfills').fetchone()['version'] == pending['version']
+    pg.execute("UPDATE ai_feature_configs SET enabled=FALSE WHERE feature=%s", (ai.FEATURE,))
+    summary_periods.backfill_due(pg, now)
+    assert pg.execute('SELECT version FROM offhours_summary_backfills').fetchone()['version'] == pending['version']
+    pg.execute("UPDATE ai_feature_configs SET enabled=TRUE WHERE feature=%s", (ai.FEATURE,))
+    # Missing consent postpones the durable pair instead of exporting or losing it.
+    pg.execute('SAVEPOINT backfill_no_consent')
+    pg.execute('UPDATE authorizations SET body_consent_at=NULL WHERE id=%s', (s.ids['cm'],))
+    summary_periods.backfill_due(pg, now)
+    postponed = pg.execute('SELECT * FROM offhours_summary_backfills').fetchone()
+    assert postponed and postponed['not_before'] > now and len(s.calls) == 1
+    pg.execute('ROLLBACK TO SAVEPOINT backfill_no_consent')
+    pg.execute('SAVEPOINT backfill_no_identity')
+    pg.execute('DELETE FROM lark_identities WHERE contact_id=%s', (s.ids['other'],))
+    summary_periods.backfill_due(pg, now)
+    assert pg.execute('SELECT not_before FROM offhours_summary_backfills').fetchone()['not_before'] > now
+    pg.execute('ROLLBACK TO SAVEPOINT backfill_no_identity')
+    pg.execute('SAVEPOINT backfill_invalid_identity')
+    pg.execute("UPDATE contact_roles SET status='rejected' WHERE contact_id=%s", (s.ids['other'],))
+    summary_periods.backfill_due(pg, now)
+    assert not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone() and len(s.calls) == 1
+    pg.execute('ROLLBACK TO SAVEPOINT backfill_invalid_identity')
+    ai.schedule_if_due(pg, force=True)
+    assert pg.execute('SELECT not_before FROM offhours_summary_backfills').fetchone()['not_before'] > now
+    assert old_tasks() == original
+    after = pg.execute('SELECT * FROM offhours_summary_runs WHERE id=%s', (run['id'],)).fetchone()
+    assert after['refresh_until'] == end and after['next_check_at'] is None
+    assert after['coverage']['confirmed_creators'] == 2
+    assert after['coverage']['conversations'] == 2 and after['coverage']['messages'] == 2
+    assert old_gap not in after['coverage']['gaps'] and media_gap in after['coverage']['gaps']
+    missing = pg.execute("SELECT next_check_at,refresh_until,window_end FROM offhours_summary_runs "
+                         "WHERE responsible_authorization_id=%s AND report_date=%s AND period='off'",
+                         (s.ids['cm'], missing_day)).fetchone()
+    assert missing and missing['next_check_at'] is None and missing['refresh_until'] == missing['window_end']
+    assert not pg.execute('SELECT 1 FROM offhours_summary_tasks WHERE run_id=%s', (ancient,)).fetchone()
+    target_task = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND chat_id='new-creator' "
+                             'AND is_current', (run['id'],)).fetchone()
+    assert target_task and target_task['status'] == 'queued'
+    # A zero-message old task does not inflate totals; a not-yet-synced related chat remains a gap.
+    pg.execute('SAVEPOINT backfill_zero_message_coverage')
+    add_private('empty-old-private', s.ids['cm'], 'empty-placeholder')
+    pg.execute("DELETE FROM authorization_message_observations WHERE message_id='empty-placeholder'")
+    pg.execute("DELETE FROM chat_messages WHERE message_id='empty-placeholder'")
+    pg.execute("UPDATE authorization_chats SET p2p_counterpart_open_id='ou_person',last_incremental_at=%s "
+               "WHERE chat_id='empty-old-private'", (start - timedelta(hours=1),))
+    pg.execute('''INSERT INTO offhours_summary_tasks(id,run_id,chat_id,input_fingerprint,cutoff,status)
+        VALUES(%s,%s,'empty-old-private','old-zero',%s,'succeeded')''', (uuid4(), run['id'], end))
+    ai._schedule_run(pg, {**after, 'run_id': run['id']}, now, contact_ids={s.ids['other']})
+    coverage = pg.execute('SELECT coverage FROM offhours_summary_runs WHERE id=%s', (run['id'],)).fetchone()['coverage']
+    assert coverage['conversations'] == 2 and coverage['messages'] == 2 and not coverage['synced']
+    assert any('同步进度' in gap for gap in coverage['gaps'])
+    pg.execute('ROLLBACK TO SAVEPOINT backfill_zero_message_coverage')
+
+    # A running source that changed is deferred, not cancelled or replaced by a second paid request.
+    pg.execute('SAVEPOINT backfill_inflight')
+    pg.execute("UPDATE offhours_summary_tasks SET status='running',attempts=1,lease_until=NOW()+INTERVAL '10 minutes' "
+               'WHERE id=%s', (target_task['id'],))
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='new-request'",
+               (s.cipher.encrypt(json.dumps({'text': 'Sample please, another update'})),))
+    pg.execute('SELECT enqueue_summary_backfill(%s,%s)', (s.ids['other'], s.ids['cm']))
+    summary_periods.backfill_due(pg, now)
+    deferred = pg.execute('SELECT * FROM offhours_summary_backfills').fetchone()
+    assert deferred and deferred['not_before'] > now
+    assert pg.execute('SELECT status,is_current FROM offhours_summary_tasks WHERE id=%s',
+                      (target_task['id'],)).fetchone() == {'status': 'running', 'is_current': True}
+    assert old_tasks() == original and len(s.calls) == 1
+    pg.execute('ROLLBACK TO SAVEPOINT backfill_inflight')
+    # Queuing never bypasses the existing last-moment identity, relationship or consent checks.
+    for change in ('consent', 'relationship', 'identity'):
+        pg.execute('SAVEPOINT backfill_revoke')
+        job = ai.claim_next_summary()
+        assert job['id'] == target_task['id']
+        if change == 'consent':
+            pg.execute('UPDATE authorizations SET body_consent_at=NULL WHERE id=%s', (s.ids['cm'],))
+        elif change == 'relationship':
+            pg.execute('UPDATE contact_assignments SET ended_at=NOW() WHERE id=%s', (assignment,))
+        else:
+            pg.execute("UPDATE contact_roles SET status='rejected' WHERE contact_id=%s", (s.ids['other'],))
+        ai.run_claimed_summary(job, s.settings)
+        assert len(s.calls) == 1
+        assert pg.execute('SELECT status FROM offhours_summary_tasks WHERE id=%s',
+                          (job['id'],)).fetchone()['status'] == 'cancelled'
+        pg.execute('ROLLBACK TO SAVEPOINT backfill_revoke')
+    # Real source edits after admission invalidate the queued task; the retained signal rebuilds it.
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='new-request'",
+               (s.cipher.encrypt(json.dumps({'text': 'Sample please, latest corrected request'})),))
+    stale = ai.claim_next_summary()
+    assert stale['id'] == target_task['id']
+    ai.run_claimed_summary(stale, s.settings)
+    assert len(s.calls) == 1
+    assert pg.execute('SELECT status FROM offhours_summary_tasks WHERE id=%s',
+                      (stale['id'],)).fetchone()['status'] == 'cancelled'
+    summary_periods.backfill_due(pg, now + timedelta(seconds=31))
+    rebuilt = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND chat_id='new-creator' "
+                         'AND is_current', (run['id'],)).fetchone()
+    assert rebuilt['id'] != stale['id'] and rebuilt['status'] == 'queued'
+    assert pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
+    rebuilt_job = ai.claim_next_summary()
+    assert rebuilt_job['id'] == rebuilt['id']
+    ai.run_claimed_summary(rebuilt_job, s.settings)
+    assert len(s.calls) == 2 and old_tasks() == original
+    assert 'latest corrected request' in json.dumps(s.calls[-1])
+    summary_periods.backfill_due(pg, now + timedelta(seconds=62))
+    pending_merge = pg.execute('SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND contact_id=%s '
+                               'AND is_current', (run['id'], s.ids['other'])).fetchone()
+    assert pending_merge and pending_merge['status'] == 'queued'
+    assert pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
+    pg.execute('SAVEPOINT backfill_late_merge_change')
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='new-request'",
+               (s.cipher.encrypt(json.dumps({'text': 'A later update before the merge'})),))
+    merge_job = ai.claim_next_summary()
+    assert merge_job['id'] == pending_merge['id']
+    ai.run_claimed_summary(merge_job, s.settings)
+    assert len(s.calls) == 2 and pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
+    assert pg.execute('SELECT status FROM offhours_summary_tasks WHERE id=%s',
+                      (merge_job['id'],)).fetchone()['status'] == 'cancelled'
+    pg.execute('ROLLBACK TO SAVEPOINT backfill_late_merge_change')
+    finish()
+    summary_periods.backfill_due(pg, now + timedelta(seconds=93))
+    finish()
+    assert not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone() and len(s.calls) == 2
+    view = ai.get_summary_view(pg, s.ids['cm'], day=day, period='work')
+    assert len(view['events']) == 2
+    tasks = pg.execute('SELECT id,input_fingerprint FROM offhours_summary_tasks WHERE run_id=%s AND is_current '
+                       'ORDER BY id', (run['id'],)).fetchall()
+    # A failed unrelated creator cannot block this creator's merge or cause its private source to be reread.
+    pg.execute('SAVEPOINT backfill_failure_isolation')
+    pg.execute("UPDATE offhours_summary_tasks SET status='failed',result_ciphertext=NULL,attempts=3 "
+               "WHERE run_id=%s AND chat_id='chat' AND is_current", (run['id'],))
+    old_merge = pg.execute('SELECT id,input_fingerprint,result_ciphertext FROM offhours_summary_tasks '
+                           'WHERE run_id=%s AND contact_id=%s AND is_current',
+                           (run['id'], s.ids['person'])).fetchone()
+    previous_target_merge = pg.execute('SELECT id FROM offhours_summary_tasks WHERE run_id=%s AND contact_id=%s '
+                                       'AND is_current', (run['id'], s.ids['other'])).fetchone()['id']
+    add_private('retry-target-private', s.ids['cm'], 'retry-target-message', 'Routine target-only update')
+    pg.execute('SELECT enqueue_summary_backfill(%s,%s)', (s.ids['other'], s.ids['cm']))
+    failure_calls, source_reads = [], []
+    load = ai._load_chat
+
+    def observed_load(conn, state, chat_id, cutoff, **kwargs):
+        source_reads.append(chat_id)
+        return load(conn, state, chat_id, cutoff, **kwargs)
+
+    def target_only_model(_cfg, _key, pack, _cm, **_kwargs):
+        assert pack['chat_name'] == 'retry-target-private'
+        failure_calls.append(pack)
+        return {'text': json.dumps({'processed_refs': pack['core_refs'], 'events': []}),
+                'usage': {'input_tokens': 1}}
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ai, '_load_chat', observed_load)
+        patch.setattr(openai_client, 'call_openai', target_only_model)
+        summary_periods.backfill_due(pg, now)
+        related = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s "
+                             "AND chat_id='retry-target-private' AND is_current", (run['id'],)).fetchone()
+        assert related and related['status'] == 'queued'
+        pg.execute("UPDATE offhours_summary_tasks SET status='failed',attempts=3 WHERE id=%s", (related['id'],))
+        summary_periods.backfill_due(pg, now + timedelta(seconds=31))
+        blocked_signal = pg.execute('SELECT * FROM offhours_summary_backfills').fetchone()
+        assert blocked_signal['not_before'] == now + timedelta(minutes=15, seconds=31)
+        assert not pg.execute('SELECT 1 FROM offhours_summary_tasks WHERE run_id=%s AND contact_id=%s '
+                              "AND is_current AND id<>%s",
+                              (run['id'], s.ids['other'], previous_target_merge)).fetchone()
+        assert not failure_calls and 'chat' not in source_reads
+        pg.execute('SAVEPOINT backfill_failure_grace_expired')
+        pg.execute('UPDATE offhours_summary_backfills SET requested_at=%s,not_before=%s',
+                   (now - timedelta(hours=25), now))
+        failed_before = pg.execute('SELECT status,attempts,is_current,result_ciphertext FROM offhours_summary_tasks '
+                                   'WHERE id=%s', (related['id'],)).fetchone()
+        gaps_before = pg.execute('SELECT coverage FROM offhours_summary_runs WHERE id=%s',
+                                 (run['id'],)).fetchone()['coverage']['gaps']
+        summary_periods.backfill_due(pg, now)
+        assert not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
+        assert pg.execute('SELECT status,attempts,is_current,result_ciphertext FROM offhours_summary_tasks '
+                          'WHERE id=%s', (related['id'],)).fetchone() == failed_before
+        assert pg.execute('SELECT coverage FROM offhours_summary_runs WHERE id=%s',
+                          (run['id'],)).fetchone()['coverage']['gaps'] == gaps_before
+        assert pg.execute("SELECT 1 FROM audit_events WHERE action='creator_summary_backfill_scheduled' "
+                          "AND metadata->>'contact_id'=%s AND metadata->>'cm_id'=%s "
+                          "AND metadata->>'has_failed_tasks'='true'",
+                          (str(s.ids['other']), str(s.ids['cm']))).fetchone()
+        assert not failure_calls and 'chat' not in source_reads
+        pg.execute('ROLLBACK TO SAVEPOINT backfill_failure_grace_expired')
+        pg.execute("UPDATE offhours_summary_tasks SET status='queued',attempts=0,scheduled_at=NOW() WHERE id=%s",
+                   (related['id'],))
+        finish()
+        summary_periods.backfill_due(pg, now + timedelta(minutes=16))
+        finish()
+        assert not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
+        assert len(failure_calls) == 1 and 'chat' not in source_reads
+        isolated = ai.get_summary_view(pg, s.ids['cm'], day=day, period='work')
+        assert len(isolated['events']) == 1
+        assert {e['chat_id'] for e in isolated['events'][0]['evidence']} == {'new-creator'}
+        assert 'chat' not in source_reads
+        assert pg.execute('SELECT id,input_fingerprint,result_ciphertext FROM offhours_summary_tasks '
+                          'WHERE id=%s', (old_merge['id'],)).fetchone() == old_merge
+    pg.execute('ROLLBACK TO SAVEPOINT backfill_failure_isolation')
+    pg.execute('SELECT enqueue_summary_backfill(%s,%s)', (s.ids['other'], s.ids['cm']))
+    version = pg.execute('SELECT version FROM offhours_summary_backfills').fetchone()['version']
+    schedule, signalled = ai._schedule_run, False
+
+    def schedule_and_receive_new_signal(*args, **kwargs):
+        nonlocal signalled
+        result = schedule(*args, **kwargs)
+        if not signalled:
+            signalled = True
+            pg.execute('SELECT enqueue_summary_backfill(%s,%s)', (s.ids['other'], s.ids['cm']))
+        return result
+
+    # An enrollment arriving during scheduling must survive the old version's conditional DELETE.
+    with monkeypatch.context() as patch:
+        patch.setattr(ai, '_schedule_run', schedule_and_receive_new_signal)
+        summary_periods.backfill_due(pg, now)
+    assert pg.execute('SELECT version FROM offhours_summary_backfills').fetchone()['version'] == version + 1
+    summary_periods.backfill_due(pg, now)
+    finish()
+    assert not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
+    assert len(s.calls) == 2
+    assert pg.execute('SELECT id,input_fingerprint FROM offhours_summary_tasks WHERE run_id=%s AND is_current '
+                      'ORDER BY id', (run['id'],)).fetchall() == tasks
+    pg.execute('SAVEPOINT legacy_backfill_trigger')
+    legacy = uuid4()
+    pg.execute('''INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,
+        contact_id,relationship,source,created_by_authorization_id,candidate_id)
+        VALUES(%s,%s,%s,%s,'representative','cm_confirmation',%s,%s)''',
+        (legacy, s.account, s.ids['reviewer'], s.ids['person'], s.ids['owner'], s.candidate_id))
+    assert not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
+    pg.execute("UPDATE creator_account_assignments SET relationship='owner' WHERE id=%s", (legacy,))
+    legacy_signal = pg.execute('SELECT * FROM offhours_summary_backfills').fetchone()
+    assert legacy_signal['contact_id'] == s.ids['person']
+    assert legacy_signal['responsible_authorization_id'] == s.ids['reviewer']
+    pg.execute("UPDATE creator_account_assignments SET source='excel_verified' WHERE id=%s", (legacy,))
+    assert pg.execute('SELECT version FROM offhours_summary_backfills').fetchone()['version'] == \
+        legacy_signal['version']
+    pg.execute('ROLLBACK TO SAVEPOINT legacy_backfill_trigger')
+    # The same creator can belong to another CM, but only that CM's observed messages are exported.
+    second_cm = s.ids['reviewer']
+    pg.execute('''INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source)
+        VALUES(%s,%s,%s,'ai')''', (uuid4(), s.ids['other'], second_cm))
+    summary_periods.backfill_due(pg, now)
+    assert len(s.calls) == 2 and not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
+    add_private('second-cm-private', second_cm, 'second-cm-request', 'Second CM private sample request')
+    pg.execute('SELECT enqueue_summary_backfill(%s,%s)', (s.ids['other'], second_cm))
+    summary_periods.backfill_due(pg, now)
+    finish()
+    assert len(s.calls) == 3 and 'Second CM private' in json.dumps(s.calls[-1])
+    summary_periods.backfill_due(pg, now + timedelta(seconds=31))
+    finish()
+    assert not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone() and len(s.calls) == 3
+    assert 'Second CM private' not in json.dumps(s.calls[:-1])
+    second_run = pg.execute("SELECT * FROM offhours_summary_runs WHERE responsible_authorization_id=%s "
+                            "AND report_date=%s AND period='work'", (second_cm, day)).fetchone()
+    assert second_run and second_run['id'] != run['id']
+    assert pg.execute('SELECT chat_id FROM offhours_summary_tasks WHERE run_id=%s AND chat_id IS NOT NULL '
+                      'AND is_current', (second_run['id'],)).fetchall() == [{'chat_id': 'second-cm-private'}]
+    assert old_tasks() == original
+
+
 
 
 def finish_merges(pg, s):

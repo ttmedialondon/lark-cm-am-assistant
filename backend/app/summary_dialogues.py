@@ -107,6 +107,11 @@ def checked_chat(conn, job, settings):
     return data
 
 
+def _blocked_people(chats, tasks):
+    pending = {task["chat_id"] for task in tasks if task["status"] != "succeeded"}
+    return {str(person) for chat in chats if chat["chat_id"] in pending for person in chat["contact_ids"]}
+
+
 def schedule_merges(conn, settings):
     if not core._enabled(conn):
         return 0
@@ -115,9 +120,7 @@ def schedule_merges(conn, settings):
         """SELECT r.* FROM offhours_summary_runs r JOIN offhours_summary_settings s ON s.id
         WHERE (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL))
         AND r.coverage->>'policy'=%s AND EXISTS(SELECT 1 FROM offhours_summary_tasks t
-            WHERE t.run_id=r.id AND t.is_current AND t.chat_id IS NOT NULL)
-        AND NOT EXISTS(SELECT 1 FROM offhours_summary_tasks t WHERE t.run_id=r.id
-            AND t.is_current AND t.chat_id IS NOT NULL AND t.status<>'succeeded')""",
+            WHERE t.run_id=r.id AND t.is_current AND t.chat_id IS NOT NULL)""",
         (core.POLICY_VERSION,),
     ).fetchall()
     for run in runs:
@@ -126,13 +129,33 @@ def schedule_merges(conn, settings):
             AND chat_id IS NOT NULL ORDER BY id""",
             (run["id"],),
         ).fetchall()
+        blocked = set()
+        if any(task["status"] != "succeeded" for task in tasks):
+            try:
+                core._authorize(conn, run["requested_by_authorization_id"], owner_only=True,
+                                cm_id=run["responsible_authorization_id"])
+                roster = core._roster(conn, run["responsible_authorization_id"])
+                chats = core._related_chats(conn, roster, settings=settings,
+                                           cm_id=run["responsible_authorization_id"])
+            except (PermissionError, core.SummaryInputError):
+                continue
+            blocked = _blocked_people(chats, tasks)
         people = {}
         for task in tasks:
+            if task["status"] != "succeeded":
+                continue
             result = decode(task["result_ciphertext"], settings)
             for user in result["users"].values():
                 people.setdefault(user["contact_id"], []).append(task)
-        selected = []
+        # Keep blocked results/checkpoints; current-source validation hides them until
+        # that person's related chats finish, without cancelling unrelated work.
+        selected = [row["id"] for row in conn.execute(
+            "SELECT id FROM offhours_summary_tasks WHERE run_id=%s AND is_current "
+            "AND contact_id=ANY(%s::uuid[])", (run["id"], sorted(blocked)),
+        ).fetchall()] if blocked else []
         for person, sources in people.items():
+            if str(person) in blocked:
+                continue
             fingerprint = core._hash([(str(t["id"]), t["input_fingerprint"]) for t in sources])
             existing = conn.execute(
                 "SELECT id,input_fingerprint,status FROM offhours_summary_tasks "
@@ -191,10 +214,12 @@ def merge_input(conn, run, task, settings, roster=None, chats=None, *, read_cach
             AND chat_id IS NOT NULL ORDER BY id""", (task["run_id"],),
         ).fetchall()
     sources = cache["sources"]
-    if any(t["status"] != "succeeded" for t in sources):
+    if str(task["contact_id"]) in _blocked_people(chats, sources):
         raise core.SummaryInputError("会话尚未完成。")
     events, source_hashes, person = [], [], None
     for source in sources:
+        if source["status"] != "succeeded":
+            continue
         key = ("decoded", source["id"])
         if key not in cache:
             cache[key] = decode(source["result_ciphertext"], settings)
