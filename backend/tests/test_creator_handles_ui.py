@@ -33,6 +33,27 @@ def browser(monkeypatch, *, owner=False, active=True):
     return TestClient(app), actor
 
 
+def test_broadcast_prototype_is_owner_only_read_only_and_never_exposes_a_send_action(monkeypatch):
+    client, _actor = browser(monkeypatch, owner=True)
+    response = client.get("/creators/broadcast")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert "交互原型 · 示例数据 · 不会发送" in response.text
+    assert "模拟发送" in response.text and "creator-broadcast.mjs" in response.text
+    assert client.post("/creators/broadcast").status_code == 405
+    ordinary, _ = browser(monkeypatch)
+    assert ordinary.get("/creators/broadcast").status_code == 403
+    revoked, _ = browser(monkeypatch, owner=True, active=False)
+    assert revoked.get("/creators/broadcast").status_code == 403
+    app = FastAPI()
+    app.include_router(creator_handles_routes.create_router(
+        current_authorization=lambda _: None, csrf_token=lambda _: "",
+        render_template=lambda *_: pytest.fail("Unauthenticated prototype was rendered"),
+    ))
+    denied = TestClient(app).get("/creators/broadcast", follow_redirects=False)
+    assert (denied.status_code, denied.headers["location"]) == (303, "/")
+
+
 
 
 def test_retired_handle_ai_and_type_actions_still_require_active_auth_and_csrf(monkeypatch):

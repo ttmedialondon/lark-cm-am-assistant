@@ -1,0 +1,14 @@
+#broadcast-app textarea { resize: vertical; }
+#broadcast-app .broadcast-message { background: var(--tblr-bg-surface-secondary); border-radius: 8px; padding: 16px; white-space: pre-wrap; overflow-wrap: anywhere; }
+#broadcast-app .broadcast-dialog { width: min(760px, calc(100vw - 24px)); max-height: 85dvh; padding: 24px; border: 1px solid var(--tblr-border-color); border-radius: 12px; color: var(--tblr-body-color); background: var(--tblr-bg-surface); }
+#broadcast-app .broadcast-dialog::backdrop { background: rgb(15 23 42 / 35%); }
+#broadcast-app .broadcast-target { padding-block: 12px; border-bottom: 1px solid var(--tblr-border-color); overflow-wrap: anywhere; }
+#broadcast-app .broadcast-target:last-child { border-bottom: 0; }
+#broadcast-app .broadcast-identity { min-width: 140px; overflow-wrap: anywhere; }
+#broadcast-app td { vertical-align: top; white-space: normal; }
+#broadcast-app .broadcast-route { min-width: 170px; }
+@media (max-width: 575px) {
+  #broadcast-app .broadcast-dialog { padding: 16px; }
+  #broadcast-app .card-table th, #broadcast-app .card-table td { padding-inline: 10px; }
+  #broadcast-app .broadcast-identity { min-width: 120px; }
+}

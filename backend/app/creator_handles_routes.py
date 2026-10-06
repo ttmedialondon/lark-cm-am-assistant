@@ -8,7 +8,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import creator_imports, creator_roster
+from . import admin_permissions, creator_imports, creator_roster
 from .http_helpers import (
     csrf_matches as _csrf_matches,
 )
@@ -40,6 +40,19 @@ def create_router(*, current_authorization, render_template, csrf_token):
         if not _csrf_matches(form, csrf_token(auth)):
             raise ValueError("请求校验失败，请刷新页面后重试。")
         return auth, form
+
+    @router.get("/broadcast")
+    def broadcast_prototype(request: Request):
+        auth = current_authorization(request)
+        if not auth:
+            return secure(RedirectResponse("/", status_code=303))
+        try:
+            auth = actor(auth)
+            if not admin_permissions.access_for(auth["id"])["is_owner"]:
+                raise PermissionError("群发原型目前仅供项目负责人检查。")
+            return secure(render_template(request, "creator_broadcast.html", {"authorization": auth}))
+        except PermissionError as exc:
+            return error(exc)
 
     @router.get("")
     @router.get("/data")
