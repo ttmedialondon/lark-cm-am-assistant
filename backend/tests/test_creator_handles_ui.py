@@ -42,9 +42,10 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
               {"id": p2, "name": "Example Two", "handles": ["example_two"]}]
     group = {"id": "oc_example", "name": "Example group", "purpose": "support", "members": [p1, p2],
              "member_count": None, "membership_note": creator_broadcast.MEMBERSHIP_NOTE}
-    changed = {"routes": False, "role": True}
+    changed = {"routes": False, "role": True, "cm_active": True}
     reads = []
     saved_lists = {}
+    saved_templates = {}
 
     class Rows:
         def __init__(self, values):
@@ -59,6 +60,30 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
             return nullcontext()
         def execute(self, sql, params=()):
             reads.append(sql)
+            if "creator_broadcast_templates" in sql:
+                if sql.startswith("INSERT"):
+                    name, body, owner = params
+                    item = {"id": uuid4(), "name": name, "body": body, "owner_authorization_id": owner,
+                            "revision": 1, "deleted_at": None}
+                    saved_templates[str(item["id"])] = item
+                    return Rows([dict(item)])
+                if sql.startswith("UPDATE"):
+                    item = saved_templates.get(str(params[-3]))
+                    if (not item or str(item["owner_authorization_id"]) != str(params[-2])
+                            or item["revision"] != params[-1] or item["deleted_at"]):
+                        return Rows([])
+                    if "SET deleted_at" in sql:
+                        item["deleted_at"] = True
+                    else:
+                        item.update(name=params[0], body=params[1])
+                    item["revision"] += 1
+                    return Rows([dict(item)])
+                if "WHERE id=%s" in sql:
+                    item = saved_templates.get(str(params[0]))
+                    owned = item and str(item["owner_authorization_id"]) == str(params[1]) and not item["deleted_at"]
+                    return Rows([dict(item)] if owned else [])
+                return Rows([dict(item) for item in saved_templates.values()
+                             if str(item["owner_authorization_id"]) == str(params[0]) and not item["deleted_at"]])
             if "creator_broadcast_lists" in sql:
                 if sql.startswith("INSERT"):
                     name, notes, cm, purpose, mention, targets, snapshot, owner = params
@@ -98,7 +123,13 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
             if "SELECT 1 FROM authorizations" in sql:
                 return Rows([{"active": True}])
             if "SELECT id,open_id,display_name" in sql:
-                return Rows([{"id": params[0], "open_id": "ou_example", "display_name": "CM"}])
+                return Rows([{"id": params[0], "open_id": "ou_example", "display_name": "CM"}]
+                            if changed["cm_active"] else [])
+            if "FROM authorization_chats ac JOIN authorizations" in sql:
+                return Rows([{"chat_id": group["id"], "name": group["name"], "purpose": params[0],
+                              "member_count": None, "member_count_status": "pending",
+                              "member_snapshot_checked_at": None, "member_snapshot_status": "pending",
+                              "last_seen_at": None}] if not changed["routes"] else [])
             raise AssertionError(f"Unexpected query: {sql}")
 
     monkeypatch.setattr(creator_broadcast, "connection", lambda: nullcontext(Conn()))
@@ -111,7 +142,7 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
     response = client.get("/creators/broadcast")
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store, max-age=0"
-    assert "真实数据 · 仅预览" in response.text
+    assert "仅预览 · 不会发送" in response.text
     assert "发送（未开通）" in response.text and "creator-broadcast.mjs" in response.text
     for label in creator_broadcast.PURPOSES.values():
         assert label in response.text
@@ -128,11 +159,26 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
                "selections": [{"contact_id": p1, "chat_id": group["id"]},
                               {"contact_id": p1, "chat_id": group["id"]},
                               {"contact_id": p2, "chat_id": group["id"]}]}
-    for purpose in creator_broadcast.PURPOSES:
-        preview["purpose"] = purpose
-        checked = client.post("/creators/broadcast/preview", json=preview, headers=headers).json()
-        assert checked["issues"] == [] and len(checked["groups"]) == 1
-        assert len(checked["groups"][0]["mentions"]) == 2 and checked["can_send"] is False
+    checked = client.post("/creators/broadcast/preview", json=preview, headers=headers).json()
+    assert checked["issues"] == [] and len(checked["groups"]) == 1
+    assert len(checked["groups"][0]["mentions"]) == 2 and checked["can_send"] is False
+    for purpose in creator_broadcast.PURPOSES.keys() - {"support"}:
+        group_fields = {"cm_id": other_cm, "purpose": purpose, "mention": True,
+                        "message": "Example", "selections": [{"chat_id": group["id"]}, {"chat_id": group["id"]}]}
+        available = client.post("/creators/broadcast/groups", json=group_fields, headers=headers)
+        assert available.status_code == 200 and available.json()["selected_chat_ids"] == []
+        assert len(available.json()["groups"]) == 1 and available.json()["groups"][0]["members"] == []
+        joined_sql = reads[-1]
+        assert "ac.is_visible" in joined_sql and "sync_enabled" not in joined_sql
+        assert "contact_roles" not in joined_sql and "chat_members" not in joined_sql
+        assert "a.status='active'" in joined_sql and "a.body_consent_at IS NOT NULL" in joined_sql
+        checked = client.post("/creators/broadcast/preview", json=group_fields, headers=headers).json()
+        assert checked["mode"] == "groups" and checked["issues"] == [] and len(checked["groups"]) == 1
+        assert checked["groups"][0]["mention_all"] and checked["groups"][0]["mentions"] == []
+        assert not checked["can_send"] and checked["people"] == []
+        assert client.post("/creators/broadcast/groups", json=dict(group_fields, cm_id="all"),
+                           headers=headers).status_code == 400
+        assert client.post(url, json=dict(request, purpose=purpose), headers=headers).status_code == 400
     preview.update(cm_id=other_cm, actor_id=other_cm)
     scoped = client.post("/creators/broadcast/preview", json=preview, headers=headers).json()
     assert len(scoped["issues"]) == 1 and len(scoped["groups"][0]["mentions"]) == 1
@@ -198,10 +244,78 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
     deleted = client.post(lists_url + "delete", json={"id": item["id"], "revision": 3}, headers=headers)
     assert deleted.status_code == 200 and deleted.json()["lists"] == [] and stored["deleted_at"]
     assert client.post(lists_url + "load", json={"id": item["id"]}, headers=headers).status_code == 404
+
+    # Group lists do not require a creator contact or an assigned creator. Older list data is preserved.
+    group_list = dict(group_fields, name="Group list", notes="Example")
+    created_group = client.post(lists_url + "save", json=group_list, headers=headers)
+    assert created_group.status_code == 200, created_group.text
+    group_item = created_group.json()["list"]
+    group_stored = saved_lists[group_item["id"]]
+    assert group_item["target_count"] == 1 and group_stored["targets"] == [{"chat_id": group["id"]}]
+    loaded_group = client.post(lists_url + "load", json={"id": group_item["id"]}, headers=headers).json()
+    assert loaded_group["selected_chat_ids"] == [group["id"]] and loaded_group["issues"] == []
+    assert loaded_group["mention"] and loaded_group["list"]["mention"]
+    group_stored["targets"] = [{"contact_id": p1, "chat_id": group["id"]},
+                               {"contact_id": p2, "chat_id": group["id"]}]
+    legacy = client.post(lists_url + "load", json={"id": group_item["id"]}, headers=headers).json()
+    assert legacy["list"]["targets"] == [{"chat_id": group["id"]}] and legacy["list"]["target_count"] == 1
+    assert legacy["selected_chat_ids"] == [group["id"]] and legacy["issues"] == []
+    assert not legacy["mention"] and not legacy["list"]["mention"] and "@all" in legacy["notice"]
+    assert group_stored["mention"]  # Old @selected-people is not silently upgraded to @all or changed in DB.
+    group_stored["targets"] = [{"chat_id": group["id"]}]
+    group_stored["snapshot"].pop("mode")
+    snapshot_legacy = client.post(lists_url + "load", json={"id": group_item["id"]}, headers=headers).json()
+    assert not snapshot_legacy["list"]["mention"] and snapshot_legacy["selected_chat_ids"] == [group["id"]]
+    group_stored["targets"] = [{"contact_id": p1, "chat_id": group["id"]},
+                               {"contact_id": p2, "chat_id": group["id"]}]
+    assert len(group_stored["targets"]) == 2  # Reading an old list never rewrites its stored targets.
+    group_stored["cm_id"] = None
+    legacy_all = client.post(lists_url + "load", json={"id": group_item["id"]}, headers=headers).json()
+    assert legacy_all["selected_chat_ids"] == [] and legacy_all["issues"] and legacy_all["list"]["id"]
+    group_stored["cm_id"] = other_cm
+    changed["routes"] = True
+    invalid_group = client.post(lists_url + "load", json={"id": group_item["id"]}, headers=headers).json()
+    assert invalid_group["selected_chat_ids"] == [] and len(invalid_group["issues"]) == 1
+    assert client.post(lists_url + "save", json=group_list, headers=headers).status_code == 400
+    changed["routes"] = False
+    changed["cm_active"] = False
+    revoked_group = client.post(lists_url + "load", json={"id": group_item["id"]}, headers=headers).json()
+    assert revoked_group["selected_chat_ids"] == [] and len(revoked_group["issues"]) == 1
+    assert client.post("/creators/broadcast/groups", json=group_fields, headers=headers).status_code == 403
+    assert client.post("/creators/broadcast/preview", json=group_fields, headers=headers).status_code == 403
+    changed["cm_active"] = True
+
+    templates_url = "/creators/broadcast/templates/"
+    draft = {"name": "Example template", "body": "Example\nhttps://example.com"}
+    assert client.post(templates_url + "save", json=draft).status_code == 400
+    for invalid in (dict(draft, body=" "), dict(draft, body="x" * 4001),
+                    dict(draft, body="bad\x00body"), dict(draft, name="bad\x00name")):
+        assert client.post(templates_url + "save", json=invalid, headers=headers).status_code == 400
+    template = client.post(templates_url + "save", json=draft, headers=headers)
+    assert template.status_code == 200, template.text
+    template_item = template.json()["template"]
+    assert template_item["body"] == draft["body"]
+    template_stored = saved_templates[template_item["id"]]
+    assert creator_broadcast.page_data(actor["id"])["templates"] == [template_item]
+    assert draft["name"] in client.get("/creators/broadcast").text
+    update_template = dict(draft, id=template_item["id"], revision=1, body="Updated")
+    assert client.post(templates_url + "save", json=update_template, headers=headers).json()["template"]["revision"] == 2
+    assert client.post(templates_url + "save", json=update_template, headers=headers).status_code == 400
+    template_stored["owner_authorization_id"] = other_cm
+    for action in ("save", "delete"):
+        assert client.post(templates_url + action, json=dict(update_template, revision=2), headers=headers).status_code == 404
+    assert creator_broadcast.page_data(actor["id"])["templates"] == []
+    template_stored["owner_authorization_id"] = actor["id"]
+    assert client.post(templates_url + "delete", json={"id": template_item["id"], "revision": 1},
+                       headers=headers).status_code == 400
+    deleted_template = client.post(templates_url + "delete", json={"id": template_item["id"], "revision": 2},
+                                   headers=headers)
+    assert deleted_template.json()["templates"] == [] and template_stored["deleted_at"]
     changed["role"] = False
     assert client.get("/creators/broadcast").status_code == 403
     assert client.post(url, json=request, headers=headers).status_code == 403
     assert client.post(lists_url + "save", json=fields, headers=headers).status_code == 403
+    assert client.post(templates_url + "save", json=draft, headers=headers).status_code == 403
     ordinary, _ = browser(monkeypatch)
     assert ordinary.get("/creators/broadcast").status_code == 403
     revoked, _ = browser(monkeypatch, owner=True, active=False)

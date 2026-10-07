@@ -1,4 +1,4 @@
-// Routing is rechecked server-side. Only personal static lists are written; never sends.
+// Routing is rechecked server-side. Personal lists/templates only; never sends.
 export function recipients(entries, routes, groups, purpose) {
   const rows = new Map();
   for (const entry of entries) {
@@ -26,6 +26,16 @@ export function buildPlan(rows, mention, purposeLabel) {
   }
   return { groups: [...groups.values()], issues, people };
 }
+export function groupPlan(groups, selected, mention) {
+  const available = new Map(groups.map(group => [group.id, group]));
+  const targets = [], issues = [];
+  for (const id of new Set(selected)) {
+    const group = available.get(id);
+    if (group) targets.push({...group, people:[], mentions:[], mention_all:mention});
+    else issues.push({key:id,reason:'群已失效，请重新选择'});
+  }
+  return {groups:targets,issues,people:[]};
+}
 export function parseSelection(raw, actor, now = Date.now()) {
   const selection = JSON.parse(raw), age = now - selection.created_at;
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -37,7 +47,7 @@ export function parseSelection(raw, actor, now = Date.now()) {
 }
 export function listState(cmId, purpose, mention, targets) {
   return JSON.stringify([cmId, purpose, mention,
-    targets.map(target => [target.contact_id, target.chat_id]).sort((a,b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))]);
+    targets.map(target => [target.contact_id || '', target.chat_id]).sort((a,b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))]);
 }
 
 if (typeof process !== 'undefined' && process.argv.includes('--self-check')) {
@@ -75,6 +85,11 @@ if (typeof process !== 'undefined' && process.argv.includes('--self-check')) {
   for (const purpose of ['community','category','campaign']) {
     assert.equal(buildPlan(recipients(entries,new Map(),groups,purpose),true,'群').groups.length,0);
   }
+  const direct = groupPlan(groups, ['training','training','training2'], true);
+  assert.equal(direct.groups.length,2); assert.ok(direct.groups.every(group => group.mention_all && !group.people.length));
+  assert.equal(groupPlan(groups, ['missing'], true).issues.length,1);
+  assert.equal(groupPlan(groups, [], true).groups.length,0);
+  assert.notEqual(listState('cm','category',true,[{chat_id:'training'}]),listState('cm','category',true,[{chat_id:'training2'}]));
   console.log('Multi-purpose broadcast routing check passed; no API calls.');
 }
 
@@ -88,13 +103,15 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   let entries = [], groups = [], routes = new Map(), purpose = 'support', dirty = true, busy = false;
   let lists = config.lists || [], currentList = null, editingList = null, fixedIds = null, fixedTargets = null;
   let savedState = '', editMode = 'create', pendingAction = null, initialMetadata = '';
+  let selectedGroups = new Set(), templates = config.templates || [], currentTemplateId = '', editingTemplate = null, initialTemplate = '';
+  const groupMode = () => purpose !== 'support';
   const rows = () => recipients(entries, routes, groups, purpose);
-  const plan = () => buildPlan(rows(), $('mention').checked, config.purposes[purpose]);
+  const plan = () => groupMode() ? groupPlan(groups,selectedGroups,$('mention').checked) : buildPlan(rows(), $('mention').checked, config.purposes[purpose]);
   function notice(text) { $('notice').textContent = text; }
-  const selections = () => rows().filter(row => row.selected && row.person).map(row => ({contact_id:row.person.id,chat_id:row.chatId}));
+  const selections = () => groupMode() ? [...selectedGroups].map(chat_id => ({chat_id})) : rows().filter(row => row.selected && row.person).map(row => ({contact_id:row.person.id,chat_id:row.chatId}));
   const canSaveTargets = () => !dirty && plan().groups.length > 0 && plan().issues.length === 0;
   const selectionState = () => listState($('cm').value,purpose,$('mention').checked,selections());
-  const unsavedTargets = () => currentList ? dirty || selectionState() !== savedState : Boolean(entries.length || $('input').value.trim());
+  const unsavedTargets = () => currentList ? dirty || selectionState() !== savedState : groupMode() ? Boolean(selectedGroups.size) : Boolean(entries.length || $('input').value.trim());
   function renderLibrary(current = plan()) {
     const canSave = !dirty && current.groups.length > 0 && current.issues.length === 0, changed = unsavedTargets();
     $('list-library').textContent = lists.length ? `名单库 · ${lists.length}` : '打开名单库';
@@ -104,7 +121,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     $('list-current-update').hidden = !currentList;
     $('list-current-update').disabled = busy || !canSave || !changed;
     $('list-info').textContent = currentList ? `当前：${currentList.name}${changed ? ' · 有未保存的调整' : ''}`
-      : canSave ? `已选 ${current.people.length} 人，可以保存为名单。` : '匹配对象后，可保存名单重复使用。';
+      : canSave ? groupMode() ? `已选 ${current.groups.length} 个群` : `已选 ${current.people.length} 人` : '';
     $('library-items').replaceChildren();
     if (!lists.length) {
       const empty = node('div','','broadcast-library-empty');
@@ -117,7 +134,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       heading.append(node('h4',list.name,'mb-0'));
       if (currentList?.id === list.id) heading.append(node('span','当前使用','badge bg-blue-lt'));
       const cm = config.cms.find(cm => cm.id === list.cm_id)?.name || (list.cm_id === 'all' ? '全部达人' : '原负责人已失效');
-      item.append(heading,node('div',`${config.purposes[list.purpose]} · ${list.target_count} 人 · ${cm}`,'text-secondary small mt-2'));
+      item.append(heading,node('div',`${config.purposes[list.purpose]} · ${list.target_count} ${list.purpose === 'support' ? '人' : '个群'} · ${cm}`,'text-secondary small mt-2'));
       if (list.notes) item.append(node('p',list.notes,'small text-secondary'));
       const actions = node('div','','broadcast-list-actions');
       for (const [label,style,action] of [
@@ -131,9 +148,43 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       item.append(actions); $('library-items').append(item);
     }
   }
+  function renderGroupPicker() {
+    const focused = document.activeElement?.dataset.chatId;
+    const query = $('group-search').value.trim().toLocaleLowerCase();
+    const visible = groups.filter(group => group.name.toLocaleLowerCase().includes(query));
+    $('group-items').replaceChildren();
+    for (const group of visible) {
+      const label = node('label','','broadcast-group-item');
+      const check = node('input'); check.type = 'checkbox'; check.className = 'form-check-input';
+      check.dataset.chatId = group.id; check.checked = selectedGroups.has(group.id); check.disabled = busy;
+      check.setAttribute('aria-label',`选择群 ${group.name}`);
+      check.addEventListener('change',() => {
+        if (check.checked && selectedGroups.size >= 500) { check.checked = false; notice('最多选择 500 个群。'); return; }
+        if (check.checked) selectedGroups.add(group.id); else selectedGroups.delete(group.id);
+        render();
+      });
+      label.append(check,node('span',group.name)); $('group-items').append(label);
+    }
+    if (!visible.length) $('group-items').append(node('div',busy ? '正在读取群聊…' : !$('cm').value ? '选择 CM/AM 后查看群聊' : query ? '没有匹配的群' : '暂无已分类的群','broadcast-group-empty text-secondary'));
+    $('group-count').textContent = `已选 ${selectedGroups.size} / ${groups.length}`;
+    $('group-all').checked = visible.length > 0 && visible.every(group => selectedGroups.has(group.id));
+    $('group-all').indeterminate = visible.some(group => selectedGroups.has(group.id)) && !$('group-all').checked;
+    $('group-all').disabled = busy || !visible.length;
+    if (focused) [...$('group-items').querySelectorAll('input')].find(input => input.dataset.chatId === focused)?.focus();
+  }
+  function renderTemplates() {
+    $('template-select').replaceChildren(new Option('选择消息模板',''));
+    for (const template of templates) $('template-select').add(new Option(template.name,template.id));
+    $('template-select').value = currentTemplateId;
+    $('template-edit').disabled = busy || !templates.some(template => template.id === currentTemplateId);
+  }
   function render() {
     const current = plan(), all = rows();
-    $('matches').hidden = !entries.length;
+    $('people-input').hidden = groupMode(); $('group-picker').hidden = !groupMode();
+    $('cm-label').textContent = groupMode() ? 'CM/AM' : '达人范围';
+    $('mention-label').textContent = groupMode() ? '@ 全体成员' : '@ 所选达人';
+    $('matches').hidden = groupMode() || !entries.length;
+    if (groupMode()) renderGroupPicker();
     $('count').textContent = `已选 ${current.people.length} 人 · 待处理 ${current.issues.length} 项`;
     $('route-title').textContent = `目标${config.purposes[purpose]}`;
     $('rows').replaceChildren();
@@ -186,25 +237,26 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       tr.append(selection, identity, route); $('rows').append(tr);
     }
     $('exclude').hidden = !current.issues.length;
-    $('summary').textContent = entries.length ? `已选 ${current.people.length} 人 · ${current.groups.length} 个群` : '尚未选择对象';
+    $('summary').textContent = groupMode() ? `已选 ${current.groups.length} 个群` : entries.length ? `已选 ${current.people.length} 人 · ${current.groups.length} 个群` : '尚未选择对象';
     $('preview').disabled = busy || dirty || !current.groups.length || Boolean(current.issues.length) || !$('message').value.trim();
     $('download').disabled = busy || dirty || !current.people.length;
     $('message-preview').textContent = $('message').value || '输入消息后预览';
     $('input').readOnly = Boolean(fixedIds);
     $('match').textContent = fixedIds ? '重新核验' : '匹配名单';
-    $('mention-preview').textContent = current.groups[0]?.mentions.map(person => `@${person.name}`).join(' ') || '';
+    $('mention-preview').textContent = groupMode() ? $('mention').checked ? '@全体成员' : '' : current.groups[0]?.mentions.map(person => `@${person.name}`).join(' ') || '';
     for (const button of buttons) {
       const active = button.dataset.purpose === purpose;
       button.className = `btn ${active ? 'btn-primary' : 'btn-outline-secondary'}`; button.setAttribute('aria-pressed', String(active));
     }
     renderLibrary(current);
+    renderTemplates();
   }
   function lock(value) {
     busy = value;
     for (const control of document.querySelectorAll('#broadcast-app main button, #broadcast-app main input, #broadcast-app main select, #broadcast-app main textarea')) control.disabled = value;
     render();
     for (const control of $('rows').querySelectorAll('input,select,button')) control.disabled = value;
-    for (const dialog of ['list-dialog','library-dialog','list-action-dialog']) {
+    for (const dialog of ['list-dialog','library-dialog','list-action-dialog','template-dialog']) {
       for (const control of $(dialog).querySelectorAll('input,textarea,button')) control.disabled = value;
     }
   }
@@ -213,9 +265,10 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       const response = await fetch(`/creators/broadcast/${action}`, {method:'POST', credentials:'same-origin', signal:AbortSignal.timeout(30000), headers:{'Content-Type':'application/json','X-CSRF-Token':$('app').dataset.csrf}, body:JSON.stringify(data)});
       const result = await response.json().catch(() => { throw new Error('服务暂时不可用，请稍后重试。'); });
       if (!response.ok) throw new Error(result.error || '请求失败，请稍后重试。');
-      const readAction = ['match','resolve','preview','lists/load'].includes(action);
-      if (!result || (readAction && (!Array.isArray(result.groups) || !Array.isArray(result[action === 'preview' ? 'issues' : 'entries'])))
-          || (!readAction && !Array.isArray(result.lists))) throw new Error('返回格式异常，请刷新后重试。');
+      const readAction = ['match','resolve','groups','preview','lists/load'].includes(action);
+      const groupRead = action === 'groups' || result?.mode === 'groups';
+      if (!result || (readAction && (!Array.isArray(result.groups) || !Array.isArray(result[action === 'preview' || groupRead ? 'issues' : 'entries'])))
+          || (!readAction && !Array.isArray(action.startsWith('templates/') ? result.templates : result.lists))) throw new Error('返回格式异常，请刷新后重试。');
       return result;
     } catch (error) {
       if (['TimeoutError','AbortError'].includes(error.name)) throw new Error('请求超时，请重新尝试。');
@@ -224,7 +277,30 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     }
   }
   function applyTargets(result) {
-    entries = result.entries; groups = result.groups; routes = new Map((result.routes || []).map(route => [route.contact_id,route.chat_id])); dirty = false;
+    entries = result.entries || []; groups = result.groups; routes = new Map((result.routes || []).map(route => [route.contact_id,route.chat_id]));
+    selectedGroups = new Set(result.selected_chat_ids || []); dirty = false;
+  }
+  function configureScope(value = $('cm').value) {
+    $('cm').replaceChildren(new Option(groupMode() ? '选择 CM/AM' : '全部已入库达人',groupMode() ? '' : 'all'));
+    for (const cm of config.cms) $('cm').add(new Option(groupMode() ? cm.name : `${cm.name} 负责的达人`,cm.id));
+    if (!groupMode() && !value) value = 'all';
+    if (groupMode() && value === 'all') value = config.cms.some(cm => cm.id === $('app').dataset.actor) ? $('app').dataset.actor : '';
+    if (value && ![...$('cm').options].some(option => option.value === value)) $('cm').add(new Option('授权已失效',value));
+    $('cm').value = value;
+  }
+  async function fetchGroups(preserve = false) {
+    if (busy) return;
+    const old = preserve ? new Set(selectedGroups) : new Set();
+    if (!preserve) { groups = []; selectedGroups = new Set(); }
+    dirty = true;
+    if (!$('cm').value || $('cm').value === 'all') { render(); return; }
+    lock(true); notice('');
+    try {
+      const result = await api('groups',{cm_id:$('cm').value,purpose}); applyTargets(result);
+      selectedGroups = new Set(groups.filter(group => old.has(group.id)).map(group => group.id));
+      if (selectedGroups.size !== old.size) notice('已跳过失效群，请检查当前选择。');
+    } catch (error) { notice(error.message); }
+    finally { lock(false); }
   }
   async function match(preserve = false) {
     if (busy) return;
@@ -245,11 +321,27 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   $('match').addEventListener('click', () => void match());
   $('input').addEventListener('input', () => { dirty = true; notice(entries.length ? '名单已修改，请重新匹配。' : ''); render(); });
   for (const id of ['message','mention']) $(id).addEventListener('input', render);
-  $('cm').addEventListener('change', () => { entries = []; groups = []; routes = new Map(); fixedIds = null; fixedTargets = null; currentList = null; $('input').value = ''; dirty = true; notice('范围已切换，请重新匹配。'); render(); });
+  $('cm').addEventListener('change', () => {
+    entries = []; groups = []; selectedGroups = new Set(); routes = new Map(); fixedIds = null; fixedTargets = null; currentList = null; $('input').value = ''; dirty = true; notice('');
+    if (groupMode()) void fetchGroups(); else render();
+  });
   for (const button of buttons) button.addEventListener('click', () => {
     if (purpose === button.dataset.purpose || busy) return;
-    purpose = button.dataset.purpose; routes = new Map(); fixedTargets = null; $('confirm').close();
-    if (entries.length && !dirty) void match(true); else { entries = []; groups = []; render(); }
+    const wasGroupMode = groupMode();
+    purpose = button.dataset.purpose; entries = []; groups = []; selectedGroups = new Set(); routes = new Map(); fixedIds = null; fixedTargets = null; currentList = null; dirty = true;
+    if (wasGroupMode !== groupMode()) $('mention').checked = !groupMode();
+    $('confirm').close(); $('input').value = ''; $('group-search').value = ''; notice(''); configureScope();
+    if (groupMode()) void fetchGroups(); else render();
+  });
+  $('group-refresh').addEventListener('click',() => void fetchGroups(true));
+  $('group-search').addEventListener('input',renderGroupPicker);
+  $('group-all').addEventListener('change',() => {
+    const query = $('group-search').value.trim().toLocaleLowerCase(), visible = groups.filter(group => group.name.toLocaleLowerCase().includes(query));
+    if ($('group-all').checked) {
+      if (new Set([...selectedGroups,...visible.map(group => group.id)]).size > 500) { notice('最多选择 500 个群，请缩小搜索范围。'); render(); return; }
+      for (const group of visible) selectedGroups.add(group.id);
+    } else for (const group of visible) selectedGroups.delete(group.id);
+    render();
   });
   $('clear').addEventListener('click', () => { $('input').value = ''; entries = []; groups = []; routes = new Map(); fixedIds = null; fixedTargets = null; currentList = null; dirty = true; notice(''); render(); });
   $('exclude').addEventListener('click', () => {
@@ -274,16 +366,16 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     lock(true); notice('正在重新核对路由…');
     try {
       const result = await api('preview',{cm_id:$('cm').value,purpose,mention:$('mention').checked,message:$('message').value,selections:selections()});
-      if (result.issues.length) { dirty = true; throw new Error(`${result.issues.length} 项路由已变化，请重新匹配。`); }
-      $('confirm-count').textContent = `${config.purposes[purpose]} · ${result.people.length} 位达人 → ${result.groups.length} 个群 → ${result.groups.length} 条消息`;
-      $('confirm-scope').textContent = `资料范围：${$('cm').selectedOptions[0].textContent}。查看权限不等于发送权限。`;
+      if (result.issues.length) { dirty = true; throw new Error(groupMode() ? '群聊已变化，请点击“刷新”重新核验。' : `${result.issues.length} 项路由已变化，请重新匹配。`); }
+      $('confirm-count').textContent = `${result.groups.length} 个群 · ${result.groups.length} 条消息${groupMode() ? '' : ` · ${result.people.length} 位达人`}`;
+      $('confirm-scope').textContent = $('cm').selectedOptions[0].textContent;
       $('confirm-message').textContent = result.message; $('confirm-groups').replaceChildren();
       for (const group of result.groups) {
         const item = node('div', '', 'broadcast-target');
-        item.append(node('strong',group.name),node('div',group.mentions.length ? group.mentions.map(person => `@${person.name}`).join(' ') : '不 @ 成员','text-primary small mt-1'),node('div',`群内全体可见 · 库内成员数：${group.member_count ?? '未知'}`,'text-secondary small mt-1'));
+        item.append(node('strong',group.name),node('div',group.mention_all ? '@全体成员 · 权限待核验' : group.mentions.length ? group.mentions.map(person => `@${person.name}`).join(' ') : '不 @ 成员','text-primary small mt-1'));
         $('confirm-groups').append(item);
       }
-      notice('路由预览已生成，不会发送。'); $('confirm').showModal();
+      notice(''); $('confirm').showModal();
     } catch (error) { notice(error.message || '预览失败，请稍后重试。'); }
     finally { lock(false); }
   });
@@ -293,13 +385,12 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     try {
       const result = await api('lists/load',{id:list.id});
       lists = lists.map(list => list.id === result.list.id ? result.list : list);
-      currentList = result.list; fixedIds = result.entries.map(entry => entry.key.replace(/^contact:/,'')); fixedTargets = result.list.targets;
-      purpose = result.purpose;
-      if (![...$('cm').options].some(option => option.value === result.selected_cm_id)) $('cm').add(new Option('原负责人已失效',result.selected_cm_id));
-      $('cm').value = result.selected_cm_id; $('mention').checked = result.list.mention;
-      $('input').value = result.entries.map(entry => entry.inputs[0]).join('\n'); applyTargets(result);
+      currentList = result.list; purpose = result.purpose;
+      fixedIds = groupMode() ? null : result.entries.map(entry => entry.key.replace(/^contact:/,'')); fixedTargets = groupMode() ? null : result.list.targets;
+      configureScope(groupMode() && result.selected_cm_id === 'all' ? '' : result.selected_cm_id); $('mention').checked = result.list.mention;
+      $('input').value = (result.entries || []).map(entry => entry.inputs[0]).join('\n'); $('group-search').value = ''; applyTargets(result);
       savedState = selectionState(); pendingAction = null; $('library-dialog').close(); $('list-action-dialog').close();
-      notice(result.issues.length ? `名单已载入，${result.issues.length} 项已跳过；可查看原因或重新选群。` : '名单已载入，人员与群已重新核验。');
+      notice([result.issues.length ? `已跳过 ${result.issues.length} 项：${result.issues[0].reason}` : '',result.notice || '名单已载入。'].filter(Boolean).join(' '));
     } catch (error) {
       $('library-error').textContent = error.message; $('list-action-error').textContent = error.message; notice(error.message);
     }
@@ -318,20 +409,20 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     initialMetadata = JSON.stringify([$('list-name').value,$('list-notes').value]);
     $('list-save').textContent = mode === 'edit' ? '保存修改' : mode === 'update' ? '确认更新名单' : '创建名单';
     $('list-error').textContent = '';
-    $('list-description').textContent = mode === 'edit' ? '只修改名称和备注，不改变名单中的人员和群。'
-      : `${mode === 'update' ? `将原 ${list.target_count} 人替换为当前 ` : '保存当前 '}${plan().people.length} 人 · ${config.purposes[purpose]} · ${plan().groups.length} 个群${$('mention').checked ? ' · @ 所选达人' : ' · 不 @ 成员'}。不保存正文，不会发送。`;
+    $('list-description').textContent = mode === 'edit' ? '修改名称和备注，不改变接收对象。'
+      : `${groupMode() ? '' : `${plan().people.length} 人 · `}${plan().groups.length} 个群 · ${config.purposes[purpose]}${$('mention').checked ? groupMode() ? ' · @全体成员' : ' · @所选达人' : ''}`;
     $('list-dialog').showModal(); $('list-name').focus();
   }
   function confirmListAction(kind, list = null) {
     if (busy) return;
     pendingAction = {kind,list}; $('list-action-error').textContent = '';
     if (kind !== 'discard') $('library-error').textContent = '';
-    $('list-action-title').textContent = kind === 'delete' ? '删除这份名单？' : kind === 'load' ? '替换当前接收对象？' : '放弃未保存的修改？';
+    $('list-action-title').textContent = kind === 'delete' ? '删除这份名单？' : kind === 'template-delete' ? '删除这个模板？' : kind === 'load' ? '替换当前接收对象？' : kind === 'template-use' ? '替换当前消息？' : '放弃未保存的修改？';
     $('list-action-name').textContent = list?.name || '';
-    $('list-action-description').textContent = kind === 'delete' ? '只删除保存的名单。达人、群和当前选择都会保留。'
-      : kind === 'load' ? '当前接收对象有未保存的调整。使用这份名单会替换它们，消息正文会保留。' : '名称和备注尚未保存，关闭后将放弃这些修改。';
-    $('list-action-proceed').textContent = kind === 'delete' ? '删除名单' : kind === 'load' ? '使用这份名单' : '放弃修改';
-    $('list-action-proceed').className = `btn ${kind === 'delete' ? 'btn-danger' : 'btn-primary'}`;
+    $('list-action-description').textContent = kind === 'delete' ? '只删除名单，保留当前选择。' : kind === 'template-delete' ? '删除保存的模板，当前消息会保留。'
+      : kind === 'load' ? '替换未保存的接收对象，消息正文会保留。' : kind === 'template-use' ? '用模板正文替换当前消息，接收对象不变。' : '关闭后将放弃未保存的修改。';
+    $('list-action-proceed').textContent = kind === 'delete' ? '删除名单' : kind === 'template-delete' ? '删除模板' : kind === 'load' ? '使用名单' : kind === 'template-use' ? '使用模板' : '放弃修改';
+    $('list-action-proceed').className = `btn ${kind.endsWith('delete') ? 'btn-danger' : 'btn-primary'}`;
     $('list-action-dialog').showModal(); $('list-action-cancel').focus();
   }
   function closeEditor() {
@@ -346,7 +437,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   $('library-dialog').addEventListener('cancel', event => { if (busy) event.preventDefault(); });
   $('list-new').addEventListener('click', () => {
     if (canSaveTargets()) editList(null);
-    else { notice('先匹配接收对象并选好群，再保存名单。'); $('input').focus(); $('input').scrollIntoView({block:'center',behavior:'smooth'}); }
+    else { notice(groupMode() ? '先选择群聊。' : '先匹配达人并选好群。'); const control = $(groupMode() ? 'group-search' : 'input'); control.focus(); control.scrollIntoView({block:'center',behavior:'smooth'}); }
   });
   $('list-current-update').addEventListener('click', () => { if (canSaveTargets()) editList(currentList,'update'); });
   $('list-cancel').addEventListener('click',closeEditor);
@@ -364,7 +455,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       const result = await api('lists/save',fields); lists = result.lists;
       if (currentList?.id === result.list.id) currentList = {...currentList,...result.list};
       if (!metadataOnly) {
-        currentList = {...result.list,targets:fields.selections}; fixedIds = fields.selections.map(target => target.contact_id); fixedTargets = fields.selections;
+        currentList = {...result.list,targets:fields.selections}; fixedIds = groupMode() ? null : fields.selections.map(target => target.contact_id); fixedTargets = groupMode() ? null : fields.selections;
         savedState = selectionState();
       }
       $('list-dialog').close();
@@ -375,20 +466,70 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       if (!$('list-dialog').open) ($('library-dialog').open ? $('library-close') : $('list-new')).focus();
     }
   });
+  function useTemplate(template) {
+    currentTemplateId = template.id; $('message').value = template.body;
+    pendingAction = null; $('list-action-dialog').close(); render();
+  }
+  function editTemplate(template = null) {
+    if (busy) return;
+    editingTemplate = template;
+    $('template-title').textContent = template ? '编辑消息模板' : '新建消息模板';
+    $('template-name').value = template?.name || ''; $('template-body').value = template?.body ?? $('message').value;
+    initialTemplate = JSON.stringify([$('template-name').value,$('template-body').value]);
+    $('template-error').textContent = ''; $('template-delete').hidden = !template;
+    $('template-dialog').showModal(); $('template-name').focus();
+  }
+  function closeTemplate() {
+    if (busy) return;
+    if (JSON.stringify([$('template-name').value,$('template-body').value]) !== initialTemplate) confirmListAction('template-discard');
+    else $('template-dialog').close();
+  }
+  $('template-new').addEventListener('click',() => editTemplate());
+  $('template-edit').addEventListener('click',() => editTemplate(templates.find(template => template.id === currentTemplateId)));
+  $('template-select').addEventListener('change',() => {
+    const template = templates.find(template => template.id === $('template-select').value);
+    if (!template) { currentTemplateId = ''; renderTemplates(); return; }
+    $('template-select').value = currentTemplateId;
+    if ($('message').value.trim() && $('message').value !== template.body) confirmListAction('template-use',template);
+    else useTemplate(template);
+  });
+  $('template-cancel').addEventListener('click',closeTemplate);
+  $('template-dialog').addEventListener('cancel',event => { event.preventDefault(); closeTemplate(); });
+  $('template-delete').addEventListener('click',() => { if (editingTemplate) confirmListAction('template-delete',editingTemplate); });
+  $('template-form').addEventListener('submit',async event => {
+    event.preventDefault(); if (busy) return;
+    const fields = {name:$('template-name').value,body:$('template-body').value,
+      ...(editingTemplate ? {id:editingTemplate.id,revision:editingTemplate.revision} : {})};
+    lock(true); $('template-error').textContent = '';
+    try {
+      const result = await api('templates/save',fields); templates = result.templates; useTemplate(result.template);
+      $('template-dialog').close(); notice('模板已保存。');
+    } catch (error) { $('template-error').textContent = error.message; }
+    finally { lock(false); if (!$('template-dialog').open) $('template-select').focus(); }
+  });
   $('list-action-cancel').addEventListener('click', () => { pendingAction = null; $('list-action-dialog').close(); });
   $('list-action-dialog').addEventListener('cancel', event => { if (busy) event.preventDefault(); else pendingAction = null; });
   $('list-action-proceed').addEventListener('click', async () => {
     if (busy || !pendingAction) return;
     const {kind,list} = pendingAction;
     if (kind === 'discard') { pendingAction = null; $('list-action-dialog').close(); $('list-dialog').close(); return; }
+    if (kind === 'template-discard') { pendingAction = null; $('list-action-dialog').close(); $('template-dialog').close(); return; }
+    if (kind === 'template-use') { useTemplate(list); return; }
     if (kind === 'load') { await loadList(list); return; }
     lock(true); $('list-action-error').textContent = '';
     try {
-      const result = await api('lists/delete',{id:list.id,revision:list.revision}); lists = result.lists;
-      if (currentList?.id === list.id) currentList = null;
-      pendingAction = null; $('list-action-dialog').close(); notice('名单已删除；达人、群和当前选择未改动。');
+      if (kind === 'template-delete') {
+        const result = await api('templates/delete',{id:list.id,revision:list.revision}); templates = result.templates;
+        if (currentTemplateId === list.id) currentTemplateId = '';
+        $('template-dialog').close(); notice('模板已删除。');
+      } else {
+        const result = await api('lists/delete',{id:list.id,revision:list.revision}); lists = result.lists;
+        if (currentList?.id === list.id) currentList = null;
+        notice('名单已删除。');
+      }
+      pendingAction = null; $('list-action-dialog').close();
     } catch (error) { $('list-action-error').textContent = error.message; }
-    finally { lock(false); ($('list-action-dialog').open ? $('list-action-cancel') : $('library-close')).focus(); }
+    finally { lock(false); ($('list-action-dialog').open ? $('list-action-cancel') : kind === 'template-delete' ? $('template-select') : $('library-close')).focus(); }
   });
   $('back').addEventListener('click', () => $('confirm').close());
   render();

@@ -59,9 +59,12 @@ def create_router(*, current_authorization, render_template, csrf_token):
     @router.post("/broadcast/match")
     @router.post("/broadcast/preview")
     @router.post("/broadcast/resolve")
+    @router.post("/broadcast/groups")
     @router.post("/broadcast/lists/save")
     @router.post("/broadcast/lists/load")
     @router.post("/broadcast/lists/delete")
+    @router.post("/broadcast/templates/save")
+    @router.post("/broadcast/templates/delete")
     async def broadcast_read(request: Request):
         """Bounded, session-scoped routing and personal lists; never sends."""
         try:
@@ -83,7 +86,16 @@ def create_router(*, current_authorization, render_template, csrf_token):
                 raise ValueError("请求格式无效。")
             args = (auth["id"], fields.get("cm_id", "all"), fields.get("purpose", "support"))
             action = request.url.path.rsplit("/", 1)[-1]
-            if action == "match":
+            if "/templates/" in request.url.path:
+                if action == "save":
+                    result = await run_in_threadpool(creator_broadcast.template_save, auth["id"], fields)
+                else:
+                    result = await run_in_threadpool(
+                        creator_broadcast.template_delete, auth["id"], fields.get("id"), fields.get("revision"),
+                    )
+            elif action == "groups":
+                result = await run_in_threadpool(creator_broadcast.groups, *args)
+            elif action == "match":
                 result = await run_in_threadpool(creator_broadcast.match, args[0], args[1], fields.get("raw"), args[2])
             elif action == "resolve":
                 result = await run_in_threadpool(

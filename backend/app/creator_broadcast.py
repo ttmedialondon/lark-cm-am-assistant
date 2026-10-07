@@ -1,4 +1,4 @@
-"""Owner-only routing previews and personal static lists; never send or call AI."""
+"""Owner-only routing previews, personal lists and message drafts; never send or call AI."""
 
 import re
 import unicodedata
@@ -94,6 +94,68 @@ def _groups(conn, contact_ids, cm_id, purpose):
     return list(groups.values())
 
 
+def _joined_groups(conn, cm_id, purpose):
+    """CM visibility comes from Lark discovery, not historical member rows or sync settings."""
+    rows = conn.execute("""SELECT ch.chat_id,ch.name,g.purpose,ac.member_count,ac.member_count_status,
+        ac.member_snapshot_checked_at,ac.member_snapshot_status,ac.last_seen_at
+        FROM authorization_chats ac JOIN authorizations a ON a.id=ac.authorization_id
+        JOIN chats ch ON ch.chat_id=ac.chat_id
+        JOIN chat_group_classifications g ON g.chat_id=ch.chat_id AND g.purpose=%s
+        WHERE ac.authorization_id=%s AND ac.is_visible
+          AND a.status='active' AND a.body_consent_at IS NOT NULL
+          AND COALESCE(ch.chat_status,'normal')='normal' AND COALESCE(ch.chat_mode,'group')<>'p2p'
+        ORDER BY ch.name,ch.chat_id""", (purpose, cm_id)).fetchall()
+    return [{"id": row["chat_id"], "name": row["name"] or "未命名群", "purpose": row["purpose"],
+             "members": [],
+             "member_count": row["member_count"] if row["member_count_status"] == "succeeded" else None,
+             "membership_status": row["member_snapshot_status"],
+             "membership_checked_at": row["member_snapshot_checked_at"].isoformat()
+                 if row["member_snapshot_checked_at"] else None,
+             "visibility_checked_at": row["last_seen_at"].isoformat() if row["last_seen_at"] else None,
+             "membership_note": MEMBERSHIP_NOTE} for row in rows]
+
+
+def _group_targets(values):
+    if not isinstance(values, list) or not 1 <= len(values) <= 500:
+        raise ValueError("请选择 1–500 个群。")
+    targets = []
+    for item in values:
+        chat_id = item.get("chat_id") if isinstance(item, dict) else None
+        if not isinstance(chat_id, str) or not chat_id.strip() or len(chat_id) > 256 or "\x00" in chat_id:
+            raise ValueError("目标群标识无效。")
+        try:
+            chat_id.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("目标群标识无效。") from None
+        if chat_id not in targets:
+            targets.append(chat_id)
+    return targets
+
+
+def _resolve_groups(conn, cm, purpose, selections=None, scope_reason=""):
+    if _purpose(purpose) == "support":
+        raise ValueError("客服群请使用达人名单。")
+    reason = scope_reason or ("请选择一位 CM/AM，重新核验目标群" if cm is None else "")
+    available = [] if reason else _joined_groups(conn, cm, purpose)
+    ids = None if selections is None else _group_targets(selections)
+    valid = {group["id"] for group in available}
+    issues = [{"chat_id": chat_id, "reason": reason or "目标群授权、分类或可见性已变化，请重新选择"}
+              for chat_id in ids or [] if reason or chat_id not in valid]
+    return {"groups": available, "selected_chat_ids": [chat_id for chat_id in ids or [] if chat_id in valid],
+            "issues": issues, "entries": [], "routes": [], "mode": "groups",
+            "count": len(available), "purpose": purpose, "selected_cm_id": str(cm) if cm else "all",
+            "preview_only": True, "can_send": False, "blocked_reason": BLOCKED_REASON}
+
+
+def groups(actor_id, cm_id, purpose):
+    with connection() as conn, conn.transaction():
+        conn.execute("SET TRANSACTION READ ONLY")
+        cm = _scope(conn, actor_id, cm_id)
+        if cm is None:
+            raise ValueError("请选择一位 CM/AM。")
+        return _resolve_groups(conn, cm, purpose)
+
+
 def _match_entries(raw, people):
     if not isinstance(raw, str) or len(raw) > 65536:
         raise ValueError("名单不能超过 65,536 字符。")
@@ -160,14 +222,16 @@ def page_data(actor_id):
             WHERE status='active' AND body_consent_at IS NOT NULL ORDER BY display_name,id""").fetchall()
         return {"purposes": PURPOSES, "cms": [{"id": str(cm["id"]), "name": cm["display_name"] or "未命名用户"}
                                              for cm in cms],
-                "selected_cm_id": "all", "preview_only": True, "lists": _lists(conn, actor_id)}
+                "selected_cm_id": "all", "preview_only": True, "lists": _lists(conn, actor_id),
+                "templates": _templates(conn, actor_id)}
 
 
 def match(actor_id, cm_id, raw, purpose):
     with connection() as conn, conn.transaction():
         conn.execute("SET TRANSACTION READ ONLY")
         cm = _scope(conn, actor_id, cm_id)
-        _purpose(purpose)
+        if _purpose(purpose) != "support":
+            raise ValueError("此类群请直接选择 CM/AM 已加入的群。")
         entries, duplicates = _match_entries(raw, _people(conn, cm))
         candidates = {candidate["id"]: candidate for entry in entries for candidate in entry["candidates"]}
         groups = _groups(conn, list(candidates), cm, purpose)
@@ -176,7 +240,7 @@ def match(actor_id, cm_id, raw, purpose):
                 candidates[contact_id]["groups"].append(group["id"])
         return {"entries": entries, "groups": groups, "count": len(entries), "duplicate_inputs": duplicates,
                 "purpose": purpose, "selected_cm_id": "all" if cm is None else str(cm),
-                "preview_only": True, "can_send": False, "blocked_reason": BLOCKED_REASON}
+                "mode": "people", "preview_only": True, "can_send": False, "blocked_reason": BLOCKED_REASON}
 
 
 def _targets(values, *, one_per_contact=False):
@@ -240,26 +304,34 @@ def _resolve(conn, cm, purpose, contact_ids, selections=None, scope_reason=""):
     return {"entries": entries, "groups": groups, "issues": issues, "routes": routes, "count": len(entries),
             "duplicate_inputs": len(contact_ids) - len(ids), "purpose": purpose,
             "selected_cm_id": "all" if cm is None else str(cm),
-            "preview_only": True, "can_send": False, "blocked_reason": BLOCKED_REASON}
+            "mode": "people", "preview_only": True, "can_send": False, "blocked_reason": BLOCKED_REASON}
 
 
 def resolve(actor_id, cm_id, purpose, contact_ids, selections=None):
     with connection() as conn, conn.transaction():
         conn.execute("SET TRANSACTION READ ONLY")
         cm, reason = _resolve_scope(conn, actor_id, cm_id)
+        if _purpose(purpose) != "support":
+            return _resolve_groups(conn, cm, purpose, selections, reason)
         return _resolve(conn, cm, purpose, contact_ids, selections, reason)
+
+
+def _legacy_group_list(row):
+    return row["purpose"] != "support" and (
+        row.get("snapshot", {}).get("mode") != "groups" or any("contact_id" in target for target in row["targets"]))
 
 
 def _list_metadata(row):
     return {"id": str(row["id"]), "name": row["name"], "notes": row["notes"], "revision": row["revision"],
-            "purpose": row["purpose"], "mention": row["mention"],
+            "purpose": row["purpose"], "mention": False if _legacy_group_list(row) else row["mention"],
+            "mode": "people" if row["purpose"] == "support" else "groups",
             "cm_id": str(row["cm_id"]) if row["cm_id"] else "all",
-            "target_count": row.get("target_count", len(row.get("targets", [])))}
+            "target_count": len({target["chat_id"] for target in row["targets"]})
+                if row["purpose"] != "support" else len(row["targets"])}
 
 
 def _lists(conn, actor_id):
-    rows = conn.execute("""SELECT id,name,notes,revision,purpose,mention,cm_id,
-        jsonb_array_length(targets) AS target_count FROM creator_broadcast_lists
+    rows = conn.execute("""SELECT id,name,notes,revision,purpose,mention,cm_id,targets,snapshot FROM creator_broadcast_lists
         WHERE owner_authorization_id=%s AND deleted_at IS NULL ORDER BY updated_at DESC,id""",
         (creator_access.parse_id(actor_id),)).fetchall()
     return [_list_metadata(row) for row in rows]
@@ -276,10 +348,10 @@ def _owned_list(conn, actor_id, list_id):
 
 def _revision(value):
     if isinstance(value, bool) or not isinstance(value, int | str) or not re.fullmatch(r"[1-9][0-9]{0,9}", str(value)):
-        raise ValueError("名单版本无效，请刷新后重试。")
+        raise ValueError("版本无效，请刷新后重试。")
     revision = int(value)
     if revision > 2_147_483_647:
-        raise ValueError("名单版本无效，请刷新后重试。")
+        raise ValueError("版本无效，请刷新后重试。")
     return revision
 
 
@@ -317,12 +389,19 @@ def list_save(actor_id, fields):
             mention = fields.get("mention")
             if not isinstance(mention, bool):
                 raise ValueError("@ 选项无效。")
-            targets = _targets(fields.get("selections"), one_per_contact=True)
-            selections = [{"contact_id": contact, "chat_id": chat} for contact, chat in targets]
-            checked = _resolve(conn, cm, purpose, [contact for contact, _ in targets], selections)
+            if purpose == "support":
+                targets = _targets(fields.get("selections"), one_per_contact=True)
+                selections = [{"contact_id": contact, "chat_id": chat} for contact, chat in targets]
+                checked = _resolve(conn, cm, purpose, [contact for contact, _ in targets], selections)
+            else:
+                if cm is None:
+                    raise ValueError("请选择一位 CM/AM。")
+                selections = [{"chat_id": chat} for chat in _group_targets(fields.get("selections"))]
+                checked = _resolve_groups(conn, cm, purpose, selections)
             if checked["issues"]:
                 raise ValueError("名单中有已失效的达人或目标群，请重新匹配后保存。")
-            snapshot = {"cm_id": "all" if cm is None else str(cm), "purpose": purpose, "channel": "group"}
+            snapshot = {"cm_id": "all" if cm is None else str(cm), "purpose": purpose, "channel": "group",
+                        "mode": "people" if purpose == "support" else "groups"}
             values = (name.strip(), notes, cm, purpose, mention, Jsonb(selections), Jsonb(snapshot))
             if existing:
                 row = conn.execute("""UPDATE creator_broadcast_lists
@@ -347,10 +426,17 @@ def list_load(actor_id, list_id):
         row = _owned_list(conn, actor_id, list_id)
         cm_id = str(row["cm_id"]) if row["cm_id"] else "all"
         cm, reason = _resolve_scope(conn, actor_id, cm_id)
-        data = _resolve(conn, cm, row["purpose"], [target["contact_id"] for target in row["targets"]],
-                        row["targets"], reason)
-        data.update(list={**_list_metadata(row), "targets": row["targets"], "snapshot": row["snapshot"],
-                          "channel": "group"}, cm_id=cm_id, mention=row["mention"])
+        targets = row["targets"]
+        if row["purpose"] == "support":
+            data = _resolve(conn, cm, row["purpose"], [target["contact_id"] for target in targets], targets, reason)
+        else:
+            targets = [{"chat_id": chat} for chat in _group_targets(targets)]
+            data = _resolve_groups(conn, cm, row["purpose"], targets, reason)
+        metadata = _list_metadata(row)
+        if _legacy_group_list(row):
+            data["notice"] = "旧名单的 @ 选项已关闭；如需通知全群，请重新选择 @all。"
+        data.update(list={**metadata, "targets": targets, "snapshot": row["snapshot"],
+                          "channel": "group"}, cm_id=cm_id, mention=metadata["mention"])
         return data
 
 
@@ -367,15 +453,88 @@ def list_delete(actor_id, list_id, revision):
         return {"lists": _lists(conn, actor_id)}
 
 
+def _message(value):
+    if not isinstance(value, str) or not value.strip() or len(value) > 4000 or "\x00" in value:
+        raise ValueError("请填写 1–4,000 字符的消息。")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("消息包含无效字符。") from None
+    return value
+
+
+def _template_metadata(row):
+    return {"id": str(row["id"]), "name": row["name"], "body": row["body"], "revision": row["revision"]}
+
+
+def _templates(conn, actor_id):
+    return [_template_metadata(row) for row in conn.execute("""SELECT id,name,body,revision
+        FROM creator_broadcast_templates WHERE owner_authorization_id=%s AND deleted_at IS NULL
+        ORDER BY updated_at DESC,id""", (creator_access.parse_id(actor_id),)).fetchall()]
+
+
+def template_save(actor_id, fields):
+    with connection() as conn, conn.transaction():
+        _scope(conn, actor_id, "all")
+        name = fields.get("name")
+        if not isinstance(name, str) or "\x00" in name or not 1 <= len(name.strip()) <= 80:
+            raise ValueError("模板名称须为 1–80 字符。")
+        try:
+            name.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("模板名称包含无效字符。") from None
+        body = _message(fields.get("body"))
+        owner = creator_access.parse_id(actor_id)
+        if fields.get("id"):
+            template_id = creator_access.parse_id(fields["id"])
+            if not conn.execute("""SELECT 1 FROM creator_broadcast_templates
+                WHERE id=%s AND owner_authorization_id=%s AND deleted_at IS NULL""",
+                (template_id, owner)).fetchone():
+                raise LookupError("找不到该模板。")
+            row = conn.execute("""UPDATE creator_broadcast_templates
+                SET name=%s,body=%s,revision=revision+1,updated_at=NOW()
+                WHERE id=%s AND owner_authorization_id=%s AND revision=%s AND deleted_at IS NULL RETURNING *""",
+                (name.strip(), body, template_id, owner, _revision(fields.get("revision")))).fetchone()
+        else:
+            row = conn.execute("""INSERT INTO creator_broadcast_templates(name,body,owner_authorization_id)
+                VALUES(%s,%s,%s) RETURNING *""", (name.strip(), body, owner)).fetchone()
+        if not row:
+            raise ValueError("模板已被修改或删除，请刷新后重试。")
+        return {"template": _template_metadata(row), "templates": _templates(conn, actor_id)}
+
+
+def template_delete(actor_id, template_id, revision):
+    with connection() as conn, conn.transaction():
+        _scope(conn, actor_id, "all")
+        target, owner = creator_access.parse_id(template_id), creator_access.parse_id(actor_id)
+        if not conn.execute("""SELECT 1 FROM creator_broadcast_templates
+            WHERE id=%s AND owner_authorization_id=%s AND deleted_at IS NULL""", (target, owner)).fetchone():
+            raise LookupError("找不到该模板。")
+        row = conn.execute("""UPDATE creator_broadcast_templates SET deleted_at=NOW(),updated_at=NOW(),revision=revision+1
+            WHERE id=%s AND owner_authorization_id=%s AND revision=%s AND deleted_at IS NULL RETURNING id""",
+            (target, owner, _revision(revision))).fetchone()
+        if not row:
+            raise ValueError("模板已被修改或删除，请刷新后重试。")
+        return {"templates": _templates(conn, actor_id)}
+
+
 def preview(actor_id, cm_id, purpose, selections, message, mention):
     with connection() as conn, conn.transaction():
         conn.execute("SET TRANSACTION READ ONLY")
         cm = _scope(conn, actor_id, cm_id)
         _purpose(purpose)
-        if not isinstance(message, str) or not message.strip() or len(message) > 4000:
-            raise ValueError("请填写 1–4,000 字符的消息。")
+        _message(message)
         if not isinstance(mention, bool):
             raise ValueError("@ 选项无效。")
+        if purpose != "support":
+            if cm is None:
+                raise ValueError("请选择一位 CM/AM。")
+            data = _resolve_groups(conn, cm, purpose, selections)
+            chosen = set(data["selected_chat_ids"])
+            data.update(groups=[{**group, "people": [], "mentions": [], "mention_all": mention}
+                                for group in data["groups"] if group["id"] in chosen],
+                        people=[], message=message, mention_all=mention)
+            return data
         selected = _targets(selections)
         contact_ids = list(dict.fromkeys(contact_id for contact_id, _ in selected))
         people = {p["id"]: {"id": p["id"], "name": p["name"]} for p in _people(conn, cm, contact_ids)}
@@ -394,6 +553,7 @@ def preview(actor_id, cm_id, purpose, selections, message, mention):
                     target["mentions"].append(person)
         return {"groups": list(groups.values()), "issues": issues, "people": list(people.values()),
                 "message": message, "purpose": purpose, "selected_cm_id": "all" if cm is None else str(cm),
+                "mode": "people", "mention_all": False,
                 "preview_only": True, "can_send": False, "blocked_reason": BLOCKED_REASON}
 
 
