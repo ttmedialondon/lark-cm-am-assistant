@@ -35,6 +35,10 @@ export function parseSelection(raw, actor, now = Date.now()) {
       || !selection.contact_ids.every(id => typeof id === 'string' && uuid.test(id))) throw new Error('带入名单已失效，请回到“我的达人”重新选择。');
   return {cm_id:selection.cm_id,contact_ids:[...new Set(selection.contact_ids)]};
 }
+export function listState(cmId, purpose, mention, targets) {
+  return JSON.stringify([cmId, purpose, mention,
+    targets.map(target => [target.contact_id, target.chat_id]).sort((a,b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))]);
+}
 
 if (typeof process !== 'undefined' && process.argv.includes('--self-check')) {
   const { default: assert } = await import('node:assert/strict');
@@ -61,6 +65,13 @@ if (typeof process !== 'undefined' && process.argv.includes('--self-check')) {
   assert.throws(() => parseSelection(JSON.stringify(handoff),'other',1001));
   assert.throws(() => parseSelection(JSON.stringify(handoff),'actor',301001));
   assert.throws(() => parseSelection(JSON.stringify({...handoff,contact_ids:['bad']}),'actor',1001));
+  const targets = [{contact_id:'p1',chat_id:'shared'},{contact_id:'p2',chat_id:'shared'}];
+  const saved = listState('all','support',true,targets);
+  assert.equal(saved,listState('all','support',true,[...targets].reverse()));
+  assert.notEqual(saved,listState('all','support',false,targets));
+  assert.notEqual(saved,listState('all','training',true,targets));
+  assert.notEqual(saved,listState('other','support',true,targets));
+  assert.notEqual(saved,listState('all','support',true,targets.slice(0,1)));
   for (const purpose of ['community','category','campaign']) {
     assert.equal(buildPlan(recipients(entries,new Map(),groups,purpose),true,'群').groups.length,0);
   }
@@ -76,20 +87,49 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   };
   let entries = [], groups = [], routes = new Map(), purpose = 'support', dirty = true, busy = false;
   let lists = config.lists || [], currentList = null, editingList = null, fixedIds = null, fixedTargets = null;
+  let savedState = '', editMode = 'create', pendingAction = null, initialMetadata = '';
   const rows = () => recipients(entries, routes, groups, purpose);
   const plan = () => buildPlan(rows(), $('mention').checked, config.purposes[purpose]);
   function notice(text) { $('notice').textContent = text; }
   const selections = () => rows().filter(row => row.selected && row.person).map(row => ({contact_id:row.person.id,chat_id:row.chatId}));
   const canSaveTargets = () => !dirty && plan().groups.length > 0 && plan().issues.length === 0;
-  function renderLibrary() {
-    const selected = $('list-select').value;
-    $('list-select').replaceChildren(new Option(lists.length ? '选择已保存的名单' : '还没有保存的名单', ''),
-      ...lists.map(list => new Option(`${list.name} · ${list.target_count} 人`,list.id)));
-    $('list-select').value = selected;
-    $('list-load').disabled = busy || !$('list-select').value;
-    $('list-manage').disabled = busy || !$('list-select').value;
-    $('list-new').disabled = busy || !canSaveTargets();
-    $('list-info').textContent = currentList ? `已载入「${currentList.name}」 · 固定 ${currentList.target_count} 人，失效项不会替换成其他群。` : '保存固定人员和群，下次直接载入。';
+  const selectionState = () => listState($('cm').value,purpose,$('mention').checked,selections());
+  const unsavedTargets = () => currentList ? dirty || selectionState() !== savedState : Boolean(entries.length || $('input').value.trim());
+  function renderLibrary(current = plan()) {
+    const canSave = !dirty && current.groups.length > 0 && current.issues.length === 0, changed = unsavedTargets();
+    $('list-library').textContent = lists.length ? `名单库 · ${lists.length}` : '打开名单库';
+    $('list-library').disabled = busy;
+    $('list-new').textContent = currentList ? '另存为新名单' : '保存当前名单';
+    $('list-new').disabled = busy;
+    $('list-current-update').hidden = !currentList;
+    $('list-current-update').disabled = busy || !canSave || !changed;
+    $('list-info').textContent = currentList ? `当前：${currentList.name}${changed ? ' · 有未保存的调整' : ''}`
+      : canSave ? `已选 ${current.people.length} 人，可以保存为名单。` : '匹配对象后，可保存名单重复使用。';
+    $('library-items').replaceChildren();
+    if (!lists.length) {
+      const empty = node('div','','broadcast-library-empty');
+      empty.append(node('h4','还没有保存的名单'),node('p','先添加接收对象，再点击“保存当前名单”。','text-secondary mb-0'));
+      $('library-items').append(empty);
+    }
+    for (const list of lists) {
+      const item = node('article','',`broadcast-library-item${currentList?.id === list.id ? ' is-current' : ''}`);
+      const heading = node('div','','d-flex align-items-start justify-content-between gap-2');
+      heading.append(node('h4',list.name,'mb-0'));
+      if (currentList?.id === list.id) heading.append(node('span','当前使用','badge bg-blue-lt'));
+      const cm = config.cms.find(cm => cm.id === list.cm_id)?.name || (list.cm_id === 'all' ? '全部达人' : '原负责人已失效');
+      item.append(heading,node('div',`${config.purposes[list.purpose]} · ${list.target_count} 人 · ${cm}`,'text-secondary small mt-2'));
+      if (list.notes) item.append(node('p',list.notes,'small text-secondary'));
+      const actions = node('div','','broadcast-list-actions');
+      for (const [label,style,action] of [
+        ['使用','btn-outline-primary',() => unsavedTargets() ? confirmListAction('load',list) : void loadList(list)],
+        ['编辑','btn-outline-secondary',() => editList(list)],
+        ['删除','btn-ghost-danger',() => confirmListAction('delete',list)],
+      ]) {
+        const button = node('button',label,`btn btn-sm ${style}`); button.type = 'button'; button.disabled = busy;
+        button.setAttribute('aria-label',`${label}名单 ${list.name}`); button.addEventListener('click',action); actions.append(button);
+      }
+      item.append(actions); $('library-items').append(item);
+    }
   }
   function render() {
     const current = plan(), all = rows();
@@ -157,15 +197,16 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       const active = button.dataset.purpose === purpose;
       button.className = `btn ${active ? 'btn-primary' : 'btn-outline-secondary'}`; button.setAttribute('aria-pressed', String(active));
     }
-    renderLibrary();
+    renderLibrary(current);
   }
   function lock(value) {
     busy = value;
     for (const control of document.querySelectorAll('#broadcast-app main button, #broadcast-app main input, #broadcast-app main select, #broadcast-app main textarea')) control.disabled = value;
     render();
     for (const control of $('rows').querySelectorAll('input,select,button')) control.disabled = value;
-    for (const control of $('list-form').querySelectorAll('input,textarea,button')) control.disabled = value;
-    $('list-update').disabled = value || !canSaveTargets();
+    for (const dialog of ['list-dialog','library-dialog','list-action-dialog']) {
+      for (const control of $(dialog).querySelectorAll('input,textarea,button')) control.disabled = value;
+    }
   }
   async function api(action, data) {
     try {
@@ -246,61 +287,108 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     } catch (error) { notice(error.message || '预览失败，请稍后重试。'); }
     finally { lock(false); }
   });
-  $('list-select').addEventListener('change', renderLibrary);
-  $('list-load').addEventListener('click', async () => {
-    if (busy || !$('list-select').value) return;
-    lock(true); notice('正在载入并核验名单…');
+  async function loadList(list) {
+    if (busy) return;
+    lock(true); $('library-error').textContent = ''; notice('正在载入并核验名单…');
     try {
-      const result = await api('lists/load',{id:$('list-select').value});
+      const result = await api('lists/load',{id:list.id});
       lists = lists.map(list => list.id === result.list.id ? result.list : list);
       currentList = result.list; fixedIds = result.entries.map(entry => entry.key.replace(/^contact:/,'')); fixedTargets = result.list.targets;
       purpose = result.purpose;
       if (![...$('cm').options].some(option => option.value === result.selected_cm_id)) $('cm').add(new Option('原负责人已失效',result.selected_cm_id));
       $('cm').value = result.selected_cm_id; $('mention').checked = result.list.mention;
       $('input').value = result.entries.map(entry => entry.inputs[0]).join('\n'); applyTargets(result);
+      savedState = selectionState(); pendingAction = null; $('library-dialog').close(); $('list-action-dialog').close();
       notice(result.issues.length ? `名单已载入，${result.issues.length} 项已跳过；可查看原因或重新选群。` : '名单已载入，人员与群已重新核验。');
-    } catch (error) { notice(error.message); }
-    finally { lock(false); }
-  });
-  function editList(list) {
-    editingList = list; $('list-title').textContent = list ? '管理名单' : '保存名单';
-    $('list-name').value = list?.name || ''; $('list-notes').value = list?.notes || '';
-    $('list-update').checked = false; $('list-update-wrap').hidden = !list;
-    $('list-update').disabled = !canSaveTargets(); $('list-delete').hidden = !list;
-    $('list-save').textContent = list ? '保存修改' : '保存名单'; $('list-error').textContent = '';
-    $('list-description').textContent = list ? '默认只修改名称和备注；勾选上方选项才会替换名单目标。' : `保存当前 ${plan().people.length} 位达人和已选群，不保存消息正文，不会发送。`;
-    $('list-dialog').showModal();
+    } catch (error) {
+      $('library-error').textContent = error.message; $('list-action-error').textContent = error.message; notice(error.message);
+    }
+    finally {
+      lock(false);
+      if ($('list-action-dialog').open) $('list-action-cancel').focus();
+      else if ($('library-dialog').open) $('library-close').focus();
+    }
   }
-  $('list-new').addEventListener('click', () => editList(null));
-  $('list-manage').addEventListener('click', () => editList(lists.find(list => list.id === $('list-select').value)));
-  $('list-cancel').addEventListener('click', () => $('list-dialog').close());
-  $('list-dialog').addEventListener('cancel', event => { if (busy) event.preventDefault(); });
+  function editList(list, mode = list ? 'edit' : 'create') {
+    if (busy) return;
+    if (mode === 'update' && (!currentList || list?.id !== currentList.id)) return;
+    editingList = list; editMode = mode; $('library-error').textContent = '';
+    $('list-title').textContent = mode === 'edit' ? '编辑名单信息' : mode === 'update' ? '更新当前名单' : '保存为新名单';
+    $('list-name').value = list?.name || ''; $('list-notes').value = list?.notes || '';
+    initialMetadata = JSON.stringify([$('list-name').value,$('list-notes').value]);
+    $('list-save').textContent = mode === 'edit' ? '保存修改' : mode === 'update' ? '确认更新名单' : '创建名单';
+    $('list-error').textContent = '';
+    $('list-description').textContent = mode === 'edit' ? '只修改名称和备注，不改变名单中的人员和群。'
+      : `${mode === 'update' ? `将原 ${list.target_count} 人替换为当前 ` : '保存当前 '}${plan().people.length} 人 · ${config.purposes[purpose]} · ${plan().groups.length} 个群${$('mention').checked ? ' · @ 所选达人' : ' · 不 @ 成员'}。不保存正文，不会发送。`;
+    $('list-dialog').showModal(); $('list-name').focus();
+  }
+  function confirmListAction(kind, list = null) {
+    if (busy) return;
+    pendingAction = {kind,list}; $('list-action-error').textContent = '';
+    if (kind !== 'discard') $('library-error').textContent = '';
+    $('list-action-title').textContent = kind === 'delete' ? '删除这份名单？' : kind === 'load' ? '替换当前接收对象？' : '放弃未保存的修改？';
+    $('list-action-name').textContent = list?.name || '';
+    $('list-action-description').textContent = kind === 'delete' ? '只删除保存的名单。达人、群和当前选择都会保留。'
+      : kind === 'load' ? '当前接收对象有未保存的调整。使用这份名单会替换它们，消息正文会保留。' : '名称和备注尚未保存，关闭后将放弃这些修改。';
+    $('list-action-proceed').textContent = kind === 'delete' ? '删除名单' : kind === 'load' ? '使用这份名单' : '放弃修改';
+    $('list-action-proceed').className = `btn ${kind === 'delete' ? 'btn-danger' : 'btn-primary'}`;
+    $('list-action-dialog').showModal(); $('list-action-cancel').focus();
+  }
+  function closeEditor() {
+    if (busy) return;
+    if (JSON.stringify([$('list-name').value,$('list-notes').value]) !== initialMetadata) confirmListAction('discard');
+    else $('list-dialog').close();
+  }
+  $('list-library').addEventListener('click', () => {
+    $('library-error').textContent = ''; renderLibrary(); $('library-dialog').showModal();
+  });
+  $('library-close').addEventListener('click', () => $('library-dialog').close());
+  $('library-dialog').addEventListener('cancel', event => { if (busy) event.preventDefault(); });
+  $('list-new').addEventListener('click', () => {
+    if (canSaveTargets()) editList(null);
+    else { notice('先匹配接收对象并选好群，再保存名单。'); $('input').focus(); $('input').scrollIntoView({block:'center',behavior:'smooth'}); }
+  });
+  $('list-current-update').addEventListener('click', () => { if (canSaveTargets()) editList(currentList,'update'); });
+  $('list-cancel').addEventListener('click',closeEditor);
+  $('list-dialog').addEventListener('cancel', event => { event.preventDefault(); closeEditor(); });
   $('list-form').addEventListener('submit', async event => {
     event.preventDefault(); if (busy) return;
-    const metadataOnly = Boolean(editingList) && !$('list-update').checked;
+    const metadataOnly = editMode === 'edit';
+    if (editMode === 'update' && editingList?.id !== currentList?.id) { $('list-error').textContent = '请先载入要更新的名单。'; return; }
     if (!metadataOnly && !canSaveTargets()) { $('list-error').textContent = '请先完成名单匹配和选群。'; return; }
     const fields = {name:$('list-name').value,notes:$('list-notes').value,metadata_only:metadataOnly,
-      cm_id:$('cm').value,purpose,mention:$('mention').checked,selections:selections(),
+      ...(!metadataOnly ? {cm_id:$('cm').value,purpose,mention:$('mention').checked,selections:selections()} : {}),
       ...(editingList ? {id:editingList.id,revision:editingList.revision} : {})};
     lock(true); $('list-error').textContent = '';
     try {
       const result = await api('lists/save',fields); lists = result.lists;
-      if (currentList?.id === result.list.id) currentList = result.list;
-      if (!metadataOnly) { currentList = result.list; fixedIds = fields.selections.map(target => target.contact_id); fixedTargets = fields.selections; }
-      renderLibrary(); $('list-select').value = result.list.id; $('list-dialog').close();
-      notice('名单已保存，不会发送消息。');
+      if (currentList?.id === result.list.id) currentList = {...currentList,...result.list};
+      if (!metadataOnly) {
+        currentList = {...result.list,targets:fields.selections}; fixedIds = fields.selections.map(target => target.contact_id); fixedTargets = fields.selections;
+        savedState = selectionState();
+      }
+      $('list-dialog').close();
+      notice(metadataOnly ? '名单信息已保存。' : editMode === 'update' ? '当前名单已更新。' : '新名单已创建。');
     } catch (error) { $('list-error').textContent = error.message; }
-    finally { lock(false); }
+    finally {
+      lock(false);
+      if (!$('list-dialog').open) ($('library-dialog').open ? $('library-close') : $('list-new')).focus();
+    }
   });
-  $('list-delete').addEventListener('click', async () => {
-    if (busy || !editingList || !window.confirm(`删除个人名单「${editingList.name}」？不会删除达人或群。`)) return;
-    lock(true);
+  $('list-action-cancel').addEventListener('click', () => { pendingAction = null; $('list-action-dialog').close(); });
+  $('list-action-dialog').addEventListener('cancel', event => { if (busy) event.preventDefault(); else pendingAction = null; });
+  $('list-action-proceed').addEventListener('click', async () => {
+    if (busy || !pendingAction) return;
+    const {kind,list} = pendingAction;
+    if (kind === 'discard') { pendingAction = null; $('list-action-dialog').close(); $('list-dialog').close(); return; }
+    if (kind === 'load') { await loadList(list); return; }
+    lock(true); $('list-action-error').textContent = '';
     try {
-      const result = await api('lists/delete',{id:editingList.id,revision:editingList.revision}); lists = result.lists;
-      if (currentList?.id === editingList.id) currentList = null;
-      $('list-dialog').close(); notice('个人名单已删除；达人、群和当前选择未改动。');
-    } catch (error) { $('list-error').textContent = error.message; }
-    finally { lock(false); }
+      const result = await api('lists/delete',{id:list.id,revision:list.revision}); lists = result.lists;
+      if (currentList?.id === list.id) currentList = null;
+      pendingAction = null; $('list-action-dialog').close(); notice('名单已删除；达人、群和当前选择未改动。');
+    } catch (error) { $('list-action-error').textContent = error.message; }
+    finally { lock(false); ($('list-action-dialog').open ? $('list-action-cancel') : $('library-close')).focus(); }
   });
   $('back').addEventListener('click', () => $('confirm').close());
   render();

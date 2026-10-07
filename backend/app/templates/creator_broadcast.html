@@ -1,14 +1,14 @@
 {% extends "base.html" %}
 {% block title %}群发消息 · TT Media{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-broadcast.css?v=20261007-personal-lists">{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-broadcast.css?v=20261007-list-library">{% endblock %}
 {% block body %}
 <div class="page" id="broadcast-app" data-csrf="{{ csrf_token }}" data-actor="{{ authorization.id }}">
   <header class="navbar navbar-expand-md"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media</a><div class="navbar-nav flex-row gap-3"><a class="nav-link" href="/creators">我的达人</a><span class="nav-link text-secondary">{{ authorization.display_name or 'CM/AM' }}</span></div></div></header>
   <main class="page-wrapper"><div class="page-body"><div class="container-xl">
     <div class="broadcast-heading mb-4"><div><div class="subheader mb-1">CREATOR OUTREACH</div><h2 class="page-title">群发消息</h2><p class="text-secondary mb-0 mt-2">选好对象和群，统一编写消息。</p></div><span class="badge bg-yellow-lt">真实数据 · 仅预览</span></div>
     <section class="card broadcast-library mb-4" aria-labelledby="list-title"><div class="card-body">
-      <div class="broadcast-library-title"><span class="broadcast-step" aria-hidden="true">☷</span><div><h3 class="card-title mb-1" id="list-title">我的名单</h3><div class="small text-secondary" id="broadcast-list-info">保存固定人员和群，下次直接载入。</div></div></div>
-      <div class="broadcast-library-controls"><label class="visually-hidden" for="broadcast-list-select">选择个人名单</label><select class="form-select" id="broadcast-list-select"><option value="">选择已保存的名单</option></select><button class="btn btn-outline-primary" id="broadcast-list-load" type="button" disabled>载入</button><button class="btn btn-outline-secondary" id="broadcast-list-manage" type="button" disabled>管理</button></div>
+      <div class="broadcast-library-title"><span class="broadcast-step" aria-hidden="true">☷</span><div><h3 class="card-title mb-1" id="list-title">我的名单</h3><div class="small text-secondary" id="broadcast-list-info">匹配对象后，可保存名单重复使用。</div></div></div>
+      <div class="broadcast-library-controls"><button class="btn btn-outline-secondary" id="broadcast-list-library" type="button">打开名单库</button><button class="btn btn-outline-primary" id="broadcast-list-current-update" type="button" hidden>更新当前名单</button><button class="btn btn-primary" id="broadcast-list-new" type="button">保存当前名单</button></div>
     </div></section>
     <div class="row g-4">
       <section class="col-lg-7" aria-labelledby="targets-title">
@@ -25,7 +25,7 @@
           <div class="mt-3" id="broadcast-notice" role="status" aria-live="polite"></div>
         </div>
         <div id="broadcast-matches" hidden>
-          <div class="card-header d-flex justify-content-between flex-wrap gap-2"><h3 class="card-title mb-0" id="broadcast-count">匹配结果</h3><div class="btn-list"><button class="btn btn-sm btn-outline-primary" id="broadcast-list-new" type="button" disabled>保存名单</button><button class="btn btn-sm btn-outline-secondary" id="broadcast-download" type="button">导出 TXT</button><button class="btn btn-sm btn-outline-secondary" id="broadcast-exclude" type="button" hidden>移除待处理项</button></div></div>
+          <div class="card-header d-flex justify-content-between flex-wrap gap-2"><h3 class="card-title mb-0" id="broadcast-count">匹配结果</h3><div class="btn-list"><button class="btn btn-sm btn-outline-secondary" id="broadcast-download" type="button">导出 TXT</button><button class="btn btn-sm btn-outline-secondary" id="broadcast-exclude" type="button" hidden>移除待处理项</button></div></div>
           <div class="table-responsive"><table class="table table-vcenter card-table broadcast-match-table"><thead><tr><th scope="col">选择</th><th scope="col">达人 / 输入</th><th scope="col" id="broadcast-route-title">目标客服群</th></tr></thead><tbody id="broadcast-rows"></tbody></table></div>
         </div></div>
       </section>
@@ -44,15 +44,24 @@
     </div>
     <noscript><div class="alert alert-warning mt-3">请开启 JavaScript 使用名单匹配。</div></noscript>
   </div></div></main>
+  <dialog class="broadcast-dialog" id="broadcast-library-dialog" aria-labelledby="broadcast-library-title">
+    <div class="broadcast-heading mb-3"><div><h3 class="mb-1" id="broadcast-library-title">我的名单</h3><div class="small text-secondary">只保存人员和群，不保存消息正文。</div></div><button class="btn btn-sm btn-outline-secondary" id="broadcast-library-close" type="button">关闭</button></div>
+    <div class="broadcast-library-items" id="broadcast-library-items"></div>
+    <div class="small text-danger mt-2" id="broadcast-library-error" role="alert"></div>
+  </dialog>
   <dialog class="broadcast-dialog broadcast-list-dialog" id="broadcast-list-dialog" aria-labelledby="broadcast-list-title">
     <form id="broadcast-list-form">
       <div class="broadcast-heading mb-3"><h3 class="mb-0" id="broadcast-list-title">保存名单</h3><button class="btn btn-sm btn-outline-secondary" id="broadcast-list-cancel" type="button">关闭</button></div>
       <label class="form-label" for="broadcast-list-name">名单名称</label><input class="form-control mb-3" id="broadcast-list-name" required maxlength="80" placeholder="例如：本周活动通知">
       <label class="form-label" for="broadcast-list-notes">备注 <span class="text-secondary">（选填）</span></label><textarea class="form-control" id="broadcast-list-notes" rows="3" maxlength="500" placeholder="记录这份名单的用途"></textarea>
-      <label class="form-check mt-3" id="broadcast-list-update-wrap" hidden><input class="form-check-input" id="broadcast-list-update" type="checkbox"><span class="form-check-label">更新为当前选中的人员、群和 @ 设置</span></label>
       <p class="small text-secondary mt-3 mb-0" id="broadcast-list-description">只保存对象和路由，不保存消息正文，不会发送。</p><div class="small text-danger mt-2" id="broadcast-list-error" role="alert"></div>
-      <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mt-4"><button class="btn btn-outline-danger" id="broadcast-list-delete" type="button" hidden>删除名单</button><button class="btn btn-primary ms-auto" id="broadcast-list-save" type="submit">保存名单</button></div>
+      <div class="d-flex justify-content-end mt-4"><button class="btn btn-primary" id="broadcast-list-save" type="submit">保存名单</button></div>
     </form>
+  </dialog>
+  <dialog class="broadcast-dialog broadcast-list-dialog" id="broadcast-list-action-dialog" aria-labelledby="broadcast-list-action-title">
+    <h3 id="broadcast-list-action-title">删除名单？</h3><p class="broadcast-list-action-name" id="broadcast-list-action-name"></p><p class="text-secondary mb-0" id="broadcast-list-action-description"></p>
+    <div class="small text-danger mt-2" id="broadcast-list-action-error" role="alert"></div>
+    <div class="d-flex justify-content-end gap-2 mt-4"><button class="btn btn-outline-secondary" id="broadcast-list-action-cancel" type="button" autofocus>取消</button><button class="btn btn-danger" id="broadcast-list-action-proceed" type="button">删除名单</button></div>
   </dialog>
   <dialog class="broadcast-dialog" id="broadcast-confirm" aria-labelledby="confirm-title">
     <div class="d-flex align-items-center justify-content-between gap-3 mb-3"><h3 class="mb-0" id="confirm-title">群发预览</h3><button class="btn btn-sm btn-outline-secondary" id="broadcast-back" type="button">返回修改</button></div>
@@ -64,5 +73,5 @@
   </dialog>
 </div>
 <script id="broadcast-config" type="application/json">{{ broadcast_data | tojson }}</script>
-<script type="module" src="/static/creator-broadcast.mjs?v=20261007-personal-lists"></script>
+<script type="module" src="/static/creator-broadcast.mjs?v=20261007-list-library"></script>
 {% endblock %}
