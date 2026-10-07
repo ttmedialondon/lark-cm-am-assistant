@@ -126,9 +126,14 @@ def test_reauthorization_restarts_an_active_job_with_a_new_generation() -> None:
     assert "last_http_status = NULL" in query
 
 
-@pytest.mark.parametrize("upgrade", ("profile", "send"))
+@pytest.mark.parametrize("upgrade,owner,initial_status", (
+    ("profile", True, "attention_required"),
+    ("send", True, "active"),
+    ("send", False, "active"),
+    ("send", False, "attention_required"),
+))
 def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapping_grants(
-    pg, monkeypatch, upgrade,  # noqa: F811
+    pg, monkeypatch, upgrade, owner, initial_status,  # noqa: F811
 ):
     scopes = (
         "offline_access", "im:chat:read", "im:message:readonly", "im:chat.members:read",
@@ -159,10 +164,12 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
         body_consent_at,p2p_discovery_status,p2p_last_checked_at,p2p_last_error)
         VALUES(%s,'ou_upgrade','Old Profile',%s,%s,%s,%s,NOW()-INTERVAL '30 days',
         'succeeded',NOW()-INTERVAL '1 day','retained p2p detail')""",
-        (actor, cipher.encrypt("old-access"), list(initial_scopes), "active" if send else "attention_required",
+        (actor, cipher.encrypt("old-access"), list(initial_scopes), initial_status,
+         "token_expired" if send and initial_status == "attention_required" else
          None if send else main.PROFILE_SCOPE_UPGRADE_REASON),
     )
-    pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (actor,))
+    if owner:
+        pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (actor,))
     pg.execute(
         "INSERT INTO sync_jobs(id,authorization_id,mode,status,discovery_generation) "
         "VALUES(%s,%s,'backfill','running',9)",
@@ -238,7 +245,13 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
         )
         return value
 
-    def callback(value, code="full"):
+    current = None
+
+    def callback(value, code="full", *, session_actor=actor):
+        nonlocal current
+        if send:
+            current = pg.execute("SELECT * FROM authorizations WHERE id=%s", (actor,)).fetchone()
+            current = {**current, "id": session_actor} if session_actor else None
         client.cookies.clear()
         response = client.get(
             "/auth/lark/callback", params={"state": value, "code": code},
@@ -256,45 +269,56 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
 
     original = snapshot()
     if send:
-        # A send grant is personal and Owner-only; it must not widen ordinary onboarding.
-        current = None
+        # Any already-consenting CM may upgrade only their own account, without widening onboarding.
         monkeypatch.setattr(main, "_current_authorization", lambda _: current)
         for authorization in (None, {"id": actor, "status": "revoked", "body_consent_at": True},
                               {"id": actor, "status": "active", "body_consent_at": None}):
             current = authorization
             assert client.get("/auth/lark/start?send=1", follow_redirects=False).status_code == 403
-        current = pg.execute("SELECT * FROM authorizations WHERE id=%s", (actor,)).fetchone()
-        pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (actor,))
-        assert client.get("/auth/lark/start?send=1", follow_redirects=False).status_code == 403
-        pg.execute("UPDATE admin_roles SET is_active=TRUE,role='viewer' WHERE authorization_id=%s", (actor,))
-        assert client.get("/auth/lark/start?send=1", follow_redirects=False).status_code == 403
-        pg.execute("UPDATE admin_roles SET role='owner' WHERE authorization_id=%s", (actor,))
         assert not pg.execute("SELECT 1 FROM oauth_states").fetchone()
-        for params, requested, target in (({"send": "1"}, upgrade_scopes, actor), ({}, scopes, None)):
-            response = client.get("/auth/lark/start", params=params, follow_redirects=False)
-            assert response.status_code == 303
-            assert parse_qs(urlparse(response.headers["location"]).query)["scope"] == [" ".join(requested)]
-            row = pg.execute("SELECT * FROM oauth_states").fetchone()
-            assert row["requested_scopes"] == list(requested) and row["authorization_id"] == target
-            pg.execute("DELETE FROM oauth_states")
-            assert settings.oauth_scopes == scopes and snapshot() == original
+        for status in ("active", "attention_required"):
+            pg.execute("UPDATE authorizations SET status=%s WHERE id=%s", (status, actor))
+            current = pg.execute("SELECT * FROM authorizations WHERE id=%s", (actor,)).fetchone()
+            before_start = snapshot()
+            for account_id in (str(uuid4()), "", "not-a-uuid"):
+                assert client.get("/auth/lark/start", params={"send": "1", "account_id": account_id},
+                                  follow_redirects=False).status_code == 403
+                assert not pg.execute("SELECT 1 FROM oauth_states").fetchone()
+            for params, requested, target in (
+                ({"send": "1"}, upgrade_scopes, actor),
+                ({"send": "1", "account_id": str(actor)}, upgrade_scopes, actor),
+                ({}, scopes, None),
+            ):
+                response = client.get("/auth/lark/start", params=params, follow_redirects=False)
+                assert response.status_code == 303
+                assert parse_qs(urlparse(response.headers["location"]).query)["scope"] == [" ".join(requested)]
+                row = pg.execute("SELECT * FROM oauth_states").fetchone()
+                assert row["requested_scopes"] == list(requested) and row["authorization_id"] == target
+                pg.execute("DELETE FROM oauth_states")
+                assert settings.oauth_scopes == scopes and snapshot() == before_start
+        pg.execute("UPDATE authorizations SET status=%s WHERE id=%s", (initial_status, actor))
+        assert snapshot() == original
     overlap = state()
     for grant in ("missing", "partial"):
         assert callback(state(), grant).status_code == 403
         assert snapshot() == original
     if send:
+        for session_actor in (None, uuid4()):
+            assert callback(state(), session_actor=session_actor).status_code == 403
+            assert snapshot() == original
         for grant, status in (("missing_send", 403), ("wrong_account", 403), ("no_refresh", 502)):
             assert callback(state(), grant).status_code == status
             assert snapshot() == original
-        # Recheck authority after OAuth, not just when the link was created.
+        # Revocation after link creation must not reactivate or replace the account.
         revoked_link = state()
-        pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (actor,))
+        pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (actor,))
         revoked = snapshot()
         assert callback(revoked_link).status_code == 403 and snapshot() == revoked
-        pg.execute("UPDATE admin_roles SET is_active=TRUE WHERE authorization_id=%s", (actor,))
+        pg.execute("UPDATE authorizations SET status=%s WHERE id=%s", (initial_status, actor))
 
     response = callback(state())
-    assert response.status_code == 303 and response.headers["location"] == "/dashboard"
+    destination = "/creators/broadcast" if send and owner else "/dashboard"
+    assert response.status_code == 303 and response.headers["location"] == destination
     upgraded = snapshot()
     auth = upgraded["authorizations"][0]
     assert auth["id"] == actor and auth["open_id"] == "ou_upgrade" and auth["status"] == "active"
@@ -326,6 +350,12 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
 
     assert callback(overlap).status_code == 409
     assert snapshot() == upgraded  # An older tab cannot reset cursors or replace tokens/profile again.
+    if send:
+        pg.execute("UPDATE authorizations SET status='attention_required' WHERE id=%s", (actor,))
+        waiting = snapshot()
+        assert callback(state()).status_code == 409 and snapshot() == waiting
+        pg.execute("UPDATE authorizations SET status='active' WHERE id=%s", (actor,))
+        assert snapshot() == upgraded
 
     assert callback(state(fresh=True, upgraded=False), "ordinary").status_code == 303
     ordinary = snapshot()

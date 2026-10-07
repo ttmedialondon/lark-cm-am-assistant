@@ -989,6 +989,7 @@ def _store_refreshed_tokens(
         UPDATE authorizations
         SET access_token_ciphertext = %s, refresh_token_ciphertext = %s,
             access_token_expires_at = %s, refresh_token_expires_at = %s,
+            scopes = COALESCE(%s::text[], scopes),
             status = 'active', last_error = NULL, updated_at = NOW()
         WHERE id = %s
         """,
@@ -997,6 +998,7 @@ def _store_refreshed_tokens(
             cipher.encrypt(bundle.refresh_token or ""),
             _expiry(bundle.expires_in),
             _expiry(bundle.refresh_expires_in),
+            list(dict.fromkeys(bundle.scope.split())) if bundle.scope is not None else None,
             authorization_id,
         ),
     )

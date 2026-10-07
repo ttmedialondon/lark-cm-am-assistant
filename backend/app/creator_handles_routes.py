@@ -47,6 +47,11 @@ def create_router(*, current_authorization, render_template, csrf_token):
         auth = current_authorization(request)
         if not auth:
             return secure(RedirectResponse("/", status_code=303))
+        if auth["status"] == "attention_required" and auth.get("body_consent_at"):
+            return secure(render_template(request, "error.html", {
+                "title": "账号连接需要更新", "detail": "请使用本人 Lark 账号补充授权，已有数据和同步进度会保留。",
+                "return_url": f"/auth/lark/start?send=1&account_id={auth['id']}", "return_label": "更新本人授权",
+            }))
         try:
             auth = actor(auth)
             data = creator_broadcast.page_data(auth["id"])
@@ -60,6 +65,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
     @router.post("/broadcast/preview")
     @router.post("/broadcast/resolve")
     @router.post("/broadcast/groups")
+    @router.post("/broadcast/permissions")
     @router.post("/broadcast/lists/save")
     @router.post("/broadcast/lists/load")
     @router.post("/broadcast/lists/delete")
@@ -68,7 +74,10 @@ def create_router(*, current_authorization, render_template, csrf_token):
     async def broadcast_read(request: Request):
         """Bounded, session-scoped routing and personal lists; never sends."""
         try:
-            auth = actor(await run_in_threadpool(current_authorization, request))
+            current = await run_in_threadpool(current_authorization, request)
+            reconnect_self = (request.url.path == "/creators/broadcast/permissions" and current
+                              and current["status"] == "attention_required" and current.get("body_consent_at"))
+            auth = current if reconnect_self else actor(current)
             if not _csrf_matches({"csrf_token": request.headers.get("X-CSRF-Token", "")}, csrf_token(auth)):
                 raise ValueError("请求校验失败，请刷新页面后重试。")
             if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
@@ -86,6 +95,13 @@ def create_router(*, current_authorization, render_template, csrf_token):
                 raise ValueError("请求格式无效。")
             args = (auth["id"], fields.get("cm_id", "all"), fields.get("purpose", "support"))
             action = request.url.path.rsplit("/", 1)[-1]
+            if reconnect_self:
+                return payload({
+                    "status": "needs_authorization", "account_id": str(auth["id"]),
+                    "account_name": auth.get("display_name") or "当前账号", "is_self": True, "is_sender": False,
+                    "missing_scopes": [], "authorization_url": f"/auth/lark/start?send=1&account_id={auth['id']}",
+                    "message": "当前账号连接需要更新，请本人补充授权。",
+                })
             if "/templates/" in request.url.path:
                 if action == "save":
                     result = await run_in_threadpool(creator_broadcast.template_save, auth["id"], fields)
@@ -93,6 +109,8 @@ def create_router(*, current_authorization, render_template, csrf_token):
                     result = await run_in_threadpool(
                         creator_broadcast.template_delete, auth["id"], fields.get("id"), fields.get("revision"),
                     )
+            elif action == "permissions":
+                result = await run_in_threadpool(creator_broadcast.permission_check, args[0], args[1])
             elif action == "groups":
                 result = await run_in_threadpool(creator_broadcast.groups, *args)
             elif action == "match":

@@ -79,7 +79,7 @@ def index(request: Request):
 
 
 @app.get("/auth/lark/start")
-def start_lark_authorization(request: Request, send: bool = False):
+def start_lark_authorization(request: Request, send: bool = False, account_id: str | None = None):
     settings = get_settings()
     if not settings.app_secret_configured:
         return _template(
@@ -91,9 +91,15 @@ def start_lark_authorization(request: Request, send: bool = False):
 
     authorization = _current_authorization(request) if send else None
     if send:
-        if not authorization or authorization["status"] != "active" or not authorization["body_consent_at"]:
+        if (not authorization or authorization["status"] not in {"active", "attention_required"}
+                or not authorization["body_consent_at"]):
             return _template(
                 request, "error.html", {"title": "无法增加发送权限", "detail": "请使用已授权的本人账号登录。"}, 403,
+            )
+        if account_id is not None and account_id != str(authorization["id"]):
+            return _template(
+                request, "error.html",
+                {"title": "发送授权账号不一致", "detail": "请目标人员使用本人账号登录后授权。"}, 403,
             )
         settings = replace(settings, oauth_scopes=tuple(dict.fromkeys((
             *settings.oauth_scopes, *(authorization.get("scopes") or ()), *SEND_OAUTH_SCOPES,
@@ -105,14 +111,6 @@ def start_lark_authorization(request: Request, send: bool = False):
     cipher = TokenCipher(settings.token_encryption_key)
 
     with connection() as conn, conn.transaction():
-        if send:
-            try:
-                creator_access.require_owner(conn, authorization["id"])
-            except PermissionError:
-                return _template(
-                    request, "error.html", {"title": "无法增加发送权限", "detail": "目前仅系统 Owner 可增加发送权限。"},
-                    403,
-                )
         conn.execute("DELETE FROM oauth_states WHERE expires_at <= NOW()")
         conn.execute(
             """
@@ -166,6 +164,16 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
     requested_scopes = tuple(state_row["requested_scopes"] or settings.oauth_scopes)
     if send_upgrade and not set(SEND_OAUTH_SCOPES).issubset(requested_scopes):
         return _template(request, "error.html", {"title": "授权校验失败", "detail": "请重新开始发送权限授权。"}, 400)
+    if send_upgrade:
+        authorization = _current_authorization(request)
+        if (not authorization or authorization["id"] != state_row["authorization_id"]
+                or authorization["status"] not in {"active", "attention_required"}
+                or not authorization["body_consent_at"]):
+            return _template(
+                request, "error.html",
+                {"title": "发送授权账号不一致", "detail": "请使用发起增权的本人账号登录后重新授权，原有授权保持不变。"},
+                403,
+            )
     if requested_scopes != settings.oauth_scopes:
         settings = replace(settings, oauth_scopes=requested_scopes)
 
@@ -204,19 +212,13 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
         ).fetchone()
         if send_upgrade:
             if (not previous or previous["id"] != state_row["authorization_id"]
-                    or previous["status"] != "active" or not previous["body_consent_at"]):
+                    or previous["status"] not in {"active", "attention_required"} or not previous["body_consent_at"]):
                 return _template(
                     request, "error.html",
                     {"title": "发送授权账号不一致", "detail": "请使用发起增权的本人账号重新授权，原有授权保持不变。"},
                     403,
                 )
-            try:
-                creator_access.require_owner(conn, previous["id"])
-            except PermissionError:
-                return _template(
-                    request, "error.html", {"title": "发送授权已失效", "detail": "当前账号已不具备 Owner 权限。"}, 403,
-                )
-        if previous and previous["status"] == "active" and conn.execute(
+        if previous and (send_upgrade or previous["status"] == "active") and conn.execute(
             """SELECT 1 FROM audit_events WHERE authorization_id=%s
                AND action IN ('oauth_profile_permissions_upgraded','oauth_send_permissions_upgraded')
                AND created_at>=%s LIMIT 1""",
@@ -301,6 +303,9 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
         )
         _audit(conn, authorization_id, "oauth_send_permissions_upgraded" if send_upgrade else
                "oauth_profile_permissions_upgraded" if profile_upgrade else "oauth_authorized")
+        destination = (
+            "/creators/broadcast" if send_upgrade and creator_access.is_owner(conn, authorization_id) else "/dashboard"
+        )
 
         session_token = secrets.token_urlsafe(32)
         conn.execute(
@@ -311,7 +316,7 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
             (_sha256(session_token), authorization_id, SESSION_DAYS),
         )
 
-    response = RedirectResponse(url="/dashboard", status_code=303)
+    response = RedirectResponse(url=destination, status_code=303)
     response.delete_cookie(OAUTH_STATE_COOKIE, path="/")
     response.set_cookie(
         SESSION_COOKIE,

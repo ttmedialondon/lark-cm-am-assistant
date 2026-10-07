@@ -62,6 +62,15 @@ def test_authorization_url_uses_oauth_client_id_and_pkce(monkeypatch) -> None:
     assert "scope" not in requests[1]  # Renewal cannot silently request newly configured privileges.
 
 
+def test_token_response_distinguishes_missing_scope_from_an_explicit_empty_grant(monkeypatch):
+    client = LarkClient(settings())
+    for fields, expected in (({}, None), ({"scope": " "}, ""), ({"scope": " im:message "}, "im:message")):
+        monkeypatch.setattr(client, "_request", lambda *_args, fields=fields, **_kwargs: {
+            "access_token": "fixture", **fields,
+        })
+        assert client.refresh_token("fixture-refresh").scope == expected
+
+
 @pytest.mark.parametrize(
     "fields,expected",
     [

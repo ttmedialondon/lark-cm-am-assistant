@@ -1,19 +1,25 @@
-"""Owner-only routing previews, personal lists and message drafts; never send or call AI."""
+"""Owner-only routing previews, personal lists and permission checks; never send or call AI."""
 
 import re
 import unicodedata
+from datetime import UTC, datetime
 from difflib import get_close_matches
 
+import httpx
+from cryptography.fernet import InvalidToken
 from psycopg.types.json import Jsonb
 
 from . import contact_handles, creator_access
+from .config import get_settings
 from .creator_group_evidence import PURPOSES as GROUP_PURPOSES
+from .crypto import TokenCipher
 from .db import connection
 from .handle_evidence import normalize_handle
+from .lark_api import LarkApiError, LarkClient
 
 PURPOSES = {key: value for key, value in GROUP_PURPOSES.items() if key != "unknown"}
 MEMBERSHIP_NOTE = "来自当前库快照，发送前需实测核验成员及 @ 权限"
-BLOCKED_REASON = "发送权限未就绪，当前仅预览"
+BLOCKED_REASON = "当前仅预览，发送功能尚未启用"
 
 
 def _normalized(value):
@@ -226,6 +232,84 @@ def page_data(actor_id):
                 "templates": _templates(conn, actor_id)}
 
 
+def permission_check(actor_id, cm_id):
+    """Check token acceptance and recorded grants, not external-group or @all sendability."""
+    from .worker import ReauthorizationRequired, _authorization, _usable_access_token
+
+    actor = creator_access.parse_id(actor_id)
+    sql = """SELECT id,open_id,display_name,status,body_consent_at,scopes,access_token_ciphertext
+        FROM authorizations WHERE id=%s"""
+    with connection() as conn:
+        creator_access.require_owner(conn, actor)
+        target = actor if cm_id == "all" else creator_access.parse_id(cm_id) if cm_id else None
+        row = conn.execute(sql, (target,)).fetchone() if target else None
+    result = {"status": "unavailable", "account_id": str(target) if target else None,
+              "account_name": row["display_name"] or "未命名用户" if row else "",
+              "is_self": target == actor, "is_sender": bool(target and cm_id != "all"),
+              "missing_scopes": [], "authorization_url": None,
+              "message": "请选择一位 CM/AM。", "checked_at": datetime.now(UTC).isoformat()}
+    if not target:
+        return result
+    if not row or row["status"] == "revoked" or not row["body_consent_at"]:
+        result.update(status="needs_authorization", message="该账号尚未完成有效的聊天授权，请本人先完成接入。")
+        return result
+    settings = get_settings()
+    required = set(settings.oauth_scopes) | {"im:message", "im:message.send_as_user"}
+    cipher = TokenCipher(settings.token_encryption_key)
+    checked = row
+    result["message"] = "暂时无法核验授权，请稍后重试。"
+    try:
+        authorization = _authorization(target)
+        if (not authorization or authorization["status"] == "revoked"
+                or authorization["open_id"] != row["open_id"] or not authorization["body_consent_at"]):
+            raise ReauthorizationRequired
+        with httpx.Client(timeout=8) as http:
+            client = LarkClient(settings, http_client=http)
+            access_token = _usable_access_token(target, authorization, client, settings)
+            # A refresh can replace tokens/scopes. Read its committed generation before probing.
+            with connection() as conn:
+                checked = conn.execute(sql, (target,)).fetchone()
+            if (not checked or checked["status"] == "revoked" or not checked["body_consent_at"]
+                    or checked["open_id"] != row["open_id"]):
+                raise ReauthorizationRequired
+            if cipher.decrypt(checked["access_token_ciphertext"]) != access_token:
+                result["message"] = "授权已更新，请重新检查。"
+            else:
+                profile = client.user_info(access_token)
+                if profile.open_id != checked["open_id"]:
+                    result["message"] = "返回账号与选定账号不一致，已停止核验。"
+                else:
+                    result["missing_scopes"] = sorted(required - set(checked["scopes"] or ()))
+                    missing = [{"im:message": "发送消息", "im:message.send_as_user": "以本人身份发送"}.get(scope, scope)
+                               for scope in result["missing_scopes"]]
+                    result.update(status="needs_authorization"
+                                  if missing or checked["status"] != "active" else "ready",
+                                  message="缺少授权：" + "、".join(missing) + "；请由该账号本人补充。" if missing
+                                  else "该账号授权状态需要更新，请本人重新授权。" if checked["status"] != "active"
+                                  else "账号连接有效，已记录所需权限；群成员、外部群及 @ 权限仍需单独核验。")
+    except ReauthorizationRequired:
+        result.update(status="needs_authorization", message="账号连接已失效，请本人重新授权。")
+    except LarkApiError as exc:
+        # Permission/resource denials and transient failures are not proof of missing user grants.
+        if not exc.retryable and (exc.status_code == 401 or exc.lark_code in {20064, 99991668, 99991669, 99991677}):
+            result.update(status="needs_authorization", message="账号连接已失效，请本人重新授权。")
+    except (httpx.HTTPError, InvalidToken, ValueError, RuntimeError):
+        pass
+    with connection() as conn:
+        creator_access.require_owner(conn, actor)
+        current = conn.execute(sql, (target,)).fetchone()
+    if not current or current["status"] == "revoked" or not current["body_consent_at"]:
+        result.update(status="needs_authorization", missing_scopes=[], message="聊天授权已失效，请本人先完成接入。")
+    elif not checked or any(current[key] != checked[key] for key in (
+        "open_id", "status", "access_token_ciphertext", "scopes", "body_consent_at",
+    )):
+        result.update(status="unavailable", missing_scopes=[], message="授权已更新，请重新检查。")
+    elif result["status"] == "needs_authorization":
+        result["authorization_url"] = f"/auth/lark/start?send=1&account_id={target}"
+    result["checked_at"] = datetime.now(UTC).isoformat()
+    return result
+
+
 def match(actor_id, cm_id, raw, purpose):
     with connection() as conn, conn.transaction():
         conn.execute("SET TRANSACTION READ ONLY")
@@ -331,7 +415,8 @@ def _list_metadata(row):
 
 
 def _lists(conn, actor_id):
-    rows = conn.execute("""SELECT id,name,notes,revision,purpose,mention,cm_id,targets,snapshot FROM creator_broadcast_lists
+    rows = conn.execute("""SELECT id,name,notes,revision,purpose,mention,cm_id,targets,snapshot
+        FROM creator_broadcast_lists
         WHERE owner_authorization_id=%s AND deleted_at IS NULL ORDER BY updated_at DESC,id""",
         (creator_access.parse_id(actor_id),)).fetchall()
     return [_list_metadata(row) for row in rows]
@@ -510,7 +595,8 @@ def template_delete(actor_id, template_id, revision):
         if not conn.execute("""SELECT 1 FROM creator_broadcast_templates
             WHERE id=%s AND owner_authorization_id=%s AND deleted_at IS NULL""", (target, owner)).fetchone():
             raise LookupError("找不到该模板。")
-        row = conn.execute("""UPDATE creator_broadcast_templates SET deleted_at=NOW(),updated_at=NOW(),revision=revision+1
+        row = conn.execute("""UPDATE creator_broadcast_templates
+            SET deleted_at=NOW(),updated_at=NOW(),revision=revision+1
             WHERE id=%s AND owner_authorization_id=%s AND revision=%s AND deleted_at IS NULL RETURNING id""",
             (target, owner, _revision(revision))).fetchone()
         if not row:

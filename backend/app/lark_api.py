@@ -281,7 +281,7 @@ class LarkClient:
             refresh_token=_string(data.get("refresh_token")),
             expires_in=_int(data.get("expires_in"), 7200),
             refresh_expires_in=_optional_int(data.get("refresh_expires_in")),
-            scope=_string(data.get("scope")),
+            scope=data["scope"].strip() if isinstance(data.get("scope"), str) else None,
         )
 
     def _request(

@@ -7,6 +7,8 @@ from uuid import UUID
 import pytest
 
 from app import worker
+from app.crypto import TokenCipher
+from app.lark_api import TokenBundle
 from app.worker import (
     _body_content,
     _is_author_message,
@@ -193,6 +195,41 @@ def test_p2p_contact_discovery_skips_bots(pg, monkeypatch) -> None:
     ).fetchone() == {"p2p_counterpart_open_id": None, "p2p_counterpart_seen_at": None}
     assert pg.execute("SELECT contact_id FROM lark_identities WHERE open_id='ou_person'").fetchone()[
         "contact_id"] == contact_id
+
+
+def test_token_refresh_records_actual_scope_without_inventing_missing_grants(pg, monkeypatch):
+    actor, key = UUID(int=991), b"r" * 32
+    cipher = TokenCipher(key)
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
+    pg.execute("""INSERT INTO authorizations(id,open_id,access_token_ciphertext,refresh_token_ciphertext,
+        access_token_expires_at,refresh_token_expires_at,scopes,body_consent_at)
+        VALUES(%s,'ou_refresh_scope',%s,%s,NOW()-INTERVAL '1 hour',NOW()+INTERVAL '1 day',%s,
+        NOW()-INTERVAL '30 days')""",
+        (actor, cipher.encrypt("old-access"), cipher.encrypt("old-refresh"),
+         ["im:message:readonly", "im:message.send_as_user"]))
+    consent = worker._authorization(actor)["body_consent_at"]
+
+    class Client:
+        calls = 0
+        scope = None
+        def refresh_token(self, refresh):
+            assert refresh == ("old-refresh" if self.calls == 0 else f"refresh-{self.calls}")
+            self.calls += 1
+            return TokenBundle(f"access-{self.calls}", f"refresh-{self.calls}", 3600, 86400, self.scope)
+
+    client = Client()
+    for scope, expected in (("im:message:readonly im:message:readonly", ["im:message:readonly"]),
+                            (None, ["im:message:readonly"]),
+                            ("im:message.send_as_user im:message.send_as_user", ["im:message.send_as_user"]),
+                            ("", [])):
+        pg.execute("UPDATE authorizations SET access_token_expires_at=NOW()-INTERVAL '1 hour' WHERE id=%s", (actor,))
+        client.scope = scope
+        assert worker._usable_access_token(actor, worker._authorization(actor), client,
+                                           SimpleNamespace(token_encryption_key=key)) == f"access-{client.calls}"
+        row = pg.execute("SELECT * FROM authorizations WHERE id=%s", (actor,)).fetchone()
+        assert row["scopes"] == expected and row["body_consent_at"] == consent
+        assert row["status"] == "active"
+        assert cipher.decrypt(row["refresh_token_ciphertext"]) == f"refresh-{client.calls}"
 
 
 def test_member_snapshot_follows_lark_pagination_and_keeps_member_facts() -> None:

@@ -1,11 +1,15 @@
 {% extends "base.html" %}
 {% block title %}群发消息 · TT Media{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-broadcast.css?v=20261007-groups-templates">{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-broadcast.css?v=20261007-permission-check">{% endblock %}
 {% block body %}
 <div class="page" id="broadcast-app" data-csrf="{{ csrf_token }}" data-actor="{{ authorization.id }}">
   <header class="navbar navbar-expand-md"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media</a><div class="navbar-nav flex-row gap-3"><a class="nav-link" href="/creators">我的达人</a><span class="nav-link text-secondary">{{ authorization.display_name or 'CM/AM' }}</span></div></div></header>
   <main class="page-wrapper"><div class="page-body"><div class="container-xl">
     <div class="broadcast-heading mb-4"><h2 class="page-title">群发消息</h2><span class="badge bg-yellow-lt">仅预览 · 不会发送</span></div>
+    <div class="broadcast-permissions mb-4" id="broadcast-permission-bar" aria-busy="true">
+      <div role="status" aria-live="polite"><span id="broadcast-permission-account">当前账号</span><span class="badge bg-secondary-lt ms-2" id="broadcast-permission-status">正在核对授权</span><div class="small text-secondary mt-1" id="broadcast-permission-message"></div></div>
+      <div class="btn-list"><a class="btn btn-sm btn-primary" id="broadcast-permission-authorize" target="_blank" rel="noopener" hidden>补充授权</a><button class="btn btn-sm btn-outline-primary" id="broadcast-permission-copy" type="button" hidden>复制本人授权链接</button><button class="btn btn-sm btn-ghost-secondary" id="broadcast-permission-retry" type="button" disabled>重新检查</button></div>
+    </div>
     <section class="card broadcast-library mb-4" aria-labelledby="list-title"><div class="card-body">
       <div class="broadcast-library-title"><div><h3 class="card-title mb-1" id="list-title">我的名单</h3><div class="small text-secondary" id="broadcast-list-info"></div></div></div>
       <div class="broadcast-library-controls"><button class="btn btn-outline-secondary" id="broadcast-list-library" type="button">打开名单库</button><button class="btn btn-outline-primary" id="broadcast-list-current-update" type="button" hidden>更新当前名单</button><button class="btn btn-primary" id="broadcast-list-new" type="button">保存当前名单</button></div>
@@ -83,9 +87,9 @@
     <p id="broadcast-confirm-count"></p><p id="broadcast-confirm-scope" class="small text-secondary"></p>
     <div class="broadcast-message mb-3" id="broadcast-confirm-message"></div><div id="broadcast-confirm-groups"></div>
     <p class="small text-secondary mt-3">正文对群内全体可见，@ 不限制可见范围。</p>
-    <div class="d-flex align-items-center justify-content-between gap-3 mt-3"><span class="text-secondary small">仅预览，发送与 @ 权限尚未验收</span><button class="btn btn-primary" type="button" disabled>发送（未开通）</button></div>
+    <div class="d-flex align-items-center justify-content-between gap-3 mt-3"><span class="text-secondary small">仅预览，目标群发送能力尚未验收</span><button class="btn btn-primary" type="button" disabled>发送（未开通）</button></div>
   </dialog>
 </div>
 <script id="broadcast-config" type="application/json">{{ broadcast_data | tojson }}</script>
-<script type="module" src="/static/creator-broadcast.mjs?v=20261007-groups-templates"></script>
+<script type="module" src="/static/creator-broadcast.mjs?v=20261007-permission-check"></script>
 {% endblock %}

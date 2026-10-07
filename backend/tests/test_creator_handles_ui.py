@@ -2,10 +2,12 @@
 
 import asyncio
 import json
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -13,6 +15,8 @@ from fastapi.testclient import TestClient
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from app import admin_permissions, creator_broadcast, creator_handles_routes, creator_imports
+from app.crypto import TokenCipher
+from app.lark_api import LarkApiError, LarkProfile, TokenBundle
 
 
 def browser(monkeypatch, *, owner=False, active=True):
@@ -33,6 +37,138 @@ def browser(monkeypatch, *, owner=False, active=True):
         render_template=lambda _request, name, context: HTMLResponse(templates.get_template(name).render(**context)),
     ))
     return TestClient(app), actor
+
+
+def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, monkeypatch):
+    from app import worker
+
+    client, actor = browser(monkeypatch, owner=True)
+    other = uuid4()
+    baseline = ("offline_access", "im:chat:read")
+    required = (*baseline, "im:message", "im:message.send_as_user")
+    settings = SimpleNamespace(oauth_scopes=baseline, token_encryption_key=b"p" * 32)
+    cipher = TokenCipher(settings.token_encryption_key)
+    for account, open_id, token, scopes in ((actor["id"], "ou_owner", "fixture-owner", required),
+                                           (other, "ou_other", "fixture-other", ())):
+        pg.execute("""INSERT INTO authorizations(id,open_id,display_name,access_token_ciphertext,
+            refresh_token_ciphertext,access_token_expires_at,refresh_token_expires_at,scopes,body_consent_at)
+            VALUES(%s,%s,%s,%s,%s,NOW()+INTERVAL '1 hour',NOW()+INTERVAL '1 day',%s,NOW())""",
+            (account, open_id, open_id, cipher.encrypt(token), cipher.encrypt("fixture-refresh"), list(scopes)))
+    pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (actor["id"],))
+    state = {"connections": 0, "calls": [], "refreshes": 0, "error": None, "change": None}
+
+    @contextmanager
+    def connection():
+        state["connections"] += 1
+        try:
+            yield pg
+        finally:
+            state["connections"] -= 1
+
+    class FakeLark:
+        def __init__(self, received, *, http_client):
+            assert received is settings and http_client.timeout.read == 8
+
+        def user_info(self, token):
+            assert state["connections"] == 0
+            state["calls"].append(token)
+            if state["error"]:
+                raise state["error"]
+            if state["change"] == "token":
+                pg.execute("UPDATE authorizations SET access_token_ciphertext=%s WHERE id=%s",
+                           (cipher.encrypt("fixture-replacement"), other))
+            elif state["change"] == "scope":
+                pg.execute("UPDATE authorizations SET scopes='{}' WHERE id=%s", (other,))
+            elif state["change"] == "revoked":
+                pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (other,))
+            elif state["change"] == "owner":
+                pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (actor["id"],))
+            open_id = "ou_owner" if token == "fixture-owner" else "ou_other"
+            return LarkProfile("ou_wrong" if state["change"] == "identity" else open_id, None, None, None)
+
+        def refresh_token(self, _token):
+            state["refreshes"] += 1
+            return TokenBundle("fixture-refreshed", "fixture-refresh-new", 3600, 86400, "")
+
+    monkeypatch.setattr(creator_broadcast, "connection", connection)
+    monkeypatch.setattr(worker, "connection", connection)
+    monkeypatch.setattr(creator_broadcast, "get_settings", lambda: settings)
+    monkeypatch.setattr(creator_broadcast, "LarkClient", FakeLark)
+    url, headers = "/creators/broadcast/permissions", {"X-CSRF-Token": "csrf"}
+
+    def check(cm_id="all"):
+        response = client.post(url, json={"cm_id": cm_id, "actor_id": str(other)}, headers=headers)
+        assert response.status_code == 200, response.text
+        assert response.headers["cache-control"] == "no-store, max-age=0"
+        return response.json()
+
+    assert client.post(url, json={"cm_id": "all"}).status_code == 400
+    assert not state["calls"]
+    own = check()
+    assert own["status"] == "ready" and own["is_self"] and not own["is_sender"]
+    assert not own["missing_scopes"] and own["authorization_url"] is None and own["checked_at"]
+    assert check(str(actor["id"]))["is_sender"] and state["refreshes"] == 0
+    missing = check(str(other))
+    assert missing["status"] == "needs_authorization" and set(missing["missing_scopes"]) == set(required)
+    assert missing["is_sender"] and not missing["is_self"] and missing["account_id"] == str(other)
+    assert missing["authorization_url"] == f"/auth/lark/start?send=1&account_id={other}"
+    assert "发送消息" in missing["message"] and "以本人身份发送" in missing["message"]
+    assert state["calls"][-1] == "fixture-other"
+    assert check("")["status"] == "unavailable"
+    assert client.post(url, json={"cm_id": "bad"}, headers=headers).status_code == 400
+    for error in (LarkApiError(403, 99991679, "denied"), LarkApiError(429, None, "limited"),
+                  LarkApiError(500, None, "unavailable"), httpx.ReadTimeout("fixture timeout")):
+        state["error"] = error
+        result = check(str(other))
+        assert result["status"] == "unavailable" and not result["missing_scopes"]
+        assert result["authorization_url"] is None
+    state["error"] = LarkApiError(401, None, "invalid user token")
+    assert check(str(other))["status"] == "needs_authorization"
+    state["error"] = None
+    for change in ("identity", "token", "scope", "revoked"):
+        pg.execute("UPDATE authorizations SET status='active',scopes=%s,access_token_ciphertext=%s WHERE id=%s",
+                   (list(required), cipher.encrypt("fixture-other"), other))
+        state["change"] = change
+        result = check(str(other))
+        assert result["status"] == ("needs_authorization" if change == "revoked" else "unavailable")
+        assert result["authorization_url"] is None and not result["missing_scopes"]
+    state["change"] = None
+    before = len(state["calls"])
+    assert check(str(other))["status"] == "needs_authorization" and len(state["calls"]) == before
+    pg.execute("UPDATE authorizations SET status='active',body_consent_at=NULL WHERE id=%s", (other,))
+    assert check(str(other))["authorization_url"] is None and len(state["calls"]) == before
+    pg.execute("UPDATE authorizations SET status='attention_required',body_consent_at=NOW(),scopes=%s WHERE id=%s",
+               (list(required), other))
+    attention = check(str(other))
+    assert attention["status"] == "needs_authorization" and not attention["missing_scopes"]
+    assert pg.execute("SELECT status FROM authorizations WHERE id=%s",
+                      (other,)).fetchone()["status"] == "attention_required"
+    pg.execute("""UPDATE authorizations SET body_consent_at=NOW(),scopes=%s,access_token_ciphertext=%s,
+        access_token_expires_at=NOW()-INTERVAL '1 minute',status='active' WHERE id=%s""",
+        (list(required), cipher.encrypt("fixture-other"), other))
+    refreshed = check(str(other))
+    assert state["refreshes"] == 1 and state["calls"][-1] == "fixture-refreshed"
+    assert refreshed["status"] == "needs_authorization" and set(refreshed["missing_scopes"]) == set(required)
+    assert pg.execute("SELECT scopes,status FROM authorizations WHERE id=%s", (other,)).fetchone() == {
+        "scopes": [], "status": "active"}
+    assert settings.oauth_scopes == baseline
+    assert pg.execute("SELECT COUNT(*) AS n FROM sync_jobs").fetchone()["n"] == 0
+    actor.update(status="attention_required", body_consent_at=True)
+    reconnect = check(str(other))
+    assert reconnect["status"] == "needs_authorization" and reconnect["is_self"]
+    assert reconnect["account_id"] == str(actor["id"]) and not reconnect["is_sender"]
+    assert reconnect["authorization_url"] == f"/auth/lark/start?send=1&account_id={actor['id']}"
+    assert client.post(url, json={"cm_id": "all"}).status_code == 400
+    attention_page = client.get("/creators/broadcast")
+    assert attention_page.status_code == 200 and "账号连接需要更新" in attention_page.text
+    assert f"/auth/lark/start?send=1&amp;account_id={actor['id']}" in attention_page.text
+    actor["status"] = "active"
+    state["change"] = "owner"
+    assert client.post(url, json={"cm_id": "all"}, headers=headers).status_code == 403
+    state["change"] = None
+    before = len(state["calls"])
+    assert client.post(url, json={"cm_id": "all"}, headers=headers).status_code == 403
+    assert len(state["calls"]) == before
 
 
 def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monkeypatch):
@@ -299,11 +435,13 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
     assert creator_broadcast.page_data(actor["id"])["templates"] == [template_item]
     assert draft["name"] in client.get("/creators/broadcast").text
     update_template = dict(draft, id=template_item["id"], revision=1, body="Updated")
-    assert client.post(templates_url + "save", json=update_template, headers=headers).json()["template"]["revision"] == 2
+    assert client.post(templates_url + "save", json=update_template,
+                       headers=headers).json()["template"]["revision"] == 2
     assert client.post(templates_url + "save", json=update_template, headers=headers).status_code == 400
     template_stored["owner_authorization_id"] = other_cm
     for action in ("save", "delete"):
-        assert client.post(templates_url + action, json=dict(update_template, revision=2), headers=headers).status_code == 404
+        assert client.post(templates_url + action, json=dict(update_template, revision=2),
+                           headers=headers).status_code == 404
     assert creator_broadcast.page_data(actor["id"])["templates"] == []
     template_stored["owner_authorization_id"] = actor["id"]
     assert client.post(templates_url + "delete", json={"id": template_item["id"], "revision": 1},

@@ -56,9 +56,18 @@ curl --fail --silent --show-error https://larkbot.ttapp.help/healthz
 
 `im:message`、`im:message.send_as_user` 必须在当前上线应用的**用户身份权限**中开通。不要将它们加入全局 `LARK_OAUTH_SCOPES`，避免让只需同步消息的 CM/AM 也被要求授权发送。
 
-已登录的 Owner 打开 `/auth/lark/start?send=1`，经 Lark 明确同意后补充本人发送授权。一次性 OAuth state 保存本次权限和目标账号；回调拒绝账号切换、权限缺失、失效或重复的旧链接。成功时只更新本人令牌、资料和登录会话，保留原有正文授权、同步游标和业务关系，并记录 `oauth_send_permissions_upgraded`，不触发全量回填。
+已经同意正文授权、当前状态为 active 或 attention_required 的人员打开 `/auth/lark/start?send=1&account_id=<本人授权UUID>`，经 Lark 明确同意后补充本人发送授权。不能代别人授权，也不能恢复已撤销的授权。一次性 OAuth state 保存本次权限和目标账号；回调同时核对本站会话、state 和真实 Lark 账号，拒绝账号切换、权限缺失、失效或重复的旧链接。成功时只更新本人令牌、资料和登录会话，保留原有正文授权、同步游标和业务关系，并记录 `oauth_send_permissions_upgraded`，不触发全量回填。Owner 回群发页，其他人员回个人首页；此入口不会增加后台访问权限。
 
 旧令牌不会因应用权限已开通自动获得发送权限。验收必须检查新令牌实际返回的两项 scope；此入口不会发送消息，也不会开启群发队列。普通登录与既有资料权限升级仍按原流程执行；后续普通登录若未返回发送 scope，需再次使用此增权入口。
+
+#### 群发页面的授权检查
+
+采用按功能增量授权，参考 [Google](https://developers.google.com/identity/protocols/oauth2/resources/granular-permissions)、[Microsoft](https://learn.microsoft.com/en-us/entra/identity-platform/consent-types-developer) 和 [Slack](https://docs.slack.dev/authentication/installing-with-oauth/) 的官方流程。不把应用已开通的全部权限都要求用户授权。
+
+- 每次进入、恢复页面及切换 CM/AM 时，通过带会话和 CSRF 校验的 `POST /creators/broadcast/permissions` 核对账号。客服群选择“全部达人”时核对当前登录账号，不把全部达人误认为一个发送人。
+- 结合最新 OAuth/刷新响应记录的 scope 与只读 `user_info` 核对基线、两项发送权限、凭证和本人身份。只有令牌临近到期才沿用现有行锁刷新；刷新明确返回 scope 时同步保存，未返回则保留历史记录。
+- 缺权或明确失效时引导本人补授权；Owner 只能复制其他人的本人绑定链接。新标签页授权，原页名单和正文保留，返回原页自动重查。网络错误、限流、5xx 或资源拒绝显示暂时无法核对，不修改全局接入状态、不循环授权。
+- [Lark CLI 的 auth check](https://github.com/larksuite/cli/blob/main/cmd/auth/check.go) 也是检查本地保存的 scope；`user_info` 不返回 scope。因此“授权已核对”只代表已记录必要权限齐全且当前凭证可用，不是实时发送 scope introspection，也不证明外部群、群发言或 @all 可用。群发界面仍为预览，不能因这项检查通过自动发送消息。
 
 预期健康检查返回 `{"status":"ok","database":"ok",...}`。若服务未启动，先查看不含消息正文的 systemd 日志：
 

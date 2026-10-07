@@ -104,6 +104,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   let lists = config.lists || [], currentList = null, editingList = null, fixedIds = null, fixedTargets = null;
   let savedState = '', editMode = 'create', pendingAction = null, initialMetadata = '';
   let selectedGroups = new Set(), templates = config.templates || [], currentTemplateId = '', editingTemplate = null, initialTemplate = '';
+  let permissionCheck = 0, permissionPending = false, permissionCm = null, permissionResult = null;
   const groupMode = () => purpose !== 'support';
   const rows = () => recipients(entries, routes, groups, purpose);
   const plan = () => groupMode() ? groupPlan(groups,selectedGroups,$('mention').checked) : buildPlan(rows(), $('mention').checked, config.purposes[purpose]);
@@ -255,6 +256,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     busy = value;
     for (const control of document.querySelectorAll('#broadcast-app main button, #broadcast-app main input, #broadcast-app main select, #broadcast-app main textarea')) control.disabled = value;
     render();
+    $('permission-retry').disabled = permissionPending;
     for (const control of $('rows').querySelectorAll('input,select,button')) control.disabled = value;
     for (const dialog of ['list-dialog','library-dialog','list-action-dialog','template-dialog']) {
       for (const control of $(dialog).querySelectorAll('input,textarea,button')) control.disabled = value;
@@ -268,7 +270,8 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       const readAction = ['match','resolve','groups','preview','lists/load'].includes(action);
       const groupRead = action === 'groups' || result?.mode === 'groups';
       if (!result || (readAction && (!Array.isArray(result.groups) || !Array.isArray(result[action === 'preview' || groupRead ? 'issues' : 'entries'])))
-          || (!readAction && !Array.isArray(action.startsWith('templates/') ? result.templates : result.lists))) throw new Error('返回格式异常，请刷新后重试。');
+          || (action === 'permissions' ? !['ready','needs_authorization','unavailable'].includes(result.status)
+            : !readAction && !Array.isArray(action.startsWith('templates/') ? result.templates : result.lists))) throw new Error('返回格式异常，请刷新后重试。');
       return result;
     } catch (error) {
       if (['TimeoutError','AbortError'].includes(error.name)) throw new Error('请求超时，请重新尝试。');
@@ -276,6 +279,48 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       throw error;
     }
   }
+  async function checkPermissions(force = false) {
+    const cm = $('cm').value;
+    if (!force && permissionCm === cm) return;
+    if (force && permissionPending && permissionCm === cm) return;
+    const request = ++permissionCheck; permissionCm = cm; permissionPending = true; permissionResult = null;
+    $('permission-bar').setAttribute('aria-busy','true'); $('permission-retry').disabled = true;
+    $('permission-account').textContent = cm === 'all' ? '当前账号' : config.cms.find(item => item.id === cm)?.name || 'CM/AM';
+    $('permission-status').textContent = '正在核对授权'; $('permission-status').className = 'badge bg-secondary-lt ms-2';
+    $('permission-message').textContent = ''; $('permission-authorize').hidden = true; $('permission-copy').hidden = true;
+    try {
+      const result = await api('permissions',{cm_id:cm});
+      if (request !== permissionCheck) return;
+      permissionResult = result;
+      $('permission-account').textContent = `${result.is_sender ? 'CM/AM' : '当前账号'}：${result.account_name || '未选择'}`;
+      $('permission-status').textContent = result.status === 'ready' ? '授权已核对' : result.status === 'needs_authorization' ? '需要补授权' : '暂时无法核对';
+      $('permission-status').className = `badge ms-2 ${result.status === 'ready' ? 'bg-green-lt' : 'bg-yellow-lt'}`;
+      $('permission-message').textContent = result.message || '';
+      if (result.status === 'needs_authorization' && result.authorization_url) {
+        if (result.is_self) { $('permission-authorize').href = result.authorization_url; $('permission-authorize').hidden = false; }
+        else $('permission-copy').hidden = false;
+      }
+    } catch (error) {
+      if (request !== permissionCheck) return;
+      $('permission-status').textContent = '暂时无法核对'; $('permission-status').className = 'badge bg-yellow-lt ms-2';
+      $('permission-message').textContent = error.message;
+    } finally {
+      if (request === permissionCheck) { permissionPending = false; $('permission-bar').setAttribute('aria-busy','false'); $('permission-retry').disabled = false; }
+    }
+  }
+  $('permission-retry').addEventListener('click',() => void checkPermissions(true));
+  $('permission-copy').addEventListener('click',async () => {
+    const result = permissionResult, request = permissionCheck;
+    if (!result?.authorization_url) return;
+    try {
+      await navigator.clipboard.writeText(new URL(result.authorization_url,location.origin).href);
+      if (request === permissionCheck) $('permission-message').textContent = `已复制，请 ${result.account_name} 用本人账号打开。`;
+    } catch { if (request === permissionCheck) $('permission-message').textContent = '无法复制，请允许浏览器访问剪贴板后重试。'; }
+  });
+  document.addEventListener('visibilitychange',() => {
+    if (!document.hidden) void checkPermissions(true);
+  });
+  window.addEventListener('pageshow',event => { if (event.persisted) void checkPermissions(true); });
   function applyTargets(result) {
     entries = result.entries || []; groups = result.groups; routes = new Map((result.routes || []).map(route => [route.contact_id,route.chat_id]));
     selectedGroups = new Set(result.selected_chat_ids || []); dirty = false;
@@ -287,6 +332,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     if (groupMode() && value === 'all') value = config.cms.some(cm => cm.id === $('app').dataset.actor) ? $('app').dataset.actor : '';
     if (value && ![...$('cm').options].some(option => option.value === value)) $('cm').add(new Option('授权已失效',value));
     $('cm').value = value;
+    void checkPermissions();
   }
   async function fetchGroups(preserve = false) {
     if (busy) return;
@@ -324,6 +370,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   $('cm').addEventListener('change', () => {
     entries = []; groups = []; selectedGroups = new Set(); routes = new Map(); fixedIds = null; fixedTargets = null; currentList = null; $('input').value = ''; dirty = true; notice('');
     if (groupMode()) void fetchGroups(); else render();
+    void checkPermissions();
   });
   for (const button of buttons) button.addEventListener('click', () => {
     if (purpose === button.dataset.purpose || busy) return;
@@ -388,6 +435,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       currentList = result.list; purpose = result.purpose;
       fixedIds = groupMode() ? null : result.entries.map(entry => entry.key.replace(/^contact:/,'')); fixedTargets = groupMode() ? null : result.list.targets;
       configureScope(groupMode() && result.selected_cm_id === 'all' ? '' : result.selected_cm_id); $('mention').checked = result.list.mention;
+      void checkPermissions(true);
       $('input').value = (result.entries || []).map(entry => entry.inputs[0]).join('\n'); $('group-search').value = ''; applyTargets(result);
       savedState = selectionState(); pendingAction = null; $('library-dialog').close(); $('list-action-dialog').close();
       notice([result.issues.length ? `已跳过 ${result.issues.length} 项：${result.issues[0].reason}` : '',result.notice || '名单已载入。'].filter(Boolean).join(' '));
@@ -546,4 +594,5 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       }).catch(error => { fixedIds = null; notice(error.message); }).finally(() => lock(false));
     }
   } catch (error) { fixedIds = null; notice(error.message || '无法读取带入名单，请重新选择。'); render(); }
+  void checkPermissions();
 }
