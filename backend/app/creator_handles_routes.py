@@ -47,9 +47,12 @@ def create_router(*, current_authorization, render_template, csrf_token):
         auth = current_authorization(request)
         if not auth:
             return secure(RedirectResponse("/", status_code=303))
-        if auth["status"] == "attention_required" and auth.get("body_consent_at"):
-            return secure(RedirectResponse(f"/auth/lark/start?send=1&account_id={auth['id']}&auto=1", status_code=303))
         try:
+            if auth["status"] == "attention_required" and auth.get("body_consent_at"):
+                creator_broadcast.require_access(auth["id"])
+                return secure(RedirectResponse(
+                    f"/auth/lark/start?send=1&account_id={auth['id']}&auto=1", status_code=303,
+                ))
             auth = actor(auth)
             data = creator_broadcast.page_data(auth["id"])
             return secure(render_template(request, "creator_broadcast.html", {
@@ -96,6 +99,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
             args = (auth["id"], fields.get("cm_id", "all"), fields.get("purpose", "support"))
             action = request.url.path.rsplit("/", 1)[-1]
             if reconnect_self:
+                await run_in_threadpool(creator_broadcast.require_access, auth["id"])
                 if action != "permissions":
                     return payload({
                         "error": "请先更新本人群发授权。",
@@ -156,6 +160,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
             auth = actor(auth)
             tab = tab if tab in ('candidates', 'unassigned') else 'mine'
             data = creator_roster.page_data(auth["id"], cm_id=cm_id, tab=tab, query=q[:120], page=max(1, page))
+            data["can_broadcast"] = bool(auth.get("broadcast_enabled") or data["can_view_unassigned"])
             if request.url.path.endswith("/data"):
                 return payload(data)
             return secure(render_template(request, "creator_handles.html", {

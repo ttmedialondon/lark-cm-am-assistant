@@ -28,14 +28,16 @@
   }
   function selectedCM() { return el("cm")?.value || data.selected_cm_id || ""; }
   function selectedCMName() { return data.cms?.find(cm => cm.id === selectedCM())?.name || "我"; }
+  const canSelectContacts = () => Boolean(data.can_broadcast && (data.can_view_unassigned
+    ? tab !== "candidates" : tab === "mine" && selectedCM() === app.dataset.actor));
   function selectableContact(item) {
-    return data.can_view_unassigned && tab !== "candidates" && item.kind === "confirmed"
+    return canSelectContacts() && item.kind === "confirmed"
       && typeof item.contact_id === "string" && uuid.test(item.contact_id) ? item.contact_id : "";
   }
   function renderSelection() {
     if (!el("selection-bar")) return;
-    const available = Boolean(data.can_view_unassigned && tab !== "candidates");
-    if (!data.can_view_unassigned) selectedContacts.clear();
+    const available = canSelectContacts();
+    if (!available) selectedContacts.clear();
     el("selection-bar").hidden = !available; el("selection-head").hidden = !available;
     el("selection-count").textContent = `已选 ${selectedContacts.size} / 500 位`;
     const ids = (data.items || []).map(selectableContact).filter(Boolean);
@@ -174,7 +176,7 @@
       parts.selectionCell = node("td", "", "creator-selection-cell");
       parts.selection = node("input", "", "form-check-input"); parts.selection.type = "checkbox";
       parts.selection.addEventListener("change", () => {
-        if (busy || reading || !parts.selectionId) return;
+        if (busy || reading || !canSelectContacts() || !parts.selectionId) return;
         if (parts.selection.checked && !selectedContacts.has(parts.selectionId) && selectedContacts.size >= 500) {
           notice("最多选择 500 位达人。", true); renderSelection(); return;
         }
@@ -440,7 +442,7 @@
   el("import-check").addEventListener("click", checkImport);
   el("import-confirm").addEventListener("click", startImport);
   el("select-page")?.addEventListener("change", () => {
-    if (busy || reading) return;
+    if (busy || reading || !canSelectContacts()) return;
     const ids = (data.items || []).map(selectableContact).filter(Boolean);
     if (el("select-page").checked) {
       if (selectedContacts.size + ids.filter(id => !selectedContacts.has(id)).length > 500) {
@@ -452,7 +454,7 @@
   });
   el("selection-clear")?.addEventListener("click", () => { selectedContacts.clear(); notice(""); renderSelection(); });
   el("selection-broadcast")?.addEventListener("click", () => {
-    if (busy || reading || !data.can_view_unassigned || !selectedContacts.size) return;
+    if (busy || reading || !canSelectContacts() || !selectedContacts.size) return;
     const cm = tab === "unassigned" ? "all" : selectedCM();
     if (!uuid.test(app.dataset.actor || "") || (cm !== "all" && !uuid.test(cm))) return notice("当前账号或负责人不可用，请刷新。", true);
     try {

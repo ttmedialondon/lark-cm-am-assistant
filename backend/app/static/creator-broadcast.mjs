@@ -36,11 +36,12 @@ export function groupPlan(groups, selected, mention) {
   }
   return {groups:targets,issues,people:[]};
 }
-export function parseSelection(raw, actor, now = Date.now()) {
+export function parseSelection(raw, actor, now = Date.now(), canSelectCm = true) {
   const selection = JSON.parse(raw), age = now - selection.created_at;
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (selection.actor_id !== actor || typeof selection.created_at !== 'number' || !Number.isFinite(age) || age < 0 || age > 300000
-      || (selection.cm_id !== 'all' && !uuid.test(selection.cm_id)) || !Array.isArray(selection.contact_ids)
+      || (selection.cm_id !== 'all' && !uuid.test(selection.cm_id)) || (!canSelectCm && selection.cm_id !== actor)
+      || !Array.isArray(selection.contact_ids)
       || !selection.contact_ids.length || selection.contact_ids.length > 500
       || !selection.contact_ids.every(id => typeof id === 'string' && uuid.test(id))) throw new Error('带入名单已失效，请回到“我的达人”重新选择。');
   return {cm_id:selection.cm_id,contact_ids:[...new Set(selection.contact_ids)]};
@@ -62,7 +63,7 @@ export function automaticAuthorizationUrl(value, actor, origin) {
   }
   return `/auth/lark/start?${new URLSearchParams({send:'1',account_id:actor,auto:'1'})}`;
 }
-export function parseDraft(raw, actor, now = Date.now()) {
+export function parseDraft(raw, actor, now = Date.now(), canSelectCm = true) {
   if (typeof raw !== 'string' || raw.length > 300000) throw new Error('授权草稿无效。');
   const draft = JSON.parse(raw), uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const text = (value, limit) => typeof value === 'string' && value.length <= limit && !value.includes('\0');
@@ -71,7 +72,7 @@ export function parseDraft(raw, actor, now = Date.now()) {
   const age = now - draft?.created_at;
   if (!draft || draft.version !== 1 || draft.actor_id !== actor || typeof draft.created_at !== 'number'
       || !Number.isFinite(age) || age < 0 || age > 1800000
-      || (!['all',''].includes(draft.cm_id) && !id(draft.cm_id))
+      || (!['all',''].includes(draft.cm_id) && !id(draft.cm_id)) || (!canSelectCm && draft.cm_id !== actor)
       || !['support','community','training','category','campaign'].includes(draft.purpose)
       || typeof draft.mention !== 'boolean' || !text(draft.raw,65536) || !text(draft.message,4000)
       || (draft.fixed_ids !== null && (!Array.isArray(draft.fixed_ids) || draft.fixed_ids.length > 500
@@ -130,10 +131,16 @@ if (typeof process !== 'undefined' && process.argv.includes('--self-check')) {
   assert.equal(groupPlan(groups, [], true).groups.length,0);
   assert.notEqual(listState('cm','category',true,[{chat_id:'training'}]),listState('cm','category',true,[{chat_id:'training2'}]));
   const actor = '00000000-0000-0000-0000-000000000001', other = '00000000-0000-0000-0000-000000000002';
+  assert.equal(parseSelection(JSON.stringify({...handoff,actor_id:actor,cm_id:actor}),actor,1001,false).cm_id,actor);
+  for (const cm_id of ['all',other]) {
+    assert.throws(() => parseSelection(JSON.stringify({...handoff,actor_id:actor,cm_id}),actor,1001,false));
+  }
   const draft = {version:1,actor_id:actor,created_at:1000,cm_id:'all',purpose:'support',mention:true,
     message:'Keep my text',raw:'@example',fixed_ids:[other],fixed_targets:[{contact_id:other,chat_id:'oc_example'}],
     selected_groups:[]};
   assert.equal(parseDraft(JSON.stringify(draft),actor,1001).message,draft.message);
+  assert.equal(parseDraft(JSON.stringify({...draft,cm_id:actor}),actor,1001,false).message,draft.message);
+  for (const cm_id of ['all','',other]) assert.throws(() => parseDraft(JSON.stringify({...draft,cm_id}),actor,1001,false));
   assert.equal(parseDraft(JSON.stringify({...draft,fixed_ids:[],fixed_targets:[]}),actor,1001).fixed_ids.length,0);
   assert.equal(parseDraft(JSON.stringify({...draft,fixed_targets:[{contact_id:other,chat_id:''}]}),actor,1001).fixed_targets[0].chat_id,'');
   for (const fields of [{actor_id:other},{created_at:-1800001},{message:'x'.repeat(4001)},
@@ -156,6 +163,7 @@ if (typeof process !== 'undefined' && process.argv.includes('--self-check')) {
 if (typeof document !== 'undefined' && document.getElementById('broadcast-app')) {
   const $ = id => document.getElementById(`broadcast-${id}`);
   const config = JSON.parse($('config').textContent), buttons = [...document.querySelectorAll('[data-purpose]')];
+  const canSelectCm = config.can_select_cm === true, actor = $('app').dataset.actor;
   const node = (tag, text = '', className = '') => {
     const element = document.createElement(tag); element.textContent = text;
     if (className) element.className = className; return element;
@@ -319,7 +327,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   }
   function syncGate() {
     $('workspace').disabled = $('editors').disabled = busy || !allowed();
-    $('cm').disabled = redirecting;
+    $('cm').disabled = redirecting || !canSelectCm;
     $('permission-retry').disabled = permissionPending || redirecting;
     $('permission-copy').disabled = permissionPending || redirecting;
   }
@@ -337,7 +345,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
         fixed_ids:selected ? selected.map(row => row.person.id) : fixedIds,
         fixed_targets:selected ? selected.map(row => ({contact_id:row.person.id,chat_id:row.chatId})) : fixedTargets,
         selected_groups:[...selectedGroups]});
-      parseDraft(raw,$('app').dataset.actor);
+      parseDraft(raw,actor,Date.now(),canSelectCm);
       sessionStorage.setItem(draftKey,raw);
       if (sessionStorage.getItem(draftKey) !== raw) throw new Error('无法保存草稿');
       redirecting = true; syncGate(); location.assign(url);
@@ -444,11 +452,13 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     selectedGroups = new Set(result.selected_chat_ids || []); dirty = false;
   }
   function configureScope(value = $('cm').value) {
-    $('cm').replaceChildren(new Option(groupMode() ? '选择 CM/AM' : '全部已入库达人',groupMode() ? '' : 'all'));
-    for (const cm of config.cms) $('cm').add(new Option(groupMode() ? cm.name : `${cm.name} 负责的达人`,cm.id));
+    $('cm').replaceChildren();
+    if (canSelectCm) $('cm').add(new Option(groupMode() ? '选择 CM/AM' : '全部已入库达人',groupMode() ? '' : 'all'));
+    for (const cm of config.cms.filter(cm => canSelectCm || cm.id === actor)) $('cm').add(new Option(groupMode() ? cm.name : `${cm.name} 负责的达人`,cm.id));
+    if (!canSelectCm) value = actor;
     if (!groupMode() && !value) value = 'all';
     if (groupMode() && value === 'all') value = config.cms.some(cm => cm.id === $('app').dataset.actor) ? $('app').dataset.actor : '';
-    if (value && ![...$('cm').options].some(option => option.value === value)) $('cm').add(new Option('授权已失效',value));
+    if (canSelectCm && value && ![...$('cm').options].some(option => option.value === value)) $('cm').add(new Option('授权已失效',value));
     $('cm').value = value;
   }
   async function fetchGroups(preserve = false) {
@@ -709,10 +719,11 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     finally { lock(false); ($('list-action-dialog').open ? $('list-action-cancel') : kind === 'template-delete' ? $('template-select') : $('library-close')).focus(); }
   });
   $('back').addEventListener('click', () => $('confirm').close());
+  configureScope(config.selected_cm_id);
   try {
     const raw = sessionStorage.getItem(draftKey); sessionStorage.removeItem(draftKey);
     if (raw) {
-      const draft = parseDraft(raw,$('app').dataset.actor);
+      const draft = parseDraft(raw,actor,Date.now(),canSelectCm);
       purpose = draft.purpose; fixedIds = draft.fixed_ids; fixedTargets = draft.fixed_targets;
       selectedGroups = new Set(draft.selected_groups); $('input').value = draft.raw; $('message').value = draft.message;
       $('mention').checked = draft.mention; configureScope(draft.cm_id); pendingRestore = true;
@@ -722,7 +733,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   try {
     const raw = sessionStorage.getItem('ttmedia.broadcast.selection'); sessionStorage.removeItem('ttmedia.broadcast.selection');
     if (raw) {
-      const selection = parseSelection(raw,$('app').dataset.actor);
+      const selection = parseSelection(raw,actor,Date.now(),canSelectCm);
       purpose = 'support'; fixedIds = selection.contact_ids; fixedTargets = null; selectedGroups = new Set();
       $('input').value = ''; $('mention').checked = true; configureScope(selection.cm_id); pendingRestore = true;
       notice('已带入选中达人，授权核对后会重新核验目标群。');

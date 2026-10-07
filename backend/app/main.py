@@ -62,10 +62,10 @@ def _template(request: Request, name: str, context: dict[str, Any], status_code:
         owner = bool(context.get("admin_role") == "owner"
                      or context.get("creator_data", {}).get("can_view_unassigned")
                      or context.get("summary_data", {}).get("can_manage")
-                     or name == "creator_broadcast.html")
+                     or context.get("broadcast_data", {}).get("can_select_cm"))
         active = authorization["status"] == "active"
         context = {**context, "business_nav": {
-            "can_broadcast": active and owner,
+            "can_broadcast": active and (owner or bool(authorization.get("broadcast_enabled"))),
             "can_summary": context.get("offhours_summary_visible", active and (
                 bool(authorization.get("body_consent_at")) or owner
                 or _is_remi_tester(authorization, {"is_owner": owner})
@@ -331,9 +331,13 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
         )
         _audit(conn, authorization_id, "oauth_send_permissions_upgraded" if send_upgrade else
                "oauth_profile_permissions_upgraded" if profile_upgrade else "oauth_authorized")
-        destination = (
-            "/creators/broadcast" if send_upgrade and creator_access.is_owner(conn, authorization_id) else "/dashboard"
-        )
+        destination = "/dashboard"
+        if send_upgrade:
+            try:
+                creator_access.require_broadcast_access(conn, authorization_id)
+                destination = "/creators/broadcast"
+            except PermissionError:
+                pass
 
         session_token = secrets.token_urlsafe(32)
         conn.execute(
@@ -446,7 +450,7 @@ def _current_authorization(request: Request) -> dict[str, Any] | None:
         row = conn.execute(
             """
             SELECT a.id, a.open_id, a.display_name, a.status, a.last_error, a.scopes,
-                   a.body_consent_at, a.p2p_discovery_status, a.p2p_last_error,
+                   a.body_consent_at, a.p2p_discovery_status, a.p2p_last_error, a.broadcast_enabled,
                    s.last_seen_at < NOW() - INTERVAL '5 minutes' AS touch_session
             FROM web_sessions s
             JOIN authorizations a ON a.id = s.authorization_id

@@ -35,6 +35,19 @@ def is_owner(conn, actor):
         return False
 
 
+def require_broadcast_access(conn, actor):
+    """A separate frontend grant never inherits creator-management privileges."""
+    row = conn.execute(
+        """SELECT a.status,a.broadcast_enabled,r.role,r.is_active
+           FROM authorizations a LEFT JOIN admin_roles r ON r.authorization_id=a.id
+           WHERE a.id=%s""", (parse_id(actor),),
+    ).fetchone()
+    owner = bool(row and row["role"] == "owner" and row["is_active"])
+    if not row or row["status"] not in {"active", "attention_required"} or not (owner or row["broadcast_enabled"]):
+        raise PermissionError("您尚未开通群发功能。")
+    return owner
+
+
 def can_view_all(conn, actor):
     return is_owner(conn, actor) or bool(conn.execute(
         "SELECT 1 FROM admin_page_permissions WHERE authorization_id=%s "

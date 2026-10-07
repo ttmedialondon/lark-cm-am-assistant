@@ -1,4 +1,4 @@
-"""Owner-only routing previews, personal lists and permission checks; never send or call AI."""
+"""Scoped routing previews, personal lists and permission checks; never send or call AI."""
 
 import re
 import unicodedata
@@ -31,13 +31,29 @@ class BroadcastAuthorizationRequired(PermissionError):
 
 def _require_broadcast_grant(conn, actor_id):
     actor = creator_access.parse_id(actor_id)
-    creator_access.require_owner(conn, actor)
+    owner = creator_access.require_broadcast_access(conn, actor)
     row = conn.execute("""SELECT id,status,body_consent_at,scopes FROM authorizations WHERE id=%s""",
                        (actor,)).fetchone()
     if not row or row["status"] != "active" or not row["body_consent_at"]:
         raise PermissionError("本人聊天授权已失效，请先完成接入。")
     if not (set(get_settings().oauth_scopes) | set(SEND_SCOPES)).issubset(row["scopes"] or ()):
         raise BroadcastAuthorizationRequired(actor)
+    return owner
+
+
+def require_access(actor_id):
+    with connection() as conn:
+        return creator_access.require_broadcast_access(conn, actor_id)
+
+
+def _selected_cm(actor_id, cm_id, owner):
+    actor = creator_access.parse_id(actor_id)
+    if cm_id == "all":
+        return None if owner else actor
+    cm = creator_access.parse_id(cm_id)
+    if not owner and cm != actor:
+        raise PermissionError("群发只能使用您本人的达人和群聊。")
+    return cm
 
 
 def _normalized(value):
@@ -45,10 +61,10 @@ def _normalized(value):
 
 
 def _scope(conn, actor_id, cm_id):
-    _require_broadcast_grant(conn, actor_id)
-    if cm_id == "all":
+    owner = _require_broadcast_grant(conn, actor_id)
+    cm = _selected_cm(actor_id, cm_id, owner)
+    if cm is None:
         return None
-    cm = creator_access.parse_id(cm_id)
     return creator_access.access(conn, actor_id, cm, read_only=True)[0]
 
 
@@ -241,12 +257,15 @@ def _match_entries(raw, people):
 def page_data(actor_id):
     with connection() as conn, conn.transaction():
         conn.execute("SET TRANSACTION READ ONLY")
-        _scope(conn, actor_id, "all")
+        owner = _require_broadcast_grant(conn, actor_id)
+        scope = None if owner else creator_access.parse_id(actor_id)
         cms = conn.execute("""SELECT id,display_name FROM authorizations
-            WHERE status='active' AND body_consent_at IS NOT NULL ORDER BY display_name,id""").fetchall()
+            WHERE status='active' AND body_consent_at IS NOT NULL
+              AND (%s::uuid IS NULL OR id=%s::uuid) ORDER BY display_name,id""", (scope, scope)).fetchall()
         return {"purposes": PURPOSES, "cms": [{"id": str(cm["id"]), "name": cm["display_name"] or "未命名用户"}
                                              for cm in cms],
-                "selected_cm_id": "all", "preview_only": True, "lists": _lists(conn, actor_id),
+                "selected_cm_id": "all" if owner else str(scope), "can_select_cm": owner,
+                "preview_only": True, "lists": _lists(conn, actor_id),
                 "templates": _templates(conn, actor_id)}
 
 
@@ -258,12 +277,12 @@ def permission_check(actor_id, cm_id):
     sql = """SELECT id,open_id,display_name,status,body_consent_at,scopes,access_token_ciphertext
         FROM authorizations WHERE id=%s"""
     with connection() as conn:
-        creator_access.require_owner(conn, actor)
-        target = actor if cm_id == "all" else creator_access.parse_id(cm_id) if cm_id else None
+        owner = creator_access.require_broadcast_access(conn, actor)
+        target = actor if cm_id == "all" else _selected_cm(actor, cm_id, owner) if cm_id else None
         row = conn.execute(sql, (target,)).fetchone() if target else None
     result = {"status": "unavailable", "account_id": str(target) if target else None,
               "account_name": row["display_name"] or "未命名用户" if row else "",
-              "is_self": target == actor, "is_sender": bool(target and cm_id != "all"),
+              "is_self": target == actor, "is_sender": bool(target and (cm_id != "all" or not owner)),
               "missing_scopes": [], "authorization_url": None,
               "message": "请选择一位 CM/AM。", "checked_at": datetime.now(UTC).isoformat()}
     if not target:
@@ -314,7 +333,9 @@ def permission_check(actor_id, cm_id):
     except (httpx.HTTPError, InvalidToken, ValueError, RuntimeError):
         pass
     with connection() as conn:
-        creator_access.require_owner(conn, actor)
+        owner = creator_access.require_broadcast_access(conn, actor)
+        if target:
+            _selected_cm(actor, str(target), owner)
         current = conn.execute(sql, (target,)).fetchone()
     if not current or current["status"] == "revoked" or not current["body_consent_at"]:
         result.update(status="needs_authorization", missing_scopes=[], message="聊天授权已失效，请本人先完成接入。")
@@ -366,10 +387,10 @@ def _targets(values, *, one_per_contact=False):
 
 
 def _resolve_scope(conn, actor_id, cm_id):
-    _require_broadcast_grant(conn, actor_id)
-    if cm_id == "all":
+    owner = _require_broadcast_grant(conn, actor_id)
+    cm = _selected_cm(actor_id, cm_id, owner)
+    if cm is None:
         return None, ""
-    cm = creator_access.parse_id(cm_id)
     return cm, "" if creator_access.authorized_cm(conn, cm) else "名单所属 CM/AM 的授权已失效"
 
 

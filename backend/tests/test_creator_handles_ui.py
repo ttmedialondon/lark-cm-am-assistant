@@ -83,6 +83,8 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
                 pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (other,))
             elif state["change"] == "owner":
                 pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (actor["id"],))
+            elif state["change"] == "broadcast":
+                pg.execute("UPDATE authorizations SET broadcast_enabled=FALSE WHERE id=%s", (actor["id"],))
             open_id = "ou_owner" if token == "fixture-owner" else "ou_other"
             return LarkProfile("ou_wrong" if state["change"] == "identity" else open_id, None, None, None)
 
@@ -174,6 +176,85 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
     assert client.post(url, json={"cm_id": "all"}, headers=headers).status_code == 403
     assert len(state["calls"]) == before
 
+    # A frontend grant allows only this account, not management or another CM's resources.
+    pg.execute("UPDATE authorizations SET broadcast_enabled=TRUE WHERE id=%s", (actor["id"],))
+    data = creator_broadcast.page_data(actor["id"])
+    assert data["cms"] == [{"id": str(actor["id"]), "name": "ou_owner"}]
+    assert data["selected_cm_id"] == str(actor["id"]) and not data["can_select_cm"]
+    opened = client.get("/creators/broadcast")
+    assert opened.status_code == 200 and "发送（未开通）" in opened.text
+    assert check()["is_self"] and check()["is_sender"]
+    pg.execute("UPDATE authorizations SET status='active',scopes=%s WHERE id=%s", (list(required), other))
+    for account, chat, name in ((actor["id"], "oc_own", "Own creator"), (other, "oc_foreign", "Foreign creator")):
+        person, identity = uuid4(), "ou_" + chat
+        pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)", (person, name))
+        pg.execute("INSERT INTO lark_identities(open_id,contact_id,display_name) VALUES(%s,%s,%s)",
+                   (identity, person, name))
+        pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) VALUES(%s,'creator','confirmed','manual')",
+                   (person,))
+        pg.execute("""INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source)
+            VALUES(%s,%s,%s,'manual')""", (uuid4(), person, account))
+        pg.execute("INSERT INTO chats(chat_id,name) VALUES(%s,%s)", (chat, name + " group"))
+        pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,%s)", (account, chat))
+        pg.execute("""INSERT INTO chat_group_classifications(chat_id,purpose,confirmed_by_authorization_id)
+            VALUES(%s,'category',%s)""", (chat, actor["id"]))
+    own_fields = {"cm_id": "all", "purpose": "category", "mention": True,
+                  "message": "Example", "selections": [{"chat_id": "oc_own"}]}
+    matched = client.post("/creators/broadcast/match", json={"cm_id": "all", "purpose": "support",
+                          "raw": "Own creator\nForeign creator"}, headers=headers).json()
+    assert matched["selected_cm_id"] == str(actor["id"])
+    assert matched["entries"][0]["person"]["name"] == "Own creator"
+    assert matched["entries"][1]["person"] is None
+    joined = client.post("/creators/broadcast/groups", json=own_fields, headers=headers).json()
+    assert [group["id"] for group in joined["groups"]] == ["oc_own"]
+    checked = client.post("/creators/broadcast/preview", json=own_fields, headers=headers).json()
+    assert checked["groups"][0]["mention_all"] and not checked["can_send"]
+    assert client.post("/creators/broadcast/send", json=own_fields, headers=headers).status_code == 404
+    list_fields = dict(own_fields, name="Own list")
+    list_item = client.post("/creators/broadcast/lists/save", json=list_fields, headers=headers).json()["list"]
+    assert list_item["cm_id"] == str(actor["id"])
+    assert client.post("/creators/broadcast/lists/load", json={"id": list_item["id"]},
+                       headers=headers).json()["selected_chat_ids"] == ["oc_own"]
+    draft = {"name": "Own template", "body": "Example"}
+    template = client.post("/creators/broadcast/templates/save", json=draft, headers=headers).json()["template"]
+    foreign_list = pg.execute("""INSERT INTO creator_broadcast_lists(owner_authorization_id,name,cm_id,purpose,
+        targets,snapshot) VALUES(%s,'Foreign list',%s,'category','[{"chat_id":"oc_foreign"}]','{"mode":"groups"}')
+        RETURNING id""", (other, other)).fetchone()["id"]
+    foreign_template = pg.execute("""INSERT INTO creator_broadcast_templates(owner_authorization_id,name,body)
+        VALUES(%s,'Foreign template','Example') RETURNING id""", (other,)).fetchone()["id"]
+    personal = creator_broadcast.page_data(actor["id"])
+    assert [item["id"] for item in personal["lists"]] == [list_item["id"]]
+    assert personal["templates"] == [template]
+    for action in ("load", "delete", "save"):
+        response = client.post("/creators/broadcast/lists/" + action,
+                               json=dict(list_fields, id=str(foreign_list), revision=1), headers=headers)
+        assert response.status_code == 404
+    for action in ("delete", "save"):
+        response = client.post("/creators/broadcast/templates/" + action,
+                               json=dict(draft, id=str(foreign_template), revision=1), headers=headers)
+        assert response.status_code == 404
+    pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-manage')",
+               (actor["id"],))
+    for action in ("permissions", "match", "groups", "resolve", "preview", "lists/save"):
+        fields = dict(list_fields, cm_id=str(other), raw="Foreign creator", contact_ids=[str(uuid4())])
+        assert client.post("/creators/broadcast/" + action, json=fields, headers=headers).status_code == 403
+    pg.execute("UPDATE authorizations SET scopes=%s WHERE id=%s", (list(baseline), actor["id"]))
+    missing = client.get("/creators/broadcast", follow_redirects=False)
+    assert missing.status_code == 303
+    assert missing.headers["location"] == f"/auth/lark/start?send=1&account_id={actor['id']}&auto=1"
+    pg.execute("UPDATE authorizations SET scopes=%s WHERE id=%s", (list(required), actor["id"]))
+    state["change"] = "broadcast"
+    assert client.post(url, json={"cm_id": "all"}, headers=headers).status_code == 403
+    state["change"] = None
+    assert client.get("/creators/broadcast").status_code == 403
+    assert client.post("/creators/broadcast/templates/save", json=draft, headers=headers).status_code == 403
+    ordinary, ordinary_actor = browser(monkeypatch)
+    ordinary_actor["id"] = other
+    assert ordinary.get("/creators/broadcast").status_code == 403
+    ordinary_actor.update(status="attention_required", body_consent_at=True)
+    assert ordinary.get("/creators/broadcast", follow_redirects=False).status_code == 403
+    assert ordinary.post(url, json={"cm_id": "all"}, headers=headers).status_code == 403
+
 
 def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monkeypatch):
     client, actor = browser(monkeypatch, owner=True)
@@ -261,7 +342,11 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
             if sql == "SET TRANSACTION READ ONLY":
                 return Rows([])
             if "JOIN admin_roles" in sql:
-                return Rows([{"owner": True}] if changed["role"] and str(params[0]) == str(actor["id"]) else [])
+                owner = changed["role"] and str(params[0]) == str(actor["id"])
+                if "broadcast_enabled" in sql:
+                    return Rows([{"status": "active", "broadcast_enabled": False,
+                                  "role": "owner" if owner else None, "is_active": owner}])
+                return Rows([{"owner": True}] if owner else [])
             if "SELECT id,status,body_consent_at,scopes" in sql:
                 return Rows([{"id": params[0], "status": "active", "body_consent_at": changed["consent"],
                               "scopes": changed["scopes"] if str(params[0]) == str(actor["id"]) else list(required)}])

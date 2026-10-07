@@ -46,13 +46,18 @@ def test_session_touch_is_throttled_without_caching_revocation(pg, monkeypatch):
     pg.execute("INSERT INTO web_sessions(session_hash,authorization_id,expires_at,last_seen_at) "
                "VALUES(%s,%s,NOW()+INTERVAL '1 day',NOW()-INTERVAL '10 minutes')", (session_hash, actor))
     request = _request_with_session("fixture-session")
-    assert main._current_authorization(request)["status"] == "active"
+    authorization = main._current_authorization(request)
+    assert authorization["status"] == "active" and authorization["broadcast_enabled"] is False
     touched = pg.execute("SELECT last_seen_at FROM web_sessions WHERE session_hash=%s", (session_hash,)).fetchone()
     pg.execute("UPDATE web_sessions SET last_seen_at=NOW()-INTERVAL '1 minute' WHERE session_hash=%s", (session_hash,))
     for _ in range(3):
         assert main._current_authorization(request)["id"] == actor
     unchanged = pg.execute("SELECT last_seen_at FROM web_sessions WHERE session_hash=%s", (session_hash,)).fetchone()
     assert touched["last_seen_at"] - unchanged["last_seen_at"] == timedelta(minutes=1)
+    pg.execute("UPDATE authorizations SET broadcast_enabled=TRUE WHERE id=%s", (actor,))
+    assert main._current_authorization(request)["broadcast_enabled"] is True
+    pg.execute("UPDATE authorizations SET broadcast_enabled=FALSE WHERE id=%s", (actor,))
+    assert main._current_authorization(request)["broadcast_enabled"] is False
     pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (actor,))
     assert main._current_authorization(request)["status"] == "revoked"
     pg.execute("DELETE FROM web_sessions WHERE session_hash=%s", (session_hash,))
@@ -75,6 +80,10 @@ def test_dashboard_navigation_preserves_access_and_connection_controls() -> None
     assert 'href="/creators"' in rendered and 'href="/dashboard/offhours-summary"' in rendered
     assert "/creators/broadcast" not in rendered and 'href="/admin"' not in rendered
     assert 'hx-trigger="load, every 5s"' in rendered
+    enabled = main._template(request, "dashboard.html", {
+        **context, "authorization": {**authorization, "broadcast_enabled": True},
+    }).body.decode()
+    assert 'href="/creators/broadcast"' in enabled and 'href="/admin"' not in enabled
     owner = main._template(request, "dashboard.html", {
         **context, "admin_role": "owner", "admin_landing_path": "/admin",
     }).body.decode()
@@ -142,14 +151,15 @@ def test_reauthorization_restarts_an_active_job_with_a_new_generation() -> None:
     assert "last_http_status = NULL" in query
 
 
-@pytest.mark.parametrize("upgrade,owner,initial_status", (
-    ("profile", True, "attention_required"),
-    ("send", True, "active"),
-    ("send", False, "active"),
-    ("send", False, "attention_required"),
+@pytest.mark.parametrize("upgrade,owner,initial_status,broadcast_enabled", (
+    ("profile", True, "attention_required", False),
+    ("send", True, "active", False),
+    ("send", False, "active", False),
+    ("send", False, "attention_required", False),
+    ("send", False, "active", True),
 ))
 def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapping_grants(
-    pg, monkeypatch, upgrade, owner, initial_status,  # noqa: F811
+    pg, monkeypatch, upgrade, owner, initial_status, broadcast_enabled,  # noqa: F811
 ):
     scopes = (
         "offline_access", "im:chat:read", "im:message:readonly", "im:chat.members:read",
@@ -186,6 +196,8 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
     )
     if owner:
         pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (actor,))
+    if broadcast_enabled:
+        pg.execute("UPDATE authorizations SET broadcast_enabled=TRUE WHERE id=%s", (actor,))
     pg.execute(
         "INSERT INTO sync_jobs(id,authorization_id,mode,status,discovery_generation) "
         "VALUES(%s,%s,'backfill','running',9)",
@@ -360,7 +372,7 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
         pg.execute("UPDATE authorizations SET status=%s WHERE id=%s", (initial_status, actor))
 
     response = callback(state())
-    destination = "/creators/broadcast" if send and owner else "/dashboard"
+    destination = "/creators/broadcast" if send and (owner or broadcast_enabled) else "/dashboard"
     assert response.status_code == 303 and response.headers["location"] == destination
     if send:
         cleared = next(header for header in response.headers.get_list("set-cookie")
