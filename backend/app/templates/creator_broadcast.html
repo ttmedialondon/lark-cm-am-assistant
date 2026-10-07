@@ -1,36 +1,40 @@
 {% extends "base.html" %}
 {% block title %}群发消息 · TT Media{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-broadcast.css?v=20261007-live-preview">{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-broadcast.css?v=20261007-personal-lists">{% endblock %}
 {% block body %}
-<div class="page" id="broadcast-app" data-csrf="{{ csrf_token }}">
+<div class="page" id="broadcast-app" data-csrf="{{ csrf_token }}" data-actor="{{ authorization.id }}">
   <header class="navbar navbar-expand-md"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media</a><div class="navbar-nav flex-row gap-3"><a class="nav-link" href="/creators">我的达人</a><span class="nav-link text-secondary">{{ authorization.display_name or 'CM/AM' }}</span></div></div></header>
   <main class="page-wrapper"><div class="page-body"><div class="container-xl">
-    <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3"><h2 class="page-title">群发消息</h2><span class="badge bg-yellow-lt">真实数据 · 仅预览</span></div>
+    <div class="broadcast-heading mb-4"><div><div class="subheader mb-1">CREATOR OUTREACH</div><h2 class="page-title">群发消息</h2><p class="text-secondary mb-0 mt-2">选好对象和群，统一编写消息。</p></div><span class="badge bg-yellow-lt">真实数据 · 仅预览</span></div>
+    <section class="card broadcast-library mb-4" aria-labelledby="list-title"><div class="card-body">
+      <div class="broadcast-library-title"><span class="broadcast-step" aria-hidden="true">☷</span><div><h3 class="card-title mb-1" id="list-title">我的名单</h3><div class="small text-secondary" id="broadcast-list-info">保存固定人员和群，下次直接载入。</div></div></div>
+      <div class="broadcast-library-controls"><label class="visually-hidden" for="broadcast-list-select">选择个人名单</label><select class="form-select" id="broadcast-list-select"><option value="">选择已保存的名单</option></select><button class="btn btn-outline-primary" id="broadcast-list-load" type="button" disabled>载入</button><button class="btn btn-outline-secondary" id="broadcast-list-manage" type="button" disabled>管理</button></div>
+    </div></section>
     <div class="row g-4">
       <section class="col-lg-7" aria-labelledby="targets-title">
         <div class="card"><div class="card-body">
-          <h3 class="card-title" id="targets-title">选择接收对象</h3>
-          <div class="btn-list mb-3" role="group" aria-label="群类型">
+          <h3 class="card-title broadcast-section-title" id="targets-title"><span class="broadcast-step" aria-hidden="true">1</span>选择接收对象</h3>
+          <div class="btn-list broadcast-purposes mb-4" role="group" aria-label="群类型">
             {% for key, label in broadcast_data.purposes.items() %}<button class="btn {{ 'btn-primary' if key == 'support' else 'btn-outline-secondary' }}" type="button" data-purpose="{{ key }}" aria-pressed="{{ 'true' if key == 'support' else 'false' }}">{{ label }}</button>{% endfor %}
           </div>
           <label class="form-label" for="broadcast-cm">名单范围</label>
-          <select class="form-select mb-3" id="broadcast-cm"><option value="all">全部已入库达人（Owner 预览）</option>{% for cm in broadcast_data.cms %}<option value="{{ cm.id }}">{{ cm.name }} 负责的达人</option>{% endfor %}</select>
+          <select class="form-select mb-3" id="broadcast-cm"><option value="all">全部已入库达人</option>{% for cm in broadcast_data.cms %}<option value="{{ cm.id }}">{{ cm.name }} 负责的达人</option>{% endfor %}</select>
           <label class="form-label" for="broadcast-input">批量输入 handle 或名字</label>
-          <textarea class="form-control" id="broadcast-input" rows="7" maxlength="65536" placeholder="每行一个；支持 TikTok 链接，也可以直接粘贴 Excel 一列"></textarea>
+          <textarea class="form-control" id="broadcast-input" rows="5" maxlength="65536" placeholder="每行一个 handle 或名字，也支持 TikTok 链接"></textarea>
           <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mt-3"><span class="text-secondary small">最多 500 项，只查已入库关系。</span><div class="btn-list"><button class="btn btn-outline-secondary" id="broadcast-clear" type="button">清空名单</button><button class="btn btn-primary" id="broadcast-match" type="button">匹配名单</button></div></div>
           <div class="mt-3" id="broadcast-notice" role="status" aria-live="polite"></div>
         </div>
         <div id="broadcast-matches" hidden>
-          <div class="card-header d-flex justify-content-between flex-wrap gap-2"><h3 class="card-title mb-0" id="broadcast-count">匹配结果</h3><div class="btn-list"><button class="btn btn-sm btn-outline-secondary" id="broadcast-download" type="button">下载已选名单</button><button class="btn btn-sm btn-outline-secondary" id="broadcast-exclude" type="button" hidden>移除待处理项</button></div></div>
+          <div class="card-header d-flex justify-content-between flex-wrap gap-2"><h3 class="card-title mb-0" id="broadcast-count">匹配结果</h3><div class="btn-list"><button class="btn btn-sm btn-outline-primary" id="broadcast-list-new" type="button" disabled>保存名单</button><button class="btn btn-sm btn-outline-secondary" id="broadcast-download" type="button">导出 TXT</button><button class="btn btn-sm btn-outline-secondary" id="broadcast-exclude" type="button" hidden>移除待处理项</button></div></div>
           <div class="table-responsive"><table class="table table-vcenter card-table broadcast-match-table"><thead><tr><th scope="col">选择</th><th scope="col">达人 / 输入</th><th scope="col" id="broadcast-route-title">目标客服群</th></tr></thead><tbody id="broadcast-rows"></tbody></table></div>
         </div></div>
       </section>
       <section class="col-lg-5" aria-labelledby="message-title">
-        <div class="card"><div class="card-body">
-          <h3 class="card-title" id="message-title">编写消息</h3>
-          <div class="mb-3 small">当前登录账号 <strong>{{ authorization.display_name or 'CM/AM' }}</strong><div class="text-secondary mt-1">尚未接入发送，仅预览。</div></div>
+        <div class="card broadcast-composer"><div class="card-body">
+          <h3 class="card-title broadcast-section-title" id="message-title"><span class="broadcast-step" aria-hidden="true">2</span>编写消息</h3>
+          <div class="broadcast-account mb-3"><span class="avatar avatar-sm bg-blue-lt">{{ (authorization.display_name or 'CM')[0] }}</span><div><strong>{{ authorization.display_name or 'CM/AM' }}</strong><div class="text-secondary small">尚未接入发送，仅预览。</div></div></div>
           <label class="form-label" for="broadcast-message">消息正文</label>
-          <textarea class="form-control" id="broadcast-message" rows="9" maxlength="4000" placeholder="输入通知，支持换行和链接；不要粘贴私人聊天或敏感信息"></textarea>
+          <textarea class="form-control" id="broadcast-message" rows="7" maxlength="4000" placeholder="输入通知，支持换行和链接"></textarea>
           <label class="form-check mt-3"><input class="form-check-input" id="broadcast-mention" type="checkbox" checked><span class="form-check-label">@ 本次选中的达人</span></label>
           <div class="broadcast-message mt-3" aria-label="消息预览"><div class="small text-secondary mb-2">正文预览</div><div id="broadcast-mention-preview" class="text-primary mb-1"></div><div id="broadcast-message-preview">输入消息后预览</div></div>
           <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mt-4"><span id="broadcast-summary" class="text-secondary" aria-live="polite">尚未选择对象</span><button class="btn btn-primary" id="broadcast-preview" type="button" disabled>预览群发</button></div>
@@ -40,6 +44,16 @@
     </div>
     <noscript><div class="alert alert-warning mt-3">请开启 JavaScript 使用名单匹配。</div></noscript>
   </div></div></main>
+  <dialog class="broadcast-dialog broadcast-list-dialog" id="broadcast-list-dialog" aria-labelledby="broadcast-list-title">
+    <form id="broadcast-list-form">
+      <div class="broadcast-heading mb-3"><h3 class="mb-0" id="broadcast-list-title">保存名单</h3><button class="btn btn-sm btn-outline-secondary" id="broadcast-list-cancel" type="button">关闭</button></div>
+      <label class="form-label" for="broadcast-list-name">名单名称</label><input class="form-control mb-3" id="broadcast-list-name" required maxlength="80" placeholder="例如：本周活动通知">
+      <label class="form-label" for="broadcast-list-notes">备注 <span class="text-secondary">（选填）</span></label><textarea class="form-control" id="broadcast-list-notes" rows="3" maxlength="500" placeholder="记录这份名单的用途"></textarea>
+      <label class="form-check mt-3" id="broadcast-list-update-wrap" hidden><input class="form-check-input" id="broadcast-list-update" type="checkbox"><span class="form-check-label">更新为当前选中的人员、群和 @ 设置</span></label>
+      <p class="small text-secondary mt-3 mb-0" id="broadcast-list-description">只保存对象和路由，不保存消息正文，不会发送。</p><div class="small text-danger mt-2" id="broadcast-list-error" role="alert"></div>
+      <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mt-4"><button class="btn btn-outline-danger" id="broadcast-list-delete" type="button" hidden>删除名单</button><button class="btn btn-primary ms-auto" id="broadcast-list-save" type="submit">保存名单</button></div>
+    </form>
+  </dialog>
   <dialog class="broadcast-dialog" id="broadcast-confirm" aria-labelledby="confirm-title">
     <div class="d-flex align-items-center justify-content-between gap-3 mb-3"><h3 class="mb-0" id="confirm-title">群发预览</h3><button class="btn btn-sm btn-outline-secondary" id="broadcast-back" type="button">返回修改</button></div>
     <p class="text-secondary">真实名单与群分类已重新核对；本次只预览，不会发送。</p>
@@ -50,5 +64,5 @@
   </dialog>
 </div>
 <script id="broadcast-config" type="application/json">{{ broadcast_data | tojson }}</script>
-<script type="module" src="/static/creator-broadcast.mjs?v=20261007-live-preview-2"></script>
+<script type="module" src="/static/creator-broadcast.mjs?v=20261007-personal-lists"></script>
 {% endblock %}

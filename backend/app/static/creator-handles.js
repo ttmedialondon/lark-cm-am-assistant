@@ -10,6 +10,8 @@
   let query = el("query").value.trim();
   let busy = false, reading = false, refreshQueued = false, version = 0, evidenceVersion = 0;
   const rows = new Map();
+  const selectedContacts = new Map();
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   let importPreview = null;
   const rowKey = item => `${item.kind || "person"}:${item.id}`;
   const node = (tag, text = "", classes = "") => {
@@ -26,6 +28,29 @@
   }
   function selectedCM() { return el("cm")?.value || data.selected_cm_id || ""; }
   function selectedCMName() { return data.cms?.find(cm => cm.id === selectedCM())?.name || "我"; }
+  function selectableContact(item) {
+    return data.can_view_unassigned && tab !== "candidates" && item.kind === "confirmed"
+      && typeof item.contact_id === "string" && uuid.test(item.contact_id) ? item.contact_id : "";
+  }
+  function renderSelection() {
+    if (!el("selection-bar")) return;
+    const available = Boolean(data.can_view_unassigned && tab !== "candidates");
+    if (!data.can_view_unassigned) selectedContacts.clear();
+    el("selection-bar").hidden = !available; el("selection-head").hidden = !available;
+    el("selection-count").textContent = `已选 ${selectedContacts.size} / 500 位`;
+    const ids = (data.items || []).map(selectableContact).filter(Boolean);
+    const count = ids.filter(id => selectedContacts.has(id)).length;
+    el("select-page").checked = Boolean(ids.length && count === ids.length);
+    el("select-page").indeterminate = count > 0 && count < ids.length;
+    el("select-page").disabled = busy || reading || !ids.length;
+    el("selection-clear").disabled = busy || reading || !selectedContacts.size;
+    el("selection-broadcast").disabled = busy || reading || !selectedContacts.size;
+    for (const parts of rows.values()) if (parts.selection) {
+      parts.selectionCell.hidden = !available;
+      parts.selection.checked = selectedContacts.has(parts.selectionId);
+      parts.selection.disabled = busy || reading || !parts.selectionId;
+    }
+  }
   function clearRows() { for (const row of rows.values()) row.searchVersion++; rows.clear(); el("rows").replaceChildren(); }
   function importMessage(text, error = false) {
     el("import-message").textContent = text;
@@ -145,6 +170,20 @@
     const saved = node("div", "", "mb-2"); handleCell.append(saved);
     const actions = node("td");
     const parts = {row, name, lark, avatar, initial, saved, actions};
+    if (el("selection-bar")) {
+      parts.selectionCell = node("td", "", "creator-selection-cell");
+      parts.selection = node("input", "", "form-check-input"); parts.selection.type = "checkbox";
+      parts.selection.addEventListener("change", () => {
+        if (busy || reading || !parts.selectionId) return;
+        if (parts.selection.checked && !selectedContacts.has(parts.selectionId) && selectedContacts.size >= 500) {
+          notice("最多选择 500 位达人。", true); renderSelection(); return;
+        }
+        if (parts.selection.checked) selectedContacts.set(parts.selectionId, true);
+        else selectedContacts.delete(parts.selectionId);
+        renderSelection();
+      });
+      parts.selectionCell.append(parts.selection); row.append(parts.selectionCell);
+    }
     row.append(handleCell, person, actions);
     return parts;
   }
@@ -166,6 +205,10 @@
       const parts = rows.get(key);
       if (el("rows").children[index] !== parts.row) el("rows").insertBefore(parts.row, el("rows").children[index] || null);
       if (item.kind === "import") { renderImportRow(item, parts); continue; }
+      if (parts.selection) {
+        parts.selectionId = selectableContact(item);
+        parts.selection.setAttribute("aria-label", `选择 ${item.display_name || "此达人"}`);
+      }
       parts.name.textContent = item.display_name || "—";
       if (item.profile_url) parts.name.href = item.profile_url;
       else parts.name.removeAttribute("href");
@@ -209,6 +252,7 @@
     el("page-label").textContent = `共 ${data.total_count || 0} ${tab === "candidates" ? "条" : "人"} · 第 ${page} / ${Math.max(1, data.total_pages || 0)} 页`;
     el("previous").disabled = busy || page <= 1; el("next").disabled = busy || page >= (data.total_pages || 1);
     renderImports();
+    renderSelection();
   }
   async function refresh(automatic = false) {
     if (automatic && (reading || busy || document.hidden || [...rows.values()].some(row => row.dirty) || el("import-dialog").open)) return;
@@ -217,6 +261,7 @@
       return;
     }
     const token = ++version; reading = true;
+    renderSelection();
     const params = new URLSearchParams({tab, q: query, page: String(page)});
     if (selectedCM()) params.set("cm_id", selectedCM());
     history.replaceState(null, "", `/creators?${params}`);
@@ -226,6 +271,7 @@
     } catch (error) { if (token === version) notice(error.message, true); }
     finally {
       reading = false;
+      renderSelection();
       if (refreshQueued) { refreshQueued = false; void refresh(); }
     }
   }
@@ -372,7 +418,10 @@
       list(conclusion, evidence.conflicts, "text-danger");
     } catch (error) { if (token === evidenceVersion) body.textContent = error.message; }
   }
-  for (const key of ["mine", "candidates", "unassigned"]) el(key).addEventListener("click", () => { tab = key; page = 1; clearRows(); refresh(); });
+  for (const key of ["mine", "candidates", "unassigned"]) el(key).addEventListener("click", () => {
+    if (tab === key) return;
+    selectedContacts.clear(); tab = key; page = 1; clearRows(); renderSelection(); refresh();
+  });
   el("search").addEventListener("submit", event => { event.preventDefault(); query = el("query").value.trim(); page = 1; clearRows(); refresh(); });
   el("refresh").addEventListener("click", () => refresh());
   el("previous").addEventListener("click", () => { page--; clearRows(); refresh(); });
@@ -390,12 +439,36 @@
   });
   el("import-check").addEventListener("click", checkImport);
   el("import-confirm").addEventListener("click", startImport);
+  el("select-page")?.addEventListener("change", () => {
+    if (busy || reading) return;
+    const ids = (data.items || []).map(selectableContact).filter(Boolean);
+    if (el("select-page").checked) {
+      if (selectedContacts.size + ids.filter(id => !selectedContacts.has(id)).length > 500) {
+        notice("最多选择 500 位达人。", true); renderSelection(); return;
+      }
+      for (const id of ids) selectedContacts.set(id, true);
+    } else for (const id of ids) selectedContacts.delete(id);
+    renderSelection();
+  });
+  el("selection-clear")?.addEventListener("click", () => { selectedContacts.clear(); notice(""); renderSelection(); });
+  el("selection-broadcast")?.addEventListener("click", () => {
+    if (busy || reading || !data.can_view_unassigned || !selectedContacts.size) return;
+    const cm = tab === "unassigned" ? "all" : selectedCM();
+    if (!uuid.test(app.dataset.actor || "") || (cm !== "all" && !uuid.test(cm))) return notice("当前账号或负责人不可用，请刷新。", true);
+    try {
+      sessionStorage.setItem("ttmedia.broadcast.selection", JSON.stringify({
+        actor_id: app.dataset.actor, cm_id: cm, contact_ids: [...selectedContacts.keys()], created_at: Date.now(),
+      }));
+      location.assign("/creators/broadcast");
+    } catch { notice("无法带入名单，请允许浏览器存储后重试。", true); }
+  });
   if (data.can_select_cm) {
     if (data.cms?.length) {
       el("cm").replaceChildren(...data.cms.map(cm => { const option = node("option", cm.name); option.value = cm.id; return option; }));
       el("cm").value = data.selected_cm_id;
     }
     el("cm").addEventListener("change", () => {
+      selectedContacts.clear();
       tab = "mine";
       data = {...data, items: [], import_batches: [], page: 1, total_count: 0, total_pages: 0};
       page = 1; clearRows(); render(); refresh();

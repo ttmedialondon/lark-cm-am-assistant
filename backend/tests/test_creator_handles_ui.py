@@ -43,6 +43,7 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
              "member_count": None, "membership_note": creator_broadcast.MEMBERSHIP_NOTE}
     changed = {"routes": False, "role": True}
     reads = []
+    saved_lists = {}
 
     class Rows:
         def __init__(self, values):
@@ -57,6 +58,36 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
             return nullcontext()
         def execute(self, sql, params=()):
             reads.append(sql)
+            if "creator_broadcast_lists" in sql:
+                if sql.startswith("INSERT"):
+                    name, notes, cm, purpose, mention, targets, snapshot, owner = params
+                    item = {"id": uuid4(), "name": name, "notes": notes, "cm_id": cm,
+                            "purpose": purpose, "mention": mention, "targets": targets.obj,
+                            "snapshot": snapshot.obj, "owner_authorization_id": owner, "revision": 1,
+                            "deleted_at": None}
+                    saved_lists[str(item["id"])] = item
+                    return Rows([dict(item)])
+                if sql.startswith("UPDATE"):
+                    item = saved_lists.get(str(params[-3]))
+                    if (not item or str(item["owner_authorization_id"]) != str(params[-2])
+                            or item["revision"] != params[-1] or item["deleted_at"]):
+                        return Rows([])
+                    if "SET deleted_at" in sql:
+                        item["deleted_at"] = True
+                    elif "cm_id=%s" in sql:
+                        name, notes, cm, purpose, mention, targets, snapshot = params[:7]
+                        item.update(name=name, notes=notes, cm_id=cm, purpose=purpose, mention=mention,
+                                    targets=targets.obj, snapshot=snapshot.obj)
+                    else:
+                        item.update(name=params[0], notes=params[1])
+                    item["revision"] += 1
+                    return Rows([dict(item)])
+                if "WHERE id=%s" in sql:
+                    item = saved_lists.get(str(params[0]))
+                    owned = item and str(item["owner_authorization_id"]) == str(params[1]) and not item["deleted_at"]
+                    return Rows([dict(item)] if owned else [])
+                return Rows([dict(item) for item in saved_lists.values()
+                             if str(item["owner_authorization_id"]) == str(params[0]) and not item["deleted_at"]])
             if sql == "SET TRANSACTION READ ONLY":
                 return Rows([])
             if "JOIN admin_roles" in sql:
@@ -73,7 +104,8 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
     monkeypatch.setattr(creator_broadcast, "_people", lambda _conn, cm, ids=None: [
         person for person in people if (ids is None or person["id"] in ids) and (cm is None or person["id"] == p1)
     ])
-    monkeypatch.setattr(creator_broadcast, "_groups", lambda _conn, ids, _cm, purpose: [dict(group, purpose=purpose)]
+    monkeypatch.setattr(creator_broadcast, "_groups", lambda _conn, ids, _cm, purpose: [dict(group, purpose=purpose,
+                        members=[contact for contact in group["members"] if contact in ids])]
                         if ids and not changed["routes"] else [])
     response = client.get("/creators/broadcast")
     assert response.status_code == 200
@@ -113,9 +145,59 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
     assert client.post(url, content=b"{", headers=json_headers).status_code == 400
     assert client.post("/creators/broadcast/send", json=preview, headers=headers).status_code == 404
     assert any(sql == "SET TRANSACTION READ ONLY" for sql in reads)
+    changed["routes"] = False
+    preview.update(cm_id="all", purpose="support")
+    resolve_url = "/creators/broadcast/resolve"
+    resolved = client.post(resolve_url, json={"cm_id": "all", "purpose": "support",
+                                             "contact_ids": [p1, p2, p1]}, headers=headers).json()
+    assert len(resolved["entries"]) == 2 and resolved["duplicate_inputs"] == 1
+    for scope in (None, "", "bad-uuid"):
+        denied_scope = client.post(resolve_url, json={"cm_id": scope, "purpose": "support", "contact_ids": [p1]},
+                                   headers=headers)
+        assert denied_scope.status_code == 400
+    lists_url = "/creators/broadcast/lists/"
+    fields = {"name": "Example static list", "notes": "Example", "cm_id": "all", "purpose": "support",
+              "mention": True, "selections": preview["selections"], "message": "must not be saved"}
+    assert client.post(lists_url + "save", json=fields).status_code == 400
+    for invalid in (dict(fields, name="bad\x00name"), dict(fields, notes="bad\x00notes")):
+        assert client.post(lists_url + "save", json=invalid, headers=headers).status_code == 400
+    created = client.post(lists_url + "save", json=fields, headers=headers)
+    assert created.status_code == 200
+    item = created.json()["list"]
+    stored = saved_lists[item["id"]]
+    assert len(stored["targets"]) == 2 and "message" not in stored["snapshot"]
+    assert item["target_count"] == 2
+    loaded = client.post(lists_url + "load", json={"id": item["id"]}, headers=headers).json()
+    assert loaded["issues"] == [] and len(loaded["routes"]) == 2
+    changed["routes"] = True
+    stale = client.post(lists_url + "load", json={"id": item["id"]}, headers=headers).json()
+    assert len(stale["issues"]) == 2 and all(not route["chat_id"] for route in stale["routes"])
+    assert all(not entry["selected"] for entry in stale["entries"])
+    metadata = dict(fields, id=item["id"], revision=1, metadata_only=True, name="Renamed", cm_id="invalid",
+                    selections=[], mention="invalid", purpose="invalid")
+    renamed = client.post(lists_url + "save", json=metadata, headers=headers)
+    assert renamed.status_code == 200 and renamed.json()["list"]["revision"] == 2
+    assert stored["purpose"] == "support" and len(stored["targets"]) == 2
+    assert client.post(lists_url + "save", json=metadata, headers=headers).status_code == 400
+    invalid_update = client.post(lists_url + "save", json=dict(fields, id=item["id"], revision=2), headers=headers)
+    assert invalid_update.status_code == 400
+    changed["routes"] = False
+    updated = client.post(lists_url + "save", json=dict(fields, id=item["id"], revision=2,
+                           selections=[{"contact_id": p1, "chat_id": group["id"]}]), headers=headers)
+    assert updated.status_code == 200 and updated.json()["list"]["target_count"] == 1, updated.text
+    stored["owner_authorization_id"] = other_cm
+    for action in ("load", "delete", "save"):
+        foreign = client.post(lists_url + action, json=dict(fields, id=item["id"], revision=3), headers=headers)
+        assert foreign.status_code == 404
+    stored["owner_authorization_id"] = actor["id"]
+    assert client.post(lists_url + "delete", json={"id": item["id"], "revision": 2}, headers=headers).status_code == 400
+    deleted = client.post(lists_url + "delete", json={"id": item["id"], "revision": 3}, headers=headers)
+    assert deleted.status_code == 200 and deleted.json()["lists"] == [] and stored["deleted_at"]
+    assert client.post(lists_url + "load", json={"id": item["id"]}, headers=headers).status_code == 404
     changed["role"] = False
     assert client.get("/creators/broadcast").status_code == 403
     assert client.post(url, json=request, headers=headers).status_code == 403
+    assert client.post(lists_url + "save", json=fields, headers=headers).status_code == 403
     ordinary, _ = browser(monkeypatch)
     assert ordinary.get("/creators/broadcast").status_code == 403
     revoked, _ = browser(monkeypatch, owner=True, active=False)

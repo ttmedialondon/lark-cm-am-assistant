@@ -58,8 +58,12 @@ def create_router(*, current_authorization, render_template, csrf_token):
 
     @router.post("/broadcast/match")
     @router.post("/broadcast/preview")
+    @router.post("/broadcast/resolve")
+    @router.post("/broadcast/lists/save")
+    @router.post("/broadcast/lists/load")
+    @router.post("/broadcast/lists/delete")
     async def broadcast_read(request: Request):
-        """Bounded, CSRF-protected reads. There is deliberately no send endpoint."""
+        """Bounded, session-scoped routing and personal lists; never sends."""
         try:
             auth = actor(await run_in_threadpool(current_authorization, request))
             if not _csrf_matches({"csrf_token": request.headers.get("X-CSRF-Token", "")}, csrf_token(auth)):
@@ -78,8 +82,22 @@ def create_router(*, current_authorization, render_template, csrf_token):
             if not isinstance(fields, dict):
                 raise ValueError("请求格式无效。")
             args = (auth["id"], fields.get("cm_id", "all"), fields.get("purpose", "support"))
-            if request.url.path.endswith("/match"):
+            action = request.url.path.rsplit("/", 1)[-1]
+            if action == "match":
                 result = await run_in_threadpool(creator_broadcast.match, args[0], args[1], fields.get("raw"), args[2])
+            elif action == "resolve":
+                result = await run_in_threadpool(
+                    creator_broadcast.resolve, *args, fields.get("contact_ids"),
+                    fields.get("selections"),
+                )
+            elif action == "save":
+                result = await run_in_threadpool(creator_broadcast.list_save, auth["id"], fields)
+            elif action == "load":
+                result = await run_in_threadpool(creator_broadcast.list_load, auth["id"], fields.get("id"))
+            elif action == "delete":
+                result = await run_in_threadpool(
+                    creator_broadcast.list_delete, auth["id"], fields.get("id"), fields.get("revision"),
+                )
             else:
                 result = await run_in_threadpool(
                     creator_broadcast.preview, *args,

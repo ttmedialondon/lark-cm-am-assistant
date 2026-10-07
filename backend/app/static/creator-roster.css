@@ -4,3 +4,24 @@
 .creator-lark-link { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; margin-left: 2px; align-self: flex-start; border-radius: 4px; text-decoration: none; flex-shrink: 0; }
 .creator-lark-link:hover { background: var(--tblr-bg-surface-secondary, #f3f4f6); }
 .creator-lark-link[hidden] { display: none; }
+#creators-app .creator-roster-card { border-color: #dce3eb; }
+#creators-app .creator-roster-card .card-header { background: #f8fafc; }
+#creators-app .creator-selection-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 12px 20px; background: #eef4fb; border-bottom: 1px solid #dce3eb; color: #334155; }
+#creators-app .creator-selection-bar[hidden] { display: none; }
+#creators-app .creator-selection-cell { width: 48px; min-width: 48px; text-align: center; }
+#creators-app .creator-selection-cell[hidden] { display: none; }
+#creators-app .creator-roster-table td { white-space: normal; overflow-wrap: anywhere; }
+@media (max-width: 575px) {
+  #creators-app .creator-selection-bar { gap: 8px; padding: 12px; }
+  #creators-app .creator-selection-bar .btn-list { width: 100%; margin-left: 0 !important; }
+  #creators-app .creator-selection-bar .btn { flex: 1; }
+  #creators-app .creator-selection-hint { font-size: 11px; }
+  #creators-app #creators-search { width: 100%; }
+  #creators-app .creator-roster-table thead { display: none; }
+  #creators-app .creator-roster-table tbody, #creators-app .creator-roster-table tr { display: block; }
+  #creators-app .creator-roster-table tr { position: relative; padding: 12px; border-bottom: 1px solid #e2e8f0; }
+  #creators-app .creator-roster-table tr:has(.creator-selection-cell:not([hidden])) { padding-left: 48px; }
+  #creators-app .creator-roster-table td { display: block; border: 0; padding: 5px 0; min-width: 0 !important; }
+  #creators-app .creator-roster-table td.creator-selection-cell { position: absolute; left: 12px; top: 15px; width: auto; min-width: 0; }
+  .creator-evidence { padding: 16px; }
+}
