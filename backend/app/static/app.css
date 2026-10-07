@@ -16,6 +16,7 @@ body { min-height: 100vh; }
 
 .business-page { min-height: 100vh; color: var(--tblr-body-color); background: var(--tblr-bg-surface-secondary, #f6f8fb); }
 .business-page .container-xl { max-width: 1280px; }
+.business-page .page-body { margin-block: 0; }
 .business-page .page-body, .business-page .oh-main { padding-top: 32px; padding-bottom: 40px; }
 .business-page .page-title { font-size: 26px; font-weight: 600; letter-spacing: -.02em; }
 .business-page .card { border-radius: 12px; box-shadow: none; }
