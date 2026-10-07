@@ -302,6 +302,10 @@ def list_save(actor_id, fields):
             raise ValueError("名单名称须为 1–80 字符。")
         if not isinstance(notes, str) or "\x00" in notes or len(notes) > 500:
             raise ValueError("名单备注不能超过 500 字符。")
+        try:
+            (name + notes).encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("名单名称或备注包含无效字符。") from None
         if metadata_only:
             row = conn.execute("""UPDATE creator_broadcast_lists
                 SET name=%s,notes=%s,revision=revision+1,updated_at=NOW()

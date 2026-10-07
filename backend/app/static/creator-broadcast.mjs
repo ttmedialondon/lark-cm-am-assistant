@@ -187,7 +187,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   }
   async function match(preserve = false) {
     if (busy) return;
-    const old = preserve ? new Map(entries.map(entry => [entry.key,{id:entry.person?.id,selected:entry.selected}])) : new Map();
+    const old = preserve || fixedIds ? new Map(entries.map(entry => [entry.key,{id:entry.person?.id,selected:entry.selected}])) : new Map();
     lock(true); notice('正在匹配…');
     try {
       const result = await api(fixedIds ? 'resolve' : 'match',
@@ -195,7 +195,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       applyTargets(result);
       for (const entry of entries) {
         const saved = old.get(entry.key);
-        if (saved) { entry.selected = saved.selected; if (saved.id) entry.person = entry.candidates.find(person => person.id === saved.id) || entry.person; }
+        if (saved) { entry.selected = !entry.reason && saved.selected; if (saved.id) entry.person = entry.candidates.find(person => person.id === saved.id) || entry.person; }
       }
       notice(result.duplicate_inputs ? `已合并 ${result.duplicate_inputs} 项重复输入。` : '匹配完成。');
     } catch (error) { dirty = true; notice(error.message || '匹配失败，请稍后重试。'); }
