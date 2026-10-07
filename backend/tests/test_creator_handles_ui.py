@@ -1,6 +1,7 @@
 """Frontend CM review stays separate from owner-only scan management."""
 
 import asyncio
+import json
 from contextlib import nullcontext
 from pathlib import Path
 from uuid import uuid4
@@ -159,9 +160,11 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
     fields = {"name": "Example static list", "notes": "Example", "cm_id": "all", "purpose": "support",
               "mention": True, "selections": preview["selections"], "message": "must not be saved"}
     assert client.post(lists_url + "save", json=fields).status_code == 400
-    for invalid in (dict(fields, name="bad\x00name"), dict(fields, notes="bad\x00notes"),
-                    dict(fields, name="bad\ud800name")):
+    for invalid in (dict(fields, name="bad\x00name"), dict(fields, notes="bad\x00notes")):
         assert client.post(lists_url + "save", json=invalid, headers=headers).status_code == 400
+    invalid_unicode = json.dumps(dict(fields, name="bad\ud800name"))
+    assert client.post(lists_url + "save", content=invalid_unicode,
+                       headers=dict(headers, **{"Content-Type": "application/json"})).status_code == 400
     created = client.post(lists_url + "save", json=fields, headers=headers)
     assert created.status_code == 200
     item = created.json()["list"]
