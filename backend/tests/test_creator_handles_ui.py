@@ -1,6 +1,7 @@
 """Frontend CM review stays separate from owner-only scan management."""
 
 import asyncio
+from contextlib import nullcontext
 from pathlib import Path
 from uuid import uuid4
 
@@ -10,7 +11,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from app import admin_permissions, creator_handles_routes, creator_imports
+from app import admin_permissions, creator_broadcast, creator_handles_routes, creator_imports
 
 
 def browser(monkeypatch, *, owner=False, active=True):
@@ -33,14 +34,88 @@ def browser(monkeypatch, *, owner=False, active=True):
     return TestClient(app), actor
 
 
-def test_broadcast_prototype_is_owner_only_read_only_and_never_exposes_a_send_action(monkeypatch):
-    client, _actor = browser(monkeypatch, owner=True)
+def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monkeypatch):
+    client, actor = browser(monkeypatch, owner=True)
+    p1, p2, other_cm = map(str, (uuid4(), uuid4(), uuid4()))
+    people = [{"id": p1, "name": "Example One", "handles": ["example_one", "example_backup"]},
+              {"id": p2, "name": "Example Two", "handles": ["example_two"]}]
+    group = {"id": "oc_example", "name": "Example group", "purpose": "support", "members": [p1, p2],
+             "member_count": None, "membership_note": creator_broadcast.MEMBERSHIP_NOTE}
+    changed = {"routes": False, "role": True}
+    reads = []
+
+    class Rows:
+        def __init__(self, values):
+            self.values = values
+        def fetchone(self):
+            return self.values[0] if self.values else None
+        def fetchall(self):
+            return self.values
+
+    class Conn:
+        def transaction(self):
+            return nullcontext()
+        def execute(self, sql, params=()):
+            reads.append(sql)
+            if sql == "SET TRANSACTION READ ONLY":
+                return Rows([])
+            if "JOIN admin_roles" in sql:
+                return Rows([{"owner": True}] if changed["role"] and str(params[0]) == str(actor["id"]) else [])
+            if "SELECT id,display_name" in sql:
+                return Rows([{"id": actor["id"], "display_name": "CM"}])
+            if "SELECT 1 FROM authorizations" in sql:
+                return Rows([{"active": True}])
+            if "SELECT id,open_id,display_name" in sql:
+                return Rows([{"id": params[0], "open_id": "ou_example", "display_name": "CM"}])
+            raise AssertionError(f"Unexpected query: {sql}")
+
+    monkeypatch.setattr(creator_broadcast, "connection", lambda: nullcontext(Conn()))
+    monkeypatch.setattr(creator_broadcast, "_people", lambda _conn, cm, ids=None: [
+        person for person in people if (ids is None or person["id"] in ids) and (cm is None or person["id"] == p1)
+    ])
+    monkeypatch.setattr(creator_broadcast, "_groups", lambda _conn, ids, _cm, purpose: [dict(group, purpose=purpose)]
+                        if ids and not changed["routes"] else [])
     response = client.get("/creators/broadcast")
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store, max-age=0"
-    assert "交互原型 · 示例数据 · 不会发送" in response.text
-    assert "模拟发送" in response.text and "creator-broadcast.mjs" in response.text
+    assert "真实数据 · 仅预览" in response.text
+    assert "发送（未开通）" in response.text and "creator-broadcast.mjs" in response.text
+    for label in creator_broadcast.PURPOSES.values():
+        assert label in response.text
     assert client.post("/creators/broadcast").status_code == 405
+    headers = {"X-CSRF-Token": "csrf"}
+    request = {"cm_id": "all", "purpose": "support", "raw": "@example_one\n@example_backup\n@example_two"}
+    url = "/creators/broadcast/match"
+    assert client.post(url, json=request).status_code == 400
+    result = client.post(url, json=request, headers=headers)
+    assert result.status_code == 200 and len(result.json()["entries"]) == 3
+    assert result.headers["cache-control"] == "no-store, max-age=0"
+    assert result.json()["can_send"] is False
+    preview = {"cm_id": "all", "purpose": "support", "message": "Example\nhttps://example.com", "mention": True,
+               "selections": [{"contact_id": p1, "chat_id": group["id"]},
+                              {"contact_id": p1, "chat_id": group["id"]},
+                              {"contact_id": p2, "chat_id": group["id"]}]}
+    for purpose in creator_broadcast.PURPOSES:
+        preview["purpose"] = purpose
+        checked = client.post("/creators/broadcast/preview", json=preview, headers=headers).json()
+        assert checked["issues"] == [] and len(checked["groups"]) == 1
+        assert len(checked["groups"][0]["mentions"]) == 2 and checked["can_send"] is False
+    preview.update(cm_id=other_cm, actor_id=other_cm)
+    scoped = client.post("/creators/broadcast/preview", json=preview, headers=headers).json()
+    assert len(scoped["issues"]) == 1 and len(scoped["groups"][0]["mentions"]) == 1
+    changed["routes"] = True
+    assert client.post("/creators/broadcast/preview", json=preview, headers=headers).json()["groups"] == []
+    for invalid in (dict(request, purpose="unknown"), dict(request, raw=123), dict(request, raw="name\n" * 501)):
+        assert client.post(url, json=invalid, headers=headers).status_code == 400
+    json_headers = dict(headers, **{"Content-Type": "application/json"})
+    assert client.post(url, content=b"x" * 300001, headers=json_headers).status_code == 400
+    assert client.post(url, content=iter([b"x" * 300001]), headers=json_headers).status_code == 400
+    assert client.post(url, content=b"{", headers=json_headers).status_code == 400
+    assert client.post("/creators/broadcast/send", json=preview, headers=headers).status_code == 404
+    assert any(sql == "SET TRANSACTION READ ONLY" for sql in reads)
+    changed["role"] = False
+    assert client.get("/creators/broadcast").status_code == 403
+    assert client.post(url, json=request, headers=headers).status_code == 403
     ordinary, _ = browser(monkeypatch)
     assert ordinary.get("/creators/broadcast").status_code == 403
     revoked, _ = browser(monkeypatch, owner=True, active=False)

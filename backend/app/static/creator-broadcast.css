@@ -9,6 +9,12 @@
 #broadcast-app .broadcast-route { min-width: 170px; }
 @media (max-width: 575px) {
   #broadcast-app .broadcast-dialog { padding: 16px; }
+  #broadcast-app .row { margin-inline: 0; }
+  #broadcast-app .row > section { padding-inline: 0; }
   #broadcast-app .card-table th, #broadcast-app .card-table td { padding-inline: 10px; }
-  #broadcast-app .broadcast-identity { min-width: 120px; }
+  #broadcast-app .broadcast-match-table thead { display: none; }
+  #broadcast-app .broadcast-match-table tbody, #broadcast-app .broadcast-match-table tr { display: block; }
+  #broadcast-app .broadcast-match-table tr { position: relative; padding: 12px 12px 12px 44px; border-bottom: 1px solid var(--tblr-border-color); }
+  #broadcast-app .broadcast-match-table td { display: block; border: 0; padding: 3px 0; min-width: 0; }
+  #broadcast-app .broadcast-match-table td:first-child { position: absolute; left: 12px; top: 15px; }
 }

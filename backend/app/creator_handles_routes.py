@@ -1,5 +1,6 @@
 """Session-scoped creator candidates; CM review is a frontend permission, not an admin grant."""
 
+import json
 from urllib.parse import unquote
 from uuid import UUID
 
@@ -8,7 +9,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import admin_permissions, creator_imports, creator_roster
+from . import creator_broadcast, creator_imports, creator_roster
 from .http_helpers import (
     csrf_matches as _csrf_matches,
 )
@@ -42,16 +43,50 @@ def create_router(*, current_authorization, render_template, csrf_token):
         return auth, form
 
     @router.get("/broadcast")
-    def broadcast_prototype(request: Request):
+    def broadcast_page(request: Request):
         auth = current_authorization(request)
         if not auth:
             return secure(RedirectResponse("/", status_code=303))
         try:
             auth = actor(auth)
-            if not admin_permissions.access_for(auth["id"])["is_owner"]:
-                raise PermissionError("群发原型目前仅供项目负责人检查。")
-            return secure(render_template(request, "creator_broadcast.html", {"authorization": auth}))
+            data = creator_broadcast.page_data(auth["id"])
+            return secure(render_template(request, "creator_broadcast.html", {
+                "authorization": auth, "broadcast_data": data, "csrf_token": csrf_token(auth),
+            }))
         except PermissionError as exc:
+            return error(exc)
+
+    @router.post("/broadcast/match")
+    @router.post("/broadcast/preview")
+    async def broadcast_read(request: Request):
+        """Bounded, CSRF-protected reads. There is deliberately no send endpoint."""
+        try:
+            auth = actor(await run_in_threadpool(current_authorization, request))
+            if not _csrf_matches({"csrf_token": request.headers.get("X-CSRF-Token", "")}, csrf_token(auth)):
+                raise ValueError("请求校验失败，请刷新页面后重试。")
+            if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+                raise ValueError("请使用 JSON 提交名单。")
+            content = bytearray()
+            async for chunk in request.stream():
+                content.extend(chunk[:300001 - len(content)])
+                if len(content) > 300000:
+                    raise ValueError("请求过大，请拆分名单。")
+            try:
+                fields = json.loads(content)
+            except (ValueError, UnicodeError, RecursionError):
+                raise ValueError("请求格式无效。") from None
+            if not isinstance(fields, dict):
+                raise ValueError("请求格式无效。")
+            args = (auth["id"], fields.get("cm_id", "all"), fields.get("purpose", "support"))
+            if request.url.path.endswith("/match"):
+                result = await run_in_threadpool(creator_broadcast.match, args[0], args[1], fields.get("raw"), args[2])
+            else:
+                result = await run_in_threadpool(
+                    creator_broadcast.preview, *args,
+                    fields.get("selections"), fields.get("message"), fields.get("mention"),
+                )
+            return payload(result)
+        except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
 
     @router.get("")
