@@ -20,6 +20,24 @@ from .lark_api import LarkApiError, LarkClient
 PURPOSES = {key: value for key, value in GROUP_PURPOSES.items() if key != "unknown"}
 MEMBERSHIP_NOTE = "来自当前库快照，发送前需实测核验成员及 @ 权限"
 BLOCKED_REASON = "当前仅预览，发送功能尚未启用"
+SEND_SCOPES = ("im:message", "im:message.send_as_user")
+
+
+class BroadcastAuthorizationRequired(PermissionError):
+    def __init__(self, account_id):
+        super().__init__("请先完成本人群发授权。")
+        self.account_id = str(account_id)
+
+
+def _require_broadcast_grant(conn, actor_id):
+    actor = creator_access.parse_id(actor_id)
+    creator_access.require_owner(conn, actor)
+    row = conn.execute("""SELECT id,status,body_consent_at,scopes FROM authorizations WHERE id=%s""",
+                       (actor,)).fetchone()
+    if not row or row["status"] != "active" or not row["body_consent_at"]:
+        raise PermissionError("本人聊天授权已失效，请先完成接入。")
+    if not (set(get_settings().oauth_scopes) | set(SEND_SCOPES)).issubset(row["scopes"] or ()):
+        raise BroadcastAuthorizationRequired(actor)
 
 
 def _normalized(value):
@@ -27,7 +45,7 @@ def _normalized(value):
 
 
 def _scope(conn, actor_id, cm_id):
-    creator_access.require_owner(conn, creator_access.parse_id(actor_id))
+    _require_broadcast_grant(conn, actor_id)
     if cm_id == "all":
         return None
     cm = creator_access.parse_id(cm_id)
@@ -254,7 +272,7 @@ def permission_check(actor_id, cm_id):
         result.update(status="needs_authorization", message="该账号尚未完成有效的聊天授权，请本人先完成接入。")
         return result
     settings = get_settings()
-    required = set(settings.oauth_scopes) | {"im:message", "im:message.send_as_user"}
+    required = set(settings.oauth_scopes) | set(SEND_SCOPES)
     cipher = TokenCipher(settings.token_encryption_key)
     checked = row
     result["message"] = "暂时无法核验授权，请稍后重试。"
@@ -348,7 +366,7 @@ def _targets(values, *, one_per_contact=False):
 
 
 def _resolve_scope(conn, actor_id, cm_id):
-    creator_access.require_owner(conn, creator_access.parse_id(actor_id))
+    _require_broadcast_grant(conn, actor_id)
     if cm_id == "all":
         return None, ""
     cm = creator_access.parse_id(cm_id)

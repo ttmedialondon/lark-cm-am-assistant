@@ -255,8 +255,12 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
         client.cookies.clear()
         response = client.get(
             "/auth/lark/callback", params={"state": value, "code": code},
-            headers={"cookie": f"{main.OAUTH_STATE_COOKIE}={value}"}, follow_redirects=False,
+            headers={"cookie": f"{main.OAUTH_STATE_COOKIE}={value}" + (
+                f"; {main.SEND_OAUTH_ATTEMPT_COOKIE}={actor}" if send else "")}, follow_redirects=False,
         )
+        if response.status_code != 303 or not send:
+            assert not any(header.startswith(main.SEND_OAUTH_ATTEMPT_COOKIE + "=")
+                           for header in response.headers.get_list("set-cookie"))
         assert not pg.execute("SELECT 1 FROM oauth_states WHERE state_hash=%s", (main._sha256(value),)).fetchone()
         return response
 
@@ -275,13 +279,15 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
                               {"id": actor, "status": "active", "body_consent_at": None}):
             current = authorization
             assert client.get("/auth/lark/start?send=1", follow_redirects=False).status_code == 403
+            assert client.get("/auth/lark/start?send=1&auto=1", follow_redirects=False,
+                              headers={"cookie": f"{main.SEND_OAUTH_ATTEMPT_COOKIE}={actor}"}).status_code == 403
         assert not pg.execute("SELECT 1 FROM oauth_states").fetchone()
         for status in ("active", "attention_required"):
             pg.execute("UPDATE authorizations SET status=%s WHERE id=%s", (status, actor))
             current = pg.execute("SELECT * FROM authorizations WHERE id=%s", (actor,)).fetchone()
             before_start = snapshot()
             for account_id in (str(uuid4()), "", "not-a-uuid"):
-                assert client.get("/auth/lark/start", params={"send": "1", "account_id": account_id},
+                assert client.get("/auth/lark/start", params={"send": "1", "account_id": account_id, "auto": "1"},
                                   follow_redirects=False).status_code == 403
                 assert not pg.execute("SELECT 1 FROM oauth_states").fetchone()
             for params, requested, target in (
@@ -297,6 +303,27 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
                 pg.execute("DELETE FROM oauth_states")
                 assert settings.oauth_scopes == scopes and snapshot() == before_start
         pg.execute("UPDATE authorizations SET status=%s WHERE id=%s", (initial_status, actor))
+        assert snapshot() == original
+        current = pg.execute("SELECT * FROM authorizations WHERE id=%s", (actor,)).fetchone()
+        client.cookies.clear()
+        automatic = {"send": "1", "account_id": str(actor), "auto": "1"}
+        first = client.get("/auth/lark/start", params=automatic, follow_redirects=False)
+        assert first.status_code == 303 and first.cookies[main.SEND_OAUTH_ATTEMPT_COOKIE] == str(actor)
+        marker = next(header for header in first.headers.get_list("set-cookie")
+                      if header.startswith(main.SEND_OAUTH_ATTEMPT_COOKIE + "="))
+        assert all(attribute in marker for attribute in ("Max-Age=600", "Secure", "HttpOnly", "SameSite=lax", "Path=/"))
+        started = pg.execute("SELECT * FROM oauth_states").fetchall()
+        blocked = client.get("/auth/lark/start", params=automatic, follow_redirects=False)
+        assert blocked.status_code == 409 and "授权未完成" in blocked.text
+        assert f'href="/auth/lark/start?send=1&amp;account_id={actor}"' in blocked.text
+        assert "auto=" not in blocked.text and pg.execute("SELECT * FROM oauth_states").fetchall() == started
+        assert client.get("/auth/lark/start", params={"send": "1", "account_id": str(actor)},
+                          follow_redirects=False).status_code == 303
+        ordinary_start = client.get("/auth/lark/start?auto=1", follow_redirects=False)
+        assert ordinary_start.status_code == 303
+        assert not any(header.startswith(main.SEND_OAUTH_ATTEMPT_COOKIE + "=")
+                       for header in ordinary_start.headers.get_list("set-cookie"))
+        pg.execute("DELETE FROM oauth_states")
         assert snapshot() == original
     overlap = state()
     for grant in ("missing", "partial"):
@@ -319,6 +346,10 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
     response = callback(state())
     destination = "/creators/broadcast" if send and owner else "/dashboard"
     assert response.status_code == 303 and response.headers["location"] == destination
+    if send:
+        cleared = next(header for header in response.headers.get_list("set-cookie")
+                       if header.startswith(main.SEND_OAUTH_ATTEMPT_COOKIE + "="))
+        assert all(attribute in cleared for attribute in ("Max-Age=0", "Secure", "HttpOnly", "SameSite=lax", "Path=/"))
     upgraded = snapshot()
     auth = upgraded["authorizations"][0]
     assert auth["id"] == actor and auth["open_id"] == "ou_upgrade" and auth["status"] == "active"
@@ -357,7 +388,10 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
         pg.execute("UPDATE authorizations SET status='active' WHERE id=%s", (actor,))
         assert snapshot() == upgraded
 
-    assert callback(state(fresh=True, upgraded=False), "ordinary").status_code == 303
+    ordinary_response = callback(state(fresh=True, upgraded=False), "ordinary")
+    assert ordinary_response.status_code == 303
+    assert not any(header.startswith(main.SEND_OAUTH_ATTEMPT_COOKIE + "=")
+                   for header in ordinary_response.headers.get_list("set-cookie"))
     ordinary = snapshot()
     assert ordinary["authorizations"][0]["id"] == actor and ordinary["admin_roles"] == original["admin_roles"]
     assert ordinary["authorizations"][0]["body_consent_at"] > auth["body_consent_at"]

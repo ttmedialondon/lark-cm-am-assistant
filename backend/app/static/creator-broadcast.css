@@ -7,6 +7,10 @@
 #broadcast-app .page-title { font-size: 27px; letter-spacing: -.02em; }
 #broadcast-app .broadcast-permissions { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 18px; border: 1px solid var(--tblr-border-color); border-radius: 12px; background: var(--tblr-bg-surface); }
 #broadcast-app .broadcast-permissions .btn-list { flex-shrink: 0; }
+#broadcast-app .broadcast-permissions [role="status"] { flex: 1; min-width: 0; }
+#broadcast-app .broadcast-account { width: 240px; flex-shrink: 0; }
+#broadcast-app .broadcast-workspace { padding: 0; margin: 0; border: 0; min-width: 0; }
+#broadcast-app #broadcast-workspace:disabled { opacity: .7; }
 #broadcast-app .broadcast-library { box-shadow: none; }
 #broadcast-app .broadcast-library .card-body { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
 #broadcast-app .broadcast-library-title, #broadcast-app .broadcast-section-title { display: flex; align-items: center; gap: 12px; }
@@ -55,6 +59,7 @@
   #broadcast-app .broadcast-library-controls { justify-content: flex-start; }
   #broadcast-app .broadcast-heading { align-items: flex-start; }
   #broadcast-app .broadcast-permissions { flex-direction: column; align-items: stretch; }
+  #broadcast-app .broadcast-account { width: 100%; }
   #broadcast-app .page-title { font-size: 24px; }
   #broadcast-app .broadcast-dialog { padding: 16px; }
   #broadcast-app .row { margin-inline: 0; }

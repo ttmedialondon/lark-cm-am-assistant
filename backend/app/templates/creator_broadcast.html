@@ -1,15 +1,17 @@
 {% extends "base.html" %}
 {% block title %}群发消息 · TT Media{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-broadcast.css?v=20261007-permission-check">{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-broadcast.css?v=20261007-permission-gate">{% endblock %}
 {% block body %}
 <div class="page" id="broadcast-app" data-csrf="{{ csrf_token }}" data-actor="{{ authorization.id }}">
   <header class="navbar navbar-expand-md"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media</a><div class="navbar-nav flex-row gap-3"><a class="nav-link" href="/creators">我的达人</a><span class="nav-link text-secondary">{{ authorization.display_name or 'CM/AM' }}</span></div></div></header>
   <main class="page-wrapper"><div class="page-body"><div class="container-xl">
     <div class="broadcast-heading mb-4"><h2 class="page-title">群发消息</h2><span class="badge bg-yellow-lt">仅预览 · 不会发送</span></div>
     <div class="broadcast-permissions mb-4" id="broadcast-permission-bar" aria-busy="true">
+      <div class="broadcast-account"><label class="form-label mb-1" id="broadcast-cm-label" for="broadcast-cm">达人范围</label><select class="form-select" id="broadcast-cm"><option value="all">全部已入库达人</option>{% for cm in broadcast_data.cms %}<option value="{{ cm.id }}">{{ cm.name }} 负责的达人</option>{% endfor %}</select></div>
       <div role="status" aria-live="polite"><span id="broadcast-permission-account">当前账号</span><span class="badge bg-secondary-lt ms-2" id="broadcast-permission-status">正在核对授权</span><div class="small text-secondary mt-1" id="broadcast-permission-message"></div></div>
-      <div class="btn-list"><a class="btn btn-sm btn-primary" id="broadcast-permission-authorize" target="_blank" rel="noopener" hidden>补充授权</a><button class="btn btn-sm btn-outline-primary" id="broadcast-permission-copy" type="button" hidden>复制本人授权链接</button><button class="btn btn-sm btn-ghost-secondary" id="broadcast-permission-retry" type="button" disabled>重新检查</button></div>
+      <div class="btn-list"><button class="btn btn-sm btn-outline-primary" id="broadcast-permission-copy" type="button" hidden>复制该账号授权链接</button><button class="btn btn-sm btn-ghost-secondary" id="broadcast-permission-retry" type="button" disabled>重新检查</button></div>
     </div>
+    <fieldset id="broadcast-workspace" class="broadcast-workspace" aria-label="群发编辑区" disabled>
     <section class="card broadcast-library mb-4" aria-labelledby="list-title"><div class="card-body">
       <div class="broadcast-library-title"><div><h3 class="card-title mb-1" id="list-title">我的名单</h3><div class="small text-secondary" id="broadcast-list-info"></div></div></div>
       <div class="broadcast-library-controls"><button class="btn btn-outline-secondary" id="broadcast-list-library" type="button">打开名单库</button><button class="btn btn-outline-primary" id="broadcast-list-current-update" type="button" hidden>更新当前名单</button><button class="btn btn-primary" id="broadcast-list-new" type="button">保存当前名单</button></div>
@@ -21,8 +23,6 @@
           <div class="btn-list broadcast-purposes mb-4" role="group" aria-label="群类型">
             {% for key, label in broadcast_data.purposes.items() %}<button class="btn {{ 'btn-primary' if key == 'support' else 'btn-outline-secondary' }}" type="button" data-purpose="{{ key }}" aria-pressed="{{ 'true' if key == 'support' else 'false' }}">{{ label }}</button>{% endfor %}
           </div>
-          <label class="form-label" id="broadcast-cm-label" for="broadcast-cm">达人范围</label>
-          <select class="form-select mb-3" id="broadcast-cm"><option value="all">全部已入库达人</option>{% for cm in broadcast_data.cms %}<option value="{{ cm.id }}">{{ cm.name }} 负责的达人</option>{% endfor %}</select>
           <div id="broadcast-people-input">
             <label class="form-label" for="broadcast-input">批量输入 handle 或名字</label>
             <textarea class="form-control" id="broadcast-input" rows="5" maxlength="65536" placeholder="每行一个 handle、名字或 TikTok 链接"></textarea>
@@ -52,8 +52,10 @@
         </div></div>
       </section>
     </div>
+    </fieldset>
     <noscript><div class="alert alert-warning mt-3">请开启 JavaScript 使用名单匹配。</div></noscript>
   </div></div></main>
+  <fieldset id="broadcast-editors" class="broadcast-workspace" aria-label="群发弹窗" disabled>
   <dialog class="broadcast-dialog" id="broadcast-library-dialog" aria-labelledby="broadcast-library-title">
     <div class="broadcast-heading mb-3"><h3 class="mb-0" id="broadcast-library-title">我的名单</h3><button class="btn btn-sm btn-outline-secondary" id="broadcast-library-close" type="button">关闭</button></div>
     <div class="broadcast-library-items" id="broadcast-library-items"></div>
@@ -89,7 +91,8 @@
     <p class="small text-secondary mt-3">正文对群内全体可见，@ 不限制可见范围。</p>
     <div class="d-flex align-items-center justify-content-between gap-3 mt-3"><span class="text-secondary small">仅预览，目标群发送能力尚未验收</span><button class="btn btn-primary" type="button" disabled>发送（未开通）</button></div>
   </dialog>
+  </fieldset>
 </div>
 <script id="broadcast-config" type="application/json">{{ broadcast_data | tojson }}</script>
-<script type="module" src="/static/creator-broadcast.mjs?v=20261007-permission-check"></script>
+<script type="module" src="/static/creator-broadcast.mjs?v=20261007-permission-gate"></script>
 {% endblock %}

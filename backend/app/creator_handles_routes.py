@@ -48,16 +48,17 @@ def create_router(*, current_authorization, render_template, csrf_token):
         if not auth:
             return secure(RedirectResponse("/", status_code=303))
         if auth["status"] == "attention_required" and auth.get("body_consent_at"):
-            return secure(render_template(request, "error.html", {
-                "title": "账号连接需要更新", "detail": "请使用本人 Lark 账号补充授权，已有数据和同步进度会保留。",
-                "return_url": f"/auth/lark/start?send=1&account_id={auth['id']}", "return_label": "更新本人授权",
-            }))
+            return secure(RedirectResponse(f"/auth/lark/start?send=1&account_id={auth['id']}&auto=1", status_code=303))
         try:
             auth = actor(auth)
             data = creator_broadcast.page_data(auth["id"])
             return secure(render_template(request, "creator_broadcast.html", {
                 "authorization": auth, "broadcast_data": data, "csrf_token": csrf_token(auth),
             }))
+        except creator_broadcast.BroadcastAuthorizationRequired as exc:
+            return secure(RedirectResponse(
+                f"/auth/lark/start?send=1&account_id={exc.account_id}&auto=1", status_code=303,
+            ))
         except PermissionError as exc:
             return error(exc)
 
@@ -75,8 +76,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
         """Bounded, session-scoped routing and personal lists; never sends."""
         try:
             current = await run_in_threadpool(current_authorization, request)
-            reconnect_self = (request.url.path == "/creators/broadcast/permissions" and current
-                              and current["status"] == "attention_required" and current.get("body_consent_at"))
+            reconnect_self = current and current["status"] == "attention_required" and current.get("body_consent_at")
             auth = current if reconnect_self else actor(current)
             if not _csrf_matches({"csrf_token": request.headers.get("X-CSRF-Token", "")}, csrf_token(auth)):
                 raise ValueError("请求校验失败，请刷新页面后重试。")
@@ -96,6 +96,11 @@ def create_router(*, current_authorization, render_template, csrf_token):
             args = (auth["id"], fields.get("cm_id", "all"), fields.get("purpose", "support"))
             action = request.url.path.rsplit("/", 1)[-1]
             if reconnect_self:
+                if action != "permissions":
+                    return payload({
+                        "error": "请先更新本人群发授权。",
+                        "authorization_url": f"/auth/lark/start?send=1&account_id={auth['id']}",
+                    }, 403)
                 return payload({
                     "status": "needs_authorization", "account_id": str(auth["id"]),
                     "account_name": auth.get("display_name") or "当前账号", "is_self": True, "is_sender": False,
@@ -134,6 +139,10 @@ def create_router(*, current_authorization, render_template, csrf_token):
                     fields.get("selections"), fields.get("message"), fields.get("mention"),
                 )
             return payload(result)
+        except creator_broadcast.BroadcastAuthorizationRequired as exc:
+            return payload({
+                "error": str(exc), "authorization_url": f"/auth/lark/start?send=1&account_id={exc.account_id}",
+            }, 403)
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
 

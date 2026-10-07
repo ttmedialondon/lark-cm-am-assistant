@@ -159,9 +159,13 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
     assert reconnect["account_id"] == str(actor["id"]) and not reconnect["is_sender"]
     assert reconnect["authorization_url"] == f"/auth/lark/start?send=1&account_id={actor['id']}"
     assert client.post(url, json={"cm_id": "all"}).status_code == 400
-    attention_page = client.get("/creators/broadcast")
-    assert attention_page.status_code == 200 and "账号连接需要更新" in attention_page.text
-    assert f"/auth/lark/start?send=1&amp;account_id={actor['id']}" in attention_page.text
+    attention_page = client.get("/creators/broadcast", follow_redirects=False)
+    assert attention_page.status_code == 303
+    assert attention_page.headers["location"] == f"/auth/lark/start?send=1&account_id={actor['id']}&auto=1"
+    blocked = client.post("/creators/broadcast/templates/save", json={"name": "Example", "body": "Example"},
+                          headers=headers)
+    assert blocked.status_code == 403
+    assert blocked.json()["authorization_url"] == f"/auth/lark/start?send=1&account_id={actor['id']}"
     actor["status"] = "active"
     state["change"] = "owner"
     assert client.post(url, json={"cm_id": "all"}, headers=headers).status_code == 403
@@ -173,12 +177,16 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
 
 def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monkeypatch):
     client, actor = browser(monkeypatch, owner=True)
+    baseline = ("offline_access", "im:chat:read", "im:message:readonly", "im:chat.members:read",
+                "contact:contact.base:readonly", "contact:user.base:readonly")
+    required = (*baseline, *creator_broadcast.SEND_SCOPES)
+    monkeypatch.setattr(creator_broadcast, "get_settings", lambda: SimpleNamespace(oauth_scopes=baseline))
     p1, p2, other_cm = map(str, (uuid4(), uuid4(), uuid4()))
     people = [{"id": p1, "name": "Example One", "handles": ["example_one", "example_backup"]},
               {"id": p2, "name": "Example Two", "handles": ["example_two"]}]
     group = {"id": "oc_example", "name": "Example group", "purpose": "support", "members": [p1, p2],
              "member_count": None, "membership_note": creator_broadcast.MEMBERSHIP_NOTE}
-    changed = {"routes": False, "role": True, "cm_active": True}
+    changed = {"routes": False, "role": True, "cm_active": True, "scopes": list(required), "consent": True}
     reads = []
     saved_lists = {}
     saved_templates = {}
@@ -254,6 +262,9 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
                 return Rows([])
             if "JOIN admin_roles" in sql:
                 return Rows([{"owner": True}] if changed["role"] and str(params[0]) == str(actor["id"]) else [])
+            if "SELECT id,status,body_consent_at,scopes" in sql:
+                return Rows([{"id": params[0], "status": "active", "body_consent_at": changed["consent"],
+                              "scopes": changed["scopes"] if str(params[0]) == str(actor["id"]) else list(required)}])
             if "SELECT id,display_name" in sql:
                 return Rows([{"id": actor["id"], "display_name": "CM"}])
             if "SELECT 1 FROM authorizations" in sql:
@@ -449,6 +460,45 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
     deleted_template = client.post(templates_url + "delete", json={"id": template_item["id"], "revision": 2},
                                    headers=headers)
     assert deleted_template.json()["templates"] == [] and template_stored["deleted_at"]
+    # Every business entry is gated by the live actor grant, even when another CM has all scopes.
+    business_calls = (
+        lambda: creator_broadcast.page_data(actor["id"]),
+        lambda: creator_broadcast.match(actor["id"], other_cm, request["raw"], "support"),
+        lambda: creator_broadcast.groups(actor["id"], other_cm, "category"),
+        lambda: creator_broadcast.resolve(actor["id"], other_cm, "support", [p1]),
+        lambda: creator_broadcast.preview(actor["id"], other_cm, "support", preview["selections"], "Example", True),
+        lambda: creator_broadcast.list_save(actor["id"], fields),
+        lambda: creator_broadcast.list_load(actor["id"], group_item["id"]),
+        lambda: creator_broadcast.list_delete(actor["id"], group_item["id"], 1),
+        lambda: creator_broadcast.template_save(actor["id"], draft),
+        lambda: creator_broadcast.template_delete(actor["id"], template_item["id"], 1),
+    )
+    for removed_scope in (baseline[0], *creator_broadcast.SEND_SCOPES):
+        changed["scopes"] = [scope for scope in required if scope != removed_scope]
+        before = len(reads)
+        redirect = client.get("/creators/broadcast", follow_redirects=False)
+        assert redirect.status_code == 303
+        assert redirect.headers["location"] == f"/auth/lark/start?send=1&account_id={actor['id']}&auto=1"
+        assert not any("creator_broadcast_lists" in sql or "creator_broadcast_templates" in sql
+                       for sql in reads[before:])
+        for call in business_calls:
+            before = len(reads)
+            with pytest.raises(creator_broadcast.BroadcastAuthorizationRequired) as denied:
+                call()
+            assert denied.value.account_id == str(actor["id"])
+            assert not any("creator_broadcast_lists" in sql or "creator_broadcast_templates" in sql
+                           for sql in reads[before:])
+        blocked = client.post(url, json=dict(request, cm_id=other_cm), headers=headers)
+        assert blocked.status_code == 403
+        assert blocked.json()["authorization_url"] == f"/auth/lark/start?send=1&account_id={actor['id']}"
+        assert client.post(resolve_url, json={"cm_id": other_cm, "purpose": "support", "contact_ids": [p1]},
+                           headers=headers).status_code == 403
+    changed["scopes"] = list(required)
+    changed["consent"] = False
+    with pytest.raises(PermissionError, match="本人聊天授权已失效"):
+        creator_broadcast.page_data(actor["id"])
+    changed["consent"] = True
+    assert client.post(url, json=request, headers=headers).status_code == 200
     changed["role"] = False
     assert client.get("/creators/broadcast").status_code == 403
     assert client.post(url, json=request, headers=headers).status_code == 403
