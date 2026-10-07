@@ -1,6 +1,8 @@
 from contextlib import nullcontext
+from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlencode, urlparse
 from uuid import uuid4
 
 import pytest
@@ -9,6 +11,7 @@ from starlette.requests import Request
 from test_identity_names import pg  # noqa: F401
 
 from app import main
+from app.config import Settings
 from app.crypto import TokenCipher
 from app.lark_api import LarkProfile
 
@@ -123,12 +126,25 @@ def test_reauthorization_restarts_an_active_job_with_a_new_generation() -> None:
     assert "last_http_status = NULL" in query
 
 
-def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapping_grants(pg, monkeypatch):  # noqa: F811
+@pytest.mark.parametrize("upgrade", ("profile", "send"))
+def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapping_grants(
+    pg, monkeypatch, upgrade,  # noqa: F811
+):
     scopes = (
         "offline_access", "im:chat:read", "im:message:readonly", "im:chat.members:read",
         "contact:contact.base:readonly", "contact:user.base:readonly",
     )
-    settings = SimpleNamespace(app_secret_configured=True, token_encryption_key=b"o" * 32, oauth_scopes=scopes)
+    send = upgrade == "send"
+    initial_scopes = scopes + ("contact:user.email:readonly",) if send else scopes[:4]
+    upgrade_scopes = tuple(dict.fromkeys((*scopes, *initial_scopes, *main.SEND_OAUTH_SCOPES))) if send else scopes
+    settings = Settings(
+        database_url="fixture", lark_app_id="fixture-app", lark_app_secret="fixture-secret",
+        lark_redirect_uri="https://testserver/auth/lark/callback", token_encryption_key=b"o" * 32,
+        oauth_authorize_url="https://lark.test/authorize", oauth_token_url="https://lark.test/token",
+        user_info_url="https://lark.test/user", lark_api_base_url="https://lark.test", oauth_scopes=scopes,
+        sync_lookback_days=0, sync_interval_seconds=300, sync_overlap_seconds=600,
+        member_count_refresh_seconds=86400, worker_idle_seconds=3,
+    )
     cipher = TokenCipher(settings.token_encryption_key)
     actor, person, job = uuid4(), uuid4(), uuid4()
     pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,'Old Profile')", (person,))
@@ -141,9 +157,10 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
     pg.execute(
         """INSERT INTO authorizations(id,open_id,display_name,access_token_ciphertext,scopes,status,last_error,
         body_consent_at,p2p_discovery_status,p2p_last_checked_at,p2p_last_error)
-        VALUES(%s,'ou_upgrade','Old Profile',%s,%s,'attention_required',%s,NOW()-INTERVAL '30 days',
+        VALUES(%s,'ou_upgrade','Old Profile',%s,%s,%s,%s,NOW()-INTERVAL '30 days',
         'succeeded',NOW()-INTERVAL '1 day','retained p2p detail')""",
-        (actor, cipher.encrypt("old-access"), list(scopes[:4]), main.PROFILE_SCOPE_UPGRADE_REASON),
+        (actor, cipher.encrypt("old-access"), list(initial_scopes), "active" if send else "attention_required",
+         None if send else main.PROFILE_SCOPE_UPGRADE_REASON),
     )
     pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (actor,))
     pg.execute(
@@ -180,32 +197,44 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
 
     class FakeLark:
         def __init__(self, received):
-            assert received is settings
+            self.scopes = received.oauth_scopes
+            assert received == replace(settings, oauth_scopes=self.scopes)
+
+        def authorization_url(self, state, challenge):
+            assert state and challenge
+            return settings.oauth_authorize_url + "?" + urlencode({"scope": " ".join(self.scopes)})
 
         def exchange_code(self, code, verifier):
             assert verifier == "synthetic-verifier"
-            granted = None if code == "missing" else " ".join(scopes[:4] if code == "partial" else scopes)
+            granted = (
+                None if code == "missing" else " ".join(scopes[:4]) if code == "partial" else
+                " ".join(initial_scopes) if code == "missing_send" else
+                " ".join(scopes) if code == "ordinary" else " ".join(upgrade_scopes)
+            )
             return SimpleNamespace(
-                access_token="new-access-" + code, refresh_token="new-refresh", expires_in=3600,
+                access_token="new-access-" + code,
+                refresh_token=None if code == "no_refresh" else "new-refresh", expires_in=3600,
                 refresh_expires_in=86400, scope=granted,
             )
 
         def user_info(self, token):
             assert token.startswith("new-access-")
-            return profile
+            return replace(profile, open_id="ou_counterpart") if token.endswith("wrong_account") else profile
 
     monkeypatch.setattr(main, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(main, "get_settings", lambda: settings)
     monkeypatch.setattr(main, "LarkClient", FakeLark)
     client = TestClient(main.app, base_url="https://testserver")
 
-    def state(*, fresh=False):
+    def state(*, fresh=False, upgraded=True):
         value = uuid4().hex
         # The fixture holds one transaction/NOW(); model separate request timestamps explicitly.
         pg.execute(
-            """INSERT INTO oauth_states(state_hash,code_verifier_ciphertext,expires_at,created_at)
-            VALUES(%s,%s,NOW()+INTERVAL '10 minutes',NOW()+(%s*INTERVAL '1 second'))""",
-            (main._sha256(value), cipher.encrypt("synthetic-verifier"), 1 if fresh else -60),
+            """INSERT INTO oauth_states(state_hash,code_verifier_ciphertext,expires_at,created_at,
+            requested_scopes,authorization_id)
+            VALUES(%s,%s,NOW()+INTERVAL '10 minutes',NOW()+(%s*INTERVAL '1 second'),%s,%s)""",
+            (main._sha256(value), cipher.encrypt("synthetic-verifier"), 1 if fresh else -60,
+             list(upgrade_scopes) if send and upgraded else None, actor if send and upgraded else None),
         )
         return value
 
@@ -226,17 +255,50 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
         }
 
     original = snapshot()
+    if send:
+        # A send grant is personal and Owner-only; it must not widen ordinary onboarding.
+        current = None
+        monkeypatch.setattr(main, "_current_authorization", lambda _: current)
+        for authorization in (None, {"id": actor, "status": "revoked", "body_consent_at": True},
+                              {"id": actor, "status": "active", "body_consent_at": None}):
+            current = authorization
+            assert client.get("/auth/lark/start?send=1", follow_redirects=False).status_code == 403
+        current = pg.execute("SELECT * FROM authorizations WHERE id=%s", (actor,)).fetchone()
+        pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (actor,))
+        assert client.get("/auth/lark/start?send=1", follow_redirects=False).status_code == 403
+        pg.execute("UPDATE admin_roles SET is_active=TRUE,role='viewer' WHERE authorization_id=%s", (actor,))
+        assert client.get("/auth/lark/start?send=1", follow_redirects=False).status_code == 403
+        pg.execute("UPDATE admin_roles SET role='owner' WHERE authorization_id=%s", (actor,))
+        assert not pg.execute("SELECT 1 FROM oauth_states").fetchone()
+        for params, requested, target in (({"send": "1"}, upgrade_scopes, actor), ({}, scopes, None)):
+            response = client.get("/auth/lark/start", params=params, follow_redirects=False)
+            assert response.status_code == 303
+            assert parse_qs(urlparse(response.headers["location"]).query)["scope"] == [" ".join(requested)]
+            row = pg.execute("SELECT * FROM oauth_states").fetchone()
+            assert row["requested_scopes"] == list(requested) and row["authorization_id"] == target
+            pg.execute("DELETE FROM oauth_states")
+            assert settings.oauth_scopes == scopes and snapshot() == original
     overlap = state()
     for grant in ("missing", "partial"):
         assert callback(state(), grant).status_code == 403
         assert snapshot() == original
+    if send:
+        for grant, status in (("missing_send", 403), ("wrong_account", 403), ("no_refresh", 502)):
+            assert callback(state(), grant).status_code == status
+            assert snapshot() == original
+        # Recheck authority after OAuth, not just when the link was created.
+        revoked_link = state()
+        pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (actor,))
+        revoked = snapshot()
+        assert callback(revoked_link).status_code == 403 and snapshot() == revoked
+        pg.execute("UPDATE admin_roles SET is_active=TRUE WHERE authorization_id=%s", (actor,))
 
     response = callback(state())
     assert response.status_code == 303 and response.headers["location"] == "/dashboard"
     upgraded = snapshot()
     auth = upgraded["authorizations"][0]
     assert auth["id"] == actor and auth["open_id"] == "ou_upgrade" and auth["status"] == "active"
-    assert auth["last_error"] is None and auth["scopes"] == list(scopes)
+    assert auth["last_error"] is None and auth["scopes"] == list(upgrade_scopes)
     assert cipher.decrypt(auth["access_token_ciphertext"]) == "new-access-full"
     for field in ("body_consent_at", "p2p_discovery_status", "p2p_last_checked_at", "p2p_last_error"):
         assert auth[field] == original["authorizations"][0][field]
@@ -249,19 +311,23 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
     assert upgraded["contacts"][0]["id"] == person and upgraded["contacts"][0]["display_name"] == "Alex（张三）"
     assert upgraded["chat_members"][0]["display_name"] == "Alex（张三）"
     provider = upgraded["identity_profile_providers"][0]
-    assert provider["scopes"] == list(scopes) and provider["status"] == "pending" and provider["error_code"] is None
-    assert upgraded["sync_jobs"][0]["id"] == job and upgraded["sync_jobs"][0]["mode"] == "incremental"
+    assert provider["scopes"] == list(upgrade_scopes)
+    assert provider["status"] == "pending" and provider["error_code"] is None
+    if send:
+        assert upgraded["sync_jobs"] == original["sync_jobs"]
+    else:
+        assert upgraded["sync_jobs"][0]["id"] == job and upgraded["sync_jobs"][0]["mode"] == "incremental"
     session = response.cookies[main.SESSION_COOKIE]
     assert upgraded["web_sessions"][0]["session_hash"] == main._sha256(session)
     assert upgraded["web_sessions"][0]["authorization_id"] == actor
     assert [row["action"] for row in upgraded["audit_events"] if row["authorization_id"] == actor] == [
-        "oauth_profile_permissions_upgraded"
+        "oauth_send_permissions_upgraded" if send else "oauth_profile_permissions_upgraded"
     ]
 
     assert callback(overlap).status_code == 409
     assert snapshot() == upgraded  # An older tab cannot reset cursors or replace tokens/profile again.
 
-    assert callback(state(fresh=True), "ordinary").status_code == 303
+    assert callback(state(fresh=True, upgraded=False), "ordinary").status_code == 303
     ordinary = snapshot()
     assert ordinary["authorizations"][0]["id"] == actor and ordinary["admin_roles"] == original["admin_roles"]
     assert ordinary["authorizations"][0]["body_consent_at"] > auth["body_consent_at"]

@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import secrets
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from fastapi.templating import Jinja2Templates
 from . import (
     admin,
     admin_permissions,
+    creator_access,
     creator_group_routes,
     creator_handle_matching_routes,
     creator_handles_routes,
@@ -46,6 +48,7 @@ SESSION_COOKIE = "__Host-lark_message_stats"
 OAUTH_STATE_COOKIE = "__Host-lark_oauth_state"
 SESSION_DAYS = 30
 PROFILE_SCOPE_UPGRADE_REASON = "profile_scope_upgrade_required"
+SEND_OAUTH_SCOPES = ("im:message", "im:message.send_as_user")
 LONDON_TIME_ZONE = ZoneInfo("Europe/London")
 REMI_TEST_OWNER_ID = uuid.UUID("9d5f4370-6463-4c3a-a2ed-67753a1cabc0")
 REMI_TEST_SHANG_MA_ID = uuid.UUID("1225b4a0-fbd8-431e-962e-25e66943a8a0")
@@ -76,7 +79,7 @@ def index(request: Request):
 
 
 @app.get("/auth/lark/start")
-def start_lark_authorization(request: Request):
+def start_lark_authorization(request: Request, send: bool = False):
     settings = get_settings()
     if not settings.app_secret_configured:
         return _template(
@@ -86,19 +89,39 @@ def start_lark_authorization(request: Request):
             status_code=503,
         )
 
+    authorization = _current_authorization(request) if send else None
+    if send:
+        if not authorization or authorization["status"] != "active" or not authorization["body_consent_at"]:
+            return _template(
+                request, "error.html", {"title": "无法增加发送权限", "detail": "请使用已授权的本人账号登录。"}, 403,
+            )
+        settings = replace(settings, oauth_scopes=tuple(dict.fromkeys((
+            *settings.oauth_scopes, *(authorization.get("scopes") or ()), *SEND_OAUTH_SCOPES,
+        ))))
+
     state = secrets.token_urlsafe(32)
     verifier = secrets.token_urlsafe(64)
     challenge = _code_challenge(verifier)
     cipher = TokenCipher(settings.token_encryption_key)
 
     with connection() as conn, conn.transaction():
+        if send:
+            try:
+                creator_access.require_owner(conn, authorization["id"])
+            except PermissionError:
+                return _template(
+                    request, "error.html", {"title": "无法增加发送权限", "detail": "目前仅系统 Owner 可增加发送权限。"},
+                    403,
+                )
         conn.execute("DELETE FROM oauth_states WHERE expires_at <= NOW()")
         conn.execute(
             """
-            INSERT INTO oauth_states (state_hash, code_verifier_ciphertext, expires_at)
-            VALUES (%s, %s, NOW() + INTERVAL '10 minutes')
+            INSERT INTO oauth_states (
+                state_hash, code_verifier_ciphertext, expires_at, requested_scopes, authorization_id
+            ) VALUES (%s, %s, NOW() + INTERVAL '10 minutes', %s, %s)
             """,
-            (_sha256(state), cipher.encrypt(verifier)),
+            (_sha256(state), cipher.encrypt(verifier), list(settings.oauth_scopes),
+             authorization["id"] if send else None),
         )
 
     destination = LarkClient(settings).authorization_url(state, challenge)
@@ -131,12 +154,20 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
             """
             DELETE FROM oauth_states
             WHERE state_hash = %s AND expires_at > NOW()
-            RETURNING code_verifier_ciphertext, created_at
+            RETURNING code_verifier_ciphertext, created_at, requested_scopes, authorization_id
             """,
             (_sha256(state),),
         ).fetchone()
     if not state_row:
         return _template(request, "error.html", {"title": "授权已过期", "detail": "请返回首页重新开始授权。"}, 400)
+
+    base_required_scopes = settings.oauth_scopes
+    send_upgrade = bool(state_row["authorization_id"])
+    requested_scopes = tuple(state_row["requested_scopes"] or settings.oauth_scopes)
+    if send_upgrade and not set(SEND_OAUTH_SCOPES).issubset(requested_scopes):
+        return _template(request, "error.html", {"title": "授权校验失败", "detail": "请重新开始发送权限授权。"}, 400)
+    if requested_scopes != settings.oauth_scopes:
+        settings = replace(settings, oauth_scopes=requested_scopes)
 
     try:
         verifier = cipher.decrypt(state_row["code_verifier_ciphertext"])
@@ -156,20 +187,39 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
     refresh_expires_at = _expiry(tokens.refresh_expires_in) if tokens.refresh_expires_in else None
     # A requested scope is not a granted scope. Never activate a partial/unknown grant.
     scopes = tokens.scope.split() if tokens.scope else []
-    if not set(settings.oauth_scopes).issubset(scopes):
+    if not (set(base_required_scopes) | set(requested_scopes)).issubset(scopes):
         return _template(
             request, "error.html",
-            {"title": "授权范围不完整", "detail": "请重新授权并同意聊天和人员基本资料的读取权限。原有数据不会删除。"},
+            {"title": "授权范围不完整", "detail": "请同意本次申请的全部权限。原有授权和数据不会修改。"},
             403,
+        )
+    if send_upgrade and not tokens.refresh_token:
+        return _template(
+            request, "error.html", {"title": "授权未完成", "detail": "Lark 未返回可续期授权，原有授权保持不变。"}, 502,
         )
     with connection() as conn, conn.transaction():
         previous = conn.execute(
             "SELECT id,status,last_error,body_consent_at FROM authorizations WHERE open_id=%s FOR UPDATE",
             (profile.open_id,),
         ).fetchone()
+        if send_upgrade:
+            if (not previous or previous["id"] != state_row["authorization_id"]
+                    or previous["status"] != "active" or not previous["body_consent_at"]):
+                return _template(
+                    request, "error.html",
+                    {"title": "发送授权账号不一致", "detail": "请使用发起增权的本人账号重新授权，原有授权保持不变。"},
+                    403,
+                )
+            try:
+                creator_access.require_owner(conn, previous["id"])
+            except PermissionError:
+                return _template(
+                    request, "error.html", {"title": "发送授权已失效", "detail": "当前账号已不具备 Owner 权限。"}, 403,
+                )
         if previous and previous["status"] == "active" and conn.execute(
             """SELECT 1 FROM audit_events WHERE authorization_id=%s
-               AND action='oauth_profile_permissions_upgraded' AND created_at>=%s LIMIT 1""",
+               AND action IN ('oauth_profile_permissions_upgraded','oauth_send_permissions_upgraded')
+               AND created_at>=%s LIMIT 1""",
             (previous["id"], state_row["created_at"]),
         ).fetchone():
             return _template(
@@ -180,6 +230,7 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
             previous and previous["status"] == "attention_required"
             and previous["last_error"] == PROFILE_SCOPE_UPGRADE_REASON and previous["body_consent_at"]
         )
+        preserve_sync = profile_upgrade or send_upgrade
         row = conn.execute(
             """
             INSERT INTO authorizations (
@@ -218,14 +269,15 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 token_expires_at,
                 refresh_expires_at,
                 scopes,
-                profile_upgrade, profile_upgrade, profile_upgrade, profile_upgrade,
+                preserve_sync, preserve_sync, preserve_sync, preserve_sync,
             ),
         ).fetchone()
         authorization_id = row["id"]
         # Page commits lock sync_jobs before authorization_chats. Preserve
         # that order here so OAuth reauthorization cannot deadlock with a
         # late page response.
-        _queue_job(conn, authorization_id, "incremental" if profile_upgrade else "backfill")
+        if not send_upgrade:
+            _queue_job(conn, authorization_id, "incremental" if profile_upgrade else "backfill")
         conn.execute(
             """INSERT INTO lark_identities (open_id, display_name, first_seen_at, last_seen_at)
                VALUES (%s, %s, NOW(), NOW()) ON CONFLICT (open_id) DO UPDATE
@@ -240,14 +292,15 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
             "UPDATE authorizations SET display_name=%s WHERE id=%s AND display_name IS DISTINCT FROM %s",
             (profile_label, authorization_id, profile_label),
         )
-        if not profile_upgrade:
+        if not preserve_sync:
             _reset_chat_backfill(conn, authorization_id)
         # A new consent is the opportunity to retry previously denied profile reads.
         conn.execute(
             """UPDATE identity_profile_providers SET scopes=%s,status='pending',error_code=NULL,retry_at=NOW()
                WHERE authorization_id=%s""", (scopes, authorization_id),
         )
-        _audit(conn, authorization_id, "oauth_profile_permissions_upgraded" if profile_upgrade else "oauth_authorized")
+        _audit(conn, authorization_id, "oauth_send_permissions_upgraded" if send_upgrade else
+               "oauth_profile_permissions_upgraded" if profile_upgrade else "oauth_authorized")
 
         session_token = secrets.token_urlsafe(32)
         conn.execute(
@@ -357,7 +410,7 @@ def _current_authorization(request: Request) -> dict[str, Any] | None:
     with connection() as conn, conn.transaction():
         row = conn.execute(
             """
-            SELECT a.id, a.open_id, a.display_name, a.status, a.last_error,
+            SELECT a.id, a.open_id, a.display_name, a.status, a.last_error, a.scopes,
                    a.body_consent_at, a.p2p_discovery_status, a.p2p_last_error,
                    s.last_seen_at < NOW() - INTERVAL '5 minutes' AS touch_session
             FROM web_sessions s
