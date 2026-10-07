@@ -1,34 +1,57 @@
 {% extends "base.html" %}
-{% block title %}消息提醒中心 · Lark CM/AM Assistant{% endblock %}
+{% block title %}工作台 · Lark CM/AM Assistant{% endblock %}
 {% block body %}
-<div class="page">
-  <header class="navbar navbar-expand-md d-print-none">
-    <div class="container-xl">
-      <a class="navbar-brand" href="/">TT Media 消息提醒</a>
-      <div class="navbar-nav flex-row order-md-last">
-        {% if admin_role %}<div class="nav-item"><a class="nav-link" href="{{ admin_landing_path }}">管理台</a></div>{% endif %}
-        <div class="nav-item"><span class="nav-link text-secondary">{{ authorization.display_name or "CM / AM" }}</span></div>
-      </div>
-    </div>
-  </header>
+<div class="page business-page workbench">
+  {% set business_section = 'workbench' %}
+  {% include "partials/business_nav.html" %}
   <div class="page-wrapper">
-    <div class="page-header d-print-none">
+    <div class="page-header business-heading d-print-none">
       <div class="container-xl">
-        <div class="row g-2 align-items-center">
-          <div class="col">
-            <h2 class="page-title">消息提醒中心</h2>
-            <div class="text-secondary mt-1">用于测试需要优先关注与跟进的消息提醒。页面每 5 秒更新一次。</div>
-          </div>
-        </div>
+        <h1 class="page-title">工作台</h1>
       </div>
     </div>
     <div class="page-body">
       <div class="container-xl">
-        <section class="card mb-4"><div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3"><div><h3 class="card-title mb-1">我的达人</h3><p class="text-secondary mb-0">核对候选达人的 handle，查看已确认的达人。</p></div><a class="btn btn-primary" href="/creators">查看达人</a></div></section>
-        {% if offhours_summary_visible %}
-        <section class="card mb-4 border-primary"><div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3"><div><h3 class="card-title mb-1">达人消息总结</h3><p class="text-secondary mb-0">已入库达人 · 查看上班、下班时段的消息总结和最近7天记录。</p></div><a class="btn btn-primary" href="/dashboard/offhours-summary">查看消息总结</a></div></section>
-        {% endif %}
-        {% include "partials/stats.html" %}
+        <section class="row g-3 mb-5" aria-label="常用功能">
+          <div class="col-md-4">
+            <div class="card business-feature-card h-100">
+              <div class="card-body d-flex flex-column">
+                <h2 class="card-title">我的达人</h2>
+                <p class="text-secondary flex-grow-1 mb-0">查看达人资料、关联账号和负责人。</p>
+                <a class="fw-medium align-self-start mt-4" href="/creators">查看达人 →</a>
+              </div>
+            </div>
+          </div>
+          {% if business_nav and business_nav.can_broadcast %}
+          <div class="col-md-4">
+            <div class="card business-feature-card h-100">
+              <div class="card-body d-flex flex-column">
+                <div class="d-flex align-items-center gap-2 mb-3">
+                  <h2 class="card-title mb-0">群发消息</h2>
+                  <span class="badge bg-secondary-lt">预览</span>
+                </div>
+                <p class="text-secondary flex-grow-1 mb-0">选择接收对象，编辑内容并预览消息。</p>
+                <a class="fw-medium align-self-start mt-4" href="/creators/broadcast">准备消息 →</a>
+              </div>
+            </div>
+          </div>
+          {% endif %}
+          {% if offhours_summary_visible or (business_nav and business_nav.can_summary) %}
+          <div class="col-md-4">
+            <div class="card business-feature-card h-100">
+              <div class="card-body d-flex flex-column">
+                <h2 class="card-title">消息总结</h2>
+                <p class="text-secondary flex-grow-1 mb-0">查看达人消息总结和最近 7 天记录。</p>
+                <a class="fw-medium align-self-start mt-4" href="/dashboard/offhours-summary">查看总结 →</a>
+              </div>
+            </div>
+          </div>
+          {% endif %}
+        </section>
+        <section aria-labelledby="connection-title">
+          <h2 id="connection-title" class="h3 mb-3">账号连接</h2>
+          {% include "partials/stats.html" %}
+        </section>
         {% if not body_consent %}
         <div class="alert alert-info mt-4">提醒功能需要重新确认 Lark 授权，请 <a href="/auth/lark/start" class="alert-link">重新使用 Lark 授权</a>。</div>
         {% elif authorization.p2p_discovery_status == 'unavailable' %}

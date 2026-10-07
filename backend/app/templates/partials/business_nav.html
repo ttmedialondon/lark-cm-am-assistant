@@ -1,0 +1,18 @@
+{% set nav = business_nav|default({}) %}
+<header class="business-nav">
+  <div class="container-xl business-nav__inner">
+    <a class="business-nav__brand" href="/dashboard">TT Media</a>
+    <nav class="business-nav__links" aria-label="业务导航">
+      {% for section, label, path, visible in [
+        ('workbench', '工作台', '/dashboard', true),
+        ('creators', '我的达人', '/creators', true),
+        ('broadcast', '群发消息', '/creators/broadcast', nav.can_broadcast),
+        ('summary', '消息总结', '/dashboard/offhours-summary', nav.can_summary)
+      ] %}{% if visible %}
+      <a class="business-nav__link{% if business_section == section %} is-active{% endif %}" href="{{ path }}"{% if business_section == section %} aria-current="page"{% endif %}>{{ label }}</a>
+      {% endif %}{% endfor %}
+    </nav>
+    {% if business_section == 'workbench' and admin_role and admin_landing_path %}<a class="business-nav__admin" href="{{ admin_landing_path }}">管理台</a>{% endif %}
+    <span class="business-nav__account" title="{{ authorization.display_name or 'CM/AM' }}">{{ authorization.display_name or 'CM/AM' }}</span>
+  </div>
+</header>

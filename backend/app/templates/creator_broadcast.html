@@ -2,10 +2,10 @@
 {% block title %}群发消息 · TT Media{% endblock %}
 {% block extra_head %}<link rel="stylesheet" href="/static/creator-broadcast.css?v=20261007-permission-gate">{% endblock %}
 {% block body %}
-<div class="page" id="broadcast-app" data-csrf="{{ csrf_token }}" data-actor="{{ authorization.id }}">
-  <header class="navbar navbar-expand-md"><div class="container-xl"><a class="navbar-brand" href="/dashboard">TT Media</a><div class="navbar-nav flex-row gap-3"><a class="nav-link" href="/creators">我的达人</a><span class="nav-link text-secondary">{{ authorization.display_name or 'CM/AM' }}</span></div></div></header>
+<div class="page business-page" id="broadcast-app" data-csrf="{{ csrf_token }}" data-actor="{{ authorization.id }}">
+  {% with business_section='broadcast' %}{% include "partials/business_nav.html" %}{% endwith %}
   <main class="page-wrapper"><div class="page-body"><div class="container-xl">
-    <div class="broadcast-heading mb-4"><h2 class="page-title">群发消息</h2><span class="badge bg-yellow-lt">仅预览 · 不会发送</span></div>
+    <div class="business-heading"><div><h2 class="page-title">群发消息</h2><p>选择接收对象，编辑并预览消息。</p></div><span class="badge bg-yellow-lt">仅预览 · 不会发送</span></div>
     <div class="broadcast-permissions mb-4" id="broadcast-permission-bar" aria-busy="true">
       <div class="broadcast-account"><label class="form-label mb-1" id="broadcast-cm-label" for="broadcast-cm">达人范围</label><select class="form-select" id="broadcast-cm"><option value="all">全部已入库达人</option>{% for cm in broadcast_data.cms %}<option value="{{ cm.id }}">{{ cm.name }} 负责的达人</option>{% endfor %}</select></div>
       <div role="status" aria-live="polite"><span id="broadcast-permission-account">当前账号</span><span class="badge bg-secondary-lt ms-2" id="broadcast-permission-status">正在核对授权</span><div class="small text-secondary mt-1" id="broadcast-permission-message"></div></div>

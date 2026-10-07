@@ -59,17 +59,33 @@ def test_session_touch_is_throttled_without_caching_revocation(pg, monkeypatch):
     assert main._current_authorization(request) is None
 
 
-def test_dashboard_keeps_messages_and_removes_retired_creator_controls() -> None:
-    rendered = main.templates.get_template("dashboard.html").render(
-        authorization={"display_name": "CM", "p2p_discovery_status": "succeeded"},
-        admin_role=None,
-        body_consent=True,
-        stats={
+def test_dashboard_navigation_preserves_access_and_connection_controls() -> None:
+    authorization = {"id": uuid4(), "status": "active", "display_name": "CM", "body_consent_at": True,
+                     "p2p_discovery_status": "succeeded"}
+    context = {
+        "authorization": authorization, "admin_role": None, "body_consent": True,
+        "stats": {
             "badge": "success", "status": "接入完成", "detail": "当前不会自动发送消息。",
             "last_synced_at": "2026-09-01 12:00 BST", "job": {"status": "succeeded"},
         },
-    )
-    assert "消息提醒中心" in rendered and "权限与数据使用" in rendered
+    }
+    request = _request_with_session("fixture-session")
+    rendered = main._template(request, "dashboard.html", context).body.decode()
+    assert "工作台" in rendered and "权限与数据使用" in rendered
+    assert 'href="/creators"' in rendered and 'href="/dashboard/offhours-summary"' in rendered
+    assert "/creators/broadcast" not in rendered and 'href="/admin"' not in rendered
+    assert 'hx-trigger="load, every 5s"' in rendered
+    owner = main._template(request, "dashboard.html", {
+        **context, "admin_role": "owner", "admin_landing_path": "/admin",
+    }).body.decode()
+    assert 'href="/creators/broadcast"' in owner and 'href="/admin"' in owner
+    restricted = main._template(request, "dashboard.html", {
+        **context, "authorization": {**authorization, "body_consent_at": None},
+        "body_consent": False, "offhours_summary_visible": False,
+    }).body.decode()
+    assert "/creators/broadcast" not in restricted and "/dashboard/offhours-summary" not in restricted
+    assert "重新使用 Lark 授权" in restricted
+    assert "business_nav" not in context
     for retired in ("/dashboard/creators", "creator-setup-preview", "creator-candidates",
                     "待我确认的达人候选", "历史联系人归属"):
         assert retired not in rendered

@@ -56,6 +56,21 @@ REMI_TEST_SHANG_MA_ID = uuid.UUID("1225b4a0-fbd8-431e-962e-25e66943a8a0")
 
 
 def _template(request: Request, name: str, context: dict[str, Any], status_code: int = 200):
+    if name in {"dashboard.html", "creator_handles.html", "creator_broadcast.html", "offhours_summary.html"}:
+        authorization = context["authorization"]
+        # Reuse the page's effective access; a navigation link never grants access.
+        owner = bool(context.get("admin_role") == "owner"
+                     or context.get("creator_data", {}).get("can_view_unassigned")
+                     or context.get("summary_data", {}).get("can_manage")
+                     or name == "creator_broadcast.html")
+        active = authorization["status"] == "active"
+        context = {**context, "business_nav": {
+            "can_broadcast": active and owner,
+            "can_summary": context.get("offhours_summary_visible", active and (
+                bool(authorization.get("body_consent_at")) or owner
+                or _is_remi_tester(authorization, {"is_owner": owner})
+            )),
+        }}
     return templates.TemplateResponse(request, name, context, status_code=status_code)
 
 
