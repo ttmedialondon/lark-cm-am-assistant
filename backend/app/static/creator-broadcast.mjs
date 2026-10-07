@@ -16,7 +16,7 @@ export function buildPlan(rows, mention, purposeLabel) {
   for (const row of rows.filter(row => row.selected)) {
     const group = row.options.find(option => option.id === row.chatId);
     const reason = !row.person ? (row.entries[0].candidates.length ? '请选择具体达人' : '未找到已入库达人')
-      : !row.options.length ? `没有${purposeLabel}` : !group ? `请选择${purposeLabel}`
+      : !row.options.length ? `暂无可用${purposeLabel}` : !group ? `请选择${purposeLabel}`
         : !group.members.includes(row.person.id) ? '人员与群的关联已变化' : '';
     if (row.person) people.push(row.person);
     if (reason) { issues.push({ key: row.key, reason }); continue; }
@@ -95,7 +95,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
           select.append(new Option(entry.approximate ? '近似候选，需选择' : '同名或同账号，需选择', ''));
           for (const person of entry.candidates) {
             const group = groups.find(group => person.groups.includes(group.id));
-            select.append(new Option([person.name, person.handles[0] ? `@${person.handles[0].replace(/^@/,'')}` : '', group?.name || '没有对应群'].filter(Boolean).join(' · '), person.id));
+            select.append(new Option([person.name, person.handles[0] ? `@${person.handles[0].replace(/^@/,'')}` : '', group?.name || '暂无可用群'].filter(Boolean).join(' · '), person.id));
           }
           select.addEventListener('change', () => { entry.person = entry.candidates.find(person => person.id === select.value) || null; render(); });
           identity.append(select);
