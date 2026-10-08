@@ -44,8 +44,9 @@ def ranking_flow(pg, monkeypatch):
         pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES(%s,%s,'p2p')", (chat, chat))
         pg.execute(
             """INSERT INTO authorization_chats(authorization_id,chat_id,p2p_counterpart_open_id,
-            backfill_complete,backfill_window_start_at) VALUES(%s,%s,'ou_creator',TRUE,NOW()-INTERVAL '100 days')""",
-            (cm, chat),
+            backfill_complete,backfill_window_start_at,backfill_window_end_at,last_backfill_at,sync_status)
+            VALUES(%s,%s,'ou_creator',TRUE,%s,NOW()-INTERVAL '1 hour',NOW(),'succeeded')""",
+            (cm, chat, None if cm == owner else now - timedelta(days=100)),
         )
     cipher = message_body_cipher(settings.token_encryption_key)
     state = SimpleNamespace(
@@ -162,6 +163,25 @@ def ranking_flow(pg, monkeypatch):
     return state
 
 
+@pytest.mark.parametrize("missing", ["backfill_complete", "backfill_window_end_at", "last_backfill_at",
+                                    "recent_start", "not_readable"])
+def test_history_coverage_requires_successful_full_sync(pg, ranking_flow, missing):
+    flow = ranking_flow
+    flow.enable()
+    if missing == "recent_start":
+        pg.execute("UPDATE authorization_chats SET backfill_window_start_at=NOW()-INTERVAL '7 days'")
+    elif missing == "not_readable":
+        pg.execute("UPDATE authorization_chats SET sync_status='not_readable'")
+    else:
+        value = "FALSE" if missing == "backfill_complete" else "NULL"
+        pg.execute(f"UPDATE authorization_chats SET {missing}={value}")
+    job = pg.execute("""SELECT *,NOW()-INTERVAL '90 days' history_start,NOW() history_end
+        FROM creator_importance_jobs WHERE responsible_authorization_id=%s""", (flow.owner,)).fetchone()
+    material = importance.build_batch(pg, job, flow.settings, importance._state(job, flow.settings))
+    assert material["state"]["chat_coverage"] == {"own_private": False}
+    assert not flow.calls
+
+
 def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_flow):
     flow = ranking_flow
     assert not importance.prepare_next(flow.settings) and importance.claim() is None
@@ -226,6 +246,7 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
     assert profiles[flow.owner]["auto_tier"] == "focus" and profiles[flow.other]["auto_tier"] == "normal"
     assert profiles[flow.owner]["last_substantive_progress_at"] == flow.now - timedelta(days=20) + timedelta(minutes=1)
     assert all(r["coverage"]["history_complete"] for r in profiles.values())
+    assert all(r["coverage"]["source_history_complete"] for r in profiles.values())
     assert len(flow.calls) >= 3  # The first history was actually split, not read as one unbounded request.
     for pack in flow.calls:
         private = "own_private" if pack["cm_id"] == str(flow.owner) else "other_private"

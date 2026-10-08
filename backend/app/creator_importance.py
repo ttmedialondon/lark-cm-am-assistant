@@ -268,7 +268,8 @@ _READABLE = """FROM chat_messages m JOIN authorization_message_observations o US
               AND NOT target_message.is_deleted))"""
 _COLUMNS = """SELECT m.*,i.contact_id,i.display_name sender_name,ch.name chat_name,ch.chat_mode,
     a.open_id cm_open_id,a.body_consent_at,ac.p2p_counterpart_open_id,ac.backfill_complete,
-    ac.backfill_window_start_at,ac.member_snapshot_status,ac.member_count,
+    ac.backfill_window_start_at,ac.backfill_window_end_at,ac.last_backfill_at,ac.sync_status,
+    ac.member_snapshot_status,ac.member_count,
     md5(m.mentions_json::text) mentions_fingerprint """
 
 
@@ -352,8 +353,12 @@ def build_batch(conn, job, settings, state):
                           or m["tenant_classification"] == "internal" for m in members))
         chats[row["chat_id"]] = {"name": row["chat_name"], "private": row["p2p_counterpart_open_id"] in opens,
                                   "unique_creator": unique}
-        coverage[row["chat_id"]] = bool(row["backfill_complete"] and row["backfill_window_start_at"]
-                                        and row["backfill_window_start_at"] <= job["history_start"])
+        # A null start is the sync worker's unbounded-history window, not missing coverage.
+        coverage[row["chat_id"]] = bool(row["backfill_complete"] and row["sync_status"] != "not_readable"
+            and row["backfill_window_end_at"] and row["last_backfill_at"]
+            and row["last_backfill_at"] >= row["backfill_window_end_at"]
+            and (row["backfill_window_start_at"] is None
+                 or row["backfill_window_start_at"] <= job["history_start"]))
     decoded = {}
     for key, row in sorted(by_key.items(), key=lambda item: (item[1]["message_create_time"], *item[0])):
         if row["chat_id"] not in chats:
