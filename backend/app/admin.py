@@ -84,9 +84,9 @@ AI_FEATURES = {
         "processing_label": "逐群分类，高置信度自动入库，不发送消息",
     },
     "creator_importance": {
-        "title": "合作重要度",
-        "description": "仅从本人授权聊天提取合作事实，规则分为重点、常规、待评估；不依赖 Curva 或销量。",
-        "enabled_label": "开启合作重要度评估",
+        "title": "维护优先级",
+        "description": "根据本人授权聊天判断维护优先级，分为重点、常规、待评估；不依赖 Curva 或销量。",
+        "enabled_label": "开启维护优先级评估",
         "processing_label": "首次历史分析，之后增量更新",
     },
     "offhours_summary": {

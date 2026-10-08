@@ -120,6 +120,8 @@ def test_owner_can_view_only_safe_ai_config_fields(monkeypatch):
         "creator_importance",
         "offhours_summary", "desktop_reply",
     ]
+    priority = next(item for item in contexts[-1][1]["configs"] if item["feature"] == "creator_importance")
+    assert priority["title"] == "维护优先级" and priority["enabled_label"] == "开启维护优先级评估"
     for feature in ("contact_assessment", "contact_assignment", "creator_workflow"):
         response = browser.post("/admin/ai", data={"csrf_token": "csrf", "feature": feature, "enabled": "1"})
         assert response.status_code == 400

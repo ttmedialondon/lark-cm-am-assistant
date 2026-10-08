@@ -9,7 +9,7 @@
   let tab = app.dataset.tab;
   let page = data.page || 1;
   let query = el("query").value.trim();
-  let sort = data.sort || "name", tier = data.tier || "";
+  let sort = data.sort || "importance", tier = data.tier || "";
   let busy = false, reading = false, refreshQueued = false, version = 0, evidenceVersion = 0;
   const rows = new Map();
   const selectedContacts = new Map();
@@ -178,21 +178,21 @@
     const saved = node("div", "", "mb-2"); handleCell.append(saved);
     const actions = node("td");
     const importance = node("details", "", "creator-importance-detail");
-    importance.append(node("summary", "合作详情"));
+    importance.append(node("summary", "维护依据"));
     const grounds = node("ul", "", "creator-importance-grounds"), cutoff = node("div", "", "text-secondary"), gap = node("div", "", "text-secondary mt-1");
     importance.append(grounds, cutoff, gap);
     const parts = {row, name, lark, avatar, initial, saved, actions, importanceBadge, importance, grounds, cutoff, gap, manualDirty: false};
     if (data.can_adjust_importance) {
       const editor = node("details", "", "creator-importance-editor"); editor.append(node("summary", "人工调整"));
       const form = node("form", "", "mt-2"), manualTier = node("select", "", "form-select form-select-sm"), manualReason = node("input", "", "form-control form-control-sm mt-2");
-      manualTier.setAttribute("aria-label", "人工合作重要度");
+      manualTier.setAttribute("aria-label", "人工维护优先级");
       for (const [value, label] of [["", "使用自动评估"], ["focus", "重点"], ["normal", "常规"], ["pending", "待评估"]]) {
         const option = node("option", label); option.value = value; manualTier.append(option);
       }
       manualReason.maxLength = 240; manualReason.placeholder = "调整依据"; manualReason.setAttribute("aria-label", "人工调整依据");
       const save = node("button", "保存", "btn btn-sm btn-outline-primary mt-2"); save.type = "submit";
       form.append(manualTier, manualReason, save); editor.append(form); importance.append(editor);
-      Object.assign(parts, {manualTier, manualReason, manualSave: save});
+      Object.assign(parts, {manualEditor: editor, manualTier, manualReason, manualSave: save});
       manualTier.addEventListener("change", () => { parts.manualDirty = true; manualReason.required = Boolean(manualTier.value); });
       manualReason.addEventListener("input", () => { parts.manualDirty = true; });
       form.addEventListener("submit", event => {
@@ -250,14 +250,15 @@
       parts.importanceBadge.hidden = !importance;
       if (importance) {
         parts.importanceBadge.dataset.tier = ["focus", "normal"].includes(importance.tier) ? importance.tier : "pending";
-        parts.importanceBadge.textContent = [importance.tier_label || "待评估", importance.phase_label, importance.manual_tier ? "人工" : ""].filter(Boolean).join(" · ");
+        parts.importanceBadge.textContent = [importance.tier_label || "待评估", importance.manual_tier ? "人工" : ""].filter(Boolean).join(" · ");
         parts.grounds.replaceChildren(...(importance.grounds || []).slice(0, 2).map(text => node("li", text)));
         parts.grounds.hidden = !parts.grounds.childElementCount;
-        parts.cutoff.textContent = importance.cutoff_label ? `截至 ${importance.cutoff_label}` : "";
+        parts.cutoff.textContent = importance.cutoff_label ? `资料截至 ${importance.cutoff_label}` : "";
         parts.cutoff.hidden = !importance.cutoff_label;
         parts.gap.textContent = importance.gap_label || (importance.stale ? "依据待更新" : "");
         parts.gap.hidden = !parts.gap.textContent;
         if (parts.manualTier) {
+          parts.manualEditor.hidden = !data.can_adjust_importance;
           if (!parts.manualDirty) { parts.manualTier.value = importance.manual_tier || ""; parts.manualReason.value = importance.manual_reason || ""; }
           parts.manualReason.required = Boolean(parts.manualTier.value);
           parts.manualTier.disabled = busy; parts.manualReason.disabled = busy; parts.manualSave.disabled = busy;
@@ -314,13 +315,13 @@
     const token = ++version; reading = true;
     renderSelection();
     const params = new URLSearchParams({tab, q: query, page: String(page)});
-    if (tab === "mine") { if (sort !== "name") params.set("sort", sort); if (tier) params.set("tier", tier); }
+    if (tab === "mine") { params.set("sort", sort); if (tier) params.set("tier", tier); }
     if (selectedCM()) params.set("cm_id", selectedCM());
     history.replaceState(null, "", `/creators?${params}`);
     try {
       const next = await read(await fetch(`/creators/data?${params}`, {cache: "no-store"}));
       if (token === version && !(automatic && [...rows.values()].some(row => row.dirty || row.manualDirty))) {
-        data = next; sort = data.sort || "name"; tier = data.tier || ""; render();
+        data = next; sort = data.sort || "importance"; tier = data.tier || ""; render();
       }
     } catch (error) {
       if (token === version) {
@@ -360,7 +361,7 @@
       else if (path.endsWith("/importance")) {
         const parts = rows.get(`confirmed:${path.split("/")[2]}`);
         if (parts) parts.manualDirty = false;
-        notice("合作重要度已更新。");
+        notice("维护优先级已更新。");
       }
       else if (path.endsWith("/defer")) {
         notice("已暂缓，尚未确认的修改不会入库。");

@@ -151,13 +151,13 @@ def ranking_flow(pg, monkeypatch):
     )
     message("a3", "Thanks", at=now - timedelta(days=19))
     message("a4", "Thank you", creator=True, at=now - timedelta(days=19) + timedelta(minutes=1), parent="a3")
-    message("b1", "SINGLE Beta: our confidential one-video agreement", cm=other_cm, at=now - timedelta(days=15))
+    message("b1", "SINGLE Beta: our confidential one-video agreement", cm=other_cm, at=now - timedelta(days=35))
     message(
         "b2",
         "SINGLE Beta: I accept the confidential one-video agreement",
         cm=other_cm,
         creator=True,
-        at=now - timedelta(days=15) + timedelta(minutes=1),
+        at=now - timedelta(days=35) + timedelta(minutes=1),
         parent="b1",
     )
     return state
@@ -251,12 +251,50 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
     for pack in flow.calls:
         private = "own_private" if pack["cm_id"] == str(flow.owner) else "other_private"
         assert all(m["chat_id"] == private for m in pack["messages"])
-    assert importance.view_for(pg, flow.person, flow.owner, flow.settings)["grounds"] == [
-        "Acme weekly lives：持续／再次合作"
-    ]
-    assert importance.view_for(pg, flow.person, flow.other, flow.settings)["grounds"] == [
-        "Beta single video：已成立单次合作"
-    ]
+    assert importance.view_for(pg, flow.person, flow.owner, flow.settings)["tier"] == "focus"
+    assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "normal"
+    assert profiles[flow.owner]["coverage"]["has_readable"]
+    assert profiles[flow.owner]["coverage"]["priority"]["business_days"]
+    join, args = importance.roster_sql(flow.other)
+    # An old stored focus label must not defeat the current 30-day maintenance window.
+    pg.execute("UPDATE creator_importance_profiles SET auto_tier='focus' "
+               "WHERE responsible_authorization_id=%s", (flow.other,))
+    assert pg.execute("SELECT ip.effective_tier FROM contacts c" + join + " WHERE c.id=%s",
+                      [*args, flow.person]).fetchone()["effective_tier"] == "normal"
+    pg.execute("SAVEPOINT current_priority_metadata")
+    today = flow.now.astimezone(importance.LONDON).date().isoformat()
+    yesterday = (flow.now.astimezone(importance.LONDON).date() - timedelta(days=1)).isoformat()
+    pg.execute("UPDATE creator_importance_profiles SET coverage=jsonb_set(coverage,'{priority}',%s::jsonb) "
+               "WHERE responsible_authorization_id=%s", (json.dumps({
+                   "primary_at": (flow.now - timedelta(days=35)).isoformat(),
+                   "business_at": (flow.now - timedelta(minutes=2)).isoformat(),
+                   "business_days": [today, today, yesterday, "2020-01-01"], "historical": True,
+               }), flow.other))
+    assert pg.execute("SELECT ip.effective_tier,ip.recency_rank,ip.business_days,ip.has_history "
+                      "FROM contacts c" + join + " WHERE c.id=%s", [*args, flow.person]).fetchone() == {
+                          "effective_tier": "normal", "recency_rank": 0, "business_days": 2, "has_history": True,
+                      }
+    pg.execute("UPDATE creator_importance_profiles SET coverage=jsonb_set(coverage,'{priority,primary_at}',%s::jsonb) "
+               "WHERE responsible_authorization_id=%s", (json.dumps(
+                   (flow.now - timedelta(days=20)).isoformat()), flow.other))
+    assert pg.execute("SELECT ip.effective_tier,ip.recency_rank FROM contacts c" + join + " WHERE c.id=%s",
+                      [*args, flow.person]).fetchone() == {"effective_tier": "focus", "recency_rank": 0}
+    pg.execute("ROLLBACK TO SAVEPOINT current_priority_metadata")
+    pg.execute("SAVEPOINT readable_without_facts")
+    other_job = dict(pg.execute("SELECT * FROM creator_importance_jobs WHERE responsible_authorization_id=%s",
+                                (flow.other,)).fetchone())
+    proof = next(source for source in profiles[flow.other]["sources"] if source["message_id"] == "b2")
+    importance._save_profile(pg, other_job, {
+        "facts": [], "sources": {proof["ref"]: proof}, "readable_ref": proof["ref"],
+        "seen": {}, "unreadable": 0, "gaps": 0,
+    }, flow.settings, history_complete=True)
+    assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "normal"
+    assert pg.execute("SELECT ip.effective_tier FROM contacts c" + join + " WHERE c.id=%s",
+                      [*args, flow.person]).fetchone()["effective_tier"] == "normal"
+    flow.enable(False)
+    pg.execute("UPDATE chat_messages SET is_deleted=TRUE,body_ciphertext=NULL WHERE message_id='b2'")
+    assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "pending"
+    pg.execute("ROLLBACK TO SAVEPOINT readable_without_facts")
     with pytest.raises(PermissionError):
         creator_access.access(pg, flow.other, flow.owner, read_only=True)
     with pytest.raises(PermissionError):

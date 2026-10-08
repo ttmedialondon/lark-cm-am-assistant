@@ -9,18 +9,22 @@ from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-PROMPT_VERSION = "creator-importance-facts-v1.0.2"
-RULE_VERSION = "creator-importance-v1.0.1"
+PROMPT_VERSION = "creator-importance-facts-v2.0"
+RULE_VERSION = "creator-importance-v2.0"
 MAX_FACTS, MAX_REFS = 12, 8
-KINDS = ("intent", "agreed", "ongoing", "completed", "cancelled", "progress", "uncertain")
+KINDS = ("intent", "opportunity", "agreed", "ongoing", "completed", "progress", "interaction",
+         "cancelled", "uncertain")
 _ORDER = {kind: index for index, kind in enumerate(KINDS)}
+LONDON = ZoneInfo("Europe/London")
 _COMPLETION = re.compile(
     r"\b(?:published|posted|uploaded|released|live\s+(?:finished|ended|done)|"
-    r"(?:finished|completed|done)\b.{0,24}\b(?:live|stream|video|campaign)|"
-    r"(?:live|stream|video|campaign)\b.{0,16}\b(?:done|over|ended|finished|complete|up))\b|"
+    r"(?:finished|completed|done)\b.{0,24}\b(?:lives?|streams?|videos?|campaigns?|content)|"
+    r"(?:lives?|streams?|videos?|campaigns?|content)\b.{0,16}\b"
+    r"(?:done|over|ended|finished|completed?|up))\b|"
     r"(?:直播|视频|内容|活动).{0,12}(?:结束|完成|发布|发出)|已发布|发了(?:视频|作品)|"
-    r"https?://(?:www\.)?tiktok\.com/@[^\s/]+/video/", re.I,
+    r"(?:直播|视频|内容|活动)已完成", re.I,
 )
 _NOT_FINISHED = re.compile(
     r"\b(?:not|haven['’]?t|hasn['’]?t|didn['’]?t|will|tomorrow|planning\s+to|going\s+to|need\s+to)\b|"
@@ -214,20 +218,35 @@ def validate(raw, pack, previous=()):
         at = max(_time(m["created_at"]) for m in cited)
         key = key or keys.setdefault(_object(obj), "C" + hashlib.sha256(
             (_object(obj) + "\0" + min(refs)).encode()).hexdigest()[:20])
+        roles = {message["role"] for message in cited}
+        bilateral = {"creator", "cm"} <= roles
         normalized.append({"key": key, "kind": kind, "object": obj, "refs": refs,
-                           "occurred_at": at.isoformat()})
+                           "occurred_at": at.isoformat(), "business_dates": sorted({
+                               _time(message["created_at"]).astimezone(LONDON).date().isoformat()
+                               for message in cited
+                           }) if bilateral else []})
 
+    grounded = []
     for fact in normalized:
         roles = {messages[ref]["role"] for ref in fact["refs"]}
-        if fact["kind"] in {"agreed", "ongoing"} and not {"creator", "cm"} <= roles:
+        if fact["kind"] == "interaction" and not {"creator", "cm"} <= roles:
+            continue
+        if fact["kind"] in {"opportunity", "agreed", "ongoing"} and not {"creator", "cm"} <= roles:
             fact["kind"] = "intent"
         elif fact["kind"] == "ongoing":
             fact["kind"] = _ongoing_kind([messages[ref] for ref in fact["refs"]], messages, pack.get("chats", {}))
+        grounded.append(fact)
+    normalized = grounded
     all_facts = [*previous, *normalized]
     for fact in normalized:
         cited = [messages[ref] for ref in fact["refs"]]
         established = any(f["key"] == fact["key"] and f["kind"] in {"agreed", "ongoing"}
-                          and _time(f["occurred_at"]) <= _time(fact["occurred_at"]) for f in all_facts)
+                          and _time(f["occurred_at"]) <= _time(fact["occurred_at"])
+                          for f in all_facts)
+        progressable = any(f["key"] == fact["key"]
+                           and f["kind"] in {"opportunity", "agreed", "ongoing"}
+                           and _time(f["occurred_at"]) <= _time(fact["occurred_at"])
+                           for f in all_facts)
         adverse = max((_time(f["occurred_at"]) for f in all_facts
                        if f["key"] == fact["key"] and f["kind"] in {"cancelled", "uncertain"}
                        and _time(f["occurred_at"]) <= _time(fact["occurred_at"])), default=None)
@@ -235,10 +254,14 @@ def validate(raw, pack, previous=()):
             established = any(f["key"] == fact["key"] and f["kind"] in {"agreed", "ongoing"}
                               and adverse < _time(f["occurred_at"]) <= _time(fact["occurred_at"])
                               for f in all_facts)
+            progressable = any(f["key"] == fact["key"]
+                               and f["kind"] in {"opportunity", "agreed", "ongoing"}
+                               and adverse < _time(f["occurred_at"]) <= _time(fact["occurred_at"])
+                               for f in all_facts)
         if fact["kind"] == "completed":
             if not established or not _completion_evidence(cited, messages, pack.get("chats", {})):
                 fact["kind"] = "intent"
-        elif fact["kind"] == "progress" and not established:
+        elif fact["kind"] == "progress" and not progressable:
             fact["kind"] = "intent"
     return merge_facts((), normalized)
 
@@ -251,13 +274,14 @@ def prompt_previous(previous):
     output = []
     for events in by_object.values():
         selected = []
-        for kind in ({"agreed", "ongoing", "completed", "cancelled", "uncertain"}, {"agreed", "ongoing"},
-                     {"completed"}, {"cancelled", "uncertain"}):
+        for kind in ({"opportunity", "agreed", "ongoing", "completed", "cancelled", "uncertain"},
+                     {"opportunity", "agreed", "ongoing"}, {"completed"}, {"cancelled", "uncertain"}):
             match = next((fact for fact in reversed(events) if fact["kind"] in kind), None)
             if match is not None and match not in selected:
                 selected.append(match)
         if not selected:
-            selected = [events[-1]]
+            selected = [match] if (match := next((fact for fact in reversed(events)
+                                                  if fact["kind"] != "interaction"), None)) else []
         output.extend({name: fact[name] for name in ("key", "kind", "object", "occurred_at")} for fact in selected)
     return sorted(output, key=lambda fact: (fact["key"], _time(fact["occurred_at"]), _ORDER[fact["kind"]]))
 
@@ -266,43 +290,67 @@ def merge_facts(previous, incoming):
     facts = {}
     for fact in [*previous, *incoming]:
         identity = (fact["key"], fact["kind"], tuple(sorted(set(fact["refs"]))))
-        facts[identity] = {**fact, "refs": sorted(set(fact["refs"]))}
+        current = facts.get(identity, {})
+        facts[identity] = {**fact, "refs": sorted(set(fact["refs"])), "business_dates": sorted(set(
+            current.get("business_dates", ())) | set(fact.get("business_dates", ())))}
     return sorted(facts.values(), key=lambda f: (_time(f["occurred_at"]), f["key"], _ORDER[f["kind"]], f["refs"]))
 
 
-def rank(facts, now=None):
-    """Sort factual lifecycle events, not messages, handles or model confidence."""
+def rank(facts, now=None, *, readable=False):
+    """Current maintenance priority from grounded events, never message volume or model confidence."""
     now = _time(now) if now is not None else datetime.now(UTC)
     groups = defaultdict(list)
     for fact in merge_facts((), facts):
         groups[fact["key"]].append(fact)
-    focus, single, history, intent = [], [], [], []
+    active, single, history, intent = [], [], [], []
+    business_at, progress_at, business_dates, historical = None, None, set(), False
     for events in groups.values():
-        state, repeat, completed = None, False, False
-        progress, last_completed = None, None
+        state, primary, repeat, completed = None, None, False, False
+        last_completed = None
         for event in events:
+            if _time(event["occurred_at"]) > now:
+                continue
             kind = event["kind"]
-            if kind in {"agreed", "ongoing"}:
+            if kind in {"intent", "opportunity", "agreed", "ongoing", "completed", "progress", "interaction"}:
+                if business_at is None or _time(event["occurred_at"]) > _time(business_at):
+                    business_at = event["occurred_at"]
+                business_dates.update(event.get("business_dates", ()))
+            if kind in {"agreed", "ongoing", "completed"}:
+                historical = True
+            if kind == "opportunity":
+                state = primary = event
+            elif kind in {"agreed", "ongoing"}:
                 repeat = repeat or completed or kind == "ongoing"
-                state = event
+                state = primary = event
             elif kind == "completed":
                 if state and state["kind"] in {"cancelled", "uncertain"}:
                     continue
-                state = event
+                state, primary = event, None
                 completed, last_completed = True, event
             elif kind in {"cancelled", "uncertain"}:
-                state, repeat = event, False
+                state, primary, repeat = event, None, False
                 if kind == "uncertain":
                     completed, last_completed = False, None
             elif kind == "intent" and state is None:
                 state = event
+            elif kind == "progress" and state and state["kind"] in {"opportunity", "agreed", "ongoing"}:
+                primary = event
             if kind in {"agreed", "ongoing", "completed", "progress"}:
-                progress = event["occurred_at"]
+                if progress_at is None or _time(event["occurred_at"]) > _time(progress_at):
+                    progress_at = event["occurred_at"]
         if state is None:
             continue
-        row = {"object": state["object"], "at": progress, "kind": state["kind"]}
+        row = {"object": state["object"], "at": primary["occurred_at"] if primary else state["occurred_at"],
+               "kind": state["kind"]}
+        if primary is not None:
+            primary_kind = primary["kind"]
+            active.append({"object": primary["object"], "at": primary["occurred_at"], "kind": primary_kind,
+                           "phase": "intent" if state["kind"] == "opportunity" else
+                                    "ongoing" if repeat or state["kind"] == "ongoing" else "single",
+                           "label": "具体机会" if primary_kind == "opportunity" else
+                                    "实质推进" if primary_kind == "progress" else "交付安排"})
         if state["kind"] in {"agreed", "ongoing"}:
-            (focus if repeat else single).append(row)
+            single.append(row)
         elif state["kind"] == "completed":
             history.append(row)
         elif state["kind"] == "cancelled" and last_completed is not None:
@@ -310,17 +358,40 @@ def rank(facts, now=None):
                             "kind": "completed"})
         elif state["kind"] == "intent":
             intent.append(row)
-    if focus:
-        selected, tier, phase, label = focus, "focus", "ongoing", "持续／再次合作"
+    primary_at = max((row["at"] for row in active), key=_time, default=None)
+    current = primary_at is not None and _time(primary_at) >= now - timedelta(days=30)
+    readable = bool(readable or groups)
+    if active:
+        selected, phase = active, None
     elif single:
-        selected, tier, phase, label = single, "normal", "single", "已成立单次合作"
+        selected, phase = single, "single"
     elif history:
-        selected, tier, phase, label = history, "normal", "history", "已完成合作"
+        selected, phase = history, "history"
     else:
-        selected, tier = intent, "pending"
-        phase, label = ("intent", "仅有合作意向") if intent else ("unknown", "暂无可靠合作事实")
-    selected.sort(key=lambda row: (row["at"] or "", row["object"]), reverse=True)
-    at = max((row["at"] for row in selected if row["at"]), default=None)
-    return {"tier": tier, "phase": phase, "last_progress_at": at,
-            "grounds": [f"{row['object'][:48]}：{label}" for row in selected[:2]] or [label],
-            "needs_update": bool(tier != "pending" and at and _time(at) < now - timedelta(days=30))}
+        selected = intent
+        phase = "intent" if intent else "unknown"
+    tier = "focus" if current else "normal" if readable else "pending"
+    selected.sort(key=lambda row: (_time(row["at"]), row["object"]), reverse=True)
+    if active:
+        phase = selected[0]["phase"]
+    recent_date = now.astimezone(LONDON).date() - timedelta(days=29)
+    today = now.astimezone(LONDON).date()
+    business_dates = sorted(day for day in business_dates if datetime.fromisoformat(day).date() <= today)
+    recent_business_dates = [day for day in business_dates
+                             if datetime.fromisoformat(day).date() >= recent_date]
+    priority = {"primary_at": primary_at, "business_at": business_at,
+                "business_days": business_dates, "historical": historical}
+    if tier == "focus":
+        lead = selected[0]
+        grounds = [f"{lead['object'][:48]}：{lead['label']}"]
+        latest = _time(business_at).astimezone(LONDON).strftime("%m-%d")
+        grounds.append(f"近30天业务交流{len(recent_business_dates)}天 · 最近推进{latest}")
+    elif tier == "normal":
+        grounds = ["近期无重点事项"] + (["已有历史合作记录"] if historical else [])
+    else:
+        grounds = ["尚无完整可读资料"]
+    return {"tier": tier, "phase": phase, "last_progress_at": progress_at,
+            "grounds": grounds,
+            "needs_update": bool(readable and business_at and _time(business_at) < now - timedelta(days=30)),
+            "primary_at": primary_at, "recent_business_dates": recent_business_dates,
+            "has_history": historical, "priority": priority}

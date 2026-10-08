@@ -7,7 +7,7 @@ from .identity_profiles import safe_avatar_url
 from .lark_api import private_chat_url
 
 
-def page_data(actor_id, cm_id=None, tab="mine", query="", page=1, sort="name", tier=""):
+def page_data(actor_id, cm_id=None, tab="mine", query="", page=1, sort="importance", tier=""):
     """Current library: Excel import candidates and confirmed people."""
     query = str(query or "").strip()[:120]
     sort = sort if sort in {"name", "importance"} and tab == "mine" else "name"
@@ -72,8 +72,9 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1, sort="name", t
                     args.append(tier)
                 if sort == "importance":
                     order = """CASE COALESCE(ip.effective_tier,'pending') WHEN 'focus' THEN 0
-                        WHEN 'normal' THEN 1 ELSE 2 END,ip.phase_rank ASC NULLS LAST,
-                        ip.last_substantive_progress_at DESC NULLS LAST,c.display_name,c.id"""
+                        WHEN 'normal' THEN 1 ELSE 2 END,ip.recency_rank,ip.business_days DESC,
+                        ip.last_substantive_progress_at DESC NULLS LAST,ip.has_history DESC,
+                        lower(c.display_name),c.id"""
             if query:
                 formal_base += """ AND (POSITION(lower(%s) IN lower(COALESCE(c.display_name,'')))>0
                     OR EXISTS (SELECT 1 FROM contact_social_accounts l JOIN social_accounts s

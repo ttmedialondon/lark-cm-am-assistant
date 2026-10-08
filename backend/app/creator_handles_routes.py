@@ -154,7 +154,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
     @router.get("")
     @router.get("/data")
     def page(request: Request, cm_id: UUID | None = None, tab: str = "mine", q: str = "", page: int = 1,
-             sort: str = "name", tier: str = ""):
+             sort: str = "importance", tier: str = ""):
         auth = current_authorization(request)
         if request.url.path == "/creators" and not auth:
             return secure(RedirectResponse("/", status_code=303))

@@ -68,6 +68,8 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
     monkeypatch.setattr(creator_importance, "get_settings", lambda: settings)
     monkeypatch.setattr(admin_permissions, "permission_keys_for", lambda _: ())
 
+    default = client.get(f"/creators/data?cm_id={cm}")
+    assert default.status_code == 200 and default.json()["sort"] == "importance"
     pending = client.get(f"/creators/data?cm_id={cm}&sort=importance&tier=pending")
     assert pending.status_code == 200 and pending.json()["total_count"] == 1
     assert pending.json()["items"][0]["importance"]["tier"] == "pending"

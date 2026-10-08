@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}我的达人 · TT Media{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-roster.css?v=20261008-cooperation">{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-roster.css?v=20261008-maintenance">{% endblock %}
 {% block body %}
 <div class="page business-page" id="creators-app" data-csrf="{{ csrf_token }}" data-tab="{{ creator_tab }}" data-actor="{{ authorization.id }}">
   {% with business_section='creators' %}{% include "partials/business_nav.html" %}{% endwith %}
@@ -13,8 +13,8 @@
     <section class="card mb-3" id="creators-import-batches" hidden aria-label="Excel 导入记录"><div class="card-header"><h3 class="card-title">Excel 导入记录</h3></div><div id="creators-import-batch-list" class="card-body"></div></section>
     <section class="card creator-roster-card"><div class="card-header d-flex align-items-center flex-wrap gap-3"><div class="btn-list me-auto" role="group" aria-label="达人列表"><button type="button" id="creators-mine" class="btn">我的达人</button><button type="button" id="creators-candidates" class="btn">候选达人</button><button type="button" id="creators-unassigned" class="btn" hidden>未分配达人</button></div><form id="creators-search" class="d-flex gap-2" role="search"><label class="visually-hidden" for="creators-query">姓名或 handle</label><input class="form-control" id="creators-query" type="search" value="{{ creator_query }}" maxlength="120" placeholder="搜索姓名或 handle"><button class="btn btn-outline-secondary" type="submit">搜索</button></form></div>
       <div class="creator-importance-toolbar" id="creators-importance-toolbar" {% if not creator_data.can_view_importance %}hidden{% endif %}>
-        <div><label class="visually-hidden" for="creators-tier">合作重要度</label><select class="form-select form-select-sm" id="creators-tier"><option value="">全部重要度</option><option value="focus">重点</option><option value="normal">常规</option><option value="pending">待评估</option></select></div>
-        <div><label class="visually-hidden" for="creators-sort">排序</label><select class="form-select form-select-sm" id="creators-sort"><option value="name">按姓名排序</option><option value="importance">按合作重要度排序</option></select></div>
+        <div><label class="visually-hidden" for="creators-tier">维护优先级</label><select class="form-select form-select-sm" id="creators-tier"><option value="">全部优先级</option><option value="focus">重点</option><option value="normal">常规</option><option value="pending">待评估</option></select></div>
+        <div><label class="visually-hidden" for="creators-sort">排序</label><select class="form-select form-select-sm pe-4" id="creators-sort"><option value="importance">按维护优先级排序</option><option value="name">按姓名排序</option></select></div>
       </div>
       {% if creator_data.can_broadcast %}<div class="creator-selection-bar" id="creators-selection-bar" hidden><label class="form-check mb-0"><input class="form-check-input" type="checkbox" id="creators-select-page"><span class="form-check-label">本页全选</span></label><span id="creators-selection-count" class="fw-semibold" role="status" aria-live="polite">已选 0 / 500 位</span><span class="text-secondary small creator-selection-hint">搜索、翻页保留选择</span><div class="btn-list ms-auto"><button class="btn btn-sm btn-outline-secondary" id="creators-selection-clear" type="button" disabled>清空选择</button><button class="btn btn-sm btn-primary" id="creators-selection-broadcast" type="button" disabled>带入群发</button></div></div>{% endif %}
       <div class="table-responsive"><table class="table table-vcenter card-table creator-roster-table"><thead><tr>{% if creator_data.can_broadcast %}<th scope="col" class="creator-selection-cell" id="creators-selection-head" hidden>选择</th>{% endif %}<th scope="col">达人 handle</th><th scope="col">Lark 用户</th><th scope="col">操作</th></tr></thead><tbody id="creators-rows"></tbody></table></div>
@@ -35,5 +35,5 @@
   </dialog>
 </div>
 <script id="creators-initial" type="application/json">{{ creator_data|tojson }}</script>
-<script src="/static/creator-handles.js?v=20261008-cooperation-context" defer></script>
+<script src="/static/creator-handles.js?v=20261008-maintenance" defer></script>
 {% endblock %}

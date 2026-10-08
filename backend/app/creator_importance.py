@@ -70,16 +70,31 @@ _VALID_SOURCE = """EXISTS(SELECT 1 FROM chat_messages m
       AND md5(m.mentions_json::text) IS NOT DISTINCT FROM s->>'mentions_fingerprint'
       AND (m.sender_open_id=a.open_id OR i.contact_id=p.contact_id AND i.identity_type='user'))"""
 _PROFILE_VALID = "creator_importance_is_eligible(p.contact_id,p.responsible_authorization_id) AND p.auto_valid " \
+                 "AND p.prompt_version='" + facts.PROMPT_VERSION + "' " \
                  "AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(p.sources) s WHERE NOT " + _VALID_SOURCE + ")"
 
 
 def roster_sql(cm_id):
     join = """ LEFT JOIN LATERAL(SELECT
-        COALESCE(p.manual_tier,CASE WHEN """ + _PROFILE_VALID + """ THEN p.auto_tier END,'pending') effective_tier,
-        CASE WHEN """ + _PROFILE_VALID + """ THEN CASE p.phase WHEN 'ongoing' THEN 0 WHEN 'single' THEN 1
-          WHEN 'history' THEN 2 WHEN 'intent' THEN 3 ELSE 4 END ELSE 4 END phase_rank,
-        CASE WHEN """ + _PROFILE_VALID + """ THEN p.last_substantive_progress_at END last_substantive_progress_at
-        FROM creator_importance_profiles p WHERE p.contact_id=c.id AND p.responsible_authorization_id=%s
+        COALESCE(p.manual_tier,CASE WHEN v.valid THEN
+          CASE WHEN s.primary_at>=NOW()-INTERVAL '30 days' AND s.primary_at<=NOW() THEN 'focus'
+            WHEN COALESCE((p.coverage->>'has_readable')::boolean,FALSE) THEN 'normal' ELSE 'pending' END
+          END,'pending') effective_tier,
+        CASE WHEN v.valid THEN CASE WHEN s.signal_at BETWEEN NOW()-INTERVAL '7 days' AND NOW() THEN 0
+          WHEN s.signal_at BETWEEN NOW()-INTERVAL '30 days' AND NOW() THEN 1 ELSE 2 END ELSE 2 END recency_rank,
+        CASE WHEN v.valid THEN (SELECT count(DISTINCT day)
+          FROM jsonb_array_elements_text(COALESCE(p.coverage->'priority'->'business_days','[]'::jsonb)) day
+          WHERE day::date BETWEEN (NOW() AT TIME ZONE 'Europe/London')::date-29
+            AND (NOW() AT TIME ZONE 'Europe/London')::date) ELSE 0 END business_days,
+        CASE WHEN v.valid THEN s.business_at END last_substantive_progress_at,
+        v.valid AND COALESCE((p.coverage->'priority'->>'historical')::boolean,FALSE) has_history
+        FROM creator_importance_profiles p
+        CROSS JOIN LATERAL(SELECT (""" + _PROFILE_VALID + """) valid) v
+        CROSS JOIN LATERAL(SELECT
+          (p.coverage->'priority'->>'primary_at')::timestamptz primary_at,
+          (p.coverage->'priority'->>'business_at')::timestamptz business_at) times
+        CROSS JOIN LATERAL(SELECT times.*,times.business_at signal_at) s
+        WHERE p.contact_id=c.id AND p.responsible_authorization_id=%s
         AND creator_importance_is_eligible(p.contact_id,p.responsible_authorization_id)
       ) ip ON TRUE """
     return join, [cm_id]
@@ -138,8 +153,11 @@ def _prune(conn, state, job):
 
 def _save_profile(conn, job, state, settings, *, cutoff=None, history_complete=False):
     selected = {ref for item in state["facts"] for ref in item["refs"]}
+    readable = state.get("readable_ref") in state["sources"]
+    if readable:
+        selected.add(state["readable_ref"])
     sources = [s for ref, s in state["sources"].items() if ref in selected]
-    result = facts.rank(state["facts"])
+    result = facts.rank(state["facts"], readable=readable)
     conn.execute("""INSERT INTO creator_importance_profiles(contact_id,responsible_authorization_id,
         auto_tier,phase,last_substantive_progress_at,facts_ciphertext,sources,auto_valid,coverage,
         window_start,cutoff,evaluated_at,prompt_version)
@@ -153,6 +171,7 @@ def _save_profile(conn, job, state, settings, *, cutoff=None, history_complete=F
          result.get("last_progress_at"), _cipher(settings).encrypt(creator_data.encode(state["facts"])),
          creator_data.encode(sources), history_complete, creator_data.encode({"history_complete": history_complete,
              "unreadable": state["unreadable"], "gaps": state["gaps"], "processed": len(state["seen"]),
+             "has_readable": readable or bool(state["facts"]), "priority": result["priority"],
              "source_history_complete": all(state.get("chat_coverage", {}).values())
                  if state.get("chat_coverage") else False}),
          job["history_start"], cutoff or job["history_end"], facts.PROMPT_VERSION))
@@ -177,7 +196,7 @@ def view_for(conn, contact_id, cm_id, settings, *, actor_id=None):
                 and not row["coverage"].get("history_complete") else
                 "依据已变化，等待更新" if row["evaluated_at"] else "尚未自动评估"}
     material = json.loads(_cipher(settings).decrypt(row["facts_ciphertext"])) if row["facts_ciphertext"] else []
-    result = facts.rank(material)
+    result = facts.rank(material, readable=row["coverage"].get("has_readable", False))
     tier = row["manual_tier"] or result["tier"]
     coverage = row["coverage"]
     output.update(tier=tier, tier_label=TIERS[tier], phase_label=PHASES[result["phase"]],
@@ -474,6 +493,11 @@ def _finish_batch(conn, job, material, settings, incoming=()):
     state = material["state"]
     state["facts"] = facts.merge_facts(state["facts"], incoming)
     state["sources"].update({source["ref"]: source for source in material["sources"]})
+    # Even an empty-fact assessment needs a revocable source proving that text was actually read.
+    readable = [m["ref"] for m in (material["pack"] or {}).get("messages", ())
+                if m["role"] in {"creator", "cm"} and m["context_complete"] and m["text"].strip()]
+    if readable:
+        state["readable_ref"] = readable[-1]
     remaining = {key: value for key, value in job["pending_messages"].items() if key not in material["consumed"]}
     history_complete = not job["needs_history"] or material["done"]
     finished = history_complete and not remaining

@@ -74,7 +74,7 @@ test("creator names open permitted profiles while a separate accessible icon ope
   const data = {cms: [{id: "cm-1", name: "CM"}], selected_cm_id: "cm-1", can_select_cm: false,
     can_view_unassigned: false, can_view_importance: true, can_adjust_importance: true,
     read_only: false, import_batches: [],
-    sort: "name", tier: "", importance_running: true, page: 1, total_count: 3, total_pages: 1,
+    sort: "importance", tier: "", importance_running: true, page: 1, total_count: 3, total_pages: 1,
     items: [
       {id: "person-1", kind: "confirmed", display_name: "Creator One", open_id: "ou_creator_one", profile_url: "/admin/contacts/ou_creator_one", handles: ["one"]},
       {id: "person-2", kind: "confirmed", display_name: "No identity", open_id: null, profile_url: null, handles: ["two"]},
@@ -83,7 +83,7 @@ test("creator names open permitted profiles while a separate accessible icon ope
   const tierLabels = {focus: "重点", normal: "常规", pending: "待评估"};
   for (const [i, tier] of ["focus", "normal", "pending"].entries()) data.items[i].importance = {
     tier, tier_label: tierLabels[tier], phase_label: i === 0 ? "持续合作" : i === 1 ? "单次合作" : "",
-    grounds: i === 0 ? ["已确认持续合作安排。", "双方确认下一轮合作。", "这一条不应展示。"] : [],
+    grounds: i === 0 ? ["Acme：需要跟进直播安排。", "Beta：事项仍在推进。", "这一条不应展示。"] : [],
     cutoff_label: i === 2 ? "" : "10-08 13:00", gap_label: i === 2 ? "尚未评估" : "",
     manual_tier: "", manual_reason: "",
   };
@@ -112,7 +112,7 @@ test("creator names open permitted profiles while a separate accessible icon ope
     state.calls.push({method: request.method(), url: target.pathname, search: target.search});
     if (target.pathname === "/admin/contacts/ou_creator_one") return route.fulfill({contentType: "text/html", body: "<p>Creator One profile</p>"});
     if (target.pathname === "/creators/data") {
-      state.data.sort = target.searchParams.get("sort") || "name";
+      state.data.sort = target.searchParams.get("sort") || "importance";
       state.data.tier = target.searchParams.get("tier") || "";
       return route.fulfill({status: state.status,
         json: state.status === 200 ? state.data : {error: "Fixture access no longer available"}});
@@ -124,14 +124,23 @@ test("creator names open permitted profiles while a separate accessible icon ope
   await rows.nth(2).waitFor();
   const names = rows.locator("td:nth-child(2) .fw-bold");
   assert.deepEqual(await names.allTextContents(), data.items.map(item => item.display_name));
-  assert.deepEqual(await rows.locator(".creator-importance-badge").allTextContents(), ["重点 · 持续合作", "常规 · 单次合作", "待评估"]);
+  assert.equal(await page.locator("#creators-sort").inputValue(), "importance");
+  assert.deepEqual(await rows.locator(".creator-importance-badge").allTextContents(), ["重点", "常规", "待评估"]);
+  assert.equal(await rows.first().locator(".creator-importance-detail > summary").textContent(), "维护依据");
   await rows.first().locator(".creator-importance-detail > summary").click();
   assert.equal(await rows.first().locator(".creator-importance-grounds li").count(), 2);
+  assert.equal(await page.getByText("Acme：需要跟进直播安排。", {exact: true}).count(), 1);
+  const manual = rows.first().locator(".creator-importance-editor");
+  assert(!(await manual.evaluate(element => element.open)));
+  await manual.locator("summary").click();
+  assert.equal(await manual.getByRole("combobox", {name: "人工维护优先级"}).count(), 1);
+  await manual.locator("summary").click();
   await rows.nth(2).locator(".creator-importance-detail > summary").click();
   assert.equal(await rows.nth(2).getByText("尚未评估", {exact: true}).count(), 1);
+  assert.equal(await rows.nth(2).locator(".creator-importance-grounds li").count(), 0);
   await rows.nth(2).locator(".creator-importance-detail > summary").click();
   assert.equal(await page.getByText("这一条不应展示。", {exact: true}).count(), 0);
-  assert.equal(await page.getByText("截至 10-08 13:00", {exact: true}).count(), 2);
+  assert.equal(await page.getByText("资料截至 10-08 13:00", {exact: true}).count(), 2);
   const polling = page.waitForResponse(response => response.url().includes("/creators/data?"));
   state.data.importance_running = false;
   await polling;
@@ -211,7 +220,7 @@ test("creator names open permitted profiles while a separate accessible icon ope
   const search = new URLSearchParams(state.calls.at(-1).search);
   assert.equal(search.get("tab"), "mine");
   assert.equal(search.get("q"), "Creator");
-  for (const [key, value] of [["sort", "importance"], ["tier", "focus"]]) {
+  for (const [key, value] of [["sort", "name"], ["sort", "importance"], ["tier", "focus"]]) {
     await Promise.all([
       page.waitForResponse(response => response.url().includes("/creators/data?") && new URL(response.url()).searchParams.get(key) === value),
       page.locator(`#creators-${key}`).selectOption(value),
@@ -219,6 +228,9 @@ test("creator names open permitted profiles while a separate accessible icon ope
   }
   const ranked = new URLSearchParams(state.calls.at(-1).search);
   assert.equal(ranked.get("q"), "Creator"); assert.equal(ranked.get("sort"), "importance"); assert.equal(ranked.get("tier"), "focus");
+  state.data.can_adjust_importance = false;
+  await page.locator("#creators-refresh").click();
+  await page.waitForFunction(() => [...document.querySelectorAll('.creator-importance-editor')].every(node => node.hidden));
   for (const item of state.data.items) item.importance = null;
   await page.locator("#creators-refresh").click();
   await page.waitForFunction(() => [...document.querySelectorAll('.creator-importance-badge')].every(node => node.hidden));
