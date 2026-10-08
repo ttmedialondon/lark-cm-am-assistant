@@ -108,6 +108,7 @@ def ranking_flow(pg, monkeypatch):
         for marker, kind, obj in (
             ("ONGOING", "ongoing", "Acme weekly lives"),
             ("SINGLE", "agreed", "Beta single video"),
+            ("GAMMA", "agreed", "Gamma autumn video"),
         ):
             cited = [m for m in pack["messages"] if marker in m["text"] and m["role"] in {"creator", "cm"}]
             if {m["role"] for m in cited} == {"creator", "cm"}:
@@ -137,7 +138,7 @@ def ranking_flow(pg, monkeypatch):
     monkeypatch.setattr(importance, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(importance, "get_settings", lambda: settings)
     monkeypatch.setattr(importance.api, "call_openai", respond)
-    monkeypatch.setattr(importance, "MAX_MESSAGES", 2)
+    monkeypatch.setattr(importance, "MAX_MESSAGES", 1)
     state.message, state.enable, state.due, state.drain = message, enable, due, drain
     state.cipher = cipher
     message("a1", "ONGOING Acme: please join our agreed weekly lives", at=now - timedelta(days=20))
@@ -146,7 +147,6 @@ def ranking_flow(pg, monkeypatch):
         "ONGOING Acme: agreed, I will do our weekly lives",
         creator=True,
         at=now - timedelta(days=20) + timedelta(minutes=1),
-        parent="a1",
     )
     message("a3", "Thanks", at=now - timedelta(days=19))
     message("a4", "Thank you", creator=True, at=now - timedelta(days=19) + timedelta(minutes=1), parent="a3")
@@ -246,6 +246,26 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
         (flow.owner,),
     ).fetchone()["manual_reason_ciphertext"]
     assert "Human-reviewed priority" not in raw_manual
+    # Natural replies do not always carry parent_id; the newly confirmed object must survive incremental batching.
+    flow.message(
+        "gamma_question", "GAMMA Gamma: one agreed video on Friday, please confirm", at=flow.now - timedelta(minutes=2)
+    )
+    flow.drain()
+    flow.message(
+        "gamma_acceptance", "GAMMA Gamma: confirmed, I will post the agreed video on Friday",
+        creator=True, at=flow.now - timedelta(minutes=1),
+    )
+    flow.drain()
+    material = pg.execute(
+        "SELECT facts_ciphertext,sources FROM creator_importance_profiles WHERE responsible_authorization_id=%s",
+        (flow.owner,),
+    ).fetchone()
+    incremental = next(
+        fact for fact in json.loads(importance._cipher(flow.settings).decrypt(material["facts_ciphertext"]))
+        if fact["object"] == "Gamma autumn video" and fact["kind"] == "agreed"
+    )
+    refs = {source["ref"]: source["message_id"] for source in material["sources"]}
+    assert {refs[ref] for ref in incremental["refs"]} == {"gamma_question", "gamma_acceptance"}
     calls = len(flow.calls)
     flow.message("new_empty", "Thank you, have a nice day", creator=True, at=flow.now - timedelta(minutes=5))
     # Arrival during an active request must survive finishing that request, including an older business timestamp.

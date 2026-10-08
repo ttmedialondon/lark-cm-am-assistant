@@ -253,7 +253,8 @@
         parts.importanceBadge.textContent = [importance.tier_label || "待评估", importance.phase_label, importance.manual_tier ? "人工" : ""].filter(Boolean).join(" · ");
         parts.grounds.replaceChildren(...(importance.grounds || []).slice(0, 2).map(text => node("li", text)));
         parts.grounds.hidden = !parts.grounds.childElementCount;
-        parts.cutoff.textContent = importance.cutoff_label ? `截至 ${importance.cutoff_label}` : "尚未评估";
+        parts.cutoff.textContent = importance.cutoff_label ? `截至 ${importance.cutoff_label}` : "";
+        parts.cutoff.hidden = !importance.cutoff_label;
         parts.gap.textContent = importance.gap_label || (importance.stale ? "依据待更新" : "");
         parts.gap.hidden = !parts.gap.textContent;
         if (parts.manualTier) {

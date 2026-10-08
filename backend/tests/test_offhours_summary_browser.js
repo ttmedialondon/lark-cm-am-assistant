@@ -84,7 +84,8 @@ test("creator names open permitted profiles while a separate accessible icon ope
   for (const [i, tier] of ["focus", "normal", "pending"].entries()) data.items[i].importance = {
     tier, tier_label: tierLabels[tier], phase_label: i === 0 ? "持续合作" : i === 1 ? "单次合作" : "",
     grounds: i === 0 ? ["已确认持续合作安排。", "双方确认下一轮合作。", "这一条不应展示。"] : [],
-    cutoff_label: "10-08 13:00", gap_label: "", manual_tier: "", manual_reason: "",
+    cutoff_label: i === 2 ? "" : "10-08 13:00", gap_label: i === 2 ? "尚未评估" : "",
+    manual_tier: "", manual_reason: "",
   };
   const rendered = spawnSync(path.join(backend, ".venv/bin/python"), ["-c",
     "import json,sys; from app.lark_api import private_chat_url; from jinja2 import Environment,FileSystemLoader,select_autoescape; data=json.load(sys.stdin); [item.update(private_chat_url=private_chat_url(item['open_id'])) for item in data['items']]; html=Environment(loader=FileSystemLoader('app/templates'),autoescape=select_autoescape()).get_template('creator_handles.html').render(authorization={'display_name':'CM'},creator_data=data,creator_tab='mine',creator_query='',csrf_token='fixture-csrf'); print(json.dumps({'data':data,'html':html}))"],
@@ -126,8 +127,11 @@ test("creator names open permitted profiles while a separate accessible icon ope
   assert.deepEqual(await rows.locator(".creator-importance-badge").allTextContents(), ["重点 · 持续合作", "常规 · 单次合作", "待评估"]);
   await rows.first().locator(".creator-importance-detail > summary").click();
   assert.equal(await rows.first().locator(".creator-importance-grounds li").count(), 2);
+  await rows.nth(2).locator(".creator-importance-detail > summary").click();
+  assert.equal(await rows.nth(2).getByText("尚未评估", {exact: true}).count(), 1);
+  await rows.nth(2).locator(".creator-importance-detail > summary").click();
   assert.equal(await page.getByText("这一条不应展示。", {exact: true}).count(), 0);
-  assert.equal(await page.getByText("截至 10-08 13:00", {exact: true}).count(), 3);
+  assert.equal(await page.getByText("截至 10-08 13:00", {exact: true}).count(), 2);
   const polling = page.waitForResponse(response => response.url().includes("/creators/data?"));
   state.data.importance_running = false;
   await polling;

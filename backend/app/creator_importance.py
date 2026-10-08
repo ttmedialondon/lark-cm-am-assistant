@@ -304,18 +304,39 @@ def build_batch(conn, job, settings, state):
     done = (len(rows) < MAX_MESSAGES if history
             else not job["pending_messages"] or len(pending) == len(job["pending_messages"]))
     by_key = {(r["chat_id"], r["message_id"]): r for r in rows}
-    missing = {(r["chat_id"], r["parent_id"]) for r in rows if r.get("parent_id")} - set(by_key)
-    for _ in range(8):
-        if not missing or len(by_key) >= MAX_MESSAGES * 2:
+
+    def read_parents():
+        missing = {(r["chat_id"], r["parent_id"]) for r in by_key.values() if r.get("parent_id")} - set(by_key)
+        for _ in range(8):
+            room = MAX_MESSAGES * 2 - len(by_key)
+            if not missing or room <= 0:
+                break
+            extra = conn.execute(_COLUMNS + _READABLE + " AND EXISTS(SELECT 1 FROM jsonb_to_recordset(%s::jsonb) "
+                "AS x(chat_id text,message_id text) WHERE x.chat_id=m.chat_id AND x.message_id=m.message_id) LIMIT %s",
+                (cm_id, contact_id, contact_id, contact_id, contact_id,
+                 creator_data.encode([{"chat_id": c, "message_id": m} for c, m in sorted(missing)]), room)).fetchall()
+            if not extra:
+                break
+            by_key.update({(r["chat_id"], r["message_id"]): r for r in extra})
+            missing = {(r["chat_id"], r["parent_id"]) for r in extra if r.get("parent_id")} - set(by_key)
+
+    read_parents()
+    boundaries = {}
+    for row in rows:
+        boundaries.setdefault(row["chat_id"], row)
+    # Natural chat answers often have no parent_id; carry a bounded same-chat tail across batches.
+    tail_limit = max(1, min(4, MAX_MESSAGES // max(1, len(boundaries))))
+    for chat_id, first in boundaries.items():
+        room = MAX_MESSAGES * 2 - len(by_key)
+        if room <= 0:
             break
-        extra = conn.execute(_COLUMNS + _READABLE + " AND EXISTS(SELECT 1 FROM jsonb_to_recordset(%s::jsonb) "
-            "AS x(chat_id text,message_id text) WHERE x.chat_id=m.chat_id AND x.message_id=m.message_id) LIMIT 80",
-            (cm_id, contact_id, contact_id, contact_id, contact_id,
-             creator_data.encode([{"chat_id": c, "message_id": m} for c, m in sorted(missing)]))).fetchall()
-        if not extra:
-            break
+        extra = conn.execute(_COLUMNS + _READABLE + " AND m.chat_id=%s "
+            "AND m.message_create_time>=%s AND (m.message_create_time,m.message_id)<(%s,%s) "
+            "ORDER BY m.message_create_time DESC,m.message_id DESC LIMIT %s",
+            (cm_id, contact_id, contact_id, contact_id, contact_id, chat_id, job["history_start"],
+             first["message_create_time"], first["message_id"], min(tail_limit, room))).fetchall()
         by_key.update({(r["chat_id"], r["message_id"]): r for r in extra})
-        missing = {(r["chat_id"], r["parent_id"]) for r in extra if r.get("parent_id")} - set(by_key)
+    read_parents()
     body_cipher = message_body_cipher(settings.token_encryption_key)
     names = mention_names(conn, list(by_key.values()), lock=False)
     chats = {}
@@ -378,14 +399,18 @@ def build_batch(conn, job, settings, state):
         if item is None:
             state["unreadable"] += 1
         elif state["seen"].get(ref) != _hash(item["source"]):
-            chain, current, visited = [], key, set()
-            while current in decoded and current not in visited:
-                visited.add(current)
-                chain.append(current)
-                parent_id = by_key[current].get("parent_id")
-                if not parent_id:
-                    break
-                current = current[0], parent_id
+            nearby = sorted((k for k in decoded if k[0] == key[0]
+                and (by_key[k]["message_create_time"], k[1]) < (anchor["message_create_time"], key[1])),
+                key=lambda k: (by_key[k]["message_create_time"], k[1]))[-min(4, MAX_MESSAGES):]
+            chain, visited = [], set()
+            for current in [key, *nearby]:
+                while current in decoded and current not in visited:
+                    visited.add(current)
+                    chain.append(current)
+                    parent_id = by_key[current].get("parent_id")
+                    if not parent_id:
+                        break
+                    current = current[0], parent_id
             bundle = [k for k in reversed(chain) if k not in selected]
             length = sum(len(decoded[k]["message"]["text"]) for k in bundle)
             if length > MAX_CHARS or len(bundle) > MAX_MESSAGES * 2:
