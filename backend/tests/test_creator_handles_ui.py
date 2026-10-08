@@ -213,9 +213,9 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
         "Confirmed rosters queried retired import candidates"))
     for suffix in ("", "?tab=candidates", "?tab=invalid"):
         default = client.get("/creators/data" + suffix)
-        assert default.status_code == 200 and default.json()["tab"] == "unassigned"
-        assert [item["id"] for item in default.json()["items"]] == [str(unassigned)]
-        assert default.json()["read_only"] and not default.json()["can_edit_handles"]
+        assert default.status_code == 200 and default.json()["tab"] == "mine"
+        assert default.json()["items"] == []
+        assert not default.json()["read_only"] and default.json()["can_edit_handles"]
     pending = client.get(f"/creators/data?tab=mine&cm_id={cm}&sort=importance&tier=pending")
     assert pending.status_code == 200 and pending.json()["total_count"] == 1
     assert pending.json()["items"][0]["importance"]["tier"] == "pending"

@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}我的达人 · TT Media{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-roster.css?v=20261008-unassigned-default">{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-roster.css?v=20261008-mine-default">{% endblock %}
 {% block body %}
 <div class="page business-page" id="creators-app" data-csrf="{{ csrf_token }}" data-tab="{{ creator_tab }}" data-actor="{{ authorization.id }}">
   {% with business_section='creators' %}{% include "partials/business_nav.html" %}{% endwith %}
@@ -8,7 +8,7 @@
     <div class="business-heading"><h2 class="page-title">我的达人</h2><div class="btn-list">{% if creator_data.can_broadcast %}<a class="btn btn-outline-primary" href="/creators/broadcast">群发预览</a>{% endif %}<button type="button" id="creators-import-open" class="btn btn-primary">导入 Excel</button><button type="button" id="creators-refresh" class="btn btn-outline-secondary">刷新</button></div></div>
     <div id="creators-notice" class="alert d-none" role="status"></div>
     <details class="card mb-3 creator-import-history" id="creators-import-batches" hidden><summary class="fw-semibold">导入记录</summary><div id="creators-import-batch-list" class="card-body"></div></details>
-    <section class="card creator-roster-card"><div class="card-header d-flex align-items-center flex-wrap gap-3"><div class="btn-list me-auto" role="group" aria-label="达人列表"><button type="button" id="creators-unassigned" class="btn" hidden>未分配达人</button><button type="button" id="creators-mine" class="btn">我的达人</button></div>{% if creator_data.can_select_cm %}<div class="creator-cm-filter" id="creators-cm-filter"><label for="creators-cm" class="visually-hidden">负责人</label><select id="creators-cm" class="form-select"><option value="">暂无可用负责人</option></select></div>{% endif %}<form id="creators-search" class="d-flex gap-2" role="search"><label class="visually-hidden" for="creators-query">姓名或 handle</label><input class="form-control" id="creators-query" type="search" value="{{ creator_query }}" maxlength="120" placeholder="搜索姓名或 handle"><button class="btn btn-outline-secondary" type="submit">搜索</button></form></div>
+    <section class="card creator-roster-card"><div class="card-header d-flex align-items-center flex-wrap gap-3"><div class="btn-list me-auto" role="group" aria-label="达人列表"><button type="button" id="creators-mine" class="btn">我的达人</button><button type="button" id="creators-unassigned" class="btn" hidden>未分配达人</button></div>{% if creator_data.can_select_cm %}<div class="creator-cm-filter" id="creators-cm-filter"><label for="creators-cm" class="visually-hidden">负责人</label><select id="creators-cm" class="form-select"><option value="">暂无可用负责人</option></select></div>{% endif %}<form id="creators-search" class="d-flex gap-2" role="search"><label class="visually-hidden" for="creators-query">姓名或 handle</label><input class="form-control" id="creators-query" type="search" value="{{ creator_query }}" maxlength="120" placeholder="搜索姓名或 handle"><button class="btn btn-outline-secondary" type="submit">搜索</button></form></div>
       <div class="creator-importance-toolbar" id="creators-importance-toolbar" {% if not creator_data.can_view_importance %}hidden{% endif %}>
         <div><label class="visually-hidden" for="creators-tier">维护优先级</label><select class="form-select form-select-sm" id="creators-tier"><option value="">全部优先级</option><option value="focus">重点</option><option value="priority">优先</option><option value="normal">常规</option><option value="dormant">久未联系</option><option value="pending">待评估</option></select></div>
         <div><label class="visually-hidden" for="creators-sort">排序</label><select class="form-select form-select-sm pe-4" id="creators-sort"><option value="importance">按维护优先级排序</option><option value="name">按姓名排序</option></select></div>
@@ -30,5 +30,5 @@
   </dialog>
 </div>
 <script id="creators-initial" type="application/json">{{ creator_data|tojson }}</script>
-<script src="/static/creator-handles.js?v=20261008-unassigned-default" defer></script>
+<script src="/static/creator-handles.js?v=20261008-mine-default" defer></script>
 {% endblock %}

@@ -13,7 +13,7 @@ def page_data(actor_id, cm_id=None, tab="", query="", page=1, sort="importance",
     page = max(1, min(int(page), 10000))
     with connection() as conn, conn.transaction():
         can_view_unassigned = creator_access.is_owner(conn, actor_id)
-        tab = tab if tab in {"mine", "unassigned"} else ("unassigned" if can_view_unassigned else "mine")
+        tab = tab if tab in {"mine", "unassigned"} else "mine"
         sort = sort if sort in {"name", "importance"} and tab == "mine" else "name"
         tier = tier if tier in creator_importance.TIERS and tab == "mine" else ""
         unassigned = tab == 'unassigned'

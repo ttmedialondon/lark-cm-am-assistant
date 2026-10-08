@@ -126,7 +126,7 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
       return route.fulfill({json: {saved: true, handles: state.data.items[0].handles}});
     }
     if (target.pathname === "/creators/data") {
-      state.data.tab = target.searchParams.get("tab") || "unassigned";
+      state.data.tab = target.searchParams.get("tab") || "mine";
       state.data.sort = target.searchParams.get("sort") || "importance";
       state.data.tier = target.searchParams.get("tier") || "";
       return route.fulfill({status: state.status,
@@ -138,7 +138,7 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
   const rows = page.locator("#creators-rows tr");
   await rows.nth(2).waitFor();
   assert.equal(await page.getByRole("button", {name: "候选达人", exact: true}).count(), 0);
-  assert.deepEqual(await page.getByRole("group", {name: "达人列表"}).getByRole("button").allTextContents(), ["未分配达人", "我的达人"]);
+  assert.deepEqual(await page.getByRole("group", {name: "达人列表"}).getByRole("button").allTextContents(), ["我的达人", "未分配达人"]);
   assert.equal(await page.getByRole("combobox", {name: "负责人", exact: true}).inputValue(), "cm-1");
   const history = page.locator("#creators-import-batches");
   assert(!(await history.evaluate(element => element.open)));
