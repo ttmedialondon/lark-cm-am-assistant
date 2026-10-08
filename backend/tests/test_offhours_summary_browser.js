@@ -72,8 +72,8 @@ test("bilingual user labels are displayed literally in evidence", async t => {
 test("creator roster edits preserve sibling handles and permission-scoped profile links", async t => {
   const attack = '<img src=x onerror="window.compromised=true">';
   const contactId = "11111111-1111-4111-8111-111111111111";
-  const data = {cms: [{id: "cm-1", name: "CM"}], selected_cm_id: "cm-1", can_select_cm: true,
-    can_view_unassigned: false, can_view_importance: true, can_adjust_importance: true, can_edit_handles: true,
+  const data = {tab: "mine", cms: [{id: "cm-1", name: "CM"}], selected_cm_id: "cm-1", can_select_cm: true,
+    can_view_unassigned: true, can_view_importance: true, can_adjust_importance: true, can_edit_handles: true,
     read_only: false, import_batches: [{id: "batch-1", filename: "fixture.xlsx", status: "completed",
       status_label: "识别完成", counts: {confirmed: 2, review: 1}, can_recheck: true}],
     sort: "importance", tier: "", importance_running: true, page: 1, total_count: 3, total_pages: 1,
@@ -126,6 +126,7 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
       return route.fulfill({json: {saved: true, handles: state.data.items[0].handles}});
     }
     if (target.pathname === "/creators/data") {
+      state.data.tab = target.searchParams.get("tab") || "unassigned";
       state.data.sort = target.searchParams.get("sort") || "importance";
       state.data.tier = target.searchParams.get("tier") || "";
       return route.fulfill({status: state.status,
@@ -136,6 +137,8 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
   await page.goto("http://localhost/creators");
   const rows = page.locator("#creators-rows tr");
   await rows.nth(2).waitFor();
+  assert.equal(await page.getByRole("button", {name: "候选达人", exact: true}).count(), 0);
+  assert.deepEqual(await page.getByRole("group", {name: "达人列表"}).getByRole("button").allTextContents(), ["未分配达人", "我的达人"]);
   assert.equal(await page.getByRole("combobox", {name: "负责人", exact: true}).inputValue(), "cm-1");
   const history = page.locator("#creators-import-batches");
   assert(!(await history.evaluate(element => element.open)));
@@ -283,6 +286,27 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
   }
   const ranked = new URLSearchParams(state.calls.at(-1).search);
   assert.equal(ranked.get("q"), "Creator"); assert.equal(ranked.get("sort"), "importance"); assert.equal(ranked.get("tier"), "focus");
+  const mineView = {read_only: state.data.read_only, can_view_importance: state.data.can_view_importance,
+    can_adjust_importance: state.data.can_adjust_importance, can_edit_handles: state.data.can_edit_handles,
+    import_batches: state.data.import_batches};
+  Object.assign(state.data, {read_only: true, can_view_importance: false,
+    can_adjust_importance: false, can_edit_handles: false, import_batches: []});
+  await Promise.all([
+    page.waitForResponse(response => response.url().includes("/creators/data?")
+      && new URL(response.url()).searchParams.get("tab") === "unassigned"),
+    page.getByRole("button", {name: "未分配达人", exact: true}).click(),
+  ]);
+  await page.waitForFunction(() => document.querySelector('#creators-unassigned').getAttribute('aria-pressed') === 'true'
+    && document.querySelector('#creators-cm-filter').hidden);
+  assert.equal(await page.getByRole("button", {name: "未分配达人", exact: true}).getAttribute("aria-pressed"), "true");
+  assert(!(await page.getByRole("combobox", {name: "负责人", exact: true}).isVisible()));
+  assert(!(await page.locator('#creators-importance-toolbar').isVisible()));
+  assert.equal(await page.locator('.creator-inline-editor:visible').count(), 0);
+  Object.assign(state.data, mineView);
+  await page.getByRole("button", {name: "我的达人", exact: true}).click();
+  await page.waitForFunction(() => document.querySelector('#creators-mine').getAttribute('aria-pressed') === 'true'
+    && document.querySelectorAll('.creator-handle-editor').length === 3);
+  assert(await page.getByRole("combobox", {name: "负责人", exact: true}).isVisible());
   let releaseSave;
   state.handleSaveGate = new Promise(resolve => { releaseSave = resolve; });
   await handleEditor.locator("summary").click();

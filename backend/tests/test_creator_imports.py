@@ -259,9 +259,9 @@ def test_cap_excel_two_stage_matching_manual_confirmation_and_replays_preserve_p
                       (creator,)).fetchone()["status"] == "confirmed"
     formal = creator_roster.page_data(cm, tab="mine")["items"]
     assert len(formal) == 1 and set(formal[0]["handles"]) == {"beauty.one_12", "corrected_02"}
-    assert formal[0]["sources"] == ["Excel", "AI"]
+    assert "sources" not in formal[0] and "evidence_rows" not in formal[0]
     assert formal[0]["profile_url"] is None
-    assert creator_roster.page_data(owner, cm)["items"][0]["profile_url"] == "/admin/contacts/ou_creator"
+    assert creator_roster.page_data(owner, cm, tab="mine")["items"][0]["profile_url"] == "/admin/contacts/ou_creator"
     imports.preview_import(owner, cm, "roster.xlsx", data)
     imports.start_import(owner, batch["id"])
     assert row_for(pg, batch, "second_02") is None
@@ -539,8 +539,7 @@ def test_shared_group_identifies_each_handle_person_and_preserves_the_evidence_c
         assert imports.source_labels(row) == ["Excel", "AI"]
         formal = next(item for item in creator_roster.page_data(cm, tab="mine")["items"]
                       if item["contact_id"] == str(contact))
-        assert formal["sources"] == ["Excel", "AI"]
-        assert {"id": str(row["id"]), "handle": handle} in formal["evidence_rows"]
+        assert handle in formal["handles"] and "sources" not in formal and "evidence_rows" not in formal
         displayed = imports.row_evidence(cm, row["id"])
         assert displayed["groups"] and displayed["person"]["confidence"] == .99
         assert any(g["selected"] and len(g["members"]) == 3 for g in displayed["groups"])
@@ -1239,7 +1238,7 @@ def test_delegated_creator_manager_can_review_evidence_and_import_across_cms(pg,
     assert imports.search_users(manager, cm, 'creator')
     view = creator_roster.page_data(manager, cm)
     assert view['can_manage'] and view['can_select_cm'] and not view['read_only']
-    assert view['items'][0]['evidence_rows']
+    assert 'evidence_rows' not in view['items'][0]
     assert view['items'][0]['profile_url'] is None
     lark_url = 'https://applink.larksuite.com/client/chat/open?openId=ou_creator'
     assert view['items'][0]['private_chat_url'] == lark_url
@@ -1263,7 +1262,8 @@ def test_delegated_creator_manager_can_review_evidence_and_import_across_cms(pg,
     admin_permissions.set_permissions(pilot.ids['owner'], manager, ['creator-manage'])
     revoked = creator_roster.page_data(manager, cm)['items'][0]
     assert revoked['profile_url'] is None and revoked['private_chat_url'] == lark_url
-    assert creator_roster.page_data(manager, cm, tab='candidates')['import_batches']
+    old_link = creator_roster.page_data(manager, cm, tab='candidates')
+    assert old_link['tab'] == 'mine' and old_link['import_batches']
     saved = pg.execute('SELECT uploaded_by,cm_authorization_id FROM creator_import_batches WHERE id=%s',
                        (batch['id'],)).fetchone()
     assert saved['uploaded_by'] == manager and saved['cm_authorization_id'] == cm

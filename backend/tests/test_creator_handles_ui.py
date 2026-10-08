@@ -198,15 +198,25 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
                    (person,))
     pg.execute("""INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source)
         VALUES(%s,%s,%s,'manual')""", (uuid4(), assigned, cm))
+    pg.execute("""INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source,ended_at)
+        VALUES(%s,%s,%s,'manual',NOW())""", (uuid4(), unassigned, cm))
+    candidate = uuid4()
+    pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,'Unconfirmed candidate')", (candidate,))
+    pg.execute("INSERT INTO creator_workflow_candidates(id,contact_id) VALUES(%s,%s)", (uuid4(), candidate))
     for module in (creator_handles_routes, creator_imports, creator_roster):
         monkeypatch.setattr(module, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(creator_roster, "get_settings", lambda: settings)
     monkeypatch.setattr(creator_importance, "get_settings", lambda: settings)
     monkeypatch.setattr(admin_permissions, "permission_keys_for", lambda _: ())
 
-    default = client.get(f"/creators/data?cm_id={cm}")
-    assert default.status_code == 200 and default.json()["sort"] == "importance"
-    pending = client.get(f"/creators/data?cm_id={cm}&sort=importance&tier=pending")
+    monkeypatch.setattr(creator_imports, "_page_data", lambda *args, **kwargs: pytest.fail(
+        "Confirmed rosters queried retired import candidates"))
+    for suffix in ("", "?tab=candidates", "?tab=invalid"):
+        default = client.get("/creators/data" + suffix)
+        assert default.status_code == 200 and default.json()["tab"] == "unassigned"
+        assert [item["id"] for item in default.json()["items"]] == [str(unassigned)]
+        assert default.json()["read_only"] and not default.json()["can_edit_handles"]
+    pending = client.get(f"/creators/data?tab=mine&cm_id={cm}&sort=importance&tier=pending")
     assert pending.status_code == 200 and pending.json()["total_count"] == 1
     assert pending.json()["items"][0]["importance"]["tier"] == "pending"
     assert set(pending.json()["items"][0]["importance"]) == {"tier", "tier_label", "manual_tier", "manual_reason"}
@@ -216,23 +226,23 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
     pg.execute("UPDATE ai_feature_configs SET enabled=TRUE,api_key_ciphertext='fixture-only',key_suffix='only' "
                "WHERE feature='creator_importance'")
     pg.execute("SELECT enqueue_creator_importance(%s,%s)", (assigned, cm))
-    assert client.get(f"/creators/data?cm_id={cm}").json()["importance_running"]
+    assert client.get(f"/creators/data?tab=mine&cm_id={cm}").json()["importance_running"]
     pg.execute("UPDATE ai_feature_configs SET enabled=FALSE WHERE feature='creator_importance'")
     url = f"/creators/people/{assigned}/importance"
     fields = {"csrf_token": "csrf", "cm_id": str(cm), "tier": "focus", "reason": "Owner reviewed cooperation"}
     assert client.post(url, data={**fields, "csrf_token": "bad"}).status_code == 400
     saved = client.post(url, data=fields)
     assert saved.status_code == 200 and saved.json()["importance"]["tier"] == "focus"
-    focus = client.get(f"/creators/data?cm_id={cm}&sort=importance&tier=focus")
+    focus = client.get(f"/creators/data?tab=mine&cm_id={cm}&sort=importance&tier=focus")
     assert focus.status_code == 200 and focus.json()["total_count"] == 1
     assert focus.json()["items"][0]["importance"]["manual_tier"] == "focus"
-    assert client.get(f"/creators/data?cm_id={cm}&tier=normal").json()["total_count"] == 0
+    assert client.get(f"/creators/data?tab=mine&cm_id={cm}&tier=normal").json()["total_count"] == 0
     for added_tier in ("priority", "dormant"):
         assert client.post(url, data={**fields, "tier": added_tier}).status_code == 200
-        selected = client.get(f"/creators/data?cm_id={cm}&tier={added_tier}").json()
+        selected = client.get(f"/creators/data?tab=mine&cm_id={cm}&tier={added_tier}").json()
         assert selected["total_count"] == 1 and selected["items"][0]["importance"]["tier"] == added_tier
     assert client.post(url, data=fields).status_code == 200
-    safe = client.get(f"/creators/data?cm_id={cm}&sort=bad%27SQL&tier=bad%27SQL").json()
+    safe = client.get(f"/creators/data?tab=mine&cm_id={cm}&sort=bad%27SQL&tier=bad%27SQL").json()
     assert safe["sort"] == "name" and safe["tier"] == "" and safe["total_count"] == 1
     pg.execute("SAVEPOINT roster_pagination")
     expected_ids = [str(assigned)]
@@ -247,8 +257,8 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
                        "VALUES(%s,%s,%s,'manual')", (uuid4(), person, cm))
             pg.execute("INSERT INTO creator_importance_profiles(contact_id,responsible_authorization_id,manual_tier) "
                        "VALUES(%s,%s,%s)", (person, cm, manual_tier))
-    first_page = client.get(f"/creators/data?cm_id={cm}&sort=importance&page=1").json()
-    second_page = client.get(f"/creators/data?cm_id={cm}&sort=importance&page=2").json()
+    first_page = client.get(f"/creators/data?tab=mine&cm_id={cm}&sort=importance&page=1").json()
+    second_page = client.get(f"/creators/data?tab=mine&cm_id={cm}&sort=importance&page=2").json()
     assert first_page["total_count"] == second_page["total_count"] == 31
     assert first_page["total_pages"] == second_page["total_pages"] == 2
     assert len(first_page["items"]) == 25 and len(second_page["items"]) == 6
@@ -257,21 +267,24 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
     assert len({item["id"] for item in items}) == 31
     assert [item["importance"]["tier"] for item in items] == ["focus"] + [
         t for t in creator_importance.TIERS for _ in range(6)]
-    repeated = client.get(f"/creators/data?cm_id={cm}&sort=importance&page=2").json()
+    repeated = client.get(f"/creators/data?tab=mine&cm_id={cm}&sort=importance&page=2").json()
     assert [item["id"] for item in repeated["items"]] == expected_ids[25:]
     pg.execute("ROLLBACK TO SAVEPOINT roster_pagination")
     actor["id"] = cm
     assert client.post(url, data=fields).status_code == 403
-    personal = client.get(f"/creators/data?cm_id={fields['cm_id']}").json()
+    personal = client.get("/creators/data").json()
+    assert personal["tab"] == "mine" and personal["total_count"] == 1
     assert not personal["can_adjust_importance"] and not personal["can_edit_handles"]
     assert personal["items"][0]["importance"]["manual_reason"] == ""
+    assert client.get("/creators/data?tab=candidates").json()["tab"] == "mine"
+    assert client.get("/creators/data?tab=unassigned").status_code == 403
     owner = pg.execute("SELECT authorization_id FROM admin_roles WHERE role='owner'").fetchone()["authorization_id"]
     actor["id"] = owner
     monkeypatch.setattr(creator_importance, "view_for", lambda *args, **kwargs: pytest.fail(
         "Roster-only or unassigned request read a CM profile"))
     pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (owner,))
     pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-roster')", (owner,))
-    readonly = client.get(f"/creators/data?cm_id={cm}&sort=importance&tier=focus")
+    readonly = client.get(f"/creators/data?tab=mine&cm_id={cm}&sort=importance&tier=focus")
     assert readonly.status_code == 200
     assert readonly.json()["total_count"] == 1 and readonly.json()["items"][0]["importance"] is None
     assert readonly.json()["sort"] == "name" and readonly.json()["tier"] == ""

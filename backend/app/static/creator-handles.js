@@ -6,7 +6,7 @@
   const el = key => document.getElementById(`creators-${key}`);
   let data = JSON.parse(el("initial").textContent);
   el("initial").textContent = "";
-  let tab = app.dataset.tab;
+  let tab = data.tab || app.dataset.tab;
   let page = data.page || 1;
   let query = el("query").value.trim();
   let sort = data.sort || "importance", tier = data.tier || "";
@@ -34,7 +34,7 @@
   function selectedCM() { return el("cm")?.value || data.selected_cm_id || ""; }
   function selectedCMName() { return data.cms?.find(cm => cm.id === selectedCM())?.name || "我"; }
   const canSelectContacts = () => Boolean(data.can_broadcast && (data.can_view_unassigned
-    ? tab !== "candidates" : tab === "mine" && selectedCM() === app.dataset.actor));
+    || tab === "mine" && selectedCM() === app.dataset.actor));
   function selectableContact(item) {
     return canSelectContacts() && item.kind === "confirmed"
       && typeof item.contact_id === "string" && uuid.test(item.contact_id) ? item.contact_id : "";
@@ -58,63 +58,10 @@
       parts.selection.disabled = busy || reading || !parts.selectionId;
     }
   }
-  function clearRows() { for (const row of rows.values()) row.searchVersion++; rows.clear(); el("rows").replaceChildren(); }
+  function clearRows() { rows.clear(); el("rows").replaceChildren(); }
   function importMessage(text, error = false) {
     el("import-message").textContent = text;
     el("import-message").className = `small mt-3 ${error ? "text-danger" : "text-secondary"}`;
-  }
-  function makeImportRow(item) {
-    const row = node("tr"), handleCell = node("td"), userCell = node("td");
-    handleCell.style.minWidth = "200px"; userCell.style.minWidth = "240px";
-    const handle = node("input", "", "form-control"); handle.maxLength = 160;
-    handle.setAttribute("aria-label", "达人 handle"); handle.placeholder = "—";
-    const groups = node("div", "", "small text-secondary mt-1");
-    handleCell.append(handle, groups);
-    const searchLine = node("div", "", "d-flex gap-1");
-    const user = node("input", "", "form-control"); user.maxLength = 120; user.placeholder = "— 搜索对应用户";
-    user.setAttribute("aria-label", "搜索当前负责人可访问的用户");
-    const search = node("button", "搜索", "btn btn-sm btn-outline-secondary"); search.type = "button";
-    const choices = node("div", "", "d-flex flex-column gap-1 mt-1"); choices.setAttribute("aria-live", "polite");
-    searchLine.append(user, search); userCell.append(searchLine, choices);
-    const editNote = node("div", "账号或用户已修改，原判断失效，确认时重新核验。", "small text-warning mt-1");
-    editNote.hidden = true;
-    const actions = node("td"), actionsList = node("div", "", "d-flex gap-1 flex-wrap");
-    const confirm = node("button", "确认入库", "btn btn-sm btn-primary"); confirm.type = "button";
-    const defer = node("button", "暂缓", "btn btn-sm btn-outline-secondary"); defer.type = "button";
-    actionsList.append(confirm, defer); actions.append(actionsList, editNote);
-    row.append(handleCell, userCell, actions);
-    const parts = {row, handle, groups, user, search, choices, editNote, confirm, defer, contactId: "", dirty: false, searchVersion: 0};
-    const check = () => {
-      confirm.disabled = busy || !parts.canConfirm || !handle.value.trim() || !parts.contactId;
-      editNote.hidden = !parts.dirty;
-    };
-    handle.addEventListener("input", () => { parts.dirty = true; check(); });
-    user.addEventListener("input", () => { parts.dirty = true; parts.contactId = ""; parts.searchVersion++; choices.replaceChildren(); check(); });
-    search.addEventListener("click", async () => {
-      const token = ++parts.searchVersion, scope = selectedCM(); search.disabled = true;
-      choices.textContent = "正在查找…";
-      try {
-        const matches = await read(await fetch(`/creators/imports/users?${new URLSearchParams({cm_id: scope, q: user.value.trim()})}`, {cache: "no-store"}));
-        if (token !== parts.searchVersion || scope !== selectedCM()) return;
-        choices.replaceChildren();
-        for (const match of matches) {
-          const choice = node("button", [match.display_name || "未命名用户", match.context_label].filter(Boolean).join(" · "), "btn btn-sm btn-outline-secondary text-start");
-          choice.type = "button";
-          choice.addEventListener("click", () => {
-            if (busy) return;
-            parts.contactId = match.id; user.value = match.display_name || "未命名用户";
-            parts.dirty = true; choices.replaceChildren(); check();
-          });
-          choices.append(choice);
-        }
-        if (!matches.length) choices.textContent = "没有找到可访问的用户，请换个姓名试试。";
-      } catch (error) { if (token === parts.searchVersion) choices.textContent = error.message; }
-      finally { search.disabled = busy || !parts.canConfirm; }
-    });
-    user.addEventListener("keydown", event => { if (event.key === "Enter") { event.preventDefault(); search.click(); } });
-    confirm.addEventListener("click", () => mutate(`/imports/rows/${item.id}/confirm`, {handle: handle.value.trim(), contact_id: parts.contactId}));
-    defer.addEventListener("click", () => mutate(`/imports/rows/${item.id}/defer`));
-    return parts;
   }
   function renderImports() {
     el("import-open").disabled = busy || !selectedCM();
@@ -139,21 +86,6 @@
       }
       el("import-batch-list").append(line);
     }
-  }
-  function renderImportRow(item, parts) {
-    if (!parts.dirty) {
-      parts.handle.value = item.handle || ""; parts.user.value = item.contact_id ? item.display_name || "" : "";
-      parts.contactId = item.contact_id || "";
-    }
-    parts.canConfirm = !!item.can_confirm;
-    parts.groups.textContent = item.group_names?.length ? `群：${item.group_names.join("、")}` : "群：—";
-    parts.editNote.hidden = !parts.dirty;
-    parts.handle.disabled = busy || !parts.canConfirm; parts.user.disabled = busy || !parts.canConfirm;
-    parts.search.disabled = busy || !parts.canConfirm;
-    parts.confirm.hidden = !parts.canConfirm;
-    parts.confirm.disabled = busy || !parts.canConfirm || !parts.handle.value.trim() || !parts.contactId;
-    parts.defer.hidden = !item.can_defer; parts.defer.disabled = busy;
-    for (const choice of parts.choices.querySelectorAll("button")) choice.disabled = busy;
   }
   function makeRow(item) {
     const row = node("tr");
@@ -230,26 +162,26 @@
     return parts;
   }
   function render() {
+    tab = data.tab || tab;
     el("importance-toolbar").hidden = tab !== "mine" || !data.can_view_importance;
     el("sort").value = sort; el("tier").value = tier;
     el("sort").disabled = busy; el("tier").disabled = busy;
     el("unassigned").hidden = !data.can_view_unassigned;
     el("import-open").hidden = Boolean(data.read_only);
-    el("candidates").hidden = Boolean(data.read_only);
+    if (el("cm-filter")) el("cm-filter").hidden = tab !== "mine" || !data.can_select_cm;
     if (data.can_select_cm) el("cm").disabled = busy;
-    for (const key of ["mine", "candidates", "unassigned"]) {
+    for (const key of ["unassigned", "mine"]) {
       el(key).className = `btn ${key === tab ? "btn-primary" : "btn-outline-secondary"}`;
       el(key).setAttribute("aria-pressed", String(key === tab));
       el(key).disabled = busy;
     }
     const ids = new Set((data.items || []).map(rowKey));
-    for (const [id, parts] of rows) if (!ids.has(id)) { parts.searchVersion++; parts.row.remove(); rows.delete(id); }
+    for (const [id, parts] of rows) if (!ids.has(id)) { parts.row.remove(); rows.delete(id); }
     for (const [index, item] of (data.items || []).entries()) {
       const key = rowKey(item);
-      if (!rows.has(key)) rows.set(key, item.kind === "import" ? makeImportRow(item) : makeRow(item));
+      if (!rows.has(key)) rows.set(key, makeRow(item));
       const parts = rows.get(key);
       if (el("rows").children[index] !== parts.row) el("rows").insertBefore(parts.row, el("rows").children[index] || null);
-      if (item.kind === "import") { renderImportRow(item, parts); continue; }
       if (parts.selection) {
         parts.selectionId = selectableContact(item);
         parts.selection.setAttribute("aria-label", `选择 ${item.display_name || "此达人"}`);
@@ -312,14 +244,14 @@
     }
     page = data.page || 1;
     el("empty").hidden = !!data.items?.length;
-    el("empty").textContent = tab === "candidates" ? "暂无候选达人。" : "暂无达人。";
-    el("page-label").textContent = `共 ${data.total_count || 0} ${tab === "candidates" ? "条" : "人"} · 第 ${page} / ${Math.max(1, data.total_pages || 0)} 页`;
+    el("empty").textContent = tab === "unassigned" ? "暂无未分配达人。" : "暂无达人。";
+    el("page-label").textContent = `共 ${data.total_count || 0} 人 · 第 ${page} / ${Math.max(1, data.total_pages || 0)} 页`;
     el("previous").disabled = busy || page <= 1; el("next").disabled = busy || page >= (data.total_pages || 1);
     renderImports();
     renderSelection();
   }
   async function refresh(automatic = false) {
-    if (automatic && (reading || busy || document.hidden || [...rows.values()].some(row => row.dirty || row.manualDirty || row.handleDirty) || el("import-dialog").open)) return;
+    if (automatic && (reading || busy || document.hidden || [...rows.values()].some(row => row.manualDirty || row.handleDirty) || el("import-dialog").open)) return;
     if (reading) {
       refreshQueued = true; version++;
       return;
@@ -332,7 +264,7 @@
     history.replaceState(null, "", `/creators?${params}`);
     try {
       const next = await read(await fetch(`/creators/data?${params}`, {cache: "no-store"}));
-      if (token === version && !(automatic && [...rows.values()].some(row => row.dirty || row.manualDirty || row.handleDirty))) {
+      if (token === version && !(automatic && [...rows.values()].some(row => row.manualDirty || row.handleDirty))) {
         data = next; sort = data.sort || "importance"; tier = data.tier || ""; render();
       }
     } catch (error) {
@@ -363,14 +295,7 @@
     try {
       const result = await read(await fetch(`/creators${path}`, {method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"},
         body: new URLSearchParams({csrf_token: app.dataset.csrf, ...fields})}));
-      if (tab === "candidates" && (path.endsWith("/confirm") || path.endsWith("/defer"))) {
-        const key = `import:${path.split("/")[3]}`;
-        data.items = data.items.filter(item => rowKey(item) !== key);
-      }
-      if (path.endsWith("/confirm")) {
-        notice("已入库。");
-      }
-      else if (path.endsWith("/importance")) {
+      if (path.endsWith("/importance")) {
         const item = data.items.find(item => item.contact_id === path.split("/")[2]);
         if (item && selectedCM() === fields.cm_id) item.importance = result.importance;
         const parts = rows.get(`confirmed:${path.split("/")[2]}`);
@@ -384,12 +309,9 @@
         if (parts?.handleEditor) { parts.handleDirty = false; parts.handleEditor.open = false; }
         notice("handle 已更新。");
       }
-      else if (path.endsWith("/defer")) {
-        notice("已暂缓，修改未入库。");
-      }
       else if (path.endsWith("/start")) {
         page = 1; clearRows();
-        notice("已导入，正在匹配。待核对结果请到候选达人确认。");
+        notice("已导入，正在匹配。");
       }
       else if (path.endsWith("/recheck")) notice("未确认账号已重新排队。");
       else if (path.endsWith("/pause")) notice("已暂停，进行中的请求仍会完成。");
@@ -411,7 +333,7 @@
         method: "POST", headers: {"Content-Type": "application/octet-stream", "X-CSRF-Token": app.dataset.csrf, "X-Filename": encodeURIComponent(file.name)}, body: file,
       }));
       const counts = importPreview.counts || {};
-      const nextStep = importPreview.status !== "preview" ? "这份表已导入，请查看导入记录及候选达人。" : counts.valid ? "请核对后确认导入。" : "请修改表格后重新上传。";
+      const nextStep = importPreview.status !== "preview" ? "这份表已导入，请查看导入记录。" : counts.valid ? "请核对后确认导入。" : "请修改表格后重新上传。";
       importMessage(`有效 handle ${counts.valid || 0} · 重复 ${counts.duplicates || 0} · 无效 ${counts.invalid || 0}。${nextStep}`);
       const preview = el("import-preview"); preview.replaceChildren();
       const list = node("div", "", "border rounded p-2"); list.style.maxHeight = "240px"; list.style.overflowY = "auto";
@@ -432,14 +354,14 @@
       await read(await fetch(`/creators/imports/${importPreview.id}/start`, {method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: new URLSearchParams({csrf_token: app.dataset.csrf})}));
       importPreview = null; el("import-dialog").close();
       page = 1; clearRows();
-      notice("已导入，正在匹配。待核对结果请到候选达人确认。");
+      notice("已导入，正在匹配。");
       void refresh();
     } catch (error) { importMessage(error.message, true); }
     finally { busy = false; render(); }
   }
-  for (const key of ["mine", "candidates", "unassigned"]) el(key).addEventListener("click", () => {
+  for (const key of ["unassigned", "mine"]) el(key).addEventListener("click", () => {
     if (tab === key) return;
-    selectedContacts.clear(); tab = key; page = 1; clearRows(); renderSelection(); refresh();
+    selectedContacts.clear(); tab = key; data.tab = key; page = 1; clearRows(); renderSelection(); refresh();
   });
   el("search").addEventListener("submit", event => { event.preventDefault(); query = el("query").value.trim(); page = 1; clearRows(); refresh(); });
   for (const key of ["sort", "tier"]) el(key).addEventListener("change", () => {
@@ -490,7 +412,7 @@
     el("cm").addEventListener("change", () => {
       selectedContacts.clear();
       tab = "mine";
-      data = {...data, items: [], import_batches: [], page: 1, total_count: 0, total_pages: 0};
+      data = {...data, tab, items: [], import_batches: [], page: 1, total_count: 0, total_pages: 0};
       page = 1; clearRows(); render(); refresh();
     });
   }

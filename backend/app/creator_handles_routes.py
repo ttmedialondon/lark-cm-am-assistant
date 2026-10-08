@@ -1,4 +1,4 @@
-"""Session-scoped creator candidates; CM review is a frontend permission, not an admin grant."""
+"""Session-scoped creator rosters and imports; CM access is not an admin grant."""
 
 import json
 from urllib.parse import unquote
@@ -153,14 +153,13 @@ def create_router(*, current_authorization, render_template, csrf_token):
 
     @router.get("")
     @router.get("/data")
-    def page(request: Request, cm_id: UUID | None = None, tab: str = "mine", q: str = "", page: int = 1,
+    def page(request: Request, cm_id: UUID | None = None, tab: str = "", q: str = "", page: int = 1,
              sort: str = "importance", tier: str = ""):
         auth = current_authorization(request)
         if request.url.path == "/creators" and not auth:
             return secure(RedirectResponse("/", status_code=303))
         try:
             auth = actor(auth)
-            tab = tab if tab in ('candidates', 'unassigned') else 'mine'
             data = creator_roster.page_data(auth["id"], cm_id=cm_id, tab=tab, query=q[:120], page=max(1, page),
                                            sort=sort, tier=tier)
             data["can_broadcast"] = bool(auth.get("broadcast_enabled") or data["can_view_unassigned"])
@@ -168,7 +167,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
                 return payload(data)
             return secure(render_template(request, "creator_handles.html", {
                 "authorization": auth, "creator_data": jsonable_encoder(data),
-                "creator_tab": tab, "creator_query": q[:120], "csrf_token": csrf_token(auth),
+                "creator_tab": data["tab"], "creator_query": q[:120], "csrf_token": csrf_token(auth),
             }))
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
