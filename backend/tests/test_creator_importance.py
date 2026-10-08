@@ -60,11 +60,18 @@ def test_weak_claims_and_unrelated_cancellations_do_not_overwrite_valid_facts():
     assert weak[0]["kind"] == "intent"
     cancelled = facts.validate({"facts": [_fact("cancelled", ["E2"], obj="Beta summer campaign")]}, pack, current)
     assert facts.rank(facts.merge_facts(current, [*weak, *cancelled]))["tier"] == "focus"
-    cancelled_target = facts.validate({"facts": [_fact("cancelled", ["E3"], key=current[0]["key"])]}, pack, current)
+    cancelled_target = facts.validate({"facts": [_fact("cancelled", ["E3"], key=current[0]["key"],
+                                                     obj="Acme weekly live arrangement")]}, pack, current)
+    assert cancelled_target[0]["object"] == current[0]["object"]
+    assert cancelled_target[0]["key"] == current[0]["key"]
     assert facts.rank(facts.merge_facts(current, cancelled_target))["tier"] == "pending"
     with pytest.raises(ValueError, match="previous object"):
-        facts.validate({"facts": [_fact("cancelled", ["E3"], key=current[0]["key"], obj="Other object")]},
+        facts.validate({"facts": [_fact("cancelled", ["E3"], key="unknown", obj=current[0]["object"])]},
                        pack, current)
+    for invalid in (" ", "x" * 161):
+        with pytest.raises(ValueError, match="business object"):
+            facts.validate({"facts": [_fact("cancelled", ["E3"], key=current[0]["key"], obj=invalid)]},
+                           pack, current)
     solo = facts.validate({"facts": [_fact("completed", ["E2"])]}, pack)
     assert solo[0]["kind"] == "intent" and facts.rank(solo)["tier"] == "pending"
 
@@ -96,6 +103,18 @@ def test_completion_needs_positive_execution_and_accepts_linked_natural_answers(
         weak = facts.validate({"facts": [_fact("completed", [ref], key=key)]}, pack, established)
         assert weak[0]["kind"] == "intent"
         assert facts.rank(facts.merge_facts(established, weak))["last_progress_at"] == established[0]["occurred_at"]
+    pack["chats"] = {"c1": {"private": True}}
+    pack["messages"][4]["created_at"] = "2026-08-04T10:01:00+00:00"
+    natural = facts.validate({"facts": [_fact("completed", ["E3", "E4"], key=key)]}, pack, established)
+    assert natural[0]["kind"] == "completed"
+    pack["chats"]["c1"]["private"] = False
+    group = facts.validate({"facts": [_fact("completed", ["E3", "E4"], key=key)]}, pack, established)
+    assert group[0]["kind"] == "intent"
+    pack["chats"]["c1"]["private"] = True
+    pack["messages"][4]["chat_id"] = "other"
+    unrelated = facts.validate({"facts": [_fact("completed", ["E3", "E4"], key=key)]}, pack, established)
+    assert unrelated[0]["kind"] == "intent"
+    pack["messages"][4]["chat_id"] = "c1"
     pack["messages"][4]["reply_to"] = "E3"
     yes = facts.validate({"facts": [_fact("completed", ["E3", "E4"], key=key)]}, pack, established)
     assert yes[0]["kind"] == "completed"

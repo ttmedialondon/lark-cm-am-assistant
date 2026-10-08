@@ -440,7 +440,7 @@ def build_batch(conn, job, settings, state):
         else:
             complete = False
         item["message"]["context_complete"] = complete
-        if not complete:
+        if not complete and any((r["chat_id"], r["message_id"]) == key for r in rows):
             state["gaps"] += 1
     ordered = sorted(selected.values(), key=lambda x: (x["message"]["created_at"], x["message"]["ref"]))
     messages = [item["message"] for item in ordered]

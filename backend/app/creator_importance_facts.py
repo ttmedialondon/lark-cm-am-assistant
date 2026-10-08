@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 
-PROMPT_VERSION = "creator-importance-facts-v1.0"
+PROMPT_VERSION = "creator-importance-facts-v1.0.1"
 RULE_VERSION = "creator-importance-v1.0"
 MAX_FACTS, MAX_REFS = 12, 8
 KINDS = ("intent", "agreed", "ongoing", "completed", "cancelled", "progress", "uncertain")
@@ -36,7 +36,7 @@ _THIRD_DELIVERY = re.compile(
 )
 
 
-def _completion_evidence(cited, messages):
+def _completion_evidence(cited, messages, chats):
     """Require a positive execution witness, including an explicit completed-action Q&A."""
     refs = {m["ref"] for m in cited}
     for message in cited:
@@ -48,8 +48,15 @@ def _completion_evidence(cited, messages):
                and not _THIRD_DELIVERY.search(part) for part in clauses):
             return True
         question = messages.get(message.get("reply_to"))
+        if not message.get("reply_to") and chats.get(message.get("chat_id"), {}).get("private"):
+            earlier = [m for m in messages.values() if m.get("chat_id") == message.get("chat_id")
+                       and _time(m["created_at"]) < _time(message["created_at"])]
+            previous = max(earlier, key=lambda m: _time(m["created_at"]), default=None)
+            if previous and _time(message["created_at"]) - _time(previous["created_at"]) <= timedelta(minutes=30):
+                question = previous
         if (question and question["ref"] in refs and question["role"] == "cm"
                 and _FINISHED_REPLY.search(body) and not _NOT_FINISHED.search(body)
+                and not _THIRD_DELIVERY.search(body)
                 and _COMPLETION.search(question.get("text", ""))
                 and not _NOT_FINISHED.search(question.get("text", ""))):
             return True
@@ -119,9 +126,10 @@ def validate(raw, pack, previous=()):
         if not isinstance(obj, str) or not obj.strip() or len(obj) > 160:
             raise ValueError("business object")
         obj = " ".join(obj.split())
-        if key is not None and (not isinstance(key, str) or key not in old
-                                or _object(obj) != _object(old[key]["object"])):
-            raise ValueError("previous object")
+        if key is not None:
+            if not isinstance(key, str) or key not in old:
+                raise ValueError("previous object")
+            obj = old[key]["object"]
         if (not isinstance(refs, list) or not 1 <= len(refs) <= MAX_REFS
                 or any(not isinstance(ref, str) or ref not in messages for ref in refs)):
             raise ValueError("refs")
@@ -157,7 +165,7 @@ def validate(raw, pack, previous=()):
                               and adverse < _time(f["occurred_at"]) <= _time(fact["occurred_at"])
                               for f in all_facts)
         if fact["kind"] == "completed":
-            if not established or not _completion_evidence(cited, messages):
+            if not established or not _completion_evidence(cited, messages, pack.get("chats", {})):
                 fact["kind"] = "intent"
         elif fact["kind"] == "progress" and not established:
             fact["kind"] = "intent"
