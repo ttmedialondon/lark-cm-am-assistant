@@ -449,7 +449,7 @@ def rank(facts, now=None, *, readable=False):
         lead = selected[0]
         grounds = [f"{lead['object'][:48]}：{lead['label']}"]
         latest = _time(business_at).astimezone(LONDON).strftime("%m-%d")
-        grounds.append(f"近30天业务交流{len(recent_business_dates)}天 · 最近推进{latest}")
+        grounds.append(f"近30天业务交流{len(recent_business_dates)}天 · 最近业务消息{latest}")
     elif tier == "normal":
         grounds = ["近期无重点事项"] + (["已有历史合作记录"] if historical else [])
     else:

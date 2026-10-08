@@ -116,7 +116,7 @@ def test_current_opportunity_and_bilateral_business_days_drive_maintenance_not_v
     }
     assert ranked["grounds"] == [
         "Acme autumn skincare video：具体机会",
-        "近30天业务交流2天 · 最近推进08-02",
+        "近30天业务交流2天 · 最近业务消息08-02",
     ]
 
     later = datetime(2026, 9, 10, 12, tzinfo=UTC)
