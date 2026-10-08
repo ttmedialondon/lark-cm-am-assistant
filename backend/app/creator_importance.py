@@ -218,7 +218,7 @@ def _save_profile(conn, job, state, settings, *, cutoff=None, history_complete=F
          job["history_start"], cutoff or job["history_end"], facts.PROMPT_VERSION))
 
 
-def view_for(conn, contact_id, cm_id, settings, *, actor_id=None):
+def view_for(conn, contact_id, cm_id, settings, *, actor_id=None, details=True):
     blank = {"tier": "pending", "tier_label": "待评估", "phase_label": "", "grounds": [],
              "cutoff_label": "", "gap_label": "尚未评估", "manual_tier": "", "manual_reason": "", "stale": False}
     row = conn.execute("SELECT p.*, (" + _PROFILE_VALID + ") valid FROM creator_importance_profiles p "
@@ -236,6 +236,11 @@ def view_for(conn, contact_id, cm_id, settings, *, actor_id=None):
         return {**output, "gap_label": "历史分析中" if row["evaluated_at"]
                 and not row["coverage"].get("history_complete") else
                 "依据已变化，等待更新" if row["evaluated_at"] else "尚未自动评估"}
+    if not details:
+        join, args = roster_sql(cm_id)
+        ranked = conn.execute("SELECT COALESCE(ip.effective_tier,'pending') tier FROM contacts c "
+                              + join + " WHERE c.id=%s", [*args, contact_id]).fetchone()
+        return {**output, "tier": ranked["tier"], "tier_label": TIERS[ranked["tier"]]}
     material = json.loads(_cipher(settings).decrypt(row["facts_ciphertext"])) if row["facts_ciphertext"] else []
     join, args = roster_sql(cm_id)
     activity = conn.execute("SELECT ip.last_message_at FROM contacts c " + join + " WHERE c.id=%s",

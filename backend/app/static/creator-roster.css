@@ -1,6 +1,5 @@
 .creator-evidence { width: min(720px, calc(100vw - 24px)); max-height: 85vh; border: 1px solid var(--tblr-border-color); border-radius: 12px; padding: 24px; color: inherit; }
 .creator-evidence::backdrop { background: rgb(15 23 42 / 35%); }
-.creator-evidence blockquote { white-space: pre-wrap; overflow-wrap: anywhere; font-size: inherit; }
 .creator-lark-link { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; margin-left: 2px; align-self: flex-start; border-radius: 4px; text-decoration: none; flex-shrink: 0; }
 .creator-lark-link:hover { background: var(--tblr-bg-surface-secondary, #f3f4f6); }
 .creator-lark-link[hidden] { display: none; }
@@ -24,12 +23,10 @@
 #creators-app .creator-importance-badge[data-tier="priority"] { background: #edf2fa; color: #52688b; }
 #creators-app .creator-importance-badge[data-tier="normal"] { background: #eaf5ee; color: #38734b; }
 #creators-app .creator-importance-badge[data-tier="dormant"] { background: #f4f0e9; color: #78654d; }
-#creators-app .creator-importance-detail { min-width: 180px; max-width: 310px; font-size: 12px; }
-#creators-app .creator-importance-detail > summary { color: #64748b; cursor: pointer; }
-#creators-app .creator-account-detail { margin-top: 4px; font-size: 12px; }
-#creators-app .creator-account-detail > summary { color: #64748b; cursor: pointer; }
-#creators-app .creator-importance-detail .creator-importance-grounds { margin: 8px 0; padding-left: 16px; }
-#creators-app .creator-importance-editor { border-top: 1px solid var(--tblr-border-color); margin-top: 10px; padding-top: 10px; }
+#creators-app .creator-inline-editor { min-width: 180px; max-width: 260px; margin-top: 4px; font-size: 12px; }
+#creators-app .creator-inline-editor[hidden] { display: none; }
+#creators-app .creator-inline-editor > summary { color: #52688b; cursor: pointer; }
+#creators-app .creator-inline-editor > summary:hover { color: var(--tblr-primary); }
 @media (max-width: 575px) {
   #creators-app .creator-importance-toolbar { padding: 10px 12px; }
   #creators-app .creator-importance-toolbar > div { flex: 1; }

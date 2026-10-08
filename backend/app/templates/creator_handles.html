@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}我的达人 · TT Media{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-roster.css?v=20261008-roster-cleanup">{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-roster.css?v=20261008-roster-edit">{% endblock %}
 {% block body %}
 <div class="page business-page" id="creators-app" data-csrf="{{ csrf_token }}" data-tab="{{ creator_tab }}" data-actor="{{ authorization.id }}">
   {% with business_section='creators' %}{% include "partials/business_nav.html" %}{% endwith %}
@@ -20,7 +20,6 @@
     </section>
     <noscript><div class="alert alert-warning mt-3">请开启浏览器 JavaScript 后核对达人。</div></noscript>
   </div></div></main>
-  <dialog id="creators-evidence" class="creator-evidence" aria-labelledby="creators-evidence-title"><div class="d-flex align-items-center gap-3 mb-3"><h3 id="creators-evidence-title" class="mb-0 me-auto">证据链</h3><button type="button" id="creators-evidence-close" class="btn btn-sm btn-outline-secondary">关闭</button></div><div id="creators-evidence-body" aria-live="polite"></div></dialog>
   <dialog id="creators-import-dialog" class="creator-evidence" aria-labelledby="creators-import-title"><div class="d-flex align-items-center gap-3 mb-3"><h3 id="creators-import-title" class="mb-0 me-auto">导入达人账号名单</h3><button type="button" id="creators-import-close" class="btn btn-sm btn-outline-secondary">关闭</button></div>
     <p>负责人：<strong id="creators-import-cm"></strong></p>
     <p class="text-secondary">一列 handle，每行一个，可带表头。导入后自动匹配，待核对结果需人工确认。</p>
@@ -31,5 +30,5 @@
   </dialog>
 </div>
 <script id="creators-initial" type="application/json">{{ creator_data|tojson }}</script>
-<script src="/static/creator-handles.js?v=20261008-roster-cleanup" defer></script>
+<script src="/static/creator-handles.js?v=20261008-roster-edit" defer></script>
 {% endblock %}

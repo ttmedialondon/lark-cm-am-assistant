@@ -253,6 +253,13 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
         assert all(m["chat_id"] == private for m in pack["messages"])
     assert importance.view_for(pg, flow.person, flow.owner, flow.settings)["tier"] == "priority"
     assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "dormant"
+    pg.execute("SAVEPOINT brief_roster")
+    pg.execute("UPDATE creator_importance_profiles SET facts_ciphertext='not-a-ciphertext'")
+    audits = pg.execute("SELECT count(*) n FROM audit_events").fetchone()["n"]
+    assert importance.view_for(pg, flow.person, flow.owner, flow.settings, details=False)["tier"] == "priority"
+    assert importance.view_for(pg, flow.person, flow.other, flow.settings, details=False)["tier"] == "dormant"
+    assert pg.execute("SELECT count(*) n FROM audit_events").fetchone()["n"] == audits
+    pg.execute("ROLLBACK TO SAVEPOINT brief_roster")
     assert profiles[flow.owner]["coverage"]["has_readable"]
     assert profiles[flow.owner]["coverage"]["priority"]["business_days"]
     join, args = importance.roster_sql(flow.other)

@@ -9,7 +9,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import creator_broadcast, creator_importance, creator_imports, creator_roster
+from . import contact_handles, creator_broadcast, creator_importance, creator_imports, creator_roster
 from .db import connection
 from .http_helpers import (
     csrf_matches as _csrf_matches,
@@ -173,6 +173,22 @@ def create_router(*, current_authorization, render_template, csrf_token):
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
 
+    @router.post("/people/{contact_id}/handle")
+    async def handle_manual(request: Request, contact_id: UUID):
+        try:
+            auth, form = await form_for(request)
+
+            def save():
+                with connection() as conn, conn.transaction():
+                    return contact_handles.set_manual(
+                        conn, auth["id"], contact_id, form.get("cm_id"),
+                        form.get("old_handle", ""), form.get("handle", ""),
+                    )
+
+            return payload(await run_in_threadpool(save))
+        except (ValueError, LookupError, PermissionError) as exc:
+            return error(exc)
+
     @router.post("/people/{contact_id}/importance")
     async def importance_manual(request: Request, contact_id: UUID):
         try:
@@ -184,9 +200,14 @@ def create_router(*, current_authorization, render_template, csrf_token):
                         conn, auth["id"], contact_id, form.get("cm_id"),
                         form.get("tier", ""), form.get("reason", ""),
                     )
+                    importance = creator_importance.view_for(
+                        conn, contact_id, form.get("cm_id") or auth["id"],
+                        creator_importance.get_settings(), details=False,
+                    )
+                    return {"saved": True, "importance": {key: importance[key] for key in
+                        ("tier", "tier_label", "manual_tier", "manual_reason")}}
 
-            await run_in_threadpool(save)
-            return payload({"ok": True})
+            return payload(await run_in_threadpool(save))
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
 

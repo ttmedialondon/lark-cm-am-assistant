@@ -16,6 +16,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from app import (
     admin_permissions,
+    contact_handles,
     creator_broadcast,
     creator_handles_routes,
     creator_importance,
@@ -46,6 +47,141 @@ def browser(monkeypatch, *, owner=False, active=True):
     return TestClient(app), actor
 
 
+def test_owner_handle_correction_preserves_siblings_history_and_all_cm_responsibilities(pg, monkeypatch):
+    client, actor = browser(monkeypatch, owner=True)
+    owner = actor["id"]
+    cm, second_cm, manager = uuid4(), uuid4(), uuid4()
+    for authorization in (owner, cm, second_cm, manager):
+        pg.execute("""INSERT INTO authorizations(id,open_id,access_token_ciphertext,body_consent_at)
+            VALUES(%s,%s,'unused',NOW())""", (authorization, "ou_" + authorization.hex))
+    pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (owner,))
+    pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-manage')",
+               (manager,))
+    person, empty_person, legacy_person, foreign_person = (uuid4() for _ in range(4))
+    for contact in (person, empty_person, legacy_person, foreign_person):
+        pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,'Creator')", (contact,))
+        pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) "
+                   "VALUES(%s,'creator','confirmed','manual')", (contact,))
+    for contact, responsible in ((person, cm), (person, second_cm), (empty_person, cm)):
+        pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
+                   "VALUES(%s,%s,%s,'manual')", (uuid4(), contact, responsible))
+    accounts = {handle: uuid4() for handle in ("old_handle", "sibling", "occupied", "represented", "legacy_old",
+                                              "legacy_occupied", "legacy_represented")}
+    for handle, account in accounts.items():
+        pg.execute("INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) "
+                   "VALUES(%s,'tiktok',%s,%s)", (account, handle, handle))
+    for contact, handle, relationship in ((person, "old_handle", "owner"), (person, "sibling", "owner"),
+                                          (foreign_person, "occupied", "owner"),
+                                          (person, "represented", "representative")):
+        pg.execute("""INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source)
+            VALUES(%s,%s,%s,'confirmed','excel_ai_verified')""", (contact, accounts[handle], relationship))
+    batch, import_row = uuid4(), uuid4()
+    pg.execute("""INSERT INTO creator_import_batches(id,cm_authorization_id,uploaded_by,filename,
+        file_fingerprint,policy_version,status) VALUES(%s,%s,%s,'history.xlsx','history',%s,'completed')""",
+        (batch, cm, owner, creator_imports.POLICY_VERSION))
+    pg.execute("""INSERT INTO creator_import_rows(id,batch_id,cm_authorization_id,row_number,original_handle,
+        handle,contact_id,status,review_status,pack_ciphertext,result_ciphertext)
+        VALUES(%s,%s,%s,1,'old_handle','old_handle',%s,'succeeded','confirmed','history','history')""",
+        (import_row, batch, cm, person))
+    pg.execute("UPDATE contact_social_accounts SET import_row_id=%s WHERE contact_id=%s AND social_account_id=%s",
+               (import_row, person, accounts["old_handle"]))
+    candidate = uuid4()
+    pg.execute("INSERT INTO creator_workflow_candidates(id,contact_id) VALUES(%s,%s)", (candidate, legacy_person))
+    for responsible in (cm, second_cm):
+        pg.execute("""INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,
+            contact_id,relationship,source,candidate_id,created_by_authorization_id)
+            VALUES(%s,%s,%s,%s,'owner','cm_confirmation',%s,%s)""",
+            (uuid4(), accounts["legacy_old"], responsible, legacy_person, candidate, owner))
+    for contact, handle, relationship in ((foreign_person, "legacy_occupied", "owner"),
+                                          (person, "legacy_represented", "representative")):
+        linked_candidate = uuid4()
+        pg.execute("INSERT INTO creator_workflow_candidates(id,contact_id) VALUES(%s,%s)", (linked_candidate, contact))
+        pg.execute("""INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,
+            contact_id,relationship,source,candidate_id,created_by_authorization_id)
+            VALUES(%s,%s,%s,%s,%s,'cm_confirmation',%s,%s)""",
+            (uuid4(), accounts[handle], cm, contact, relationship, linked_candidate, owner))
+    monkeypatch.setattr(creator_handles_routes, "connection", lambda: nullcontext(pg))
+    url = f"/creators/people/{person}/handle"
+    fields = {"csrf_token": "csrf", "cm_id": str(cm), "old_handle": "@OLD_HANDLE", "handle": "new_handle"}
+
+    def facts():
+        return {table: pg.execute(f"SELECT to_jsonb(t) data FROM {table} t ORDER BY to_jsonb(t)::text").fetchall()
+                for table in ("contacts", "contact_roles", "contact_assignments", "creator_account_assignments",
+                              "social_accounts", "contact_social_accounts", "creator_import_rows", "audit_events")}
+
+    original = facts()
+    assert client.post(url, data={**fields, "csrf_token": "bad"}).status_code == 400
+    for current_actor in (cm, manager):
+        actor["id"] = current_actor
+        assert client.post(url, data={**fields, "actor_id": str(owner)}).status_code == 403
+    actor.update(id=owner, status="revoked")
+    assert client.post(url, data=fields).status_code == 403
+    actor["status"] = "active"
+    for changes, code in (({"cm_id": str(manager)}, 403), ({"handle": "invalid handle"}, 400),
+                          ({"old_handle": "stale"}, 400), ({"old_handle": ""}, 400),
+                          ({"handle": "occupied"}, 400), ({"handle": "represented"}, 400),
+                          ({"handle": "legacy_occupied"}, 400), ({"handle": "legacy_represented"}, 400)):
+        assert client.post(url, data={**fields, **changes}).status_code == code
+        assert facts() == original
+    saved = client.post(url, data=fields)
+    assert saved.status_code == 200 and saved.json()["handles"] == ["legacy_represented", "new_handle", "sibling"]
+    for responsible in (cm, second_cm):
+        expected = ["legacy_represented", "new_handle", "sibling"] if responsible == cm else ["new_handle", "sibling"]
+        assert contact_handles.for_contacts(pg, [person], responsible)[person] == expected
+    changed = facts()
+    for table in ("contacts", "contact_roles", "contact_assignments", "creator_account_assignments",
+                  "creator_import_rows"):
+        assert changed[table] == original[table]
+    assert pg.execute("SELECT normalized_handle FROM social_accounts WHERE id=%s", (accounts["old_handle"],)
+                      ).fetchone()["normalized_handle"] == "old_handle"
+    rejected = pg.execute("SELECT * FROM contact_social_accounts WHERE contact_id=%s AND social_account_id=%s",
+                          (person, accounts["old_handle"])).fetchone()
+    assert rejected["status"] == "rejected" and rejected["import_row_id"] == import_row
+    assert rejected["reviewed_by_authorization_id"] == owner and rejected["reviewed_at"]
+    assert creator_imports._conflicts(pg, [(None, person, "old_handle")]) == [True]
+    assert next(row for row in contact_handles.confirmed_pairs(pg, [person])
+                if row["handle"] == "new_handle")["human_confirmed"]
+    audit = pg.execute("SELECT metadata FROM audit_events WHERE action='creator_handle_manual'").fetchone()["metadata"]
+    assert audit["before"] == ["legacy_represented", "old_handle", "sibling"]
+    assert audit["after"] == ["legacy_represented", "new_handle", "sibling"]
+    assert client.post(url, data=fields).status_code == 400  # A second stale save cannot remove the new account.
+    assert facts() == changed
+
+    # A sibling added while the editor was open survives the single-account correction.
+    extra_account = uuid4()
+    pg.execute("INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) "
+               "VALUES(%s,'tiktok','concurrent_extra','concurrent_extra')", (extra_account,))
+    pg.execute("""INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source)
+        VALUES(%s,%s,'owner','confirmed','creator_handle_auto_verified')""", (person, extra_account))
+    restore = {**fields, "old_handle": "new_handle", "handle": "https://www.tiktok.com/@old_handle"}
+    assert client.post(url, data=restore).status_code == 200
+    assert contact_handles.for_contacts(pg, [person])[person] == [
+        "concurrent_extra", "legacy_represented", "old_handle", "sibling"]
+    assert creator_imports._conflicts(pg, [(None, person, "new_handle")]) == [True]
+    assert client.post(url, data={**fields, "old_handle": "old_handle", "handle": "sibling"}).status_code == 200
+    assert contact_handles.for_contacts(pg, [person])[person] == ["concurrent_extra", "legacy_represented", "sibling"]
+
+    add_url = f"/creators/people/{empty_person}/handle"
+    add_fields = {**fields, "old_handle": "", "handle": "first_account"}
+    assert client.post(add_url, data=add_fields).status_code == 200
+    assert client.post(add_url, data={**add_fields, "handle": "second_account"}).status_code == 400
+    assert contact_handles.for_contacts(pg, [empty_person])[empty_person] == ["first_account"]
+
+    legacy_url = f"/creators/people/{legacy_person}/handle"
+    legacy_fields = {**fields, "old_handle": "legacy_old", "handle": "legacy_new"}
+    assert client.post(legacy_url, data=legacy_fields).status_code == 200
+    for responsible in (cm, second_cm):
+        assert contact_handles.for_contacts(pg, [legacy_person], responsible)[legacy_person] == ["legacy_new"]
+        assert pg.execute("SELECT creator_importance_is_eligible(%s,%s) ok", (legacy_person, responsible)
+                          ).fetchone()["ok"]
+    assert pg.execute("SELECT count(*) n FROM creator_account_assignments WHERE contact_id=%s AND ended_at IS NOT NULL",
+                      (legacy_person,)).fetchone()["n"] == 2
+    assert creator_imports._conflicts(pg, [(None, legacy_person, "legacy_old")]) == [True]
+    assert pg.execute("SELECT reviewed_by_authorization_id FROM contact_social_accounts "
+                      "WHERE contact_id=%s AND social_account_id=%s", (legacy_person, accounts["legacy_old"])
+                      ).fetchone()["reviewed_by_authorization_id"] == owner
+
+
 def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypatch):
     client, actor = browser(monkeypatch, owner=True)
     settings = SimpleNamespace(token_encryption_key=b"i" * 32)
@@ -73,6 +209,9 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
     pending = client.get(f"/creators/data?cm_id={cm}&sort=importance&tier=pending")
     assert pending.status_code == 200 and pending.json()["total_count"] == 1
     assert pending.json()["items"][0]["importance"]["tier"] == "pending"
+    assert set(pending.json()["items"][0]["importance"]) == {"tier", "tier_label", "manual_tier", "manual_reason"}
+    assert "evidence_rows" not in pending.json()["items"][0]
+    assert pending.json()["can_edit_handles"]
     assert not pending.json()["importance_running"]
     pg.execute("UPDATE ai_feature_configs SET enabled=TRUE,api_key_ciphertext='fixture-only',key_suffix='only' "
                "WHERE feature='creator_importance'")
@@ -82,7 +221,8 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
     url = f"/creators/people/{assigned}/importance"
     fields = {"csrf_token": "csrf", "cm_id": str(cm), "tier": "focus", "reason": "Owner reviewed cooperation"}
     assert client.post(url, data={**fields, "csrf_token": "bad"}).status_code == 400
-    assert client.post(url, data=fields).status_code == 200
+    saved = client.post(url, data=fields)
+    assert saved.status_code == 200 and saved.json()["importance"]["tier"] == "focus"
     focus = client.get(f"/creators/data?cm_id={cm}&sort=importance&tier=focus")
     assert focus.status_code == 200 and focus.json()["total_count"] == 1
     assert focus.json()["items"][0]["importance"]["manual_tier"] == "focus"
@@ -122,7 +262,9 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
     pg.execute("ROLLBACK TO SAVEPOINT roster_pagination")
     actor["id"] = cm
     assert client.post(url, data=fields).status_code == 403
-    assert client.get(f"/creators/data?cm_id={fields['cm_id']}").json()["can_adjust_importance"] is False
+    personal = client.get(f"/creators/data?cm_id={fields['cm_id']}").json()
+    assert not personal["can_adjust_importance"] and not personal["can_edit_handles"]
+    assert personal["items"][0]["importance"]["manual_reason"] == ""
     owner = pg.execute("SELECT authorization_id FROM admin_roles WHERE role='owner'").fetchone()["authorization_id"]
     actor["id"] = owner
     monkeypatch.setattr(creator_importance, "view_for", lambda *args, **kwargs: pytest.fail(

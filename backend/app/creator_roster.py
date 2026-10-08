@@ -88,18 +88,7 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1, sort="importan
             page = min(page,pages)
             people = conn.execute("SELECT c.id,c.display_name " + formal_base
                                   + f" ORDER BY {order} LIMIT 25 OFFSET %s", [*args,(page-1)*25]).fetchall()
-            imports_by_person = {person["id"]: [] for person in people}
-            for row in conn.execute(
-                """SELECT r.id,r.contact_id,r.handle,r.api_requests,r.stats,
-                    r.pack_ciphertext IS NOT NULL AS has_evidence
-                    FROM creator_import_rows r JOIN creator_import_batches b ON b.id=r.batch_id
-                    WHERE r.contact_id=ANY(%s::uuid[]) AND r.cm_authorization_id=%s
-                    AND r.review_status='confirmed' AND b.policy_version=%s
-                    ORDER BY r.created_at DESC,r.id DESC""",
-                (list(imports_by_person), cm_id, creator_imports.POLICY_VERSION),
-            ).fetchall():
-                imports_by_person[row["contact_id"]].append(row)
-            ids = list(imports_by_person)
+            ids = [person["id"] for person in people]
             identities = {r["contact_id"]: r for r in conn.execute(
                 """SELECT DISTINCT ON (contact_id) contact_id,open_id,
                     CASE WHEN avatar_status='unavailable' THEN NULL ELSE avatar_url END avatar_url
@@ -111,14 +100,11 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1, sort="importan
             for person in people:
                 identity = identities.get(person["id"])
                 chat_url = private_chat_url(identity["open_id"] if identity else None)
-                import_rows = imports_by_person[person["id"]]
-                sources = list(dict.fromkeys(
-                    label for row in import_rows for label in creator_imports.source_labels(row)
-                )) or ["手动"]
-                evidence_rows = {}
-                for row in import_rows:
-                    if row["has_evidence"]:
-                        evidence_rows.setdefault(row["handle"], {"id": str(row["id"]), "handle": row["handle"]})
+                importance = (creator_importance.view_for(
+                    conn, person["id"], cm_id, get_settings(), actor_id=actor_id, details=False,
+                ) if can_view_importance else None)
+                if importance and not can_view_unassigned:
+                    importance["manual_reason"] = ""
                 items.append({
                     "id": str(person["id"]), "kind": "confirmed", "contact_id": str(person["id"]),
                     "display_name": person["display_name"] or "未命名用户",
@@ -127,12 +113,9 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1, sort="importan
                     "private_chat_url": chat_url,
                     "profile_url": f"/admin/contacts/{identity['open_id']}" if can_view_profiles and chat_url else None,
                     "handles": handles[person["id"]],
-                    "sources": sources, "source": " + ".join(sources),
-                    "evidence_rows": [] if read_only else list(evidence_rows.values()),
                     "status_label": "已入库", "can_confirm": False, "can_defer": False,
-                    "importance": (creator_importance.view_for(
-                        conn, person["id"], cm_id, get_settings(), actor_id=actor_id,
-                    ) if can_view_importance else None),
+                    "importance": ({key: importance[key] for key in
+                        ("tier", "tier_label", "manual_tier", "manual_reason")} if importance else None),
                 })
         return {
             "cms": cms, "selected_cm_id": str(cm_id), "can_manage": can_manage,
@@ -140,6 +123,7 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1, sort="importan
             "can_view_unassigned": can_view_unassigned,
             "can_view_importance": can_view_importance,
             "can_adjust_importance": can_view_unassigned and can_view_importance, "sort": sort, "tier": tier,
+            "can_edit_handles": can_view_unassigned and can_view_importance,
             "importance_running": bool(can_view_importance and conn.execute(
                 """SELECT 1 FROM creator_importance_jobs j JOIN ai_feature_configs f
                     ON f.feature='creator_importance' AND f.enabled

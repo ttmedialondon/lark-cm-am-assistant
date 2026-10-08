@@ -69,16 +69,16 @@ test("bilingual user labels are displayed literally in evidence", async t => {
   assert.deepEqual(errors, []);
 });
 
-test("creator names open permitted profiles while a separate accessible icon opens Lark", async t => {
+test("creator roster edits preserve sibling handles and permission-scoped profile links", async t => {
   const attack = '<img src=x onerror="window.compromised=true">';
+  const contactId = "11111111-1111-4111-8111-111111111111";
   const data = {cms: [{id: "cm-1", name: "CM"}], selected_cm_id: "cm-1", can_select_cm: true,
-    can_view_unassigned: false, can_view_importance: true, can_adjust_importance: true,
+    can_view_unassigned: false, can_view_importance: true, can_adjust_importance: true, can_edit_handles: true,
     read_only: false, import_batches: [{id: "batch-1", filename: "fixture.xlsx", status: "completed",
       status_label: "识别完成", counts: {confirmed: 2, review: 1}, can_recheck: true}],
     sort: "importance", tier: "", importance_running: true, page: 1, total_count: 3, total_pages: 1,
     items: [
-      {id: "person-1", kind: "confirmed", display_name: "Creator One", open_id: "ou_creator_one", profile_url: "/admin/contacts/ou_creator_one", handles: ["one"],
-        evidence_rows: [{id: "row-1", handle: "one"}, {id: "row-2", handle: "one.alt"}]},
+      {id: contactId, contact_id: contactId, kind: "confirmed", display_name: "Creator One", open_id: "ou_creator_one", profile_url: "/admin/contacts/ou_creator_one", handles: ["one", "one.alt"]},
       {id: "person-2", kind: "confirmed", display_name: "No identity", open_id: null, profile_url: null, handles: ["two"]},
       {id: "person-3", kind: "confirmed", display_name: attack, open_id: "javascript:alert(1)", profile_url: null, handles: ["three"]},
     ]};
@@ -102,7 +102,7 @@ test("creator names open permitted profiles while a separate accessible icon ope
   t.after(() => browser.close());
   const context = await browser.newContext(), page = await context.newPage();
   const errors = []; page.on("pageerror", error => errors.push(error.message));
-  await context.route("**/*", route => {
+  await context.route("**/*", async route => {
     const request = route.request(), target = new URL(request.url());
     if (target.origin !== "http://localhost") {
       if (target.origin === "https://applink.larksuite.com") state.larkRequests.push(request.url());
@@ -111,9 +111,20 @@ test("creator names open permitted profiles while a separate accessible icon ope
     }
     if (target.pathname === "/creators") return route.fulfill({contentType: "text/html", body: fixture.html});
     if (target.pathname.startsWith("/static/")) return route.fulfill({contentType: target.pathname.endsWith(".js") ? "text/javascript" : target.pathname.endsWith(".svg") ? "image/svg+xml" : "text/css", body: fs.readFileSync(path.join(backend, "app", target.pathname))});
-    state.calls.push({method: request.method(), url: target.pathname, search: target.search});
+    state.calls.push({method: request.method(), url: target.pathname, search: target.search, body: request.postData()});
     if (target.pathname === "/admin/contacts/ou_creator_one") return route.fulfill({contentType: "text/html", body: "<p>Creator One profile</p>"});
-    if (target.pathname === "/creators/imports/rows/row-2/evidence") return route.fulfill({json: {handle: "one.alt", reason: "Fixture account evidence"}});
+    if (request.method() === "POST" && target.pathname === `/creators/people/${contactId}/importance`) {
+      const fields = new URLSearchParams(request.postData());
+      Object.assign(state.data.items[0].importance, {tier: fields.get("tier"), tier_label: "优先",
+        manual_tier: fields.get("tier"), manual_reason: fields.get("reason")});
+      return route.fulfill({json: {saved: true, importance: state.data.items[0].importance}});
+    }
+    if (request.method() === "POST" && target.pathname === `/creators/people/${contactId}/handle`) {
+      const fields = new URLSearchParams(request.postData());
+      state.data.items[0].handles = state.data.items[0].handles.map(handle => handle === fields.get("old_handle") ? fields.get("handle") : handle);
+      if (state.handleSaveGate) await state.handleSaveGate;
+      return route.fulfill({json: {saved: true, handles: state.data.items[0].handles}});
+    }
     if (target.pathname === "/creators/data") {
       state.data.sort = target.searchParams.get("sort") || "importance";
       state.data.tier = target.searchParams.get("tier") || "";
@@ -132,52 +143,63 @@ test("creator names open permitted profiles while a separate accessible icon ope
   await history.locator("summary").press("Enter");
   assert(await history.getByRole("button", {name: "重新检查未确认"}).isVisible());
   await history.locator("summary").click();
-  const account = rows.first().locator(".creator-account-detail");
-  assert(!(await account.evaluate(element => element.open)));
-  assert(!(await account.getByRole("button").first().isVisible()));
-  assert.equal(await rows.nth(1).locator(".creator-account-detail").count(), 0);
-  await account.locator("summary").press("Enter");
-  await account.getByRole("button", {name: "查看 @one.alt 的账号依据", exact: true}).click();
-  await page.getByText("Fixture account evidence", {exact: true}).waitFor();
-  assert(await page.getByRole("dialog", {name: "one.alt · 证据链"}).isVisible());
-  await page.getByRole("button", {name: "关闭", exact: true}).click();
+  assert.equal(await page.locator("#creators-evidence, .creator-account-detail, .creator-importance-detail").count(), 0);
+  assert.equal(await page.getByText("Acme：需要跟进直播安排。", {exact: true}).count(), 0);
   const names = rows.locator("td:nth-child(2) .fw-bold");
   assert.deepEqual(await names.allTextContents(), data.items.map(item => item.display_name));
   assert.equal(await page.locator("#creators-sort").inputValue(), "importance");
   assert.deepEqual(await page.locator("#creators-tier option").allTextContents(), ["全部优先级", "重点", "优先", "常规", "久未联系", "待评估"]);
   assert.deepEqual(await rows.locator(".creator-importance-badge").allTextContents(), ["重点", "常规", "待评估"]);
-  assert.equal(await rows.first().locator(".creator-importance-detail > summary").textContent(), "维护依据");
-  await rows.first().locator(".creator-importance-detail > summary").click();
-  assert.equal(await rows.first().locator(".creator-importance-grounds li").count(), 2);
-  assert.equal(await page.getByText("Acme：需要跟进直播安排。", {exact: true}).count(), 1);
   const manual = rows.first().locator(".creator-importance-editor");
   assert(!(await manual.evaluate(element => element.open)));
-  await manual.locator("summary").click();
-  assert.equal(await manual.getByRole("combobox", {name: "人工维护优先级"}).count(), 1);
+  await manual.locator("summary").press("Enter");
+  assert.equal(await manual.getByRole("combobox", {name: "重要度", exact: true}).count(), 1);
   assert.deepEqual(await manual.locator("option").allTextContents(), ["使用自动评估", "重点", "优先", "常规", "久未联系", "待评估"]);
-  await manual.locator("summary").click();
-  await rows.nth(2).locator(".creator-importance-detail > summary").click();
-  assert.equal(await rows.nth(2).getByText("尚未评估", {exact: true}).count(), 1);
-  assert.equal(await rows.nth(2).locator(".creator-importance-grounds li").count(), 0);
-  await rows.nth(2).locator(".creator-importance-detail > summary").click();
+  await manual.getByRole("combobox", {name: "重要度", exact: true}).selectOption("priority");
+  await manual.getByRole("textbox", {name: "调整说明"}).fill("Owner reviewed fixture");
+  await manual.getByRole("button", {name: "保存", exact: true}).click();
+  await page.waitForFunction(() => document.querySelector('.creator-importance-badge').textContent === "优先 · 人工");
+  assert(!(await manual.evaluate(element => element.open)));
+  const handleEditor = rows.first().locator(".creator-handle-editor");
+  await handleEditor.locator("summary").press("Enter");
+  assert.deepEqual(await handleEditor.locator("option").allTextContents(), ["@one", "@one.alt"]);
+  await handleEditor.getByRole("textbox", {name: "新 handle", exact: true}).fill("cancelled.edit");
+  await handleEditor.getByRole("button", {name: "取消", exact: true}).click();
+  assert(!(await handleEditor.evaluate(element => element.open)));
+  await handleEditor.locator("summary").press("Enter");
+  assert.equal(await handleEditor.getByRole("textbox", {name: "新 handle", exact: true}).inputValue(), "one");
+  await handleEditor.getByRole("textbox", {name: "新 handle", exact: true}).fill("one.updated");
+  state.data.items[0].handles.push("worker.added");
+  state.status = 503;
+  await handleEditor.getByRole("button", {name: "保存", exact: true}).click();
+  await page.getByText("Fixture access no longer available", {exact: true}).waitFor();
+  await page.waitForFunction(() => document.querySelector('#creators-rows td').textContent.includes("@one.updated"));
+  assert.deepEqual(await rows.first().locator("td:first-child span").allTextContents(), ["@one.updated", "@one.alt", "@worker.added"]);
+  assert(!(await handleEditor.evaluate(element => element.open)));
+  const posts = state.calls.filter(call => call.method === "POST");
+  assert.deepEqual(posts.map(call => call.url), [`/creators/people/${contactId}/importance`, `/creators/people/${contactId}/handle`]);
+  for (const call of posts) {
+    const fields = new URLSearchParams(call.body);
+    assert.equal(fields.get("csrf_token"), "fixture-csrf"); assert.equal(fields.get("cm_id"), "cm-1");
+  }
+  assert.equal(new URLSearchParams(posts[1].body).get("old_handle"), "one");
+  assert.equal(new URLSearchParams(posts[1].body).get("handle"), "one.updated");
+  state.status = 200;
+  await page.locator("#creators-refresh").click();
   assert.equal(await page.getByText("这一条不应展示。", {exact: true}).count(), 0);
-  assert.equal(await page.getByText("资料截至 10-08 13:00", {exact: true}).count(), 2);
+  assert.equal(await page.getByText("资料截至 10-08 13:00", {exact: true}).count(), 0);
   const polling = page.waitForResponse(response => response.url().includes("/creators/data?"));
   state.data.importance_running = false;
   await polling;
-  assert(await account.evaluate(element => element.open));
   assert(!(await history.evaluate(element => element.open)));
-  Object.assign(state.data.items[0].importance, {tier: "priority", tier_label: "优先"});
+  Object.assign(state.data.items[0].importance, {tier: "priority", tier_label: "优先", manual_tier: ""});
   Object.assign(state.data.items[1].importance, {tier: "dormant", tier_label: "久未联系",
     grounds: ["已同步记录已42天无相关消息", "最近消息：2026-08-27"], gap_label: "历史同步范围不足"});
   await page.locator("#creators-refresh").click();
   await page.waitForFunction(() => document.querySelectorAll('.creator-importance-badge[data-tier="dormant"]').length === 1);
   assert.deepEqual(await rows.locator(".creator-importance-badge").allTextContents(), ["优先", "久未联系", "待评估"]);
   assert.equal(await rows.first().locator(".creator-importance-badge").getAttribute("data-tier"), "priority");
-  await rows.nth(1).locator(".creator-importance-detail > summary").click();
-  assert(await rows.nth(1).getByText("已同步记录已42天无相关消息", {exact: true}).isVisible());
-  assert(await rows.nth(1).getByText("历史同步范围不足", {exact: true}).isVisible());
-  assert(state.calls.every(call => call.method === "GET"));
+  assert.equal(await rows.nth(1).getByText("历史同步范围不足", {exact: true}).count(), 0);
   if (process.env.OH_SCREENSHOT_DIR) {
     await page.screenshot({path: path.join(process.env.OH_SCREENSHOT_DIR, "creator-importance-desktop.png"), fullPage: true});
     await page.setViewportSize({width: 390, height: 844});
@@ -190,7 +212,7 @@ test("creator names open permitted profiles while a separate accessible icon ope
   assert(await names.evaluateAll(elements => elements.every(element => element.tagName === "A")));
   assert.equal(await names.locator("img").count(), 0);
   assert.equal(await page.evaluate(() => window.compromised), undefined);
-  assert.deepEqual(await rows.locator("td:first-child").allTextContents(), ["@one", "@two", "@three"]);
+  assert.deepEqual(await rows.locator("td:first-child").allTextContents(), ["@one.updated · @one.alt · @worker.added", "@two", "@three"]);
   assert.equal(await names.first().getAttribute("href"), "/admin/contacts/ou_creator_one");
   assert.equal(await names.first().getAttribute("title"), "查看个人资料");
   assert.equal(await names.first().getAttribute("target"), null);
@@ -261,9 +283,22 @@ test("creator names open permitted profiles while a separate accessible icon ope
   }
   const ranked = new URLSearchParams(state.calls.at(-1).search);
   assert.equal(ranked.get("q"), "Creator"); assert.equal(ranked.get("sort"), "importance"); assert.equal(ranked.get("tier"), "focus");
+  let releaseSave;
+  state.handleSaveGate = new Promise(resolve => { releaseSave = resolve; });
+  await handleEditor.locator("summary").click();
+  await handleEditor.getByRole("textbox", {name: "新 handle", exact: true}).fill("one.final");
+  const pendingSave = page.waitForRequest(request => request.method() === "POST" && request.url().endsWith("/handle"));
+  await handleEditor.getByRole("button", {name: "保存", exact: true}).click();
+  await pendingSave;
   state.data.can_adjust_importance = false;
-  await page.locator("#creators-refresh").click();
-  await page.waitForFunction(() => [...document.querySelectorAll('.creator-importance-editor')].every(node => node.hidden));
+  state.data.can_edit_handles = false;
+  await page.locator("#creators-search button").click();
+  await page.waitForFunction(() => document.querySelectorAll('#creators-rows tr').length === 3
+    && !document.querySelector('.creator-handle-editor'));
+  releaseSave();
+  await page.getByText("handle 已更新。", {exact: true}).waitFor();
+  assert.equal(await page.locator('.creator-importance-editor:visible').count(), 0);
+  assert.equal(await page.locator('.creator-handle-editor:visible').count(), 0);
   for (const item of state.data.items) item.importance = null;
   await page.locator("#creators-refresh").click();
   await page.waitForFunction(() => [...document.querySelectorAll('.creator-importance-badge')].every(node => node.hidden));
@@ -275,11 +310,12 @@ test("creator names open permitted profiles while a separate accessible icon ope
   state.status = 403;
   await page.locator("#creators-refresh").click();
   await page.waitForFunction(() => !document.querySelectorAll('#creators-rows tr').length);
-  assert.equal(await page.locator('#creators-evidence-body').textContent(), "");
+  assert.equal(await page.locator('#creators-evidence').count(), 0);
   assert.equal(await page.locator('#creators-initial').textContent(), "");
   assert(!(await history.isVisible()));
   assert(!(await page.locator('#creators-importance-toolbar').isVisible()));
-  assert(state.calls.every(call => call.method === "GET"));
+  assert.equal(state.calls.filter(call => call.method === "POST").length, 3);
+  assert(!state.calls.some(call => call.url.endsWith("/evidence")));
   assert.deepEqual(errors, []);
 });
 

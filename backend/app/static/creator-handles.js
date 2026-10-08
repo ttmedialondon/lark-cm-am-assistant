@@ -10,7 +10,7 @@
   let page = data.page || 1;
   let query = el("query").value.trim();
   let sort = data.sort || "importance", tier = data.tier || "";
-  let busy = false, reading = false, refreshQueued = false, version = 0, evidenceVersion = 0;
+  let busy = false, reading = false, refreshQueued = false, version = 0;
   const rows = new Map();
   const selectedContacts = new Map();
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -81,11 +81,9 @@
     const actions = node("td"), actionsList = node("div", "", "d-flex gap-1 flex-wrap");
     const confirm = node("button", "确认入库", "btn btn-sm btn-primary"); confirm.type = "button";
     const defer = node("button", "暂缓", "btn btn-sm btn-outline-secondary"); defer.type = "button";
-    const evidence = node("button", "查看证据链", "btn btn-sm btn-outline-secondary"); evidence.type = "button";
-    evidence.addEventListener("click", () => showEvidence(item.id, parts.dirty));
-    actionsList.append(confirm, defer, evidence); actions.append(actionsList, editNote);
+    actionsList.append(confirm, defer); actions.append(actionsList, editNote);
     row.append(handleCell, userCell, actions);
-    const parts = {row, handle, groups, user, search, choices, editNote, confirm, defer, evidence, contactId: "", dirty: false, searchVersion: 0};
+    const parts = {row, handle, groups, user, search, choices, editNote, confirm, defer, contactId: "", dirty: false, searchVersion: 0};
     const check = () => {
       confirm.disabled = busy || !parts.canConfirm || !handle.value.trim() || !parts.contactId;
       editNote.hidden = !parts.dirty;
@@ -155,7 +153,6 @@
     parts.confirm.hidden = !parts.canConfirm;
     parts.confirm.disabled = busy || !parts.canConfirm || !parts.handle.value.trim() || !parts.contactId;
     parts.defer.hidden = !item.can_defer; parts.defer.disabled = busy;
-    parts.evidence.hidden = !item.has_evidence; parts.evidence.disabled = busy;
     for (const choice of parts.choices.querySelectorAll("button")) choice.disabled = busy;
   }
   function makeRow(item) {
@@ -177,29 +174,42 @@
     const handleCell = node("td"); handleCell.style.minWidth = "250px";
     const saved = node("div", "", "mb-2"); handleCell.append(saved);
     const actions = node("td");
-    const importance = node("details", "", "creator-importance-detail");
-    importance.append(node("summary", "维护依据"));
-    const grounds = node("ul", "", "creator-importance-grounds"), cutoff = node("div", "", "text-secondary"), gap = node("div", "", "text-secondary mt-1");
-    importance.append(grounds, cutoff, gap);
-    const account = node("details", "", "creator-account-detail"); account.append(node("summary", "账号依据"));
-    const accountButtons = node("div", "", "d-flex flex-wrap gap-1 mt-2"); account.append(accountButtons);
-    const parts = {row, name, lark, avatar, initial, saved, actions, importanceBadge, importance, grounds, cutoff, gap, account, accountButtons, manualDirty: false};
+    const parts = {row, name, lark, avatar, initial, saved, actions, importanceBadge, manualDirty: false, handleDirty: false};
     if (data.can_adjust_importance) {
-      const editor = node("details", "", "creator-importance-editor"); editor.append(node("summary", "人工调整"));
+      const editor = node("details", "", "creator-inline-editor creator-importance-editor"); editor.append(node("summary", "调整重要度"));
       const form = node("form", "", "mt-2"), manualTier = node("select", "", "form-select form-select-sm"), manualReason = node("input", "", "form-control form-control-sm mt-2");
-      manualTier.setAttribute("aria-label", "人工维护优先级");
+      manualTier.setAttribute("aria-label", "重要度");
       for (const [value, label] of [["", "使用自动评估"], ["focus", "重点"], ["priority", "优先"], ["normal", "常规"], ["dormant", "久未联系"], ["pending", "待评估"]]) {
         const option = node("option", label); option.value = value; manualTier.append(option);
       }
-      manualReason.maxLength = 240; manualReason.placeholder = "调整依据"; manualReason.setAttribute("aria-label", "人工调整依据");
+      manualReason.maxLength = 240; manualReason.placeholder = "调整说明"; manualReason.setAttribute("aria-label", "调整说明");
       const save = node("button", "保存", "btn btn-sm btn-outline-primary mt-2"); save.type = "submit";
-      form.append(manualTier, manualReason, save); editor.append(form); importance.append(editor);
-      Object.assign(parts, {manualEditor: editor, manualTier, manualReason, manualSave: save});
+      const cancel = node("button", "取消", "btn btn-sm btn-link mt-2"); cancel.type = "button";
+      cancel.addEventListener("click", () => { if (!busy) { parts.manualDirty = false; editor.open = false; render(); } });
+      form.append(manualTier, manualReason, save, cancel); editor.append(form); actions.append(editor);
+      Object.assign(parts, {manualEditor: editor, manualTier, manualReason, manualSave: save, manualCancel: cancel});
       manualTier.addEventListener("change", () => { parts.manualDirty = true; manualReason.required = Boolean(manualTier.value); });
       manualReason.addEventListener("input", () => { parts.manualDirty = true; });
       form.addEventListener("submit", event => {
         event.preventDefault();
         void mutate(`/people/${item.contact_id}/importance`, {cm_id: selectedCM(), tier: manualTier.value, reason: manualReason.value.trim()});
+      });
+    }
+    if (data.can_edit_handles) {
+      const editor = node("details", "", "creator-inline-editor creator-handle-editor"); editor.append(node("summary", "修改 handle"));
+      const form = node("form", "", "mt-2"), oldHandle = node("select", "", "form-select form-select-sm"), handle = node("input", "", "form-control form-control-sm mt-2");
+      oldHandle.setAttribute("aria-label", "选择要修改的 handle");
+      handle.maxLength = 160; handle.required = true; handle.placeholder = "新 handle"; handle.setAttribute("aria-label", "新 handle");
+      const save = node("button", "保存", "btn btn-sm btn-outline-primary mt-2"); save.type = "submit";
+      const cancel = node("button", "取消", "btn btn-sm btn-link mt-2"); cancel.type = "button";
+      cancel.addEventListener("click", () => { if (!busy) { parts.handleDirty = false; editor.open = false; render(); } });
+      form.append(oldHandle, handle, save, cancel); editor.append(form); actions.append(editor);
+      Object.assign(parts, {handleEditor: editor, oldHandle, handleInput: handle, handleSave: save, handleCancel: cancel});
+      oldHandle.addEventListener("change", () => { parts.handleDirty = true; handle.value = oldHandle.value; });
+      handle.addEventListener("input", () => { parts.handleDirty = true; });
+      form.addEventListener("submit", event => {
+        event.preventDefault();
+        void mutate(`/people/${item.contact_id}/handle`, {cm_id: selectedCM(), old_handle: oldHandle.value, handle: handle.value.trim()});
       });
     }
     if (el("selection-bar")) {
@@ -250,21 +260,29 @@
       parts.name.title = item.profile_url ? "查看个人资料" : "";
       const importance = item.importance;
       parts.importanceBadge.hidden = !importance;
+      if (parts.manualEditor) {
+        parts.manualEditor.hidden = !data.can_adjust_importance || !importance;
+        if (parts.manualEditor.hidden) { parts.manualDirty = false; parts.manualEditor.open = false; }
+      }
       if (importance) {
         parts.importanceBadge.dataset.tier = ["focus", "priority", "normal", "dormant"].includes(importance.tier) ? importance.tier : "pending";
         parts.importanceBadge.textContent = [importance.tier_label || "待评估", importance.manual_tier ? "人工" : ""].filter(Boolean).join(" · ");
-        parts.grounds.replaceChildren(...(importance.grounds || []).slice(0, 2).map(text => node("li", text)));
-        parts.grounds.hidden = !parts.grounds.childElementCount;
-        parts.cutoff.textContent = importance.cutoff_label ? `资料截至 ${importance.cutoff_label}` : "";
-        parts.cutoff.hidden = !importance.cutoff_label;
-        parts.gap.textContent = importance.gap_label || (importance.stale ? "依据待更新" : "");
-        parts.gap.hidden = !parts.gap.textContent;
         if (parts.manualTier) {
-          parts.manualEditor.hidden = !data.can_adjust_importance;
           if (!parts.manualDirty) { parts.manualTier.value = importance.manual_tier || ""; parts.manualReason.value = importance.manual_reason || ""; }
           parts.manualReason.required = Boolean(parts.manualTier.value);
-          parts.manualTier.disabled = busy; parts.manualReason.disabled = busy; parts.manualSave.disabled = busy;
+          parts.manualTier.disabled = busy; parts.manualReason.disabled = busy; parts.manualSave.disabled = busy; parts.manualCancel.disabled = busy;
         }
+      }
+      if (parts.handleEditor) {
+        parts.handleEditor.hidden = !data.can_edit_handles;
+        if (parts.handleEditor.hidden) { parts.handleDirty = false; parts.handleEditor.open = false; }
+        if (!parts.handleDirty) {
+          parts.oldHandle.replaceChildren(...(item.handles?.length ? item.handles : [""]).map(handle => {
+            const option = node("option", handle ? `@${handle}` : "尚无 handle"); option.value = handle; return option;
+          }));
+          parts.handleInput.value = parts.oldHandle.value;
+        }
+        parts.oldHandle.disabled = busy; parts.handleInput.disabled = busy; parts.handleSave.disabled = busy; parts.handleCancel.disabled = busy;
       }
       parts.initial.textContent = Array.from((item.display_name || "").trim())[0]?.toUpperCase() || "?";
       if (parts.avatarUrl !== item.avatar_url) {
@@ -290,17 +308,6 @@
         parts.saved.append(node("span", `@${handle.replace(/^@/, "")}`));
       }
       if (!item.handles?.length) parts.saved.textContent = "—";
-      parts.actions.replaceChildren();
-      if (importance) parts.actions.append(parts.importance);
-      parts.accountButtons.replaceChildren();
-      for (const evidenceRow of item.evidence_rows || []) {
-        const button = node("button", `@${evidenceRow.handle}`, "btn btn-sm btn-outline-secondary");
-        button.setAttribute("aria-label", `查看 @${evidenceRow.handle} 的账号依据`);
-        button.type = "button"; button.disabled = busy;
-        button.addEventListener("click", () => showEvidence(evidenceRow.id));
-        parts.accountButtons.append(button);
-      }
-      if (parts.accountButtons.childElementCount) parts.actions.append(parts.account);
       if (!parts.actions.childElementCount) parts.actions.textContent = "—";
     }
     page = data.page || 1;
@@ -312,7 +319,7 @@
     renderSelection();
   }
   async function refresh(automatic = false) {
-    if (automatic && (reading || busy || document.hidden || [...rows.values()].some(row => row.dirty || row.manualDirty) || el("import-dialog").open)) return;
+    if (automatic && (reading || busy || document.hidden || [...rows.values()].some(row => row.dirty || row.manualDirty || row.handleDirty) || el("import-dialog").open)) return;
     if (reading) {
       refreshQueued = true; version++;
       return;
@@ -325,7 +332,7 @@
     history.replaceState(null, "", `/creators?${params}`);
     try {
       const next = await read(await fetch(`/creators/data?${params}`, {cache: "no-store"}));
-      if (token === version && !(automatic && [...rows.values()].some(row => row.dirty || row.manualDirty))) {
+      if (token === version && !(automatic && [...rows.values()].some(row => row.dirty || row.manualDirty || row.handleDirty))) {
         data = next; sort = data.sort || "importance"; tier = data.tier || ""; render();
       }
     } catch (error) {
@@ -333,10 +340,10 @@
         if ([401, 403].includes(error.status)) {
           selectedContacts.clear(); importPreview = null; clearRows();
           el("initial").textContent = "";
-          el("evidence").close(); el("evidence-body").replaceChildren(); el("import-dialog").close();
+          el("import-dialog").close();
           data = {...data, items: [], import_batches: [], cms: [], read_only: true,
             can_view_unassigned: false, can_select_cm: false, can_broadcast: false,
-            can_view_importance: false, can_adjust_importance: false, importance_running: false,
+            can_view_importance: false, can_adjust_importance: false, can_edit_handles: false, importance_running: false,
             total_count: 0, total_pages: 1, page: 1};
           if (el("cm")) { el("cm").replaceChildren(); el("cm").disabled = true; }
           render();
@@ -354,7 +361,7 @@
     if (busy) return;
     busy = true; render(); notice("");
     try {
-      await read(await fetch(`/creators${path}`, {method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"},
+      const result = await read(await fetch(`/creators${path}`, {method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"},
         body: new URLSearchParams({csrf_token: app.dataset.csrf, ...fields})}));
       if (tab === "candidates" && (path.endsWith("/confirm") || path.endsWith("/defer"))) {
         const key = `import:${path.split("/")[3]}`;
@@ -364,9 +371,18 @@
         notice("已入库。");
       }
       else if (path.endsWith("/importance")) {
+        const item = data.items.find(item => item.contact_id === path.split("/")[2]);
+        if (item && selectedCM() === fields.cm_id) item.importance = result.importance;
         const parts = rows.get(`confirmed:${path.split("/")[2]}`);
-        if (parts) parts.manualDirty = false;
-        notice("维护优先级已更新。");
+        if (parts?.manualEditor) { parts.manualDirty = false; parts.manualEditor.open = false; }
+        notice("重要度已更新。");
+      }
+      else if (path.endsWith("/handle")) {
+        const item = data.items.find(item => item.contact_id === path.split("/")[2]);
+        if (item && selectedCM() === fields.cm_id) item.handles = result.handles;
+        const parts = rows.get(`confirmed:${path.split("/")[2]}`);
+        if (parts?.handleEditor) { parts.handleDirty = false; parts.handleEditor.open = false; }
+        notice("handle 已更新。");
       }
       else if (path.endsWith("/defer")) {
         notice("已暂缓，修改未入库。");
@@ -379,7 +395,7 @@
       else if (path.endsWith("/pause")) notice("已暂停，进行中的请求仍会完成。");
       else if (path.endsWith("/resume")) notice("已继续匹配。");
       else notice("已保存。");
-      void refresh();
+      await refresh();
     } catch (error) { notice(error.message, true); }
     finally { busy = false; render(); }
   }
@@ -421,82 +437,6 @@
     } catch (error) { importMessage(error.message, true); }
     finally { busy = false; render(); }
   }
-  async function showEvidence(rowId, edited = false) {
-    const token = ++evidenceVersion, scope = selectedCM(), body = el("evidence-body");
-    el("evidence-title").textContent = "证据链"; body.textContent = "正在读取…";
-    if (!el("evidence").open) el("evidence").showModal();
-    try {
-      const evidence = await read(await fetch(`/creators/imports/rows/${rowId}/evidence`, {cache: "no-store"}));
-      if (token !== evidenceVersion || scope !== selectedCM()) return;
-      el("evidence-title").textContent = `${evidence.handle || "账号"} · 证据链`;
-      body.replaceChildren();
-      const confidence = (value, label = "置信度") => Number.isFinite(value) ? `${label} ${Math.round(value * 100)}%` : "";
-      const section = title => {
-        const part = node("section", "", "border-top pt-3 mt-3");
-        part.append(node("h4", title)); body.append(part); return part;
-      };
-      const list = (parent, values, classes = "") => {
-        if (!values?.length) return;
-        const ul = node("ul", "", classes);
-        for (const value of values) ul.append(node("li", value));
-        parent.append(ul);
-      };
-      body.append(node("p", [evidence.phase_label, evidence.status_label].filter(Boolean).join(" · "), "text-secondary"));
-      if (edited) body.append(node("p", "以下是已保存的证据。当前账号或用户的修改尚未提交，原 AI 判断不适用于修改后的内容。", "alert alert-warning"));
-      list(body, evidence.warnings, "text-warning");
-      const groups = section("1. 对应群与相关材料");
-      if (evidence.group_decision) {
-        const decision = evidence.group_decision;
-        groups.append(node("p", ["AI 找群判断", decision.status_label, confidence(decision.confidence, "对此结论的置信度")].filter(Boolean).join(" · "), "fw-semibold"));
-        groups.append(node("p", decision.reason || "等待 AI 判断对应群。"));
-        if (decision.search_summary) groups.append(node("p", decision.search_summary, "small text-secondary"));
-        if (decision.evidence_refs?.length) groups.append(node("p", `依据：${decision.evidence_refs.join("、")}`, "small text-secondary"));
-      }
-      for (const group of evidence.groups || []) {
-        const detail = node("details", "", "border rounded p-3 mb-2"); detail.open = !!group.selected;
-        const selection = group.selected === true ? "已选中" : group.selected === false ? "未选中" : "待判断";
-        detail.append(node("summary", [group.ref, group.name || "未命名群", selection, confidence(group.confidence)].filter(Boolean).join(" · "), "fw-semibold"));
-        detail.append(node("p", group.reason || "尚无选群判断。", "mt-2 mb-2"));
-        const members = node("details", "", "mt-3"); members.open = (group.members || []).length <= 8;
-        members.append(node("summary", `群成员 · ${(group.members || []).length} 人`, "fw-semibold"));
-        if (group.members?.length) {
-          const wrap = node("div", "", "table-responsive mt-2"); wrap.style.maxHeight = "320px"; wrap.style.overflowY = "auto";
-          const table = node("table", "", "table table-sm table-vcenter");
-          const head = node("thead"), header = node("tr"), rows = node("tbody");
-          for (const text of ["用户", "已知分类", "本次处理", "依据"]) {
-            const th = node("th", text); th.scope = "col"; header.append(th);
-          }
-          head.append(header); table.append(head, rows);
-          for (const member of group.members) {
-            const row = node("tr");
-            for (const text of [[member.ref, member.display_name || "未命名用户"].filter(Boolean).join(" · "), member.classification || "待定", member.status_label || "—", member.reason || "—"]) row.append(node("td", text));
-            rows.append(row);
-          }
-          wrap.append(table); members.append(wrap);
-        } else members.append(node("p", "本群成员信息尚不可用。", "text-secondary mt-2"));
-        detail.append(members);
-        const messages = node("details", "", "mt-3"); messages.open = (group.messages || []).length <= 3;
-        messages.append(node("summary", `相关发言 · ${(group.messages || []).length} 条`, "fw-semibold"));
-        for (const message of group.messages || []) {
-          const quote = node("div", "", "border-top mt-2 pt-2");
-          quote.append(node("p", [message.ref, message.sender_name, message.time_label].filter(Boolean).join(" · "), "small text-secondary mb-1"));
-          quote.append(node("blockquote", message.available === false ? "这条材料当前不可读取。" : message.text || "—"));
-          messages.append(quote);
-        }
-        if (!group.messages?.length) messages.append(node("p", "本次没有可展示的相关发言。", "text-secondary mt-2"));
-        detail.append(messages); groups.append(detail);
-      }
-      if (!evidence.groups?.length) groups.append(node("p", "暂无可展示的候选群，具体原因见下方结论。", "text-secondary"));
-      const person = evidence.person || {}, personSection = section("2. 用户判断");
-      personSection.append(node("p", ["AI 找人判断", person.status_label, confidence(person.confidence, "对此结论的置信度")].filter(Boolean).join(" · "), "fw-semibold"));
-      personSection.append(node("p", `用户：${person.display_name || "—"}`));
-      personSection.append(node("p", person.reason || "尚未确定具体用户。"));
-      if (person.evidence_refs?.length) personSection.append(node("p", `依据：${person.evidence_refs.join("、")}`, "small text-secondary"));
-      const conclusion = section("3. 当前结论");
-      conclusion.append(node("p", evidence.reason || "尚未完成匹配。"));
-      list(conclusion, evidence.conflicts, "text-danger");
-    } catch (error) { if (token === evidenceVersion) body.textContent = error.message; }
-  }
   for (const key of ["mine", "candidates", "unassigned"]) el(key).addEventListener("click", () => {
     if (tab === key) return;
     selectedContacts.clear(); tab = key; page = 1; clearRows(); renderSelection(); refresh();
@@ -505,11 +445,9 @@
   for (const key of ["sort", "tier"]) el(key).addEventListener("change", () => {
     sort = el("sort").value; tier = el("tier").value; page = 1; clearRows(); refresh();
   });
-  el("refresh").addEventListener("click", () => refresh());
+  el("refresh").addEventListener("click", () => { notice(""); void refresh(); });
   el("previous").addEventListener("click", () => { page--; clearRows(); refresh(); });
   el("next").addEventListener("click", () => { page++; clearRows(); refresh(); });
-  el("evidence-close").addEventListener("click", () => el("evidence").close());
-  el("evidence").addEventListener("close", () => { evidenceVersion++; el("evidence-body").replaceChildren(); });
   el("import-open").addEventListener("click", () => {
     importPreview = null; el("import-file").value = ""; el("import-preview").hidden = true;
     el("import-cm").textContent = selectedCMName(); importMessage(""); render(); el("import-dialog").showModal();
