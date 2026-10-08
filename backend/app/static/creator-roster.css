@@ -6,6 +6,10 @@
 .creator-lark-link[hidden] { display: none; }
 #creators-app .creator-roster-card { border-color: #dce3eb; }
 #creators-app .creator-roster-card .card-header { background: #f8fafc; }
+#creators-app .creator-cm-filter { width: 200px; }
+#creators-app .creator-import-history { display: block; }
+#creators-app .creator-import-history[hidden] { display: none; }
+#creators-app .creator-import-history > summary { padding: 14px 20px; cursor: pointer; color: #64748b; }
 #creators-app .creator-selection-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 12px 20px; background: #eef4fb; border-bottom: 1px solid #dce3eb; color: #334155; }
 #creators-app .creator-selection-bar[hidden] { display: none; }
 #creators-app .creator-selection-cell { width: 48px; min-width: 48px; text-align: center; }
@@ -22,6 +26,8 @@
 #creators-app .creator-importance-badge[data-tier="dormant"] { background: #f4f0e9; color: #78654d; }
 #creators-app .creator-importance-detail { min-width: 180px; max-width: 310px; font-size: 12px; }
 #creators-app .creator-importance-detail > summary { color: #64748b; cursor: pointer; }
+#creators-app .creator-account-detail { margin-top: 4px; font-size: 12px; }
+#creators-app .creator-account-detail > summary { color: #64748b; cursor: pointer; }
 #creators-app .creator-importance-detail .creator-importance-grounds { margin: 8px 0; padding-left: 16px; }
 #creators-app .creator-importance-editor { border-top: 1px solid var(--tblr-border-color); margin-top: 10px; padding-top: 10px; }
 @media (max-width: 575px) {
@@ -30,7 +36,7 @@
   #creators-app .creator-selection-bar { gap: 8px; padding: 12px; }
   #creators-app .creator-selection-bar .btn-list { width: 100%; margin-left: 0 !important; }
   #creators-app .creator-selection-bar .btn { flex: 1; }
-  #creators-app .creator-selection-hint { font-size: 11px; }
+  #creators-app .creator-cm-filter { width: 100%; }
   #creators-app #creators-search { width: 100%; }
   #creators-app .creator-roster-table thead { display: none; }
   #creators-app .creator-roster-table tbody, #creators-app .creator-roster-table tr { display: block; }

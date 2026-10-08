@@ -76,7 +76,7 @@
     const search = node("button", "搜索", "btn btn-sm btn-outline-secondary"); search.type = "button";
     const choices = node("div", "", "d-flex flex-column gap-1 mt-1"); choices.setAttribute("aria-live", "polite");
     searchLine.append(user, search); userCell.append(searchLine, choices);
-    const editNote = node("div", "账号或用户已修改，原 AI 判断不适用于本次修改；确认时重新核验。", "small text-warning mt-1");
+    const editNote = node("div", "账号或用户已修改，原判断失效，确认时重新核验。", "small text-warning mt-1");
     editNote.hidden = true;
     const actions = node("td"), actionsList = node("div", "", "d-flex gap-1 flex-wrap");
     const confirm = node("button", "确认入库", "btn btn-sm btn-primary"); confirm.type = "button";
@@ -181,7 +181,9 @@
     importance.append(node("summary", "维护依据"));
     const grounds = node("ul", "", "creator-importance-grounds"), cutoff = node("div", "", "text-secondary"), gap = node("div", "", "text-secondary mt-1");
     importance.append(grounds, cutoff, gap);
-    const parts = {row, name, lark, avatar, initial, saved, actions, importanceBadge, importance, grounds, cutoff, gap, manualDirty: false};
+    const account = node("details", "", "creator-account-detail"); account.append(node("summary", "账号依据"));
+    const accountButtons = node("div", "", "d-flex flex-wrap gap-1 mt-2"); account.append(accountButtons);
+    const parts = {row, name, lark, avatar, initial, saved, actions, importanceBadge, importance, grounds, cutoff, gap, account, accountButtons, manualDirty: false};
     if (data.can_adjust_importance) {
       const editor = node("details", "", "creator-importance-editor"); editor.append(node("summary", "人工调整"));
       const form = node("form", "", "mt-2"), manualTier = node("select", "", "form-select form-select-sm"), manualReason = node("input", "", "form-control form-control-sm mt-2");
@@ -290,12 +292,15 @@
       if (!item.handles?.length) parts.saved.textContent = "—";
       parts.actions.replaceChildren();
       if (importance) parts.actions.append(parts.importance);
+      parts.accountButtons.replaceChildren();
       for (const evidenceRow of item.evidence_rows || []) {
-        const button = node("button", `@${evidenceRow.handle} · 查看证据链`, "btn btn-sm btn-outline-secondary d-block mb-1");
+        const button = node("button", `@${evidenceRow.handle}`, "btn btn-sm btn-outline-secondary");
+        button.setAttribute("aria-label", `查看 @${evidenceRow.handle} 的账号依据`);
         button.type = "button"; button.disabled = busy;
         button.addEventListener("click", () => showEvidence(evidenceRow.id));
-        parts.actions.append(button);
+        parts.accountButtons.append(button);
       }
+      if (parts.accountButtons.childElementCount) parts.actions.append(parts.account);
       if (!parts.actions.childElementCount) parts.actions.textContent = "—";
     }
     page = data.page || 1;
@@ -356,7 +361,7 @@
         data.items = data.items.filter(item => rowKey(item) !== key);
       }
       if (path.endsWith("/confirm")) {
-        notice("已确认入库，可在“我的达人”查看。同一人的多个 handle 会合并展示。");
+        notice("已入库。");
       }
       else if (path.endsWith("/importance")) {
         const parts = rows.get(`confirmed:${path.split("/")[2]}`);
@@ -364,15 +369,15 @@
         notice("维护优先级已更新。");
       }
       else if (path.endsWith("/defer")) {
-        notice("已暂缓，尚未确认的修改不会入库。");
+        notice("已暂缓，修改未入库。");
       }
       else if (path.endsWith("/start")) {
         page = 1; clearRows();
-        notice("名单已导入，系统正在找群、找人。结果保留待核对，确认前请核验 Curva 收录及本人账号证据。");
+        notice("已导入，正在匹配。待核对结果请到候选达人确认。");
       }
-      else if (path.endsWith("/recheck")) notice("未确认的账号已重新排队，可在候选行查看进度和证据链。");
-      else if (path.endsWith("/pause")) notice("已暂停，已发出的请求完成后不再开始下一步。");
-      else if (path.endsWith("/resume")) notice("已继续匹配，可在候选行查看进度。");
+      else if (path.endsWith("/recheck")) notice("未确认账号已重新排队。");
+      else if (path.endsWith("/pause")) notice("已暂停，进行中的请求仍会完成。");
+      else if (path.endsWith("/resume")) notice("已继续匹配。");
       else notice("已保存。");
       void refresh();
     } catch (error) { notice(error.message, true); }
@@ -393,13 +398,12 @@
       const nextStep = importPreview.status !== "preview" ? "这份表已导入，请查看导入记录及候选达人。" : counts.valid ? "请核对后确认导入。" : "请修改表格后重新上传。";
       importMessage(`有效 handle ${counts.valid || 0} · 重复 ${counts.duplicates || 0} · 无效 ${counts.invalid || 0}。${nextStep}`);
       const preview = el("import-preview"); preview.replaceChildren();
-      preview.append(node("p", `负责人：${selectedCMName()}。确认导入后，系统自动找群、找人并检查冲突；结果保留待核对。`, "small"));
       const list = node("div", "", "border rounded p-2"); list.style.maxHeight = "240px"; list.style.overflowY = "auto";
       for (const item of (importPreview.rows || []).slice(0, 100)) {
         list.append(node("div", `第 ${item.row_number} 行 · ${item.handle || "—"}${item.error ? ` · ${item.error}` : ""}`, `small py-1 ${item.error ? "text-danger" : ""}`));
       }
       preview.append(list);
-      if ((importPreview.rows || []).length > 100) preview.append(node("p", "这里只展示前 100 行，确认后会处理全部有效 handle。", "small text-secondary mt-2"));
+      if ((importPreview.rows || []).length > 100) preview.append(node("p", "预览前 100 行，导入全部有效 handle。", "small text-secondary mt-2"));
       preview.hidden = false;
       void refresh();
     } catch (error) { importMessage(error.message, true); }
@@ -412,7 +416,7 @@
       await read(await fetch(`/creators/imports/${importPreview.id}/start`, {method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: new URLSearchParams({csrf_token: app.dataset.csrf})}));
       importPreview = null; el("import-dialog").close();
       page = 1; clearRows();
-      notice("名单已导入，系统正在找群、找人。结果保留待核对，确认前请核验 Curva 收录及本人账号证据。");
+      notice("已导入，正在匹配。待核对结果请到候选达人确认。");
       void refresh();
     } catch (error) { importMessage(error.message, true); }
     finally { busy = false; render(); }

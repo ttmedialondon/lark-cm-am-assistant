@@ -1,22 +1,19 @@
 {% extends "base.html" %}
 {% block title %}我的达人 · TT Media{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-roster.css?v=20261008-maintenance-tiers">{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-roster.css?v=20261008-roster-cleanup">{% endblock %}
 {% block body %}
 <div class="page business-page" id="creators-app" data-csrf="{{ csrf_token }}" data-tab="{{ creator_tab }}" data-actor="{{ authorization.id }}">
   {% with business_section='creators' %}{% include "partials/business_nav.html" %}{% endwith %}
   <main class="page-wrapper"><div class="page-body"><div class="container-xl">
-    <div class="business-heading"><div><h2 class="page-title">我的达人</h2><p>查看达人账号与负责人。</p></div><div class="btn-list">{% if creator_data.can_broadcast %}<a class="btn btn-outline-primary" href="/creators/broadcast">群发预览</a>{% endif %}<button type="button" id="creators-import-open" class="btn btn-primary">导入 Excel</button><button type="button" id="creators-refresh" class="btn btn-outline-secondary">刷新</button></div></div>
+    <div class="business-heading"><h2 class="page-title">我的达人</h2><div class="btn-list">{% if creator_data.can_broadcast %}<a class="btn btn-outline-primary" href="/creators/broadcast">群发预览</a>{% endif %}<button type="button" id="creators-import-open" class="btn btn-primary">导入 Excel</button><button type="button" id="creators-refresh" class="btn btn-outline-secondary">刷新</button></div></div>
     <div id="creators-notice" class="alert d-none" role="status"></div>
-    {% if creator_data.can_select_cm %}<section class="card mb-3" aria-label="名单负责人"><div class="card-body">
-      <label for="creators-cm" class="form-label">负责人</label><select id="creators-cm" class="form-select"><option value="">暂无可用负责人</option></select>
-    </div></section>{% endif %}
-    <section class="card mb-3" id="creators-import-batches" hidden aria-label="Excel 导入记录"><div class="card-header"><h3 class="card-title">Excel 导入记录</h3></div><div id="creators-import-batch-list" class="card-body"></div></section>
-    <section class="card creator-roster-card"><div class="card-header d-flex align-items-center flex-wrap gap-3"><div class="btn-list me-auto" role="group" aria-label="达人列表"><button type="button" id="creators-mine" class="btn">我的达人</button><button type="button" id="creators-candidates" class="btn">候选达人</button><button type="button" id="creators-unassigned" class="btn" hidden>未分配达人</button></div><form id="creators-search" class="d-flex gap-2" role="search"><label class="visually-hidden" for="creators-query">姓名或 handle</label><input class="form-control" id="creators-query" type="search" value="{{ creator_query }}" maxlength="120" placeholder="搜索姓名或 handle"><button class="btn btn-outline-secondary" type="submit">搜索</button></form></div>
+    <details class="card mb-3 creator-import-history" id="creators-import-batches" hidden><summary class="fw-semibold">导入记录</summary><div id="creators-import-batch-list" class="card-body"></div></details>
+    <section class="card creator-roster-card"><div class="card-header d-flex align-items-center flex-wrap gap-3"><div class="btn-list me-auto" role="group" aria-label="达人列表"><button type="button" id="creators-mine" class="btn">我的达人</button><button type="button" id="creators-candidates" class="btn">候选达人</button><button type="button" id="creators-unassigned" class="btn" hidden>未分配达人</button></div>{% if creator_data.can_select_cm %}<div class="creator-cm-filter"><label for="creators-cm" class="visually-hidden">负责人</label><select id="creators-cm" class="form-select"><option value="">暂无可用负责人</option></select></div>{% endif %}<form id="creators-search" class="d-flex gap-2" role="search"><label class="visually-hidden" for="creators-query">姓名或 handle</label><input class="form-control" id="creators-query" type="search" value="{{ creator_query }}" maxlength="120" placeholder="搜索姓名或 handle"><button class="btn btn-outline-secondary" type="submit">搜索</button></form></div>
       <div class="creator-importance-toolbar" id="creators-importance-toolbar" {% if not creator_data.can_view_importance %}hidden{% endif %}>
         <div><label class="visually-hidden" for="creators-tier">维护优先级</label><select class="form-select form-select-sm" id="creators-tier"><option value="">全部优先级</option><option value="focus">重点</option><option value="priority">优先</option><option value="normal">常规</option><option value="dormant">久未联系</option><option value="pending">待评估</option></select></div>
         <div><label class="visually-hidden" for="creators-sort">排序</label><select class="form-select form-select-sm pe-4" id="creators-sort"><option value="importance">按维护优先级排序</option><option value="name">按姓名排序</option></select></div>
       </div>
-      {% if creator_data.can_broadcast %}<div class="creator-selection-bar" id="creators-selection-bar" hidden><label class="form-check mb-0"><input class="form-check-input" type="checkbox" id="creators-select-page"><span class="form-check-label">本页全选</span></label><span id="creators-selection-count" class="fw-semibold" role="status" aria-live="polite">已选 0 / 500 位</span><span class="text-secondary small creator-selection-hint">搜索、翻页保留选择</span><div class="btn-list ms-auto"><button class="btn btn-sm btn-outline-secondary" id="creators-selection-clear" type="button" disabled>清空选择</button><button class="btn btn-sm btn-primary" id="creators-selection-broadcast" type="button" disabled>带入群发</button></div></div>{% endif %}
+      {% if creator_data.can_broadcast %}<div class="creator-selection-bar" id="creators-selection-bar" hidden><label class="form-check mb-0"><input class="form-check-input" type="checkbox" id="creators-select-page"><span class="form-check-label">本页全选</span></label><span id="creators-selection-count" class="fw-semibold" role="status" aria-live="polite">已选 0 / 500 位</span><div class="btn-list ms-auto"><button class="btn btn-sm btn-outline-secondary" id="creators-selection-clear" type="button" disabled>清空选择</button><button class="btn btn-sm btn-primary" id="creators-selection-broadcast" type="button" disabled>带入群发</button></div></div>{% endif %}
       <div class="table-responsive"><table class="table table-vcenter card-table creator-roster-table"><thead><tr>{% if creator_data.can_broadcast %}<th scope="col" class="creator-selection-cell" id="creators-selection-head" hidden>选择</th>{% endif %}<th scope="col">达人 handle</th><th scope="col">Lark 用户</th><th scope="col">操作</th></tr></thead><tbody id="creators-rows"></tbody></table></div>
       <div class="card-body text-secondary" id="creators-empty">{% if creator_tab == 'mine' %}还没有已入库的达人。{% else %}暂无候选达人。{% endif %}</div>
       <div class="card-footer d-flex align-items-center justify-content-between"><span id="creators-page-label" class="text-secondary"></span><div class="btn-list"><button type="button" id="creators-previous" class="btn btn-sm btn-outline-secondary">上一页</button><button type="button" id="creators-next" class="btn btn-sm btn-outline-secondary">下一页</button></div></div>
@@ -25,9 +22,8 @@
   </div></div></main>
   <dialog id="creators-evidence" class="creator-evidence" aria-labelledby="creators-evidence-title"><div class="d-flex align-items-center gap-3 mb-3"><h3 id="creators-evidence-title" class="mb-0 me-auto">证据链</h3><button type="button" id="creators-evidence-close" class="btn btn-sm btn-outline-secondary">关闭</button></div><div id="creators-evidence-body" aria-live="polite"></div></dialog>
   <dialog id="creators-import-dialog" class="creator-evidence" aria-labelledby="creators-import-title"><div class="d-flex align-items-center gap-3 mb-3"><h3 id="creators-import-title" class="mb-0 me-auto">导入达人账号名单</h3><button type="button" id="creators-import-close" class="btn btn-sm btn-outline-secondary">关闭</button></div>
-    <p>这份名单的负责人：<strong id="creators-import-cm"></strong></p>
-    <p class="text-secondary">仅上传一列 handle，每行一个，可带 handle 表头。上传者和负责人分别记录。</p>
-    <p class="text-secondary small">确认导入后自动开始：找对应群 → 找用户 → 检查冲突 → 入库或待核对。每个 handle 单独匹配，支持查看完整证据链；需人工核验账号证据和 Curva 收录后确认，也可暂缓。</p>
+    <p>负责人：<strong id="creators-import-cm"></strong></p>
+    <p class="text-secondary">一列 handle，每行一个，可带表头。导入后自动匹配，待核对结果需人工确认。</p>
     <label for="creators-import-file" class="form-label">Excel 文件（.xlsx，最多 2 MB）</label><input type="file" id="creators-import-file" class="form-control" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
     <div id="creators-import-message" class="small mt-3" role="status" aria-live="polite"></div>
     <div id="creators-import-preview" class="mt-3" hidden></div>
@@ -35,5 +31,5 @@
   </dialog>
 </div>
 <script id="creators-initial" type="application/json">{{ creator_data|tojson }}</script>
-<script src="/static/creator-handles.js?v=20261008-maintenance-tiers" defer></script>
+<script src="/static/creator-handles.js?v=20261008-roster-cleanup" defer></script>
 {% endblock %}

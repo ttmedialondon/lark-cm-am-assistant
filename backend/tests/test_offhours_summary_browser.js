@@ -71,12 +71,14 @@ test("bilingual user labels are displayed literally in evidence", async t => {
 
 test("creator names open permitted profiles while a separate accessible icon opens Lark", async t => {
   const attack = '<img src=x onerror="window.compromised=true">';
-  const data = {cms: [{id: "cm-1", name: "CM"}], selected_cm_id: "cm-1", can_select_cm: false,
+  const data = {cms: [{id: "cm-1", name: "CM"}], selected_cm_id: "cm-1", can_select_cm: true,
     can_view_unassigned: false, can_view_importance: true, can_adjust_importance: true,
-    read_only: false, import_batches: [],
+    read_only: false, import_batches: [{id: "batch-1", filename: "fixture.xlsx", status: "completed",
+      status_label: "识别完成", counts: {confirmed: 2, review: 1}, can_recheck: true}],
     sort: "importance", tier: "", importance_running: true, page: 1, total_count: 3, total_pages: 1,
     items: [
-      {id: "person-1", kind: "confirmed", display_name: "Creator One", open_id: "ou_creator_one", profile_url: "/admin/contacts/ou_creator_one", handles: ["one"]},
+      {id: "person-1", kind: "confirmed", display_name: "Creator One", open_id: "ou_creator_one", profile_url: "/admin/contacts/ou_creator_one", handles: ["one"],
+        evidence_rows: [{id: "row-1", handle: "one"}, {id: "row-2", handle: "one.alt"}]},
       {id: "person-2", kind: "confirmed", display_name: "No identity", open_id: null, profile_url: null, handles: ["two"]},
       {id: "person-3", kind: "confirmed", display_name: attack, open_id: "javascript:alert(1)", profile_url: null, handles: ["three"]},
     ]};
@@ -111,6 +113,7 @@ test("creator names open permitted profiles while a separate accessible icon ope
     if (target.pathname.startsWith("/static/")) return route.fulfill({contentType: target.pathname.endsWith(".js") ? "text/javascript" : target.pathname.endsWith(".svg") ? "image/svg+xml" : "text/css", body: fs.readFileSync(path.join(backend, "app", target.pathname))});
     state.calls.push({method: request.method(), url: target.pathname, search: target.search});
     if (target.pathname === "/admin/contacts/ou_creator_one") return route.fulfill({contentType: "text/html", body: "<p>Creator One profile</p>"});
+    if (target.pathname === "/creators/imports/rows/row-2/evidence") return route.fulfill({json: {handle: "one.alt", reason: "Fixture account evidence"}});
     if (target.pathname === "/creators/data") {
       state.data.sort = target.searchParams.get("sort") || "importance";
       state.data.tier = target.searchParams.get("tier") || "";
@@ -122,6 +125,22 @@ test("creator names open permitted profiles while a separate accessible icon ope
   await page.goto("http://localhost/creators");
   const rows = page.locator("#creators-rows tr");
   await rows.nth(2).waitFor();
+  assert.equal(await page.getByRole("combobox", {name: "负责人", exact: true}).inputValue(), "cm-1");
+  const history = page.locator("#creators-import-batches");
+  assert(!(await history.evaluate(element => element.open)));
+  assert(!(await history.getByRole("button", {name: "重新检查未确认"}).isVisible()));
+  await history.locator("summary").press("Enter");
+  assert(await history.getByRole("button", {name: "重新检查未确认"}).isVisible());
+  await history.locator("summary").click();
+  const account = rows.first().locator(".creator-account-detail");
+  assert(!(await account.evaluate(element => element.open)));
+  assert(!(await account.getByRole("button").first().isVisible()));
+  assert.equal(await rows.nth(1).locator(".creator-account-detail").count(), 0);
+  await account.locator("summary").press("Enter");
+  await account.getByRole("button", {name: "查看 @one.alt 的账号依据", exact: true}).click();
+  await page.getByText("Fixture account evidence", {exact: true}).waitFor();
+  assert(await page.getByRole("dialog", {name: "one.alt · 证据链"}).isVisible());
+  await page.getByRole("button", {name: "关闭", exact: true}).click();
   const names = rows.locator("td:nth-child(2) .fw-bold");
   assert.deepEqual(await names.allTextContents(), data.items.map(item => item.display_name));
   assert.equal(await page.locator("#creators-sort").inputValue(), "importance");
@@ -146,6 +165,8 @@ test("creator names open permitted profiles while a separate accessible icon ope
   const polling = page.waitForResponse(response => response.url().includes("/creators/data?"));
   state.data.importance_running = false;
   await polling;
+  assert(await account.evaluate(element => element.open));
+  assert(!(await history.evaluate(element => element.open)));
   Object.assign(state.data.items[0].importance, {tier: "priority", tier_label: "优先"});
   Object.assign(state.data.items[1].importance, {tier: "dormant", tier_label: "久未联系",
     grounds: ["已同步记录已42天无相关消息", "最近消息：2026-08-27"], gap_label: "历史同步范围不足"});
@@ -256,6 +277,7 @@ test("creator names open permitted profiles while a separate accessible icon ope
   await page.waitForFunction(() => !document.querySelectorAll('#creators-rows tr').length);
   assert.equal(await page.locator('#creators-evidence-body').textContent(), "");
   assert.equal(await page.locator('#creators-initial').textContent(), "");
+  assert(!(await history.isVisible()));
   assert(!(await page.locator('#creators-importance-toolbar').isVisible()));
   assert(state.calls.every(call => call.method === "GET"));
   assert.deepEqual(errors, []);
