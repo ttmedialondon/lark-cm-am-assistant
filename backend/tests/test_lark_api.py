@@ -1,4 +1,6 @@
+import json
 from contextlib import contextmanager
+from uuid import UUID
 
 import httpx
 import pytest
@@ -252,3 +254,128 @@ def test_legacy_rate_limit_code_is_retryable_without_http_429() -> None:
 
     assert error.rate_limited
     assert error.retryable
+
+
+def test_broadcast_preflight_checks_live_members_posting_and_mention_permissions():
+    calls = []
+    chat = {
+        "name": "External support", "chat_mode": "group", "chat_status": "normal", "external": True,
+        "moderation_permission": "all_members", "at_all_permission": "only_owner",
+        "owner_id_type": "open_id", "owner_id": "ou_owner", "user_manager_id_list": ["ou_cm"],
+        "user_count": "101",
+    }
+    in_chat = [True]
+    complete = [True]
+
+    def handle(request):
+        calls.append(request)
+        assert request.headers["Authorization"] == "Bearer user-token"
+        if request.url.path.endswith("/is_in_chat"):
+            data = {"is_in_chat": in_chat[0]}
+        elif request.url.path.endswith("/members/list"):
+            assert request.url.params["member_id_type"] == "open_id"
+            second = request.url.params.get("page_token") == "second"
+            data = {"users": [{"member_id": "ou_creator" if second else "ou_other"}],
+                    "has_more": not second, "page_token": "second", "truncations": [] if complete[0] else ["user"]}
+        elif request.url.path.endswith("/moderation"):
+            assert request.url.params["user_id_type"] == "open_id"
+            second = request.url.params.get("page_token") == "second"
+            data = {"moderation_setting": "moderator_list", "has_more": not second, "page_token": "second",
+                    "items": [{"user_id_type": "open_id", "user_id": "ou_cm" if second else "ou_other"}]}
+        else:
+            assert request.url.params["user_id_type"] == "open_id"
+            data = chat
+        return httpx.Response(200, json={"code": 0, "data": data})
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http_client:
+        client = LarkClient(settings(), http_client=http_client)
+        data = client.check_chat_send_access("user-token", "oc_group", sender_open_id="ou_cm",
+                                             mention_all=True, mention_open_ids=("ou_creator",))
+        assert data == {"chat_name": "External support", "member_count": 101, "external": True}
+        assert len(calls) == 4  # A second roster page is needed; no guessing from local names.
+        for changes, reason in (
+            ({"at_all_permission": "only_owner", "user_manager_id_list": []}, "mention everyone"),
+            ({"moderation_permission": "only_owner"}, "cannot post"),
+            ({"moderation_permission": "all_members", "chat_status": "dissolved"}, "unavailable"),
+        ):
+            chat.update(changes)
+            with pytest.raises(LarkApiError, match=reason):
+                client.check_chat_send_access("user-token", "oc_group", sender_open_id="ou_cm", mention_all=True)
+        in_chat[0] = False
+        with pytest.raises(LarkApiError, match="no longer a group member"):
+            client.check_chat_send_access("user-token", "oc_group", sender_open_id="ou_cm")
+        in_chat[0] = True
+        chat.update(chat_status="normal", moderation_permission="all_members")
+        complete[0] = False
+        with pytest.raises(LarkApiError, match="roster was incomplete"):
+            client.check_chat_send_access("user-token", "oc_group", sender_open_id="ou_cm",
+                                         mention_open_ids=("ou_creator",))
+        complete[0] = True
+        with pytest.raises(LarkApiError, match="Mentioned person is no longer a group member"):
+            client.check_chat_send_access("user-token", "oc_group", sender_open_id="ou_cm",
+                                         mention_open_ids=("ou_missing",))
+        chat["moderation_permission"] = "moderator_list"
+        assert client.check_chat_send_access("user-token", "oc_group", sender_open_id="ou_cm")["external"]
+
+
+def test_broadcast_send_uses_explicit_real_mentions_and_fixed_uuid_without_parsing_body():
+    requests = []
+    message_uuid = str(UUID(int=42))
+    body = 'Hello @all <at user_id="all">not a mention</at>\nhttps://example.com/?a=1&b=2'
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(200, json={"code": 0, "data": {"message_id": "om_sent", "chat_id": "oc_group"}})
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http_client:
+        client = LarkClient(settings(), http_client=http_client)
+        assert client.send_chat_post("user-token", "oc_group", body, message_uuid=message_uuid,
+                                     mentions=[{"id": "ou_creator", "name": "Creator"}]) == "om_sent"
+        request = requests[0]
+        assert request.method == "POST" and request.url.params["receive_id_type"] == "chat_id"
+        assert request.headers["Authorization"] == "Bearer user-token"
+        payload = json.loads(request.content)
+        assert payload["uuid"] == message_uuid and payload["receive_id"] == "oc_group" and payload["msg_type"] == "post"
+        rows = json.loads(payload["content"])["zh_cn"]["content"]
+        assert rows == [[{"tag": "at", "user_id": "ou_creator", "user_name": "Creator"}],
+                        *[[{"tag": "text", "text": line}] for line in body.split("\n")]]
+        client.send_chat_post("user-token", "oc_group", "test", message_uuid=message_uuid, mention_all=True)
+        all_rows = json.loads(json.loads(requests[1].content)["content"])["zh_cn"]["content"]
+        assert all_rows[0] == [{"tag": "at", "user_id": "all", "user_name": "all"}]
+        with pytest.raises(ValueError, match="Invalid Lark identity"):
+            client.send_chat_post("user-token", "oc_group", "test", message_uuid=message_uuid,
+                                 mentions=[{"id": "all", "name": "do not silently escalate"}])
+        with pytest.raises(ValueError, match="size limit"):
+            client.send_chat_post("user-token", "oc_group", "test\n" * 1000, message_uuid=message_uuid)
+        assert len(requests) == 2
+
+
+def test_broadcast_send_distinguishes_known_rejection_from_unknown_delivery_and_hides_raw_errors():
+    calls = []
+    responses = iter((
+        httpx.ConnectError("credentials in upstream message"),
+        httpx.ReadTimeout("body in upstream message"),
+        httpx.Response(500, json={"code": 0, "msg": "private body"}),
+        httpx.Response(400, json={"code": 230049, "msg": "private body"}),
+        httpx.Response(200, json={"code": 0, "data": {}}),
+        httpx.Response(200, text="private body"),
+        httpx.Response(400, json={"code": 230035, "msg": "private body"}),
+        httpx.Response(400, json={"code": 230020, "msg": "private body"}),
+    ))
+
+    def handle(request):
+        calls.append(request)
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http_client:
+        client = LarkClient(settings(), http_client=http_client)
+        for index, unknown in enumerate((False, True, True, True, True, True, False, False), start=1):
+            with pytest.raises(LarkApiError) as raised:
+                client.send_chat_post("secret-token", "oc_group", "secret-body", message_uuid=str(UUID(int=42)))
+            assert raised.value.delivery_unknown is unknown
+            assert len(calls) == index  # No internal retry, even with the idempotency UUID.
+            assert "private body" not in str(raised.value) and "secret" not in str(raised.value)
+        assert raised.value.rate_limited

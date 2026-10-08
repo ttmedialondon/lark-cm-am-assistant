@@ -60,16 +60,18 @@ curl --fail --silent --show-error https://larkbot.ttapp.help/healthz
 
 旧令牌不会因应用权限已开通自动获得发送权限。验收必须检查新令牌实际返回的两项 scope；此入口不会发送消息，也不会开启群发队列。普通登录与既有资料权限升级仍按原流程执行；后续普通登录若未返回发送 scope，需再次使用此增权入口。
 
-#### 群发页面的授权检查
+#### 群发页面与正式发送
 
 采用按功能增量授权，参考 [Google](https://developers.google.com/identity/protocols/oauth2/resources/granular-permissions)、[Microsoft](https://learn.microsoft.com/en-us/entra/identity-platform/consent-types-developer) 和 [Slack](https://docs.slack.dev/authentication/installing-with-oauth/) 的官方流程。不把应用已开通的全部权限都要求用户授权。
 
-- 每次进入、恢复页面及切换 CM/AM 时，通过带会话和 CSRF 校验的 `POST /creators/broadcast/permissions` 核对账号。客服群选择“全部达人”时核对当前登录账号，不把全部达人误认为一个发送人。
+- 每次进入、恢复页面及切换收件范围时，通过带会话和 CSRF 校验的 `POST /creators/broadcast/permissions` 核对当前登录者本人；选择其他 CM 只改变预览范围，不检查其凭据，也不能以其身份发送。
 - 结合最新 OAuth/刷新响应记录的 scope 与只读 `user_info` 核对基线、两项发送权限、凭证和本人身份。只有令牌临近到期才沿用现有行锁刷新；刷新明确返回 scope 时同步保存，未返回则保留历史记录。
-- 群发页面及所有群发业务接口统一要求本人已接入、Owner 有效或 `authorizations.broadcast_enabled` 单独开通、基线和两项发送权限齐全。普通用户仅使用本人负责的达人、本人可见的已分类群和个人名单／模板；`all` 归一本人，伪造其他 CM 一律拒绝，不继承已有跨 CM 管理权限。开通此标志不改变后台角色、页面权限、消息来源或 Lark scope；撤销后下一个请求立即拒绝。首次缺本人 scope 时，GET 在读取名单或模板前自动跳到本人 OAuth；进入页面后发现本人缺权或连接失效，也自动在当前标签页进入授权，无须点击本站的补授权按钮，Lark 同意仍由本人完成。权限检查中或未通过时，名单、模板、匹配、下载与预览均禁用；后端拒绝缺授权的业务操作，其他网站页面不受这项限制。
-- 自动授权链接增加 `auto=1`，仅以本人绑定的 HttpOnly/Secure cookie 防止重复自动跳转，不把 cookie 当作权限凭证；取消或失败停在提示页，需明确重试，完整成功才清除防循环标记。离开页面前在当前标签页临时保存同账号的有限草稿，返回后重核验目标，不自动保存或发送。
-- Owner 只能复制其他人的本人绑定链接，不能替目标 CM 授权；切换到缺权限的 CM 时锁住业务操作，但保留 CM 选择、授权链接和重试入口。网络错误、限流、5xx 或资源拒绝仅显示暂时无法核对并保持禁用，不修改全局接入状态、不循环授权。
-- [Lark CLI 的 auth check](https://github.com/larksuite/cli/blob/main/cmd/auth/check.go) 也是检查本地保存的 scope；`user_info` 不返回 scope。因此“授权已核对”只代表已记录必要权限齐全且当前凭证可用，不是实时发送 scope introspection，也不证明外部群、群发言或 @all 可用。群发界面仍为预览，不能因这项检查通过自动发送消息。
+- 编辑、保存、匹配和预览要求本人 active、正文同意和读取基线完整；通常由 Owner 或 `authorizations.broadcast_enabled` 单独开通。不再因缺发送 scope 自动跳 OAuth、锁住整个编辑区；实际发送前由本人点击补授权。草稿仅在当前标签页临时保留，返回后重新准备，不自动发送。普通用户只使用自己的达人、可见群和个人名单／模板，伪造其他 CM 拒绝；“自选群”允许选择未分类的本人可见群，但不改变正式分类。
+- 演示可配置 `BROADCAST_PREVIEW_UNTIL=2026-10-11T00:00:00+01:00`，仅在期限内绕过功能开通标志以预览；仍要求登录、正文授权和读取权限。到期自动恢复，不新增后台角色或发送授权。正式发送、重试及 Worker 始终要求 Owner 有效或本人功能标志为 true，并核对两项发送 scope。
+- `POST /creators/broadcast/prepare` 核验本人凭据、固定当前数据库范围和 @ 身份，并加密保存 15 分钟有效快照；`POST /creators/broadcast/send` 经再次确认、CSRF 与最新授权检查后入队。队列只有本人可创建/查看/停止/重试，Owner 不可冒充其他人。准备和确认不重复逐群请求 Lark；Worker 临发送逐群核验实际成员、发言、@ 对象及 @all 权限。
+- `/creators/broadcast/batches` 与 `/{id}` 展示本人结果；`/{id}/cancel` 停止尚未开始 POST 的项，已发出不撤回；`/{id}/retry` 只重排明确失败项。成功及结果未知不重发，未知项需到 Lark 核实。重复请求/预览复用同一任务；10 分钟内相同本人、正文、目标去重，每群持久化固定 UUID。
+- 独立发送 Worker 最多 2 个账号并行，同一账号串行，不占 AI 并发。限流尊重 Retry-After，最多 3 次自动尝试；不确定的网络/服务端结果及已开始发送的失效租约标记 unknown，未开始的失效租约恢复 pending。错误与审计不写正文或令牌，正文只加密保存并由本人在回执页查看。
+- [Lark CLI 的 auth check](https://github.com/larksuite/cli/blob/main/cmd/auth/check.go) 检查本地 scope；`user_info` 不返回 scope。因此授权就绪不等于外部群、发言或 @all 已经可用。正式验收需经网站确认并核对 Lark 回执与实际消息，不以一次直接 API 测试替代；外部群需另获指定群测试授权。
 
 预期健康检查返回 `{"status":"ok","database":"ok",...}`。若服务未启动，先查看不含消息正文的 systemd 日志：
 

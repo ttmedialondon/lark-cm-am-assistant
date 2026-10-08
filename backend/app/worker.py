@@ -17,6 +17,7 @@ import psycopg
 
 from . import (
     ai_dispatch,
+    creator_broadcast_delivery,
     creator_group_matching,
     creator_handle_matching,
     creator_importance,
@@ -112,6 +113,10 @@ def run_forever() -> None:
     next_organization_check = 0.0
     ai_executor = ThreadPoolExecutor(max_workers=ai_dispatch.MAX_CONCURRENT_REQUESTS, thread_name_prefix="openai")
     ai_futures: set[Future[Any]] = set()
+    broadcast_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="lark-broadcast")
+    broadcast_futures: set[Future[Any]] = set()
+    next_broadcast_check = 0.0
+    next_broadcast_recovery = 0.0
     preview_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="creator-preview")
     preview_future: Future[tuple[bool, int]] | None = None
     next_preview_check = 0.0
@@ -158,6 +163,12 @@ def run_forever() -> None:
                         getattr(settings, "organization_sync_interval_seconds", 21_600), 300
                     )
                 if settings.app_secret_configured:
+                    if time.monotonic() >= next_broadcast_recovery:
+                        creator_broadcast_delivery.recover()
+                        next_broadcast_recovery = time.monotonic() + 60
+                    next_broadcast_check = _schedule_broadcast(
+                        settings, broadcast_executor, broadcast_futures, next_broadcast_check,
+                    )
                     # Existing message pages get a turn before synchronous
                     # discovery for newly authorized users. Discovery remains
                     # a per-user phase barrier, but it cannot starve active
@@ -170,7 +181,7 @@ def run_forever() -> None:
                     _schedule_member_snapshot(settings, client, lark_executor, page_futures, member_futures)
                     identity_profiles.fill_slots(settings, client, avatar_executor, avatar_futures)
                 time.sleep(
-                    0.05 if page_futures or member_futures or avatar_futures or preview_future
+                    0.05 if page_futures or member_futures or avatar_futures or preview_future or broadcast_futures
                     else settings.worker_idle_seconds
                 )
             except KeyboardInterrupt:
@@ -181,6 +192,7 @@ def run_forever() -> None:
     finally:
         # Leases preserve in-flight work if systemd terminates us during a call.
         ai_executor.shutdown(wait=False, cancel_futures=False)
+        broadcast_executor.shutdown(wait=False, cancel_futures=False)
         preview_executor.shutdown(wait=False, cancel_futures=False)
         lark_executor.shutdown(wait=False, cancel_futures=False)
         avatar_executor.shutdown(wait=False, cancel_futures=False)
@@ -194,6 +206,30 @@ def _run_organization_sync(settings: Settings, client: LarkClient) -> None:
         organization_sync.sync_if_due(settings, client)
     except Exception:
         LOGGER.exception("organization sync failed without exposing organization data")
+
+
+def _schedule_broadcast(settings, executor, futures, next_check):
+    """Separate sending slots; the durable claim serializes each sender account."""
+    completed = False
+    for future in tuple(futures):
+        if not future.done():
+            continue
+        futures.remove(future)
+        completed = True
+        try:
+            future.result()
+        except Exception:
+            LOGGER.exception("broadcast delivery failed without exposing message data")
+    if completed:
+        next_check = 0.0
+    if time.monotonic() < next_check:
+        return next_check
+    while len(futures) < 2:
+        job = creator_broadcast_delivery.claim_next()
+        if not job:
+            return time.monotonic() + max(settings.worker_idle_seconds, 0.05)
+        futures.add(executor.submit(creator_broadcast_delivery.run_claimed, job, settings))
+    return 0.0
 
 
 def _dispatch_ai_turn(

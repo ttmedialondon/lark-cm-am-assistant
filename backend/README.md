@@ -28,7 +28,7 @@ python3 -m venv .venv
 .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8100
 ```
 
-另开终端，用同一开发环境运行 `.venv/bin/python -m app.worker`。worker 会领取同步及已启用的 AI 任务；不要把生产授权或 API Key 放进普通本地测试。
+另开终端，用同一开发环境运行 `.venv/bin/python -m app.worker`。worker 会领取同步、已启用的 AI 任务及用户明确确认的群发任务；群发使用独立并发，不占 AI 槽位。不要把生产授权或 API Key 放进普通本地测试。正式发送及临时演示配置见 [部署手册](../docs/runbooks/deploy-mvp.md#群发页面与正式发送)。
 
 ## 桌面回复接口（schema 1.1）
 

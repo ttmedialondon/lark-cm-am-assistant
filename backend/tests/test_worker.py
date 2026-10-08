@@ -385,6 +385,42 @@ def test_offhours_tasks_fill_five_parallel_slots_without_waiting(monkeypatch) ->
     assert len(futures) == 5
 
 
+def test_broadcast_uses_two_independent_slots_and_idle_backoff(monkeypatch):
+    now = [10.0]
+    jobs = iter(({"id": 1}, {"id": 2}, None, {"id": 3}, None))
+    calls, submitted = [], []
+
+    def claim():
+        calls.append(now[0])
+        return next(jobs)
+
+    class Executor:
+        def submit(self, runner, job, settings):
+            assert runner is worker.creator_broadcast_delivery.run_claimed
+            future = TaskFuture()
+            submitted.append((job, future))
+            return future
+
+    monkeypatch.setattr(worker.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(worker.creator_broadcast_delivery, "claim_next", claim)
+    monkeypatch.setattr(worker, "_schedule_ai", lambda *_: pytest.fail("Broadcast must not occupy an AI slot"))
+    futures = set()
+    config = SimpleNamespace(worker_idle_seconds=3)
+    executor = Executor()
+    next_check = worker._schedule_broadcast(config, executor, futures, 0)
+    assert len(futures) == 2 and next_check == 0 and len(calls) == 2
+    assert worker._schedule_broadcast(config, executor, futures, next_check) == 0 and len(calls) == 2
+    submitted[0][1].set_result(None)
+    next_check = worker._schedule_broadcast(config, executor, futures, next_check)
+    assert next_check == 13 and len(futures) == 1
+    now[0] = 11
+    assert worker._schedule_broadcast(config, executor, futures, next_check) == 13 and len(calls) == 3
+    submitted[1][1].set_exception(RuntimeError("safe failure"))
+    next_check = worker._schedule_broadcast(config, executor, futures, next_check)
+    assert next_check == 14 and [job["id"] for job, _ in submitted] == [1, 2, 3]
+    assert len(futures) == 1
+
+
 def test_creator_previews_are_fair_single_flight_and_back_off_without_work(monkeypatch) -> None:
     now = [10.0]
     submitted = []

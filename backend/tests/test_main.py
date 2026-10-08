@@ -64,7 +64,8 @@ def test_session_touch_is_throttled_without_caching_revocation(pg, monkeypatch):
     assert main._current_authorization(request) is None
 
 
-def test_dashboard_navigation_preserves_access_and_connection_controls() -> None:
+def test_dashboard_navigation_preserves_access_and_connection_controls(monkeypatch) -> None:
+    monkeypatch.setattr(main.creator_broadcast, "preview_open", lambda: False)
     authorization = {"id": uuid4(), "status": "active", "display_name": "CM", "body_consent_at": True,
                      "p2p_discovery_status": "succeeded"}
     context = {
@@ -88,6 +89,9 @@ def test_dashboard_navigation_preserves_access_and_connection_controls() -> None
         **context, "admin_role": "owner", "admin_landing_path": "/admin",
     }).body.decode()
     assert 'href="/creators/broadcast"' in owner and 'href="/admin"' in owner
+    monkeypatch.setattr(main.creator_broadcast, "preview_open", lambda: True)
+    demo = main._template(request, "dashboard.html", context).body.decode()
+    assert 'href="/creators/broadcast"' in demo and 'href="/admin"' not in demo
     restricted = main._template(request, "dashboard.html", {
         **context, "authorization": {**authorization, "body_consent_at": None},
         "body_consent": False, "offhours_summary_visible": False,

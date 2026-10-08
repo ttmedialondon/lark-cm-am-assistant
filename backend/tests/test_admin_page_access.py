@@ -203,6 +203,7 @@ def test_navigation_keeps_exact_grants_when_switching_between_pages(permissions)
     ((), True, {"/admin"}),
 ])
 def test_frontend_entry_uses_current_page_permissions(monkeypatch, permissions, owner, expected):
+    monkeypatch.setattr(main.creator_broadcast, "preview_open", lambda: False)
     _, actor, _ = _client(monkeypatch, permissions=permissions, owner=owner)
     actor.update(body_consent_at=True, p2p_discovery_status="succeeded")
     monkeypatch.setattr(main, "_current_authorization", lambda _: actor)

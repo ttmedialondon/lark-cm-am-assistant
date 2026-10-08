@@ -1,4 +1,4 @@
-// Routing is rechecked server-side. Personal lists/templates only; never sends.
+// Sending uses a frozen, server-rechecked preview and an idempotent request ID.
 export function recipients(entries, routes, groups, purpose) {
   const rows = new Map();
   for (const entry of entries) {
@@ -61,7 +61,7 @@ export function automaticAuthorizationUrl(value, actor, origin) {
       || [...url.searchParams.keys()].some(key => !['send','account_id','auto'].includes(key))) {
     throw new Error('授权账号不一致，请重新检查。');
   }
-  return `/auth/lark/start?${new URLSearchParams({send:'1',account_id:actor,auto:'1'})}`;
+  return `/auth/lark/start?${new URLSearchParams({send:'1',account_id:actor})}`;
 }
 export function parseDraft(raw, actor, now = Date.now(), canSelectCm = true) {
   if (typeof raw !== 'string' || raw.length > 300000) throw new Error('授权草稿无效。');
@@ -73,7 +73,7 @@ export function parseDraft(raw, actor, now = Date.now(), canSelectCm = true) {
   if (!draft || draft.version !== 1 || draft.actor_id !== actor || typeof draft.created_at !== 'number'
       || !Number.isFinite(age) || age < 0 || age > 1800000
       || (!['all',''].includes(draft.cm_id) && !id(draft.cm_id)) || (!canSelectCm && draft.cm_id !== actor)
-      || !['support','community','training','category','campaign'].includes(draft.purpose)
+      || !['support','community','training','category','campaign','custom'].includes(draft.purpose)
       || typeof draft.mention !== 'boolean' || !text(draft.raw,65536) || !text(draft.message,4000)
       || (draft.fixed_ids !== null && (!Array.isArray(draft.fixed_ids) || draft.fixed_ids.length > 500
         || !draft.fixed_ids.every(id)))
@@ -147,7 +147,7 @@ if (typeof process !== 'undefined' && process.argv.includes('--self-check')) {
     {fixed_ids:['bad']},{fixed_targets:[{contact_id:actor,chat_id:'oc_example'}]},{selected_groups:['']},
     {purpose:'unknown'}]) assert.throws(() => parseDraft(JSON.stringify({...draft,...fields}),actor,1001));
   assert.equal(automaticAuthorizationUrl(`/auth/lark/start?send=1&account_id=${actor}`,actor,'https://testserver'),
-    `/auth/lark/start?send=1&account_id=${actor}&auto=1`);
+    `/auth/lark/start?send=1&account_id=${actor}`);
   for (const url of [`https://other.test/auth/lark/start?send=1&account_id=${actor}`,
     `/auth/lark/start?send=1&account_id=${other}`,`/auth/lark/start?send=1&account_id=${actor}&redirect=evil`]) {
     assert.throws(() => automaticAuthorizationUrl(url,actor,'https://testserver'));
@@ -173,9 +173,12 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   let savedState = '', editMode = 'create', pendingAction = null, initialMetadata = '';
   let selectedGroups = new Set(), templates = config.templates || [], currentTemplateId = '', editingTemplate = null, initialTemplate = '';
   let permissionCheck = 0, permissionPending = false, permissionCm = null, permissionResult = null;
-  let redirecting = false, pendingRestore = false, businessRequest = null, loadingGroups = false;
+  let redirecting = false, pendingRestore = false, loadingGroups = false;
+  let frozenPreview = null, sendRequestId = null, sending = false, batches = [], activeBatch = null, batchTimer = null, batchBusy = false, batchRequest = 0;
   const draftKey = 'ttmedia.broadcast.authorization-draft';
-  const allowed = () => permissionReady(permissionResult,permissionPending,$('cm').value,permissionCm,redirecting);
+  const allowed = () => !redirecting;
+  const sendReady = () => permissionReady(permissionResult,permissionPending,$('cm').value,permissionCm,redirecting)
+    && permissionResult.feature_enabled === true && $('cm').value === actor;
   const groupMode = () => purpose !== 'support';
   const rows = () => recipients(entries, routes, groups, purpose);
   const plan = () => groupMode() ? groupPlan(groups,selectedGroups,$('mention').checked) : buildPlan(rows(), $('mention').checked, config.purposes[purpose]);
@@ -339,15 +342,17 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     syncGate();
   }
   function syncGate() {
-    $('workspace').disabled = $('editors').disabled = busy || !allowed();
+    $('workspace').disabled = busy || redirecting;
+    $('editors').disabled = busy || redirecting;
     $('cm').disabled = redirecting || !canSelectCm;
     $('permission-retry').disabled = permissionPending || redirecting;
-    $('permission-copy').disabled = permissionPending || redirecting;
+    $('permission-authorize').disabled = permissionPending || redirecting;
+    $('send').disabled = busy || sending || !sendReady();
+    $('send').textContent = frozenPreview ? `确认发送 ${frozenPreview.groups.length} 个群` : '准备发送';
+    if (!sending) $('confirm-state').textContent = sendReady() ? frozenPreview ? `以 ${frozenPreview.account_name || permissionResult.account_name} 本人身份发送 · 发送前逐群检查权限` : '尚未发送'
+      : permissionPending ? '正在核对发送授权，仍可预览' : $('cm').value !== actor ? '其他人员范围仅可预览' : permissionResult?.feature_enabled === false ? '演示模式 · 发送权限未开通' : '预览可用，发送前需补充本人授权';
   }
   function lock(value) { busy = value; render(); }
-  function closeDialogs() {
-    for (const dialog of $('app').querySelectorAll('dialog[open]')) dialog.close();
-  }
   function beginAuthorization(value) {
     if (redirecting) return;
     try {
@@ -371,36 +376,35 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     const business = action !== 'permissions', request = permissionCheck, cm = $('cm').value;
     if (business && !allowed()) throw new Error('请先完成当前账号的授权核对。');
     const control = {'permissions':'permission-retry','match':'match','resolve':'match','groups':'group-refresh',
-      'preview':'preview','lists/save':'list-save','templates/save':'template-save',
+      'preview':'preview','prepare':'send','send':'send','lists/save':'list-save','templates/save':'template-save',
       'lists/delete':'list-action-proceed','templates/delete':'list-action-proceed'}[action];
     const indicator = action === 'lists/load' ? $('list-action-dialog').open ? $('list-action-proceed')
       : [...$('library-items').querySelectorAll('[data-list-id]')].find(button => button.dataset.listId === data.id)
       : control ? $(control) : null;
     indicator?.setAttribute('aria-busy','true');
     const controller = new AbortController();
-    if (business) businessRequest = controller;
     try {
       const response = await fetch(`/creators/broadcast/${action}`, {method:'POST', credentials:'same-origin', signal:AbortSignal.any([controller.signal,AbortSignal.timeout(30000)]), headers:{'Content-Type':'application/json','X-CSRF-Token':$('app').dataset.csrf}, body:JSON.stringify(data)});
       const result = await response.json().catch(() => { throw new Error('服务暂时不可用，请稍后重试。'); });
-      if (business && (request !== permissionCheck || cm !== $('cm').value || !allowed())) throw new Error('账号或授权状态已变化，请重新核验。');
+      if (business && (cm !== $('cm').value || !allowed())) throw new Error('账号已变化，请重新核验。');
       if (!response.ok) {
         if (business && response.status === 403) {
-          permissionResult = null; closeDialogs(); syncGate();
+          permissionResult = null; syncGate();
           $('permission-status').textContent = '需要重新核对'; $('permission-status').className = 'badge bg-yellow-lt ms-2';
           $('permission-message').textContent = result.error || '当前操作权限已变化，请重新检查。';
-          $('permission-copy').hidden = true;
+          $('permission-authorize').hidden = true;
           if (result.authorization_url) {
-            try { automaticAuthorizationUrl(result.authorization_url,$('app').dataset.actor,location.origin); beginAuthorization(result.authorization_url); }
-            catch { /* A different account or unrelated 403 must never trigger own-account OAuth. */ }
+            try { automaticAuthorizationUrl(result.authorization_url,actor,location.origin); permissionResult = {status:'needs_authorization',is_self:true,authorization_url:result.authorization_url}; $('permission-authorize').hidden = false; }
+            catch { /* Never offer OAuth for a different account or an unrelated 403. */ }
           }
         }
         throw new Error(result.error || '请求失败，请稍后重试。');
       }
-      const readAction = ['match','resolve','groups','preview','lists/load'].includes(action);
+      const readAction = ['match','resolve','groups','preview','prepare','lists/load'].includes(action);
       const groupRead = action === 'groups' || result?.mode === 'groups';
-      if (!result || (readAction && (!Array.isArray(result.groups) || !Array.isArray(result[action === 'preview' || groupRead ? 'issues' : 'entries'])))
+      if (!result || (readAction && (!Array.isArray(result.groups) || !Array.isArray(result[action === 'preview' || action === 'prepare' || groupRead ? 'issues' : 'entries'])))
           || (action === 'permissions' ? !['ready','needs_authorization','unavailable'].includes(result.status)
-            : !readAction && !Array.isArray(action.startsWith('templates/') ? result.templates : result.lists))) throw new Error('返回格式异常，请刷新后重试。');
+            : action === 'send' ? !result.batch?.id : !readAction && !Array.isArray(action.startsWith('templates/') ? result.templates : result.lists))) throw new Error('返回格式异常，请刷新后重试。');
       return result;
     } catch (error) {
       if (error.name === 'AbortError' && controller.signal.aborted) throw new Error('授权正在重新核对，请稍后继续。');
@@ -409,7 +413,6 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       throw error;
     } finally {
       if (business || request === permissionCheck) indicator?.setAttribute('aria-busy','false');
-      if (businessRequest === controller) businessRequest = null;
     }
   }
   async function checkPermissions(force = false) {
@@ -418,28 +421,24 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     if (permissionPending && permissionCm === cm) return false;
     if (redirecting) return false;
     const request = ++permissionCheck; permissionCm = cm; permissionPending = true; permissionResult = null;
-    businessRequest?.abort();
     $('permission-bar').setAttribute('aria-busy','true'); $('permission-retry').disabled = true;
-    $('permission-account').textContent = cm === 'all' ? '当前账号' : config.cms.find(item => item.id === cm)?.name || 'CM/AM';
+    $('permission-account').textContent = `发送账号：${config.cms.find(item => item.id === actor)?.name || '本人'}`;
     $('permission-status').replaceChildren(loading('正在核对授权')); $('permission-status').className = 'badge bg-secondary-lt ms-2';
     $('permission-status').setAttribute('aria-busy','true');
-    $('permission-message').textContent = ''; $('permission-copy').hidden = true; syncGate();
+    $('permission-message').textContent = ''; $('permission-authorize').hidden = true; syncGate();
     try {
       const result = await api('permissions',{cm_id:cm});
       if (request !== permissionCheck || cm !== $('cm').value) return false;
       permissionResult = result;
-      $('permission-account').textContent = `${result.is_sender ? 'CM/AM' : '当前账号'}：${result.account_name || '未选择'}`;
-      $('permission-status').textContent = result.status === 'ready' ? '授权已核对' : result.status === 'needs_authorization' ? '需要补授权' : '暂时无法核对';
-      $('permission-status').className = `badge ms-2 ${result.status === 'ready' ? 'bg-green-lt' : 'bg-yellow-lt'}`;
-      $('permission-message').textContent = result.message || '';
-      if (result.status !== 'ready') closeDialogs();
+      $('permission-account').textContent = `发送账号：${result.account_name || '本人'}`;
+      $('permission-status').textContent = result.status === 'ready' && result.feature_enabled ? '本人发送已就绪' : result.feature_enabled === false ? '演示模式' : result.status === 'needs_authorization' ? '待补发送授权' : '暂时无法核对';
+      $('permission-status').className = `badge ms-2 ${result.status === 'ready' && result.feature_enabled ? 'bg-green-lt' : 'bg-yellow-lt'}`;
+      $('permission-message').textContent = result.status === 'ready' && result.feature_enabled ? '' : '可编辑、保存和预览；实际发送需要本人授权及发送权限。';
       if (result.status === 'needs_authorization' && result.authorization_url) {
-        if (result.is_self) beginAuthorization(result.authorization_url);
-        else $('permission-copy').hidden = false;
+        if (result.is_self) $('permission-authorize').hidden = false;
       }
     } catch (error) {
       if (request !== permissionCheck) return false;
-      closeDialogs();
       $('permission-status').textContent = '暂时无法核对'; $('permission-status').className = 'badge bg-yellow-lt ms-2';
       $('permission-message').textContent = error.message;
     } finally {
@@ -457,17 +456,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     return allowed();
   }
   $('permission-retry').addEventListener('click',() => void checkPermissions(true));
-  $('permission-copy').addEventListener('click',async () => {
-    const result = permissionResult, request = permissionCheck;
-    if (!result?.authorization_url) return;
-    try {
-      const url = new URL(result.authorization_url,location.origin);
-      if (url.origin !== location.origin || url.pathname !== '/auth/lark/start' || url.searchParams.get('send') !== '1'
-          || url.searchParams.get('account_id') !== result.account_id) throw new Error('授权链接无效');
-      await navigator.clipboard.writeText(url.href);
-      if (request === permissionCheck) $('permission-message').textContent = `已复制，请 ${result.account_name} 用本人账号打开。`;
-    } catch { if (request === permissionCheck) $('permission-message').textContent = '无法复制，请允许浏览器访问剪贴板后重试。'; }
-  });
+  $('permission-authorize').addEventListener('click',() => { if (permissionResult?.is_self && permissionResult.authorization_url) beginAuthorization(permissionResult.authorization_url); });
   document.addEventListener('visibilitychange',() => {
     if (!document.hidden) void checkPermissions(true);
   });
@@ -578,17 +567,151 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     try {
       const result = await api('preview',{cm_id:$('cm').value,purpose,mention:$('mention').checked,message:$('message').value,selections:selections()});
       if (result.issues.length) { dirty = true; throw new Error(groupMode() ? '群聊已变化，请点击“刷新”重新核验。' : `${result.issues.length} 项路由已变化，请重新匹配。`); }
-      $('confirm-count').textContent = `${result.groups.length} 个群 · ${result.groups.length} 条消息${groupMode() ? '' : ` · ${result.people.length} 位达人`}`;
-      $('confirm-scope').textContent = $('cm').selectedOptions[0].textContent;
-      $('confirm-message').textContent = result.message; $('confirm-groups').replaceChildren();
-      for (const group of result.groups) {
-        const item = node('div', '', 'broadcast-target');
-        item.append(node('strong',group.name),node('div',group.mention_all ? '@全体成员 · 权限待核验' : group.mentions.length ? group.mentions.map(person => `@${person.name}`).join(' ') : '不 @ 成员','text-primary small mt-1'));
-        $('confirm-groups').append(item);
-      }
+      frozenPreview = null; sendRequestId = null; $('confirm-error').textContent = '';
+      renderPreview(result);
       notice(''); $('confirm').showModal();
     } catch (error) { notice(error.message || '预览失败，请稍后重试。'); }
     finally { lock(false); }
+  });
+  function renderPreview(result) {
+    $('confirm-count').textContent = `${result.groups.length} 个群 · ${result.groups.length} 条消息`;
+    $('confirm-scope').textContent = result.account_name ? `发送账号：${result.account_name}` : $('cm').selectedOptions[0].textContent;
+    $('confirm-message').textContent = result.message; $('confirm-groups').replaceChildren();
+    for (const group of result.groups) {
+      const item = node('div','','broadcast-target');
+      item.append(node('strong',group.name),node('div',group.mention_all ? '@全体成员'
+        : group.mentions?.length ? group.mentions.map(person => `@${person.name}`).join(' ') : '不 @ 成员','text-primary small mt-1'));
+      $('confirm-groups').append(item);
+    }
+    for (const issue of result.issues || []) $('confirm-groups').append(node('div',`已跳过：${issue.name || issue.chat_name || ''} ${issue.reason || '群聊不可发送'}`,'broadcast-target small text-orange'));
+    syncGate();
+  }
+  $('send').addEventListener('click',async () => {
+    if (sending || busy || !sendReady()) return;
+    sending = true; $('confirm-error').textContent = ''; syncGate();
+    try {
+      if (!frozenPreview) {
+        const result = await api('prepare',{cm_id:$('cm').value,purpose,mention:$('mention').checked,message:$('message').value,selections:selections()});
+        if (!result.preview_id || !result.groups.length) throw new Error('没有可发送的群，请返回修改。');
+        frozenPreview = result; sendRequestId = crypto.randomUUID(); renderPreview(result);
+      } else {
+        const result = await api('send',{preview_id:frozenPreview.preview_id,request_id:sendRequestId});
+        $('confirm').close(); frozenPreview = null; sendRequestId = null;
+        notice(result.deduplicated ? '已显示已有发送任务，未重复创建。' : '已加入发送队列。');
+        upsertBatch(result.batch); await openBatch(result.batch.id);
+      }
+    } catch (error) {
+      $('confirm-error').textContent = error.message;
+      if (!sendReady()) $('confirm-state').textContent = '发送已暂停，预览和消息会保留';
+    } finally { sending = false; syncGate(); }
+  });
+  const statusLabels = {pending:'排队中',sending:'发送中',succeeded:'已发送',failed:'失败',unknown:'状态未知',cancelled:'已停止',partial:'部分完成'};
+  const statusStyle = status => status === 'succeeded' ? 'bg-green-lt' : ['failed','unknown'].includes(status) ? 'bg-yellow-lt' : 'bg-secondary-lt';
+  const batchActive = batch => ['pending','sending'].includes(batch.status) || batch.pending > 0 || batch.sending > 0;
+  const progress = batch => [`${batch.total} 个群`, batch.succeeded ? `已发 ${batch.succeeded}` : '', batch.failed ? `失败 ${batch.failed}` : '',
+    batch.unknown ? `待核对 ${batch.unknown}` : '', batch.cancelled ? `已停 ${batch.cancelled}` : ''].filter(Boolean).join(' · ');
+  function upsertBatch(batch) {
+    batches = [batch,...batches.filter(item => item.id !== batch.id)].slice(0,20);
+    batches.sort((a,b) => String(b.created_at).localeCompare(String(a.created_at))); renderHistory();
+  }
+  function renderHistory() {
+    $('history').replaceChildren();
+    if (!batches.length) $('history').append(node('div','暂无发送记录','text-secondary small'));
+    for (const batch of batches) {
+      const button = node('button','','broadcast-history-row'); button.type = 'button';
+      const summary = node('span'), date = new Date(batch.created_at);
+      summary.append(node('span',`${batch.account_name || '本人发送'} · ${Number.isNaN(date.getTime()) ? '' : date.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})}`),node('span',progress(batch),'small text-secondary mt-1'));
+      button.append(summary,node('span',statusLabels[batch.status] || batch.status,`badge ${statusStyle(batch.status)}`));
+      button.addEventListener('click',() => void openBatch(batch.id)); $('history').append(button);
+    }
+  }
+  async function batchApi(path = '', action = '', data = {}) {
+    let response;
+    try {
+      response = await fetch(`/creators/broadcast/batches${path}`,{method:action ? 'POST' : 'GET',credentials:'same-origin',
+        signal:AbortSignal.timeout(30000),headers:{'Content-Type':'application/json','X-CSRF-Token':$('app').dataset.csrf},...(action ? {body:JSON.stringify(data)} : {})});
+    } catch { throw new Error('网络或请求超时，请重新查询结果。'); }
+    const result = await response.json().catch(() => { throw new Error('暂时无法读取发送记录。'); });
+    if (!response.ok) throw new Error(result.error || '操作失败，请重试。');
+    if (!result || (!path ? !Array.isArray(result.batches) : !result.batch?.id)) throw new Error('发送记录格式异常。');
+    return result;
+  }
+  async function refreshHistory() {
+    if ($('history-refresh').disabled) return;
+    $('history-refresh').disabled = true; $('history-refresh').setAttribute('aria-busy','true'); $('history-error').textContent = '';
+    try { batches = (await batchApi()).batches; renderHistory(); }
+    catch (error) { $('history-error').textContent = error.message; }
+    finally { $('history-refresh').disabled = false; $('history-refresh').setAttribute('aria-busy','false'); }
+  }
+  function renderBatch(result) {
+    const batch = result.batch; activeBatch = batch; upsertBatch(batch);
+    $('batch-summary').textContent = `${statusLabels[batch.status] || batch.status} · ${progress(batch)}`;
+    $('batch-message-panel').hidden = !result.message; $('batch-message').textContent = result.message || '';
+    $('batch-targets').replaceChildren();
+    for (const target of result.targets || []) {
+      const item = node('div','','broadcast-target broadcast-result'), info = node('div');
+      if (typeof target.chat_id === 'string' && /^oc_[A-Za-z0-9_-]{1,128}$/.test(target.chat_id)) {
+        const link = node('a',target.chat_name,'fw-semibold');
+        link.href = `https://applink.larksuite.com/client/chat/open?openChatId=${encodeURIComponent(target.chat_id)}`;
+        link.target = '_blank'; link.rel = 'noopener noreferrer'; link.title = '在 Lark 中打开此群'; info.append(link);
+      } else info.append(node('strong',target.chat_name));
+      if (target.error_message) info.append(node('div',target.error_message,'small text-secondary mt-1'));
+      item.append(info,node('span',statusLabels[target.status] || target.status,`badge ${statusStyle(target.status)}`)); $('batch-targets').append(item);
+    }
+    $('batch-cancel').hidden = !(batch.pending > 0 || batch.sending > 0);
+    $('batch-retry').hidden = batch.can_retry !== true;
+    $('batch-cancel').disabled = $('batch-retry').disabled = batchBusy;
+    $('batch-note').textContent = batch.unknown > 0 ? '状态未知项不会重发，请先在 Lark 核对。' : batch.pending > 0 || batch.sending > 0 ? '停止尚未发送的消息，已发出的不撤回。' : batch.can_retry ? '重试只发送失败项，不重发成功项。' : '';
+  }
+  async function loadBatch(id) {
+    const request = ++batchRequest;
+    const result = await batchApi(`/${encodeURIComponent(id)}`);
+    if (request !== batchRequest || !$('batch-dialog').open || activeBatch?.id !== id) return;
+    renderBatch(result); $('batch-error').textContent = '';
+    if (batchActive(result.batch)) batchTimer = setTimeout(() => void pollBatch(id),3000);
+  }
+  async function pollBatch(id) {
+    batchTimer = null;
+    if (document.hidden || !$('batch-dialog').open || activeBatch?.id !== id || batchBusy) return;
+    try { await loadBatch(id); }
+    catch (error) { $('batch-error').textContent = `${error.message} 点击“刷新”重查。`; }
+  }
+  async function openBatch(id) {
+    clearTimeout(batchTimer); batchTimer = null; activeBatch = {id};
+    $('batch-summary').replaceChildren(loading('读取发送结果')); $('batch-targets').replaceChildren();
+    $('batch-message-panel').hidden = true; $('batch-message-panel').open = false; $('batch-error').textContent = ''; $('batch-note').textContent = '';
+    $('batch-cancel').hidden = $('batch-retry').hidden = true;
+    if (!$('batch-dialog').open) $('batch-dialog').showModal();
+    try { await loadBatch(id); } catch (error) { $('batch-error').textContent = error.message; }
+  }
+  $('history-refresh').addEventListener('click',async () => { await refreshHistory(); if ($('batch-dialog').open && activeBatch?.id) await openBatch(activeBatch.id); });
+  $('batch-refresh').addEventListener('click',async () => {
+    if (batchBusy || !activeBatch?.id) return;
+    $('batch-refresh').disabled = true; $('batch-refresh').setAttribute('aria-busy','true');
+    try { await openBatch(activeBatch.id); }
+    finally { $('batch-refresh').disabled = false; $('batch-refresh').setAttribute('aria-busy','false'); }
+  });
+  $('batch-close').addEventListener('click',() => $('batch-dialog').close());
+  $('batch-dialog').addEventListener('close',() => { clearTimeout(batchTimer); batchTimer = null; activeBatch = null; ++batchRequest; });
+  for (const action of ['cancel','retry']) $(`batch-${action}`).addEventListener('click',async () => {
+    if (batchBusy || !activeBatch?.id) return;
+    const id = activeBatch.id; batchBusy = true; ++batchRequest; clearTimeout(batchTimer); batchTimer = null;
+    $('batch-cancel').disabled = $('batch-retry').disabled = true; $(`batch-${action}`).setAttribute('aria-busy','true'); $('batch-error').textContent = '';
+    try {
+      const result = await batchApi(`/${encodeURIComponent(id)}/${action}`,action);
+      upsertBatch(result.batch);
+    } catch (error) { $('batch-error').textContent = error.message; }
+    finally {
+      batchBusy = false; $(`batch-${action}`).setAttribute('aria-busy','false');
+      if ($('batch-dialog').open && activeBatch?.id === id) {
+        try { await loadBatch(id); } catch (error) { $('batch-error').textContent = error.message; }
+        $('batch-cancel').disabled = $('batch-retry').disabled = false;
+      }
+    }
+  });
+  document.addEventListener('visibilitychange',() => {
+    clearTimeout(batchTimer); batchTimer = null;
+    if (!document.hidden && $('batch-dialog').open && activeBatch?.id) void pollBatch(activeBatch.id);
   });
   async function loadList(list) {
     if (busy || !allowed()) return;
@@ -743,7 +866,8 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     } catch (error) { $('list-action-error').textContent = error.message; }
     finally { lock(false); ($('list-action-dialog').open ? $('list-action-cancel') : kind === 'template-delete' ? $('template-select') : $('library-close')).focus(); }
   });
-  $('back').addEventListener('click', () => $('confirm').close());
+  $('back').addEventListener('click', () => { if (!sending) { frozenPreview = null; sendRequestId = null; $('confirm').close(); } });
+  $('confirm').addEventListener('cancel',event => { if (sending) event.preventDefault(); });
   configureScope(config.selected_cm_id);
   try {
     const raw = sessionStorage.getItem(draftKey); sessionStorage.removeItem(draftKey);
@@ -752,7 +876,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       purpose = draft.purpose; fixedIds = draft.fixed_ids; fixedTargets = draft.fixed_targets;
       selectedGroups = new Set(draft.selected_groups); $('input').value = draft.raw; $('message').value = draft.message;
       $('mention').checked = draft.mention; configureScope(draft.cm_id); pendingRestore = true;
-      notice('草稿已恢复，授权核对后会重新核验接收对象。');
+      notice('草稿已恢复，正在重新核验接收对象。');
     }
   } catch (error) { notice(error.message || '无法读取授权草稿。'); }
   try {
@@ -761,9 +885,10 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       const selection = parseSelection(raw,actor,Date.now(),canSelectCm);
       purpose = 'support'; fixedIds = selection.contact_ids; fixedTargets = null; selectedGroups = new Set();
       $('input').value = ''; $('mention').checked = true; configureScope(selection.cm_id); pendingRestore = true;
-      notice('已带入选中达人，授权核对后会重新核验目标群。');
+      notice('已带入选中达人，正在核验目标群。');
     }
   } catch (error) { notice(error.message || '无法读取带入名单，请重新选择。'); }
   render();
   void checkPermissions();
+  void refreshHistory();
 }

@@ -1,17 +1,17 @@
 {% extends "base.html" %}
 {% block title %}群发消息 · TT Media{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-broadcast.css?v=20261007-permission-gate">{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/creator-broadcast.css?v=20261009-send">{% endblock %}
 {% block body %}
 <div class="page business-page" id="broadcast-app" data-csrf="{{ csrf_token }}" data-actor="{{ authorization.id }}">
   {% with business_section='broadcast' %}{% include "partials/business_nav.html" %}{% endwith %}
   <main class="page-wrapper"><div class="page-body"><div class="container-xl">
-    <div class="business-heading"><div><h2 class="page-title">群发消息</h2><p>选择接收对象，编辑并预览消息。</p></div><span class="badge bg-yellow-lt">仅预览 · 不会发送</span></div>
+    <div class="business-heading"><div><h2 class="page-title">群发消息</h2><p>选择群聊，以本人身份发送。</p></div></div>
     <div class="broadcast-permissions mb-4" id="broadcast-permission-bar" aria-busy="true">
       <div class="broadcast-account"><label class="form-label mb-1" id="broadcast-cm-label" for="broadcast-cm">达人范围</label><select class="form-select" id="broadcast-cm"{% if not broadcast_data.can_select_cm %} disabled{% endif %}>{% if broadcast_data.can_select_cm %}<option value="all">全部已入库达人</option>{% endif %}{% for cm in broadcast_data.cms %}<option value="{{ cm.id }}"{% if cm.id == broadcast_data.selected_cm_id %} selected{% endif %}>{{ cm.name }} 负责的达人</option>{% endfor %}</select></div>
       <div role="status" aria-live="polite"><span id="broadcast-permission-account">当前账号</span><span class="badge bg-secondary-lt ms-2" id="broadcast-permission-status" aria-busy="true"><span class="ui-loading"><span class="ui-spinner" aria-hidden="true"></span>正在核对授权</span></span><div class="small text-secondary mt-1" id="broadcast-permission-message"></div></div>
-      <div class="btn-list"><button class="btn btn-sm btn-outline-primary" id="broadcast-permission-copy" type="button" hidden>复制该账号授权链接</button><button class="btn btn-sm btn-ghost-secondary" id="broadcast-permission-retry" type="button" disabled>重新检查</button></div>
+      <div class="btn-list"><button class="btn btn-sm btn-outline-primary" id="broadcast-permission-authorize" type="button" hidden>补充本人授权</button><button class="btn btn-sm btn-ghost-secondary" id="broadcast-permission-retry" type="button">重新检查</button></div>
     </div>
-    <fieldset id="broadcast-workspace" class="broadcast-workspace" aria-label="群发编辑区" disabled>
+    <fieldset id="broadcast-workspace" class="broadcast-workspace" aria-label="群发编辑区">
     <section class="card broadcast-library mb-4" aria-labelledby="list-title"><div class="card-body">
       <div class="broadcast-library-title"><div><h3 class="card-title mb-1" id="list-title">我的名单</h3><div class="small text-secondary" id="broadcast-list-info"></div></div></div>
       <div class="broadcast-library-controls"><button class="btn btn-outline-secondary" id="broadcast-list-library" type="button">打开名单库</button><button class="btn btn-outline-primary" id="broadcast-list-current-update" type="button" hidden>更新当前名单</button><button class="btn btn-primary" id="broadcast-list-new" type="button">保存当前名单</button></div>
@@ -53,9 +53,13 @@
       </section>
     </div>
     </fieldset>
+    <section class="card mt-4" aria-labelledby="broadcast-history-title"><div class="card-body">
+      <div class="broadcast-heading mb-3"><h3 class="card-title mb-0" id="broadcast-history-title">发送记录</h3><button class="btn btn-sm btn-ghost-secondary" id="broadcast-history-refresh" type="button">刷新</button></div>
+      <div id="broadcast-history" class="broadcast-history" aria-live="polite"></div><div id="broadcast-history-error" class="small text-danger" role="alert"></div>
+    </div></section>
     <noscript><div class="alert alert-warning mt-3">请开启 JavaScript 使用名单匹配。</div></noscript>
   </div></div></main>
-  <fieldset id="broadcast-editors" class="broadcast-workspace" aria-label="群发弹窗" disabled>
+  <fieldset id="broadcast-editors" class="broadcast-workspace" aria-label="群发弹窗">
   <dialog class="broadcast-dialog" id="broadcast-library-dialog" aria-labelledby="broadcast-library-title">
     <div class="broadcast-heading mb-3"><h3 class="mb-0" id="broadcast-library-title">我的名单</h3><button class="btn btn-sm btn-outline-secondary" id="broadcast-library-close" type="button">关闭</button></div>
     <div class="broadcast-library-items" id="broadcast-library-items"></div>
@@ -89,10 +93,18 @@
     <p id="broadcast-confirm-count"></p><p id="broadcast-confirm-scope" class="small text-secondary"></p>
     <div class="broadcast-message mb-3" id="broadcast-confirm-message"></div><div id="broadcast-confirm-groups"></div>
     <p class="small text-secondary mt-3">正文对群内全体可见，@ 不限制可见范围。</p>
-    <div class="d-flex align-items-center justify-content-between gap-3 mt-3"><span class="text-secondary small">仅预览，目标群发送能力尚未验收</span><button class="btn btn-primary" type="button" disabled>发送（未开通）</button></div>
+    <div id="broadcast-confirm-error" class="small text-danger mt-2" role="alert"></div>
+    <div class="d-flex align-items-center justify-content-between flex-wrap gap-3 mt-3"><span class="text-secondary small" id="broadcast-confirm-state">尚未发送</span><button class="btn btn-primary" id="broadcast-send" type="button" disabled>准备发送</button></div>
   </dialog>
   </fieldset>
+  <dialog class="broadcast-dialog" id="broadcast-batch-dialog" aria-labelledby="broadcast-batch-title">
+    <div class="broadcast-heading mb-3"><h3 class="mb-0" id="broadcast-batch-title">发送详情</h3><div class="btn-list"><button class="btn btn-sm btn-ghost-secondary" id="broadcast-batch-refresh" type="button">刷新</button><button class="btn btn-sm btn-outline-secondary" id="broadcast-batch-close" type="button">关闭</button></div></div>
+    <p id="broadcast-batch-summary" role="status" aria-live="polite"></p>
+    <details class="mb-3" id="broadcast-batch-message-panel" hidden><summary class="small text-secondary">消息正文</summary><div class="broadcast-message mt-2" id="broadcast-batch-message"></div></details>
+    <div id="broadcast-batch-targets"></div><div id="broadcast-batch-error" class="small text-danger mt-3" role="alert"></div>
+    <div class="broadcast-batch-actions mt-3"><span class="small text-secondary" id="broadcast-batch-note"></span><div class="btn-list"><button class="btn btn-outline-danger" id="broadcast-batch-cancel" type="button" hidden>停止未发送</button><button class="btn btn-outline-primary" id="broadcast-batch-retry" type="button" hidden>重试失败项</button></div></div>
+  </dialog>
 </div>
 <script id="broadcast-config" type="application/json">{{ broadcast_data | tojson }}</script>
-<script type="module" src="/static/creator-broadcast.mjs?v=20261008-loading"></script>
+<script type="module" src="/static/creator-broadcast.mjs?v=20261009-send"></script>
 {% endblock %}

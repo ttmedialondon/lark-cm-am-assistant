@@ -23,6 +23,7 @@ from . import (
     admin,
     admin_permissions,
     creator_access,
+    creator_broadcast,
     creator_group_routes,
     creator_handle_matching_routes,
     creator_handles_routes,
@@ -65,7 +66,9 @@ def _template(request: Request, name: str, context: dict[str, Any], status_code:
                      or context.get("broadcast_data", {}).get("can_select_cm"))
         active = authorization["status"] == "active"
         context = {**context, "business_nav": {
-            "can_broadcast": active and (owner or bool(authorization.get("broadcast_enabled"))),
+            "can_broadcast": active and (owner or bool(authorization.get("broadcast_enabled"))
+                                         or (bool(authorization.get("body_consent_at"))
+                                             and creator_broadcast.preview_open())),
             "can_summary": context.get("offhours_summary_visible", active and (
                 bool(authorization.get("body_consent_at")) or owner
                 or _is_remi_tester(authorization, {"is_owner": owner})

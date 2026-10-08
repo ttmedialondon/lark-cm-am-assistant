@@ -1,4 +1,4 @@
-"""Scoped routing previews, personal lists and permission checks; never send or call AI."""
+"""Scoped routing previews, personal lists and permission checks; delivery is separate."""
 
 import re
 import unicodedata
@@ -17,9 +17,9 @@ from .db import connection
 from .handle_evidence import normalize_handle
 from .lark_api import LarkApiError, LarkClient
 
-PURPOSES = {key: value for key, value in GROUP_PURPOSES.items() if key != "unknown"}
-MEMBERSHIP_NOTE = "来自当前库快照，发送前需实测核验成员及 @ 权限"
-BLOCKED_REASON = "当前仅预览，发送功能尚未启用"
+PURPOSES = {**{key: value for key, value in GROUP_PURPOSES.items() if key != "unknown"}, "custom": "自选群"}
+MEMBERSHIP_NOTE = "发送前逐群检查权限"
+BLOCKED_REASON = "请准备并确认后发送"
 SEND_SCOPES = ("im:message", "im:message.send_as_user")
 
 
@@ -29,21 +29,27 @@ class BroadcastAuthorizationRequired(PermissionError):
         self.account_id = str(account_id)
 
 
-def _require_broadcast_grant(conn, actor_id):
+def preview_open():
+    until = getattr(get_settings(), "broadcast_preview_until", None)
+    return bool(until and until > datetime.now(UTC))
+
+
+def _require_broadcast_grant(conn, actor_id, *, sending=False):
     actor = creator_access.parse_id(actor_id)
-    owner = creator_access.require_broadcast_access(conn, actor)
+    owner = creator_access.require_broadcast_access(conn, actor, preview=not sending and preview_open())
     row = conn.execute("""SELECT id,status,body_consent_at,scopes FROM authorizations WHERE id=%s""",
                        (actor,)).fetchone()
     if not row or row["status"] != "active" or not row["body_consent_at"]:
         raise PermissionError("本人聊天授权已失效，请先完成接入。")
-    if not (set(get_settings().oauth_scopes) | set(SEND_SCOPES)).issubset(row["scopes"] or ()):
+    required = set(get_settings().oauth_scopes) | (set(SEND_SCOPES) if sending else set())
+    if not required.issubset(row["scopes"] or ()):
         raise BroadcastAuthorizationRequired(actor)
     return owner
 
 
 def require_access(actor_id):
     with connection() as conn:
-        return creator_access.require_broadcast_access(conn, actor_id)
+        return creator_access.require_broadcast_access(conn, actor_id, preview=preview_open())
 
 
 def _selected_cm(actor_id, cm_id, owner):
@@ -140,12 +146,13 @@ def _joined_groups(conn, cm_id, purpose):
         ac.member_snapshot_checked_at,ac.member_snapshot_status,ac.last_seen_at
         FROM authorization_chats ac JOIN authorizations a ON a.id=ac.authorization_id
         JOIN chats ch ON ch.chat_id=ac.chat_id
-        JOIN chat_group_classifications g ON g.chat_id=ch.chat_id AND g.purpose=%s
+        LEFT JOIN chat_group_classifications g ON g.chat_id=ch.chat_id
         WHERE ac.authorization_id=%s AND ac.is_visible
+          AND (%s='custom' OR g.purpose=%s)
           AND a.status='active' AND a.body_consent_at IS NOT NULL
           AND COALESCE(ch.chat_status,'normal')='normal' AND COALESCE(ch.chat_mode,'group')<>'p2p'
-        ORDER BY ch.name,ch.chat_id""", (purpose, cm_id)).fetchall()
-    return [{"id": row["chat_id"], "name": row["name"] or "未命名群", "purpose": row["purpose"],
+        ORDER BY ch.name,ch.chat_id""", (cm_id, purpose, purpose)).fetchall()
+    return [{"id": row["chat_id"], "name": row["name"] or "未命名群", "purpose": purpose,
              "members": [],
              "member_count": row["member_count"] if row["member_count_status"] == "succeeded" else None,
              "membership_status": row["member_snapshot_status"],
@@ -264,8 +271,9 @@ def page_data(actor_id):
               AND (%s::uuid IS NULL OR id=%s::uuid) ORDER BY display_name,id""", (scope, scope)).fetchall()
         return {"purposes": PURPOSES, "cms": [{"id": str(cm["id"]), "name": cm["display_name"] or "未命名用户"}
                                              for cm in cms],
-                "selected_cm_id": "all" if owner else str(scope), "can_select_cm": owner,
-                "preview_only": True, "lists": _lists(conn, actor_id),
+                "selected_cm_id": str(actor_id), "can_select_cm": owner,
+                "demo_preview": preview_open(), "actor_id": str(actor_id),
+                "lists": _lists(conn, actor_id),
                 "templates": _templates(conn, actor_id)}
 
 
@@ -274,19 +282,20 @@ def permission_check(actor_id, cm_id):
     from .worker import ReauthorizationRequired, _authorization, _usable_access_token
 
     actor = creator_access.parse_id(actor_id)
-    sql = """SELECT id,open_id,display_name,status,body_consent_at,scopes,access_token_ciphertext
+    sql = """SELECT id,open_id,display_name,status,body_consent_at,scopes,access_token_ciphertext,broadcast_enabled
         FROM authorizations WHERE id=%s"""
     with connection() as conn:
-        owner = creator_access.require_broadcast_access(conn, actor)
-        target = actor if cm_id == "all" else _selected_cm(actor, cm_id, owner) if cm_id else None
-        row = conn.execute(sql, (target,)).fetchone() if target else None
+        owner = creator_access.require_broadcast_access(conn, actor, preview=preview_open())
+        actor_row = conn.execute(sql, (actor,)).fetchone()
+        _selected_cm(actor, cm_id, owner)
+        target = actor
+        row = actor_row
     result = {"status": "unavailable", "account_id": str(target) if target else None,
               "account_name": row["display_name"] or "未命名用户" if row else "",
-              "is_self": target == actor, "is_sender": bool(target and (cm_id != "all" or not owner)),
+              "is_self": True, "is_sender": True,
               "missing_scopes": [], "authorization_url": None,
-              "message": "请选择一位 CM/AM。", "checked_at": datetime.now(UTC).isoformat()}
-    if not target:
-        return result
+              "feature_enabled": owner or bool(actor_row and actor_row["broadcast_enabled"]),
+              "message": "暂时无法核验本人授权。", "checked_at": datetime.now(UTC).isoformat()}
     if not row or row["status"] == "revoked" or not row["body_consent_at"]:
         result.update(status="needs_authorization", message="该账号尚未完成有效的聊天授权，请本人先完成接入。")
         return result
@@ -323,7 +332,7 @@ def permission_check(actor_id, cm_id):
                                   if missing or checked["status"] != "active" else "ready",
                                   message="缺少授权：" + "、".join(missing) + "；请由该账号本人补充。" if missing
                                   else "该账号授权状态需要更新，请本人重新授权。" if checked["status"] != "active"
-                                  else "账号连接有效，已记录所需权限；群成员、外部群及 @ 权限仍需单独核验。")
+                                  else "本人发送授权有效；发送前逐群检查权限。")
     except ReauthorizationRequired:
         result.update(status="needs_authorization", message="账号连接已失效，请本人重新授权。")
     except LarkApiError as exc:
@@ -333,9 +342,10 @@ def permission_check(actor_id, cm_id):
     except (httpx.HTTPError, InvalidToken, ValueError, RuntimeError):
         pass
     with connection() as conn:
-        owner = creator_access.require_broadcast_access(conn, actor)
-        if target:
-            _selected_cm(actor, str(target), owner)
+        owner = creator_access.require_broadcast_access(conn, actor, preview=preview_open())
+        current_actor = conn.execute(sql, (actor,)).fetchone()
+        result["feature_enabled"] = owner or bool(current_actor and current_actor["broadcast_enabled"])
+        _selected_cm(actor, cm_id, owner)
         current = conn.execute(sql, (target,)).fetchone()
     if not current or current["status"] == "revoked" or not current["body_consent_at"]:
         result.update(status="needs_authorization", missing_scopes=[], message="聊天授权已失效，请本人先完成接入。")

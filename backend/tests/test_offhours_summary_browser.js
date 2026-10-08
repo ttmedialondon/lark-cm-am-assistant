@@ -690,7 +690,8 @@ test("reply drafts preserve edits, translate before copying, and block stale or 
 
 test("broadcast waiting states preserve selections and drafts after request failures", async t => {
   const actor = "11111111-1111-4111-8111-111111111111";
-  const data = {can_select_cm: false, selected_cm_id: actor, cms: [{id: actor, name: "CM"}],
+  const other = "22222222-2222-4222-8222-222222222222";
+  const data = {can_select_cm: true, selected_cm_id: actor, cms: [{id: actor, name: "CM"}, {id: other, name: "Other CM"}],
     purposes: {support: "客服群", category: "类目群"}, lists: [], templates: []};
   const rendered = spawnSync(path.join(backend, ".venv/bin/python"), ["-c",
     "import json,sys; from jinja2 import Environment,FileSystemLoader,select_autoescape; data=json.load(sys.stdin); print(Environment(loader=FileSystemLoader('app/templates'),autoescape=select_autoescape()).get_template('creator_broadcast.html').render(authorization={'id':data['selected_cm_id'],'display_name':'CM'},broadcast_data=data,csrf_token='fixture-csrf'))"],
@@ -700,6 +701,7 @@ test("broadcast waiting states preserve selections and drafts after request fail
   t.after(() => browser.close());
   const page = await browser.newPage({viewport: {width: 1360, height: 1000}});
   const errors = [], calls = [], holds = new Map();
+  let currentBatch = null, batchTargets = [];
   page.on("pageerror", error => errors.push(error.message));
   function hold(action) {
     let started, release;
@@ -716,6 +718,8 @@ test("broadcast waiting states preserve selections and drafts after request fail
       contentType: /\.(m?js)$/.test(url.pathname) ? "text/javascript" : "text/css",
       body: fs.readFileSync(path.join(backend, "app", url.pathname))});
     const action = url.pathname.replace("/creators/broadcast/", "");
+    if (req.method() === "GET" && action === "batches") return route.fulfill({json: {batches: currentBatch ? [currentBatch] : []}});
+    if (req.method() === "GET" && action.startsWith("batches/")) return route.fulfill({json: {batch: currentBatch, targets: batchTargets, message: currentBatch.message_body}});
     assert.equal(req.method(), "POST"); assert.equal(req.headers()["x-csrf-token"], "fixture-csrf");
     calls.push({action, body: req.postDataJSON()});
     const held = holds.get(action);
@@ -725,12 +729,16 @@ test("broadcast waiting states preserve selections and drafts after request fail
   });
   await page.goto("http://localhost/creators/broadcast");
   await permissions.arrived;
-  assert(await page.locator("#broadcast-workspace").evaluate(el => el.disabled));
+  assert(!(await page.locator("#broadcast-workspace").evaluate(el => el.disabled)));
+  assert(!(await page.locator("#broadcast-message").isDisabled()));
   assert.equal(await page.locator("#broadcast-permission-status").getAttribute("aria-busy"), "true");
   assert.equal(await page.locator("#broadcast-permission-status .ui-spinner").count(), 1);
   assert.equal(await page.locator("#broadcast-permission-status .ui-spinner").evaluate(el => getComputedStyle(el).animationName), "ui-spin");
-  permissions.release({json: {status: "ready", account_name: "CM", is_self: true, is_sender: true}});
-  await page.waitForFunction(() => !document.getElementById("broadcast-workspace").disabled);
+  permissions.release({json: {status: "needs_authorization", feature_enabled: false, account_name: "CM", account_id: actor,
+    is_self: true, is_sender: true, authorization_url: `/auth/lark/start?send=1&account_id=${actor}`}});
+  await page.waitForFunction(() => document.getElementById("broadcast-permission-status").getAttribute("aria-busy") === "false");
+  assert.equal(new URL(page.url()).pathname, "/creators/broadcast");
+  assert(await page.locator("#broadcast-permission-authorize").isVisible());
   assert.equal(await page.locator("#broadcast-permission-status").getAttribute("aria-busy"), "false");
   assert.equal(await page.locator("#broadcast-permission-status .ui-spinner").count(), 0);
 
@@ -793,5 +801,91 @@ test("broadcast waiting states preserve selections and drafts after request fail
   assert.equal(await page.locator("[aria-busy='true']").count(), 0);
   assert.equal(await page.locator("html").getAttribute("data-ui-navigating"), null);
   assert.deepEqual(calls.map(call => call.action), ["permissions", "groups", "groups", "match", "templates/save"]);
+
+  await page.locator("#broadcast-template-cancel").click();
+  await page.locator("#broadcast-list-action-proceed").click();
+  const demoGroups = hold("groups");
+  await page.getByRole("button", {name: "类目群", exact: true}).click();
+  await demoGroups.arrived; demoGroups.release({json: groupResult});
+  await selected.check(); await page.locator("#broadcast-mention").check();
+  const previewResult = {message, groups: [{...groupResult.groups[0], people: [], mentions: [], mention_all: true}], issues: [], people: []};
+  const demoPreview = hold("preview");
+  await page.locator("#broadcast-preview").click(); await demoPreview.arrived; demoPreview.release({json: previewResult});
+  await page.locator("#broadcast-confirm").waitFor({state: "visible"});
+  assert(await page.locator("#broadcast-send").isDisabled());
+  assert.equal(calls.filter(call => ["prepare", "send"].includes(call.action)).length, 0);
+  await page.locator("#broadcast-back").click();
+
+  const ready = hold("permissions");
+  await page.locator("#broadcast-permission-retry").click(); await ready.arrived;
+  ready.release({json: {status: "ready", feature_enabled: true, account_name: "CM", is_self: true, is_sender: true}});
+  await page.waitForFunction(() => document.getElementById("broadcast-permission-status").textContent === "本人发送已就绪");
+  const preview = hold("preview");
+  await page.locator("#broadcast-preview").click(); await preview.arrived; preview.release({json: previewResult});
+  await page.locator("#broadcast-send").waitFor({state: "visible"});
+  const preparing = hold("prepare");
+  await page.locator("#broadcast-send").click(); await preparing.arrived;
+  assert.equal(calls.filter(call => call.action === "send").length, 0);
+  preparing.release({json: {...previewResult, preview_id: "preview-1", account_name: "CM", expires_at: "2030-01-01T00:00:00Z"}});
+  await page.waitForFunction(() => document.getElementById("broadcast-send").textContent === "确认发送 1 个群");
+  assert((await page.locator("#broadcast-confirm-state").textContent()).includes("发送前逐群检查权限"));
+  assert.equal(calls.filter(call => call.action === "send").length, 0);
+
+  const failedSend = hold("send");
+  await page.locator("#broadcast-send").click(); await failedSend.arrived;
+  assert(await page.locator("#broadcast-send").isDisabled());
+  failedSend.release({status: 503, json: {error: "发送任务响应中断，请重试确认。"}});
+  await page.getByText("发送任务响应中断，请重试确认。", {exact: true}).waitFor();
+  assert.equal(await page.locator("#broadcast-message").inputValue(), message);
+  const send = hold("send");
+  await page.locator("#broadcast-send").click(); await send.arrived;
+  const submissions = calls.filter(call => call.action === "send");
+  assert.equal(submissions.length, 2);
+  assert.equal(submissions[0].body.request_id, submissions[1].body.request_id);
+  assert.equal(submissions[0].body.preview_id, "preview-1");
+  currentBatch = {id: "batch-1", account_name: "CM", status: "partial", created_at: "2026-10-09T12:00:00Z",
+    total: 3, pending: 0, sending: 0, succeeded: 1, failed: 1, unknown: 1, cancelled: 0, can_retry: false, message_body: message};
+  batchTargets = [{chat_id: "oc_success", chat_name: "成功群", status: "succeeded"}, {chat_id: "oc_failed", chat_name: "失败群", status: "failed", error_message: "发送权限不足"},
+    {chat_id: "javascript:alert(1)", chat_name: "不确定群", status: "unknown", error_message: "结果未知，请在 Lark 核对"}];
+  send.release({json: {batch: currentBatch}});
+  await page.locator("#broadcast-batch-dialog").waitFor({state: "visible"});
+  await page.getByText("发送权限不足", {exact: true}).waitFor();
+  assert.equal(await page.locator("#broadcast-batch-targets .badge").allTextContents().then(items => items.join(",")), "已发送,失败,状态未知");
+  assert(!(await page.locator("#broadcast-batch-retry").isVisible()));
+  assert(!(await page.locator("#broadcast-batch-cancel").isVisible()));
+  assert((await page.locator("#broadcast-batch-note").textContent()).includes("状态未知项不会重发"));
+  const groupLinks = page.locator("#broadcast-batch-targets a");
+  assert.equal(await groupLinks.count(), 2);
+  assert.equal(await groupLinks.first().getAttribute("href"), "https://applink.larksuite.com/client/chat/open?openChatId=oc_success");
+  assert.equal(await groupLinks.first().getAttribute("rel"), "noopener noreferrer");
+  const bodyPanel = page.locator("#broadcast-batch-message-panel");
+  assert(!(await bodyPanel.evaluate(element => element.open)));
+  await bodyPanel.locator("summary").click();
+  assert.equal(await page.locator("#broadcast-batch-message").textContent(), message);
+  currentBatch.can_retry = true;
+  await page.locator("#broadcast-batch-refresh").click();
+  await page.locator("#broadcast-batch-retry").waitFor({state: "visible"});
+  const retrying = hold("batches/batch-1/retry");
+  await page.locator("#broadcast-batch-retry").click(); await retrying.arrived;
+  currentBatch = {...currentBatch, status: "sending", pending: 0, sending: 1, failed: 0, can_retry: false};
+  retrying.release({json: {batch: currentBatch}});
+  await page.locator("#broadcast-batch-cancel").waitFor({state: "visible"});
+  const stopping = hold("batches/batch-1/cancel");
+  await page.locator("#broadcast-batch-cancel").click(); await stopping.arrived;
+  currentBatch = {...currentBatch, status: "partial", pending: 0, sending: 0, cancelled: 1};
+  stopping.release({json: {batch: currentBatch}});
+  await page.waitForFunction(() => document.getElementById("broadcast-batch-cancel").hidden);
+  assert.equal(calls.filter(call => call.action === "send").length, 2);
+  assert.equal(calls.filter(call => call.action.endsWith("/retry")).length, 1);
+  assert.equal(calls.filter(call => call.action.endsWith("/cancel")).length, 1);
+  await page.locator("#broadcast-batch-close").click();
+  const ownPermission = hold("permissions"), otherGroups = hold("groups");
+  await page.locator("#broadcast-cm").selectOption(other); await ownPermission.arrived;
+  assert.equal(await page.locator("#broadcast-permission-account").textContent(), "发送账号：CM");
+  ownPermission.release({json: {status: "ready", feature_enabled: true, account_name: "CM", is_self: true, is_sender: true}});
+  await otherGroups.arrived; otherGroups.release({json: groupResult});
+  await page.waitForFunction(() => document.getElementById("broadcast-group-items").getAttribute("aria-busy") === "false");
+  assert.equal(await page.locator("#broadcast-permission-account").textContent(), "发送账号：CM");
+  assert(await page.locator("#broadcast-send").isDisabled());
   assert.deepEqual(errors, []);
 });

@@ -9,7 +9,14 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import contact_handles, creator_broadcast, creator_importance, creator_imports, creator_roster
+from . import (
+    contact_handles,
+    creator_broadcast,
+    creator_broadcast_delivery,
+    creator_importance,
+    creator_imports,
+    creator_roster,
+)
 from .db import connection
 from .http_helpers import (
     csrf_matches as _csrf_matches,
@@ -49,21 +56,25 @@ def create_router(*, current_authorization, render_template, csrf_token):
         if not auth:
             return secure(RedirectResponse("/", status_code=303))
         try:
-            if auth["status"] == "attention_required" and auth.get("body_consent_at"):
-                creator_broadcast.require_access(auth["id"])
-                return secure(RedirectResponse(
-                    f"/auth/lark/start?send=1&account_id={auth['id']}&auto=1", status_code=303,
-                ))
             auth = actor(auth)
             data = creator_broadcast.page_data(auth["id"])
             return secure(render_template(request, "creator_broadcast.html", {
                 "authorization": auth, "broadcast_data": data, "csrf_token": csrf_token(auth),
             }))
-        except creator_broadcast.BroadcastAuthorizationRequired as exc:
-            return secure(RedirectResponse(
-                f"/auth/lark/start?send=1&account_id={exc.account_id}&auto=1", status_code=303,
-            ))
         except PermissionError as exc:
+            return error(exc)
+
+    @router.get("/broadcast/batches")
+    @router.get("/broadcast/batches/{batch_id}")
+    async def broadcast_results(request: Request, batch_id: UUID | None = None):
+        try:
+            auth = actor(await run_in_threadpool(current_authorization, request))
+            result = await run_in_threadpool(
+                creator_broadcast_delivery.batch if batch_id else creator_broadcast_delivery.history,
+                auth["id"], *([batch_id] if batch_id else []),
+            )
+            return payload(result)
+        except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
 
     @router.post("/broadcast/match")
@@ -76,8 +87,11 @@ def create_router(*, current_authorization, render_template, csrf_token):
     @router.post("/broadcast/lists/delete")
     @router.post("/broadcast/templates/save")
     @router.post("/broadcast/templates/delete")
-    async def broadcast_read(request: Request):
-        """Bounded, session-scoped routing and personal lists; never sends."""
+    @router.post("/broadcast/prepare")
+    @router.post("/broadcast/send")
+    @router.post("/broadcast/batches/{batch_id}/{operation}")
+    async def broadcast_read(request: Request, batch_id: UUID | None = None, operation: str = ""):
+        """Scope all previews, drafts and explicit delivery actions to the session."""
         try:
             current = await run_in_threadpool(current_authorization, request)
             reconnect_self = current and current["status"] == "attention_required" and current.get("body_consent_at")
@@ -112,7 +126,20 @@ def create_router(*, current_authorization, render_template, csrf_token):
                     "missing_scopes": [], "authorization_url": f"/auth/lark/start?send=1&account_id={auth['id']}",
                     "message": "当前账号连接需要更新，请本人补充授权。",
                 })
-            if "/templates/" in request.url.path:
+            if batch_id is not None:
+                if operation not in {"cancel", "retry"}:
+                    raise ValueError("操作无效。")
+                result = await run_in_threadpool(
+                    creator_broadcast_delivery.cancel if operation == "cancel" else creator_broadcast_delivery.retry,
+                    auth["id"], batch_id,
+                )
+            elif action == "prepare":
+                result = await run_in_threadpool(creator_broadcast_delivery.prepare, auth["id"], fields)
+            elif action == "send":
+                result = await run_in_threadpool(
+                    creator_broadcast_delivery.submit, auth["id"], fields.get("preview_id"), fields.get("request_id"),
+                )
+            elif "/templates/" in request.url.path:
                 if action == "save":
                     result = await run_in_threadpool(creator_broadcast.template_save, auth["id"], fields)
                 else:
@@ -162,7 +189,8 @@ def create_router(*, current_authorization, render_template, csrf_token):
             auth = actor(auth)
             data = creator_roster.page_data(auth["id"], cm_id=cm_id, tab=tab, query=q[:120], page=max(1, page),
                                            sort=sort, tier=tier)
-            data["can_broadcast"] = bool(auth.get("broadcast_enabled") or data["can_view_unassigned"])
+            data["can_broadcast"] = bool(auth.get("broadcast_enabled") or data["can_view_unassigned"]
+                                         or creator_broadcast.preview_open())
             if request.url.path.endswith("/data"):
                 return payload(data)
             return secure(render_template(request, "creator_handles.html", {

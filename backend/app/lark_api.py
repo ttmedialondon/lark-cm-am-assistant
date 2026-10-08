@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
@@ -26,11 +28,15 @@ def private_chat_url(open_id: str | None) -> str | None:
 class LarkApiError(RuntimeError):
     """An API failure without retaining raw response bodies or credentials."""
 
-    def __init__(self, status_code: int, lark_code: int | None, message: str, retry_after: int | None = None) -> None:
+    def __init__(
+        self, status_code: int, lark_code: int | None, message: str, retry_after: int | None = None,
+        *, delivery_unknown: bool = False,
+    ) -> None:
         super().__init__(message[:300])
         self.status_code = status_code
         self.lark_code = lark_code
         self.retry_after = retry_after
+        self.delivery_unknown = delivery_unknown
 
     @property
     def retryable(self) -> bool:
@@ -40,7 +46,7 @@ class LarkApiError(RuntimeError):
     def rate_limited(self) -> bool:
         """Lark still returns its documented legacy rate error as HTTP 400."""
 
-        return self.status_code == 429 or self.lark_code == 99991400
+        return self.status_code == 429 or self.lark_code in {99991400, 230020}
 
     @property
     def likely_auth_problem(self) -> bool:
@@ -242,6 +248,123 @@ class LarkClient:
             params=params,
         )
 
+    def get_chat(self, access_token: str, chat_id: str) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"{self.settings.lark_api_base_url}/open-apis/im/v1/chats/{quote(chat_id, safe='')}",
+            access_token=access_token,
+            params={"user_id_type": "open_id"},
+        )
+
+    def is_in_chat(self, access_token: str, chat_id: str) -> bool:
+        data = self._request(
+            "GET",
+            f"{self.settings.lark_api_base_url}/open-apis/im/v1/chats/{quote(chat_id, safe='')}/members/is_in_chat",
+            access_token=access_token,
+        )
+        if not isinstance(data.get("is_in_chat"), bool):
+            raise LarkApiError(502, None, "Lark membership response was incomplete")
+        return data["is_in_chat"]
+
+    def check_chat_send_access(
+        self, access_token: str, chat_id: str, *, sender_open_id: str,
+        mention_all: bool = False, mention_open_ids: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Recheck the caller, live group permissions and explicitly selected mentions."""
+        _require_im_id(chat_id, "oc_")
+        _require_im_id(sender_open_id, "ou_")
+        for target in mention_open_ids:
+            _require_im_id(target, "ou_")
+        if not self.is_in_chat(access_token, chat_id):
+            raise LarkApiError(403, None, "Sender is no longer a group member")
+        chat = self.get_chat(access_token, chat_id)
+        if chat.get("chat_mode") not in {"group", "topic"} or chat.get("chat_status") != "normal":
+            raise LarkApiError(403, None, "Group is unavailable for broadcast")
+        managers = chat.get("user_manager_id_list")
+        manager = (
+            chat.get("owner_id_type") == "open_id" and chat.get("owner_id") == sender_open_id
+        ) or (isinstance(managers, list) and sender_open_id in managers)
+        posting = chat.get("moderation_permission")
+        if posting == "moderator_list":
+            permitted = manager or self._is_chat_moderator(access_token, chat_id, sender_open_id)
+        else:
+            permitted = posting == "all_members" or (posting == "only_owner" and manager)
+        if not permitted:
+            raise LarkApiError(403, None, "Sender cannot post in this group")
+        at_all = chat.get("at_all_permission")
+        if mention_all and not (at_all == "all_members" or (at_all == "only_owner" and manager)):
+            raise LarkApiError(403, None, "Sender cannot mention everyone in this group")
+        if mention_open_ids:
+            members = self._all_chat_member_ids(access_token, chat_id)
+            if not set(mention_open_ids).issubset(members):
+                raise LarkApiError(403, None, "Mentioned person is no longer a group member")
+        return {
+            "chat_name": _string(chat.get("name")),
+            "member_count": _optional_int(chat.get("user_count")),
+            "external": chat.get("external") is True,
+        }
+
+    def _is_chat_moderator(self, access_token: str, chat_id: str, sender_open_id: str) -> bool:
+        page_token: str | None = None
+        seen: set[str] = set()
+        while True:
+            params: dict[str, str | int] = {"user_id_type": "open_id", "page_size": 100}
+            if page_token:
+                params["page_token"] = page_token
+            page = self._request(
+                "GET", f"{self.settings.lark_api_base_url}/open-apis/im/v1/chats/{quote(chat_id, safe='')}/moderation",
+                access_token=access_token, params=params,
+            )
+            if page.get("moderation_setting") != "moderator_list":
+                raise LarkApiError(403, None, "Group posting permission changed during verification")
+            items = page.get("items")
+            if not isinstance(items, list):
+                raise LarkApiError(502, None, "Lark moderator response was incomplete")
+            if any(isinstance(item, dict) and item.get("user_id_type") == "open_id"
+                   and item.get("user_id") == sender_open_id for item in items):
+                return True
+            page_token = _next_roster_page(page, seen)
+            if page_token is None:
+                return False
+
+    def _all_chat_member_ids(self, access_token: str, chat_id: str) -> set[str]:
+        page_token: str | None = None
+        seen: set[str] = set()
+        members: set[str] = set()
+        while True:
+            page = self.list_chat_members(access_token, chat_id, page_token)
+            items = page.get("users", page.get("items"))
+            if not isinstance(items, list) or page.get("truncations"):
+                raise LarkApiError(502, None, "Lark member roster was incomplete")
+            for item in items:
+                if isinstance(item, dict):
+                    open_id = _string(item.get("member_id")) or _string(item.get("open_id"))
+                    if open_id and re.fullmatch(r"ou_[A-Za-z0-9_-]{1,128}", open_id):
+                        members.add(open_id)
+            page_token = _next_roster_page(page, seen)
+            if page_token is None:
+                return members
+
+    def send_chat_post(
+        self, access_token: str, chat_id: str, body: str, *,
+        mentions: list[dict[str, str]] | tuple[dict[str, str], ...] = (),
+        mention_all: bool = False, message_uuid: str,
+    ) -> str:
+        """Send one explicit post with durable UUID; never retry a send here."""
+        payload = build_chat_post_payload(
+            chat_id, body, mentions=mentions, mention_all=mention_all, message_uuid=message_uuid,
+        )
+        data = self._request(
+            "POST", f"{self.settings.lark_api_base_url}/open-apis/im/v1/messages",
+            access_token=access_token, params={"receive_id_type": "chat_id"}, json=payload, sending=True,
+        )
+        message_id = _string(data.get("message_id"))
+        if not message_id or not re.fullmatch(r"om_[A-Za-z0-9_-]{1,128}", message_id):
+            raise LarkApiError(502, None, "Lark did not confirm a valid message ID", delivery_unknown=True)
+        if data.get("chat_id") is not None and data["chat_id"] != chat_id:
+            raise LarkApiError(502, None, "Lark send response had an unexpected chat", delivery_unknown=True)
+        return message_id
+
     def tenant_access_token(self) -> str:
         """Get a short-lived app tenant token; never persist it."""
 
@@ -292,6 +415,7 @@ class LarkClient:
         access_token: str | None = None,
         params: dict[str, str | int] | None = None,
         json: dict[str, str] | None = None,
+        sending: bool = False,
     ) -> dict[str, Any]:
         headers = {"Accept": "application/json"}
         if json is not None:
@@ -308,6 +432,11 @@ class LarkClient:
                     with httpx.Client(timeout=httpx.Timeout(20.0, connect=8.0)) as client:
                         response = client.request(method, url, headers=headers, params=params, json=json)
             except httpx.HTTPError as exc:
+                if sending:
+                    unknown = not isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout | httpx.PoolTimeout)
+                    raise LarkApiError(
+                        503, None, "Network failure while sending to Lark", delivery_unknown=unknown,
+                    ) from None
                 raise LarkApiError(503, None, "network failure while calling Lark") from exc
 
             retry_after = _rate_limit_reset(response.headers)
@@ -316,21 +445,29 @@ class LarkClient:
             except ValueError as exc:
                 self._pause_for_rate_limit(response.status_code, None, retry_after)
                 raise LarkApiError(
-                    response.status_code, None, "Lark returned a non-JSON response", retry_after
-                ) from exc
+                    response.status_code, None, "Lark returned a non-JSON response", retry_after,
+                    delivery_unknown=sending and response.status_code != 429,
+                ) from None if sending else exc
             if not isinstance(raw, dict):
                 self._pause_for_rate_limit(response.status_code, None, retry_after)
-                raise LarkApiError(response.status_code, None, "Lark returned an invalid JSON response", retry_after)
+                raise LarkApiError(
+                    response.status_code, None, "Lark returned an invalid JSON response", retry_after,
+                    delivery_unknown=sending and response.status_code != 429,
+                )
 
             code = _optional_int(raw.get("code"))
-            message = _string(raw.get("msg")) or _string(raw.get("message")) or "Lark API request failed"
+            message = ("Lark message send was not confirmed" if sending else
+                       _string(raw.get("msg")) or _string(raw.get("message")) or "Lark API request failed")
             if not response.is_success or (code is not None and code != 0):
                 self._pause_for_rate_limit(response.status_code, code, retry_after)
-                raise LarkApiError(response.status_code, code, message, retry_after)
+                raise LarkApiError(
+                    response.status_code, code, message, retry_after,
+                    delivery_unknown=sending and (response.status_code >= 500 or code == 230049),
+                )
 
             data = raw.get("data", raw)
             if not isinstance(data, dict):
-                raise LarkApiError(502, code, "Lark response data was not an object")
+                raise LarkApiError(502, code, "Lark response data was not an object", delivery_unknown=sending)
             return data
 
     def _require_secret(self) -> None:
@@ -338,12 +475,59 @@ class LarkClient:
             raise RuntimeError("Lark App Secret is not configured")
 
     def _pause_for_rate_limit(self, status_code: int, lark_code: int | None, retry_after: int | None) -> None:
-        if self._admission and (status_code == 429 or lark_code == 99991400):
+        if self._admission and (status_code == 429 or lark_code in {99991400, 230020}):
             self._admission.pause(retry_after)
 
 
 def _string(value: object) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _require_im_id(value: str, prefix: str) -> None:
+    if not isinstance(value, str) or not re.fullmatch(prefix + r"[A-Za-z0-9_-]{1,128}", value):
+        raise ValueError("Invalid Lark identity")
+
+
+def build_chat_post_payload(
+    chat_id: str, body: str, *, mentions: list[dict[str, str]] | tuple[dict[str, str], ...] = (),
+    mention_all: bool = False, message_uuid: str,
+) -> dict[str, str]:
+    """The same literal-content and wire-size check is used at preview and send."""
+    _require_im_id(chat_id, "oc_")
+    if not isinstance(body, str) or not body.strip():
+        raise ValueError("Message body cannot be empty")
+    message_uuid = str(uuid.UUID(str(message_uuid)))
+    if mention_all and mentions:
+        raise ValueError("Mention everyone and individual mentions cannot be combined")
+    nodes: list[dict[str, str]] = []
+    if mention_all:
+        nodes.append({"tag": "at", "user_id": "all", "user_name": "all"})
+    else:
+        seen: set[str] = set()
+        for mention in mentions:
+            open_id = mention["id"]
+            _require_im_id(open_id, "ou_")
+            if open_id not in seen:
+                seen.add(open_id)
+                nodes.append({"tag": "at", "user_id": open_id, "user_name": mention.get("name") or open_id})
+    rows = [[{"tag": "text", "text": line}] for line in body.split("\n")]
+    if nodes:
+        rows.insert(0, nodes)
+    content = json.dumps({"zh_cn": {"title": "", "content": rows}}, ensure_ascii=False, separators=(",", ":"))
+    payload = {"receive_id": chat_id, "msg_type": "post", "content": content, "uuid": message_uuid}
+    if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > 30_000:
+        raise ValueError("Rich text message exceeds the Lark size limit")
+    return payload
+
+
+def _next_roster_page(page: dict[str, Any], seen: set[str]) -> str | None:
+    if page.get("has_more") is False:
+        return None
+    token = _string(page.get("page_token"))
+    if page.get("has_more") is not True or not token or token in seen or len(seen) >= 100:
+        raise LarkApiError(502, None, "Lark roster pagination was incomplete")
+    seen.add(token)
+    return token
 
 
 def _int(value: object, default: int) -> int:

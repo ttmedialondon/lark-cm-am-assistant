@@ -3,6 +3,7 @@
 import asyncio
 import json
 from contextlib import contextmanager, nullcontext
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -18,6 +19,7 @@ from app import (
     admin_permissions,
     contact_handles,
     creator_broadcast,
+    creator_broadcast_delivery,
     creator_handles_routes,
     creator_importance,
     creator_imports,
@@ -207,6 +209,7 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
         monkeypatch.setattr(module, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(creator_roster, "get_settings", lambda: settings)
     monkeypatch.setattr(creator_importance, "get_settings", lambda: settings)
+    monkeypatch.setattr(creator_broadcast, "get_settings", lambda: settings)
     monkeypatch.setattr(admin_permissions, "permission_keys_for", lambda _: ())
 
     monkeypatch.setattr(creator_imports, "_page_data", lambda *args, **kwargs: pytest.fail(
@@ -304,7 +307,7 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
     other = uuid4()
     baseline = ("offline_access", "im:chat:read")
     required = (*baseline, "im:message", "im:message.send_as_user")
-    settings = SimpleNamespace(oauth_scopes=baseline, token_encryption_key=b"p" * 32)
+    settings = SimpleNamespace(oauth_scopes=baseline, token_encryption_key=b"p" * 32, broadcast_preview_until=None)
     cipher = TokenCipher(settings.token_encryption_key)
     for account, open_id, token, scopes in ((actor["id"], "ou_owner", "fixture-owner", required),
                                            (other, "ou_other", "fixture-other", ())):
@@ -334,16 +337,17 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
                 raise state["error"]
             if state["change"] == "token":
                 pg.execute("UPDATE authorizations SET access_token_ciphertext=%s WHERE id=%s",
-                           (cipher.encrypt("fixture-replacement"), other))
+                           (cipher.encrypt("fixture-replacement"), actor["id"]))
             elif state["change"] == "scope":
-                pg.execute("UPDATE authorizations SET scopes='{}' WHERE id=%s", (other,))
+                pg.execute("UPDATE authorizations SET scopes='{}' WHERE id=%s", (actor["id"],))
             elif state["change"] == "revoked":
-                pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (other,))
+                pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (actor["id"],))
             elif state["change"] == "owner":
                 pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (actor["id"],))
             elif state["change"] == "broadcast":
                 pg.execute("UPDATE authorizations SET broadcast_enabled=FALSE WHERE id=%s", (actor["id"],))
-            open_id = "ou_owner" if token == "fixture-owner" else "ou_other"
+            assert token != "fixture-other"  # The recipient filter never selects another person's sending token.
+            open_id = "ou_owner"
             return LarkProfile("ou_wrong" if state["change"] == "identity" else open_id, None, None, None)
 
         def refresh_token(self, _token):
@@ -351,8 +355,10 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
             return TokenBundle("fixture-refreshed", "fixture-refresh-new", 3600, 86400, "")
 
     monkeypatch.setattr(creator_broadcast, "connection", connection)
+    monkeypatch.setattr(creator_broadcast_delivery, "connection", connection)
     monkeypatch.setattr(worker, "connection", connection)
     monkeypatch.setattr(creator_broadcast, "get_settings", lambda: settings)
+    monkeypatch.setattr(creator_broadcast_delivery, "get_settings", lambda: settings)
     monkeypatch.setattr(creator_broadcast, "LarkClient", FakeLark)
     url, headers = "/creators/broadcast/permissions", {"X-CSRF-Token": "csrf"}
 
@@ -365,16 +371,21 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
     assert client.post(url, json={"cm_id": "all"}).status_code == 400
     assert not state["calls"]
     own = check()
-    assert own["status"] == "ready" and own["is_self"] and not own["is_sender"]
+    assert own["status"] == "ready" and own["is_self"] and own["is_sender"]
     assert not own["missing_scopes"] and own["authorization_url"] is None and own["checked_at"]
     assert check(str(actor["id"]))["is_sender"] and state["refreshes"] == 0
+    filtered = check(str(other))
+    assert filtered["status"] == "ready" and filtered["account_id"] == str(actor["id"])
+    assert filtered["is_sender"] and filtered["is_self"] and state["calls"][-1] == "fixture-owner"
+    pg.execute("UPDATE authorizations SET scopes=%s WHERE id=%s", (list(baseline), actor["id"]))
     missing = check(str(other))
-    assert missing["status"] == "needs_authorization" and set(missing["missing_scopes"]) == set(required)
-    assert missing["is_sender"] and not missing["is_self"] and missing["account_id"] == str(other)
-    assert missing["authorization_url"] == f"/auth/lark/start?send=1&account_id={other}"
+    assert missing["status"] == "needs_authorization"
+    assert set(missing["missing_scopes"]) == set(creator_broadcast.SEND_SCOPES)
+    assert missing["is_sender"] and missing["is_self"] and missing["account_id"] == str(actor["id"])
+    assert missing["authorization_url"] == f"/auth/lark/start?send=1&account_id={actor['id']}"
     assert "发送消息" in missing["message"] and "以本人身份发送" in missing["message"]
-    assert state["calls"][-1] == "fixture-other"
-    assert check("")["status"] == "unavailable"
+    pg.execute("UPDATE authorizations SET scopes=%s WHERE id=%s", (list(required), actor["id"]))
+    assert client.post(url, json={"cm_id": ""}, headers=headers).status_code == 400
     assert client.post(url, json={"cm_id": "bad"}, headers=headers).status_code == 400
     for error in (LarkApiError(403, 99991679, "denied"), LarkApiError(429, None, "limited"),
                   LarkApiError(500, None, "unavailable"), httpx.ReadTimeout("fixture timeout")):
@@ -385,31 +396,35 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
     state["error"] = LarkApiError(401, None, "invalid user token")
     assert check(str(other))["status"] == "needs_authorization"
     state["error"] = None
-    for change in ("identity", "token", "scope", "revoked"):
+    for change in ("identity", "token", "scope"):
         pg.execute("UPDATE authorizations SET status='active',scopes=%s,access_token_ciphertext=%s WHERE id=%s",
-                   (list(required), cipher.encrypt("fixture-other"), other))
+                   (list(required), cipher.encrypt("fixture-owner"), actor["id"]))
         state["change"] = change
         result = check(str(other))
-        assert result["status"] == ("needs_authorization" if change == "revoked" else "unavailable")
+        assert result["status"] == "unavailable"
         assert result["authorization_url"] is None and not result["missing_scopes"]
+    state["change"] = "revoked"
+    pg.execute("UPDATE authorizations SET scopes=%s WHERE id=%s", (list(required), actor["id"]))
+    assert client.post(url, json={"cm_id": str(other)}, headers=headers).status_code == 403
     state["change"] = None
     before = len(state["calls"])
-    assert check(str(other))["status"] == "needs_authorization" and len(state["calls"]) == before
-    pg.execute("UPDATE authorizations SET status='active',body_consent_at=NULL WHERE id=%s", (other,))
+    assert client.post(url, json={"cm_id": str(other)}, headers=headers).status_code == 403
+    assert len(state["calls"]) == before
+    pg.execute("UPDATE authorizations SET status='active',body_consent_at=NULL WHERE id=%s", (actor["id"],))
     assert check(str(other))["authorization_url"] is None and len(state["calls"]) == before
     pg.execute("UPDATE authorizations SET status='attention_required',body_consent_at=NOW(),scopes=%s WHERE id=%s",
-               (list(required), other))
+               (list(required), actor["id"]))
     attention = check(str(other))
     assert attention["status"] == "needs_authorization" and not attention["missing_scopes"]
     assert pg.execute("SELECT status FROM authorizations WHERE id=%s",
-                      (other,)).fetchone()["status"] == "attention_required"
+                      (actor["id"],)).fetchone()["status"] == "attention_required"
     pg.execute("""UPDATE authorizations SET body_consent_at=NOW(),scopes=%s,access_token_ciphertext=%s,
         access_token_expires_at=NOW()-INTERVAL '1 minute',status='active' WHERE id=%s""",
-        (list(required), cipher.encrypt("fixture-other"), other))
+        (list(required), cipher.encrypt("fixture-owner"), actor["id"]))
     refreshed = check(str(other))
     assert state["refreshes"] == 1 and state["calls"][-1] == "fixture-refreshed"
     assert refreshed["status"] == "needs_authorization" and set(refreshed["missing_scopes"]) == set(required)
-    assert pg.execute("SELECT scopes,status FROM authorizations WHERE id=%s", (other,)).fetchone() == {
+    assert pg.execute("SELECT scopes,status FROM authorizations WHERE id=%s", (actor["id"],)).fetchone() == {
         "scopes": [], "status": "active"}
     assert settings.oauth_scopes == baseline
     assert pg.execute("SELECT COUNT(*) AS n FROM sync_jobs").fetchone()["n"] == 0
@@ -420,13 +435,15 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
     assert reconnect["authorization_url"] == f"/auth/lark/start?send=1&account_id={actor['id']}"
     assert client.post(url, json={"cm_id": "all"}).status_code == 400
     attention_page = client.get("/creators/broadcast", follow_redirects=False)
-    assert attention_page.status_code == 303
-    assert attention_page.headers["location"] == f"/auth/lark/start?send=1&account_id={actor['id']}&auto=1"
+    assert attention_page.status_code == 403 and "location" not in attention_page.headers
     blocked = client.post("/creators/broadcast/templates/save", json={"name": "Example", "body": "Example"},
                           headers=headers)
     assert blocked.status_code == 403
     assert blocked.json()["authorization_url"] == f"/auth/lark/start?send=1&account_id={actor['id']}"
     actor["status"] = "active"
+    pg.execute("""UPDATE authorizations SET status='active',scopes=%s,access_token_ciphertext=%s,
+        access_token_expires_at=NOW()+INTERVAL '1 hour' WHERE id=%s""",
+        (list(required), cipher.encrypt("fixture-owner"), actor["id"]))
     state["change"] = "owner"
     assert client.post(url, json={"cm_id": "all"}, headers=headers).status_code == 403
     state["change"] = None
@@ -440,7 +457,7 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
     assert data["cms"] == [{"id": str(actor["id"]), "name": "ou_owner"}]
     assert data["selected_cm_id"] == str(actor["id"]) and not data["can_select_cm"]
     opened = client.get("/creators/broadcast")
-    assert opened.status_code == 200 and "发送（未开通）" in opened.text
+    assert opened.status_code == 200 and "发送记录" in opened.text and "发送（未开通）" not in opened.text
     assert check()["is_self"] and check()["is_sender"]
     pg.execute("UPDATE authorizations SET status='active',scopes=%s WHERE id=%s", (list(required), other))
     for account, chat, name in ((actor["id"], "oc_own", "Own creator"), (other, "oc_foreign", "Foreign creator")):
@@ -467,7 +484,7 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
     assert [group["id"] for group in joined["groups"]] == ["oc_own"]
     checked = client.post("/creators/broadcast/preview", json=own_fields, headers=headers).json()
     assert checked["groups"][0]["mention_all"] and not checked["can_send"]
-    assert client.post("/creators/broadcast/send", json=own_fields, headers=headers).status_code == 404
+    assert client.post("/creators/broadcast/send", json=own_fields, headers=headers).status_code == 400
     list_fields = dict(own_fields, name="Own list")
     list_item = client.post("/creators/broadcast/lists/save", json=list_fields, headers=headers).json()["list"]
     assert list_item["cm_id"] == str(actor["id"])
@@ -498,8 +515,14 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
         assert client.post("/creators/broadcast/" + action, json=fields, headers=headers).status_code == 403
     pg.execute("UPDATE authorizations SET scopes=%s WHERE id=%s", (list(baseline), actor["id"]))
     missing = client.get("/creators/broadcast", follow_redirects=False)
-    assert missing.status_code == 303
-    assert missing.headers["location"] == f"/auth/lark/start?send=1&account_id={actor['id']}&auto=1"
+    assert missing.status_code == 200 and "location" not in missing.headers
+    assert client.post("/creators/broadcast/preview", json=own_fields, headers=headers).status_code == 200
+    assert client.post("/creators/broadcast/templates/save", json=draft, headers=headers).status_code == 200
+    send_fields = dict(own_fields, cm_id=str(actor["id"]))
+    blocked_send = client.post("/creators/broadcast/prepare", json=send_fields, headers=headers)
+    assert blocked_send.status_code == 403
+    assert blocked_send.json()["authorization_url"] == f"/auth/lark/start?send=1&account_id={actor['id']}"
+    assert pg.execute("SELECT COUNT(*) n FROM creator_broadcast_batches").fetchone()["n"] == 0
     pg.execute("UPDATE authorizations SET scopes=%s WHERE id=%s", (list(required), actor["id"]))
     state["change"] = "broadcast"
     assert client.post(url, json={"cm_id": "all"}, headers=headers).status_code == 403
@@ -513,13 +536,37 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
     assert ordinary.get("/creators/broadcast", follow_redirects=False).status_code == 403
     assert ordinary.post(url, json={"cm_id": "all"}, headers=headers).status_code == 403
 
+    # The temporary demo opens only the logged-in CM's editor; it does not enable delivery.
+    settings.broadcast_preview_until = datetime.now(UTC) + timedelta(hours=1)
+    ordinary_actor["status"] = "active"
+    pg.execute("UPDATE authorizations SET scopes=%s WHERE id=%s", (list(baseline), other))
+    assert ordinary.get("/creators/broadcast").status_code == 200
+    assert creator_broadcast.page_data(other)["demo_preview"]
+    assert creator_broadcast.page_data(other)["templates"][0]["id"] == str(foreign_template)
+    assert client.post("/creators/broadcast/templates/save", json=dict(draft, id=str(foreign_template), revision=1),
+                       headers=headers).status_code == 404
+    assert ordinary.post("/creators/broadcast/groups", json=dict(own_fields, cm_id=str(actor["id"])),
+                         headers=headers).status_code == 403
+    blocked_demo = ordinary.post("/creators/broadcast/prepare", json=dict(send_fields, cm_id=str(other)),
+                                 headers=headers)
+    assert blocked_demo.status_code == 403 and "authorization_url" not in blocked_demo.json()
+    pg.execute("UPDATE authorizations SET scopes='{}' WHERE id=%s", (other,))
+    assert ordinary.get("/creators/broadcast").status_code == 403  # Baseline consent still matters.
+    pg.execute("UPDATE authorizations SET scopes=%s,status='revoked' WHERE id=%s", (list(required), other))
+    assert ordinary.get("/creators/broadcast").status_code == 403
+    pg.execute("UPDATE authorizations SET status='active' WHERE id=%s", (other,))
+    settings.broadcast_preview_until = datetime.now(UTC) - timedelta(seconds=1)
+    assert ordinary.get("/creators/broadcast").status_code == 403
+    assert pg.execute("SELECT COUNT(*) n FROM creator_broadcast_batches").fetchone()["n"] == 0
+
 
 def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monkeypatch):
     client, actor = browser(monkeypatch, owner=True)
     baseline = ("offline_access", "im:chat:read", "im:message:readonly", "im:chat.members:read",
                 "contact:contact.base:readonly", "contact:user.base:readonly")
     required = (*baseline, *creator_broadcast.SEND_SCOPES)
-    monkeypatch.setattr(creator_broadcast, "get_settings", lambda: SimpleNamespace(oauth_scopes=baseline))
+    settings = SimpleNamespace(oauth_scopes=baseline, broadcast_preview_until=None)
+    monkeypatch.setattr(creator_broadcast, "get_settings", lambda: settings)
     p1, p2, other_cm = map(str, (uuid4(), uuid4(), uuid4()))
     people = [{"id": p1, "name": "Example One", "handles": ["example_one", "example_backup"]},
               {"id": p2, "name": "Example Two", "handles": ["example_two"]}]
@@ -616,7 +663,8 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
                 return Rows([{"id": params[0], "open_id": "ou_example", "display_name": "CM"}]
                             if changed["cm_active"] else [])
             if "FROM authorization_chats ac JOIN authorizations" in sql:
-                return Rows([{"chat_id": group["id"], "name": group["name"], "purpose": params[0],
+                assert params == (params[0], params[1], params[1])
+                return Rows([{"chat_id": group["id"], "name": group["name"], "purpose": params[1],
                               "member_count": None, "member_count_status": "pending",
                               "member_snapshot_checked_at": None, "member_snapshot_status": "pending",
                               "last_seen_at": None}] if not changed["routes"] else [])
@@ -632,8 +680,9 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
     response = client.get("/creators/broadcast")
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store, max-age=0"
-    assert "仅预览 · 不会发送" in response.text
-    assert "发送（未开通）" in response.text and "creator-broadcast.mjs" in response.text
+    assert "发送记录" in response.text and "准备发送" in response.text
+    assert "发送（未开通）" not in response.text and "creator-broadcast.mjs" in response.text
+    assert creator_broadcast.page_data(actor["id"])["selected_cm_id"] == str(actor["id"])
     for label in creator_broadcast.PURPOSES.values():
         assert label in response.text
     assert client.post("/creators/broadcast").status_code == 405
@@ -680,7 +729,7 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
     assert client.post(url, content=b"x" * 300001, headers=json_headers).status_code == 400
     assert client.post(url, content=iter([b"x" * 300001]), headers=json_headers).status_code == 400
     assert client.post(url, content=b"{", headers=json_headers).status_code == 400
-    assert client.post("/creators/broadcast/send", json=preview, headers=headers).status_code == 404
+    assert client.post("/creators/broadcast/send", json=preview, headers=headers).status_code == 400
     assert any(sql == "SET TRANSACTION READ ONLY" for sql in reads)
     changed["routes"] = False
     preview.update(cm_id="all", purpose="support")
@@ -803,7 +852,7 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
     deleted_template = client.post(templates_url + "delete", json={"id": template_item["id"], "revision": 2},
                                    headers=headers)
     assert deleted_template.json()["templates"] == [] and template_stored["deleted_at"]
-    # Every business entry is gated by the live actor grant, even when another CM has all scopes.
+    # Preview/editor entry points retain baseline authorization, not optional send scopes.
     business_calls = (
         lambda: creator_broadcast.page_data(actor["id"]),
         lambda: creator_broadcast.match(actor["id"], other_cm, request["raw"], "support"),
@@ -816,26 +865,34 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
         lambda: creator_broadcast.template_save(actor["id"], draft),
         lambda: creator_broadcast.template_delete(actor["id"], template_item["id"], 1),
     )
-    for removed_scope in (baseline[0], *creator_broadcast.SEND_SCOPES):
+    for removed_scope in creator_broadcast.SEND_SCOPES:
         changed["scopes"] = [scope for scope in required if scope != removed_scope]
+        opened = client.get("/creators/broadcast", follow_redirects=False)
+        assert opened.status_code == 200 and "location" not in opened.headers
+        assert client.post(url, json=request, headers=headers).status_code == 200
+        assert client.post("/creators/broadcast/preview", json=preview, headers=headers).status_code == 200
+        assert client.post(templates_url + "save", json=draft, headers=headers).status_code == 200
+        with pytest.raises(creator_broadcast.BroadcastAuthorizationRequired) as denied:
+            creator_broadcast._require_broadcast_grant(Conn(), actor["id"], sending=True)
+        assert denied.value.account_id == str(actor["id"])
+    changed["scopes"] = [scope for scope in required if scope != baseline[0]]
+    before = len(reads)
+    denied_page = client.get("/creators/broadcast", follow_redirects=False)
+    assert denied_page.status_code == 403 and "location" not in denied_page.headers
+    assert not any("creator_broadcast_lists" in sql or "creator_broadcast_templates" in sql
+                   for sql in reads[before:])
+    for call in business_calls:
         before = len(reads)
-        redirect = client.get("/creators/broadcast", follow_redirects=False)
-        assert redirect.status_code == 303
-        assert redirect.headers["location"] == f"/auth/lark/start?send=1&account_id={actor['id']}&auto=1"
+        with pytest.raises(creator_broadcast.BroadcastAuthorizationRequired) as denied:
+            call()
+        assert denied.value.account_id == str(actor["id"])
         assert not any("creator_broadcast_lists" in sql or "creator_broadcast_templates" in sql
                        for sql in reads[before:])
-        for call in business_calls:
-            before = len(reads)
-            with pytest.raises(creator_broadcast.BroadcastAuthorizationRequired) as denied:
-                call()
-            assert denied.value.account_id == str(actor["id"])
-            assert not any("creator_broadcast_lists" in sql or "creator_broadcast_templates" in sql
-                           for sql in reads[before:])
-        blocked = client.post(url, json=dict(request, cm_id=other_cm), headers=headers)
-        assert blocked.status_code == 403
-        assert blocked.json()["authorization_url"] == f"/auth/lark/start?send=1&account_id={actor['id']}"
-        assert client.post(resolve_url, json={"cm_id": other_cm, "purpose": "support", "contact_ids": [p1]},
-                           headers=headers).status_code == 403
+    blocked = client.post(url, json=dict(request, cm_id=other_cm), headers=headers)
+    assert blocked.status_code == 403
+    assert blocked.json()["authorization_url"] == f"/auth/lark/start?send=1&account_id={actor['id']}"
+    assert client.post(resolve_url, json={"cm_id": other_cm, "purpose": "support", "contact_ids": [p1]},
+                       headers=headers).status_code == 403
     changed["scopes"] = list(required)
     changed["consent"] = False
     with pytest.raises(PermissionError, match="本人聊天授权已失效"):
