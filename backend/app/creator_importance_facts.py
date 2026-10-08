@@ -12,7 +12,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PROMPT_VERSION = "creator-importance-facts-v2.0.2"
-RULE_VERSION = "creator-importance-v2.0.4"
+RULE_VERSION = "creator-importance-v2.0.5"
 MAX_FACTS, MAX_REFS = 12, 8
 KINDS = ("intent", "opportunity", "agreed", "ongoing", "completed", "progress", "interaction",
          "cancelled", "uncertain")
@@ -136,6 +136,34 @@ _REFUSED_REPLY = re.compile(r"^\W*(?:no\s*,?\s*(?:thanks?\b|thank\s+you\b)|not\s
 _THANKS_ONLY = re.compile(r"\W*(?:(?:hi|hello|thanks?|thank\s+you|very\s+much|so\s+much|dear|xxx|xx)\W*)+",
                          re.I)
 _AMOUNT = re.compile(r"[£€$]\s*\d+(?:[.,]\d+)*")
+_MAINTENANCE_ISSUE = re.compile(
+    r"\b(?:please\s+pay\s+me|still\s+waiting\s+for\s+(?:my|the)\s+payment|chasing\s+payment|"
+    r"unpaid|overdue\s+payment|make\s+a\s+complaint|complain\s+about|escalate\s+this)\b|"
+    r"催款|(?:还没|尚未|仍未)付款|欠款|投诉", re.I,
+)
+_BUSINESS_ADVANCE = re.compile(
+    r"\b(?:quote|quotation)\b.{0,24}\b(?:works|agreed|accepted|confirmed)\b|"
+    r"\b(?:settle|accept|confirm)\b.{0,24}\b(?:quote|quotation|filming\s+date|delivery\s+date)\b|"
+    r"\breschedul(?:e|ed|ing)\b.{0,24}\b(?:filming|delivery|live|video)\b|"
+    r"\bI(?:['’]ll|\s+(?:will|am|have))?\s+record(?:ing|ed)?\b|"
+    r"(?:确认|接受|敲定).{0,8}(?:报价|交付日期|拍摄日期)|改期.{0,8}(?:拍摄|交付|直播)|"
+    r"我(?:会|正在|已经)?(?:录制|拍摄)", re.I,
+)
+
+
+def _pure_maintenance_issue(cited):
+    if not any(_MAINTENANCE_ISSUE.search(m.get("text", "")) for m in cited):
+        return False
+    latest = max(_time(m["created_at"]) for m in cited)
+    # Only current execution can offset a chase; old agreement context cannot refresh its date.
+    for message in cited:
+        if _time(message["created_at"]) != latest:
+            continue
+        for part in re.split(r"(?<=[.!?;。！？；])|\n|\b(?:and|but)\b|但是|但", message.get("text", ""), flags=re.I):
+            if not _MAINTENANCE_ISSUE.search(part) and (
+                    _DELIVERY.search(part) or _SPECIFIC_VIDEO_PROMOTION.search(part) or _BUSINESS_ADVANCE.search(part)):
+                return False
+    return True
 
 
 def _linked_question(message, messages, chats):
@@ -337,6 +365,8 @@ def validate(raw, pack, previous=()):
                 raise ValueError("source author")
             if message.get("context_complete") is False:
                 raise ValueError("incomplete reply")
+        if kind in {"progress", "interaction"} and _pure_maintenance_issue(cited):
+            continue
         at = max(_time(m["created_at"]) for m in cited)
         key = key or keys.setdefault(_object(obj), "C" + hashlib.sha256(
             (_object(obj) + "\0" + min(refs)).encode()).hexdigest()[:20])

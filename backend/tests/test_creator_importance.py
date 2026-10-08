@@ -83,7 +83,7 @@ def test_weak_claims_and_unrelated_cancellations_do_not_overwrite_valid_facts():
 
 def test_fact_protocol_rejects_unknown_and_third_party_evidence():
     assert facts.PROMPT_VERSION == "creator-importance-facts-v2.0.2"
-    assert facts.RULE_VERSION == "creator-importance-v2.0.4"
+    assert facts.RULE_VERSION == "creator-importance-v2.0.5"
     pack = _pack(("creator", "I'd like to hear about the Acme product."))
     with pytest.raises(ValueError, match="refs"):
         facts.validate({"facts": [_fact("intent", ["missing"])]}, pack)
@@ -137,6 +137,34 @@ def test_current_opportunity_and_bilateral_business_days_drive_maintenance_not_v
     refreshed = facts.rank(facts.merge_facts(opportunity, progress), later)
     assert refreshed["tier"] == "focus" and refreshed["phase"] == "intent"
     assert refreshed["priority"]["primary_at"] == "2026-09-10T10:00:00+00:00"
+
+    for kind, texts in (
+        ("progress", (("creator", "I am still waiting for my payment. Please pay me now."),)),
+        ("progress", (("cm", "Please film the Acme video."), ("creator", "Please pay me now."))),
+        ("interaction", (("creator", "I complain about the overdue payment."),
+                         ("cm", "I will check with finance."))),
+    ):
+        issue = _pack(*texts)
+        for message in issue["messages"]:
+            message["created_at"] = message["created_at"].replace("2026-08", "2026-09")
+        rejected = facts.validate({"facts": [
+            _fact(kind, [m["ref"] for m in issue["messages"]], key=opportunity[0]["key"])
+        ]}, issue, opportunity)
+        assert rejected == []
+        assert facts.rank(facts.merge_facts(opportunity, rejected), later)["priority"] == \
+            facts.rank(opportunity, later)["priority"]
+
+    for text in (
+        "Please pay me. I'll record tomorrow.",
+        "Please pay me, but the quote works and I can film next Tuesday.",
+        "还没付款。但我正在拍摄视频。",
+    ):
+        mixed = _pack(("creator", text))
+        mixed["messages"][0]["created_at"] = "2026-09-10T10:00:00+00:00"
+        kept = facts.validate({"facts": [_fact("progress", ["E0"], key=opportunity[0]["key"])]},
+                              mixed, opportunity)
+        assert kept[0]["kind"] == "progress"
+        assert facts.rank(facts.merge_facts(opportunity, kept), later)["tier"] == "focus"
 
     future = facts.rank(opportunity, datetime(2026, 7, 31, tzinfo=UTC))
     assert future["tier"] == "normal" and future["recent_business_dates"] == []
