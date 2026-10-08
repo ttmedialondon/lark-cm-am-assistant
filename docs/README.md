@@ -31,7 +31,7 @@
 | [达人负责人匹配](specs/creator-responsibility-matching_v1.0.md) | 独立多 CM Prompt、证据边界与正式队列；独立密钥、默认关闭，高置信度自动关联 |
 | [达人群分类规则](specs/creator-group-classification-prompt_v1.1.md) | 五类用途、未确认、群名组合证据与高置信度入库；人工优先、独立密钥 |
 | [群分类研究结果](reviews/creator-group-classification-research_2026-10-04.md) | 120 位达人相关 168 个群的材料覆盖、实际阅读及分类边界 |
-| [达人重要度排行调研与技术方案](reviews/creator-priority-market-research_2026-10-08.md) | 17 个产品对照、三档重要度与商业排序、数据前提及轻量技术建议；尚未开发 |
+| [达人重要度排行调研与技术方案](reviews/creator-priority-market-research_2026-10-08.md) | 17 个产品对照；仅依赖聊天的合作事实、三档排行与增量提取，不依赖 Cruva 或 GMV；尚未开发 |
 | [部署与回退](runbooks/deploy-mvp.md) | GitHub 发布、数据库备份、迁移、健康检查与恢复 |
 | [AI 协作约定](../AGENTS.md) | 开发与交付授权、数据保护约定 |
 
