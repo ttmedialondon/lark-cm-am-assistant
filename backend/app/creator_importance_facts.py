@@ -53,8 +53,9 @@ _REPEATED_DELIVERY = re.compile(
     r"(?:\w+\s+){0,2}(?:lives?|streams?|videos?|content)\b|"
     r"\b(?:lives?|streams?|videos?|content)(?:\s+(?:on|with|for)\s+\w+)?\s+"
     r"(?:again|(?:every|each)\s+(?:day|week|month|night|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday))\b|"
-    r"(?:每天|每日|每周|每月|每晚|定期|固定|再次|多场|两场|三场).{0,8}(?:直播|开播|视频|内容)|"
-    r"(?:直播|开播|视频|内容).{0,8}(?:每天|每日|每周|每月|每晚|定期|固定|再次|多场|两场|三场)", re.I,
+    r"(?:每天|每日|每周|每月|每晚|定期|固定|再次|多场|两场|三场)"
+    r"(?:都|会|固定|安排|两场|三场){0,2}(?:直播|开播|视频|内容)|"
+    r"(?:直播|开播|视频|内容)(?:每天|每日|每周|每月|每晚)?(?:多场|两场|三场|[2-9]\d*(?:场|次|条))", re.I,
 )
 _NO_DELIVERY = re.compile(
     r"\b(?:no|not|never|cannot|can't|won't|wouldn't|couldn't|might|maybe|if)\b|"
