@@ -83,7 +83,7 @@ def test_weak_claims_and_unrelated_cancellations_do_not_overwrite_valid_facts():
 
 def test_fact_protocol_rejects_unknown_and_third_party_evidence():
     assert facts.PROMPT_VERSION == "creator-importance-facts-v2.0.2"
-    assert facts.RULE_VERSION == "creator-importance-v2.0.3"
+    assert facts.RULE_VERSION == "creator-importance-v2.0.4"
     pack = _pack(("creator", "I'd like to hear about the Acme product."))
     with pytest.raises(ValueError, match="refs"):
         facts.validate({"facts": [_fact("intent", ["missing"])]}, pack)
@@ -169,6 +169,49 @@ def test_current_opportunity_and_bilateral_business_days_drive_maintenance_not_v
     assert downgraded[0]["kind"] == "intent" and not downgraded[0]["business_dates"]
     assert facts.validate({"facts": [_fact("interaction", ["E0"])]}, one_sided) == []
 
+    for cm_text, reply in (
+        ("Please check out the product links above.", "Have you got any products that match my content style?"),
+        ("We offer £100 for three Acme product videos.", "Thank you very much xxx"),
+        ("We offer £100 for three Acme product videos.", "No thank you. I am focusing on other stuff."),
+    ):
+        weak = facts.validate({"facts": [_fact("opportunity", ["E0", "E1"])]},
+                              _pack(("cm", cm_text), ("creator", reply)))
+        assert weak[0]["kind"] == "intent" and not weak[0]["business_dates"]
+        assert facts.rank(weak, datetime(2026, 8, 5, tzinfo=UTC))["tier"] == "normal"
+
+    asynchronous = _pack(("creator", "I can shoot three Acme videos for £100; can we discuss the filming dates?"),
+                         ("cm", "Please send the brief and your available dates."))
+    assert facts.validate({"facts": [_fact("opportunity", ["E0", "E1"])]}, asynchronous)[0]["kind"] == "opportunity"
+    other_topic = _pack(("creator", "I can shoot three Acme videos for £100."),
+                        ("creator", "Can you send the Beta product links?"), ("cm", "Yes, sounds good."))
+    other_topic["messages"][2]["reply_to"] = "E1"
+    assert facts.validate({"facts": [_fact("opportunity", ["E0", "E2"])]}, other_topic)[0]["kind"] == "intent"
+    other_topic["messages"][2]["reply_to"] = "E0"
+    assert facts.validate({"facts": [_fact("opportunity", ["E0", "E2"])]}, other_topic)[0]["kind"] == "opportunity"
+    conditional = _pack(("cm", "We offer £100 for three new Acme videos; brand selection is still pending."),
+                        ("creator", "Thank you. Really appreciate it! Yes sounds good xxx"))
+    assert facts.validate({"facts": [_fact("opportunity", ["E0", "E1"])]}, conditional)[0]["kind"] == "opportunity"
+
+    separate = _pack(("cm", "The Acme autumn campaign has a concrete video offer."),
+                     ("creator", "Please send the Acme brief."),
+                     ("cm", "The Beta winter campaign has a concrete video offer."),
+                     ("creator", "No thank you."))
+    separate["messages"][3]["reply_to"] = "E2"
+    independent = facts.validate({"facts": [
+        _fact("opportunity", ["E0", "E1"]),
+        _fact("opportunity", ["E0", "E1", "E3"]),
+        _fact("opportunity", ["E2", "E3"], obj="Beta winter video"),
+    ]}, separate)
+    by_refs = {tuple(f["refs"]): f for f in independent}
+    assert by_refs[("E0", "E1")]["kind"] == "opportunity"
+    assert by_refs[("E0", "E1", "E3")]["kind"] == "intent"
+    assert not by_refs[("E0", "E1", "E3")]["business_dates"]
+    assert by_refs[("E2", "E3")]["kind"] == "intent" and not by_refs[("E2", "E3")]["business_dates"]
+    separate_priority = facts.rank(independent, datetime(2026, 8, 5, tzinfo=UTC))
+    assert separate_priority["tier"] == "focus"
+    assert separate_priority["primary_at"] == "2026-08-02T10:00:00+00:00"
+    assert separate_priority["recent_business_dates"] == ["2026-08-01", "2026-08-02"]
+
     cancelled = facts.validate({"facts": [_fact("cancelled", ["E1"], key=opportunity[0]["key"])]},
                                pack, opportunity)
     closed = facts.rank(facts.merge_facts(opportunity, cancelled), datetime(2026, 8, 5, tzinfo=UTC))
@@ -189,6 +232,22 @@ def test_platform_benefit_operations_never_become_primary_but_real_deliverables_
         obj="Platform subsidy application tied to the existing live schedule and projected GMV",
     )]}, pack)
     assert platform_application[0]["kind"] == "interaction"
+    delivery_support = _pack(("cm", "I applied but TikTok did not settle the live exclusive. "
+                              "You can go live first; when valid I will let you know."),
+                             ("creator", "I will just go live when ready. I was planning to go live this evening."))
+    for kind in ("opportunity", "agreed", "ongoing", "progress"):
+        result = facts.validate({"facts": [_fact(kind, ["E0", "E1"], obj="Acme live with live-exclusive subsidy")]},
+                                delivery_support)
+        assert result[0]["kind"] == "interaction", kind
+        assert facts.rank(result, datetime(2026, 8, 5, tzinfo=UTC))["tier"] == "normal"
+    independent_live = _pack(("cm", "Got this, I will let them know. "
+                              "You can go live first; when valid I will let you know."),
+                             ("creator", "I will just go live when ready. I was planning to go live this evening."))
+    for kind in ("opportunity", "agreed", "ongoing"):
+        result = facts.validate({"facts": [_fact(kind, ["E0", "E1"], obj="Acme live with live-exclusive subsidy")]},
+                                independent_live)
+        assert result[0]["kind"] == "intent", kind
+        assert not result[0]["business_dates"]
     scheduled_application = facts.validate({"facts": [_fact(
         "opportunity", ["E0", "E1"], obj="Platform subsidy application for tonight livestream",
     )]}, pack)
@@ -223,14 +282,37 @@ def test_platform_benefit_operations_never_become_primary_but_real_deliverables_
         "agreed", ["E0", "E1"], obj="new Acme video deliverable commission-link activation",
     )]}, unpaid_pack)
     assert unpaid[0]["kind"] == "agreed"
+    assert facts.validate({"facts": [_fact("opportunity", ["E0", "E1"], obj="Acme new video deliverable")]},
+                          unpaid_pack)[0]["kind"] == "opportunity"
+
+    existing_video = _pack(("cm", "Would you film and post your Acme video today? When are you planning to post?"),
+                           ("creator", "I'll record tomorrow but it is out of stock."))
+    for kind in ("opportunity", "agreed", "ongoing"):
+        fabricated_fee = facts.validate({"facts": [_fact(
+            kind, ["E0", "E1"], obj="Acme paid collaboration for 3 new videos for £100",
+        )]}, existing_video)
+        assert fabricated_fee[0]["kind"] == "intent" and not fabricated_fee[0]["business_dates"], kind
+    assert facts.validate({"facts": [_fact(
+        "opportunity", ["E0", "E1"], obj="Acme video content creation after sample receipt",
+    )]}, existing_video)[0]["kind"] == "opportunity"
+    carried_fee = facts.validate({"facts": [_fact("opportunity", ["E0", "E1"], key=paid[0]["key"])]},
+                                 existing_video, paid)
+    assert carried_fee[0]["kind"] == "opportunity" and carried_fee[0]["object"] == paid[0]["object"]
 
     tonight_pack = _pack(("cm", "We can arrange flash-sale prices for a Roborock livestream tonight."),
                          ("creator", "Confirmed, I will do the Roborock livestream tonight."))
     tonight = facts.validate({"facts": [_fact(
         "agreed", ["E0", "E1"], obj="Roborock flash-sale price support for tonight livestream",
     )]}, tonight_pack)
-    assert tonight[0]["kind"] == "agreed"
-    assert facts.rank(tonight, datetime(2026, 8, 5, tzinfo=UTC))["tier"] == "focus"
+    assert tonight[0]["kind"] == "intent"
+    assert facts.rank(tonight, datetime(2026, 8, 5, tzinfo=UTC))["tier"] == "normal"
+    requested_live = _pack(("cm", "Please host the Acme livestream tonight; "
+                            "we can apply for live-exclusive prices too."),
+                           ("creator", "Confirmed, I will host the Acme livestream tonight."))
+    delivery = facts.validate({"facts": [_fact("agreed", ["E0", "E1"], obj="Acme livestream tonight")]},
+                              requested_live)
+    assert delivery[0]["kind"] == "agreed"
+    assert facts.rank(delivery, datetime(2026, 8, 5, tzinfo=UTC))["tier"] == "focus"
 
     boost_pack = _pack(("cm", "Can we boost your published Acme video? Please send its ad code."),
                        ("creator", "Yes, here is the Acme ad code for that video."))
@@ -243,16 +325,16 @@ def test_platform_benefit_operations_never_become_primary_but_real_deliverables_
 def test_ongoing_needs_this_creators_recurring_delivery_not_recurring_subsidies():
     cases = [
         ("I've activated DJI subsidy and links.",
-         "Did we find out if we could get live exclusives on all DJI products?", "intent"),
+         "Did we find out if we could get live exclusives on all DJI products?", "interaction"),
         ("I've activated DJI subsidy and links.",
-         "Would I be able to get live exclusive on all DJI products?", "intent"),
+         "Would I be able to get live exclusive on all DJI products?", "interaction"),
         ("We can arrange flash sales everyday for Roborock.",
-         "I’ll be live with it tonight see how we go", "agreed"),
+         "I’ll be live with it tonight see how we go", "intent"),
         ("We can arrange flash sales everyday.",
-         "I'll be live tonight; flash sales everyday would help.", "agreed"),
-        ("每天安排闪购价。", "我会直播今晚这一场，每天有闪购价。", "agreed"),
-        ("每天安排优惠券。", "我会直播一场，每天有优惠券。", "agreed"),
-        ("每天安排优惠券。", "每天有优惠券我直播一场。", "agreed"),
+         "I'll be live tonight; flash sales everyday would help.", "intent"),
+        ("每天安排闪购价。", "我会直播今晚这一场，每天有闪购价。", "intent"),
+        ("每天安排优惠券。", "我会直播一场，每天有优惠券。", "intent"),
+        ("每天安排优惠券。", "每天有优惠券我直播一场。", "intent"),
         ("Acme weekly lives are agreed.", "I will do our weekly lives", "ongoing"),
         ("Acme weekly lives are agreed.", "I'll host the Acme live every week.", "ongoing"),
         ("Acme weekly lives are agreed.", "I host the Acme live every week.", "ongoing"),
@@ -271,7 +353,7 @@ def test_ongoing_needs_this_creators_recurring_delivery_not_recurring_subsidies(
         result = facts.validate({"facts": [_fact("ongoing", ["E0", "E1"])]}, pack)
         assert result[0]["kind"] == expected, creator
         assert facts.rank(result, datetime(2026, 8, 5, tzinfo=UTC))["tier"] == {
-            "ongoing": "focus", "agreed": "focus", "intent": "normal",
+            "ongoing": "focus", "agreed": "focus", "intent": "normal", "interaction": "normal",
         }[expected]
 
     pack = _pack(("cm", "Please host the Acme live every week."), ("creator", "Yes, agreed."))

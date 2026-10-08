@@ -12,7 +12,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PROMPT_VERSION = "creator-importance-facts-v2.0.2"
-RULE_VERSION = "creator-importance-v2.0.3"
+RULE_VERSION = "creator-importance-v2.0.4"
 MAX_FACTS, MAX_REFS = 12, 8
 KINDS = ("intent", "opportunity", "agreed", "ongoing", "completed", "progress", "interaction",
          "cancelled", "uncertain")
@@ -96,7 +96,7 @@ _THIRD_DELIVERY = re.compile(
 _DELIVERY_ACTION = (
     r"(?:go\s+live\b(?!\s+exclusiv)|be\s+live\b(?!\s+exclusiv)|"
     r"(?:host|do|run|film|shoot|post|publish|upload|make|produce|deliver)\b"
-    r"(?:\s+[\w’'-]+){0,5}\s+(?:lives?\b(?!\s+exclusiv)|streams?\b|videos?\b|content\b)|"
+    r"(?:\s+[\w’'-]+){0,5}\s+(?:lives?\b(?!\s+exclusiv)|livestreams?\b|streams?\b|videos?\b|content\b)|"
     r"(?:开播|直播|拍摄视频|发布视频|制作视频|发布内容))"
 )
 _DELIVERY = re.compile(_DELIVERY_ACTION, re.I)
@@ -121,6 +121,21 @@ _NO_DELIVERY = re.compile(
 )
 _ACCEPTED_REPLY = re.compile(r"^\W*(?:yes\b|yep\b|sure\b|agreed\b|confirmed\b|sounds\s+good\b|"
                              r"ok(?:ay)?\b|确认|同意|好的|可以|是的)", re.I)
+_CONTENT_PROPOSAL = re.compile(
+    r"\b(?:videos?|content|posts?|lives?|livestreams?|streams?)\b.{0,48}"
+    r"\b(?:offers?|proposals?|briefs?|quotes?|quotation|agreed?|confirmed|arrangements?)\b|"
+    r"\b(?:offers?|proposals?|briefs?|quotes?|quotation|agreed?|confirmed|arrangements?)\b.{0,48}"
+    r"\b(?:videos?|content|posts?|lives?|livestreams?|streams?)\b", re.I,
+)
+_DELIVERY_REQUEST = re.compile(r"\b(?:can|could|would)\s+you\b|\bplease\b|\blet['’]s\b|请", re.I)
+_BUSINESS_FOLLOWUP = re.compile(r"\b(?:brief|quotation|quote|fees?|budget|dates?|schedule|deliverables?)\b|"
+                              r"报价|费用|档期|交付", re.I)
+_REFUSED_REPLY = re.compile(r"^\W*(?:no\s*,?\s*(?:thanks?\b|thank\s+you\b)|not\s+interested\b|"
+                           r"I\s*(?:am|'m|’m)?\s*not\s+interested\b|I\s+do\s+not\s+want\b|"
+                           r"I\s+don['’]t\s+want\b|不用了|不感兴趣|不想做)", re.I)
+_THANKS_ONLY = re.compile(r"\W*(?:(?:hi|hello|thanks?|thank\s+you|very\s+much|so\s+much|dear|xxx|xx)\W*)+",
+                         re.I)
+_AMOUNT = re.compile(r"[£€$]\s*\d+(?:[.,]\d+)*")
 
 
 def _linked_question(message, messages, chats):
@@ -249,6 +264,40 @@ def _effective_kind(kind, obj):
     return "interaction" if kind in _PRIMARY_KINDS and support else kind
 
 
+def _primary_source_kind(kind, cited):
+    """A primary needs a delivery proposal in its own refs, not a persuasive model object."""
+    # ponytail: Implicit or other-language proposals need reviewed source examples before extending these literal cues.
+    if kind not in _PRIMARY_KINDS:
+        return kind
+    cm = [m for m in cited if m["role"] == "cm"]
+    creator = [m for m in cited if m["role"] == "creator"]
+    texts = {m["ref"]: re.sub(r"[:;,]", " ", m.get("text", "")) for m in cited}
+    protected = {ref for ref, text in texts.items()
+                 if _CONCRETE_DELIVERY.search(text) or _SPECIFIC_VIDEO_PROMOTION.search(text)}
+    anchors = protected | {ref for ref, text in texts.items() if _CONTENT_PROPOSAL.search(text)
+        or _DELIVERY.search(text) and (_DELIVERY_REQUEST.search(text) or _OWN_DELIVERY.search(text))}
+    cm_anchors = {m["ref"] for m in cm} & anchors
+    if (_PLATFORM_BENEFIT.search(" ".join(texts.values()))
+            and any(_STRONG_PLATFORM_OPERATION.search(texts[m["ref"]]) for m in cm)
+            and not protected and not cm_anchors):
+        return "interaction" if creator and cm else "intent"
+    if kind == "progress":
+        return kind
+    supporting_cm = [m for m in cm if m["ref"] in anchors or
+        (not m.get("reply_to") or m["reply_to"] in anchors) and
+        (_ACCEPTED_REPLY.search(texts[m["ref"]]) or _BUSINESS_FOLLOWUP.search(texts[m["ref"]]))]
+    if not anchors or not supporting_cm:
+        return "intent"
+    cm_refs = {m["ref"] for m in supporting_cm}
+    if any(m.get("reply_to") and m["reply_to"] not in cm_refs for m in creator):
+        return "intent"
+    latest = max(creator, key=lambda m: _time(m["created_at"]), default=None)
+    if (latest is None or _REFUSED_REPLY.search(latest.get("text", ""))
+            or not any(m.get("text", "").strip() and not _THANKS_ONLY.fullmatch(m["text"]) for m in creator)):
+        return "intent"
+    return kind
+
+
 def validate(raw, pack, previous=()):
     """Validate shape/author/time; weak claims do not erase previously grounded facts."""
     if isinstance(raw, str):
@@ -293,6 +342,12 @@ def validate(raw, pack, previous=()):
             (_object(obj) + "\0" + min(refs)).encode()).hexdigest()[:20])
         roles = {message["role"] for message in cited}
         bilateral = {"creator", "cm"} <= roles
+        if kind in {"opportunity", "agreed", "ongoing"} and row["previous_key"] is None:
+            amounts = {re.sub(r"\s+", "", value) for value in _AMOUNT.findall(obj)}
+            source_amounts = {re.sub(r"\s+", "", value)
+                              for message in cited for value in _AMOUNT.findall(message.get("text", ""))}
+            if not amounts <= source_amounts:
+                kind, bilateral = "intent", False
         normalized.append({"key": key, "kind": kind, "object": obj, "refs": refs,
                            "occurred_at": at.isoformat(), "business_dates": sorted({
                                _time(message["created_at"]).astimezone(LONDON).date().isoformat()
@@ -303,6 +358,11 @@ def validate(raw, pack, previous=()):
     for fact in normalized:
         roles = {messages[ref]["role"] for ref in fact["refs"]}
         bilateral = {"creator", "cm"} <= roles
+        source_kind = _primary_source_kind(fact["kind"], [messages[ref] for ref in fact["refs"]])
+        if source_kind != fact["kind"]:
+            fact["kind"] = source_kind
+            if source_kind == "intent":
+                fact["business_dates"] = []
         effective = _effective_kind(fact["kind"], fact["object"])
         if effective != fact["kind"]:
             fact["kind"] = "interaction" if bilateral else "intent"
