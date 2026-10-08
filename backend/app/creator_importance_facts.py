@@ -10,8 +10,8 @@ from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 
-PROMPT_VERSION = "creator-importance-facts-v1.0.1"
-RULE_VERSION = "creator-importance-v1.0"
+PROMPT_VERSION = "creator-importance-facts-v1.0.2"
+RULE_VERSION = "creator-importance-v1.0.1"
 MAX_FACTS, MAX_REFS = 12, 8
 KINDS = ("intent", "agreed", "ongoing", "completed", "cancelled", "progress", "uncertain")
 _ORDER = {kind: index for index, kind in enumerate(KINDS)}
@@ -31,9 +31,83 @@ _FINISHED_REPLY = re.compile(
     r"it(?:['’]s| is)\s+(?:done|up|finished)|发布了|已经发了|完成了|发好了|做完了|是的|对)", re.I,
 )
 _THIRD_DELIVERY = re.compile(
-    r"\b(?:my|our)\s+(?:friend|colleague)\b|\b(?:his|her|their)\s+(?:video|live|stream|campaign)\b|"
-    r"朋友|同事|他的视频|她的视频|他们的直播", re.I,
+    r"\b(?:my|our)\s+(?:friend|colleague|assistant|partner)\b|"
+    r"\b(?:his|her|their)\s+(?:video|live|stream|campaign)\b|"
+    r"朋友|同事|助理|他的视频|她的视频|他们的直播", re.I,
 )
+_DELIVERY_ACTION = (
+    r"(?:go\s+live\b(?!\s+exclusiv)|be\s+live\b(?!\s+exclusiv)|"
+    r"(?:host|do|run|film|shoot|post|publish|upload|make|produce|deliver)\b"
+    r"(?:\s+[\w’'-]+){0,5}\s+(?:lives?\b(?!\s+exclusiv)|streams?\b|videos?\b|content\b)|"
+    r"(?:开播|直播|拍摄视频|发布视频|制作视频|发布内容))"
+)
+_DELIVERY = re.compile(_DELIVERY_ACTION, re.I)
+_OWN_DELIVERY = re.compile(
+    r"(?:\b(?:I|we)(?:['’]ll|\s+(?:will|am\s+going\s+to|are\s+going\s+to))?\s+"
+    r"(?:(?:also|definitely|certainly|still)\s+){0,2}|"
+    r"我(?:们)?(?:会|将|确认|每天|每日|每周|每月|每晚|定期|固定|再次){0,2})"
+    + _DELIVERY_ACTION, re.I,
+)
+_REPEATED_DELIVERY = re.compile(
+    r"\b(?:daily|weekly|monthly|regular|repeated|multiple|two|three|four|[2-9]\d*)\s+"
+    r"(?:\w+\s+){0,2}(?:lives?|streams?|videos?|content)\b|"
+    r"\b(?:lives?|streams?|videos?|content)(?:\s+(?:on|with|for)\s+\w+)?\s+"
+    r"(?:again|(?:every|each)\s+(?:day|week|month|night|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday))\b|"
+    r"(?:每天|每日|每周|每月|每晚|定期|固定|再次|多场|两场|三场).{0,8}(?:直播|开播|视频|内容)|"
+    r"(?:直播|开播|视频|内容).{0,8}(?:每天|每日|每周|每月|每晚|定期|固定|再次|多场|两场|三场)", re.I,
+)
+_NO_DELIVERY = re.compile(
+    r"\b(?:no|not|never|cannot|can't|won't|wouldn't|couldn't|might|maybe|if)\b|"
+    r"不能|不会|不做|不播|不发|没法|不确定|如果|可能", re.I,
+)
+_ACCEPTED_REPLY = re.compile(r"^\W*(?:yes\b|yep\b|sure\b|agreed\b|confirmed\b|sounds\s+good\b|"
+                             r"ok(?:ay)?\b|确认|同意|好的|可以|是的)", re.I)
+
+
+def _linked_question(message, messages, chats):
+    question = messages.get(message.get("reply_to"))
+    if not message.get("reply_to") and chats.get(message.get("chat_id"), {}).get("private"):
+        earlier = [m for m in messages.values() if m.get("chat_id") == message.get("chat_id")
+                   and _time(m["created_at"]) < _time(message["created_at"])]
+        previous = max(earlier, key=lambda m: _time(m["created_at"]), default=None)
+        if previous and _time(message["created_at"]) - _time(previous["created_at"]) <= timedelta(minutes=30):
+            question = previous
+    return question
+
+
+def _ongoing_kind(cited, messages, chats):
+    """A recurring price benefit is not a creator's recurring delivery commitment."""
+    refs, single = {m["ref"] for m in cited}, False
+    for message in cited:
+        if message["role"] != "creator":
+            continue
+        body = message.get("text", "")
+        parts = re.split(r"(?<=[.!?;。！？；])|\n", body)
+        for part in parts:
+            if (_NO_DELIVERY.search(part) or _THIRD_DELIVERY.search(part)
+                    or "?" in part or "？" in part
+                    or re.match(r"\W*(?:can|could|would|will|shall|should|do|did|am|are)\s+(?:I|we)\b", part, re.I)):
+                continue
+            for own in _OWN_DELIVERY.finditer(part):
+                single = True
+                if any(repeat.start() < own.end() and repeat.end() > own.start()
+                       for repeat in _REPEATED_DELIVERY.finditer(part)):
+                    return "ongoing"
+        question = _linked_question(message, messages, chats)
+        answer = next((part for part in parts if part.strip()), "")
+        if (not question or question["ref"] not in refs or question["role"] != "cm"
+                or not _ACCEPTED_REPLY.search(answer) or _NO_DELIVERY.search(body)
+                or _THIRD_DELIVERY.search(body) or "?" in answer or "？" in answer):
+            continue
+        for part in re.split(r"[\n.!?;。！？；]", question.get("text", "")):
+            if _NO_DELIVERY.search(part) or _THIRD_DELIVERY.search(part):
+                continue
+            for delivery in _DELIVERY.finditer(part):
+                single = True
+                if any(repeat.start() < delivery.end() and repeat.end() > delivery.start()
+                       for repeat in _REPEATED_DELIVERY.finditer(part)):
+                    return "ongoing"
+    return "agreed" if single else "intent"
 
 
 def _completion_evidence(cited, messages, chats):
@@ -47,13 +121,7 @@ def _completion_evidence(cited, messages, chats):
         if any(_COMPLETION.search(part) and not _NOT_FINISHED.search(part)
                and not _THIRD_DELIVERY.search(part) for part in clauses):
             return True
-        question = messages.get(message.get("reply_to"))
-        if not message.get("reply_to") and chats.get(message.get("chat_id"), {}).get("private"):
-            earlier = [m for m in messages.values() if m.get("chat_id") == message.get("chat_id")
-                       and _time(m["created_at"]) < _time(message["created_at"])]
-            previous = max(earlier, key=lambda m: _time(m["created_at"]), default=None)
-            if previous and _time(message["created_at"]) - _time(previous["created_at"]) <= timedelta(minutes=30):
-                question = previous
+        question = _linked_question(message, messages, chats)
         if (question and question["ref"] in refs and question["role"] == "cm"
                 and _FINISHED_REPLY.search(body) and not _NOT_FINISHED.search(body)
                 and not _THIRD_DELIVERY.search(body)
@@ -152,6 +220,8 @@ def validate(raw, pack, previous=()):
         roles = {messages[ref]["role"] for ref in fact["refs"]}
         if fact["kind"] in {"agreed", "ongoing"} and not {"creator", "cm"} <= roles:
             fact["kind"] = "intent"
+        elif fact["kind"] == "ongoing":
+            fact["kind"] = _ongoing_kind([messages[ref] for ref in fact["refs"]], messages, pack.get("chats", {}))
     all_facts = [*previous, *normalized]
     for fact in normalized:
         cited = [messages[ref] for ref in fact["refs"]]

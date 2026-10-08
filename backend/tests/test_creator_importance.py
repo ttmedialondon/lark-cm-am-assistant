@@ -92,6 +92,47 @@ def test_fact_protocol_rejects_unknown_and_third_party_evidence():
     assert facts.rank([])["tier"] == "pending"
 
 
+def test_ongoing_needs_this_creators_recurring_delivery_not_recurring_subsidies():
+    cases = [
+        ("I've activated DJI subsidy and links.",
+         "Did we find out if we could get live exclusives on all DJI products?", "intent"),
+        ("I've activated DJI subsidy and links.",
+         "Would I be able to get live exclusive on all DJI products?", "intent"),
+        ("We can arrange flash sales everyday for Roborock.",
+         "I’ll be live with it tonight see how we go", "agreed"),
+        ("We can arrange flash sales everyday.",
+         "I'll be live tonight; flash sales everyday would help.", "agreed"),
+        ("Acme weekly lives are agreed.", "I will do our weekly lives", "ongoing"),
+        ("Acme weekly lives are agreed.", "I'll host the Acme live every week.", "ongoing"),
+        ("Acme weekly lives are agreed.", "I host the Acme live every week.", "ongoing"),
+        ("Acme weekly lives are agreed.", "I go live every Friday.", "ongoing"),
+        ("Acme weekly lives are agreed.", "我每周直播两场。", "ongoing"),
+        ("Acme weekly lives are agreed.", "I will do weekly lives. Is that okay?", "ongoing"),
+        ("Acme weekly lives are agreed.", "My assistant will host the Acme live every week.", "intent"),
+        ("Acme weekly lives are agreed.", "I will ask my assistant to host the Acme live every week.", "intent"),
+        ("Acme weekly lives are agreed.", "I will not host the Acme live every week.", "intent"),
+        ("Acme weekly lives are agreed.", "Will I host the Acme live every week?", "intent"),
+        ("Acme weekly lives are agreed.", "Would I host the Acme live every week", "intent"),
+    ]
+    for cm, creator, expected in cases:
+        pack = _pack(("cm", cm), ("creator", creator))
+        result = facts.validate({"facts": [_fact("ongoing", ["E0", "E1"])]}, pack)
+        assert result[0]["kind"] == expected, creator
+        assert facts.rank(result)["tier"] == {"ongoing": "focus", "agreed": "normal", "intent": "pending"}[expected]
+
+    pack = _pack(("cm", "Please host the Acme live every week."), ("creator", "Yes, agreed."))
+    pack["chats"] = {"c1": {"private": True}}
+    pack["messages"][1]["created_at"] = "2026-08-01T10:01:00+00:00"
+    assert facts.validate({"facts": [_fact("ongoing", ["E0", "E1"])]}, pack)[0]["kind"] == "ongoing"
+    assert facts.validate({"facts": [_fact("ongoing", ["E1"])]}, pack)[0]["kind"] == "intent"
+    pack["chats"]["c1"]["private"] = False
+    assert facts.validate({"facts": [_fact("ongoing", ["E0", "E1"])]}, pack)[0]["kind"] == "intent"
+    pack["messages"][1]["reply_to"] = "E0"
+    assert facts.validate({"facts": [_fact("ongoing", ["E0", "E1"])]}, pack)[0]["kind"] == "ongoing"
+    pack["messages"][0]["text"] = "We'll arrange flash sales everyday for Acme."
+    assert facts.validate({"facts": [_fact("ongoing", ["E0", "E1"])]}, pack)[0]["kind"] == "intent"
+
+
 def test_completion_needs_positive_execution_and_accepts_linked_natural_answers():
     pack = _pack(("cm", "Acme autumn skincare video on Friday is agreed."),
                  ("creator", "Confirmed, I agree."), ("creator", "I'm happy."),
