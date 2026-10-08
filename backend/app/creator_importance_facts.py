@@ -12,12 +12,58 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PROMPT_VERSION = "creator-importance-facts-v2.0.2"
-RULE_VERSION = "creator-importance-v2.0"
+RULE_VERSION = "creator-importance-v2.0.1"
 MAX_FACTS, MAX_REFS = 12, 8
 KINDS = ("intent", "opportunity", "agreed", "ongoing", "completed", "progress", "interaction",
          "cancelled", "uncertain")
 _ORDER = {kind: index for index, kind in enumerate(KINDS)}
 LONDON = ZoneInfo("Europe/London")
+_PRIMARY_KINDS = frozenset({"opportunity", "agreed", "ongoing", "progress"})
+_PLATFORM_BENEFIT = re.compile(
+    r"\b(?:platform\s+(?:benefits?|eligibility|incentives?|subsid(?:y|ies)|vouchers?)|"
+    r"subsid(?:y|ies)|vouchers?|coupons?|flash[- ]sales?|(?:live|livestream)[- ]exclusive(?:s)?|"
+    r"exclusive\s+(?:prices?|pricing|rates?|discounts?|benefits?)|commission(?:\s+(?:rates?|links?))?)\b|"
+    r"平台(?:权益|资格|补贴)|补贴|优惠券|闪购|专属价|佣金", re.I,
+)
+_PLATFORM_OPERATION = re.compile(
+    r"\b(?:activat(?:e|ed|ing|ion)|appl(?:y|ied|ying|ication)|eligib(?:le|ility)|support|benefits?|"
+    r"platform|enable(?:d|ment)?|valid(?:ity)?|available|availability|"
+    r"contact(?:ing|ed)?\s+(?:the\s+)?platform|links?|prices?|pricing|rates?)\b|"
+    r"申请|激活|开通|资格|支持|权益|平台|联系|可用|有效|链接|价格", re.I,
+)
+_CONCRETE_DELIVERY = re.compile(
+    r"\b(?:paid|sponsored)\b(?:\s+[\w'’-]+){0,3}\s+"
+    r"(?:videos?|content|posts?|lives?|livestreams?|streams?|campaigns?|deliverables?)\b|"
+    r"\bnew\b(?:\s+[\w'’-]+){0,3}\s+(?:videos?|content|posts?|lives?|livestreams?|streams?)\b"
+    r".{0,24}\b(?:deliverables?|brief|fees?|quotes?|quotation|scope|deadline|post|publish|film|produce|create)\b|"
+    r"(?:£|€|\$)\s*\d+(?:[.,]\d+)?[^\n]{0,24}\b"
+    r"(?:videos?|content|posts?|lives?|livestreams?|streams?|campaigns?|deliverables?)\b|"
+    r"\b(?:videos?|content|posts?|lives?|livestreams?|streams?|campaigns?|deliverables?)\b"
+    r"[^\n]{0,24}(?:£|€|\$)\s*\d+(?:[.,]\d+)?|"
+    r"(?:付费|新一轮).{0,12}(?:视频|内容|直播|活动|交付)|"
+    r"(?:视频|内容|直播|活动).{0,12}(?:报价|费用|交付|范围|截止)", re.I,
+)
+_SCHEDULED_DELIVERY = re.compile(
+    r"\b(?:for|due|scheduled\s+for|delivery\s+for)\s+"
+    r"(?:today|tonight|tomorrow|this\s+(?:morning|afternoon|evening|weekend))\b.{0,12}"
+    r"\b(?:videos?|content|posts?|lives?|livestreams?|streams?)\b|"
+    r"\b(?:videos?|content|posts?|lives?|livestreams?|streams?)\b.{0,12}"
+    r"\b(?:due|scheduled|confirmed)\s+(?:for\s+)?"
+    r"(?:today|tonight|tomorrow|this\s+(?:morning|afternoon|evening|weekend))\b|"
+    r"(?:安排|确认|交付).{0,8}(?:今天|今晚|明天|今早|本周末).{0,8}(?:视频|内容|直播|活动)|"
+    r"(?:视频|内容|直播|活动).{0,8}(?:安排|确认|交付).{0,8}(?:今天|今晚|明天|今早|本周末)", re.I,
+)
+_STRONG_PLATFORM_OPERATION = re.compile(
+    r"\b(?:activat(?:e|ed|ing|ion)|appl(?:y|ied|ying|ication)|eligib(?:le|ility)|"
+    r"contact(?:ing|ed)?\s+(?:the\s+)?platform|platform\s+(?:support|benefits?|eligibility))\b|"
+    r"申请|激活|开通|资格|联系平台|平台(?:支持|权益)", re.I,
+)
+_SPECIFIC_VIDEO_PROMOTION = re.compile(
+    r"\b(?:ad|spark)[- ]?codes?\b|\b(?:video|ad(?:vertising)?)\s+authorization\s+codes?\b|"
+    r"\b(?:videos?|posts?|content)\b.{0,32}\b(?:boost(?:ing|ed)?|paid\s+promotion)\b|"
+    r"\b(?:boost(?:ing|ed)?|paid\s+promotion)\b.{0,32}\b(?:videos?|posts?|content)\b|"
+    r"投流|广告码|视频授权码", re.I,
+)
 _COMPLETION = re.compile(
     r"\b(?:published|posted|uploaded|released|live\s+(?:finished|ended|done)|"
     r"(?:finished|completed|done)\b.{0,24}\b(?:lives?|streams?|videos?|campaigns?|content)|"
@@ -176,6 +222,15 @@ def _object(value):
     return " ".join(value.split()).casefold()
 
 
+def _effective_kind(kind, obj):
+    """Narrowly keep platform-benefit operations out of maintenance-primary lifecycle kinds."""
+    text = _object(obj)
+    protected = (_CONCRETE_DELIVERY.search(text) or _SPECIFIC_VIDEO_PROMOTION.search(text)
+                 or (_SCHEDULED_DELIVERY.search(text) and not _STRONG_PLATFORM_OPERATION.search(text)))
+    support = bool(_PLATFORM_BENEFIT.search(text) and _PLATFORM_OPERATION.search(text) and not protected)
+    return "interaction" if kind in _PRIMARY_KINDS and support else kind
+
+
 def validate(raw, pack, previous=()):
     """Validate shape/author/time; weak claims do not erase previously grounded facts."""
     if isinstance(raw, str):
@@ -229,9 +284,13 @@ def validate(raw, pack, previous=()):
     grounded = []
     for fact in normalized:
         roles = {messages[ref]["role"] for ref in fact["refs"]}
-        if fact["kind"] == "interaction" and not {"creator", "cm"} <= roles:
+        bilateral = {"creator", "cm"} <= roles
+        effective = _effective_kind(fact["kind"], fact["object"])
+        if effective != fact["kind"]:
+            fact["kind"] = "interaction" if bilateral else "intent"
+        elif fact["kind"] == "interaction" and not bilateral:
             continue
-        if fact["kind"] in {"opportunity", "agreed", "ongoing"} and not {"creator", "cm"} <= roles:
+        if fact["kind"] in {"opportunity", "agreed", "ongoing"} and not bilateral:
             fact["kind"] = "intent"
         elif fact["kind"] == "ongoing":
             fact["kind"] = _ongoing_kind([messages[ref] for ref in fact["refs"]], messages, pack.get("chats", {}))
@@ -240,22 +299,26 @@ def validate(raw, pack, previous=()):
     all_facts = [*previous, *normalized]
     for fact in normalized:
         cited = [messages[ref] for ref in fact["refs"]]
-        established = any(f["key"] == fact["key"] and f["kind"] in {"agreed", "ongoing"}
+        established = any(f["key"] == fact["key"]
+                          and _effective_kind(f["kind"], f["object"]) in {"agreed", "ongoing"}
                           and _time(f["occurred_at"]) <= _time(fact["occurred_at"])
                           for f in all_facts)
         progressable = any(f["key"] == fact["key"]
-                           and f["kind"] in {"opportunity", "agreed", "ongoing"}
+                           and _effective_kind(f["kind"], f["object"])
+                           in {"opportunity", "agreed", "ongoing"}
                            and _time(f["occurred_at"]) <= _time(fact["occurred_at"])
                            for f in all_facts)
         adverse = max((_time(f["occurred_at"]) for f in all_facts
                        if f["key"] == fact["key"] and f["kind"] in {"cancelled", "uncertain"}
                        and _time(f["occurred_at"]) <= _time(fact["occurred_at"])), default=None)
         if adverse is not None:
-            established = any(f["key"] == fact["key"] and f["kind"] in {"agreed", "ongoing"}
+            established = any(f["key"] == fact["key"]
+                              and _effective_kind(f["kind"], f["object"]) in {"agreed", "ongoing"}
                               and adverse < _time(f["occurred_at"]) <= _time(fact["occurred_at"])
                               for f in all_facts)
             progressable = any(f["key"] == fact["key"]
-                               and f["kind"] in {"opportunity", "agreed", "ongoing"}
+                               and _effective_kind(f["kind"], f["object"])
+                               in {"opportunity", "agreed", "ongoing"}
                                and adverse < _time(f["occurred_at"]) <= _time(fact["occurred_at"])
                                for f in all_facts)
         if fact["kind"] == "completed":
@@ -270,7 +333,8 @@ def prompt_previous(previous):
     """Compact model context, not storage: retain each object and necessary lifecycle anchors."""
     by_object = defaultdict(list)
     for fact in merge_facts((), previous):
-        by_object[fact["key"]].append(fact)
+        kind = _effective_kind(fact["kind"], fact["object"])
+        by_object[fact["key"]].append(fact if kind == fact["kind"] else {**fact, "kind": kind})
     output = []
     for events in by_object.values():
         selected = []
@@ -310,7 +374,7 @@ def rank(facts, now=None, *, readable=False):
         for event in events:
             if _time(event["occurred_at"]) > now:
                 continue
-            kind = event["kind"]
+            kind = _effective_kind(event["kind"], event["object"])
             if kind in {"intent", "opportunity", "agreed", "ongoing", "completed", "progress", "interaction"}:
                 if business_at is None or _time(event["occurred_at"]) > _time(business_at):
                     business_at = event["occurred_at"]
