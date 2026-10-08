@@ -83,7 +83,7 @@ def test_weak_claims_and_unrelated_cancellations_do_not_overwrite_valid_facts():
 
 def test_fact_protocol_rejects_unknown_and_third_party_evidence():
     assert facts.PROMPT_VERSION == "creator-importance-facts-v2.0.2"
-    assert facts.RULE_VERSION == "creator-importance-v2.0.1"
+    assert facts.RULE_VERSION == "creator-importance-v2.0.2"
     pack = _pack(("creator", "I'd like to hear about the Acme product."))
     with pytest.raises(ValueError, match="refs"):
         facts.validate({"facts": [_fact("intent", ["missing"])]}, pack)
@@ -326,6 +326,9 @@ def test_completion_needs_positive_execution_and_accepts_linked_natural_answers(
     pack["messages"][3]["text"] = "Will you publish the Acme video tomorrow?"
     planned = facts.validate({"facts": [_fact("completed", ["E3", "E4"], key=key)]}, pack, established)
     assert planned[0]["kind"] == "intent"
+    pack["messages"][3]["text"] = "Have you posted the Acme video, or will you publish it tomorrow?"
+    mixed_question = facts.validate({"facts": [_fact("completed", ["E3", "E4"], key=key)]}, pack, established)
+    assert mixed_question[0]["kind"] == "intent"
     pack["messages"][3]["text"] = "Have you published the Acme video?"
     pack["messages"][2]["text"] = "The Acme cooperation is cancelled."
     cancelled = facts.validate({"facts": [_fact("cancelled", ["E2"], key=key)]}, pack, established)
@@ -336,3 +339,62 @@ def test_completion_needs_positive_execution_and_accepts_linked_natural_answers(
     assert len(compact) <= 4 and all("refs" not in fact for fact in compact)
     assert {fact["kind"] for fact in compact} == {"agreed", "completed", "cancelled"}
     assert facts.rank(facts.merge_facts(established, [*cancelled, *yes]))["tier"] == "normal"
+
+    offer_pack = _pack(("cm", "Lilyeve paid collaboration: three product videos."),
+                       ("creator", "Please send the Lilyeve brief for the three videos."))
+    opportunity = facts.validate({"facts": [_fact(
+        "opportunity", ["E0", "E1"], obj="Lilyeve three paid product videos",
+    )]}, offer_pack)
+    opportunity_key = opportunity[0]["key"]
+    witness_pack = _pack(("creator", "I posted the three videos for lilyeve, this should validate the paid "
+                         "collaboration and I'm not stopping there."))
+    witness_pack["messages"][0]["created_at"] = "2026-08-03T10:00:00+00:00"
+    delivered = facts.validate({"facts": [_fact("completed", ["E0"], key=opportunity_key)]},
+                               witness_pack, opportunity)
+    assert delivered[0]["kind"] == "completed" and delivered[0]["key"] == opportunity_key
+    closed = facts.rank(facts.merge_facts(opportunity, delivered), datetime(2026, 8, 5, tzinfo=UTC))
+    assert closed["tier"] == "normal" and closed["priority"]["primary_at"] is None
+    assert closed["priority"]["historical"]
+    for text in (
+        "I posted the three videos for Lilyeve and I'm not stopping there.",
+        "I posted the three videos for Lilyeve, but I'm not stopping there.",
+    ):
+        witness_pack["messages"][0]["text"] = text
+        assert facts.validate({"facts": [_fact("completed", ["E0"], key=opportunity_key)]},
+                              witness_pack, opportunity)[0]["kind"] == "completed"
+    for text in (
+        "I have not posted the three videos for Lilyeve.",
+        "I haven’t posted the three videos for Lilyeve.",
+        "I have not completed the videos and content.",
+        "I will have posted the three videos for Lilyeve tomorrow.",
+        "I posted the three videos for Lilyeve? Not yet.",
+        "My friend posted her three videos for Lilyeve.",
+    ):
+        witness_pack["messages"][0]["text"] = text
+        assert facts.validate({"facts": [_fact("completed", ["E0"], key=opportunity_key)]},
+                              witness_pack, opportunity)[0]["kind"] == "intent", text
+
+    promotion_pack = _pack(("cm", "Can we boost your published Lilyeve video? Please send its ad code."),
+                           ("creator", "Yes, here is the ad code for that video."))
+    promotion = facts.validate({"facts": [_fact(
+        "opportunity", ["E0", "E1"], obj="Lilyeve video boost and ad-code authorization",
+    )]}, promotion_pack)
+    promotion_key = promotion[0]["key"]
+    for text in ("I posted the original Lilyeve video.", "Here is the ad code for that video."):
+        witness_pack["messages"][0]["text"] = text
+        assert facts.validate({"facts": [_fact("completed", ["E0"], key=promotion_key)]},
+                              witness_pack, promotion)[0]["kind"] == "intent"
+    witness_pack["messages"][0]["text"] = "The agreed Lilyeve paid promotion has finished."
+    promoted = facts.validate({"facts": [_fact("completed", ["E0"], key=promotion_key)]},
+                              witness_pack, promotion)
+    assert promoted[0]["kind"] == "completed"
+    promotion_question = _pack(("cm", "Have you published the original Lilyeve video?"),
+                               ("creator", "Yes, done."))
+    promotion_question["chats"] = {"c1": {"private": True}}
+    for index, message in enumerate(promotion_question["messages"]):
+        message["created_at"] = f"2026-08-03T10:0{index}:00+00:00"
+    for question, kind in (("Have you published the original Lilyeve video?", "intent"),
+                           ("Has the agreed Lilyeve paid promotion finished?", "completed")):
+        promotion_question["messages"][0]["text"] = question
+        assert facts.validate({"facts": [_fact("completed", ["E0", "E1"], key=promotion_key)]},
+                              promotion_question, promotion)[0]["kind"] == kind

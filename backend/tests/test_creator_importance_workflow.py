@@ -421,14 +421,25 @@ def test_paid_retry_cache_and_stale_results_keep_billing_without_repeat(pg, rank
     assert successful["input_tokens"] == 101 and successful["output_tokens"] == 23
     # Replay the same frozen, already-billed batch from before a crash: reuse encrypted cache, not the provider.
     calls = len(flow.calls)
+    checkpoint = importance._state(
+        pg.execute("SELECT * FROM creator_importance_jobs WHERE id=%s", (first["id"],)).fetchone(), flow.settings
+    )
+    checkpoint["facts"] = importance.facts.validate({"facts": [{
+        "kind": "intent", "object": "Old private-chat attribution", "previous_key": None,
+        "refs": [first["material"]["pack"]["messages"][0]["ref"]],
+    }]}, first["material"]["pack"])
     pg.execute(
-        """UPDATE creator_importance_jobs SET status='queued',checkpoint_ciphertext=NULL,
+        """UPDATE creator_importance_jobs SET status='queued',checkpoint_ciphertext=%s,
         cursor_time=NULL,cursor_chat_id=NULL,cursor_message_id=NULL,needs_history=TRUE,not_before=NOW()
         WHERE id=%s""",
-        (first["id"],),
+        (importance._cipher(flow.settings).encrypt(json.dumps(checkpoint)), first["id"]),
     )
     assert importance.prepare_next(flow.settings)
     assert len(flow.calls) == calls
+    restored = importance._state(
+        pg.execute("SELECT * FROM creator_importance_jobs WHERE id=%s", (first["id"],)).fetchone(), flow.settings
+    )
+    assert not restored["facts"]  # Old attribution cannot survive just because the original body is unchanged.
     assert pg.execute(
         "SELECT status FROM creator_importance_jobs WHERE id=%s", (first["id"],)
     ).fetchone()["status"] == "queued"  # A cache miss would prepare a paid 'ready' batch instead.

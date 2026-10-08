@@ -542,9 +542,9 @@ def prepare_next(settings):
     try:
         with connection() as conn, conn.transaction():
             conn.execute("SET LOCAL statement_timeout='90s'")
-            state = _prune(conn, _state(job, settings), job)
-            if not job["cursor_time"] and job["needs_history"]:
-                state["seen"] = {}
+            # A fresh snapshot must rebuild attribution, not carry facts from the old chat topology.
+            state = _state({"checkpoint_ciphertext": None}, settings) if job["needs_history"] \
+                and not job["cursor_time"] else _prune(conn, _state(job, settings), job)
             material = build_batch(conn, job, settings, state)
             if material["gap"]:
                 state["gaps"] += 1

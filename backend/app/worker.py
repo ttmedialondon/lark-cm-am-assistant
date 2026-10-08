@@ -1188,9 +1188,16 @@ def _discover_chats(
                         p2p_counterpart_type = COALESCE(
                             EXCLUDED.p2p_counterpart_type, authorization_chats.p2p_counterpart_type
                         ),
-                        p2p_counterpart_open_id = EXCLUDED.p2p_counterpart_open_id,
+                        -- Keep the current user FK until the identity row exists below.  An
+                        -- explicit non-user target is a real removal, not missing metadata.
+                        p2p_counterpart_open_id = CASE
+                            WHEN EXCLUDED.p2p_counterpart_type IS NOT NULL
+                              AND EXCLUDED.p2p_counterpart_type <> 'user' THEN NULL
+                            ELSE authorization_chats.p2p_counterpart_open_id
+                        END,
                         p2p_counterpart_seen_at = CASE
-                            WHEN EXCLUDED.p2p_counterpart_type = 'bot' THEN NULL
+                            WHEN EXCLUDED.p2p_counterpart_type IS NOT NULL
+                              AND EXCLUDED.p2p_counterpart_type <> 'user' THEN NULL
                             ELSE authorization_chats.p2p_counterpart_seen_at
                         END
                     """,

@@ -149,6 +149,14 @@ def test_p2p_contact_discovery_skips_bots(pg, monkeypatch) -> None:
                VALUES(%s,%s,'incremental','running','running',1)""",
         (job.id, job.authorization_id),
     )
+    pg.execute("CREATE TEMP TABLE p2p_open_id_changes(old_id TEXT,new_id TEXT)")
+    pg.execute("""CREATE FUNCTION pg_temp.capture_p2p_open_id_change() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN INSERT INTO p2p_open_id_changes VALUES(OLD.p2p_counterpart_open_id,NEW.p2p_counterpart_open_id);
+        RETURN NEW; END $$""")
+    pg.execute("""CREATE TRIGGER capture_p2p_open_id_change AFTER UPDATE OF p2p_counterpart_open_id
+        ON authorization_chats FOR EACH ROW
+        WHEN(OLD.p2p_counterpart_open_id IS DISTINCT FROM NEW.p2p_counterpart_open_id)
+        EXECUTE FUNCTION pg_temp.capture_p2p_open_id_change()""")
 
     class Client:
         target_id, target_type = "ou_person", "user"
@@ -164,7 +172,7 @@ def test_p2p_contact_discovery_skips_bots(pg, monkeypatch) -> None:
     client = Client()
     assert pg.execute("SELECT 1 FROM lark_identities WHERE open_id='ou_person'").fetchone() is None
     contact_id = None
-    for _ in range(2):
+    for attempt in range(2):
         assert worker._discover_chats(
             job, {"id": job.authorization_id}, "test", client, SimpleNamespace(), chat_type="p2p",
         ) == 2
@@ -185,11 +193,27 @@ def test_p2p_contact_discovery_skips_bots(pg, monkeypatch) -> None:
         contact_id = rows[1]["contact_id"]
         assert pg.execute("SELECT COUNT(*) AS count FROM contacts").fetchone()["count"] == 1
         assert pg.execute("SELECT 1 FROM lark_identities WHERE open_id='cli_bot'").fetchone() is None
+        if attempt == 0:
+            pg.execute("DELETE FROM p2p_open_id_changes")
+        else:
+            assert pg.execute("SELECT old_id,new_id FROM p2p_open_id_changes").fetchall() == []
+
+    client.target_id = "ou_other_person"
+    worker._discover_chats(
+        job, {"id": job.authorization_id}, "test", client, SimpleNamespace(), chat_type="p2p",
+    )
+    assert pg.execute("SELECT old_id,new_id FROM p2p_open_id_changes").fetchall() == [
+        {"old_id": "ou_person", "new_id": "ou_other_person"}
+    ]
+    pg.execute("DELETE FROM p2p_open_id_changes")
 
     client.target_id, client.target_type = "cli_bot", "bot"
     worker._discover_chats(
         job, {"id": job.authorization_id}, "test", client, SimpleNamespace(), chat_type="p2p",
     )
+    assert pg.execute("SELECT old_id,new_id FROM p2p_open_id_changes").fetchall() == [
+        {"old_id": "ou_other_person", "new_id": None}
+    ]
     assert pg.execute(
         "SELECT p2p_counterpart_open_id,p2p_counterpart_seen_at FROM authorization_chats WHERE chat_id='oc_person'",
     ).fetchone() == {"p2p_counterpart_open_id": None, "p2p_counterpart_seen_at": None}

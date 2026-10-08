@@ -12,7 +12,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PROMPT_VERSION = "creator-importance-facts-v2.0.2"
-RULE_VERSION = "creator-importance-v2.0.1"
+RULE_VERSION = "creator-importance-v2.0.2"
 MAX_FACTS, MAX_REFS = 12, 8
 KINDS = ("intent", "opportunity", "agreed", "ongoing", "completed", "progress", "interaction",
          "cancelled", "uncertain")
@@ -71,6 +71,14 @@ _COMPLETION = re.compile(
     r"(?:done|over|ended|finished|completed?|up))\b|"
     r"(?:直播|视频|内容|活动).{0,12}(?:结束|完成|发布|发出)|已发布|发了(?:视频|作品)|"
     r"(?:直播|视频|内容|活动)已完成", re.I,
+)
+_PROMOTION_COMPLETION = re.compile(
+    r"\b(?:boost(?:ing)?|(?:paid\s+)?promotion|ad(?:vertising)?\s+campaign)\b.{0,24}"
+    r"\b(?:completed?|done|over|ended|finished|ran)\b|"
+    r"\b(?:completed?|finished|ran)\b.{0,24}"
+    r"\b(?:boost(?:ing)?|(?:paid\s+)?promotion|ad(?:vertising)?\s+campaign)\b|"
+    r"(?:投流|推广|广告活动).{0,12}(?:已完成|已结束|已执行)|"
+    r"(?:完成|结束|执行了).{0,12}(?:投流|推广|广告活动)", re.I,
 )
 _NOT_FINISHED = re.compile(
     r"\b(?:not|haven['’]?t|hasn['’]?t|didn['’]?t|will|tomorrow|planning\s+to|going\s+to|need\s+to)\b|"
@@ -161,23 +169,33 @@ def _ongoing_kind(cited, messages, chats):
     return "agreed" if single else "intent"
 
 
-def _completion_evidence(cited, messages, chats):
+def _completed_action(body, pattern, *, question=False):
+    for part in re.split(r"(?<=[.!?;。！？；])|\n", body):
+        if _THIRD_DELIVERY.search(part) or not question and ("?" in part or "？" in part):
+            continue
+        for match in pattern.finditer(part):
+            action = re.split(r"[,，]|\b(?:and|but)\b|但是|但", part[:match.start()], flags=re.I)[-1] + match.group()
+            if not _NOT_FINISHED.search(action):
+                return True
+    return False
+
+
+def _completion_evidence(cited, messages, chats, obj):
     """Require a positive execution witness, including an explicit completed-action Q&A."""
+    pattern = _PROMOTION_COMPLETION if _SPECIFIC_VIDEO_PROMOTION.search(obj) else _COMPLETION
     refs = {m["ref"] for m in cited}
     for message in cited:
         if message["role"] != "creator":
             continue
         body = message.get("text", "")
-        clauses = re.split(r"[\n.!?;。！？；]", body)
-        if any(_COMPLETION.search(part) and not _NOT_FINISHED.search(part)
-               and not _THIRD_DELIVERY.search(part) for part in clauses):
+        if _completed_action(body, pattern):
             return True
         question = _linked_question(message, messages, chats)
         if (question and question["ref"] in refs and question["role"] == "cm"
                 and _FINISHED_REPLY.search(body) and not _NOT_FINISHED.search(body)
                 and not _THIRD_DELIVERY.search(body)
-                and _COMPLETION.search(question.get("text", ""))
-                and not _NOT_FINISHED.search(question.get("text", ""))):
+                and not _NOT_FINISHED.search(question.get("text", ""))
+                and _completed_action(question.get("text", ""), pattern, question=True)):
             return True
     return False
 
@@ -299,10 +317,6 @@ def validate(raw, pack, previous=()):
     all_facts = [*previous, *normalized]
     for fact in normalized:
         cited = [messages[ref] for ref in fact["refs"]]
-        established = any(f["key"] == fact["key"]
-                          and _effective_kind(f["kind"], f["object"]) in {"agreed", "ongoing"}
-                          and _time(f["occurred_at"]) <= _time(fact["occurred_at"])
-                          for f in all_facts)
         progressable = any(f["key"] == fact["key"]
                            and _effective_kind(f["kind"], f["object"])
                            in {"opportunity", "agreed", "ongoing"}
@@ -312,17 +326,13 @@ def validate(raw, pack, previous=()):
                        if f["key"] == fact["key"] and f["kind"] in {"cancelled", "uncertain"}
                        and _time(f["occurred_at"]) <= _time(fact["occurred_at"])), default=None)
         if adverse is not None:
-            established = any(f["key"] == fact["key"]
-                              and _effective_kind(f["kind"], f["object"]) in {"agreed", "ongoing"}
-                              and adverse < _time(f["occurred_at"]) <= _time(fact["occurred_at"])
-                              for f in all_facts)
             progressable = any(f["key"] == fact["key"]
                                and _effective_kind(f["kind"], f["object"])
                                in {"opportunity", "agreed", "ongoing"}
                                and adverse < _time(f["occurred_at"]) <= _time(fact["occurred_at"])
                                for f in all_facts)
         if fact["kind"] == "completed":
-            if not established or not _completion_evidence(cited, messages, pack.get("chats", {})):
+            if not progressable or not _completion_evidence(cited, messages, pack.get("chats", {}), fact["object"]):
                 fact["kind"] = "intent"
         elif fact["kind"] == "progress" and not progressable:
             fact["kind"] = "intent"
