@@ -12,7 +12,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PROMPT_VERSION = "creator-importance-facts-v2.0.2"
-RULE_VERSION = "creator-importance-v2.0.2"
+RULE_VERSION = "creator-importance-v2.0.3"
 MAX_FACTS, MAX_REFS = 12, 8
 KINDS = ("intent", "opportunity", "agreed", "ongoing", "completed", "progress", "interaction",
          "cancelled", "uncertain")
@@ -458,8 +458,9 @@ def rank(facts, now=None, *, readable=False):
     if tier == "focus":
         lead = selected[0]
         grounds = [f"{lead['object'][:48]}：{lead['label']}"]
-        latest = _time(business_at).astimezone(LONDON).strftime("%m-%d")
-        grounds.append(f"近30天业务交流{len(recent_business_dates)}天 · 最近业务消息{latest}")
+        latest = max((at for at in (progress_at, primary_at) if at), key=_time)
+        latest = _time(latest).astimezone(LONDON).strftime("%m-%d")
+        grounds.append(f"近30天业务交流{len(recent_business_dates)}天 · 最近推进{latest}")
     elif tier == "normal":
         grounds = ["近期无重点事项"] + (["已有历史合作记录"] if historical else [])
     else:

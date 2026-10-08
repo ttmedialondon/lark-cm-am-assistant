@@ -174,8 +174,8 @@ If there are no reliable new facts, return {"facts":[]}.
 - 按每个业务对象的原消息时间推进状态。取消或真实冲突只影响对应对象；空增量不删除既有事实。新协议通过的再次成立可重新启动已取消对象。
 - 同一次合作不计次数，不按消息、群、handle 数量累积分数。interaction 的频率由服务端按引用原文的不同 London 日期去重，只作同档排序辅助，不能把常规升为重点。
 - `rank` 输出无正文的 `priority={primary_at,business_at,business_days,historical}`。`primary_at` 保留当前 active primary 的原消息时间，不提前截掉 30 天，由读取 SQL 动态判断；completed/cancelled/uncertain 会清掉该对象的 active primary。`business_at` 是最近有效业务信号，`business_days` 是双边引用日期，`historical` 仅作最后平手项。
-- 用户可见依据最多两条：重点展示一条具体 primary，再展示“近30天业务交流 N 天 · 最近业务消息 MM-DD”；常规只显示“近期无重点事项”，有历史成立／交付时再显示“已有历史合作记录”。最近业务消息可以是一般业务互动，不冒充最近合作实质推进。过期事项不再显示成当前“交付安排”。未来时间不参与当前档位、依据或 priority 元数据。
-- 排序不使用综合分：档位 → 7 天／30 天时效带 → 近 30 天业务日期数 → 最近业务原文时间 → 历史合作背景 → 姓名和稳定人员 ID。旧合作背景不能永久排在近期机会前面。
+- 用户可见依据最多两条：重点展示一条具体 primary，再展示“近30天业务交流 N 天 · 最近推进 MM-DD”；常规只显示“近期无重点事项”，有历史成立／交付时再显示“已有历史合作记录”。推进时间取成立／持续／完成／实质推进与当前具体机会的最新原消息时间；一般 interaction 或单向 intent 不刷新它。过期事项不再显示成当前“交付安排”。未来时间不参与当前档位、依据或 priority 元数据。
+- 排序不使用综合分：档位 → 最近推进的 7 天／30 天时效带 → 近 30 天业务日期数 → 最近推进原文时间 → 历史合作背景 → 姓名和稳定人员 ID。旧合作背景不能永久排在近期机会前面。服务端规则 v2.0.3 复用已保存的实质推进与 active primary，不新增模型调用、字段或历史重建。
 - 每个达人与 CM 独立评估。人工档位由存储模块优先保留；紧急事件仍沿用现有 P0–P3。
 
 接口为 `output_format(refs, previous)`、`validate(raw, pack, previous)`、`merge_facts(previous, incoming)` 和 `rank(facts, now, readable=...)`。事实规范字段为 `key/kind/object/refs/occurred_at/business_dates`；时间和业务日期来自引用原消息，不是模型输出。`rank` 保留 `tier/phase/last_progress_at/grounds/needs_update`，依据最多两条，并返回上述 priority 元数据。

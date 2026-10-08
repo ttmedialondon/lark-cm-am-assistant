@@ -83,7 +83,7 @@ def test_weak_claims_and_unrelated_cancellations_do_not_overwrite_valid_facts():
 
 def test_fact_protocol_rejects_unknown_and_third_party_evidence():
     assert facts.PROMPT_VERSION == "creator-importance-facts-v2.0.2"
-    assert facts.RULE_VERSION == "creator-importance-v2.0.2"
+    assert facts.RULE_VERSION == "creator-importance-v2.0.3"
     pack = _pack(("creator", "I'd like to hear about the Acme product."))
     with pytest.raises(ValueError, match="refs"):
         facts.validate({"facts": [_fact("intent", ["missing"])]}, pack)
@@ -116,7 +116,7 @@ def test_current_opportunity_and_bilateral_business_days_drive_maintenance_not_v
     }
     assert ranked["grounds"] == [
         "Acme autumn skincare video：具体机会",
-        "近30天业务交流2天 · 最近业务消息08-02",
+        "近30天业务交流2天 · 最近推进08-02",
     ]
 
     later = datetime(2026, 9, 10, 12, tzinfo=UTC)
@@ -161,6 +161,8 @@ def test_current_opportunity_and_bilateral_business_days_drive_maintenance_not_v
     assert support["tier"] == "normal" and support["recent_business_dates"] == ["2026-08-03", "2026-08-04"]
     assert support["priority"]["primary_at"] is None  # Frequent support is not an opportunity score.
     assert support["grounds"] == ["近期无重点事项"]
+    with_support = facts.rank(facts.merge_facts(opportunity, interaction), datetime(2026, 8, 5, tzinfo=UTC))
+    assert with_support["grounds"][1] == "近30天业务交流4天 · 最近推进08-02"
 
     one_sided = _pack(("cm", "A one-way Acme campaign announcement."))
     downgraded = facts.validate({"facts": [_fact("opportunity", ["E0"])]}, one_sided)

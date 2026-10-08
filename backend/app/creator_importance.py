@@ -86,14 +86,14 @@ def roster_sql(cm_id):
           FROM jsonb_array_elements_text(COALESCE(p.coverage->'priority'->'business_days','[]'::jsonb)) day
           WHERE day::date BETWEEN (NOW() AT TIME ZONE 'Europe/London')::date-29
             AND (NOW() AT TIME ZONE 'Europe/London')::date) ELSE 0 END business_days,
-        CASE WHEN v.valid THEN s.business_at END last_substantive_progress_at,
+        CASE WHEN v.valid THEN s.signal_at END last_substantive_progress_at,
         v.valid AND COALESCE((p.coverage->'priority'->>'historical')::boolean,FALSE) has_history
         FROM creator_importance_profiles p
         CROSS JOIN LATERAL(SELECT (""" + _PROFILE_VALID + """) valid) v
         CROSS JOIN LATERAL(SELECT
-          (p.coverage->'priority'->>'primary_at')::timestamptz primary_at,
-          (p.coverage->'priority'->>'business_at')::timestamptz business_at) times
-        CROSS JOIN LATERAL(SELECT times.*,times.business_at signal_at) s
+          (p.coverage->'priority'->>'primary_at')::timestamptz primary_at) times
+        CROSS JOIN LATERAL(SELECT times.*,
+          GREATEST(p.last_substantive_progress_at,times.primary_at) signal_at) s
         WHERE p.contact_id=c.id AND p.responsible_authorization_id=%s
         AND creator_importance_is_eligible(p.contact_id,p.responsible_authorization_id)
       ) ip ON TRUE """

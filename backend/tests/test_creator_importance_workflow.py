@@ -264,21 +264,34 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
     pg.execute("SAVEPOINT current_priority_metadata")
     today = flow.now.astimezone(importance.LONDON).date().isoformat()
     yesterday = (flow.now.astimezone(importance.LONDON).date() - timedelta(days=1)).isoformat()
-    pg.execute("UPDATE creator_importance_profiles SET coverage=jsonb_set(coverage,'{priority}',%s::jsonb) "
-               "WHERE responsible_authorization_id=%s", (json.dumps({
+    pg.execute("UPDATE creator_importance_profiles SET last_substantive_progress_at=%s,"
+               "coverage=jsonb_set(coverage,'{priority}',%s::jsonb) "
+               "WHERE responsible_authorization_id=%s", (flow.now - timedelta(days=35), json.dumps({
                    "primary_at": (flow.now - timedelta(days=35)).isoformat(),
                    "business_at": (flow.now - timedelta(minutes=2)).isoformat(),
                    "business_days": [today, today, yesterday, "2020-01-01"], "historical": True,
                }), flow.other))
-    assert pg.execute("SELECT ip.effective_tier,ip.recency_rank,ip.business_days,ip.has_history "
+    assert pg.execute("SELECT ip.effective_tier,ip.recency_rank,ip.business_days,ip.has_history,"
+                      "ip.last_substantive_progress_at "
                       "FROM contacts c" + join + " WHERE c.id=%s", [*args, flow.person]).fetchone() == {
-                          "effective_tier": "normal", "recency_rank": 0, "business_days": 2, "has_history": True,
+                          "effective_tier": "normal", "recency_rank": 2, "business_days": 2, "has_history": True,
+                          "last_substantive_progress_at": flow.now - timedelta(days=35),
                       }
     pg.execute("UPDATE creator_importance_profiles SET coverage=jsonb_set(coverage,'{priority,primary_at}',%s::jsonb) "
                "WHERE responsible_authorization_id=%s", (json.dumps(
                    (flow.now - timedelta(days=20)).isoformat()), flow.other))
-    assert pg.execute("SELECT ip.effective_tier,ip.recency_rank FROM contacts c" + join + " WHERE c.id=%s",
-                      [*args, flow.person]).fetchone() == {"effective_tier": "focus", "recency_rank": 0}
+    assert pg.execute("SELECT ip.effective_tier,ip.recency_rank,ip.last_substantive_progress_at "
+                      "FROM contacts c" + join + " WHERE c.id=%s", [*args, flow.person]).fetchone() == {
+                          "effective_tier": "focus", "recency_rank": 1,
+                          "last_substantive_progress_at": flow.now - timedelta(days=20),
+                      }
+    pg.execute("UPDATE creator_importance_profiles SET last_substantive_progress_at=%s "
+               "WHERE responsible_authorization_id=%s", (flow.now - timedelta(minutes=2), flow.other))
+    assert pg.execute("SELECT ip.effective_tier,ip.recency_rank,ip.last_substantive_progress_at "
+                      "FROM contacts c" + join + " WHERE c.id=%s", [*args, flow.person]).fetchone() == {
+                          "effective_tier": "focus", "recency_rank": 0,
+                          "last_substantive_progress_at": flow.now - timedelta(minutes=2),
+                      }
     pg.execute("ROLLBACK TO SAVEPOINT current_priority_metadata")
     pg.execute("SAVEPOINT readable_without_facts")
     other_job = dict(pg.execute("SELECT * FROM creator_importance_jobs WHERE responsible_authorization_id=%s",
