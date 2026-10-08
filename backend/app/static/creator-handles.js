@@ -10,7 +10,7 @@
   let page = data.page || 1;
   let query = el("query").value.trim();
   let sort = data.sort || "importance", tier = data.tier || "";
-  let busy = false, reading = false, refreshQueued = false, version = 0;
+  let busy = false, reading = false, listLoading = false, refreshQueued = false, version = 0;
   const rows = new Map();
   const selectedContacts = new Map();
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -58,13 +58,12 @@
       parts.selection.disabled = busy || reading || !parts.selectionId;
     }
   }
-  function clearRows() { rows.clear(); el("rows").replaceChildren(); }
+  function clearRows() { data = {...data, items: [], page}; rows.clear(); el("rows").replaceChildren(); }
   function importMessage(text, error = false) {
     el("import-message").textContent = text;
     el("import-message").className = `small mt-3 ${error ? "text-danger" : "text-secondary"}`;
   }
   function renderImports() {
-    el("import-open").disabled = busy || !selectedCM();
     for (const key of ["file", "check", "confirm", "close"]) el(`import-${key}`).disabled = busy;
     el("import-confirm").hidden = !importPreview || importPreview.status !== "preview" || !(importPreview.counts?.valid > 0);
     const batches = data.import_batches || [];
@@ -124,7 +123,7 @@
       manualReason.addEventListener("input", () => { parts.manualDirty = true; });
       form.addEventListener("submit", event => {
         event.preventDefault();
-        void mutate(`/people/${item.contact_id}/importance`, {cm_id: selectedCM(), tier: manualTier.value, reason: manualReason.value.trim()});
+        void mutate(`/people/${item.contact_id}/importance`, {cm_id: selectedCM(), tier: manualTier.value, reason: manualReason.value.trim()}, save);
       });
     }
     if (data.can_edit_handles) {
@@ -141,7 +140,7 @@
       handle.addEventListener("input", () => { parts.handleDirty = true; });
       form.addEventListener("submit", event => {
         event.preventDefault();
-        void mutate(`/people/${item.contact_id}/handle`, {cm_id: selectedCM(), old_handle: oldHandle.value, handle: handle.value.trim()});
+        void mutate(`/people/${item.contact_id}/handle`, {cm_id: selectedCM(), old_handle: oldHandle.value, handle: handle.value.trim()}, save);
       });
     }
     if (el("selection-bar")) {
@@ -243,15 +242,31 @@
       if (!parts.actions.childElementCount) parts.actions.textContent = "—";
     }
     page = data.page || 1;
-    el("empty").hidden = !!data.items?.length;
     el("empty").textContent = tab === "unassigned" ? "暂无未分配达人。" : "暂无达人。";
-    el("page-label").textContent = `共 ${data.total_count || 0} 人 · 第 ${page} / ${Math.max(1, data.total_pages || 0)} 页`;
-    el("previous").disabled = busy || page <= 1; el("next").disabled = busy || page >= (data.total_pages || 1);
     renderImports();
     renderSelection();
+    renderLoading();
+  }
+  function renderLoading() {
+    el("loading").hidden = !listLoading || Boolean(data.items?.length);
+    el("loading-rows").hidden = Boolean(data.items?.length);
+    el("table").hidden = listLoading && !data.items?.length;
+    el("table").inert = listLoading;
+    el("table").setAttribute("aria-busy", String(listLoading));
+    if (listLoading && data.items?.length) el("table").dataset.uiUpdating = "true";
+    else delete el("table").dataset.uiUpdating;
+    el("empty").hidden = listLoading || Boolean(data.items?.length);
+    el("import-open").disabled = busy || listLoading || !selectedCM();
+    el("refresh").disabled = busy || listLoading;
+    if (listLoading) el("refresh").setAttribute("aria-busy", "true");
+    else el("refresh").removeAttribute("aria-busy");
+    el("page-label").textContent = listLoading && !data.items?.length ? "" : `共 ${data.total_count || 0} 人 · 第 ${page} / ${Math.max(1, data.total_pages || 0)} 页`;
+    el("previous").disabled = busy || listLoading || page <= 1;
+    el("next").disabled = busy || listLoading || page >= (data.total_pages || 1);
   }
   async function refresh(automatic = false) {
     if (automatic && (reading || busy || document.hidden || [...rows.values()].some(row => row.manualDirty || row.handleDirty) || el("import-dialog").open)) return;
+    if (!automatic) { listLoading = true; render(); }
     if (reading) {
       refreshQueued = true; version++;
       return;
@@ -287,11 +302,13 @@
       reading = false;
       renderSelection();
       if (refreshQueued) { refreshQueued = false; void refresh(); }
+      else { listLoading = false; renderLoading(); }
     }
   }
-  async function mutate(path, fields = {}) {
+  async function mutate(path, fields = {}, button = null) {
     if (busy) return;
     busy = true; render(); notice("");
+    button?.setAttribute("aria-busy", "true");
     try {
       const result = await read(await fetch(`/creators${path}`, {method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"},
         body: new URLSearchParams({csrf_token: app.dataset.csrf, ...fields})}));
@@ -319,7 +336,7 @@
       else notice("已保存。");
       await refresh();
     } catch (error) { notice(error.message, true); }
-    finally { busy = false; render(); }
+    finally { button?.removeAttribute("aria-busy"); busy = false; render(); }
   }
   async function checkImport() {
     if (busy) return;
@@ -327,6 +344,7 @@
     if (!file || !file.name.toLowerCase().endsWith(".xlsx")) return importMessage("请选择 .xlsx 文件。", true);
     if (file.size > 2 * 1024 * 1024) return importMessage("文件过大，请上传不超过 2 MB 的表格。", true);
     busy = true; importPreview = null; render(); importMessage("正在检查表格…");
+    el("import-check").setAttribute("aria-busy", "true");
     el("import-preview").hidden = true;
     try {
       importPreview = await read(await fetch(`/creators/imports/preview?${new URLSearchParams({cm_id: selectedCM()})}`, {
@@ -345,11 +363,12 @@
       preview.hidden = false;
       void refresh();
     } catch (error) { importMessage(error.message, true); }
-    finally { busy = false; render(); }
+    finally { el("import-check").removeAttribute("aria-busy"); busy = false; render(); }
   }
   async function startImport() {
     if (busy || !importPreview) return;
     busy = true; render(); importMessage("正在导入名单…");
+    el("import-confirm").setAttribute("aria-busy", "true");
     try {
       await read(await fetch(`/creators/imports/${importPreview.id}/start`, {method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: new URLSearchParams({csrf_token: app.dataset.csrf})}));
       importPreview = null; el("import-dialog").close();
@@ -357,7 +376,7 @@
       notice("已导入，正在匹配。");
       void refresh();
     } catch (error) { importMessage(error.message, true); }
-    finally { busy = false; render(); }
+    finally { el("import-confirm").removeAttribute("aria-busy"); busy = false; render(); }
   }
   for (const key of ["unassigned", "mine"]) el(key).addEventListener("click", () => {
     if (tab === key) return;

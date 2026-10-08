@@ -313,6 +313,21 @@ def test_matching_routes_recheck_live_owner_and_csrf_before_queue_writes(pg, mon
     assert client.post(path + f"/jobs/{uuid4()}/cancel", data={"csrf_token": "csrf"}).status_code == 403
     session["auth"] = {"id": owner, "status": "active"}
     assert client.post(path + "/enqueue", data={"csrf_token": "csrf"}).status_code == 400  # Disabled.
+    assert pg.execute("SELECT count(*) n FROM creator_handle_jobs").fetchone()["n"] == 0
+    contact, job = uuid4(), uuid4()
+    pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,'Synthetic creator')", (contact,))
+    pg.execute("INSERT INTO creator_handle_jobs(id,contact_id) VALUES(%s,%s)", (job, contact))
+    before = len(connections)
+    assert client.post(path + f"/jobs/{job}/cancel", data={"csrf_token": "csrf", "page": "bad"}).status_code == 400
+    assert client.post(path + f"/jobs/{job}/unknown", data={"csrf_token": "csrf", "page": "8"}).status_code == 400
+    assert len(connections) == before
+    assert pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (job,)).fetchone()["status"] == "queued"
+    response = client.post(path + f"/jobs/{job}/cancel", data={"csrf_token": "csrf", "page": "8"},
+                           follow_redirects=False)
+    assert response.status_code == 303 and response.headers["location"] == path + "?page=8"
+    assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (job,)).fetchone()["status"] == "cancelled"
     pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (owner,))
     assert client.get(path).status_code == 403  # Session does not retain an obsolete Owner grant.
-    assert pg.execute("SELECT count(*) n FROM creator_handle_jobs").fetchone()["n"] == 0
+    assert client.post(path + f"/jobs/{job}/cancel", data={"csrf_token": "csrf", "page": "8"}).status_code == 403
+    assert pg.execute("SELECT count(*) n FROM creator_handle_jobs").fetchone()["n"] == 1

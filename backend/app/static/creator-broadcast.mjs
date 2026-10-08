@@ -173,13 +173,20 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   let savedState = '', editMode = 'create', pendingAction = null, initialMetadata = '';
   let selectedGroups = new Set(), templates = config.templates || [], currentTemplateId = '', editingTemplate = null, initialTemplate = '';
   let permissionCheck = 0, permissionPending = false, permissionCm = null, permissionResult = null;
-  let redirecting = false, pendingRestore = false, businessRequest = null;
+  let redirecting = false, pendingRestore = false, businessRequest = null, loadingGroups = false;
   const draftKey = 'ttmedia.broadcast.authorization-draft';
   const allowed = () => permissionReady(permissionResult,permissionPending,$('cm').value,permissionCm,redirecting);
   const groupMode = () => purpose !== 'support';
   const rows = () => recipients(entries, routes, groups, purpose);
   const plan = () => groupMode() ? groupPlan(groups,selectedGroups,$('mention').checked) : buildPlan(rows(), $('mention').checked, config.purposes[purpose]);
-  function notice(text) { $('notice').textContent = text; }
+  function loading(text) {
+    const state = node('span','','ui-loading'), spinner = node('span','','ui-spinner');
+    spinner.setAttribute('aria-hidden','true'); state.append(spinner,document.createTextNode(text)); return state;
+  }
+  function notice(text, pending = false) {
+    $('notice').replaceChildren(pending ? loading(text) : text);
+    $('notice').setAttribute('aria-busy',String(pending));
+  }
   const selections = () => groupMode() ? [...selectedGroups].map(chat_id => ({chat_id})) : rows().filter(row => row.selected && row.person).map(row => ({contact_id:row.person.id,chat_id:row.chatId}));
   const canSaveTargets = () => !dirty && plan().groups.length > 0 && plan().issues.length === 0;
   const selectionState = () => listState($('cm').value,purpose,$('mention').checked,selections());
@@ -215,6 +222,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
         ['删除','btn-ghost-danger',() => confirmListAction('delete',list)],
       ]) {
         const button = node('button',label,`btn btn-sm ${style}`); button.type = 'button'; button.disabled = busy;
+        if (label === '使用') button.dataset.listId = list.id;
         button.setAttribute('aria-label',`${label}名单 ${list.name}`); button.addEventListener('click',action); actions.append(button);
       }
       item.append(actions); $('library-items').append(item);
@@ -237,7 +245,12 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       });
       label.append(check,node('span',group.name)); $('group-items').append(label);
     }
-    if (!visible.length) $('group-items').append(node('div',busy ? '正在读取群聊…' : !$('cm').value ? '选择 CM/AM 后查看群聊' : query ? '没有匹配的群' : '暂无已分类的群','broadcast-group-empty text-secondary'));
+    if (!visible.length) {
+      const empty = node('div',!$('cm').value ? '选择 CM/AM 后查看群聊' : query ? '没有匹配的群' : '暂无已分类的群','broadcast-group-empty text-secondary');
+      if (loadingGroups && !groups.length) empty.replaceChildren(loading('加载群聊'));
+      $('group-items').append(empty);
+    }
+    $('group-items').setAttribute('aria-busy',String(loadingGroups));
     $('group-count').textContent = `已选 ${selectedGroups.size} / ${groups.length}`;
     $('group-all').checked = visible.length > 0 && visible.every(group => selectedGroups.has(group.id));
     $('group-all').indeterminate = visible.some(group => selectedGroups.has(group.id)) && !$('group-all').checked;
@@ -357,6 +370,13 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   async function api(action, data) {
     const business = action !== 'permissions', request = permissionCheck, cm = $('cm').value;
     if (business && !allowed()) throw new Error('请先完成当前账号的授权核对。');
+    const control = {'permissions':'permission-retry','match':'match','resolve':'match','groups':'group-refresh',
+      'preview':'preview','lists/save':'list-save','templates/save':'template-save',
+      'lists/delete':'list-action-proceed','templates/delete':'list-action-proceed'}[action];
+    const indicator = action === 'lists/load' ? $('list-action-dialog').open ? $('list-action-proceed')
+      : [...$('library-items').querySelectorAll('[data-list-id]')].find(button => button.dataset.listId === data.id)
+      : control ? $(control) : null;
+    indicator?.setAttribute('aria-busy','true');
     const controller = new AbortController();
     if (business) businessRequest = controller;
     try {
@@ -388,6 +408,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       if (error instanceof TypeError) throw new Error('网络连接失败，请稍后重试。');
       throw error;
     } finally {
+      if (business || request === permissionCheck) indicator?.setAttribute('aria-busy','false');
       if (businessRequest === controller) businessRequest = null;
     }
   }
@@ -400,7 +421,8 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     businessRequest?.abort();
     $('permission-bar').setAttribute('aria-busy','true'); $('permission-retry').disabled = true;
     $('permission-account').textContent = cm === 'all' ? '当前账号' : config.cms.find(item => item.id === cm)?.name || 'CM/AM';
-    $('permission-status').textContent = '正在核对授权'; $('permission-status').className = 'badge bg-secondary-lt ms-2';
+    $('permission-status').replaceChildren(loading('正在核对授权')); $('permission-status').className = 'badge bg-secondary-lt ms-2';
+    $('permission-status').setAttribute('aria-busy','true');
     $('permission-message').textContent = ''; $('permission-copy').hidden = true; syncGate();
     try {
       const result = await api('permissions',{cm_id:cm});
@@ -421,7 +443,10 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       $('permission-status').textContent = '暂时无法核对'; $('permission-status').className = 'badge bg-yellow-lt ms-2';
       $('permission-message').textContent = error.message;
     } finally {
-      if (request === permissionCheck) { permissionPending = false; $('permission-bar').setAttribute('aria-busy','false'); syncGate(); }
+      if (request === permissionCheck) {
+        permissionPending = false; $('permission-bar').setAttribute('aria-busy','false');
+        $('permission-status').setAttribute('aria-busy','false'); syncGate();
+      }
     }
     if (request !== permissionCheck || !allowed()) return false;
     if (pendingRestore) {
@@ -467,20 +492,20 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     if (!preserve) { groups = []; selectedGroups = new Set(); }
     dirty = true;
     if (!$('cm').value || $('cm').value === 'all') { render(); return; }
-    lock(true); notice('');
+    loadingGroups = true; lock(true); notice('');
     try {
       const result = await api('groups',{cm_id:$('cm').value,purpose}); applyTargets(result);
       selectedGroups = new Set(groups.filter(group => old.has(group.id)).map(group => group.id));
       if (selectedGroups.size !== old.size) notice('已跳过失效群，请检查当前选择。');
     } catch (error) { notice(error.message); }
-    finally { lock(false); }
+    finally { loadingGroups = false; lock(false); }
   }
   async function match(preserve = false) {
     if (busy || !allowed()) return;
     if (fixedIds && !fixedIds.length) return;
     const old = preserve || fixedIds ? new Map(entries.map(entry => [entry.key,{id:entry.person?.id,selected:entry.selected}])) : new Map();
     const incompleteRoutes = fixedTargets?.some(target => !target.chat_id);
-    lock(true); notice('正在匹配…');
+    lock(true); notice('正在匹配',true);
     try {
       const result = await api(fixedIds ? 'resolve' : 'match',
         {cm_id:$('cm').value,purpose,raw:$('input').value,contact_ids:fixedIds,...(fixedTargets && !incompleteRoutes ? {selections:fixedTargets} : {})});
@@ -549,7 +574,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   $('preview').addEventListener('click', async () => {
     const current = plan();
     if (busy || !allowed() || dirty || current.issues.length || !current.groups.length || !$('message').value.trim()) return;
-    lock(true); notice('正在重新核对路由…');
+    lock(true); notice('核对路由',true);
     try {
       const result = await api('preview',{cm_id:$('cm').value,purpose,mention:$('mention').checked,message:$('message').value,selections:selections()});
       if (result.issues.length) { dirty = true; throw new Error(groupMode() ? '群聊已变化，请点击“刷新”重新核验。' : `${result.issues.length} 项路由已变化，请重新匹配。`); }
@@ -567,7 +592,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   });
   async function loadList(list) {
     if (busy || !allowed()) return;
-    lock(true); $('library-error').textContent = ''; notice('正在载入并核验名单…');
+    lock(true); $('library-error').textContent = ''; notice('加载名单',true);
     try {
       const result = await api('lists/load',{id:list.id});
       lists = lists.map(list => list.id === result.list.id ? result.list : list);

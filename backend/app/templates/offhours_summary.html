@@ -13,7 +13,7 @@
     </form>
     <p class="oh-small">按英国当地时间划分，下班时段归入开始日期。只总结已入库达人，包含相关群聊和私聊。</p>
     <div id="oh-feedback" class="oh-banner oh-warning" role="alert" hidden></div>
-    <section id="oh-status" class="oh-banner" aria-live="polite"><div><strong id="oh-status-title">正在读取总结</strong><p id="oh-status-description">请稍候。</p></div><span id="oh-updated" class="oh-small"></span></section>
+    <section id="oh-status" class="oh-banner" aria-live="polite"><div><div class="ui-loading"><span id="oh-analysis-spinner" class="ui-spinner" aria-hidden="true" hidden></span><strong id="oh-status-title">正在读取总结</strong></div><p id="oh-status-description">请稍候。</p></div><span id="oh-updated" class="oh-small"></span></section>
     <section class="oh-stats" aria-label="事件等级统计">
       <button type="button" class="oh-stat oh-p0" data-priority="P0" aria-pressed="false"><span>P0 · 重大风险</span><strong id="oh-count-P0">0</strong><small>合作关系 / 资金危机</small></button>
       <button type="button" class="oh-stat oh-p1" data-priority="P1" aria-pressed="false"><span>P1 · 优先处理</span><strong id="oh-count-P1">0</strong><small>异常、投诉、反复催促</small></button>
@@ -31,5 +31,5 @@
   </main>
 </div>
 <script id="offhours-summary-data" type="application/json">{{ summary_data|tojson }}</script>
-<script src="/static/offhours-summary.js?v=20260921-refresh" defer></script>
+<script src="/static/offhours-summary.js?v=20261008-interaction" defer></script>
 {% endblock %}

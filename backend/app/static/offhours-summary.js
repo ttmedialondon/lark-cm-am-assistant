@@ -6,7 +6,7 @@
   const labels = {P0: "重大风险", P1: "优先处理", P2: "正常跟进", P3: "日常沟通"};
   let data = JSON.parse($("offhours-summary-data").textContent);
   $("offhours-summary-data").textContent = "";
-  let selected = "all", query = "", timer = null, loading = false, denied = false;
+  let selected = "all", query = "", timer = null, loading = false, denied = false, navigating = false;
   let revision = "";
 
   function node(tag, className, text) {
@@ -54,6 +54,7 @@
   function replyPanel(event) {
     if (replyStates.has(event.id)) return replyStates.get(event.id).panel;
     const panel = node("section", "oh-reply"), feedback = node("p", "oh-small");
+    feedback.setAttribute("aria-live", "polite");
     const generate = node("button", "btn btn-outline-primary btn-sm", "生成回复建议"); generate.type = "button";
     const content = node("div", "oh-reply-content"); content.hidden = true;
     const label = node("label", "", "建议回复（可编辑）");
@@ -71,6 +72,7 @@
     replyStates.set(event.id, state);
     function stale(message) {
       copy.disabled = true; translate.disabled = true; generate.disabled = false;
+      for (const button of [copy, translate, generate]) button.removeAttribute("aria-busy");
       state.readyText = null; feedback.textContent = message;
     }
     async function poll(jobId, version, isTranslation = false) {
@@ -82,6 +84,7 @@
           state.timer = setTimeout(() => poll(jobId, version, isTranslation), 2500); return;
         }
         generate.disabled = false;
+        (isTranslation ? translate : generate).removeAttribute("aria-busy");
         if (value.status !== "succeeded") { stale(value.error || "资料已变化，请重新生成。"); return; }
         const result = value.result;
         if (isTranslation) {
@@ -122,7 +125,9 @@
     generate.addEventListener("click", async () => {
       const version = ++state.version; clearTimeout(state.timer); clearTimeout(state.editTimer);
       generate.disabled = true; copy.disabled = true; content.hidden = true;
-      feedback.textContent = "正在核对最新对话并生成建议…";
+      for (const button of [copy, translate]) button.removeAttribute("aria-busy");
+      generate.setAttribute("aria-busy", "true");
+      feedback.textContent = "正在生成回复建议…";
       try {
         const value = await replyRequest("", {event_id: event.id});
         if (!denied && version === state.version) poll(value.id, version);
@@ -133,6 +138,7 @@
       if (!state.text.trim() || !state.jobId || denied) return;
       const version = ++state.version;
       copy.disabled = true; translate.disabled = true;
+      translate.setAttribute("aria-busy", "true");
       translationLabel.hidden = translation.hidden = false;
       translation.textContent = "正在更新中文翻译…";
       try {
@@ -143,6 +149,7 @@
     editor.addEventListener("input", () => {
       state.text = editor.value; state.readyText = null; state.version++;
       clearTimeout(state.timer); clearTimeout(state.editTimer);
+      for (const button of [copy, translate]) button.removeAttribute("aria-busy");
       copy.disabled = true; translate.disabled = false;
       translation.textContent = "正文已修改，中文翻译待更新。";
       translationLabel.hidden = translation.hidden = false;
@@ -151,22 +158,27 @@
     translate.addEventListener("click", updateTranslation);
     copy.addEventListener("click", async () => {
       const version = state.version, text = state.text;
+      let fresh = false;
       copy.disabled = true;
+      copy.setAttribute("aria-busy", "true");
       try {
         const value = await replyRequest(`/${encodeURIComponent(state.copyId)}?fresh=true`);
         if (denied || version !== state.version || text !== state.text) return;
         if (value.status !== "succeeded" || state.readyText !== text) {
           stale(value.error || "建议或翻译已过时，请更新后再复制。"); return;
         }
+        fresh = true;
         await navigator.clipboard.writeText(text);
-        feedback.textContent = "已复制回复正文；未发送，也未改变事件处理状态。";
+        if (denied || version !== state.version || text !== state.text) return;
+        feedback.textContent = "已复制，未发送。";
         copy.disabled = false;
       } catch (error) {
         if (!denied && version === state.version) {
-          feedback.textContent = error.name === "NotAllowedError" ? "浏览器未允许复制，请选择正文手动复制。" : error.message;
+          feedback.textContent = error.name === "NotAllowedError" ? "浏览器未允许复制，可重试或手动复制。" : error.message;
+          if (fresh && error.name === "NotAllowedError") copy.disabled = false;
           // A failed freshness check must not make an old draft copyable.
         }
-      }
+      } finally { if (version === state.version) copy.removeAttribute("aria-busy"); }
     });
     return panel;
   }
@@ -316,6 +328,7 @@
       description = "后台正在准备当前时段的数据。尚未有结果不代表没有消息或没有风险。";
     }
     $("oh-status-title").textContent = title;
+    $("oh-analysis-spinner").hidden = denied || !data.enabled || !(pending || ["queued", "running"].includes(run?.status));
     $("oh-status-description").textContent = description;
     $("oh-updated").textContent = run?.updated_at ? `结果更新 ${date(run.updated_at)}` : "";
     const all = events();
@@ -332,12 +345,13 @@
     clearTimeout(timer);
     const active = data.enabled && (!data.run || data.window?.is_open
       || ["queued", "running"].includes(data.run.status));
-    if (!denied && !document.hidden) timer = setTimeout(refresh, active ? 10000 : 60000);
+    if (!denied && !navigating && !document.hidden) timer = setTimeout(refresh, active ? 10000 : 60000);
   }
 
-  async function refresh() {
-    if (loading || denied) return;
+  async function refresh(interactive = false) {
+    if (loading || denied || navigating) return;
     loading = true; clearTimeout(timer); $("oh-refresh").disabled = true;
+    if (interactive) $("oh-refresh").setAttribute("aria-busy", "true");
     try {
       const params = new URLSearchParams({cm_id: data.responsible.id,
         date: data.selection.date, period: data.selection.period});
@@ -345,6 +359,7 @@
         cache: "no-store", credentials: "same-origin", redirect: "error",
         headers: {Accept: "application/json", ...(revision ? {"If-None-Match": revision} : {})},
       });
+      if (navigating) return;
       if (response.status === 304) { $("oh-feedback").hidden = true; return; }
       if ([401, 403].includes(response.status)) {
         denied = true; clearReplies();
@@ -357,16 +372,18 @@
       }
       if (!response.ok) throw new Error("暂时无法刷新。仍显示上次已读取的结果，请稍后重试。");
       const next = await response.json();
+      if (navigating) return;
       if (!next.window || !Array.isArray(next.events)) throw new Error("返回的数据不完整。仍显示上次已读取的结果，请稍后重试。");
       revision = response.headers.get("ETag") || "";
       $("oh-feedback").hidden = true;
       if (JSON.stringify(data) !== JSON.stringify(next)) { data = next; render(); }
     } catch (error) {
+      if (navigating) return;
       $("oh-feedback").textContent = error instanceof TypeError || error instanceof SyntaxError
         ? "连接暂时中断，结果可能已过时。请稍后刷新；这不代表没有新事件。" : error.message;
       $("oh-feedback").hidden = false;
     } finally {
-      loading = false; $("oh-refresh").disabled = denied; schedule();
+      loading = false; $("oh-refresh").removeAttribute("aria-busy"); $("oh-refresh").disabled = denied || navigating; schedule();
     }
   }
 
@@ -374,11 +391,26 @@
     selected = button.dataset.priority; renderEvents();
   }));
   $("oh-selection").addEventListener("change", () => {
-    clearTimeout(timer);
+    if (navigating) return;
+    navigating = true; clearTimeout(timer); clearReplies();
+    $("oh-selection").inert = true;
+    $("oh-events").inert = true; $("oh-events").setAttribute("aria-busy", "true");
+    $("oh-refresh").disabled = true;
+    $("oh-status-title").textContent = "正在加载总结…";
+    $("oh-status-description").textContent = ""; $("oh-analysis-spinner").hidden = false;
     $("oh-selection").requestSubmit();
   });
   $("oh-search").addEventListener("input", event => { query = event.target.value.trim().toLocaleLowerCase(); renderEvents(); });
-  $("oh-refresh").addEventListener("click", refresh);
+  $("oh-refresh").addEventListener("click", () => refresh(true));
   document.addEventListener("visibilitychange", () => { if (document.hidden) clearTimeout(timer); else refresh(); });
+  window.addEventListener("pageshow", event => {
+    if (!event.persisted || !navigating) return;
+    navigating = false; $("oh-selection").inert = false; $("oh-events").inert = false;
+    $("oh-events").removeAttribute("aria-busy"); $("oh-refresh").disabled = denied;
+    for (const select of $("oh-selection").querySelectorAll("select")) {
+      select.value = select.name === "cm_id" ? data.responsible?.id : data.selection?.[select.name];
+    }
+    render(); refresh();
+  });
   render(); schedule();
 })();

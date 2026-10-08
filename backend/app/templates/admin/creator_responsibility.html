@@ -73,6 +73,7 @@
       <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-3">
         <div><h2 class="mb-1">达人负责人匹配</h2><div class="text-secondary">{{ '已启用' if matching.enabled else '未启用' }} · 高置信度自动关联，其余待核实</div></div>
         <div class="d-flex flex-wrap gap-2">
+          <a class="btn" href="{{ base }}?page={{ matching.page }}">刷新</a>
           <a class="btn" href="/admin/ai">API Key 配置</a>
           <form method="post" action="{{ base }}/enqueue"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary" type="submit" {% if not matching.enabled %}disabled{% endif %}>开始匹配（全部待处理）</button></form>
         </div>

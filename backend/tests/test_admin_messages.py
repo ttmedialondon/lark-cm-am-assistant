@@ -156,7 +156,8 @@ def test_text_export_zip_and_source_permissions(console, monkeypatch):
         'has_admin_access': True, 'is_owner': False, 'permissions': ['messages'],
         'message_source_ids': [console.source['id']], 'landing_path': '/admin/messages',
     })
-    assert '下载全部聊天记录' in _open(console).text
+    download_link = re.search(r'<a[^>]*href="/admin/messages/export[^>]*>', _open(console).text).group(0)
+    assert 'data-ui-download' in download_link
     url = '/admin/messages/export'
     assert console.browser.get(url, params={'user_id': str(uuid4())}).status_code == 403
     assert not calls

@@ -29,13 +29,16 @@ async function fixture(t, data = report()) {
   t.after(() => browser.close());
   const page = await browser.newPage({viewport: {width: 1360, height: 1000}});
   const errors = []; page.on("pageerror", error => errors.push(error.message));
-  await page.route("**/*", route => {
+  await page.route("**/*", async route => {
     const url = new URL(route.request().url());
     if (url.origin !== "http://localhost") {
       if (process.env.OH_SCREENSHOT_DIR && url.href.endsWith("/tabler.min.css")) return route.continue();
       return route.abort();
     }
-    if (url.pathname === "/dashboard/offhours-summary") return route.fulfill({contentType: "text/html", body: rendered.stdout});
+    if (url.pathname === "/dashboard/offhours-summary") {
+      if (state.navigationGate) await state.navigationGate;
+      return route.fulfill({contentType: "text/html", body: rendered.stdout});
+    }
     if (url.pathname.startsWith("/static/")) return route.fulfill({contentType: url.pathname.endsWith(".js") ? "text/javascript" : "text/css", body: fs.readFileSync(path.join(backend, "app", url.pathname))});
     state.calls.push({method: route.request().method(), url: url.pathname, search: url.search});
     if (url.pathname.endsWith("/data")) return route.fulfill({status: state.status, json: state.data});
@@ -126,6 +129,7 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
       return route.fulfill({json: {saved: true, handles: state.data.items[0].handles}});
     }
     if (target.pathname === "/creators/data") {
+      if (state.dataGate) await state.dataGate;
       state.data.tab = target.searchParams.get("tab") || "mine";
       state.data.sort = target.searchParams.get("sort") || "importance";
       state.data.tier = target.searchParams.get("tier") || "";
@@ -188,12 +192,27 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
   assert.equal(new URLSearchParams(posts[1].body).get("old_handle"), "one");
   assert.equal(new URLSearchParams(posts[1].body).get("handle"), "one.updated");
   state.status = 200;
+  let releaseData;
+  state.dataGate = new Promise(resolve => { releaseData = resolve; });
+  const refreshing = page.waitForRequest(request => request.url().includes("/creators/data?"));
   await page.locator("#creators-refresh").click();
+  await refreshing;
+  assert.equal(await page.locator("#creators-refresh").getAttribute("aria-busy"), "true");
+  assert.equal(await rows.count(), 3);
+  assert(await page.locator("#creators-table").evaluate(element => element.inert));
+  assert.equal(await page.locator("#creators-table").getAttribute("data-ui-updating"), "true");
+  assert(!(await page.locator("#creators-loading").isVisible()));
+  releaseData(); state.dataGate = null;
+  await page.waitForFunction(() => document.getElementById("creators-refresh").getAttribute("aria-busy") !== "true");
+  assert(!(await page.locator("#creators-table").evaluate(element => element.inert)));
+  assert.equal(await page.locator("#creators-table").getAttribute("data-ui-updating"), null);
   assert.equal(await page.getByText("这一条不应展示。", {exact: true}).count(), 0);
   assert.equal(await page.getByText("资料截至 10-08 13:00", {exact: true}).count(), 0);
   const polling = page.waitForResponse(response => response.url().includes("/creators/data?"));
   state.data.importance_running = false;
   await polling;
+  assert(!(await page.locator("#creators-loading").isVisible()));
+  assert.equal(await page.locator("#creators-refresh").getAttribute("aria-busy"), null);
   assert(!(await history.evaluate(element => element.open)));
   Object.assign(state.data.items[0].importance, {tier: "priority", tier_label: "优先", manual_tier: ""});
   Object.assign(state.data.items[1].importance, {tier: "dormant", tier_label: "久未联系",
@@ -271,10 +290,22 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
   assert.equal(await rows.getByRole("link").count(), 0);
   assert.deepEqual(await names.allTextContents(), data.items.map(item => item.display_name));
   await page.locator("#creators-query").fill("Creator");
-  await Promise.all([
-    page.waitForResponse(response => response.url().includes("/creators/data?") && new URL(response.url()).searchParams.get("q") === "Creator"),
-    page.locator("#creators-search button").click(),
-  ]);
+  state.dataGate = new Promise(resolve => { releaseData = resolve; });
+  const searching = page.waitForRequest(request => request.url().includes("/creators/data?") && new URL(request.url()).searchParams.get("q") === "Creator");
+  await page.locator("#creators-search button").click(); await searching;
+  assert.equal(await rows.count(), 0);
+  assert(await page.locator("#creators-loading").isVisible());
+  assert.equal(await page.locator("#creators-loading .ui-skeleton-row").count(), 3);
+  assert(!(await page.locator("#creators-empty").isVisible()));
+  assert.equal(await page.locator("#creators-table").getAttribute("aria-busy"), "true");
+  const spinner = page.locator("#creators-loading .ui-spinner");
+  const transform = await spinner.evaluate(element => getComputedStyle(element).transform);
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  assert.notEqual(await spinner.evaluate(element => getComputedStyle(element).transform), transform);
+  if (process.env.OH_SCREENSHOT_DIR) await page.screenshot({path: path.join(process.env.OH_SCREENSHOT_DIR, "creator-list-loading.png")});
+  releaseData(); state.dataGate = null;
+  await rows.nth(2).waitFor();
+  assert(!(await page.locator("#creators-loading").isVisible()));
   const search = new URLSearchParams(state.calls.at(-1).search);
   assert.equal(search.get("tab"), "mine");
   assert.equal(search.get("q"), "Creator");
@@ -314,6 +345,8 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
   const pendingSave = page.waitForRequest(request => request.method() === "POST" && request.url().endsWith("/handle"));
   await handleEditor.getByRole("button", {name: "保存", exact: true}).click();
   await pendingSave;
+  assert.equal(await handleEditor.getByRole("button", {name: "保存", exact: true}).getAttribute("aria-busy"), "true");
+  assert.equal(await rows.nth(1).locator('[aria-busy="true"]').count(), 0);
   state.data.can_adjust_importance = false;
   state.data.can_edit_handles = false;
   await page.locator("#creators-search button").click();
@@ -349,6 +382,8 @@ test("grades are sorted and filters/search/evidence work without writes", async 
   assert.deepEqual(await page.locator(".oh-event .oh-priority").allTextContents(), ["P0", "P1", "P2", "P3", "待核实"]);
   assert(!(await page.locator(".oh-routine .oh-event").isVisible()));
   assert.equal(await page.locator("#oh-count-P3").textContent(), "1");
+  assert(await page.locator("#oh-analysis-spinner").isVisible());
+  assert.equal(await page.locator("#oh-analysis-spinner").evaluate(element => getComputedStyle(element).animationName), "ui-spin");
   assert.equal(await page.locator('a[href^="/admin/"]').count(), 0);
   assert((await page.locator("#oh-status-title").textContent()).includes("部分结果"));
   assert.equal(await page.locator("#oh-gaps").count(), 0);
@@ -386,6 +421,7 @@ test("disabled state contains no pretend counts or seeded results", async t => {
   const {page, state, errors} = await fixture(t, report({enabled: false, can_manage: true, run: null, events: []}));
   assert.equal(await page.locator("#oh-count-P0").textContent(), "—");
   assert.equal(await page.locator(".oh-event").count(), 0);
+  assert(!(await page.locator("#oh-analysis-spinner").isVisible()));
   assert.equal(await page.locator('a[href="/admin/ai#offhours-summary"]').count(), 1);
   assert((await page.locator("#oh-empty-description").textContent()).includes("已入库达人"));
   assert.equal(state.calls.length, 0);
@@ -399,6 +435,7 @@ test("an ended window with sync gaps is incomplete, not described as still in th
   data.run.counts = {queued: 0, running: 0, completed: 5, failed: 0};
   const {page, errors} = await fixture(t, data);
   assert.equal(await page.locator("#oh-status-title").textContent(), "当前为部分结果 · 尚有资料缺口");
+  assert(!(await page.locator("#oh-analysis-spinner").isVisible()));
   const description = await page.locator("#oh-status-description").textContent();
   assert(description.includes("已完成 5 / 5"));
   assert(!description.includes("尚未到时段结束时间"));
@@ -424,7 +461,7 @@ test("source content is literal, network failures show stale results, and revoke
   assert.deepEqual(errors, []);
 });
 
-test("admin owner and read-only fixtures expose the right controls without making any write", async t => {
+test("admin role-scoped controls keep native save values and loading without production writes", async t => {
   const browser = await chromium.launch({headless: true, channel: "chrome"});
   t.after(() => browser.close());
   for (const role of ["owner", "reviewer"]) {
@@ -433,16 +470,25 @@ test("admin owner and read-only fixtures expose the right controls without makin
       {cwd: backend, encoding: "utf8"});
     assert.equal(rendered.status, 0, rendered.stderr);
     const page = await browser.newPage({viewport: {width: 1360, height: 1100}});
-    const writes = [];
-    await page.route("**/*", route => {
+    const writes = [], state = {};
+    await page.route("**/*", async route => {
       const url = new URL(route.request().url());
-      if (route.request().method() !== "GET") { writes.push(url.href); return route.abort(); }
+      if (route.request().method() !== "GET") {
+        writes.push(route.request().postData());
+        assert(state.postGate, "Only the explicitly simulated form save may POST");
+        await state.postGate;
+        return route.fulfill({contentType: "text/html", body: rendered.stdout});
+      }
       if (url.origin !== "http://localhost") {
         if (process.env.OH_SCREENSHOT_DIR && url.href.endsWith("/tabler.min.css")) return route.continue();
         return route.abort();
       }
-      if (url.pathname === "/admin/ai") return route.fulfill({contentType: "text/html", body: rendered.stdout});
-      if (url.pathname.startsWith("/static/")) return route.fulfill({contentType: "text/css", body: fs.readFileSync(path.join(backend, "app", url.pathname))});
+      if (url.pathname === "/admin/ai") {
+        if (url.search && state.navigationGate) await state.navigationGate;
+        return route.fulfill({contentType: "text/html", body: rendered.stdout});
+      }
+      if (url.pathname === "/fixture-export") return route.fulfill({contentType: "application/zip", headers: {"Content-Disposition": 'attachment; filename="fixture.zip"'}, body: "fixture-only"});
+      if (url.pathname.startsWith("/static/")) return route.fulfill({contentType: url.pathname.endsWith(".js") ? "text/javascript" : "text/css", body: fs.readFileSync(path.join(backend, "app", url.pathname))});
       return route.abort();
     });
     await page.goto("http://localhost/admin/ai");
@@ -462,6 +508,70 @@ test("admin owner and read-only fixtures expose the right controls without makin
     }
     assert.deepEqual(writes, []);
     if (process.env.OH_SCREENSHOT_DIR) await card.screenshot({path: path.join(process.env.OH_SCREENSHOT_DIR, `offhours-admin-${role}.png`)});
+    if (role === "owner") {
+      await page.evaluate(() => {
+        const link = document.createElement("a"); link.id = "fixture-export";
+        link.href = "/fixture-export"; link.dataset.uiDownload = ""; link.textContent = "下载"; document.body.append(link);
+      });
+      const download = page.waitForEvent("download");
+      await page.locator("#fixture-export").click(); await download;
+      assert.equal(await page.locator("html").getAttribute("data-ui-navigating"), null);
+      const save = card.getByRole("button", {name: "保存配置（开启则立即执行）", exact: true});
+      await card.locator('input[name="project_id"]').fill("fixture-project");
+      await save.evaluate(button => { button.name = "operation"; button.value = "save"; });
+      let saving;
+      page.on("console", message => {
+        if (message.text().startsWith("fixture-native-save:")) saving = JSON.parse(message.text().slice("fixture-native-save:".length));
+      });
+      await page.emulateMedia({reducedMotion: "reduce"});
+      assert.equal(await page.evaluate(() => {
+        document.documentElement.dataset.uiNavigating = "true";
+        const animation = getComputedStyle(document.documentElement, "::before").animationName;
+        delete document.documentElement.dataset.uiNavigating; return animation;
+      }), "none");
+      await page.emulateMedia({reducedMotion: "no-preference"});
+      await page.evaluate(() => {
+        let checked = false;
+        document.addEventListener("submit", event => {
+          if (checked || !event.target.closest("#offhours-summary")) return;
+          checked = true;
+          const button = event.submitter;
+          const duplicate = new SubmitEvent("submit", {bubbles: true, cancelable: true, submitter: button});
+          event.target.dispatchEvent(duplicate);
+          console.log("fixture-native-save:" + JSON.stringify({busy: button.getAttribute("aria-busy"), disabled: button.disabled,
+            blocked: button.getAttribute("aria-disabled"), animation: getComputedStyle(button, "::before").animationName,
+            duplicatePrevented: duplicate.defaultPrevented}));
+        });
+      });
+      let releasePost;
+      state.postGate = new Promise(resolve => { releasePost = resolve; });
+      const posting = page.waitForRequest(request => request.method() === "POST");
+      const saveAction = save.click(); const posted = await posting;
+      assert.equal(saving.busy, "true"); assert.equal(saving.blocked, "true");
+      assert(!saving.disabled, "Do not disable native submitter before serialization");
+      const fields = new URLSearchParams(posted.postData());
+      assert.equal(fields.get("operation"), "save"); assert.equal(fields.get("csrf_token"), "fixture-csrf");
+      assert.equal(fields.get("feature"), "offhours_summary"); assert.equal(fields.get("window_end"), "2026-09-10T12:00");
+      assert.equal(saving.animation, "ui-spin");
+      assert(saving.duplicatePrevented);
+      const loaded = page.waitForEvent("load"); releasePost(); await loaded; await saveAction;
+      assert.equal(page.url(), "http://localhost/admin/ai"); assert(await card.isVisible());
+      assert.equal(writes.length, 1);
+      assert.equal(await page.locator("html").getAttribute("data-ui-navigating"), null);
+      assert.equal(await card.locator('[aria-busy="true"]').count(), 0);
+      await page.evaluate(() => {
+        const link = document.createElement("a"); link.id = "fixture-page";
+        link.href = "/admin/ai?page=8"; link.textContent = "第八页"; document.body.append(link);
+        document.addEventListener("click", event => {
+          if (event.target.id === "fixture-page") event.preventDefault();
+        });
+      });
+      await page.evaluate(() => document.getElementById("fixture-page").click());
+      assert.equal(await page.locator("html").getAttribute("data-ui-navigating"), "true");
+      await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pageshow", {persisted: true})));
+      assert.equal(await page.locator("html").getAttribute("data-ui-navigating"), null);
+      assert.equal(await card.locator('[aria-busy="true"]').count(), 0);
+    }
     await page.close();
   }
 });
@@ -471,13 +581,42 @@ test("each summary selector navigates immediately without a submit button", asyn
     cms: [{id: "remi-id", name: "Remi"}, {id: "nero-id", name: "Nero"}],
     dates: ["2026-09-09", "2026-09-10"], date: "2026-09-09", period: "off",
   }});
-  const {page, errors} = await fixture(t, data);
+  const {page, state, errors} = await fixture(t, data);
   assert.equal(await page.locator('#oh-selection button, [aria-label="总结范围"]').count(), 0);
   for (const [name, value] of [["cm_id", "nero-id"], ["date", "2026-09-10"], ["period", "work"]]) {
-    await Promise.all([
-      page.waitForURL(url => url.searchParams.get(name) === value),
-      page.locator(`#oh-selection select[name="${name}"]`).selectOption(value),
-    ]);
+    let loading, restored;
+    page.on("console", message => {
+      if (message.text().startsWith("fixture-summary-navigation:")) {
+        ({loading, restored} = JSON.parse(message.text().slice("fixture-summary-navigation:".length)));
+      }
+    });
+    await page.evaluate(name => {
+      document.addEventListener("change", event => {
+        if (!event.target.closest("#oh-selection")) return;
+        const loading = {title: document.getElementById("oh-status-title").textContent,
+          events: document.getElementById("oh-events").inert, selection: document.getElementById("oh-selection").inert,
+          navigating: document.documentElement.dataset.uiNavigating};
+        let restored;
+        if (name === "cm_id") {
+          window.dispatchEvent(new PageTransitionEvent("pageshow", {persisted: true}));
+          restored = {cm: document.querySelector('#oh-selection select[name="cm_id"]').value,
+            inert: document.getElementById("oh-events").inert};
+        }
+        console.log("fixture-summary-navigation:" + JSON.stringify({loading, restored}));
+      }, {once: true});
+    }, name);
+    let releaseNavigation;
+    state.navigationGate = new Promise(resolve => { releaseNavigation = resolve; });
+    const request = page.waitForRequest(request => new URL(request.url()).searchParams.get(name) === value);
+    const selecting = page.locator(`#oh-selection select[name="${name}"]`).selectOption(value); await request;
+    assert.equal(loading.title, "正在加载总结…"); assert(loading.events); assert(loading.selection);
+    assert.equal(loading.navigating, "true");
+    if (name === "cm_id") {
+      assert.equal(restored.cm, "remi-id"); assert(!restored.inert);
+    }
+    const loaded = page.waitForEvent("load"); releaseNavigation(); await loaded; await selecting;
+    state.navigationGate = null;
+    await page.waitForFunction(() => document.getElementById("oh-status-title").textContent !== "正在读取总结");
     const url = new URL(page.url());
     assert.equal(url.pathname, "/dashboard/offhours-summary");
     assert.equal(url.searchParams.size, 3);
@@ -489,15 +628,17 @@ test("each summary selector navigates immediately without a submit button", asyn
 test("reply drafts preserve edits, translate before copying, and block stale or revoked suggestions", async t => {
   const {page, errors} = await fixture(t, report({events: [event("P1")]}));
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
-  let edited = "", stale = false, revoked = false;
+  let edited = "", stale = false, revoked = false, releaseGenerate;
+  const generateGate = new Promise(resolve => { releaseGenerate = resolve; });
   const posted = [];
-  await page.route("**/dashboard/offhours-summary/replies**", route => {
+  await page.route("**/dashboard/offhours-summary/replies**", async route => {
     if (revoked) return route.fulfill({status: 403, json: {error: "权限已失效"}});
     const req = route.request();
     if (req.method() === "POST") {
       const body = req.postDataJSON(); posted.push(body);
       assert.equal(req.headers()["x-csrf-token"], "fixture-csrf");
       if (body.parent_id) edited = body.text;
+      else await generateGate;
       return route.fulfill({status: 202, json: {id: body.parent_id ? "translation" : "draft", status: "queued"}});
     }
     if (stale) return route.fulfill({json: {status: "stale", error: "收到新消息，请重新生成建议。"}});
@@ -509,6 +650,8 @@ test("reply drafts preserve edits, translate before copying, and block stale or 
         checks: ["确认可以核对。"], checked_at: "2026-09-16T01:00:00Z"}}});
   });
   await page.getByRole("button", {name: "生成回复建议", exact: true}).click();
+  assert.equal(await page.getByRole("button", {name: "生成回复建议", exact: true}).getAttribute("aria-busy"), "true");
+  releaseGenerate();
   const editor = page.getByLabel("建议回复（可编辑）");
   await editor.waitFor({state: "visible"});
   const newText = "Hi lovely, I can check that £200 payment with you. I have the order number already, so you do not need to resend it.";
@@ -518,8 +661,20 @@ test("reply drafts preserve edits, translate before copying, and block stale or 
   await page.getByText("修改后的中文翻译，金额仍为 £200。", {exact: true}).waitFor();
   await page.getByRole("button", {name: "刷新", exact: true}).click();
   assert.equal(await editor.inputValue(), newText);
+  await page.evaluate(() => {
+    const write = navigator.clipboard.writeText.bind(navigator.clipboard);
+    let first = true;
+    navigator.clipboard.writeText = text => {
+      if (first) { first = false; return Promise.reject(new DOMException("Fixture permission rejected", "NotAllowedError")); }
+      return write(text);
+    };
+  });
   await page.getByRole("button", {name: "复制回复", exact: true}).click();
-  await page.getByText("已复制回复正文；未发送，也未改变事件处理状态。", {exact: true}).waitFor();
+  await page.getByText("浏览器未允许复制，可重试或手动复制。", {exact: true}).waitFor();
+  assert(await page.getByRole("button", {name: "复制回复", exact: true}).isEnabled());
+  assert.equal(await page.getByRole("button", {name: "复制回复", exact: true}).getAttribute("aria-busy"), null);
+  await page.getByRole("button", {name: "复制回复", exact: true}).click();
+  await page.getByText("已复制，未发送。", {exact: true}).waitFor();
   assert.equal(await page.evaluate(() => navigator.clipboard.readText()), newText);
   assert.equal(await page.locator(".oh-handling").textContent(), "没有处理");
   stale = true;
@@ -530,5 +685,113 @@ test("reply drafts preserve edits, translate before copying, and block stale or 
   await page.getByRole("button", {name: "重新生成", exact: true}).click();
   await page.waitForFunction(() => document.querySelectorAll(".oh-event").length === 0);
   assert.equal(posted.length, 2);
+  assert.deepEqual(errors, []);
+});
+
+test("broadcast waiting states preserve selections and drafts after request failures", async t => {
+  const actor = "11111111-1111-4111-8111-111111111111";
+  const data = {can_select_cm: false, selected_cm_id: actor, cms: [{id: actor, name: "CM"}],
+    purposes: {support: "客服群", category: "类目群"}, lists: [], templates: []};
+  const rendered = spawnSync(path.join(backend, ".venv/bin/python"), ["-c",
+    "import json,sys; from jinja2 import Environment,FileSystemLoader,select_autoescape; data=json.load(sys.stdin); print(Environment(loader=FileSystemLoader('app/templates'),autoescape=select_autoescape()).get_template('creator_broadcast.html').render(authorization={'id':data['selected_cm_id'],'display_name':'CM'},broadcast_data=data,csrf_token='fixture-csrf'))"],
+    {cwd: backend, input: JSON.stringify(data), encoding: "utf8"});
+  assert.equal(rendered.status, 0, rendered.stderr);
+  const browser = await chromium.launch({headless: true, channel: "chrome"});
+  t.after(() => browser.close());
+  const page = await browser.newPage({viewport: {width: 1360, height: 1000}});
+  const errors = [], calls = [], holds = new Map();
+  page.on("pageerror", error => errors.push(error.message));
+  function hold(action) {
+    let started, release;
+    const arrived = new Promise(resolve => { started = resolve; });
+    const response = new Promise(resolve => { release = resolve; });
+    holds.set(action, {started, response}); return {arrived, release};
+  }
+  const permissions = hold("permissions");
+  await page.route("**/*", async route => {
+    const req = route.request(), url = new URL(req.url());
+    if (url.origin !== "http://localhost") return route.abort();
+    if (url.pathname === "/creators/broadcast") return route.fulfill({contentType: "text/html", body: rendered.stdout});
+    if (url.pathname.startsWith("/static/")) return route.fulfill({
+      contentType: /\.(m?js)$/.test(url.pathname) ? "text/javascript" : "text/css",
+      body: fs.readFileSync(path.join(backend, "app", url.pathname))});
+    const action = url.pathname.replace("/creators/broadcast/", "");
+    assert.equal(req.method(), "POST"); assert.equal(req.headers()["x-csrf-token"], "fixture-csrf");
+    calls.push({action, body: req.postDataJSON()});
+    const held = holds.get(action);
+    assert(held, `Unexpected fixture request: ${url.pathname}`);
+    held.started(); const response = await held.response; holds.delete(action);
+    return route.fulfill(response);
+  });
+  await page.goto("http://localhost/creators/broadcast");
+  await permissions.arrived;
+  assert(await page.locator("#broadcast-workspace").evaluate(el => el.disabled));
+  assert.equal(await page.locator("#broadcast-permission-status").getAttribute("aria-busy"), "true");
+  assert.equal(await page.locator("#broadcast-permission-status .ui-spinner").count(), 1);
+  assert.equal(await page.locator("#broadcast-permission-status .ui-spinner").evaluate(el => getComputedStyle(el).animationName), "ui-spin");
+  permissions.release({json: {status: "ready", account_name: "CM", is_self: true, is_sender: true}});
+  await page.waitForFunction(() => !document.getElementById("broadcast-workspace").disabled);
+  assert.equal(await page.locator("#broadcast-permission-status").getAttribute("aria-busy"), "false");
+  assert.equal(await page.locator("#broadcast-permission-status .ui-spinner").count(), 0);
+
+  const firstGroups = hold("groups");
+  await page.getByRole("button", {name: "类目群", exact: true}).click();
+  await firstGroups.arrived;
+  assert.equal(await page.locator("#broadcast-group-items").getAttribute("aria-busy"), "true");
+  assert.equal(await page.locator("#broadcast-group-items .ui-spinner").count(), 1);
+  assert((await page.locator("#broadcast-group-items").textContent()).includes("加载群聊"));
+  const groupResult = {groups: [{id: "oc_category", name: "女装类目", purpose: "category", members: []}], issues: []};
+  firstGroups.release({json: groupResult});
+  const selected = page.getByRole("checkbox", {name: "选择群 女装类目", exact: true});
+  await selected.check();
+  const refreshGroups = hold("groups");
+  await page.locator("#broadcast-group-refresh").click();
+  await refreshGroups.arrived;
+  assert.equal(await page.locator("#broadcast-group-refresh").getAttribute("aria-busy"), "true");
+  assert.equal(await page.locator("#broadcast-group-items").getAttribute("aria-busy"), "true");
+  assert(await selected.isChecked());
+  assert.equal(await page.locator("#broadcast-group-items .ui-spinner").count(), 0);
+  refreshGroups.release({json: groupResult});
+  await page.waitForFunction(() => document.getElementById("broadcast-group-items").getAttribute("aria-busy") === "false");
+  assert(await selected.isChecked());
+  assert.equal(await page.locator("#broadcast-group-refresh").getAttribute("aria-busy"), "false");
+
+  await page.getByRole("button", {name: "客服群", exact: true}).click();
+  const raw = "@sample.handle\nSample Creator";
+  await page.locator("#broadcast-input").fill(raw);
+  const matching = hold("match");
+  await page.locator("#broadcast-match").click();
+  await matching.arrived;
+  assert.equal(await page.locator("#broadcast-match").getAttribute("aria-busy"), "true");
+  assert.equal(await page.locator("#broadcast-match").textContent(), "匹配名单");
+  assert.equal(await page.locator("#broadcast-notice .ui-spinner").count(), 1);
+  matching.release({status: 503, json: {error: "名单暂时无法读取，请重试。"}});
+  await page.getByText("名单暂时无法读取，请重试。", {exact: true}).waitFor();
+  assert.equal(await page.locator("#broadcast-match").getAttribute("aria-busy"), "false");
+  assert.equal(await page.locator("#broadcast-notice .ui-spinner").count(), 0);
+  assert.equal(await page.locator("#broadcast-input").inputValue(), raw);
+  assert(!(await page.locator("#broadcast-workspace").evaluate(el => el.disabled)));
+
+  const message = "Hello, please check this week's offer.";
+  await page.locator("#broadcast-message").fill(message);
+  await page.locator("#broadcast-template-new").click();
+  await page.locator("#broadcast-template-name").fill("本周活动");
+  const saving = hold("templates/save");
+  await page.locator("#broadcast-template-save").click();
+  await saving.arrived;
+  assert.equal(await page.locator("#broadcast-template-save").getAttribute("aria-busy"), "true");
+  assert.equal(await page.locator("#broadcast-template-save").textContent(), "保存并使用");
+  assert.equal(await page.locator("#broadcast-template-dialog").getAttribute("open"), "");
+  saving.release({status: 503, json: {error: "模板未保存，请重试。"}});
+  await page.getByText("模板未保存，请重试。", {exact: true}).waitFor();
+  assert.equal(await page.locator("#broadcast-template-save").getAttribute("aria-busy"), "false");
+  assert(!(await page.locator("#broadcast-template-save").isDisabled()));
+  assert(await page.locator("#broadcast-template-dialog").isVisible());
+  assert.equal(await page.locator("#broadcast-template-name").inputValue(), "本周活动");
+  assert.equal(await page.locator("#broadcast-template-body").inputValue(), message);
+  assert.equal(await page.locator("#broadcast-message").inputValue(), message);
+  assert.equal(await page.locator("[aria-busy='true']").count(), 0);
+  assert.equal(await page.locator("html").getAttribute("data-ui-navigating"), null);
+  assert.deepEqual(calls.map(call => call.action), ["permissions", "groups", "groups", "match", "templates/save"]);
   assert.deepEqual(errors, []);
 });

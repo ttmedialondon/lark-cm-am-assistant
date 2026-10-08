@@ -8,7 +8,7 @@
     <div class="business-heading"><div><h2 class="page-title">群发消息</h2><p>选择接收对象，编辑并预览消息。</p></div><span class="badge bg-yellow-lt">仅预览 · 不会发送</span></div>
     <div class="broadcast-permissions mb-4" id="broadcast-permission-bar" aria-busy="true">
       <div class="broadcast-account"><label class="form-label mb-1" id="broadcast-cm-label" for="broadcast-cm">达人范围</label><select class="form-select" id="broadcast-cm"{% if not broadcast_data.can_select_cm %} disabled{% endif %}>{% if broadcast_data.can_select_cm %}<option value="all">全部已入库达人</option>{% endif %}{% for cm in broadcast_data.cms %}<option value="{{ cm.id }}"{% if cm.id == broadcast_data.selected_cm_id %} selected{% endif %}>{{ cm.name }} 负责的达人</option>{% endfor %}</select></div>
-      <div role="status" aria-live="polite"><span id="broadcast-permission-account">当前账号</span><span class="badge bg-secondary-lt ms-2" id="broadcast-permission-status">正在核对授权</span><div class="small text-secondary mt-1" id="broadcast-permission-message"></div></div>
+      <div role="status" aria-live="polite"><span id="broadcast-permission-account">当前账号</span><span class="badge bg-secondary-lt ms-2" id="broadcast-permission-status" aria-busy="true"><span class="ui-loading"><span class="ui-spinner" aria-hidden="true"></span>正在核对授权</span></span><div class="small text-secondary mt-1" id="broadcast-permission-message"></div></div>
       <div class="btn-list"><button class="btn btn-sm btn-outline-primary" id="broadcast-permission-copy" type="button" hidden>复制该账号授权链接</button><button class="btn btn-sm btn-ghost-secondary" id="broadcast-permission-retry" type="button" disabled>重新检查</button></div>
     </div>
     <fieldset id="broadcast-workspace" class="broadcast-workspace" aria-label="群发编辑区" disabled>
@@ -94,5 +94,5 @@
   </fieldset>
 </div>
 <script id="broadcast-config" type="application/json">{{ broadcast_data | tojson }}</script>
-<script type="module" src="/static/creator-broadcast.mjs?v=20261007-user-access"></script>
+<script type="module" src="/static/creator-broadcast.mjs?v=20261008-loading"></script>
 {% endblock %}

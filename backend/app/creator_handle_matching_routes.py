@@ -55,6 +55,12 @@ def create_router(*, current_authorization, render_template, csrf_token):
             form = await form_fields(request)
             if not csrf_matches(form, csrf_token(auth)):
                 raise ValueError("请求校验失败，请刷新页面。")
+            try:
+                page_number = max(1, int(form.get("page", "1")))
+            except ValueError as exc:
+                raise ValueError("页码无效。") from exc
+            if job_id is not None and operation not in {"recheck", "cancel"}:
+                raise ValueError("操作无效。")
 
             def save():
                 with connection() as conn, conn.transaction():
@@ -64,7 +70,10 @@ def create_router(*, current_authorization, render_template, csrf_token):
                         matching.action(conn, auth["id"], job_id, operation)
 
             await run_in_threadpool(save)
-            return secure_response(RedirectResponse("/admin/ai/creator-handle-matching", status_code=303))
+            target = "/admin/ai/creator-handle-matching"
+            if job_id is not None and page_number > 1:
+                target += f"?page={page_number}"
+            return secure_response(RedirectResponse(target, status_code=303))
         except (ValueError, LookupError, PermissionError) as exc:
             return error_response(exc)
 
