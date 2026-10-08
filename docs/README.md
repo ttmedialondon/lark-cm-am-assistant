@@ -31,8 +31,8 @@
 | [达人负责人匹配](specs/creator-responsibility-matching_v1.0.md) | 独立多 CM Prompt、证据边界与正式队列；独立密钥、默认关闭，高置信度自动关联 |
 | [达人群分类规则](specs/creator-group-classification-prompt_v1.1.md) | 五类用途、未确认、群名组合证据与高置信度入库；人工优先、独立密钥 |
 | [群分类研究结果](reviews/creator-group-classification-research_2026-10-04.md) | 120 位达人相关 168 个群的材料覆盖、实际阅读及分类边界 |
-| [达人重要度排行调研与技术方案](reviews/creator-priority-market-research_2026-10-08.md) | 17 个产品对照；聊天合作事实、三档排行与增量提取。v1 已发布、默认关闭，真实样本与初始化待验收；不依赖 Cruva 或 GMV |
-| [合作重要度事实提取协议](specs/creator-importance-facts-prompt_v1.0.md) | 可执行 Prompt、正反例、引用校验及 Python 分档；各 CM 独立、人工优先，90／30 天参数待真实样本验证 |
+| [达人重要度排行调研与技术方案](reviews/creator-priority-market-research_2026-10-08.md) | 17 个产品对照；仅用聊天分档。v1 修订已发布，137 项测试与 5 次定向片段回归通过；独立 Key 已启用，重置后历史初始化运行中，全范围验收未完成 |
+| [合作重要度事实提取协议](specs/creator-importance-facts-prompt_v1.0.md) | 可执行 Prompt、正反例、引用校验及 Python 分档；v1.0.1 修正管理／寄样／优惠券误判，各 CM 独立、人工优先，90／30 天参数仍需扩检 |
 | [部署与回退](runbooks/deploy-mvp.md) | GitHub 发布、数据库备份、迁移、健康检查与恢复 |
 | [AI 协作约定](../AGENTS.md) | 开发与交付授权、数据保护约定 |
 
