@@ -14,7 +14,14 @@ from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from app import admin_permissions, creator_broadcast, creator_handles_routes, creator_imports
+from app import (
+    admin_permissions,
+    creator_broadcast,
+    creator_handles_routes,
+    creator_importance,
+    creator_imports,
+    creator_roster,
+)
 from app.crypto import TokenCipher
 from app.lark_api import LarkApiError, LarkProfile, TokenBundle
 
@@ -37,6 +44,69 @@ def browser(monkeypatch, *, owner=False, active=True):
         render_template=lambda _request, name, context: HTMLResponse(templates.get_template(name).render(**context)),
     ))
     return TestClient(app), actor
+
+
+def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypatch):
+    client, actor = browser(monkeypatch, owner=True)
+    settings = SimpleNamespace(token_encryption_key=b"i" * 32)
+    cm, assigned, unassigned = uuid4(), uuid4(), uuid4()
+    for account, name in ((actor["id"], "Owner"), (cm, "CM")):
+        pg.execute("""INSERT INTO authorizations(id,open_id,display_name,access_token_ciphertext,
+            refresh_token_ciphertext,access_token_expires_at,refresh_token_expires_at,body_consent_at)
+            VALUES(%s,%s,%s,'unused','unused',NOW()+INTERVAL '1 hour',NOW()+INTERVAL '1 day',NOW())""",
+                   (account, "ou_" + account.hex, name))
+    pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (actor["id"],))
+    for person, name in ((assigned, "Assigned"), (unassigned, "Unassigned")):
+        pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)", (person, name))
+        pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) VALUES(%s,'creator','confirmed','manual')",
+                   (person,))
+    pg.execute("""INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source)
+        VALUES(%s,%s,%s,'manual')""", (uuid4(), assigned, cm))
+    for module in (creator_handles_routes, creator_imports, creator_roster):
+        monkeypatch.setattr(module, "connection", lambda: nullcontext(pg))
+    monkeypatch.setattr(creator_roster, "get_settings", lambda: settings)
+    monkeypatch.setattr(creator_importance, "get_settings", lambda: settings)
+    monkeypatch.setattr(admin_permissions, "permission_keys_for", lambda _: ())
+
+    pending = client.get(f"/creators/data?cm_id={cm}&sort=importance&tier=pending")
+    assert pending.status_code == 200 and pending.json()["total_count"] == 1
+    assert pending.json()["items"][0]["importance"]["tier"] == "pending"
+    assert not pending.json()["importance_running"]
+    pg.execute("UPDATE ai_feature_configs SET enabled=TRUE,api_key_ciphertext='fixture-only',key_suffix='only' "
+               "WHERE feature='creator_importance'")
+    pg.execute("SELECT enqueue_creator_importance(%s,%s)", (assigned, cm))
+    assert client.get(f"/creators/data?cm_id={cm}").json()["importance_running"]
+    pg.execute("UPDATE ai_feature_configs SET enabled=FALSE WHERE feature='creator_importance'")
+    url = f"/creators/people/{assigned}/importance"
+    fields = {"csrf_token": "csrf", "cm_id": str(cm), "tier": "focus", "reason": "Owner reviewed cooperation"}
+    assert client.post(url, data={**fields, "csrf_token": "bad"}).status_code == 400
+    assert client.post(url, data=fields).status_code == 200
+    focus = client.get(f"/creators/data?cm_id={cm}&sort=importance&tier=focus")
+    assert focus.status_code == 200 and focus.json()["total_count"] == 1
+    assert focus.json()["items"][0]["importance"]["manual_tier"] == "focus"
+    assert client.get(f"/creators/data?cm_id={cm}&tier=normal").json()["total_count"] == 0
+    safe = client.get(f"/creators/data?cm_id={cm}&sort=bad%27SQL&tier=bad%27SQL").json()
+    assert safe["sort"] == "name" and safe["tier"] == "" and safe["total_count"] == 1
+    actor["id"] = cm
+    assert client.post(url, data=fields).status_code == 403
+    assert client.get(f"/creators/data?cm_id={fields['cm_id']}").json()["can_adjust_importance"] is False
+    owner = pg.execute("SELECT authorization_id FROM admin_roles WHERE role='owner'").fetchone()["authorization_id"]
+    actor["id"] = owner
+    monkeypatch.setattr(creator_importance, "view_for", lambda *args, **kwargs: pytest.fail(
+        "Roster-only or unassigned request read a CM profile"))
+    pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (owner,))
+    pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-roster')", (owner,))
+    readonly = client.get(f"/creators/data?cm_id={cm}&sort=importance&tier=focus")
+    assert readonly.status_code == 200
+    assert readonly.json()["total_count"] == 1 and readonly.json()["items"][0]["importance"] is None
+    assert readonly.json()["sort"] == "name" and readonly.json()["tier"] == ""
+    assert not readonly.json()["can_view_importance"] and not readonly.json()["importance_running"]
+    pg.execute("UPDATE admin_roles SET is_active=TRUE WHERE authorization_id=%s", (owner,))
+    separate = client.get("/creators/data?tab=unassigned&sort=importance&tier=focus")
+    assert separate.status_code == 200
+    assert separate.json()["items"][0]["id"] == str(unassigned)
+    assert separate.json()["items"][0]["importance"] is None
+    assert separate.json()["sort"] == "name" and separate.json()["tier"] == ""
 
 
 def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, monkeypatch):

@@ -25,6 +25,7 @@ from . import (
     ai_feature_config,
     creator_group_matching,
     creator_handle_matching,
+    creator_importance,
     creator_responsibility_matching,
     message_export,
     offhours_summary,
@@ -81,6 +82,12 @@ AI_FEATURES = {
         "description": "结合群名、成员结构和授权聊天判断用途；高置信度自动入库，其余待核实，保留人工分类。",
         "enabled_label": "启用群用途匹配队列",
         "processing_label": "逐群分类，高置信度自动入库，不发送消息",
+    },
+    "creator_importance": {
+        "title": "合作重要度",
+        "description": "仅从本人授权聊天提取合作事实，规则分为重点、常规、待评估；不依赖 Curva 或销量。",
+        "enabled_label": "开启合作重要度评估",
+        "processing_label": "首次历史分析，之后增量更新",
     },
     "offhours_summary": {
         "title": "达人消息总结",
@@ -270,6 +277,7 @@ def create_admin_router(
             ]
             dispatch_status = ai_dispatch.status(conn)
             summary_settings = offhours_summary.get_settings_view(conn)
+            importance_metrics = creator_importance.metrics(conn)
         response = render_template(
             request,
             "admin/ai.html",
@@ -278,11 +286,13 @@ def create_admin_router(
                 "configs": configs,
                 "ai_dispatch": dispatch_status,
                 "summary_settings": summary_settings,
+                "importance_metrics": importance_metrics,
                 "summary_saved": request.query_params.get("saved") == "offhours-summary",
                 "identity_saved": request.query_params.get("saved") == "people-identity",
                 "matching_saved": request.query_params.get("saved") == "creator-handle-matching",
                 "responsibility_saved": request.query_params.get("saved") == "creator-responsibility-matching",
                 "groups_saved": request.query_params.get("saved") == "creator-group-classification",
+                "importance_saved": request.query_params.get("saved") == "creator-importance",
                 # Retain this template-safe alias while external callers migrate to ``configs``.
                 "config": configs[0]["config"],
                 "form_error": error,
@@ -871,6 +881,8 @@ def create_admin_router(
                     creator_responsibility_matching.configuration_changed(conn)
                 elif feature == creator_group_matching.FEATURE:
                     creator_group_matching.configuration_changed(conn)
+                elif feature == creator_importance.FEATURE:
+                    creator_importance.configuration_changed(conn)
                 conn.execute(
                     "INSERT INTO audit_events (id, authorization_id, action, metadata) VALUES (%s, %s, %s, %s::jsonb)",
                     (
@@ -899,7 +911,9 @@ def create_admin_router(
             "/admin/ai?saved=creator-responsibility-matching#creator-responsibility-matching"
             if feature == creator_responsibility_matching.FEATURE else
             "/admin/ai?saved=creator-group-classification#creator-group-classification"
-            if feature == creator_group_matching.FEATURE else "/admin/ai"
+            if feature == creator_group_matching.FEATURE else
+            "/admin/ai?saved=creator-importance#creator-importance"
+            if feature == creator_importance.FEATURE else "/admin/ai"
         )
         response = RedirectResponse(url=saved_url, status_code=303)
         response.headers["Cache-Control"] = "no-store, max-age=0"

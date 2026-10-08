@@ -19,6 +19,7 @@ from . import (
     ai_dispatch,
     creator_group_matching,
     creator_handle_matching,
+    creator_importance,
     creator_imports,
     creator_responsibility_matching,
     identity_profiles,
@@ -27,7 +28,7 @@ from . import (
     summary_replies,
 )
 from .config import Settings, get_settings
-from .crypto import TokenCipher, message_body_cipher
+from .crypto import TokenCipher, message_body_cipher, message_body_fingerprint
 from .db import connection
 from .identity_names import format_display_name, update_identity_names
 from .lark_api import LarkApiError, LarkClient, TokenBundle
@@ -215,6 +216,7 @@ def _dispatch_ai_turn(
         (creator_handle_matching.claim, creator_handle_matching.run),
         (creator_responsibility_matching.claim, creator_responsibility_matching.run),
         (creator_group_matching.claim, creator_group_matching.run),
+        (creator_importance.claim, creator_importance.run),
     )
     for offset in range(len(queues)):
         index = (next_queue + offset) % len(queues)
@@ -269,7 +271,8 @@ def _prepare_creator_preview(settings: Settings, next_queue: int) -> tuple[bool,
               offhours_summary.prepare_next_summary,
               creator_handle_matching.prepare_next,
               creator_responsibility_matching.prepare_next,
-              creator_group_matching.prepare_next)
+              creator_group_matching.prepare_next,
+              creator_importance.prepare_next)
     for offset in range(len(queues)):
         index = (next_queue + offset) % len(queues)
         try:
@@ -683,7 +686,8 @@ def _reap_page_futures(futures: dict[Future[dict[str, Any]], PageClaim], setting
             continue
         content_cipher = message_body_cipher(settings.token_encryption_key) if claim.body_consent_at else None
         try:
-            commit = _record_claimed_page(claim, _items(data), _continuation_token(data), content_cipher)
+            commit = _record_claimed_page(claim, _items(data), _continuation_token(data), content_cipher,
+                                         fingerprint_key=settings.token_encryption_key)
         except StaleSyncJob:
             continue
         except LarkApiError as exc:
@@ -1936,6 +1940,8 @@ def _record_claimed_page(
     messages: list[dict[str, Any]],
     next_page_token: str | None,
     content_cipher: TokenCipher | None,
+    *,
+    fingerprint_key: bytes | None = None,
 ) -> PageCommit:
     """Persist a fetched page only while its exact cursor claim is still current."""
 
@@ -2040,13 +2046,13 @@ def _record_claimed_page(
                 """
                 INSERT INTO chat_messages (
                     chat_id, message_id, message_create_time, message_update_time,
-                    message_type, body_ciphertext,
+                    message_type, body_ciphertext, body_fingerprint,
                     root_id, parent_id, thread_id, mentions_json,
                     message_app_link, message_position, thread_message_position,
                     sender_id, sender_id_type, sender_open_id, sender_tenant_key, sender_type,
                     is_deleted, first_indexed_at, last_observed_at
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, NOW(), NOW()
                 )
                 ON CONFLICT (chat_id, message_id) DO UPDATE SET
@@ -2058,6 +2064,8 @@ def _record_claimed_page(
                         WHEN EXCLUDED.body_ciphertext IS NULL THEN chat_messages.body_ciphertext
                         ELSE EXCLUDED.body_ciphertext
                     END,
+                    body_fingerprint = CASE WHEN EXCLUDED.is_deleted THEN NULL
+                        ELSE COALESCE(EXCLUDED.body_fingerprint, chat_messages.body_fingerprint) END,
                     root_id = COALESCE(EXCLUDED.root_id, chat_messages.root_id),
                     parent_id = COALESCE(EXCLUDED.parent_id, chat_messages.parent_id),
                     thread_id = COALESCE(EXCLUDED.thread_id, chat_messages.thread_id),
@@ -2082,6 +2090,8 @@ def _record_claimed_page(
                     _lark_time(message.get("update_time")),
                     _text(message.get("msg_type")),
                     body_ciphertext,
+                    message_body_fingerprint(fingerprint_key, body_content)
+                    if body_ciphertext and fingerprint_key else None,
                     relations["root_id"],
                     relations["parent_id"],
                     relations["thread_id"],

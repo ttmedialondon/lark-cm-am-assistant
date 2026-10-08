@@ -38,6 +38,8 @@ def render_admin(role="owner"):
         active_page="ai", admin_landing_path="/admin/ai", admin_permissions=["ai"],
         permission_pages=[{"key": "ai", "path": "/admin/ai", "label": "AI 配置"}],
         ai_dispatch={"state": "ready"}, configs=configs, csrf_token="fixture-csrf",
+        importance_metrics={"counts": {"pending": 0, "running": 0, "succeeded": 0, "failed": 0},
+                            "usage": {"api_requests": 0, "input_tokens": 0, "output_tokens": 0}},
         summary_settings={"status_label": "未开启", "window_start_input": "2026-09-09T18:00",
                           "window_end_input": "2026-09-10T12:00"},
     )

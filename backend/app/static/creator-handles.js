@@ -5,9 +5,11 @@
   if (!app) return;
   const el = key => document.getElementById(`creators-${key}`);
   let data = JSON.parse(el("initial").textContent);
+  el("initial").textContent = "";
   let tab = app.dataset.tab;
   let page = data.page || 1;
   let query = el("query").value.trim();
+  let sort = data.sort || "name", tier = data.tier || "";
   let busy = false, reading = false, refreshQueued = false, version = 0, evidenceVersion = 0;
   const rows = new Map();
   const selectedContacts = new Map();
@@ -23,7 +25,10 @@
   }
   async function read(response) {
     const body = response.headers.get("content-type")?.includes("application/json") ? await response.json() : {};
-    if (!response.ok || response.redirected) throw new Error(body.error || "访问失败，请刷新或重新登录。");
+    if (!response.ok || response.redirected) {
+      const error = new Error(body.error || "访问失败，请刷新或重新登录。");
+      error.status = response.redirected ? 401 : response.status; throw error;
+    }
     return body;
   }
   function selectedCM() { return el("cm")?.value || data.selected_cm_id || ""; }
@@ -167,11 +172,34 @@
     lark.target = "_blank"; lark.rel = "noopener noreferrer";
     lark.title = "在 Lark 中打开私聊";
     const label = node("div", "", "d-flex align-items-center"); label.append(name, lark);
-    personWrap.append(avatar, label); person.append(personWrap);
+    const personLabel = node("div"), importanceBadge = node("span", "", "creator-importance-badge");
+    personLabel.append(label, importanceBadge); personWrap.append(avatar, personLabel); person.append(personWrap);
     const handleCell = node("td"); handleCell.style.minWidth = "250px";
     const saved = node("div", "", "mb-2"); handleCell.append(saved);
     const actions = node("td");
-    const parts = {row, name, lark, avatar, initial, saved, actions};
+    const importance = node("details", "", "creator-importance-detail");
+    importance.append(node("summary", "合作详情"));
+    const grounds = node("ul", "", "creator-importance-grounds"), cutoff = node("div", "", "text-secondary"), gap = node("div", "", "text-secondary mt-1");
+    importance.append(grounds, cutoff, gap);
+    const parts = {row, name, lark, avatar, initial, saved, actions, importanceBadge, importance, grounds, cutoff, gap, manualDirty: false};
+    if (data.can_adjust_importance) {
+      const editor = node("details", "", "creator-importance-editor"); editor.append(node("summary", "人工调整"));
+      const form = node("form", "", "mt-2"), manualTier = node("select", "", "form-select form-select-sm"), manualReason = node("input", "", "form-control form-control-sm mt-2");
+      manualTier.setAttribute("aria-label", "人工合作重要度");
+      for (const [value, label] of [["", "使用自动评估"], ["focus", "重点"], ["normal", "常规"], ["pending", "待评估"]]) {
+        const option = node("option", label); option.value = value; manualTier.append(option);
+      }
+      manualReason.maxLength = 240; manualReason.placeholder = "调整依据"; manualReason.setAttribute("aria-label", "人工调整依据");
+      const save = node("button", "保存", "btn btn-sm btn-outline-primary mt-2"); save.type = "submit";
+      form.append(manualTier, manualReason, save); editor.append(form); importance.append(editor);
+      Object.assign(parts, {manualTier, manualReason, manualSave: save});
+      manualTier.addEventListener("change", () => { parts.manualDirty = true; manualReason.required = Boolean(manualTier.value); });
+      manualReason.addEventListener("input", () => { parts.manualDirty = true; });
+      form.addEventListener("submit", event => {
+        event.preventDefault();
+        void mutate(`/people/${item.contact_id}/importance`, {cm_id: selectedCM(), tier: manualTier.value, reason: manualReason.value.trim()});
+      });
+    }
     if (el("selection-bar")) {
       parts.selectionCell = node("td", "", "creator-selection-cell");
       parts.selection = node("input", "", "form-check-input"); parts.selection.type = "checkbox";
@@ -190,6 +218,9 @@
     return parts;
   }
   function render() {
+    el("importance-toolbar").hidden = tab !== "mine" || !data.can_view_importance;
+    el("sort").value = sort; el("tier").value = tier;
+    el("sort").disabled = busy; el("tier").disabled = busy;
     el("unassigned").hidden = !data.can_view_unassigned;
     el("import-open").hidden = Boolean(data.read_only);
     el("candidates").hidden = Boolean(data.read_only);
@@ -215,6 +246,22 @@
       if (item.profile_url) parts.name.href = item.profile_url;
       else parts.name.removeAttribute("href");
       parts.name.title = item.profile_url ? "查看个人资料" : "";
+      const importance = item.importance;
+      parts.importanceBadge.hidden = !importance;
+      if (importance) {
+        parts.importanceBadge.dataset.tier = ["focus", "normal"].includes(importance.tier) ? importance.tier : "pending";
+        parts.importanceBadge.textContent = [importance.tier_label || "待评估", importance.phase_label, importance.manual_tier ? "人工" : ""].filter(Boolean).join(" · ");
+        parts.grounds.replaceChildren(...(importance.grounds || []).slice(0, 2).map(text => node("li", text)));
+        parts.grounds.hidden = !parts.grounds.childElementCount;
+        parts.cutoff.textContent = importance.cutoff_label ? `截至 ${importance.cutoff_label}` : "尚未评估";
+        parts.gap.textContent = importance.gap_label || (importance.stale ? "依据待更新" : "");
+        parts.gap.hidden = !parts.gap.textContent;
+        if (parts.manualTier) {
+          if (!parts.manualDirty) { parts.manualTier.value = importance.manual_tier || ""; parts.manualReason.value = importance.manual_reason || ""; }
+          parts.manualReason.required = Boolean(parts.manualTier.value);
+          parts.manualTier.disabled = busy; parts.manualReason.disabled = busy; parts.manualSave.disabled = busy;
+        }
+      }
       parts.initial.textContent = Array.from((item.display_name || "").trim())[0]?.toUpperCase() || "?";
       if (parts.avatarUrl !== item.avatar_url) {
         parts.avatarUrl = item.avatar_url;
@@ -240,6 +287,7 @@
       }
       if (!item.handles?.length) parts.saved.textContent = "—";
       parts.actions.replaceChildren();
+      if (importance) parts.actions.append(parts.importance);
       for (const evidenceRow of item.evidence_rows || []) {
         const button = node("button", `@${evidenceRow.handle} · 查看证据链`, "btn btn-sm btn-outline-secondary d-block mb-1");
         button.type = "button"; button.disabled = busy;
@@ -257,7 +305,7 @@
     renderSelection();
   }
   async function refresh(automatic = false) {
-    if (automatic && (reading || busy || document.hidden || [...rows.values()].some(row => row.dirty) || el("import-dialog").open)) return;
+    if (automatic && (reading || busy || document.hidden || [...rows.values()].some(row => row.dirty || row.manualDirty) || el("import-dialog").open)) return;
     if (reading) {
       refreshQueued = true; version++;
       return;
@@ -265,12 +313,30 @@
     const token = ++version; reading = true;
     renderSelection();
     const params = new URLSearchParams({tab, q: query, page: String(page)});
+    if (tab === "mine") { if (sort !== "name") params.set("sort", sort); if (tier) params.set("tier", tier); }
     if (selectedCM()) params.set("cm_id", selectedCM());
     history.replaceState(null, "", `/creators?${params}`);
     try {
       const next = await read(await fetch(`/creators/data?${params}`, {cache: "no-store"}));
-      if (token === version && !(automatic && [...rows.values()].some(row => row.dirty))) { data = next; render(); }
-    } catch (error) { if (token === version) notice(error.message, true); }
+      if (token === version && !(automatic && [...rows.values()].some(row => row.dirty || row.manualDirty))) {
+        data = next; sort = data.sort || "name"; tier = data.tier || ""; render();
+      }
+    } catch (error) {
+      if (token === version) {
+        if ([401, 403].includes(error.status)) {
+          selectedContacts.clear(); importPreview = null; clearRows();
+          el("initial").textContent = "";
+          el("evidence").close(); el("evidence-body").replaceChildren(); el("import-dialog").close();
+          data = {...data, items: [], import_batches: [], cms: [], read_only: true,
+            can_view_unassigned: false, can_select_cm: false, can_broadcast: false,
+            can_view_importance: false, can_adjust_importance: false, importance_running: false,
+            total_count: 0, total_pages: 1, page: 1};
+          if (el("cm")) { el("cm").replaceChildren(); el("cm").disabled = true; }
+          render();
+        }
+        notice(error.message, true);
+      }
+    }
     finally {
       reading = false;
       renderSelection();
@@ -289,6 +355,11 @@
       }
       if (path.endsWith("/confirm")) {
         notice("已确认入库，可在“我的达人”查看。同一人的多个 handle 会合并展示。");
+      }
+      else if (path.endsWith("/importance")) {
+        const parts = rows.get(`confirmed:${path.split("/")[2]}`);
+        if (parts) parts.manualDirty = false;
+        notice("合作重要度已更新。");
       }
       else if (path.endsWith("/defer")) {
         notice("已暂缓，尚未确认的修改不会入库。");
@@ -425,6 +496,9 @@
     selectedContacts.clear(); tab = key; page = 1; clearRows(); renderSelection(); refresh();
   });
   el("search").addEventListener("submit", event => { event.preventDefault(); query = el("query").value.trim(); page = 1; clearRows(); refresh(); });
+  for (const key of ["sort", "tier"]) el(key).addEventListener("change", () => {
+    sort = el("sort").value; tier = el("tier").value; page = 1; clearRows(); refresh();
+  });
   el("refresh").addEventListener("click", () => refresh());
   el("previous").addEventListener("click", () => { page--; clearRows(); refresh(); });
   el("next").addEventListener("click", () => { page++; clearRows(); refresh(); });
@@ -478,6 +552,6 @@
   }
   render();
   setInterval(() => {
-    if (data.import_batches?.some(batch => batch.status === "running")) void refresh(true);
+    if (data.importance_running || data.import_batches?.some(batch => batch.status === "running")) void refresh(true);
   }, 5000);
 })();

@@ -571,6 +571,7 @@ def view_events(conn, run, task, settings, roster, chats, *, read_cache=None):
         {
             **event,
             "id": f"{task['id']}:{i}",
+            "contact_id": str(task["contact_id"]),
             "creator_handle": event["handle"],
             "creator_handles": person["handles"],
             "lark_user_name": person["name"],

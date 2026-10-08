@@ -1,16 +1,19 @@
 """Current creator roster and import candidates, independent of the retired handle scanner."""
 
-from . import admin_permissions, contact_handles, creator_access, creator_imports
+from . import admin_permissions, contact_handles, creator_access, creator_importance, creator_imports
+from .config import get_settings
 from .db import connection
 from .identity_profiles import safe_avatar_url
 from .lark_api import private_chat_url
 
 
-def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
+def page_data(actor_id, cm_id=None, tab="mine", query="", page=1, sort="name", tier=""):
     """Current library: Excel import candidates and confirmed people."""
     query = str(query or "").strip()[:120]
+    sort = sort if sort in {"name", "importance"} and tab == "mine" else "name"
+    tier = tier if tier in {"focus", "normal", "pending"} and tab == "mine" else ""
     page = max(1, min(int(page), 10000))
-    with connection() as conn:
+    with connection() as conn, conn.transaction():
         unassigned = tab == 'unassigned'
         if unassigned:
             creator_access.require_owner(conn, actor_id)
@@ -18,6 +21,9 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
         can_view_unassigned = creator_access.is_owner(conn, actor_id)
         can_select_cm = creator_access.can_view_all(conn, actor_id)
         read_only = unassigned or (not can_manage and creator_access.parse_id(actor_id) != cm_id)
+        can_view_importance = tab == "mine" and (can_manage or creator_access.parse_id(actor_id) == cm_id)
+        if not can_view_importance:
+            sort, tier = "name", ""
         cms = [
             {"id": str(r["id"]), "name": r["display_name"] or "未命名用户"}
             for r in conn.execute(
@@ -54,17 +60,32 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
             pages, page = imported["total_pages"], imported["page"]
         else:
             can_view_profiles = "contacts" in admin_permissions.permission_keys_for(actor_id)
+            order = "c.display_name,c.id"
+            if sort == "importance" or tier:
+                importance_join, join_args = creator_importance.roster_sql(cm_id)
+                formal_base = formal_base.replace(
+                    "FROM contacts c WHERE", f"FROM contacts c {importance_join} WHERE", 1,
+                )
+                args = [*join_args, *args]
+                if tier:
+                    formal_base += " AND COALESCE(ip.effective_tier,'pending')=%s"
+                    args.append(tier)
+                if sort == "importance":
+                    order = """CASE COALESCE(ip.effective_tier,'pending') WHEN 'focus' THEN 0
+                        WHEN 'normal' THEN 1 ELSE 2 END,ip.phase_rank ASC NULLS LAST,
+                        ip.last_substantive_progress_at DESC NULLS LAST,c.display_name,c.id"""
             if query:
                 formal_base += """ AND (POSITION(lower(%s) IN lower(COALESCE(c.display_name,'')))>0
                     OR EXISTS (SELECT 1 FROM contact_social_accounts l JOIN social_accounts s
                         ON s.id=l.social_account_id WHERE l.contact_id=c.id AND l.status='confirmed'
                         AND l.relationship='owner' AND POSITION(lower(%s) IN lower(s.normalized_handle))>0))"""
                 args.extend((query,query))
-            total = conn.execute("SELECT count(*) n " + formal_base, args).fetchone()["n"] if query else confirmed
+            total = (conn.execute("SELECT count(*) n " + formal_base, args).fetchone()["n"]
+                     if query or tier else confirmed)
             pages = max(1,(total+24)//25)
             page = min(page,pages)
             people = conn.execute("SELECT c.id,c.display_name " + formal_base
-                                  + " ORDER BY c.display_name,c.id LIMIT 25 OFFSET %s", [*args,(page-1)*25]).fetchall()
+                                  + f" ORDER BY {order} LIMIT 25 OFFSET %s", [*args,(page-1)*25]).fetchall()
             imports_by_person = {person["id"]: [] for person in people}
             for row in conn.execute(
                 """SELECT r.id,r.contact_id,r.handle,r.api_requests,r.stats,
@@ -107,11 +128,22 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1):
                     "sources": sources, "source": " + ".join(sources),
                     "evidence_rows": [] if read_only else list(evidence_rows.values()),
                     "status_label": "已入库", "can_confirm": False, "can_defer": False,
+                    "importance": (creator_importance.view_for(
+                        conn, person["id"], cm_id, get_settings(), actor_id=actor_id,
+                    ) if can_view_importance else None),
                 })
         return {
             "cms": cms, "selected_cm_id": str(cm_id), "can_manage": can_manage,
             "can_select_cm": can_select_cm, "read_only": read_only,
             "can_view_unassigned": can_view_unassigned,
+            "can_view_importance": can_view_importance,
+            "can_adjust_importance": can_view_unassigned and can_view_importance, "sort": sort, "tier": tier,
+            "importance_running": bool(can_view_importance and conn.execute(
+                """SELECT 1 FROM creator_importance_jobs j JOIN ai_feature_configs f
+                    ON f.feature='creator_importance' AND f.enabled
+                    WHERE j.responsible_authorization_id=%s
+                    AND j.status IN ('queued','preparing','ready','running','retry_wait') LIMIT 1""", (cm_id,),
+            ).fetchone()),
             "run": None, "counts": counts, "usage": {"api_requests": 0, "input_tokens": 0, "output_tokens": 0},
             "import_batches": imported["batches"], "items": items,
             "total_count": total, "total_pages": pages, "page": page,

@@ -1149,9 +1149,14 @@ def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None):
         "confirmed_creators", "conversations", "messages", "private_conversations", "group_conversations",
         "related_private_chats", "related_groups",
     )}
-    view["events"].sort(
-        key=lambda event: ({"P0": 0, "P1": 1, "P2": 2, None: 3, "P3": 4}[event["priority"]], event["id"])
+    from . import creator_importance
+    importance_order = creator_importance.tier_order(
+        conn, [event["contact_id"] for event in view["events"] if event.get("contact_id")], cm_id,
     )
+    view["events"].sort(key=lambda event: (
+        {"P0": 0, "P1": 1, "P2": 2, None: 3, "P3": 4}[event["priority"]],
+        importance_order.get(event.get("contact_id"), 2), event["id"],
+    ))
     conn.execute(
         "INSERT INTO audit_events(id, authorization_id, action, metadata) VALUES(%s,%s,%s,%s::jsonb)",
         (uuid4(), UUID(str(actor_id)), "creator_workflow_offhours_summary_read",

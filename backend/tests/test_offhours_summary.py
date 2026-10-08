@@ -281,7 +281,7 @@ def seeded(pg, monkeypatch):
 
 
 @pytest.mark.parametrize("roster_kind", ["current", "missing_handle", "multi_handle", "legacy", "both"])
-def test_save_enabled_immediately_queues_claims_and_stores_encrypted_summary(pg, seeded, roster_kind):
+def test_save_enabled_immediately_queues_claims_and_stores_encrypted_summary(pg, seeded, roster_kind, monkeypatch):
     s = seeded
     if roster_kind == "missing_handle":
         pg.execute("DELETE FROM contact_social_accounts")
@@ -348,6 +348,18 @@ def test_save_enabled_immediately_queues_claims_and_stores_encrypted_summary(pg,
     assert record["status"] == "succeeded" and "申请样品" not in record["result_ciphertext"]
     assert pg.execute("SELECT count(*) n FROM contact_roles").fetchone()["n"] == 2
     assert pg.execute("SELECT COUNT(*) AS n FROM creator_workflow_candidates").fetchone()["n"] == 1
+    if roster_kind == "current":
+        from app import creator_importance
+        with monkeypatch.context() as patch:
+            patch.setattr(creator_importance, "tier_order", lambda *_: {"focus": 0, "normal": 1})
+            patch.setattr(summary_dialogues, "view_events", lambda *_a, **_k: [
+                {"id": "p2_focus", "priority": "P2", "contact_id": "focus"},
+                {"id": "p0_normal", "priority": "P0", "contact_id": "normal"},
+                {"id": "p0_focus", "priority": "P0", "contact_id": "focus"},
+            ])
+            assert [event["id"] for event in ai.get_summary_view(pg, s.ids["owner"])["events"]] == [
+                "p0_focus", "p0_normal", "p2_focus",
+            ]
     s.save(key="")
     ai.schedule_if_due(pg, force=True)
     assert ai.claim_next_summary() is None and len(s.calls) == 1

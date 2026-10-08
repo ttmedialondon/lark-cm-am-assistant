@@ -9,7 +9,8 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import creator_broadcast, creator_imports, creator_roster
+from . import creator_broadcast, creator_importance, creator_imports, creator_roster
+from .db import connection
 from .http_helpers import (
     csrf_matches as _csrf_matches,
 )
@@ -152,14 +153,16 @@ def create_router(*, current_authorization, render_template, csrf_token):
 
     @router.get("")
     @router.get("/data")
-    def page(request: Request, cm_id: UUID | None = None, tab: str = "mine", q: str = "", page: int = 1):
+    def page(request: Request, cm_id: UUID | None = None, tab: str = "mine", q: str = "", page: int = 1,
+             sort: str = "name", tier: str = ""):
         auth = current_authorization(request)
         if request.url.path == "/creators" and not auth:
             return secure(RedirectResponse("/", status_code=303))
         try:
             auth = actor(auth)
             tab = tab if tab in ('candidates', 'unassigned') else 'mine'
-            data = creator_roster.page_data(auth["id"], cm_id=cm_id, tab=tab, query=q[:120], page=max(1, page))
+            data = creator_roster.page_data(auth["id"], cm_id=cm_id, tab=tab, query=q[:120], page=max(1, page),
+                                           sort=sort, tier=tier)
             data["can_broadcast"] = bool(auth.get("broadcast_enabled") or data["can_view_unassigned"])
             if request.url.path.endswith("/data"):
                 return payload(data)
@@ -167,6 +170,23 @@ def create_router(*, current_authorization, render_template, csrf_token):
                 "authorization": auth, "creator_data": jsonable_encoder(data),
                 "creator_tab": tab, "creator_query": q[:120], "csrf_token": csrf_token(auth),
             }))
+        except (ValueError, LookupError, PermissionError) as exc:
+            return error(exc)
+
+    @router.post("/people/{contact_id}/importance")
+    async def importance_manual(request: Request, contact_id: UUID):
+        try:
+            auth, form = await form_for(request)
+
+            def save():
+                with connection() as conn, conn.transaction():
+                    creator_importance.set_manual(
+                        conn, auth["id"], contact_id, form.get("cm_id"),
+                        form.get("tier", ""), form.get("reason", ""),
+                    )
+
+            await run_in_threadpool(save)
+            return payload({"ok": True})
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
 

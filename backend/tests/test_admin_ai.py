@@ -17,6 +17,10 @@ def legacy_role_scenarios_use_explicit_acl(monkeypatch):
         "status": "active", "role": admin_reporting.admin_role_for(authorization_id),
         "role_active": True, "permissions": [],
     }))
+    monkeypatch.setattr(admin.creator_importance, "metrics", lambda _: {
+        "counts": {"pending": 0, "running": 0, "succeeded": 0, "failed": 0},
+        "usage": {"api_requests": 0, "input_tokens": 0, "output_tokens": 0},
+    })
 
 
 class _Connection:
@@ -113,6 +117,7 @@ def test_owner_can_view_only_safe_ai_config_fields(monkeypatch):
     assert [item["feature"] for item in contexts[-1][1]["configs"]] == [
         "creator_import", "creator_handle_matching", "creator_responsibility_matching",
         "creator_group_classification",
+        "creator_importance",
         "offhours_summary", "desktop_reply",
     ]
     for feature in ("contact_assessment", "contact_assignment", "creator_workflow"):
@@ -236,7 +241,9 @@ def test_summary_csrf_failure_does_not_save_or_schedule(monkeypatch):
     assert response.status_code == 400
 
 
-@pytest.mark.parametrize("feature", ["creator_handle_matching", "creator_responsibility_matching"])
+@pytest.mark.parametrize("feature", [
+    "creator_handle_matching", "creator_responsibility_matching", "creator_importance",
+])
 def test_matching_save_keeps_configuration_and_queue_invalidation_in_one_transaction(monkeypatch, feature):
     owner_id = uuid4()
     called = []

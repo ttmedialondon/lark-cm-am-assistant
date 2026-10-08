@@ -72,17 +72,25 @@ test("bilingual user labels are displayed literally in evidence", async t => {
 test("creator names open permitted profiles while a separate accessible icon opens Lark", async t => {
   const attack = '<img src=x onerror="window.compromised=true">';
   const data = {cms: [{id: "cm-1", name: "CM"}], selected_cm_id: "cm-1", can_select_cm: false,
-    can_view_unassigned: false, read_only: false, import_batches: [], page: 1, total_count: 3, total_pages: 1,
+    can_view_unassigned: false, can_view_importance: true, can_adjust_importance: true,
+    read_only: false, import_batches: [],
+    sort: "name", tier: "", importance_running: true, page: 1, total_count: 3, total_pages: 1,
     items: [
       {id: "person-1", kind: "confirmed", display_name: "Creator One", open_id: "ou_creator_one", profile_url: "/admin/contacts/ou_creator_one", handles: ["one"]},
       {id: "person-2", kind: "confirmed", display_name: "No identity", open_id: null, profile_url: null, handles: ["two"]},
       {id: "person-3", kind: "confirmed", display_name: attack, open_id: "javascript:alert(1)", profile_url: null, handles: ["three"]},
     ]};
+  const tierLabels = {focus: "重点", normal: "常规", pending: "待评估"};
+  for (const [i, tier] of ["focus", "normal", "pending"].entries()) data.items[i].importance = {
+    tier, tier_label: tierLabels[tier], phase_label: i === 0 ? "持续合作" : i === 1 ? "单次合作" : "",
+    grounds: i === 0 ? ["已确认持续合作安排。", "双方确认下一轮合作。", "这一条不应展示。"] : [],
+    cutoff_label: "10-08 13:00", gap_label: "", manual_tier: "", manual_reason: "",
+  };
   const rendered = spawnSync(path.join(backend, ".venv/bin/python"), ["-c",
     "import json,sys; from app.lark_api import private_chat_url; from jinja2 import Environment,FileSystemLoader,select_autoescape; data=json.load(sys.stdin); [item.update(private_chat_url=private_chat_url(item['open_id'])) for item in data['items']]; html=Environment(loader=FileSystemLoader('app/templates'),autoescape=select_autoescape()).get_template('creator_handles.html').render(authorization={'display_name':'CM'},creator_data=data,creator_tab='mine',creator_query='',csrf_token='fixture-csrf'); print(json.dumps({'data':data,'html':html}))"],
     {cwd: backend, input: JSON.stringify(data), encoding: "utf8"});
   assert.equal(rendered.status, 0, rendered.stderr);
-  const fixture = JSON.parse(rendered.stdout), state = {data: fixture.data, calls: [], larkRequests: []};
+  const fixture = JSON.parse(rendered.stdout), state = {data: fixture.data, calls: [], larkRequests: [], status: 200};
   const url = "https://applink.larksuite.com/client/chat/open?openId=ou_creator_one";
   const profileUrl = "http://localhost/admin/contacts/ou_creator_one";
   assert.equal(state.data.items[0].private_chat_url, url);
@@ -95,13 +103,19 @@ test("creator names open permitted profiles while a separate accessible icon ope
     const request = route.request(), target = new URL(request.url());
     if (target.origin !== "http://localhost") {
       if (target.origin === "https://applink.larksuite.com") state.larkRequests.push(request.url());
+      if (process.env.OH_SCREENSHOT_DIR && target.href.endsWith("/tabler.min.css")) return route.continue();
       return route.abort();
     }
     if (target.pathname === "/creators") return route.fulfill({contentType: "text/html", body: fixture.html});
     if (target.pathname.startsWith("/static/")) return route.fulfill({contentType: target.pathname.endsWith(".js") ? "text/javascript" : target.pathname.endsWith(".svg") ? "image/svg+xml" : "text/css", body: fs.readFileSync(path.join(backend, "app", target.pathname))});
     state.calls.push({method: request.method(), url: target.pathname, search: target.search});
     if (target.pathname === "/admin/contacts/ou_creator_one") return route.fulfill({contentType: "text/html", body: "<p>Creator One profile</p>"});
-    if (target.pathname === "/creators/data") return route.fulfill({json: state.data});
+    if (target.pathname === "/creators/data") {
+      state.data.sort = target.searchParams.get("sort") || "name";
+      state.data.tier = target.searchParams.get("tier") || "";
+      return route.fulfill({status: state.status,
+        json: state.status === 200 ? state.data : {error: "Fixture access no longer available"}});
+    }
     return route.abort();
   });
   await page.goto("http://localhost/creators");
@@ -109,6 +123,24 @@ test("creator names open permitted profiles while a separate accessible icon ope
   await rows.nth(2).waitFor();
   const names = rows.locator("td:nth-child(2) .fw-bold");
   assert.deepEqual(await names.allTextContents(), data.items.map(item => item.display_name));
+  assert.deepEqual(await rows.locator(".creator-importance-badge").allTextContents(), ["重点 · 持续合作", "常规 · 单次合作", "待评估"]);
+  await rows.first().locator(".creator-importance-detail > summary").click();
+  assert.equal(await rows.first().locator(".creator-importance-grounds li").count(), 2);
+  assert.equal(await page.getByText("这一条不应展示。", {exact: true}).count(), 0);
+  assert.equal(await page.getByText("截至 10-08 13:00", {exact: true}).count(), 3);
+  const polling = page.waitForResponse(response => response.url().includes("/creators/data?"));
+  state.data.importance_running = false;
+  await polling;
+  assert(state.calls.every(call => call.method === "GET"));
+  if (process.env.OH_SCREENSHOT_DIR) {
+    await page.screenshot({path: path.join(process.env.OH_SCREENSHOT_DIR, "creator-importance-desktop.png"), fullPage: true});
+    await page.setViewportSize({width: 390, height: 844});
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
+    assert.equal(await page.locator(".business-heading").count(), 1);
+    await page.screenshot({path: path.join(process.env.OH_SCREENSHOT_DIR, "creator-importance-mobile.png")});
+    await page.setViewportSize({width: 1280, height: 720});
+  }
   assert(await names.evaluateAll(elements => elements.every(element => element.tagName === "A")));
   assert.equal(await names.locator("img").count(), 0);
   assert.equal(await page.evaluate(() => window.compromised), undefined);
@@ -124,7 +156,7 @@ test("creator names open permitted profiles while a separate accessible icon ope
   assert.equal(page.url(), profileUrl);
   await page.goBack();
   await rows.nth(2).waitFor();
-  assert.equal(page.url(), "http://localhost/creators");
+  assert.equal(new URL(page.url()).pathname, "/creators");
   const link = rows.first().getByRole("link", {name: "在 Lark 中与 Creator One 私聊（新窗口）", exact: true});
   assert.equal(await link.getAttribute("href"), url);
   assert.equal(await link.getAttribute("title"), "在 Lark 中打开私聊");
@@ -175,6 +207,28 @@ test("creator names open permitted profiles while a separate accessible icon ope
   const search = new URLSearchParams(state.calls.at(-1).search);
   assert.equal(search.get("tab"), "mine");
   assert.equal(search.get("q"), "Creator");
+  for (const [key, value] of [["sort", "importance"], ["tier", "focus"]]) {
+    await Promise.all([
+      page.waitForResponse(response => response.url().includes("/creators/data?") && new URL(response.url()).searchParams.get(key) === value),
+      page.locator(`#creators-${key}`).selectOption(value),
+    ]);
+  }
+  const ranked = new URLSearchParams(state.calls.at(-1).search);
+  assert.equal(ranked.get("q"), "Creator"); assert.equal(ranked.get("sort"), "importance"); assert.equal(ranked.get("tier"), "focus");
+  for (const item of state.data.items) item.importance = null;
+  await page.locator("#creators-refresh").click();
+  await page.waitForFunction(() => [...document.querySelectorAll('.creator-importance-badge')].every(node => node.hidden));
+  assert.equal(await page.locator('.creator-importance-badge:visible').count(), 0);
+  state.status = 503;
+  await page.locator("#creators-refresh").click();
+  await page.getByText("Fixture access no longer available", {exact: true}).waitFor();
+  assert.equal(await rows.count(), 3);
+  state.status = 403;
+  await page.locator("#creators-refresh").click();
+  await page.waitForFunction(() => !document.querySelectorAll('#creators-rows tr').length);
+  assert.equal(await page.locator('#creators-evidence-body').textContent(), "");
+  assert.equal(await page.locator('#creators-initial').textContent(), "");
+  assert(!(await page.locator('#creators-importance-toolbar').isVisible()));
   assert(state.calls.every(call => call.method === "GET"));
   assert.deepEqual(errors, []);
 });

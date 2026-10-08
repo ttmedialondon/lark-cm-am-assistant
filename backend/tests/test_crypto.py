@@ -5,7 +5,7 @@ import pytest
 from cryptography.exceptions import InvalidTag
 
 from app import creator_data
-from app.crypto import TokenCipher, message_body_cipher
+from app.crypto import TokenCipher, message_body_cipher, message_body_fingerprint
 
 
 def test_token_cipher_round_trip_and_nonce_changes() -> None:
@@ -20,6 +20,9 @@ def test_token_cipher_round_trip_and_nonce_changes() -> None:
 
 def test_message_bodies_use_a_separate_encryption_domain() -> None:
     master = b"a" * 32
+    assert message_body_fingerprint(master, "同一消息") == message_body_fingerprint(master, "同一消息")
+    assert message_body_fingerprint(master, "同一消息") != message_body_fingerprint(master, "已编辑消息")
+    assert message_body_fingerprint(master, "同一消息") != message_body_fingerprint(b"b" * 32, "同一消息")
     sealed = message_body_cipher(master).encrypt('{"text":"customer message"}')
 
     assert message_body_cipher(master).decrypt(sealed) == '{"text":"customer message"}'

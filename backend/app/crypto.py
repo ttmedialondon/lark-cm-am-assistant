@@ -39,3 +39,9 @@ def message_body_cipher(master_key: bytes) -> TokenCipher:
 
     body_key = hmac.digest(master_key, b"lark-message-stats/message-body-key/v1", "sha256")
     return TokenCipher(body_key, _MESSAGE_BODY_AAD)
+
+
+def message_body_fingerprint(master_key: bytes, plaintext: str) -> str:
+    """Stable, keyed content identity; fresh encryption nonces are not message edits."""
+    key = hmac.digest(master_key, b"lark-message-stats/message-fingerprint/v1", "sha256")
+    return hmac.digest(key, plaintext.encode("utf-8"), "sha256").hex()
