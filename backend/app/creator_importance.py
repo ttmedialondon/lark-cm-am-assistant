@@ -393,6 +393,9 @@ def build_batch(conn, job, settings, state):
         elif row["body_fingerprint"] != fp:
             raise ValueError("Message content fingerprint changed outside ingestion.")
         text, incomplete = offhours_summary._body(row, body_cipher, names)
+        # Rough maintenance ranking can use the prose without guessing an unresolved mention's identity.
+        if incomplete and "[未解析的@用户]" in text:
+            incomplete = not any(ch.isalnum() for ch in text.replace("[未解析的@用户]", ""))
         ref = "E" + _hash(key)[:20]
         parent = by_key.get((row["chat_id"], row.get("parent_id")))
         creator = str(row["contact_id"]) == str(contact_id)

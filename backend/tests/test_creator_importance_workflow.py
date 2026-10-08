@@ -308,6 +308,32 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
     pg.execute("UPDATE chat_messages SET is_deleted=TRUE,body_ciphertext=NULL WHERE message_id='b2'")
     assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "pending"
     pg.execute("ROLLBACK TO SAVEPOINT readable_without_facts")
+    # Unresolved rich-text @ must not discard readable prose, but it proves no recipient identity.
+    for prose, parent, readable in (("Please confirm Friday's video", None, True),
+                                    ("", None, False),
+                                    ("，👍", None, False),
+                                    ("Please confirm Friday's video", "missing_original", False)):
+        pg.execute("SAVEPOINT rough_mentions")
+        flow.message("rough_at", "", cm=flow.other, creator=True,
+                     at=flow.now - timedelta(days=80), parent=parent)
+        raw = json.dumps({"content": [[{"tag": "at", "user_id": "ou_unknown"},
+                                        {"tag": "text", "text": prose}]]})
+        pg.execute("UPDATE chat_messages SET message_type='post',body_ciphertext=%s,body_fingerprint=%s "
+                   "WHERE message_id='rough_at'", (flow.cipher.encrypt(raw),
+                   message_body_fingerprint(flow.settings.token_encryption_key, raw)))
+        original = pg.execute("SELECT * FROM chat_messages WHERE message_id='rough_at'").fetchone()
+        assert importance.offhours_summary._body(original, flow.cipher)[1] is True
+        job = {**other_job, "needs_history": False, "checkpoint_ciphertext": None,
+               "pending_messages": {"other_private/rough_at": {"chat_id": "other_private",
+                                                              "message_id": "rough_at"}}}
+        material = importance.build_batch(pg, job, flow.settings, importance._state(job, flow.settings))
+        assert bool(material["pack"]) is readable
+        if readable:
+            message = material["pack"]["messages"][0]
+            assert message["role"] == "creator" and message["author_id"] == "ou_creator"
+            assert message["context_complete"] and "[未解析的@用户]" in message["text"]
+        pg.execute("ROLLBACK TO SAVEPOINT rough_mentions")
+        pg.execute("RELEASE SAVEPOINT rough_mentions")
     with pytest.raises(PermissionError):
         creator_access.access(pg, flow.other, flow.owner, read_only=True)
     with pytest.raises(PermissionError):
