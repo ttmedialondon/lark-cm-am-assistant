@@ -243,7 +243,7 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
     profiles = {
         r["responsible_authorization_id"]: r for r in pg.execute("SELECT * FROM creator_importance_profiles").fetchall()
     }
-    assert profiles[flow.owner]["auto_tier"] == "focus" and profiles[flow.other]["auto_tier"] == "normal"
+    assert profiles[flow.owner]["auto_tier"] == "priority" and profiles[flow.other]["auto_tier"] == "normal"
     assert profiles[flow.owner]["last_substantive_progress_at"] == flow.now - timedelta(days=20) + timedelta(minutes=1)
     assert all(r["coverage"]["history_complete"] for r in profiles.values())
     assert all(r["coverage"]["source_history_complete"] for r in profiles.values())
@@ -251,8 +251,8 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
     for pack in flow.calls:
         private = "own_private" if pack["cm_id"] == str(flow.owner) else "other_private"
         assert all(m["chat_id"] == private for m in pack["messages"])
-    assert importance.view_for(pg, flow.person, flow.owner, flow.settings)["tier"] == "focus"
-    assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "normal"
+    assert importance.view_for(pg, flow.person, flow.owner, flow.settings)["tier"] == "priority"
+    assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "dormant"
     assert profiles[flow.owner]["coverage"]["has_readable"]
     assert profiles[flow.owner]["coverage"]["priority"]["business_days"]
     join, args = importance.roster_sql(flow.other)
@@ -260,7 +260,7 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
     pg.execute("UPDATE creator_importance_profiles SET auto_tier='focus' "
                "WHERE responsible_authorization_id=%s", (flow.other,))
     assert pg.execute("SELECT ip.effective_tier FROM contacts c" + join + " WHERE c.id=%s",
-                      [*args, flow.person]).fetchone()["effective_tier"] == "normal"
+                      [*args, flow.person]).fetchone()["effective_tier"] == "dormant"
     pg.execute("SAVEPOINT current_priority_metadata")
     today = flow.now.astimezone(importance.LONDON).date().isoformat()
     yesterday = (flow.now.astimezone(importance.LONDON).date() - timedelta(days=1)).isoformat()
@@ -274,7 +274,7 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
     assert pg.execute("SELECT ip.effective_tier,ip.recency_rank,ip.business_days,ip.has_history,"
                       "ip.last_substantive_progress_at "
                       "FROM contacts c" + join + " WHERE c.id=%s", [*args, flow.person]).fetchone() == {
-                          "effective_tier": "normal", "recency_rank": 2, "business_days": 2, "has_history": True,
+                          "effective_tier": "dormant", "recency_rank": 2, "business_days": 2, "has_history": True,
                           "last_substantive_progress_at": flow.now - timedelta(days=35),
                       }
     pg.execute("UPDATE creator_importance_profiles SET coverage=jsonb_set(coverage,'{priority,primary_at}',%s::jsonb) "
@@ -282,14 +282,14 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
                    (flow.now - timedelta(days=20)).isoformat()), flow.other))
     assert pg.execute("SELECT ip.effective_tier,ip.recency_rank,ip.last_substantive_progress_at "
                       "FROM contacts c" + join + " WHERE c.id=%s", [*args, flow.person]).fetchone() == {
-                          "effective_tier": "focus", "recency_rank": 1,
+                          "effective_tier": "priority", "recency_rank": 1,
                           "last_substantive_progress_at": flow.now - timedelta(days=20),
                       }
     pg.execute("UPDATE creator_importance_profiles SET last_substantive_progress_at=%s "
                "WHERE responsible_authorization_id=%s", (flow.now - timedelta(minutes=2), flow.other))
     assert pg.execute("SELECT ip.effective_tier,ip.recency_rank,ip.last_substantive_progress_at "
                       "FROM contacts c" + join + " WHERE c.id=%s", [*args, flow.person]).fetchone() == {
-                          "effective_tier": "focus", "recency_rank": 0,
+                          "effective_tier": "priority", "recency_rank": 0,
                           "last_substantive_progress_at": flow.now - timedelta(minutes=2),
                       }
     pg.execute("ROLLBACK TO SAVEPOINT current_priority_metadata")
@@ -301,13 +301,32 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
         "facts": [], "sources": {proof["ref"]: proof}, "readable_ref": proof["ref"],
         "seen": {}, "unreadable": 0, "gaps": 0,
     }, flow.settings, history_complete=True)
-    assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "normal"
+    assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "dormant"
     assert pg.execute("SELECT ip.effective_tier FROM contacts c" + join + " WHERE c.id=%s",
-                      [*args, flow.person]).fetchone()["effective_tier"] == "normal"
+                      [*args, flow.person]).fetchone()["effective_tier"] == "dormant"
     flow.enable(False)
     pg.execute("UPDATE chat_messages SET is_deleted=TRUE,body_ciphertext=NULL WHERE message_id='b2'")
     assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "pending"
     pg.execute("ROLLBACK TO SAVEPOINT readable_without_facts")
+    pg.execute("SAVEPOINT activity_metadata")
+    flow.enable(False)
+    pg.execute("UPDATE creator_importance_profiles SET auto_valid=TRUE,facts_ciphertext=NULL,sources='[]',"
+               "coverage='{}' WHERE responsible_authorization_id=%s", (flow.other,))
+    pg.execute("UPDATE chat_messages SET message_create_time=%s WHERE chat_id='other_private'",
+               (flow.now - timedelta(days=45),))
+    assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "dormant"
+    assert pg.execute("SELECT ip.effective_tier FROM contacts c" + join + " WHERE c.id=%s",
+                      [*args, flow.person]).fetchone()["effective_tier"] == "dormant"
+    assert importance.view_for(pg, flow.person, flow.owner, flow.settings)["tier"] == "priority"
+    # A new media message is contact even without readable text; it prevents a false inactivity label.
+    flow.message("activity_image", "", cm=flow.other, creator=True, at=flow.now - timedelta(hours=1))
+    pg.execute("UPDATE chat_messages SET message_type='image',body_ciphertext=NULL WHERE message_id='activity_image'")
+    assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "pending"
+    pg.execute("UPDATE chat_messages SET message_create_time=NOW()+INTERVAL '1 day' WHERE message_id='activity_image'")
+    assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "dormant"
+    pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (flow.other,))
+    assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "pending"
+    pg.execute("ROLLBACK TO SAVEPOINT activity_metadata")
     # Unresolved rich-text @ must not discard readable prose, but it proves no recipient identity.
     for prose, parent, readable in (("Please confirm Friday's video", None, True),
                                     ("", None, False),
@@ -413,7 +432,7 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
         ).fetchone()["manual_tier"]
         == "normal"
     )
-    assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "normal"
+    assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "dormant"
 
 
 def test_paid_retry_cache_and_stale_results_keep_billing_without_repeat(pg, ranking_flow):

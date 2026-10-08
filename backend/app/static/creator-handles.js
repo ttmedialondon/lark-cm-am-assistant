@@ -186,7 +186,7 @@
       const editor = node("details", "", "creator-importance-editor"); editor.append(node("summary", "人工调整"));
       const form = node("form", "", "mt-2"), manualTier = node("select", "", "form-select form-select-sm"), manualReason = node("input", "", "form-control form-control-sm mt-2");
       manualTier.setAttribute("aria-label", "人工维护优先级");
-      for (const [value, label] of [["", "使用自动评估"], ["focus", "重点"], ["normal", "常规"], ["pending", "待评估"]]) {
+      for (const [value, label] of [["", "使用自动评估"], ["focus", "重点"], ["priority", "优先"], ["normal", "常规"], ["dormant", "久未联系"], ["pending", "待评估"]]) {
         const option = node("option", label); option.value = value; manualTier.append(option);
       }
       manualReason.maxLength = 240; manualReason.placeholder = "调整依据"; manualReason.setAttribute("aria-label", "人工调整依据");
@@ -249,7 +249,7 @@
       const importance = item.importance;
       parts.importanceBadge.hidden = !importance;
       if (importance) {
-        parts.importanceBadge.dataset.tier = ["focus", "normal"].includes(importance.tier) ? importance.tier : "pending";
+        parts.importanceBadge.dataset.tier = ["focus", "priority", "normal", "dormant"].includes(importance.tier) ? importance.tier : "pending";
         parts.importanceBadge.textContent = [importance.tier_label || "待评估", importance.manual_tier ? "人工" : ""].filter(Boolean).join(" · ");
         parts.grounds.replaceChildren(...(importance.grounds || []).slice(0, 2).map(text => node("li", text)));
         parts.grounds.hidden = !parts.grounds.childElementCount;

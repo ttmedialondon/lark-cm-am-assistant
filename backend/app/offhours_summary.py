@@ -1155,7 +1155,7 @@ def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None):
     )
     view["events"].sort(key=lambda event: (
         {"P0": 0, "P1": 1, "P2": 2, None: 3, "P3": 4}[event["priority"]],
-        importance_order.get(event.get("contact_id"), 2), event["id"],
+        importance_order.get(event.get("contact_id"), creator_importance.TIER_ORDER["pending"]), event["id"],
     ))
     conn.execute(
         "INSERT INTO audit_events(id, authorization_id, action, metadata) VALUES(%s,%s,%s,%s::jsonb)",

@@ -20,7 +20,8 @@ FEATURE = "creator_importance"
 HISTORY_DAYS = 90
 MAX_MESSAGES = 80
 MAX_CHARS = 24_000
-TIERS = {"focus": "重点", "normal": "常规", "pending": "待评估"}
+TIERS = {"focus": "重点", "priority": "优先", "normal": "常规", "dormant": "久未联系", "pending": "待评估"}
+TIER_ORDER = {tier: index for index, tier in enumerate(TIERS)}
 PHASES = {"ongoing": "持续合作", "single": "单次合作", "history": "历史合作", "intent": "具体意向",
           "unknown": "资料不足"}
 LONDON = ZoneInfo("Europe/London")
@@ -77,23 +78,63 @@ _PROFILE_VALID = "creator_importance_is_eligible(p.contact_id,p.responsible_auth
 def roster_sql(cm_id):
     join = """ LEFT JOIN LATERAL(SELECT
         COALESCE(p.manual_tier,CASE WHEN v.valid THEN
-          CASE WHEN s.primary_at>=NOW()-INTERVAL '30 days' AND s.primary_at<=NOW() THEN 'focus'
+          CASE WHEN s.primary_at BETWEEN NOW()-INTERVAL '7 days' AND NOW() THEN 'focus'
+            WHEN s.primary_at BETWEEN NOW()-INTERVAL '30 days' AND NOW() OR days.business_days>=3 THEN 'priority'
+            WHEN s.last_message_at<NOW()-INTERVAL '30 days' THEN 'dormant'
             WHEN COALESCE((p.coverage->>'has_readable')::boolean,FALSE) THEN 'normal' ELSE 'pending' END
           END,'pending') effective_tier,
         CASE WHEN v.valid THEN CASE WHEN s.signal_at BETWEEN NOW()-INTERVAL '7 days' AND NOW() THEN 0
           WHEN s.signal_at BETWEEN NOW()-INTERVAL '30 days' AND NOW() THEN 1 ELSE 2 END ELSE 2 END recency_rank,
-        CASE WHEN v.valid THEN (SELECT count(DISTINCT day)
-          FROM jsonb_array_elements_text(COALESCE(p.coverage->'priority'->'business_days','[]'::jsonb)) day
-          WHERE day::date BETWEEN (NOW() AT TIME ZONE 'Europe/London')::date-29
-            AND (NOW() AT TIME ZONE 'Europe/London')::date) ELSE 0 END business_days,
+        CASE WHEN v.valid THEN days.business_days ELSE 0 END business_days,
         CASE WHEN v.valid THEN s.signal_at END last_substantive_progress_at,
+        CASE WHEN v.valid THEN s.last_message_at END last_message_at,
         v.valid AND COALESCE((p.coverage->'priority'->>'historical')::boolean,FALSE) has_history
         FROM creator_importance_profiles p
         CROSS JOIN LATERAL(SELECT (""" + _PROFILE_VALID + """) valid) v
         CROSS JOIN LATERAL(SELECT
           (p.coverage->'priority'->>'primary_at')::timestamptz primary_at) times
+        CROSS JOIN LATERAL(SELECT count(DISTINCT day) business_days
+          FROM jsonb_array_elements_text(COALESCE(p.coverage->'priority'->'business_days','[]'::jsonb)) day
+          WHERE day::date BETWEEN (NOW() AT TIME ZONE 'Europe/London')::date-29
+            AND (NOW() AT TIME ZONE 'Europe/London')::date) days
+        LEFT JOIN LATERAL(SELECT MAX(message_create_time) last_message_at FROM (
+          (SELECT latest.message_create_time FROM lark_identities target
+            CROSS JOIN LATERAL(SELECT m.message_create_time FROM chat_messages m
+              WHERE m.sender_open_id=target.open_id
+              AND m.sender_type='user' AND NOT m.is_deleted AND m.message_create_time<=NOW()
+              AND EXISTS(SELECT 1 FROM authorization_message_observations o
+                JOIN authorization_chats ac ON ac.authorization_id=o.authorization_id AND ac.chat_id=o.chat_id
+                JOIN authorizations a ON a.id=o.authorization_id JOIN chats ch ON ch.chat_id=o.chat_id
+                WHERE o.chat_id=m.chat_id AND o.message_id=m.message_id
+                  AND o.authorization_id=p.responsible_authorization_id AND a.status='active'
+                  AND a.body_consent_at IS NOT NULL AND o.observed_at>=a.body_consent_at
+                  AND ac.is_visible AND ac.sync_enabled AND COALESCE(ch.chat_status,'normal')='normal'
+                -- Keep the indexed sender/time lookup ahead of the authorization check, not a scan of every chat.
+                OFFSET 0)
+              ORDER BY m.message_create_time DESC LIMIT 1) latest
+            WHERE target.contact_id=p.contact_id AND target.identity_type='user'
+            ORDER BY latest.message_create_time DESC LIMIT 1)
+          UNION ALL
+          (SELECT latest.message_create_time FROM lark_identities target
+            JOIN authorization_chats ac ON ac.p2p_counterpart_open_id=target.open_id
+            JOIN authorizations a ON a.id=ac.authorization_id
+            JOIN chats ch ON ch.chat_id=ac.chat_id
+            CROSS JOIN LATERAL(SELECT m.message_create_time FROM chat_messages m
+              JOIN authorization_message_observations o ON o.chat_id=m.chat_id AND o.message_id=m.message_id
+              WHERE m.chat_id=ac.chat_id AND m.sender_open_id=a.open_id AND o.authorization_id=a.id
+              AND o.observed_at>=a.body_consent_at AND m.sender_type='user'
+              AND NOT m.is_deleted AND m.message_create_time<=NOW()
+              ORDER BY m.message_create_time DESC LIMIT 1) latest
+            WHERE target.contact_id=p.contact_id AND target.identity_type='user'
+              AND a.id=p.responsible_authorization_id AND a.status='active' AND a.body_consent_at IS NOT NULL
+              AND ac.is_visible AND ac.sync_enabled AND COALESCE(ch.chat_status,'normal')='normal'
+            ORDER BY latest.message_create_time DESC LIMIT 1)
+          ) activity) activity ON v.valid
         CROSS JOIN LATERAL(SELECT times.*,
-          GREATEST(p.last_substantive_progress_at,times.primary_at) signal_at) s
+          GREATEST(p.last_substantive_progress_at,times.primary_at) signal_at,
+          GREATEST(activity.last_message_at,(SELECT MAX((source->>'created_at')::timestamptz)
+            FROM jsonb_array_elements(p.sources) source WHERE (source->>'created_at')::timestamptz<=NOW()))
+            last_message_at) s
         WHERE p.contact_id=c.id AND p.responsible_authorization_id=%s
         AND creator_importance_is_eligible(p.contact_id,p.responsible_authorization_id)
       ) ip ON TRUE """
@@ -106,7 +147,7 @@ def tier_order(conn, contact_ids, cm_id):
     join, args = roster_sql(cm_id)
     rows = conn.execute("SELECT c.id,COALESCE(ip.effective_tier,'pending') tier FROM contacts c " + join +
                         " WHERE c.id=ANY(%s::uuid[])", [*args, sorted(set(contact_ids))]).fetchall()
-    return {str(row["id"]): {"focus": 0, "normal": 1, "pending": 2}[row["tier"]] for row in rows}
+    return {str(row["id"]): TIER_ORDER[row["tier"]] for row in rows}
 
 
 def _source_checks(conn, refs, contact_id, cm_id, *, lock=False):
@@ -196,7 +237,11 @@ def view_for(conn, contact_id, cm_id, settings, *, actor_id=None):
                 and not row["coverage"].get("history_complete") else
                 "依据已变化，等待更新" if row["evaluated_at"] else "尚未自动评估"}
     material = json.loads(_cipher(settings).decrypt(row["facts_ciphertext"])) if row["facts_ciphertext"] else []
-    result = facts.rank(material, readable=row["coverage"].get("has_readable", False))
+    join, args = roster_sql(cm_id)
+    activity = conn.execute("SELECT ip.last_message_at FROM contacts c " + join + " WHERE c.id=%s",
+                            [*args, contact_id]).fetchone()
+    result = facts.rank(material, readable=row["coverage"].get("has_readable", False),
+                        last_message_at=activity["last_message_at"])
     tier = row["manual_tier"] or result["tier"]
     coverage = row["coverage"]
     output.update(tier=tier, tier_label=TIERS[tier], phase_label=PHASES[result["phase"]],

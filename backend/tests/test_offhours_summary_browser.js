@@ -125,6 +125,7 @@ test("creator names open permitted profiles while a separate accessible icon ope
   const names = rows.locator("td:nth-child(2) .fw-bold");
   assert.deepEqual(await names.allTextContents(), data.items.map(item => item.display_name));
   assert.equal(await page.locator("#creators-sort").inputValue(), "importance");
+  assert.deepEqual(await page.locator("#creators-tier option").allTextContents(), ["全部优先级", "重点", "优先", "常规", "久未联系", "待评估"]);
   assert.deepEqual(await rows.locator(".creator-importance-badge").allTextContents(), ["重点", "常规", "待评估"]);
   assert.equal(await rows.first().locator(".creator-importance-detail > summary").textContent(), "维护依据");
   await rows.first().locator(".creator-importance-detail > summary").click();
@@ -134,6 +135,7 @@ test("creator names open permitted profiles while a separate accessible icon ope
   assert(!(await manual.evaluate(element => element.open)));
   await manual.locator("summary").click();
   assert.equal(await manual.getByRole("combobox", {name: "人工维护优先级"}).count(), 1);
+  assert.deepEqual(await manual.locator("option").allTextContents(), ["使用自动评估", "重点", "优先", "常规", "久未联系", "待评估"]);
   await manual.locator("summary").click();
   await rows.nth(2).locator(".creator-importance-detail > summary").click();
   assert.equal(await rows.nth(2).getByText("尚未评估", {exact: true}).count(), 1);
@@ -144,6 +146,16 @@ test("creator names open permitted profiles while a separate accessible icon ope
   const polling = page.waitForResponse(response => response.url().includes("/creators/data?"));
   state.data.importance_running = false;
   await polling;
+  Object.assign(state.data.items[0].importance, {tier: "priority", tier_label: "优先"});
+  Object.assign(state.data.items[1].importance, {tier: "dormant", tier_label: "久未联系",
+    grounds: ["已同步记录已42天无相关消息", "最近消息：2026-08-27"], gap_label: "历史同步范围不足"});
+  await page.locator("#creators-refresh").click();
+  await page.waitForFunction(() => document.querySelectorAll('.creator-importance-badge[data-tier="dormant"]').length === 1);
+  assert.deepEqual(await rows.locator(".creator-importance-badge").allTextContents(), ["优先", "久未联系", "待评估"]);
+  assert.equal(await rows.first().locator(".creator-importance-badge").getAttribute("data-tier"), "priority");
+  await rows.nth(1).locator(".creator-importance-detail > summary").click();
+  assert(await rows.nth(1).getByText("已同步记录已42天无相关消息", {exact: true}).isVisible());
+  assert(await rows.nth(1).getByText("历史同步范围不足", {exact: true}).isVisible());
   assert(state.calls.every(call => call.method === "GET"));
   if (process.env.OH_SCREENSHOT_DIR) {
     await page.screenshot({path: path.join(process.env.OH_SCREENSHOT_DIR, "creator-importance-desktop.png"), fullPage: true});
@@ -220,7 +232,7 @@ test("creator names open permitted profiles while a separate accessible icon ope
   const search = new URLSearchParams(state.calls.at(-1).search);
   assert.equal(search.get("tab"), "mine");
   assert.equal(search.get("q"), "Creator");
-  for (const [key, value] of [["sort", "name"], ["sort", "importance"], ["tier", "focus"]]) {
+  for (const [key, value] of [["sort", "name"], ["sort", "importance"], ["tier", "priority"], ["tier", "dormant"], ["tier", "focus"]]) {
     await Promise.all([
       page.waitForResponse(response => response.url().includes("/creators/data?") && new URL(response.url()).searchParams.get(key) === value),
       page.locator(`#creators-${key}`).selectOption(value),
@@ -422,7 +434,7 @@ test("reply drafts preserve edits, translate before copying, and block stale or 
   assert(await page.getByRole("button", {name: "复制回复", exact: true}).isDisabled());
   assert(!(await page.locator(".oh-reply-translation").textContent()).includes("请确认对应哪笔订单"));
   await page.getByText("修改后的中文翻译，金额仍为 £200。", {exact: true}).waitFor();
-  await page.getByRole("button", {name: "刷新结果", exact: true}).click();
+  await page.getByRole("button", {name: "刷新", exact: true}).click();
   assert.equal(await editor.inputValue(), newText);
   await page.getByRole("button", {name: "复制回复", exact: true}).click();
   await page.getByText("已复制回复正文；未发送，也未改变事件处理状态。", {exact: true}).waitFor();

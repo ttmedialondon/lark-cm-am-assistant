@@ -351,14 +351,17 @@ def test_save_enabled_immediately_queues_claims_and_stores_encrypted_summary(pg,
     if roster_kind == "current":
         from app import creator_importance
         with monkeypatch.context() as patch:
-            patch.setattr(creator_importance, "tier_order", lambda *_: {"focus": 0, "normal": 1})
+            patch.setattr(creator_importance, "tier_order", lambda *_: creator_importance.TIER_ORDER)
             patch.setattr(summary_dialogues, "view_events", lambda *_a, **_k: [
                 {"id": "p2_focus", "priority": "P2", "contact_id": "focus"},
                 {"id": "p0_normal", "priority": "P0", "contact_id": "normal"},
                 {"id": "p0_focus", "priority": "P0", "contact_id": "focus"},
+                {"id": "p0_priority", "priority": "P0", "contact_id": "priority"},
+                {"id": "p0_dormant", "priority": "P0", "contact_id": "dormant"},
+                {"id": "p0_unknown", "priority": "P0", "contact_id": "unknown"},
             ])
             assert [event["id"] for event in ai.get_summary_view(pg, s.ids["owner"])["events"]] == [
-                "p0_focus", "p0_normal", "p2_focus",
+                "p0_focus", "p0_priority", "p0_normal", "p0_dormant", "p0_unknown", "p2_focus",
             ]
     s.save(key="")
     ai.schedule_if_due(pg, force=True)

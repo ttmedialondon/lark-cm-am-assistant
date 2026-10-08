@@ -11,7 +11,7 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1, sort="importan
     """Current library: Excel import candidates and confirmed people."""
     query = str(query or "").strip()[:120]
     sort = sort if sort in {"name", "importance"} and tab == "mine" else "name"
-    tier = tier if tier in {"focus", "normal", "pending"} and tab == "mine" else ""
+    tier = tier if tier in creator_importance.TIERS and tab == "mine" else ""
     page = max(1, min(int(page), 10000))
     with connection() as conn, conn.transaction():
         unassigned = tab == 'unassigned'
@@ -72,7 +72,8 @@ def page_data(actor_id, cm_id=None, tab="mine", query="", page=1, sort="importan
                     args.append(tier)
                 if sort == "importance":
                     order = """CASE COALESCE(ip.effective_tier,'pending') WHEN 'focus' THEN 0
-                        WHEN 'normal' THEN 1 ELSE 2 END,ip.recency_rank,ip.business_days DESC,
+                        WHEN 'priority' THEN 1 WHEN 'normal' THEN 2 WHEN 'dormant' THEN 3 ELSE 4 END,
+                        ip.recency_rank,ip.business_days DESC,
                         ip.last_substantive_progress_at DESC NULLS LAST,ip.has_history DESC,
                         lower(c.display_name),c.id"""
             if query:

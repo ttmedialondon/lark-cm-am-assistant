@@ -12,7 +12,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PROMPT_VERSION = "creator-importance-facts-v2.0.2"
-RULE_VERSION = "creator-importance-v2.0.5"
+RULE_VERSION = "creator-importance-v2.0.6"
 MAX_FACTS, MAX_REFS = 12, 8
 KINDS = ("intent", "opportunity", "agreed", "ongoing", "completed", "progress", "interaction",
          "cancelled", "uncertain")
@@ -460,7 +460,7 @@ def merge_facts(previous, incoming):
     return sorted(facts.values(), key=lambda f: (_time(f["occurred_at"]), f["key"], _ORDER[f["kind"]], f["refs"]))
 
 
-def rank(facts, now=None, *, readable=False):
+def rank(facts, now=None, *, readable=False, last_message_at=None):
     """Current maintenance priority from grounded events, never message volume or model confidence."""
     now = _time(now) if now is not None else datetime.now(UTC)
     groups = defaultdict(list)
@@ -534,7 +534,6 @@ def rank(facts, now=None, *, readable=False):
     else:
         selected = intent
         phase = "intent" if intent else "unknown"
-    tier = "focus" if current else "normal" if readable else "pending"
     selected.sort(key=lambda row: (_time(row["at"]), row["object"]), reverse=True)
     if active:
         phase = selected[0]["phase"]
@@ -543,20 +542,33 @@ def rank(facts, now=None, *, readable=False):
     business_dates = sorted(day for day in business_dates if datetime.fromisoformat(day).date() <= today)
     recent_business_dates = [day for day in business_dates
                              if datetime.fromisoformat(day).date() >= recent_date]
+    last_message_at = _time(last_message_at) if last_message_at else None
+    if last_message_at and last_message_at > now:
+        last_message_at = None
+    inactive = last_message_at is not None and last_message_at < now - timedelta(days=30)
+    tier = ("focus" if current and _time(primary_at) >= now - timedelta(days=7) else
+            "priority" if current or len(recent_business_dates) >= 3 else
+            "dormant" if inactive else "normal" if readable else "pending")
     priority = {"primary_at": primary_at, "business_at": business_at,
                 "business_days": business_dates, "historical": historical}
-    if tier == "focus":
+    if current:
         lead = selected[0]
         grounds = [f"{lead['object'][:48]}：{lead['label']}"]
         latest = max((at for at in (progress_at, primary_at) if at), key=_time)
         latest = _time(latest).astimezone(LONDON).strftime("%m-%d")
         grounds.append(f"近30天业务交流{len(recent_business_dates)}天 · 最近推进{latest}")
+    elif tier == "priority":
+        grounds = [f"近30天业务交流{len(recent_business_dates)}天", "近期业务交流较频繁"]
+    elif tier == "dormant":
+        grounds = [f"已同步记录已{(now - last_message_at).days}天无相关消息",
+                   f"最近消息：{last_message_at.astimezone(LONDON).strftime('%Y-%m-%d')}"]
     elif tier == "normal":
         grounds = ["近期无重点事项"] + (["已有历史合作记录"] if historical else [])
     else:
         grounds = ["尚无完整可读资料"]
     return {"tier": tier, "phase": phase, "last_progress_at": progress_at,
             "grounds": grounds,
-            "needs_update": bool(readable and business_at and _time(business_at) < now - timedelta(days=30)),
+            "needs_update": bool(tier != "dormant" and readable and business_at
+                                 and _time(business_at) < now - timedelta(days=30)),
             "primary_at": primary_at, "recent_business_dates": recent_business_dates,
             "has_history": historical, "priority": priority}

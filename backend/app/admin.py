@@ -85,7 +85,7 @@ AI_FEATURES = {
     },
     "creator_importance": {
         "title": "维护优先级",
-        "description": "根据本人授权聊天判断维护优先级，分为重点、常规、待评估；不依赖 Curva 或销量。",
+        "description": "根据本人授权聊天判断重点、优先、常规、久未联系；材料不足保留待评估，不依赖 Curva 或销量。",
         "enabled_label": "开启维护优先级评估",
         "processing_label": "首次历史分析，之后增量更新",
     },

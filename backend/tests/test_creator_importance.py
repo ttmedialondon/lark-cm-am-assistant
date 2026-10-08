@@ -1,7 +1,7 @@
 """Grounded cooperation lifecycle rules; queue and authorization checks extend this file."""
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -83,7 +83,7 @@ def test_weak_claims_and_unrelated_cancellations_do_not_overwrite_valid_facts():
 
 def test_fact_protocol_rejects_unknown_and_third_party_evidence():
     assert facts.PROMPT_VERSION == "creator-importance-facts-v2.0.2"
-    assert facts.RULE_VERSION == "creator-importance-v2.0.5"
+    assert facts.RULE_VERSION == "creator-importance-v2.0.6"
     pack = _pack(("creator", "I'd like to hear about the Acme product."))
     with pytest.raises(ValueError, match="refs"):
         facts.validate({"facts": [_fact("intent", ["missing"])]}, pack)
@@ -191,6 +191,21 @@ def test_current_opportunity_and_bilateral_business_days_drive_maintenance_not_v
     assert support["grounds"] == ["近期无重点事项"]
     with_support = facts.rank(facts.merge_facts(opportunity, interaction), datetime(2026, 8, 5, tzinfo=UTC))
     assert with_support["grounds"][1] == "近30天业务交流4天 · 最近推进08-02"
+
+    primary = datetime.fromisoformat(opportunity[0]["occurred_at"])
+    assert facts.rank(opportunity, primary + timedelta(days=7))["tier"] == "focus"
+    assert facts.rank(opportunity, primary + timedelta(days=7, seconds=1))["tier"] == "priority"
+    assert facts.rank(opportunity, primary + timedelta(days=30))["tier"] == "priority"
+    assert facts.rank(opportunity, primary + timedelta(days=30, seconds=1))["tier"] == "normal"
+    frequent = [{**interaction[0], "business_dates": ["2026-08-03", "2026-08-04", "2026-08-05",
+                                                      "2026-08-05", "2026-08-06", "2020-01-01"]}]
+    assert facts.rank(frequent, datetime(2026, 8, 5, tzinfo=UTC))["tier"] == "priority"
+    dormant = facts.rank([], later, last_message_at=primary)
+    assert dormant["tier"] == "dormant" and "39天" in dormant["grounds"][0]
+    assert not dormant["needs_update"]
+    assert facts.rank([], later, last_message_at=later + timedelta(days=1))["tier"] == "pending"
+    assert facts.rank([], later)["tier"] == "pending"
+    assert facts.rank(opportunity, primary + timedelta(days=7), last_message_at=primary)["tier"] == "focus"
 
     one_sided = _pack(("cm", "A one-way Acme campaign announcement."))
     downgraded = facts.validate({"facts": [_fact("opportunity", ["E0"])]}, one_sided)

@@ -87,12 +87,17 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
     assert focus.status_code == 200 and focus.json()["total_count"] == 1
     assert focus.json()["items"][0]["importance"]["manual_tier"] == "focus"
     assert client.get(f"/creators/data?cm_id={cm}&tier=normal").json()["total_count"] == 0
+    for added_tier in ("priority", "dormant"):
+        assert client.post(url, data={**fields, "tier": added_tier}).status_code == 200
+        selected = client.get(f"/creators/data?cm_id={cm}&tier={added_tier}").json()
+        assert selected["total_count"] == 1 and selected["items"][0]["importance"]["tier"] == added_tier
+    assert client.post(url, data=fields).status_code == 200
     safe = client.get(f"/creators/data?cm_id={cm}&sort=bad%27SQL&tier=bad%27SQL").json()
     assert safe["sort"] == "name" and safe["tier"] == "" and safe["total_count"] == 1
     pg.execute("SAVEPOINT roster_pagination")
     expected_ids = [str(assigned)]
-    for manual_tier in ("focus", "normal", "pending"):
-        people = [uuid4() for _ in range(12)]
+    for manual_tier in creator_importance.TIERS:
+        people = [uuid4() for _ in range(6)]
         expected_ids.extend(sorted(str(person) for person in people))
         for person in people:
             pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,'Pagination creator')", (person,))
@@ -104,13 +109,14 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
                        "VALUES(%s,%s,%s)", (person, cm, manual_tier))
     first_page = client.get(f"/creators/data?cm_id={cm}&sort=importance&page=1").json()
     second_page = client.get(f"/creators/data?cm_id={cm}&sort=importance&page=2").json()
-    assert first_page["total_count"] == second_page["total_count"] == 37
+    assert first_page["total_count"] == second_page["total_count"] == 31
     assert first_page["total_pages"] == second_page["total_pages"] == 2
-    assert len(first_page["items"]) == 25 and len(second_page["items"]) == 12
+    assert len(first_page["items"]) == 25 and len(second_page["items"]) == 6
     items = first_page["items"] + second_page["items"]
     assert [item["id"] for item in items] == expected_ids
-    assert len({item["id"] for item in items}) == 37
-    assert [item["importance"]["tier"] for item in items] == ["focus"] * 13 + ["normal"] * 12 + ["pending"] * 12
+    assert len({item["id"] for item in items}) == 31
+    assert [item["importance"]["tier"] for item in items] == ["focus"] + [
+        t for t in creator_importance.TIERS for _ in range(6)]
     repeated = client.get(f"/creators/data?cm_id={cm}&sort=importance&page=2").json()
     assert [item["id"] for item in repeated["items"]] == expected_ids[25:]
     pg.execute("ROLLBACK TO SAVEPOINT roster_pagination")
