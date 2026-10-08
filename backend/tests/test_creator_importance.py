@@ -82,6 +82,8 @@ def test_weak_claims_and_unrelated_cancellations_do_not_overwrite_valid_facts():
 
 
 def test_fact_protocol_rejects_unknown_and_third_party_evidence():
+    assert facts.PROMPT_VERSION == "creator-importance-facts-v2.0.2"
+    assert facts.RULE_VERSION == "creator-importance-v2.0"
     pack = _pack(("creator", "I'd like to hear about the Acme product."))
     with pytest.raises(ValueError, match="refs"):
         facts.validate({"facts": [_fact("intent", ["missing"])]}, pack)

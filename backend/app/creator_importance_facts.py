@@ -11,7 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-PROMPT_VERSION = "creator-importance-facts-v2.0.1"
+PROMPT_VERSION = "creator-importance-facts-v2.0.2"
 RULE_VERSION = "creator-importance-v2.0"
 MAX_FACTS, MAX_REFS = 12, 8
 KINDS = ("intent", "opportunity", "agreed", "ongoing", "completed", "progress", "interaction",
