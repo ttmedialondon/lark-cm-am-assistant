@@ -938,3 +938,22 @@ def test_member_snapshot_runs_alongside_message_work_with_one_roster_slot(monkey
     assert members == {"future": claim} and len(submitted) == 1
     worker._schedule_member_snapshot(settings, "client", executor, {"message": "running"}, members)
     assert len(submitted) == 1
+
+
+def test_member_commit_error_releases_exact_claim_for_bounded_retry(monkeypatch):
+    from psycopg.errors import DeadlockDetected
+
+    claim = worker.MemberSnapshotClaim(UUID(int=1), "fixture-group", 7, UUID(int=2))
+    future = TaskFuture()
+    future.set_result(worker.MemberSnapshotMeasurement(1, "succeeded", "succeeded", None))
+    futures = {future: claim}
+    released = []
+
+    def fail_store(*_):
+        raise DeadlockDetected("fixture-only")
+
+    monkeypatch.setattr(worker, "_store_claimed_member_snapshot", fail_store)
+    monkeypatch.setattr(worker, "_release_member_snapshot_claim", lambda *args: released.append(args))
+    worker._reap_member_futures(futures)
+    assert futures == {}
+    assert released == [(claim, "pending")]

@@ -33,7 +33,7 @@ from . import (
 )
 from .config import get_settings
 from .contact_taxonomy import ROLE_LABELS, ROLE_ORDER
-from .db import connection
+from .db import connection, lock_sync_material
 from .http_helpers import (
     csrf_matches as _csrf_matches,
 )
@@ -858,6 +858,8 @@ def create_admin_router(
                 threshold = form.get("auto_confirm_threshold", "0.950")
             enabled = feature != "creator_import" and form.get("enabled") == "1"
             with connection() as conn, conn.transaction():
+                if feature == offhours_summary.FEATURE:
+                    lock_sync_material(conn, read=True)
                 key_rotated = bool(form.get("api_key", "").strip())
                 ai_feature_config.save_feature_config(
                     conn,

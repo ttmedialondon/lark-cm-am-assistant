@@ -31,7 +31,7 @@ class _Connection:
     def transaction(self):
         yield self
 
-    def execute(self, query, params):
+    def execute(self, query, params=None):
         self.calls.append((query, params))
 
 
@@ -144,7 +144,13 @@ def test_owner_post_passes_key_to_encrypted_store_without_rendering_it(monkeypat
     monkeypatch.setattr(admin, "connection", connection)
     monkeypatch.setattr(admin, "get_settings", lambda: SimpleNamespace(token_encryption_key=b"k" * 32))
     monkeypatch.setattr(ai_feature_config, "api_key_cipher", lambda master_key: ("cipher", master_key))
-    monkeypatch.setattr(ai_feature_config, "save_feature_config", lambda *args, **kwargs: saved.append((args, kwargs)))
+
+    def save_config(*args, **kwargs):
+        assert args[0].calls == [("SELECT pg_advisory_xact_lock_shared("
+                                 "hashtextextended('lark-sync-material',0))", None)]
+        saved.append((args, kwargs))
+
+    monkeypatch.setattr(ai_feature_config, "save_feature_config", save_config)
     monkeypatch.setattr(admin.offhours_summary, "save_settings_and_enqueue", lambda *args: None)
 
     response = _client(lambda _request: {"id": owner_id, "status": "active"}).post(

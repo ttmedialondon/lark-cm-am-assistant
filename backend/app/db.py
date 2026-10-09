@@ -20,6 +20,12 @@ def connection() -> Iterator[psycopg.Connection]:
         conn.close()
 
 
+def lock_sync_material(conn: psycopg.Connection, *, read: bool = False) -> None:
+    """Take this before source row locks; release with the existing transaction."""
+    function = "pg_advisory_xact_lock_shared" if read else "pg_advisory_xact_lock"
+    conn.execute(f"SELECT {function}(hashtextextended('lark-sync-material',0))")
+
+
 def database_is_ready() -> bool:
     try:
         with connection() as conn, conn.cursor() as cursor:

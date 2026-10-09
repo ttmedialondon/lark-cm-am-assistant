@@ -30,7 +30,7 @@ from . import (
 )
 from .config import Settings, get_settings
 from .crypto import TokenCipher, message_body_cipher, message_body_fingerprint
-from .db import connection
+from .db import connection, lock_sync_material
 from .identity_names import format_display_name, update_identity_names
 from .lark_api import LarkApiError, LarkClient, TokenBundle
 from .lark_sync_admission import LarkSyncAdmission
@@ -362,6 +362,7 @@ def _reap_ai_futures(futures: set[Future[Any]]) -> None:
 
 def _recover_expired_leases() -> None:
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn)
         expired_jobs = conn.execute(
             """
             UPDATE sync_jobs
@@ -799,6 +800,7 @@ def _schedule_member_snapshot(
 
 def _claim_member_snapshot(settings: Settings) -> MemberSnapshotClaim | None:
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn)
         # Reuse the singleton admission row as a short global mutex so multiple
         # worker processes cannot each start a roster read at the same time.
         conn.execute("SELECT id FROM lark_sync_admission_state WHERE id FOR UPDATE")
@@ -863,11 +865,16 @@ def _reap_member_futures(
             LOGGER.exception("member snapshot task failed without exposing roster data")
             _release_member_snapshot_claim(claim, "pending")
             continue
-        _store_claimed_member_snapshot(claim, measurement)
+        try:
+            _store_claimed_member_snapshot(claim, measurement)
+        except psycopg.Error as exc:
+            LOGGER.warning("member snapshot commit deferred: %s; no roster data logged", type(exc).__name__)
+            _release_member_snapshot_claim(claim, "pending")
 
 
 def _store_claimed_member_snapshot(claim: MemberSnapshotClaim, measurement: MemberSnapshotMeasurement) -> None:
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn)
         row = conn.execute(
             """
             SELECT 1
@@ -935,6 +942,7 @@ def _store_claimed_member_snapshot(claim: MemberSnapshotClaim, measurement: Memb
 
 def _release_member_snapshot_claim(claim: MemberSnapshotClaim, status: str) -> None:
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn)
         conn.execute(
             """
             UPDATE authorization_chats
@@ -955,6 +963,7 @@ def _release_member_snapshot_claim(claim: MemberSnapshotClaim, status: str) -> N
 
 def _mark_one_member_snapshot_unavailable() -> None:
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn)
         conn.execute(
             """
             UPDATE authorization_chats
@@ -1081,6 +1090,7 @@ def _refresh_profile_name(
         if profile.open_id != snapshot["open_id"]:
             return
         with connection() as conn, conn.transaction():
+            lock_sync_material(conn)
             current = conn.execute(
                 """SELECT open_id,status,access_token_ciphertext FROM authorizations WHERE id=%s FOR UPDATE""",
                 (job.authorization_id,),
@@ -1167,6 +1177,7 @@ def _discover_chats(
             )
 
         with connection() as conn, conn.transaction():
+            lock_sync_material(conn)
             _assert_discovery_current(conn, job)
             internal_tenant_keys = _internal_tenant_keys(conn)
             for (
@@ -1308,6 +1319,7 @@ def _discover_chats(
             raise LarkApiError(502, None, "Lark chat pagination did not return a continuation token")
 
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn)
         _assert_discovery_current(conn, job)
         conn.execute(
             """
@@ -1742,6 +1754,7 @@ def _claim_next_page(
     """Lock one conversation cursor; another worker can only claim another chat."""
 
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn)
         current = conn.execute(
             """
             SELECT mode
@@ -2014,6 +2027,7 @@ def _record_claimed_page(
     inserted = 0
     own_inserted = 0
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn)
         # Keep the same lock order as `_claim_next_page`: coordinator first,
         # then its conversation row. This avoids a claim/commit deadlock when
         # several page fetches return together.
@@ -2267,6 +2281,7 @@ def _record_claimed_page(
 
 def _mark_chat_not_readable(claim: PageClaim) -> None:
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn)
         conn.execute(
             """
             UPDATE authorization_chats
@@ -2303,6 +2318,7 @@ def _release_retryable_page_claim(
     """Delay one failed page without interrupting sibling conversation reads."""
 
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn)
         # Lock parent then page, matching claim/commit lock order.  The exact
         # claim fence makes a late failure from an older retry a no-op.
         job = conn.execute(
@@ -2481,6 +2497,7 @@ def _add_job_progress(job: SyncJob, *, pages: int, messages: int, own_messages: 
 def _finish_and_schedule_incremental(job: SyncJob) -> None:
     settings = get_settings()
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn)
         current = conn.execute(
             """
             SELECT mode
@@ -2583,6 +2600,7 @@ def _requeue(
     """Release all of a job's page claims and retry it from durable cursors."""
 
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn)
         current_job = conn.execute(
             """
             SELECT 1 FROM sync_jobs
@@ -2645,6 +2663,7 @@ def _requeue(
 
 def _finish_job(job: SyncJob, status: str, detail: str, code: int | None = None) -> None:
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn)
         row = conn.execute(
             """
             UPDATE sync_jobs
@@ -2674,6 +2693,7 @@ def _finish_job(job: SyncJob, status: str, detail: str, code: int | None = None)
 
 def _mark_attention(job: SyncJob, detail: str, *, claim: PageClaim | None = None) -> None:
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn)
         current_job = conn.execute(
             """
             SELECT 1 FROM sync_jobs

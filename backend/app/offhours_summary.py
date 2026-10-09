@@ -17,7 +17,7 @@ from . import ai_dispatch, creator_import_evidence, creator_imports
 from .ai_feature_config import FeatureConfigInputError
 from .config import get_settings
 from .crypto import TokenCipher, message_body_cipher
-from .db import connection
+from .db import connection, lock_sync_material
 from .message_mentions import mention_names, mention_targets, resolve_mentions, rich_mention_text
 from .message_text import evidence_body
 
@@ -67,6 +67,7 @@ def _authorize(conn, actor_id, *, owner_only=False, cm_id=REMI_ID, read_cache=No
 
 
 def _authorize_live(conn, actor_id, *, owner_only=False, cm_id=REMI_ID):
+    lock_sync_material(conn, read=True)
     cm_id = UUID(str(cm_id))
     actor_id = UUID(str(actor_id))
     # Caller transactions keep these live grants stable until export/read finishes.
@@ -155,6 +156,7 @@ def get_settings_view(conn):
 
 def save_settings_and_enqueue(conn, actor_id, fields):
     """Called in the same owner/CSRF-checked transaction as encrypted AI config save."""
+    lock_sync_material(conn, read=True)
     conn.execute("SELECT pg_advisory_xact_lock(hashtextextended('offhours-summary',0))")
     cfg = _config(conn)
     if not cfg:
@@ -220,6 +222,7 @@ def save_settings_and_enqueue(conn, actor_id, fields):
 
 
 def _roster(conn, cm_id=REMI_ID):
+    lock_sync_material(conn, read=True)
     return conn.execute(
         """WITH people AS MATERIALIZED (
                SELECT contact_id FROM contact_assignments
@@ -618,6 +621,7 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
 
 
 def schedule_if_due(conn, *, force=False):
+    lock_sync_material(conn, read=True)
     conn.execute("SELECT pg_advisory_xact_lock(hashtextextended('offhours-summary',0))")
     from .summary_periods import backfill_due, seed_due
 
