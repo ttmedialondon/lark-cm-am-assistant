@@ -25,7 +25,7 @@
   }
 
   function priority(event) { return priorities.includes(event.priority) ? event.priority : null; }
-  function needsReview(event) { return event.needs_review || !priority(event); }
+  function needsReview(event) { return event.handling_status === "uncertain" || event.needs_review || !priority(event); }
   function events() { return Array.isArray(data.events) ? data.events : []; }
 
   const replyStates = new Map();
@@ -186,13 +186,23 @@
   function eventCard(event) {
     const level = priority(event), card = node("article", "oh-event");
     const heading = node("div", "oh-event-heading");
-    heading.append(node("span", `oh-priority ${level ? `oh-${level.toLowerCase()}` : "oh-warning"}`, level || "待核实"),
+    heading.append(node("span", `oh-priority ${level ? `oh-${level.toLowerCase()}` : "oh-warning"}`, level || "未分级"),
       node("h3", "oh-event-title", event.title));
-    const handlingLabels = {resolved: "已处理", unresolved: "没有处理", uncertain: "待核实", not_required: "无需处理"};
+    const statuses = node("div", "oh-event-status");
+    const names = [...new Set((Array.isArray(event.replied_by) ? event.replied_by : [])
+      .filter(name => typeof name === "string" && name.trim()))];
+    if (event.handling_status !== "not_required" && Array.isArray(event.replied_by)) {
+      const replied = names.length > 0;
+      const label = names.length ? `${names.slice(0, 2).join("、")}${names.length > 2 ? ` 等${names.length}人` : ""} 已回复`
+        : "未见回复";
+      const reply = node("span", `oh-replied${replied ? "" : " oh-replied-empty"}`, label);
+      if (names.length > 2) reply.title = `${names.join("、")} 已回复`;
+      statuses.append(reply);
+    }
+    const handlingLabels = {resolved: "已解决", unresolved: "未解决", uncertain: "待判断", not_required: "无需处理"};
     const handling = node("span", `oh-handling oh-handling-${event.handling_status || "pending"}`,
-      handlingLabels[event.handling_status] || "待分析");
-    handling.title = "截至所选时段；没有处理表示尚未看到处理完成的证据";
-    heading.append(handling);
+      handlingLabels[event.handling_status] || "待判断");
+    statuses.append(handling); heading.append(statuses);
     const identity = node("div", "oh-identity");
     identity.append(node("span", "", `达人 handle：${event.creator_handle || event.creator_handles?.join("、") || "—"}`),
       node("span", "", `Lark 用户：${event.lark_user_name || "—"}`));
@@ -217,12 +227,10 @@
       identity.append(conversations);
     }
     card.append(heading, identity);
-    if (needsReview(event)) card.append(node("span", "oh-review-tag", "信息不足，需结合原文核实"));
     card.append(node("p", "oh-summary", event.summary));
     const meta = node("div", "oh-event-meta");
     const progress = node("dl");
     progress.append(node("dt", "", "时段内最新进展"), node("dd", "", event.latest_progress));
-    if (event.handling_reason) progress.append(node("dd", "oh-small", event.handling_reason));
     meta.append(progress);
     card.append(meta);
     const evidence = Array.isArray(event.evidence) ? event.evidence : [];
@@ -230,6 +238,7 @@
       const details = node("details", "oh-evidence"), messages = node("div", "oh-evidence-list");
       details.dataset.detailKey = `event:${event.id}`;
       details.append(node("summary", "", `查看相关原文（${evidence.length}）`));
+      if (event.handling_reason) details.append(node("p", "oh-small", event.handling_reason));
       for (const message of evidence) {
         const item = node("figure", "oh-message");
         const supportsStatus = (event.handling_evidence || []).some(e => e.chat_id === message.chat_id
@@ -250,8 +259,9 @@
     const openDetails = new Set([...$("oh-events").querySelectorAll("details[open][data-detail-key]")]
       .map(detail => detail.dataset.detailKey));
     const all = events();
-    const filtered = all.filter(event => (selected === "all" || selected === "review" && needsReview(event) || priority(event) === selected)
-      && (!query || [event.creator_handle, ...(event.creator_handles || []), event.lark_user_name, event.conversation_name, event.title, event.summary, event.latest_progress]
+    const filtered = all.filter(event => (selected === "all" || selected === "review" && needsReview(event)
+      || selected === "unresolved" && event.handling_status === "unresolved" || priority(event) === selected)
+      && (!query || [event.creator_handle, ...(event.creator_handles || []), ...(Array.isArray(event.replied_by) ? event.replied_by : []), event.lark_user_name, event.conversation_name, event.title, event.summary, event.latest_progress]
         .some(value => String(value || "").toLocaleLowerCase().includes(query))));
     filtered.sort((a, b) => (priorities.indexOf(priority(a)) < 0 ? 4 : priorities.indexOf(priority(a)))
       - (priorities.indexOf(priority(b)) < 0 ? 4 : priorities.indexOf(priority(b))));
@@ -338,6 +348,7 @@
       document.querySelector(`.oh-stat[data-priority="${level}"]`).setAttribute("aria-label", `${level} ${labels[level]}，${run ? count : "尚未分析"}`);
     }
     $("oh-review-count").textContent = String(all.filter(needsReview).length);
+    $("oh-unresolved-count").textContent = String(all.filter(event => event.handling_status === "unresolved").length);
     renderEvents();
   }
 

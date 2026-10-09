@@ -7,6 +7,7 @@
 .oh-handling-uncertain {background:#fef9c3;color:#854d0e}
 
 .oh-event-heading {flex-wrap:wrap}
+.oh-event-title{flex:1;min-width:180px}.oh-event-status{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.oh-replied{font-size:12px;padding:3px 8px;border-radius:12px;background:#eef4ff;color:#375f9b;overflow-wrap:anywhere}.oh-replied-empty{background:#f1f5f9;color:#64748b}.oh-event-meta{grid-template-columns:1fr}
 
 .oh-reply{border-top:1px solid #e8edf4;margin-top:18px;padding-top:16px}
 .oh-reply-content{margin-top:12px}.oh-reply-editor{margin:8px 0 12px;line-height:1.7;min-height:150px}

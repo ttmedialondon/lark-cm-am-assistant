@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}消息总结 · TT Media{% endblock %}
-{% block extra_head %}<meta name="summary-csrf-token" content="{{ csrf_token }}"><link rel="stylesheet" href="/static/offhours-summary.css?v=20260916-reply-drafts">{% endblock %}
+{% block extra_head %}<meta name="summary-csrf-token" content="{{ csrf_token }}"><link rel="stylesheet" href="/static/offhours-summary.css?v=20261009-progress">{% endblock %}
 {% block body %}
 <div class="page business-page oh-page">
   {% with business_section='summary' %}{% include "partials/business_nav.html" %}{% endwith %}
@@ -22,7 +22,7 @@
     </section>
     <section class="oh-workspace" aria-labelledby="oh-list-title">
       <div class="oh-toolbar"><div><h2 id="oh-list-title">发生了哪些事</h2><span id="oh-visible-count" class="oh-small" aria-live="polite"></span></div><label class="oh-search"><span class="oh-sr-only">搜索达人或事件</span><input class="form-control" id="oh-search" type="search" autocomplete="off" maxlength="120" placeholder="搜索 handle、用户或事件"></label></div>
-      <div class="oh-filters" role="group" aria-label="按等级筛选"><button class="oh-filter" type="button" data-priority="all" aria-pressed="true">全部事件</button><button class="oh-filter" type="button" data-priority="P0" aria-pressed="false">P0</button><button class="oh-filter" type="button" data-priority="P1" aria-pressed="false">P1</button><button class="oh-filter" type="button" data-priority="P2" aria-pressed="false">P2</button><button class="oh-filter" type="button" data-priority="P3" aria-pressed="false">P3</button><button class="oh-filter" type="button" data-priority="review" aria-pressed="false">待核实 <span id="oh-review-count">0</span></button></div>
+      <div class="oh-filters" role="group" aria-label="筛选事件"><button class="oh-filter" type="button" data-priority="all" aria-pressed="true">全部事件</button><button class="oh-filter" type="button" data-priority="P0" aria-pressed="false">P0</button><button class="oh-filter" type="button" data-priority="P1" aria-pressed="false">P1</button><button class="oh-filter" type="button" data-priority="P2" aria-pressed="false">P2</button><button class="oh-filter" type="button" data-priority="P3" aria-pressed="false">P3</button><button class="oh-filter" type="button" data-priority="unresolved" aria-pressed="false">未解决 <span id="oh-unresolved-count">0</span></button><button class="oh-filter" type="button" data-priority="review" aria-pressed="false">待判断 <span id="oh-review-count">0</span></button></div>
       <div id="oh-events"></div>
       <div class="oh-empty" id="oh-empty" hidden><h3 id="oh-empty-title">尚未开始分析</h3><p id="oh-empty-description"></p></div>
     </section>
@@ -31,5 +31,5 @@
   </main>
 </div>
 <script id="offhours-summary-data" type="application/json">{{ summary_data|tojson }}</script>
-<script src="/static/offhours-summary.js?v=20261008-interaction" defer></script>
+<script src="/static/offhours-summary.js?v=20261009-progress" defer></script>
 {% endblock %}

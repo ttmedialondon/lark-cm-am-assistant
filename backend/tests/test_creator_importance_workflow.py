@@ -348,7 +348,7 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
                    "WHERE message_id='rough_at'", (flow.cipher.encrypt(raw),
                    message_body_fingerprint(flow.settings.token_encryption_key, raw)))
         original = pg.execute("SELECT * FROM chat_messages WHERE message_id='rough_at'").fetchone()
-        assert importance.offhours_summary._body(original, flow.cipher)[1] is True
+        assert importance.offhours_summary._body(original, flow.cipher)[1] is (not prose.strip())
         job = {**other_job, "needs_history": False, "checkpoint_ciphertext": None,
                "pending_messages": {"other_private/rough_at": {"chat_id": "other_private",
                                                               "message_id": "rough_at"}}}

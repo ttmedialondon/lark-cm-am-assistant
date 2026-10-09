@@ -61,6 +61,7 @@ def sample_event(**overrides):
         "handling_status": "unresolved",
         "handling_reason": "尚未看到完成结果。",
         "handling_evidence_refs": overrides.get("evidence_refs", ["M1"]),
+        "reply_evidence_refs": [],
         "reason": "正常样品申请。",
         "needs_review": False,
         "evidence_refs": ["M1"],
@@ -96,6 +97,7 @@ def pack():
         {"user": "outsider"},
         {"handling_status": "invented"},
         {"handling_evidence_refs": ["unknown"]},
+        {"reply_evidence_refs": ["M1"]},
         {"handling_reason": ""},
         {"handle": "@fabricated"},
         {"evidence_refs": ["unknown"]},
@@ -127,6 +129,76 @@ def test_missing_media_and_multi_handle_do_not_invent_risk_or_duplicate_account(
     assert result[0]["handling_status"] == "uncertain"
     with pytest.raises(ai.InvalidModelOutput):
         ai._validate(json.dumps({"events": [sample_event(), sample_event()]}), data)
+
+
+def test_reply_and_resolution_remain_independent_through_context_and_merge():
+    data = pack()
+    data["pack"].update(is_private=False, unique_group_user="U1",
+                        staff={"CM": {"name": "Remi"}, "CM2": {"name": "Shang"}})
+    data["pack"]["messages"][0].update(message_id="request", text="Sample order ABC-123 please",
+        mentions=[{"target": "unknown", "ambiguous": True}])
+    for ref, speaker, text in (
+        ("M2", "CM", "I'll look into sample order ABC-123 tomorrow"),
+        ("M3", "CM2", "I can help check sample order ABC-123"),
+        ("M4", "U1", "[附件或正文不可读取]"),
+    ):
+        data["pack"]["messages"].append({"ref": ref, "message_id": ref, "speaker": speaker,
+            "text": text, "in_window": True, "unreadable": ref == "M4",
+            "unavailable_or_truncated": ref == "M4"})
+    data["refs"] = {m["ref"]: {**m, "sender_name": {"CM": "Remi", "CM2": "Shang"}.get(m["speaker"], "Alice"),
+        "is_staff": m["speaker"] in {"CM", "CM2"}, "chat_id": "group", "created_at": m["ref"]}
+        for m in data["pack"]["messages"]}
+    pending = ai._validate(json.dumps({"events": [sample_event(
+        handling_evidence_refs=["M1", "M4"], reply_evidence_refs=["M2", "M3"])]}), data)[0]
+    assert pending["handling_status"] == "unresolved" and pending["replied_by"] == ["Remi", "Shang"]
+    assert not pending["needs_review"]  # An unknown @ or optional attachment does not erase a readable request.
+    pending["evidence"] = [data["refs"][r] for r in pending["evidence_refs"]]
+    done_message = {"text": "Sample order ABC-123 delivered today", "speaker": "CM2", "is_staff": True,
+                    "sender_name": "Shang", "chat_id": "group", "message_id": "done", "created_at": "M5"}
+    done = {**pending, "evidence": [done_message]}
+    refs = summary_dialogues.merged_evidence(pending, done)
+    request_ref = next(r for r, m in refs.items() if m["message_id"] == "request")
+    done_ref = next(r for r, m in refs.items() if m["message_id"] == "done")
+    value = {"same": True, "basis_kind": "identifier", "basis_value": "ABC-123", "quote_a_ref": request_ref,
+        "quote_b_ref": done_ref, "title": "样品订单", "summary": "样品已送达", "latest_progress": "同事已确认送达",
+        "handling_status": "resolved", "handling_reason": "已确认对应样品送达", "handling_evidence_refs": [done_ref],
+        "reply_evidence_refs": [r for r, m in refs.items() if m.get("is_staff")]}
+    merged = summary_dialogues.combine(json.dumps(value), pending, done)
+    assert merged["handling_status"] == "resolved" and merged["replied_by"] == ["Remi", "Shang"]
+    # A later concrete counterexample reopens the issue without forgetting who replied.
+    later = {**done, "evidence": [{**done_message, "text": "Sample order ABC-123 still not here",
+             "speaker": "U1", "is_staff": False, "sender_name": "Alice", "message_id": "later", "created_at": "M6"}]}
+    refs = summary_dialogues.merged_evidence(merged, later)
+    later_ref = next(r for r, m in refs.items() if m["message_id"] == "later")
+    value.update(quote_a_ref=next(r for r, m in refs.items() if m["message_id"] == "done"), quote_b_ref=later_ref,
+        handling_status="unresolved", handling_reason="达人随后明确反馈尚未送达", handling_evidence_refs=[later_ref],
+        reply_evidence_refs=[r for r, m in refs.items() if m.get("is_staff")])
+    assert summary_dialogues.combine(json.dumps(value), merged, later)["handling_status"] == "unresolved"
+    # Multi-person conversation boundaries prevent a colleague's unrelated broadcast being attributed to Alice.
+    data["pack"].update(unique_group_user=None)
+    data["users"]["U2"] = {"name": "Bob", "handles": []}
+    data["pack"]["messages"] += [
+        {"ref": "M5", "message_id": "bob", "speaker": "U2", "text": "My different order", "in_window": True},
+        {"ref": "M6", "message_id": "broadcast", "speaker": "CM2", "text": "Latest campaign news", "in_window": True},
+    ]
+    data["refs"].update(M5={}, M6={})
+    selected, _ = summary_dialogues.parts(data, "U1")
+    assert "broadcast" not in {m["message_id"] for m in selected}
+    # A request in a neighboring chunk still anchors a natural colleague response.
+    data["pack"]["messages"] = data["pack"]["messages"][:3]
+    selected, _ = summary_dialogues.parts(data, "U1")
+    colleague = next(m for m in selected if m["speaker"] == "CM2")
+    assert colleague["addressed_user"] == "U1"
+    for m in selected:
+        m["in_window"] = m["speaker"] == "CM2"
+    scoped = {**data, "pack": {**data["pack"], "messages": selected}, "refs": {m["ref"]: {} for m in selected}}
+    event = sample_event(evidence_refs=[colleague["ref"]], handling_evidence_refs=[colleague["ref"]],
+                         reply_evidence_refs=[colleague["ref"]])
+    assert ai._validate(json.dumps({"events": [event]}), scoped)[0]["replied_by"] == ["Shang"]
+    data["pack"].update(users=data["users"], policy="shift-handling-v4")
+    previous_chunks = {c["fingerprint"] for c in summary_dialogues.segments(data)}
+    data["pack"]["policy"] = ai.POLICY_VERSION
+    assert not previous_chunks & {c["fingerprint"] for c in summary_dialogues.segments(data)}
 
 
 @pytest.fixture
@@ -521,7 +593,7 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
     def model(_cfg, _key, input_pack, _cm, **_kwargs):
         if 'a' in input_pack:
             return {'text': json.dumps({'same': False, 'basis_kind': 'none', 'handling_status': 'uncertain',
-                'handling_reason': '不合并', 'handling_evidence_refs': ['E1'],
+                'handling_reason': '不合并', 'handling_evidence_refs': ['E1'], 'reply_evidence_refs': [],
                 'quote_a_ref': 'E1', 'quote_b_ref': 'E1',
                 **{k: '' for k in ('basis_value', 'title', 'summary', 'latest_progress')}})}
         s.calls.append(input_pack)
@@ -745,6 +817,19 @@ def test_mentions_ui_and_ai_share_resolved_text_and_id_based_targets_without_mut
     text = "Hi @_user_1, @_user_2, @_user_3, @_user_4: I haven’t heard from you"
     _set_mentions(pg, s, mentions, text)
     pg.execute("UPDATE lark_identities SET display_name='Remi（Quanzhen Liang）' WHERE open_id='ou_cm'")
+    pg.execute("UPDATE chats SET chat_mode='group' WHERE chat_id='chat'")
+    for who in ("reviewer", "tester"):
+        pg.execute("INSERT INTO lark_identities(open_id,display_name,tenant_classification) "
+                   "VALUES(%s,%s,'internal')", ("ou_" + who, who))
+    s.add("colleague", who="reviewer", text="I'll check the sample", parent_id="m1",
+          at=s.start + timedelta(hours=2))
+    s.add("not_observed", who="tester", text="Only another CM can read this", parent_id="m1",
+          at=s.start + timedelta(hours=3))
+    pg.execute("DELETE FROM authorization_message_observations WHERE message_id='not_observed'")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'chat')",
+               (s.ids["reviewer"],))
+    pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+               "VALUES(%s,'chat','not_observed')", (s.ids["reviewer"],))
     original = pg.execute("SELECT body_ciphertext,mentions_json FROM chat_messages WHERE message_id='m1'").fetchone()
     s.save()
     job = ai.claim_next_summary()
@@ -754,6 +839,13 @@ def test_mentions_ui_and_ai_share_resolved_text_and_id_based_targets_without_mut
     assert [m["target"] for m in message["mentions"]] == ["CM", "U1", "other", "unknown"]
     assert data["refs"][message["ref"]]["text"] == message["text"]
     assert "ou_" not in json.dumps(data["pack"])
+    assert not message["unreadable"]  # An unresolved @ does not obscure the readable request.
+    colleague = next(m for m in data["pack"]["messages"] if m["message_id"] == "colleague")
+    assert colleague["is_staff"] and data["refs"][colleague["ref"]]["sender_name"] == "reviewer"
+    assert data["pack"]["staff"][colleague["speaker"]]["name"] == "reviewer"
+    assert "Only another CM can read this" not in json.dumps(data)
+    pg.execute("UPDATE authorizations SET status='attention_required' WHERE id=%s", (s.ids["tester"],))
+    assert ai._load_chat(pg, job, "chat", job["cutoff"], settings=s.settings)["fingerprint"] == data["fingerprint"]
     ai.run_claimed_summary(job, s.settings)
     finish_merges(pg, s)
     view = ai.get_summary_view(pg, s.ids["owner"])
@@ -825,6 +917,9 @@ def test_rich_mentions_keep_full_text_and_credentials_redacted():
     assert text == "Hello @Remi（Original） link https://example.test/?token=[redacted]" and not incomplete
     row["body_ciphertext"] = cipher.encrypt(json.dumps({"content": [[{"tag": "at", "user_id": "ou_unknown"}]]}))
     assert ai._body(row, cipher) == ("[未解析的@用户]", True)
+    row["body_ciphertext"] = cipher.encrypt(json.dumps({"content": [[{"tag": "at", "user_id": "ou_unknown"},
+        {"tag": "text", "text": "Please check my missing payment"}]]}))
+    assert not ai._body(row, cipher)[1]
     row.update(message_type="text", body_ciphertext=cipher.encrypt(json.dumps({"text": "@_user_1" + "x" * 2000})))
     # An identifier-like suffix is not a Lark placeholder boundary.
     assert ai._body(row, cipher)[0].startswith("@_user_1x")
@@ -1452,6 +1547,14 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
             "VALUES(%s,'second',%s)",
             (s.ids["cm"], who),
         )
+    pg.execute("""INSERT INTO lark_identities(open_id,display_name,tenant_classification)
+        VALUES('ou_reviewer','reviewer','internal')""")
+    pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,body_ciphertext,
+        message_create_time,parent_id) VALUES('second','colleague','ou_reviewer','text',%s,%s,'person')""",
+        (s.cipher.encrypt(json.dumps({'text': 'I can help check sample order ABC-123'})),
+         s.start + timedelta(hours=6, minutes=15)))
+    pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+        VALUES(%s,'second','colleague')""", (s.ids['cm'],))
     calls, failed = [], False
 
     def model(_cfg, _key, pack, _cm, **kwargs):
@@ -1464,9 +1567,10 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
                 'quote_b_ref': next(r for r,e in pack['evidence_messages'].items() if e in b['evidence']),
                 'title': '样品订单', 'summary': '样品订单已送达。', 'latest_progress': '达人确认收到。',
                 'handling_status': 'resolved', 'handling_reason': '达人已确认对应订单收到。',
-                'handling_evidence_refs': [r for r, e in pack['evidence_messages'].items() if 'arrived' in e['text']]})}
+                'handling_evidence_refs': [r for r, e in pack['evidence_messages'].items() if 'arrived' in e['text']],
+                'reply_evidence_refs': [r for r, e in pack['evidence_messages'].items() if e.get('is_staff')]})}
         user = next(iter(pack['users']))
-        assert {m['speaker'] for m in pack['messages']} <= {user, 'CM'}
+        assert {m['speaker'] for m in pack['messages']} <= {user, *pack['staff']}
         assert len(pack['users']) == 1
         if pack['users'][user]['name'] == 'person':
             assert 'other creator secret' not in json.dumps(pack)
@@ -1478,7 +1582,9 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
         targets = [m for m in pack['messages'] if m['ref'] in pack['core_refs'] and m['speaker'] == user
                    and m['message_id'] in ('m1', 'person')]
         return {'text': json.dumps({'processed_refs': pack['core_refs'], 'events': [sample_event(
-            user=user, evidence_refs=[m['ref']], handle=None) for m in targets]})}
+            user=user, evidence_refs=[m['ref']], handle=None,
+            reply_evidence_refs=[r['ref'] for r in pack['messages'] if r['message_id'] == 'colleague'])
+            for m in targets]})}
 
     monkeypatch.setattr(openai_client, 'call_openai', model)
     s.save()
@@ -1508,6 +1614,8 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
     assert view['events'][0]['latest_progress'] == '达人确认收到。'
     assert view['events'][0]['handling_status'] == 'resolved'
     assert view['events'][0]['handling_evidence'][0]['chat_id'] == 'second'
+    assert view['events'][0]['replied_by'] == ['reviewer']
+    assert view['events'][0]['reply_evidence'][0]['message_id'] == 'colleague'
     # Changed access hides the merged narrative as well as its evidence.
     pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='second'")
     assert ai.get_summary_view(pg, s.ids['owner'])['events'] == []
@@ -1516,7 +1624,8 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
     with pytest.raises(ai.InvalidModelOutput):
         summary_dialogues.combine(json.dumps({'same': True, 'basis_kind': 'identifier', 'basis_value': 'payment',
             'quote_a_ref': 'E1', 'quote_b_ref': 'E1', 'title': 'x', 'summary': 'x', 'latest_progress': 'x',
-            'handling_status': 'unresolved', 'handling_reason': '未完成', 'handling_evidence_refs': ['E1']}), e, e)
+            'handling_status': 'unresolved', 'handling_reason': '未完成', 'handling_evidence_refs': ['E1'],
+            'reply_evidence_refs': []}), e, e)
 
 
 def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded, monkeypatch):
@@ -1527,6 +1636,10 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
     ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
     finish_merges(pg, s)
     event_id = ai.get_summary_view(pg, s.ids["cm"])["events"][0]["id"]
+    pg.execute("""INSERT INTO lark_identities(open_id,display_name,tenant_classification)
+        VALUES('ou_reviewer','reviewer','internal')""")
+    s.add("colleague-current", who="reviewer", text="I've asked fulfillment to check sample A-200.",
+          at=datetime.now(UTC))
     long_text = "Sample A-200: thanks for explaining that, lovely. " * 900
     s.add("long-current", who="cm", text=long_text, at=datetime.now(UTC))
     pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('reply-group','Shared group','group')")
@@ -1581,6 +1694,8 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
     processed = {m["ref"]: m for pack in calls if "core_refs" in pack for m in pack["messages"]
                  if m["ref"] in pack["core_refs"] and m["message_id"] == "long-current"}
     assert "".join(m["text"] for m in sorted(processed.values(), key=lambda m: m["part"])) == long_text
+    colleagues = [m for pack in calls for m in pack.get("messages", []) if m.get("message_id") == "colleague-current"]
+    assert colleagues and all(m["is_staff"] and m["speaker"] != "CM" for m in colleagues)
     stored = pg.execute("SELECT result_ciphertext FROM summary_reply_tasks WHERE id=%s", (job_id,)).fetchone()
     assert "Happy" not in stored["result_ciphertext"]
     with pytest.raises(PermissionError):

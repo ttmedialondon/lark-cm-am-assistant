@@ -30,11 +30,41 @@ def decode(value, settings):
     return json.loads(core._cipher(settings.token_encryption_key).decrypt(value)) if value else None
 
 
+def participant_messages(source, user, staff, unique=False, *, include_cm_broadcasts=False):
+    related_ids = {m["message_id"] for m in source if m["speaker"] == user}
+    previous_creator = None
+    selected = []
+    for m in source:
+        is_staff = m.get("is_staff") or m["speaker"] == "CM" or m["speaker"] in staff
+        if not is_staff:
+            previous_creator = m["speaker"]
+        if m["speaker"] != user and not is_staff:
+            continue
+        if is_staff:
+            targets = {t["target"] for t in m.get("mentions", []) if not t.get("ambiguous")}
+            addressed = user in targets or any(
+                m.get(k) in related_ids for k in ("parent_message_id", "root_message_id")
+            )
+            anchored = addressed or ((unique or previous_creator == user) and
+                                    not targets - {user, "CM", "unknown", *staff})
+            # A group broadcast is not this creator's event without conversation context.
+            if not anchored and not (include_cm_broadcasts and m["speaker"] == "CM"):
+                continue
+            if anchored:
+                related_ids.add(m["message_id"])
+                m = {**m, "addressed_user": user}
+        selected.append(m)
+    return selected
+
+
 def parts(evidence, user):
     messages, refs = [], {}
-    for m in evidence["pack"]["messages"]:
-        if m["speaker"] not in (user, "CM"):
-            continue
+    source = participant_messages(
+        evidence["pack"]["messages"], user, evidence["pack"].get("staff", {}),
+        evidence["pack"]["is_private"] or evidence["pack"].get("unique_group_user") == user,
+        include_cm_broadcasts=True,
+    )
+    for m in source:
         text = m["text"]
         for offset in range(0, max(1, len(text)), PART_CHARS):
             ref = f"{m['ref']}.{offset // PART_CHARS}"
@@ -302,7 +332,8 @@ identifier/product/amount 的 basis_value 必须是双方原文都包含的连�
 reference 可用双方明确承接关系，但必须有完整引用依据；仅 thanks/yes/ok 不成立。
 返回合并后的中文标题、摘要和截至时段的进展。不能因未看到回复推定无人处理，不能新增事实。
 同一事项新的礼貌消息不能消除未解决问题；明确已发生的解决进展可以更新摘要及处理状态。
-合并时从 evidence_messages 的 E 引用重新判断处理状态，不能照搬 a 或 b 的状态；same=false 时状态字段不被使用。
+合并时从 evidence_messages 的 E 引用重新判断是否已回复、是否已解决，不能照搬 a 或 b 的状态；
+其中 is_staff/speaker/sender_name 来自系统，回复人由原文引用确定。same=false 时状态字段不被使用。
 """
 
 MERGE_INSTRUCTIONS += core.HANDLING_INSTRUCTIONS
@@ -380,6 +411,9 @@ def combine(raw, left, right):
         **{k: value[k] for k in ("handling_status", "handling_reason")},
         "handling_evidence": [messages[r] for r in value["handling_evidence_refs"]],
         "handling_evidence_refs": [],
+        "reply_evidence": [messages[r] for r in value["reply_evidence_refs"]],
+        "reply_evidence_refs": [],
+        "replied_by": value["replied_by"],
         **{k: value[k] for k in ("title", "summary", "latest_progress")},
         "priority": priority,
         "needs_review": left["needs_review"] or right["needs_review"],
@@ -444,6 +478,10 @@ def step(job, settings):
                 e["handling_evidence"] = [
                     {**pending["refs"][ref], "chat_name": data["pack"]["chat_name"]}
                     for ref in e["handling_evidence_refs"]
+                ]
+                e["reply_evidence"] = [
+                    {**pending["refs"][ref], "chat_name": data["pack"]["chat_name"]}
+                    for ref in e["reply_evidence_refs"]
                 ]
             completed[pending["fingerprint"]] = events
         finished = all(c["fingerprint"] in completed for c in chunks)

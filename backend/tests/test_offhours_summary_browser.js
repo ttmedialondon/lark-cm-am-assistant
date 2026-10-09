@@ -17,7 +17,12 @@ const report = (extra = {}) => ({responsible: {id: "remi-id", name: "Remi"}, ena
   window: {start: "2026-09-09T17:00:00Z", end: "2026-09-10T11:00:00Z", timezone: "Europe/London", is_partial: true, is_open: true},
   run: {id: "run-1", status: "running", updated_at: "2026-09-10T01:00:00Z", cutoff: "2026-09-10T01:00:00Z",
     counts: {queued: 1, running: 2, completed: 4, failed: 1}, gaps: ["有一段会话同步不完整，尚不能下结论。"]},
-  events: [event("P2"), event("P0"), event("P3"), event("P1"), event(null, {creator_handle: null, title: "资料尚不足以判断", needs_review: true})], ...extra});
+  events: [event("P2", {reply_evidence_refs: [], replied_by: []}),
+    event("P0", {reply_evidence_refs: ["M2"], replied_by: ["Remi"]}),
+    event("P3", {reply_evidence_refs: [], replied_by: []}),
+    event("P1", {reply_evidence_refs: ["M2"], replied_by: ["Shang Ma"],
+      latest_progress: "Shang Ma 已回复会催付款，尚未到账。"}),
+    event(null, {creator_handle: null, title: "资料尚不足以判断", needs_review: true})], ...extra});
 
 async function fixture(t, data = report()) {
   const state = {data, calls: [], status: 200};
@@ -378,8 +383,12 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
 
 test("grades are sorted and filters/search/evidence work without writes", async t => {
   const {page, state, errors} = await fixture(t);
-  assert.deepEqual(await page.locator(".oh-handling").allTextContents(), ["已处理", "没有处理", "待核实", "无需处理", "待分析"]);
-  assert.deepEqual(await page.locator(".oh-event .oh-priority").allTextContents(), ["P0", "P1", "P2", "P3", "待核实"]);
+  assert.deepEqual(await page.locator(".oh-handling").allTextContents(), ["已解决", "未解决", "待判断", "无需处理", "待判断"]);
+  assert.deepEqual(await page.locator(".oh-replied").allTextContents(), ["Remi 已回复", "Shang Ma 已回复", "未见回复"]);
+  assert.deepEqual(await page.locator(".oh-event .oh-priority").allTextContents(), ["P0", "P1", "P2", "P3", "未分级"]);
+  assert.equal(await page.locator("#oh-unresolved-count").textContent(), "1");
+  assert.equal(await page.locator("#oh-review-count").textContent(), "2");
+  assert(!(await page.getByText("截至所选时段判断。", {exact: true}).first().isVisible()));
   assert(!(await page.locator(".oh-routine .oh-event").isVisible()));
   assert.equal(await page.locator("#oh-count-P3").textContent(), "1");
   assert(await page.locator("#oh-analysis-spinner").isVisible());
@@ -391,10 +400,20 @@ test("grades are sorted and filters/search/evidence work without writes", async 
   assert.equal(await page.locator(".oh-event").count(), 1);
   await page.getByText("查看相关原文（1）").click();
   assert(await page.getByText("Please check this issue.").isVisible());
-  await page.locator('.oh-filter[data-priority="review"]').click();
+  assert(await page.getByText("截至所选时段判断。", {exact: true}).isVisible());
+  await page.locator('.oh-filter[data-priority="unresolved"]').click();
   assert.equal(await page.locator(".oh-event").count(), 1);
-  assert((await page.locator(".oh-identity").textContent()).includes("handle：—"));
+  assert.equal(await page.locator(".oh-replied").textContent(), "Shang Ma 已回复");
+  assert.equal(await page.locator(".oh-handling").textContent(), "未解决");
+  assert(await page.getByRole("button", {name: "生成回复建议", exact: true}).isVisible());
+  await page.locator('.oh-filter[data-priority="review"]').click();
+  assert.equal(await page.locator(".oh-event").count(), 2);
+  assert((await page.locator(".oh-identity").allTextContents()).some(text => text.includes("handle：—")));
+  assert.equal(await page.locator(".oh-event").last().locator(".oh-replied").count(), 0);
   await page.locator('.oh-filter[data-priority="all"]').click();
+  await page.locator("#oh-search").fill("Shang Ma");
+  assert.equal(await page.locator(".oh-event").count(), 1);
+  assert.equal(await page.locator(".oh-handling").textContent(), "未解决");
   await page.locator("#oh-search").fill("nothing-matches");
   assert.equal(await page.locator(".oh-event").count(), 0);
   assert((await page.locator("#oh-empty-title").textContent()).includes("筛选"));
@@ -412,6 +431,7 @@ test("grades are sorted and filters/search/evidence work without writes", async 
     await page.locator(".oh-routine > summary").click();
     await page.screenshot({path: path.join(process.env.OH_SCREENSHOT_DIR, "offhours-summary-desktop.png"), fullPage: true});
     await page.setViewportSize({width: 390, height: 844});
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
     await page.screenshot({path: path.join(process.env.OH_SCREENSHOT_DIR, "offhours-summary-mobile.png"), fullPage: true});
   }
@@ -444,8 +464,11 @@ test("an ended window with sync gaps is incomplete, not described as still in th
 
 test("source content is literal, network failures show stale results, and revoked access clears them", async t => {
   const attack = '<img src=x onerror="window.compromised=true">';
-  const {page, state, errors} = await fixture(t, report({events: [event("P0", {title: attack, evidence: [{text: attack}]})]}));
+  const {page, state, errors} = await fixture(t, report({events: [event("P0", {
+    title: attack, replied_by: [attack], reply_evidence_refs: ["M1"], evidence: [{text: attack}],
+  })]}));
   assert.equal(await page.locator(".oh-event-title").textContent(), attack);
+  assert.equal(await page.locator(".oh-replied").textContent(), `${attack} 已回复`);
   assert.equal(await page.locator(".oh-event img").count(), 0);
   assert.equal(await page.evaluate(() => window.compromised), undefined);
   state.status = 503;
@@ -626,7 +649,9 @@ test("each summary selector navigates immediately without a submit button", asyn
 
 
 test("reply drafts preserve edits, translate before copying, and block stale or revoked suggestions", async t => {
-  const {page, errors} = await fixture(t, report({events: [event("P1")]}));
+  const {page, errors} = await fixture(t, report({events: [event("P1", {
+    replied_by: ["Shang Ma"], reply_evidence_refs: ["M2"],
+  })]}));
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
   let edited = "", stale = false, revoked = false, releaseGenerate;
   const generateGate = new Promise(resolve => { releaseGenerate = resolve; });
@@ -676,7 +701,8 @@ test("reply drafts preserve edits, translate before copying, and block stale or 
   await page.getByRole("button", {name: "复制回复", exact: true}).click();
   await page.getByText("已复制，未发送。", {exact: true}).waitFor();
   assert.equal(await page.evaluate(() => navigator.clipboard.readText()), newText);
-  assert.equal(await page.locator(".oh-handling").textContent(), "没有处理");
+  assert.equal(await page.locator(".oh-handling").textContent(), "未解决");
+  assert.equal(await page.locator(".oh-replied").textContent(), "Shang Ma 已回复");
   stale = true;
   await page.getByRole("button", {name: "复制回复", exact: true}).click();
   await page.getByText("收到新消息，请重新生成建议。", {exact: true}).waitFor();
