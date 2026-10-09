@@ -129,6 +129,9 @@ def run_forever() -> None:
         max_workers=settings.lark_sync_max_inflight + settings.lark_member_snapshot_max_inflight,
         thread_name_prefix="lark-sync",
     )
+    discovery_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lark-discovery")
+    discovery_future: Future[bool] | None = None
+    next_discovery_check = 0.0
     page_futures: dict[Future[dict[str, Any]], PageClaim] = {}
     member_futures: dict[Future[MemberSnapshotMeasurement], MemberSnapshotClaim] = {}
     admission = LarkSyncAdmission(
@@ -169,19 +172,18 @@ def run_forever() -> None:
                     next_broadcast_check = _schedule_broadcast(
                         settings, broadcast_executor, broadcast_futures, next_broadcast_check,
                     )
-                    # Existing message pages get a turn before synchronous
-                    # discovery for newly authorized users. Discovery remains
-                    # a per-user phase barrier, but it cannot starve active
-                    # backfills on this worker.
                     _finish_completed_jobs(page_futures)
                     _fill_lark_slots(settings, client, lark_executor, page_futures)
-                    _start_pending_jobs(settings, client)
+                    discovery_future, next_discovery_check = _schedule_discovery(
+                        settings, client, discovery_executor, discovery_future, next_discovery_check,
+                    )
                     _finish_completed_jobs(page_futures)
                     _fill_lark_slots(settings, client, lark_executor, page_futures)
                     _schedule_member_snapshot(settings, client, lark_executor, page_futures, member_futures)
                     identity_profiles.fill_slots(settings, client, avatar_executor, avatar_futures)
                 time.sleep(
                     0.05 if page_futures or member_futures or avatar_futures or preview_future or broadcast_futures
+                    or discovery_future
                     else settings.worker_idle_seconds
                 )
             except KeyboardInterrupt:
@@ -194,6 +196,7 @@ def run_forever() -> None:
         ai_executor.shutdown(wait=False, cancel_futures=False)
         broadcast_executor.shutdown(wait=False, cancel_futures=False)
         preview_executor.shutdown(wait=False, cancel_futures=False)
+        discovery_executor.shutdown(wait=False, cancel_futures=False)
         lark_executor.shutdown(wait=False, cancel_futures=False)
         avatar_executor.shutdown(wait=False, cancel_futures=False)
         http_client.close()
@@ -477,18 +480,37 @@ def _running_jobs() -> list[SyncJob]:
     ]
 
 
-def _start_pending_jobs(settings: Settings, client: LarkClient) -> None:
-    """Claim a small fair set of user coordinators and discover each one once."""
+def _schedule_discovery(settings, client, executor, future, next_check):
+    """Discover one account without blocking page commits, AI or message delivery."""
+
+    if future is not None:
+        if not future.done():
+            return future, next_check
+        try:
+            progressed = future.result()
+        except Exception:
+            LOGGER.exception("Lark discovery failed without exposing user data")
+            progressed = False
+        future = None
+        next_check = (0.0 if progressed else time.monotonic() + settings.worker_idle_seconds)
+    if time.monotonic() >= next_check:
+        future = executor.submit(_start_pending_jobs, settings, client)
+    return future, next_check
+
+
+def _start_pending_jobs(settings: Settings, client: LarkClient) -> bool:
+    """Activate one coordinator; account count is not the HTTP concurrency limit."""
 
     for job in _running_jobs():
         if job.discovery_status == "pending":
             _prepare_job(job, settings, client)
+            return True
 
-    while len(_running_jobs()) < settings.lark_sync_max_inflight:
-        job = _claim_job()
-        if not job:
-            return
+    job = _claim_job()
+    if job:
         _prepare_job(job, settings, client)
+        return True
+    return False
 
 
 def _prepare_job(job: SyncJob, settings: Settings, client: LarkClient) -> None:
@@ -633,7 +655,8 @@ def _dispatch_lark_turn(
     )
 
     def dispatch(limit: int) -> bool:
-        for job in sorted(jobs, key=lambda item: (in_flight[item.authorization_id], item.id.hex)):
+        # Stable ties keep the oldest-progress order supplied by _running_jobs.
+        for job in sorted(jobs, key=lambda item: in_flight[item.authorization_id]):
             if in_flight[job.authorization_id] >= limit:
                 continue
             cached = authorization_cache.get(job.authorization_id)

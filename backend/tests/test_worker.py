@@ -733,6 +733,131 @@ def test_lark_dispatch_uses_idle_slot_when_other_user_has_no_backlog(monkeypatch
     assert [claim.chat_id for claim in submitted] == ["oc_a_1", "oc_a_2", "oc_a_3"]
 
 
+def test_all_due_accounts_rotate_through_three_page_slots_and_resume_cursors(pg, monkeypatch):
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
+    monkeypatch.setattr(worker, "_usable_access_token", lambda *_args: "test-token")
+    settings = SimpleNamespace(lark_sync_max_inflight=3, lark_sync_per_authorization_max_inflight=2,
+                               sync_overlap_seconds=600, sync_lookback_days=0)
+    jobs = []
+    for index in range(1, 8):
+        job_id, actor_id = UUID(int=index), UUID(int=100 + index)
+        jobs.append((job_id, actor_id))
+        pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,%s,'test')",
+                   (actor_id, f"ou_fair_{index}"))
+        pg.execute("""INSERT INTO sync_jobs(id,authorization_id,mode,status,discovery_status,
+                   started_at,lease_until,last_progress_at,scheduled_at)
+                   VALUES(%s,%s,'incremental',%s,%s,NOW()-INTERVAL '2 hours',
+                   NOW()+INTERVAL '10 minutes',NOW()-INTERVAL '1 minute',NOW()-INTERVAL '1 hour')""",
+                   (job_id, actor_id, "running" if index <= 3 else "queued",
+                    "succeeded" if index <= 3 else "pending"))
+        for chat_index in range(10 if index <= 3 else 1):
+            chat_id = f"oc_fair_{index}_{chat_index}"
+            pg.execute("INSERT INTO chats(chat_id,chat_status) VALUES(%s,'normal')", (chat_id,))
+            pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,backfill_complete,
+                       last_backfill_at,sync_status) VALUES(%s,%s,TRUE,NOW()-INTERVAL '1 day','succeeded')""",
+                       (actor_id, chat_id))
+
+    prepared = []
+
+    def prepare(job, *_args):
+        prepared.append(job.id)
+        current = worker._begin_discovery(job)
+        if current:
+            worker._complete_discovery(current, 1)
+
+    monkeypatch.setattr(worker, "_prepare_job", prepare)
+    for index in range(4):
+        assert worker._start_pending_jobs(settings, object())
+        assert len(prepared) == index + 1  # Only one discovery per turn.
+    assert len(worker._running_jobs()) == 7
+    assert not worker._start_pending_jobs(settings, object())
+
+    first_job, first_actor = jobs[0]
+    pg.execute("""UPDATE authorization_chats SET incremental_job_id=%s,
+               incremental_page_token='resume-page-2',incremental_window_end_at=NOW(),
+               incremental_window_start_at=NOW()-INTERVAL '1 day'
+               WHERE authorization_id=%s AND chat_id='oc_fair_1_0'""", (first_job, first_actor))
+    pg.execute("UPDATE sync_jobs SET lease_until=NOW()-INTERVAL '1 second' WHERE id=%s", (first_job,))
+    worker._recover_expired_leases()
+    assert worker._start_pending_jobs(settings, object())
+    assert pg.execute("""SELECT incremental_page_token FROM authorization_chats
+                         WHERE authorization_id=%s AND chat_id='oc_fair_1_0'""",
+                      (first_actor,)).fetchone()["incremental_page_token"] == "resume-page-2"
+
+    executor = SimpleNamespace(submit=lambda *_args: TaskFuture())
+    seen = set()
+    resumed = False
+    for _ in range(3):
+        futures = {}
+        worker._fill_lark_slots(settings, object(), executor, futures)
+        assert len(futures) == 3
+        assert max(Counter(claim.job.authorization_id for claim in futures.values()).values()) <= 2
+        for claim in futures.values():
+            seen.add(claim.job.authorization_id)
+            resumed |= claim.expected_page_token == "resume-page-2"
+            assert worker._record_claimed_page(claim, [], None, None).committed
+            worker._add_job_progress(claim.job, pages=1, messages=0, own_messages=0)
+            # Fixture transactions keep NOW() fixed; advance fair ordering explicitly.
+            pg.execute("UPDATE sync_jobs SET last_progress_at=clock_timestamp() WHERE id=%s", (claim.job.id,))
+    assert seen == {actor for _job, actor in jobs}
+    assert resumed
+
+
+def test_discovery_is_single_flight_and_does_not_block_page_reaping(monkeypatch):
+    settings = SimpleNamespace(worker_idle_seconds=3, token_encryption_key=b"r" * 32)
+    submitted = []
+    executor = SimpleNamespace(submit=lambda *args: submitted.append(args) or TaskFuture())
+    future, next_check = worker._schedule_discovery(settings, object(), executor, None, 0)
+    assert len(submitted) == 1 and not future.done()
+    assert worker._schedule_discovery(settings, object(), executor, future, next_check) == (future, next_check)
+    assert len(submitted) == 1
+
+    page = TaskFuture()
+    page.set_result({"items": []})
+    claim = SimpleNamespace(body_consent_at=None, job="page-job")
+    pages, progressed = {page: claim}, []
+    monkeypatch.setattr(worker, "_record_claimed_page", lambda *_args, **_kwargs: worker.PageCommit(True))
+    monkeypatch.setattr(worker, "_add_job_progress", lambda job, **_kwargs: progressed.append(job))
+    worker._reap_page_futures(pages, settings)
+    assert pages == {} and progressed == ["page-job"] and not future.done()
+
+    monkeypatch.setattr(worker.time, "monotonic", lambda: 100)
+    future.set_exception(RuntimeError("synthetic discovery failure"))
+    assert worker._schedule_discovery(settings, object(), executor, future, next_check) == (None, 103)
+    assert len(submitted) == 1
+
+
+def test_new_coordinator_keeps_revocation_and_discovery_retry_fences(pg, monkeypatch):
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
+    monkeypatch.setattr(worker, "_usable_access_token", lambda *_args: "test-token")
+    monkeypatch.setattr(worker, "_refresh_profile_name", lambda *_args: None)
+    actor, job_id = UUID(int=900), UUID(int=901)
+    pg.execute("""INSERT INTO authorizations(id,open_id,status,access_token_ciphertext)
+               VALUES(%s,'ou_discovery_fence','revoked','test')""", (actor,))
+    pg.execute("""INSERT INTO sync_jobs(id,authorization_id,mode,status)
+               VALUES(%s,%s,'incremental','queued')""", (job_id, actor))
+    settings = SimpleNamespace()
+    assert worker._start_pending_jobs(settings, object())
+    assert pg.execute("SELECT status FROM sync_jobs WHERE id=%s", (job_id,)).fetchone()["status"] == "cancelled"
+
+    pg.execute("UPDATE authorizations SET status='active' WHERE id=%s", (actor,))
+    pg.execute("UPDATE sync_jobs SET status='queued',discovery_status='pending' WHERE id=%s", (job_id,))
+    pg.execute("INSERT INTO chats(chat_id) VALUES('oc_discovery_resume')")
+    pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,backfill_page_token)
+               VALUES(%s,'oc_discovery_resume','keep-page-3')""", (actor,))
+
+    def temporary_failure(*_args, **_kwargs):
+        raise worker.LarkApiError(503, None, "synthetic unavailable", retry_after=0)
+
+    client = SimpleNamespace(list_chats=temporary_failure)
+    assert worker._start_pending_jobs(settings, client)
+    assert pg.execute("SELECT status,discovery_status,discovery_generation FROM sync_jobs WHERE id=%s",
+                      (job_id,)).fetchone() == {"status": "queued", "discovery_status": "pending",
+                                              "discovery_generation": 1}
+    assert pg.execute("SELECT backfill_page_token FROM authorization_chats WHERE authorization_id=%s",
+                      (actor,)).fetchone()["backfill_page_token"] == "keep-page-3"
+
+
 def test_completed_backfill_enqueues_a_separate_incremental_job(monkeypatch) -> None:
     calls = []
     job = worker.SyncJob(UUID(int=1), UUID(int=2), "backfill", 0, "succeeded", 3)

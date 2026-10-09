@@ -1,6 +1,6 @@
 from contextlib import nullcontext
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlencode, urlparse
 from uuid import uuid4
@@ -80,7 +80,8 @@ def test_dashboard_navigation_preserves_access_and_connection_controls(monkeypat
     assert "工作台" in rendered and "权限与数据使用" in rendered
     assert 'href="/creators"' in rendered and 'href="/dashboard/offhours-summary"' in rendered
     assert "/creators/broadcast" not in rendered and 'href="/admin"' not in rendered
-    assert 'hx-trigger="load, every 5s"' in rendered
+    assert 'hx-trigger="every 10s [!document.hidden]"' in rendered
+    assert 'hx-trigger="load' not in rendered and 'class="ui-spinner"' not in rendered
     enabled = main._template(request, "dashboard.html", {
         **context, "authorization": {**authorization, "broadcast_enabled": True},
     }).body.decode()
@@ -117,6 +118,36 @@ def test_dashboard_requires_login_and_retired_creator_endpoints_are_absent(monke
     for path in ("/dashboard/creators/ai/scan", "/dashboard/creators/import/preview",
                  f"/dashboard/creators/{uuid4()}/confirm"):
         assert client.post(path).status_code == 404
+
+
+def test_dashboard_polling_distinguishes_active_sync_from_scheduled_or_paused_work(pg, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(main, "connection", lambda: nullcontext(pg))
+    actor, job = uuid4(), uuid4()
+    pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,'dashboard_actor','fixture')",
+               (actor,))
+    pg.execute("INSERT INTO chats(chat_id) VALUES('dashboard_chat')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id,backfill_complete,sync_status) "
+               "VALUES(%s,'dashboard_chat',TRUE,'succeeded')", (actor,))
+    pg.execute("INSERT INTO sync_jobs(id,authorization_id,mode,status) VALUES(%s,%s,'incremental','queued')",
+               (job, actor))
+    monkeypatch.setattr(main, "_current_authorization", lambda _: {"id": actor})
+    client = TestClient(main.app)
+    now = datetime.now(UTC)
+    for status, scheduled, discovery, http_status, error_code, label, syncing in (
+        ("queued", now + timedelta(minutes=5), "succeeded", None, None, "已接入 · 定时同步", False),
+        ("queued", now - timedelta(minutes=1), "succeeded", None, None, "准备定时更新", False),
+        ("running", now, "succeeded", None, None, "定时更新中", True),
+        ("running", now, "pending", None, None, "正在发现会话", True),
+        ("running", now, "succeeded", 429, None, "Lark 限流暂停", False),
+        ("running", now, "succeeded", None, 99991400, "Lark 限流暂停", False),
+    ):
+        pg.execute("UPDATE sync_jobs SET status=%s,scheduled_at=%s,discovery_status=%s,last_http_status=%s,"
+                   "last_error_code=%s WHERE id=%s", (status, scheduled, discovery, http_status, error_code, job))
+        response = client.get("/dashboard/stats")
+        assert response.status_code == 200 and label in response.text
+        assert ('class="ui-spinner"' in response.text) is syncing
+        assert 'hx-trigger="every 10s [!document.hidden]"' in response.text
+        assert 'hx-trigger="load' not in response.text
 
 
 def test_named_frontend_testers_do_not_require_a_retired_admin_grant() -> None:

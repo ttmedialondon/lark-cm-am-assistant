@@ -1,7 +1,7 @@
-<div id="dashboard-stats" hx-get="/dashboard/stats" hx-trigger="load, every 5s" hx-swap="outerHTML">
+<div id="dashboard-stats" hx-get="/dashboard/stats" hx-trigger="every 10s [!document.hidden]" hx-swap="outerHTML">
   <div class="card">
     <div class="card-body d-flex align-items-start gap-3">
-      <span class="badge bg-{{ stats.badge }}-lt ui-loading">{% if stats.job and stats.job.status in ['queued', 'running'] %}<span class="ui-spinner" aria-hidden="true"></span>{% endif %}{{ stats.status }}</span>
+      <span class="badge bg-{{ stats.badge }}-lt ui-loading">{% if stats.syncing %}<span class="ui-spinner" aria-hidden="true"></span>{% endif %}{{ stats.status }}</span>
       <div>
         <div>{{ stats.detail }}</div>
         <div class="text-secondary small mt-1">最近检查：{{ stats.last_synced_at }}</div>

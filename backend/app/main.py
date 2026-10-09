@@ -508,7 +508,8 @@ def _dashboard_stats(authorization_id: uuid.UUID) -> dict[str, Any]:
                 GROUP BY access.authorization_id
             ), latest_job AS (
                 SELECT mode, status, scheduled_at, pages_processed, chats_discovered,
-                       messages_indexed, own_messages_indexed, last_error, updated_at
+                       messages_indexed, own_messages_indexed, discovery_status,
+                       last_http_status, last_error_code, last_error, updated_at
                 FROM sync_jobs
                 WHERE authorization_id = %s
                 ORDER BY created_at DESC
@@ -526,6 +527,9 @@ def _dashboard_stats(authorization_id: uuid.UUID) -> dict[str, Any]:
                 j.mode AS job_mode,
                 j.status AS job_status,
                 j.scheduled_at AS job_scheduled_at,
+                j.discovery_status AS job_discovery_status,
+                j.last_http_status AS job_last_http_status,
+                j.last_error_code AS job_last_error_code,
                 j.pages_processed,
                 j.chats_discovered,
                 j.messages_indexed,
@@ -557,6 +561,7 @@ def _dashboard_stats(authorization_id: uuid.UUID) -> dict[str, Any]:
         "status": status,
         "detail": detail,
         "badge": badge,
+        "syncing": job["status"] == "running" and badge == "primary",
         "job": job,
     }
 
