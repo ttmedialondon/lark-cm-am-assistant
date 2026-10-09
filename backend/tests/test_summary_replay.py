@@ -68,6 +68,11 @@ def test_v5_replay_preserves_reports_and_usage_and_bounds_the_window(pg, seeded)
         patch.setattr(summaries, '_enabled', lambda conn: True)
         with pytest.raises(summaries.SummaryInputError):
             summaries._current(pg, lease)
+        pg.execute("UPDATE offhours_summary_runs SET coverage=coverage || jsonb_build_object('cutoff',window_end) "
+                   "WHERE id=%s", (ids['recent_done'][0],))
+        view = summaries.get_summary_view(pg, s.ids['owner'], cm_id=s.ids['cm'],
+                                          day=cases['recent_done'][0], period='work')
+        assert view['run']['status'] == 'queued' and not view['events']
     assert pg.execute('SELECT to_jsonb(c) FROM ai_feature_configs c ORDER BY feature').fetchall() == configs
     assert pg.execute('SELECT * FROM contact_assignments ORDER BY id').fetchall() == people
     assert pg.execute('SELECT * FROM chat_messages ORDER BY message_id').fetchall() == messages

@@ -237,10 +237,11 @@ def _roster(conn, cm_id=REMI_ID):
            SELECT c.id AS contact_id, sa.display_handle, sa.id AS account_id, i.open_id,
                   COALESCE(i.display_name,c.display_name) AS name
            FROM contacts c JOIN lark_identities i ON i.contact_id=c.id AND i.identity_type='user'
-           LEFT JOIN social_accounts sa ON sa.id IN (
-               SELECT social_account_id FROM owners WHERE contact_id=c.id
-               UNION SELECT social_account_id FROM legacy WHERE contact_id=c.id
-           )
+           LEFT JOIN (
+               SELECT contact_id,social_account_id FROM owners
+               UNION SELECT contact_id,social_account_id FROM legacy
+           ) links ON links.contact_id=c.id
+           LEFT JOIN social_accounts sa ON sa.id=links.social_account_id
            WHERE EXISTS(SELECT 1 FROM contact_roles r WHERE r.contact_id=c.id
              AND r.role='creator' AND r.status='confirmed')
              AND c.id IN (SELECT contact_id FROM people UNION SELECT contact_id FROM legacy)
@@ -1174,7 +1175,7 @@ def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None):
     if chat_tasks and all(t["status"] == "succeeded" for t in chat_tasks):
         if not any(t["chat_id"] is None for t in tasks):
             counts["queued"] += 1  # Preparation must still create the within-period merge.
-    if row.get("period") and not coverage.get("cutoff"):
+    if row.get("period") and (not coverage.get("cutoff") or coverage.get("policy") != POLICY_VERSION):
         status = "queued"
         gaps.append("正在准备该时段的群聊和私聊材料。")
     elif counts["queued"] or counts["running"]:
