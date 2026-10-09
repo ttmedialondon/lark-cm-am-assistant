@@ -1,6 +1,7 @@
 """Scoped CAP group/person evidence, automatic admission and manual correction."""
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from io import BytesIO
@@ -417,7 +418,8 @@ def test_manual_import_concurrent_confirmations_create_one_person_and_account_li
     for batch in batches:
         imports.start_import(cm, batch["id"])
     row_ids = [row_for(pg, batch, "same_account")["id"] for batch in batches]
-    schema, dsn = pg.execute("SELECT current_schema() name").fetchone()["name"], pg.info.dsn
+    schema = pg.execute("SELECT current_schema() name").fetchone()["name"]
+    dsn = os.environ.get("TEST_DATABASE_URL") or os.environ["CREATOR_WORKFLOW_AI_TEST_DATABASE_URL"]
     pg.execute(psycopg.sql.SQL("SET search_path TO {}").format(psycopg.sql.Identifier(schema)))
     pg.commit()
 
