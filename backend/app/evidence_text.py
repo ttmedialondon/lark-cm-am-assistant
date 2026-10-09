@@ -17,12 +17,6 @@ _IMPORTANT = re.compile(
     re.I,
 )
 
-_ROUTINE = re.compile(
-    r"^(?:(?:hi|hello|hey|thanks|thank you|okay|ok|yes|no|perfect|amazing|"
-    r"sounds good|got it|good morning|good night|cheers|你好|谢谢|好的|收到)[\s!.,?🙏👍❤️]*)+$",
-    re.I,
-)
-
 _EMAIL = re.compile(r"(?<![\w@])[\w.!#$%&'*+/=?^`{|}~-]+@[\w.-]+\.[A-Za-z]{2,}")
 
 _PHONE = re.compile(r"(?<![\w])\+?\d[\d ()-]{7,}\d(?![\w])")

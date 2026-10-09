@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from email.utils import format_datetime
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -124,10 +124,23 @@ def test_single_request_transport_preserves_retry_hints_and_safe_failure_metadat
     result = httpx.ReadTimeout("PRIVATE REQUEST", request=httpx.Request("POST", "https://api.openai.com"))
     with pytest.raises(openai_client.OpenAIRequestError) as stopped:
         request()
-    assert stopped.value.retryable
+    assert stopped.value.request_unknown and not stopped.value.retryable
     assert "PRIVATE REQUEST" not in str(stopped.value) + str(stopped.value.telemetry)
     assert openai_client.retry_delay(float("nan"), 2) == 4.5
     assert openai_client.retry_delay(-1, 2) == 4.5
+
+
+@pytest.mark.parametrize("interactive", [False, True])
+def test_invalid_deadline_is_rejected_before_any_provider_request(monkeypatch, interactive) -> None:
+    monkeypatch.setattr(openai_client.httpx, "post", lambda *a, **kw: pytest.fail("must not send"))
+    monkeypatch.setattr(openai_client, "_post_with_deadline", lambda *a, **kw: pytest.fail("must not send"))
+    fields = {"instructions": "test", "output_format": {"type": "json_object"}, "total_timeout": 0}
+    with pytest.raises(openai_client.AIInputError) as stopped:
+        if interactive:
+            asyncio.run(openai_client.call_openai_async({"model": "synthetic"}, "test-key", {}, uuid4(), **fields))
+        else:
+            openai_client.call_openai({"model": "synthetic"}, "test-key", {}, uuid4(), **fields)
+    assert not isinstance(stopped.value, openai_client.OpenAIRequestError)
 
 
 @pytest.mark.parametrize("interactive", [False, True])
@@ -173,6 +186,6 @@ def test_total_deadline_cancels_network_request_without_background_retry(monkeyp
     delay = True
     with pytest.raises(openai_client.OpenAIRequestError) as error:
         request()
-    assert error.value.retryable
+    assert error.value.request_unknown and not error.value.retryable
     assert len(calls) == len(stopped) == len(closed) == 2
     assert error.value.telemetry["response_latency_ms"] < 1_000

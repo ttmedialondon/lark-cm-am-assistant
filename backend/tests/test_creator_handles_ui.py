@@ -247,6 +247,41 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
     assert client.post(url, data=fields).status_code == 200
     safe = client.get(f"/creators/data?tab=mine&cm_id={cm}&sort=bad%27SQL&tier=bad%27SQL").json()
     assert safe["sort"] == "name" and safe["tier"] == "" and safe["total_count"] == 1
+    assert safe["items"][0]["importance"]["manual_reason"] == fields["reason"]
+    monkeypatch.setattr(creator_importance, "view_for", lambda *args, **kwargs: pytest.fail(
+        "Roster queried/decrypted a profile separately for each person"))
+    queries = []
+
+    class CountedConnection:
+        def execute(self, sql, params=None):
+            queries.append(sql)
+            return pg.execute(sql, params)
+
+        def transaction(self):
+            return pg.transaction()
+
+    monkeypatch.setattr(creator_roster, "connection", lambda: nullcontext(CountedConnection()))
+    one = creator_roster.page_data(actor["id"], cm)
+    assert len(one["items"]) == 1
+    one_count = len(queries)
+    assert sum("LEFT JOIN LATERAL" in sql for sql in queries) == 1
+    pg.execute("SAVEPOINT roster_validity")
+    pg.execute("""UPDATE creator_importance_profiles SET manual_tier=NULL,auto_valid=TRUE,
+        facts_ciphertext='not-a-ciphertext',prompt_version=%s,sources='[]',
+        coverage=jsonb_build_object('has_readable',TRUE,'priority',jsonb_build_object('primary_at',NOW()))
+        WHERE contact_id=%s AND responsible_authorization_id=%s""",
+               (creator_importance.facts.PROMPT_VERSION, assigned, cm))
+    automatic = creator_roster.page_data(actor["id"], cm, sort="name")["items"][0]["importance"]
+    assert automatic["tier"] == "focus" and automatic["manual_tier"] == ""
+    pg.execute("UPDATE creator_importance_profiles SET sources=%s::jsonb "
+               "WHERE contact_id=%s AND responsible_authorization_id=%s",
+               (json.dumps([{"chat_id": "missing_chat", "message_id": "missing_message"}]), assigned, cm))
+    assert creator_roster.page_data(actor["id"], cm)["items"][0]["importance"]["tier"] == "pending"
+    pg.execute("UPDATE creator_importance_profiles SET manual_tier='focus' "
+               "WHERE contact_id=%s AND responsible_authorization_id=%s", (assigned, cm))
+    reviewed = creator_roster.page_data(actor["id"], cm)["items"][0]["importance"]
+    assert reviewed["tier"] == "focus" and reviewed["manual_reason"] == fields["reason"]
+    pg.execute("ROLLBACK TO SAVEPOINT roster_validity")
     pg.execute("SAVEPOINT roster_pagination")
     expected_ids = [str(assigned)]
     for manual_tier in creator_importance.TIERS:
@@ -260,7 +295,10 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
                        "VALUES(%s,%s,%s,'manual')", (uuid4(), person, cm))
             pg.execute("INSERT INTO creator_importance_profiles(contact_id,responsible_authorization_id,manual_tier) "
                        "VALUES(%s,%s,%s)", (person, cm, manual_tier))
+    queries.clear()
     first_page = client.get(f"/creators/data?tab=mine&cm_id={cm}&sort=importance&page=1").json()
+    assert len(queries) == one_count
+    assert sum("LEFT JOIN LATERAL" in sql for sql in queries) == 1
     second_page = client.get(f"/creators/data?tab=mine&cm_id={cm}&sort=importance&page=2").json()
     assert first_page["total_count"] == second_page["total_count"] == 31
     assert first_page["total_pages"] == second_page["total_pages"] == 2
@@ -272,15 +310,25 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
         t for t in creator_importance.TIERS for _ in range(6)]
     repeated = client.get(f"/creators/data?tab=mine&cm_id={cm}&sort=importance&page=2").json()
     assert [item["id"] for item in repeated["items"]] == expected_ids[25:]
+    queries.clear()
+    assert len(creator_roster.page_data(actor["id"], cm, sort="name")["items"]) == 25
+    assert len(queries) == one_count
     pg.execute("ROLLBACK TO SAVEPOINT roster_pagination")
     actor["id"] = cm
     assert client.post(url, data=fields).status_code == 403
-    personal = client.get("/creators/data").json()
+    with monkeypatch.context() as scoped:
+        scoped.setattr(creator_importance, "_cipher", lambda *_args: pytest.fail(
+            "A non-Owner roster decrypted the manual reason"))
+        personal = client.get("/creators/data").json()
     assert personal["tab"] == "mine" and personal["total_count"] == 1
     assert not personal["can_adjust_importance"] and not personal["can_edit_handles"]
     assert personal["items"][0]["importance"]["manual_reason"] == ""
     assert client.get("/creators/data?tab=candidates").json()["tab"] == "mine"
     assert client.get("/creators/data?tab=unassigned").status_code == 403
+    pg.execute("SAVEPOINT roster_revoked")
+    pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (cm,))
+    assert client.get("/creators/data").status_code == 403
+    pg.execute("ROLLBACK TO SAVEPOINT roster_revoked")
     owner = pg.execute("SELECT authorization_id FROM admin_roles WHERE role='owner'").fetchone()["authorization_id"]
     actor["id"] = owner
     monkeypatch.setattr(creator_importance, "view_for", lambda *args, **kwargs: pytest.fail(

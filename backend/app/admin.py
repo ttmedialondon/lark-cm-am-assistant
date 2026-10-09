@@ -148,7 +148,6 @@ def create_admin_router(
             "/admin/contacts/{open_id}": "contacts",
             "/admin/messages/export": "messages",
             "/admin/ai": "ai", "/admin/jobs": "jobs",
-            "/admin/ai/creator-ownership": "ai", "/admin/ai/creator-ownership/data": "ai",
         }.get(route_path)
         if not acl["is_owner"]:
             if request.method == "GET" and route_path == "/admin" and "overview" not in acl["permissions"]:
@@ -288,13 +287,10 @@ def create_admin_router(
                 "summary_settings": summary_settings,
                 "importance_metrics": importance_metrics,
                 "summary_saved": request.query_params.get("saved") == "offhours-summary",
-                "identity_saved": request.query_params.get("saved") == "people-identity",
                 "matching_saved": request.query_params.get("saved") == "creator-handle-matching",
                 "responsibility_saved": request.query_params.get("saved") == "creator-responsibility-matching",
                 "groups_saved": request.query_params.get("saved") == "creator-group-classification",
                 "importance_saved": request.query_params.get("saved") == "creator-importance",
-                # Retain this template-safe alias while external callers migrate to ``configs``.
-                "config": configs[0]["config"],
                 "form_error": error,
             },
             status_code,

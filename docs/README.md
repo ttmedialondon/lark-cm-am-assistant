@@ -6,7 +6,7 @@
 
 | 文档 | 回答的问题 |
 |---|---|
-| [人员身份与达人名单](product/creator-management.md) | 名单匹配、确认入库及旧机制退役边界；旧 CAP 描述以最新规则为准 |
+| [人员身份与达人名单](product/creator-management.md) | 人员、账号、多负责人、名单导入、自动匹配及旧机制退役边界 |
 | [指定时段消息总结](product/message-summary.md) | 哪些消息要分析，P0–P3 怎么分，显示什么，哪些事不做？ |
 | [后台权限与用户显示](product/admin-access.md) | 谁能看或修改哪些页面，领导能看哪些聊天，姓名和 @ 怎么显示？ |
 | [系统技术说明](architecture/system-design.md) | 页面、同步、身份、账号、授权、并发和旧快照如何关联？ |

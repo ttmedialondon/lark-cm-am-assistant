@@ -389,6 +389,7 @@ def responsibility_flow(pg, pilot, monkeypatch):
         pack = {
             "target": "U1",
             "creator_known": True,
+            "synthetic_material_revision": state.material_version,
             "candidates": [
                 {"id": "CM1", "name": "CM one", "known_assignment": False},
                 {"id": "CM2", "name": "CM two", "known_assignment": False},
@@ -735,7 +736,8 @@ def test_retry_ledger_and_disabled_config_keep_suggestions_isolated(pg, responsi
     flow = responsibility_flow
     flow.enable()
     job = _prepared_job(pg, flow)
-    flow.error = openai_client.OpenAIRequestError("synthetic overload", retry_after_seconds=120, retryable=True)
+    flow.error = openai_client.OpenAIRequestError("synthetic overload", retry_after_seconds=120, retryable=True,
+                                                telemetry={"http_status": 429})
     matching.run(job, flow.settings)
     row = pg.execute(
         "SELECT status,EXTRACT(EPOCH FROM not_before-NOW()) seconds FROM creator_responsibility_jobs WHERE id=%s",
@@ -760,11 +762,63 @@ def test_retry_ledger_and_disabled_config_keep_suggestions_isolated(pg, responsi
         pg.execute("SELECT count(*) n FROM contact_assignments WHERE contact_id=%s", (flow.contact,)).fetchone()["n"]
         == 1
     )
+    flow.material_version += 1
+    unknown = _prepared_job(pg, flow)
+    flow.error = openai_client.OpenAIRequestError("synthetic timeout", retryable=True)
+    matching.run(unknown, flow.settings)
+    assert matching.claim() is None and len(flow.calls) == 3
+    assert pg.execute("SELECT status,reason_code FROM creator_responsibility_jobs WHERE id=%s",
+                      (unknown["id"],)).fetchone() == {"status": "failed", "reason_code": "request_unknown"}
+    assert pg.execute("SELECT error_code,finished_at FROM creator_responsibility_requests WHERE id=%s",
+                      (unknown["reservation_id"],)).fetchone()["error_code"] == "request_unknown"
+    # Rotation and unrelated signals cannot turn an unknown paid attempt into an automatic retry.
+    flow.enable("sk-rotated-after-unknown")
+    blocked = _enqueue(pg, flow.contact, "history")
+    assert matching.prepare_next(flow.settings) and matching.claim() is None
+    assert pg.execute("SELECT status,reason_code FROM creator_responsibility_jobs WHERE id=%s",
+                      (blocked,)).fetchone() == {
+        "status": "failed", "reason_code": "request_unknown",
+    }
+    assert len(flow.calls) == 3
+    flow.error = None
+    manual = _prepared_job(pg, flow)
+    matching.run(manual, flow.settings)
+    assert len(flow.calls) == 4
     flow.enable(enabled=False)
     matching.configuration_changed(pg)
     assert _enqueue(pg, flow.contact) is None and matching.claim() is None
     import_config = pg.execute("SELECT enabled FROM ai_feature_configs WHERE feature='creator_import'").fetchone()
     assert import_config["enabled"] is False
+
+
+def test_unknown_request_after_config_race_only_blocks_identical_material(pg, responsibility_flow, monkeypatch):
+    flow = responsibility_flow
+    flow.enable()
+    job = _prepared_job(pg, flow)
+    flow.error = openai_client.OpenAIRequestError("synthetic timeout", retryable=True)
+    flow.before_response = lambda: flow.enable("sk-rotated-during-call")
+    matching.run(job, flow.settings)
+    flow.before_response = None
+    assert matching.prepare_next(flow.settings) and matching.claim() is None and len(flow.calls) == 1
+    assert pg.execute("SELECT reason_code FROM creator_responsibility_jobs WHERE id=%s", (job["id"],)).fetchone() == {
+        "reason_code": "request_unknown",
+    }
+    original_build = matching.evidence.build
+
+    def changed(*args, **kwargs):
+        material = original_build(*args, **kwargs)
+        material["pack"]["messages"][0]["text"] += " Please arrange the next campaign."
+        material["fingerprint"] += "-new-message"
+        return material
+
+    monkeypatch.setattr(matching.evidence, "build", changed)
+    flow.error = None
+    _enqueue(pg, flow.contact, "history")
+    assert matching.prepare_next(flow.settings)
+    fresh = matching.claim()
+    assert fresh is not None
+    matching.run(fresh, flow.settings)
+    assert len(flow.calls) == 2
 
 
 def test_post_response_sql_failure_keeps_usage_and_never_redispatches_unknown_or_sample_tasks(
@@ -892,6 +946,14 @@ def test_owner_only_routes_csrf_lazy_evidence_and_safe_audit(pg, pilot, responsi
     assert "99%" in response.text and "已自动关联" in response.text
     assert "helper" in response.text  # CM contact ID differs from the current authorization ID.
     assert "/confirm" not in response.text and "/apply" not in response.text
+    pg.execute("SAVEPOINT unknown_page")
+    pg.execute("UPDATE creator_responsibility_jobs SET status='failed',reason_code='request_unknown',"
+               "result_ciphertext=NULL WHERE id=%s", (job["id"],))
+    unknown = client.get(path)
+    assert unknown.status_code == 200 and "调用失败" in unknown.text
+    assert unknown.text.count("请求结果未知，需核实后重新检查") == 1
+    assert "request_unknown" not in unknown.text
+    pg.execute("ROLLBACK TO SAVEPOINT unknown_page")
     read_path = path + f"/jobs/{job['id']}/evidence"
     response = client.get(read_path)
     assert response.status_code == 200 and response.headers["cache-control"] == "no-store, max-age=0"

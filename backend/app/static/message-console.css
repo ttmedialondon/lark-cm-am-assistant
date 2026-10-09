@@ -8,11 +8,6 @@
 .message-console__heading { min-width: 0; }
 .message-console__heading h1 { margin: 0 0 .5rem; font-size: 1.35rem; font-weight: 650; }
 .message-console__heading > p { margin: .5rem 0 0; color: var(--mc-muted); font-size: .76rem; }
-.message-console__steps { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1rem; margin: 0; padding: 0; color: var(--mc-muted); list-style: none; font-size: .75rem; }
-.message-console__steps li { display: flex; align-items: center; gap: .4rem; }
-.message-console__steps li > span { display: grid; place-items: center; width: 1.25rem; height: 1.25rem; border-radius: 50%; background: #e8edf5; font-size: .68rem; }
-.message-console__steps li[aria-current] { color: #2e62b8; font-weight: 600; }
-.message-console__steps li[aria-current] > span { background: #e0eaff; }
 .message-console__source-picker { flex: 0 1 34rem; min-width: 0; }
 .message-console__user-form .form-label { margin-bottom: .35rem; font-size: .75rem; color: var(--mc-muted); }
 .message-console__user-form .form-select { min-width: 0; width: 100%; font-size: .8125rem; }
@@ -24,7 +19,6 @@
 .message-console__workspace { display: grid; grid-template-columns: minmax(18rem, 22rem) minmax(0, 1fr); gap: 1rem; min-height: 34rem; }
 .message-console__directory, .message-console__detail { display: flex; flex-direction: column; min-width: 0; overflow: hidden; scroll-margin-top: 1rem; }
 .message-console__directory-header { flex: 0 0 auto; padding: 1rem 1.1rem .8rem; }
-.message-console__section-label { margin-bottom: .3rem; color: var(--mc-muted); font-size: .67rem; font-weight: 600; letter-spacing: .04em; }
 .message-console__directory-header h2 { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; margin: 0; color: var(--mc-ink); font-size: 1rem; font-weight: 650; line-height: 1.45; overflow-wrap: anywhere; }
 .message-console__directory-header > p { margin: .4rem 0 0; color: var(--mc-muted); font-size: .72rem; }
 .message-console__filter-panel { flex: 0 0 auto; padding: 0 1rem .85rem; border-bottom: 1px solid var(--mc-line); }

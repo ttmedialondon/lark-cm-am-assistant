@@ -15,7 +15,6 @@
     {% endif %}
     {% if form_error %}<div class="alert alert-danger" role="alert">{{ form_error }}</div>{% endif %}
     {% if summary_saved %}<div class="alert alert-success" role="status">配置已保存。<a href="/dashboard/offhours-summary" class="alert-link">查看总结</a></div>{% endif %}
-    {% if identity_saved %}<div class="alert alert-success" role="status">配置已保存。<a href="/admin/contacts" class="alert-link">查看识别进度</a></div>{% endif %}
     {% if matching_saved and admin_role == 'owner' %}<div class="alert alert-success" role="status">配置已保存。<a href="/admin/ai/creator-handle-matching" class="alert-link">匹配任务</a></div>{% endif %}
     {% if responsibility_saved and admin_role == 'owner' %}<div class="alert alert-success" role="status">配置已保存。<a href="/admin/ai/creator-responsibility" class="alert-link">负责人匹配</a></div>{% endif %}
     {% if groups_saved and admin_role == 'owner' %}<div class="alert alert-success" role="status">配置已保存。<a href="/admin/ai/creator-groups" class="alert-link">群用途匹配</a></div>{% endif %}

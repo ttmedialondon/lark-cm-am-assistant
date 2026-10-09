@@ -507,7 +507,9 @@ def step(job, settings):
                     job,
                     settings,
                     cfg,
-                    {"a": ledger[against], "b": candidate, "evidence_messages": evidence_messages},
+                    {"a": {k: v for k, v in ledger[against].items() if k != "reason"},
+                     "b": {k: v for k, v in candidate.items() if k != "reason"},
+                     "evidence_messages": evidence_messages},
                     merge_format(evidence_messages, ledger[against], candidate),
                     MERGE_INSTRUCTIONS,
                 )
@@ -580,7 +582,9 @@ def run(job, settings):
         delay = openai_client.retry_delay(exc.retry_after_seconds, job["attempts"])
         if retry:
             core.ai_dispatch.throttle(delay)
-        core._finish(job, "queued" if retry else "failed", "OpenAI 请求未完成；已完成分段保留。", delay=delay)
+        message = ("请求结果未知，未自动重复调用；请核实后重新生成。" if exc.request_unknown
+                   else "OpenAI 请求未完成；已完成分段保留。")
+        core._finish(job, "queued" if retry else "failed", message, delay=delay)
     except (
         core.InvalidModelOutput,
         openai_client.ModelOutputError,

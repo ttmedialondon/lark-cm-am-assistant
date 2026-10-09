@@ -53,12 +53,12 @@ export function listState(cmId, purpose, mention, targets) {
 export function permissionReady(result, pending, cm, checkedCm, redirecting = false) {
   return !pending && !redirecting && cm === checkedCm && result?.status === 'ready';
 }
-export function automaticAuthorizationUrl(value, actor, origin) {
+export function authorizationUrl(value, actor, origin) {
   if (typeof value !== 'string' || value.length > 512) throw new Error('授权地址无效，请重新检查。');
   const url = new URL(value, origin);
   if (url.origin !== origin || url.pathname !== '/auth/lark/start' || url.hash || url.username || url.password
       || url.searchParams.get('send') !== '1' || url.searchParams.get('account_id') !== actor
-      || [...url.searchParams.keys()].some(key => !['send','account_id','auto'].includes(key))) {
+      || [...url.searchParams.keys()].some(key => !['send','account_id'].includes(key))) {
     throw new Error('授权账号不一致，请重新检查。');
   }
   return `/auth/lark/start?${new URLSearchParams({send:'1',account_id:actor})}`;
@@ -88,76 +88,6 @@ export function parseDraft(raw, actor, now = Date.now(), canSelectCm = true) {
     mention:draft.mention,raw:draft.raw,message:draft.message,fixed_ids:ids,
     fixed_targets:draft.fixed_targets?.map(target => ({contact_id:target.contact_id,chat_id:target.chat_id})) || null,
     selected_groups:[...new Set(draft.selected_groups)]};
-}
-
-if (typeof process !== 'undefined' && process.argv.includes('--self-check')) {
-  const { default: assert } = await import('node:assert/strict');
-  const people = [{id:'p1', name:'Example One', handles:['one','backup'], groups:['shared','training']},
-    {id:'p2', name:'Example Two', handles:['two'], groups:['shared','training','training2']}];
-  const groups = [{id:'shared', purpose:'support', members:['p1','p2']},
-    {id:'training', purpose:'training', members:['p1','p2']}, {id:'training2', purpose:'training', members:['p2']}];
-  const entries = [people[0], people[0], people[1]].map((person,index) => ({key:`h${index}`, inputs:['input'],person,candidates:[person],selected:true}));
-  let rows = recipients(entries,new Map(),groups,'support');
-  assert.equal(rows.length,2); assert.equal(rows[0].entries.length,2);
-  assert.equal(buildPlan(rows,true,'客服群').groups.length,1);
-  assert.equal(buildPlan(rows,true,'客服群').groups[0].mentions.length,2);
-  rows = recipients(entries,new Map(),groups,'training');
-  assert.equal(buildPlan(rows,true,'培训群').issues.length,1);
-  rows = recipients(entries,new Map([['p2','training2']]),groups,'training');
-  assert.equal(buildPlan(rows,false,'培训群').groups.length,2);
-  assert.ok(buildPlan(rows,false,'培训群').groups.every(group => !group.mentions.length));
-  const mixed = [...entries,{key:'p1',inputs:['candidate'],person:null,candidates:[people[0]],selected:true}];
-  assert.equal(buildPlan(recipients(mixed,new Map(),groups,'support'),true,'客服群').issues.length,1);
-  assert.equal(buildPlan(recipients(entries,new Map([['p1','shared']]),groups,'training'),true,'培训群').issues.length,2);
-  assert.equal(buildPlan(recipients(entries,new Map([['p1','']]),groups,'support'),true,'客服群').issues.length,1);
-  const handoff = {actor_id:'actor',cm_id:'all',created_at:1000,contact_ids:['00000000-0000-0000-0000-000000000001']};
-  assert.equal(parseSelection(JSON.stringify(handoff),'actor',1001).contact_ids.length,1);
-  assert.throws(() => parseSelection(JSON.stringify(handoff),'other',1001));
-  assert.throws(() => parseSelection(JSON.stringify(handoff),'actor',301001));
-  assert.throws(() => parseSelection(JSON.stringify({...handoff,contact_ids:['bad']}),'actor',1001));
-  const targets = [{contact_id:'p1',chat_id:'shared'},{contact_id:'p2',chat_id:'shared'}];
-  const saved = listState('all','support',true,targets);
-  assert.equal(saved,listState('all','support',true,[...targets].reverse()));
-  assert.notEqual(saved,listState('all','support',false,targets));
-  assert.notEqual(saved,listState('all','training',true,targets));
-  assert.notEqual(saved,listState('other','support',true,targets));
-  assert.notEqual(saved,listState('all','support',true,targets.slice(0,1)));
-  for (const purpose of ['community','category','campaign']) {
-    assert.equal(buildPlan(recipients(entries,new Map(),groups,purpose),true,'群').groups.length,0);
-  }
-  const direct = groupPlan(groups, ['training','training','training2'], true);
-  assert.equal(direct.groups.length,2); assert.ok(direct.groups.every(group => group.mention_all && !group.people.length));
-  assert.equal(groupPlan(groups, ['missing'], true).issues.length,1);
-  assert.equal(groupPlan(groups, [], true).groups.length,0);
-  assert.notEqual(listState('cm','category',true,[{chat_id:'training'}]),listState('cm','category',true,[{chat_id:'training2'}]));
-  const actor = '00000000-0000-0000-0000-000000000001', other = '00000000-0000-0000-0000-000000000002';
-  assert.equal(parseSelection(JSON.stringify({...handoff,actor_id:actor,cm_id:actor}),actor,1001,false).cm_id,actor);
-  for (const cm_id of ['all',other]) {
-    assert.throws(() => parseSelection(JSON.stringify({...handoff,actor_id:actor,cm_id}),actor,1001,false));
-  }
-  const draft = {version:1,actor_id:actor,created_at:1000,cm_id:'all',purpose:'support',mention:true,
-    message:'Keep my text',raw:'@example',fixed_ids:[other],fixed_targets:[{contact_id:other,chat_id:'oc_example'}],
-    selected_groups:[]};
-  assert.equal(parseDraft(JSON.stringify(draft),actor,1001).message,draft.message);
-  assert.equal(parseDraft(JSON.stringify({...draft,cm_id:actor}),actor,1001,false).message,draft.message);
-  for (const cm_id of ['all','',other]) assert.throws(() => parseDraft(JSON.stringify({...draft,cm_id}),actor,1001,false));
-  assert.equal(parseDraft(JSON.stringify({...draft,fixed_ids:[],fixed_targets:[]}),actor,1001).fixed_ids.length,0);
-  assert.equal(parseDraft(JSON.stringify({...draft,fixed_targets:[{contact_id:other,chat_id:''}]}),actor,1001).fixed_targets[0].chat_id,'');
-  for (const fields of [{actor_id:other},{created_at:-1800001},{message:'x'.repeat(4001)},
-    {fixed_ids:['bad']},{fixed_targets:[{contact_id:actor,chat_id:'oc_example'}]},{selected_groups:['']},
-    {purpose:'unknown'}]) assert.throws(() => parseDraft(JSON.stringify({...draft,...fields}),actor,1001));
-  assert.equal(automaticAuthorizationUrl(`/auth/lark/start?send=1&account_id=${actor}`,actor,'https://testserver'),
-    `/auth/lark/start?send=1&account_id=${actor}`);
-  for (const url of [`https://other.test/auth/lark/start?send=1&account_id=${actor}`,
-    `/auth/lark/start?send=1&account_id=${other}`,`/auth/lark/start?send=1&account_id=${actor}&redirect=evil`]) {
-    assert.throws(() => automaticAuthorizationUrl(url,actor,'https://testserver'));
-  }
-  assert.ok(permissionReady({status:'ready'},false,'all','all'));
-  assert.ok(!permissionReady({status:'ready'},true,'all','all'));
-  assert.ok(!permissionReady({status:'ready'},false,actor,'all'));
-  assert.ok(!permissionReady({status:'ready'},false,'all','all',true));
-  assert.ok(!permissionReady({status:'needs_authorization'},false,'all','all'));
-  console.log('Multi-purpose broadcast routing check passed; no API calls.');
 }
 
 if (typeof document !== 'undefined' && document.getElementById('broadcast-app')) {
@@ -356,7 +286,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   function beginAuthorization(value) {
     if (redirecting) return;
     try {
-      const url = automaticAuthorizationUrl(value,$('app').dataset.actor,location.origin);
+      const url = authorizationUrl(value,$('app').dataset.actor,location.origin);
       const selected = !groupMode() && !dirty && entries.length ? rows().filter(row => row.selected && row.person) : null;
       const raw = JSON.stringify({version:1,actor_id:$('app').dataset.actor,created_at:Date.now(),
         cm_id:$('cm').value,purpose,mention:$('mention').checked,raw:$('input').value,message:$('message').value,
@@ -382,9 +312,8 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       : [...$('library-items').querySelectorAll('[data-list-id]')].find(button => button.dataset.listId === data.id)
       : control ? $(control) : null;
     indicator?.setAttribute('aria-busy','true');
-    const controller = new AbortController();
     try {
-      const response = await fetch(`/creators/broadcast/${action}`, {method:'POST', credentials:'same-origin', signal:AbortSignal.any([controller.signal,AbortSignal.timeout(30000)]), headers:{'Content-Type':'application/json','X-CSRF-Token':$('app').dataset.csrf}, body:JSON.stringify(data)});
+      const response = await fetch(`/creators/broadcast/${action}`, {method:'POST', credentials:'same-origin', signal:AbortSignal.timeout(30000), headers:{'Content-Type':'application/json','X-CSRF-Token':$('app').dataset.csrf}, body:JSON.stringify(data)});
       const result = await response.json().catch(() => { throw new Error('服务暂时不可用，请稍后重试。'); });
       if (business && (cm !== $('cm').value || !allowed())) throw new Error('账号已变化，请重新核验。');
       if (!response.ok) {
@@ -394,7 +323,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
           $('permission-message').textContent = result.error || '当前操作权限已变化，请重新检查。';
           $('permission-authorize').hidden = true;
           if (result.authorization_url) {
-            try { automaticAuthorizationUrl(result.authorization_url,actor,location.origin); permissionResult = {status:'needs_authorization',is_self:true,authorization_url:result.authorization_url}; $('permission-authorize').hidden = false; }
+            try { authorizationUrl(result.authorization_url,actor,location.origin); permissionResult = {status:'needs_authorization',is_self:true,authorization_url:result.authorization_url}; $('permission-authorize').hidden = false; }
             catch { /* Never offer OAuth for a different account or an unrelated 403. */ }
           }
         }
@@ -407,7 +336,6 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
             : action === 'send' ? !result.batch?.id : !readAction && !Array.isArray(action.startsWith('templates/') ? result.templates : result.lists))) throw new Error('返回格式异常，请刷新后重试。');
       return result;
     } catch (error) {
-      if (error.name === 'AbortError' && controller.signal.aborted) throw new Error('授权正在重新核对，请稍后继续。');
       if (['TimeoutError','AbortError'].includes(error.name)) throw new Error('请求超时，请重新尝试。');
       if (error instanceof TypeError) throw new Error('网络连接失败，请稍后重试。');
       throw error;

@@ -62,7 +62,6 @@ def sample_event(**overrides):
         "handling_reason": "尚未看到完成结果。",
         "handling_evidence_refs": overrides.get("evidence_refs", ["M1"]),
         "reply_evidence_refs": [],
-        "reason": "正常样品申请。",
         "needs_review": False,
         "evidence_refs": ["M1"],
         "priority_basis": "content",
@@ -129,6 +128,8 @@ def test_missing_media_and_multi_handle_do_not_invent_risk_or_duplicate_account(
     assert result[0]["handling_status"] == "uncertain"
     with pytest.raises(ai.InvalidModelOutput):
         ai._validate(json.dumps({"events": [sample_event(), sample_event()]}), data)
+    old_output = ai._validate(json.dumps({"events": [sample_event(reason="旧版等级理由")]}), pack())[0]
+    assert "reason" not in old_output and old_output["handling_reason"]
 
 
 def test_reply_and_resolution_remain_independent_through_context_and_merge():
@@ -368,6 +369,8 @@ def seeded(pg, monkeypatch):
     def model(_cfg, _key, input_pack, _cm, **kwargs):
         calls.append(input_pack)
         assert kwargs["output_format"]["strict"]
+        fields = kwargs["output_format"]["schema"]["properties"]["events"]["items"]["properties"]
+        assert "reason" not in fields and "handling_reason" in fields and "priority_basis" in fields
         message = next(m for m in input_pack["messages"] if m["in_window"] and m["speaker"] == "U1")
         return {
             "text": json.dumps({"processed_refs": input_pack.get("core_refs", []), "events": [sample_event(
@@ -512,18 +515,20 @@ def test_revocation_or_edit_before_provider_exports_nothing(pg, seeded, change):
 
 
 
-def test_disable_reenable_keeps_fencing_monotonic_and_old_call_cannot_commit(pg, seeded):
+def test_disable_preserves_unknown_and_old_call_cannot_commit(pg, seeded):
     s = seeded
     s.save()
     stale = ai.claim_next_summary()
     s.save(False, key="")
-    s.save(True, key="")
-    current = ai.claim_next_summary()
-    assert current["id"] == stale["id"] and current["attempts"] > stale["attempts"]
+    with pytest.raises(ai.SummaryInputError, match="结果未知"), pg.transaction():
+        s.save(True, key="")
+    assert ai.claim_next_summary() is None
     ai.run_claimed_summary(stale, s.settings)
     assert not s.calls
-    ai.run_claimed_summary(current, s.settings)
-    assert len(s.calls) == 1
+    current = pg.execute("SELECT status,error_message,attempts FROM offhours_summary_tasks WHERE id=%s",
+                         (stale["id"],)).fetchone()
+    assert current["status"] == "failed" and "请求结果未知" in current["error_message"]
+    assert current["attempts"] == stale["attempts"]
 
 
 def test_group_reply_to_older_creator_is_context_but_cannot_prove_silence(pg, seeded):
@@ -829,22 +834,41 @@ def test_end_boundary_is_exclusive_even_when_message_was_synced_early(pg, seeded
 
 
 
-def test_network_failure_retries_are_bounded_not_cancelled_refresh_loop(pg, seeded, monkeypatch):
+@pytest.mark.parametrize("http_status,stop_during_request", [(None, False), (None, True), (503, False)])
+def test_network_failure_retries_are_bounded_not_cancelled_refresh_loop(
+    pg, seeded, monkeypatch, http_status, stop_during_request,
+):
     s = seeded
     s.save()
 
+    calls = []
     def fail(*_a, **_k):
-        raise openai_client.AIInputError("simulated timeout")
+        calls.append(True)
+        if stop_during_request:
+            assert not s.save(False)["enabled"]
+        raise openai_client.OpenAIRequestError("simulated failure", retryable=True,
+                                              telemetry={"http_status": http_status})
 
     monkeypatch.setattr(openai_client, "call_openai", fail)
-    for _ in range(ai.MAX_ATTEMPTS):
+    for _ in range(ai.MAX_ATTEMPTS if http_status else 1):
         job = ai.claim_next_summary()
         assert job
         ai.run_claimed_summary(job, s.settings)
+        ai.ai_dispatch.resume(pg)
         pg.execute("UPDATE offhours_summary_tasks SET scheduled_at=NOW()")
     ai.schedule_if_due(pg, force=True)
     assert ai.claim_next_summary() is None
     assert pg.execute("SELECT status FROM offhours_summary_tasks WHERE is_current").fetchone()["status"] == "failed"
+    assert len(calls) == (ai.MAX_ATTEMPTS if http_status else 1)
+    if http_status is None:
+        assert "请求结果未知" in pg.execute(
+            "SELECT error_message FROM offhours_summary_tasks WHERE is_current").fetchone()["error_message"]
+        for key in ("", "replacement-fixture-key"):
+            with pytest.raises(ai.SummaryInputError, match="结果未知"), pg.transaction():
+                s.save(key=key)
+            assert ai.claim_next_summary() is None
+        assert not s.save(False)["enabled"]
+        assert len(calls) == 1
 
 
 def _set_mentions(pg, seeded, mentions, text="Hi @_user_1, I haven’t heard from you"):
@@ -1760,6 +1784,24 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
     latest_result = replies.read(pg, s.ids["cm"], latest, s.settings, fresh=True)["result"]
     assert latest_result["outcome"] == "resolved" and latest_result["draft"] == ""
     assert ai.get_summary_view(pg, s.ids["cm"])["events"][0]["handling_status"] == "unresolved"
+    # An uncertain provider timeout or expired paid lease must never silently dispatch twice.
+    count = len(calls)
+    def timeout(*_args, **_kwargs):
+        calls.append("unknown-request")
+        raise openai_client.OpenAIRequestError("synthetic timeout", retryable=True)
+    monkeypatch.setattr(openai_client, "call_openai", timeout)
+    unknown_id = replies.enqueue(pg, s.ids["cm"], event_id, s.settings)
+    replies.run(replies.claim(), s.settings)
+    assert replies.claim() is None and len(calls) == count + 1
+    assert replies.read(pg, s.ids["cm"], unknown_id, s.settings)["status"] == "failed"
+    assert "请求结果未知" in replies.read(pg, s.ids["cm"], unknown_id, s.settings)["error"]
+    interrupted_id = replies.enqueue(pg, s.ids["cm"], event_id, s.settings)
+    interrupted = replies.claim()
+    pg.execute("UPDATE summary_reply_tasks SET lease_until=NOW()-INTERVAL '1 second' WHERE id=%s",
+               (interrupted_id,))
+    assert replies.claim() is None
+    replies.run(interrupted, s.settings)
+    assert len(calls) == count + 1 and replies.read(pg, s.ids["cm"], interrupted_id, s.settings)["status"] == "failed"
     pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='chat'")
     with pytest.raises(ai.SummaryInputError):
         replies.read(pg, s.ids["cm"], job_id, s.settings, fresh=True)

@@ -177,11 +177,10 @@ def touch_chats(conn, chat_ids, settings=None):
         ORDER BY chat_id,created_at DESC,id DESC""", (sorted(set(chat_ids)),)).fetchall()}
     for chat_id in sorted(set(chat_ids)):
         job = current.get(chat_id)
-        if job and (job["reason_code"] == "request_unknown" or (
-                job["status"] == "completed"
+        if job and (job["status"] == "completed"
                 and job["stats"].get("prompt_version") in evidence.COMPATIBLE_PROMPT_VERSIONS
                 and job["stats"].get("suggested_purpose") not in {None, "unknown"}
-                and evidence.still_valid(conn, job["refs"], settings, lightweight=True))):
+                and evidence.still_valid(conn, job["refs"], settings, lightweight=True)):
             continue
         conn.execute("SELECT enqueue_creator_group(%s)", (chat_id,))
 
@@ -272,6 +271,9 @@ def _recover(conn):
         reason_code=CASE WHEN status='preparing' THEN 'lease_expired' ELSE 'request_unknown' END,
         claim_token=NULL,lease_until=NULL,not_before=NOW(),updated_at=NOW()
         WHERE status IN ('preparing','running') AND lease_until<NOW()""")
+    conn.execute("""UPDATE creator_group_requests r SET error_code='request_unknown',finished_at=NOW()
+        FROM creator_group_jobs j WHERE r.job_id=j.id AND j.reason_code='request_unknown'
+        AND r.finished_at IS NULL""")
     conn.execute("""UPDATE creator_group_jobs j SET status='cancelled',desired_version=desired_version+1,
         reason_code='scope_changed',claim_token=NULL,lease_until=NULL,updated_at=NOW()
         WHERE status NOT IN ('completed','failed','cancelled') AND NOT creator_group_is_eligible(j.chat_id)""")
@@ -281,6 +283,8 @@ def _invalidate(conn, job, config):
     active = _enabled(config) and conn.execute("SELECT creator_group_is_eligible(%s) eligible",
                                              (job["chat_id"],)).fetchone()["eligible"]
     conn.execute("""UPDATE creator_group_jobs SET status=%s,reason_code=%s,claim_token=NULL,lease_until=NULL,
+        source=CASE WHEN status='running' AND EXISTS(SELECT 1 FROM creator_group_requests r
+          WHERE r.job_id=creator_group_jobs.id AND r.error_code='request_unknown') THEN 'incremental' ELSE source END,
         result_ciphertext=NULL,not_before=NOW(),updated_at=NOW() WHERE id=%s""",
                  ("queued" if active else "cancelled", "snapshot_changed" if active else "scope_changed", job["id"]))
 
@@ -354,6 +358,20 @@ def prepare_next(settings):
                                   pack and job["source"] != "manual"
                                   and not job["stats"].get("force_reclassify")) else None
         storage = creator_data.cipher(settings)
+        if pack and job["source"] != "manual" and not cached:
+            unknown = conn.execute("""SELECT 1 FROM creator_group_requests r JOIN creator_group_jobs j ON j.id=r.job_id
+                WHERE j.chat_id=%s AND r.material_fingerprint=%s
+                AND (r.error_code='request_unknown' OR r.finished_at IS NULL) LIMIT 1""",
+                (job["chat_id"], _hash(pack))).fetchone()
+            if not unknown:
+                prior = conn.execute("""SELECT pack_ciphertext FROM creator_group_jobs WHERE chat_id=%s
+                    AND status='failed' AND reason_code='request_unknown' AND pack_ciphertext IS NOT NULL""",
+                    (job["chat_id"],)).fetchall()
+                unknown = any(json.loads(storage.decrypt(row["pack_ciphertext"])) == pack for row in prior)
+            if unknown:
+                conn.execute("""UPDATE creator_group_jobs SET status='failed',reason_code='request_unknown',
+                    claim_token=NULL,lease_until=NULL,finished_at=NOW(),updated_at=NOW() WHERE id=%s""", (job["id"],))
+                return True
         try:
             result = (evidence.validate(pack, json.loads(storage.decrypt(cached["result_ciphertext"])))
                       if cached else None)
@@ -400,11 +418,13 @@ def claim():
             _invalidate(conn, job, config)
             return None
         token, reservation = uuid4(), uuid4()
-        conn.execute("INSERT INTO creator_group_requests(id,job_id) VALUES(%s,%s)", (reservation, job["id"]))
+        pack = json.loads(creator_data.cipher(settings).decrypt(job["pack_ciphertext"]))
+        conn.execute("INSERT INTO creator_group_requests(id,job_id,material_fingerprint) VALUES(%s,%s,%s)",
+                     (reservation, job["id"], _hash(pack)))
         conn.execute("""UPDATE creator_group_jobs SET status='running',claim_token=%s,
             lease_until=NOW()+INTERVAL '180 seconds',attempts=attempts+1,updated_at=NOW() WHERE id=%s""",
                      (token, job["id"]))
-        return {**job, "pack": json.loads(creator_data.cipher(settings).decrypt(job["pack_ciphertext"])),
+        return {**job, "pack": pack,
                 "claim_token": token, "reservation_id": reservation, "attempts": job["attempts"] + 1, "config": config}
 
 
@@ -441,7 +461,7 @@ def run(job, settings):
                  if isinstance(exc, json.JSONDecodeError) else exc)
         telemetry = getattr(error, "telemetry", {}) or telemetry
     status = telemetry.get("http_status")
-    unknown = isinstance(error, api.OpenAIRequestError) and not isinstance(status, int)
+    unknown = isinstance(error, api.OpenAIRequestError) and error.request_unknown
     code = ("" if error is None else "request_unknown" if unknown else "invalid_output"
             if isinstance(error, api.ModelOutputError) else f"http_{status}"
             if isinstance(status, int) else "provider_failed")

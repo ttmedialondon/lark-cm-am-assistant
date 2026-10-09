@@ -16,6 +16,7 @@
   'quota_paused': 'API 额度不足，队列已暂停',
   'provider_retry': '服务暂不可用，等待重试', 'invalid_output': '模型结果校验失败',
   'provider_failed': 'API 调用失败', 'owner_cancelled': '已手动取消',
+  'request_unknown': '请求结果未知，需核实后重新检查',
   'already_confirmed': '已有正式关联，无需重复匹配'
 } %}
 {% set decision_labels = {'supported': '支持', 'review': '待核实', 'not_supported': '不支持关联'} %}
@@ -52,7 +53,7 @@
   </div>
   <div class="d-flex flex-wrap gap-3 mb-3">{% for item in matching.counts %}<span>{{ status_labels.get(item.status, item.status) }}：{{ item.n }}</span>{% else %}<span class="text-secondary">暂无任务</span>{% endfor %}</div>
   <div class="card table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>达人</th><th>状态</th><th>账号匹配</th><th>Token</th><th>操作</th></tr></thead><tbody>
-    {% for job in matching.jobs %}{% set display_status = job.display_status|default(job.status) %}{% set display_reason = job.display_reason_code|default(job.reason_code) %}<tr><td>{{ job.display_name or '未命名' }}</td><td>{{ status_labels.get(display_status, display_status) }}{% if display_reason %}<div class="text-secondary small">{{ reason_labels.get(display_reason, display_reason) }}</div>{% endif %}{% if job.validation_error %}<div class="text-secondary small">{{ error_labels.get(job.validation_error, job.validation_error) }}</div>{% endif %}</td>
+    {% for job in matching.jobs %}{% set display_status = job.display_status|default(job.status) %}{% set display_reason = job.display_reason_code|default(job.reason_code) %}<tr><td>{{ job.display_name or '未命名' }}</td><td>{{ status_labels.get(display_status, display_status) }}{% if display_reason %}<div class="text-secondary small">{{ reason_labels.get(display_reason, display_reason) }}</div>{% endif %}{% if job.validation_error and job.validation_error != display_reason %}<div class="text-secondary small">{{ error_labels.get(job.validation_error, job.validation_error) }}</div>{% endif %}</td>
       <td>
         {% for item in job.handle_rows %}<div class="{{ 'text-danger' if item.conflict else 'text-secondary' }}"><a class="text-reset" href="https://www.tiktok.com/@{{ item.handle }}" rel="noopener noreferrer" target="_blank">@{{ item.handle }}</a>{% if item.associated %} · {{ '人工已核准' if item.human_confirmed else '已关联' }}{% endif %}{% if item.conflict %} · 归属冲突{% endif %}{% if item.check %} · 本轮：{{ decision_labels.get(item.check.decision, item.check.decision) }}{% if not item.associated or item.check.decision != 'supported' or item.conflict %}<div class="small">{{ relation_labels.get(item.check.relation, item.check.relation) }} · {{ code_labels.get(item.check.code, item.check.code) }} · {{ period_labels.get(item.check.period, '时点不明') }}{% if item.check.validation_error %} · {{ error_labels.get(item.check.validation_error, item.check.validation_error) }}{% endif %}</div>{% endif %}{% endif %}</div>{% else %}—{% endfor %}
       </td>

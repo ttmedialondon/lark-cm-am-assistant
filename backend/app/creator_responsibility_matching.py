@@ -66,7 +66,7 @@ REASONS = {
     "quota_paused": "接口配额暂停",
     "owner_cancelled": "已取消",
     "lease_expired": "任务租约已过期",
-    "request_unknown": "请求结果未知，需手动复查",
+    "request_unknown": "请求结果未知，需核实后重新检查",
     "cached": "复用相同材料的结果",
     "suggestions_saved": "结果已保存",
     "failure_cached": "相同材料上次调用失败",
@@ -145,6 +145,9 @@ def _recover(conn):
         reason_code=CASE WHEN status='running' THEN 'request_unknown' ELSE 'lease_expired' END,
         claim_token=NULL,lease_until=NULL,not_before=NOW(),updated_at=NOW()
         WHERE status IN ('running','preparing') AND lease_until<NOW()""")
+    conn.execute("""UPDATE creator_responsibility_requests r SET error_code='request_unknown',finished_at=NOW()
+        FROM creator_responsibility_jobs j WHERE r.job_id=j.id AND j.reason_code='request_unknown'
+        AND r.finished_at IS NULL""")
     conn.execute("""UPDATE creator_responsibility_jobs j SET status='cancelled',desired_version=desired_version+1,
         reason_code='identity_removed',claim_token=NULL,lease_until=NULL,updated_at=NOW()
         WHERE status NOT IN ('completed','failed','cancelled') AND NOT EXISTS(
@@ -155,6 +158,9 @@ def _recover(conn):
 def _invalidate(conn, job):
     conn.execute(
         """UPDATE creator_responsibility_jobs SET status='queued',reason_code='snapshot_changed',
+        source=CASE WHEN status='running' AND source<>'sample' AND EXISTS(
+          SELECT 1 FROM creator_responsibility_requests r WHERE r.job_id=creator_responsibility_jobs.id
+          AND r.error_code='request_unknown') THEN 'history' ELSE source END,
         claim_token=NULL,lease_until=NULL,result_ciphertext=NULL,not_before=NOW(),updated_at=NOW() WHERE id=%s""",
         (job["id"],),
     )
@@ -181,6 +187,18 @@ def _store_prepared(conn, job, material, config, settings):
         _invalidate(conn, job)
         return
     storage = creator_data.cipher(settings)
+    envelope = {"pack": pack, "candidate_ids": material["candidate_ids"]}
+    unknown = False
+    if pack and job["source"] != "manual" and not cache:
+        unknown = conn.execute("""SELECT 1 FROM creator_responsibility_requests r
+            JOIN creator_responsibility_jobs j ON j.id=r.job_id WHERE j.contact_id=%s
+            AND r.material_fingerprint=%s AND (r.error_code='request_unknown' OR r.finished_at IS NULL) LIMIT 1""",
+            (job["contact_id"], _hash(envelope))).fetchone()
+        if not unknown:
+            prior = conn.execute("""SELECT pack_ciphertext FROM creator_responsibility_jobs WHERE contact_id=%s
+                AND status='failed' AND reason_code='request_unknown' AND pack_ciphertext IS NOT NULL""",
+                (job["contact_id"],)).fetchall()
+            unknown = any(json.loads(storage.decrypt(row["pack_ciphertext"])) == envelope for row in prior)
     if cache:
         cached = json.loads(storage.decrypt(cache["result_ciphertext"]))
         cached["result"] = evidence.validate(pack, cached["result"])
@@ -197,17 +215,17 @@ def _store_prepared(conn, job, material, config, settings):
         result_ciphertext=%s,attempts=0,claim_token=NULL,lease_until=NULL,prepared_at=NOW(),updated_at=NOW(),
         finished_at=CASE WHEN %s THEN NOW() ELSE NULL END WHERE id=%s""",
         (
-            "completed" if cache else "ready" if pack else "waiting_evidence",
-            "cached" if cache else material["reason"],
+            "completed" if cache else "failed" if unknown else "ready" if pack else "waiting_evidence",
+            "cached" if cache else "request_unknown" if unknown else material["reason"],
             fingerprint,
             _config_hash(config),
-            storage.encrypt(creator_data.encode({"pack": pack, "candidate_ids": material["candidate_ids"]}))
+            storage.encrypt(creator_data.encode(envelope))
             if pack
             else None,
             creator_data.encode(material["refs"]),
             creator_data.encode(stats),
             cache["result_ciphertext"] if cache else None,
-            bool(cache),
+            bool(cache or unknown),
             job["id"],
         ),
     )
@@ -285,8 +303,9 @@ def claim():
         material = json.loads(creator_data.cipher(settings).decrypt(job["pack_ciphertext"]))
         token, reservation = uuid4(), uuid4()
         conn.execute(
-            "INSERT INTO creator_responsibility_requests(id,job_id,key_feature) VALUES(%s,%s,%s)",
-            (reservation, job["id"], FEATURE),
+            "INSERT INTO creator_responsibility_requests(id,job_id,key_feature,material_fingerprint) "
+            "VALUES(%s,%s,%s,%s)",
+            (reservation, job["id"], FEATURE, _hash(material)),
         )
         conn.execute(
             """UPDATE creator_responsibility_jobs SET status='running',claim_token=%s,
@@ -325,6 +344,8 @@ def _error_code(error):
     if isinstance(error, api.ModelOutputError):
         return "invalid_output"
     if isinstance(error, api.OpenAIRequestError):
+        if error.request_unknown:
+            return "request_unknown"
         status = error.telemetry.get("http_status")
         return f"http_{status}" if isinstance(status, int) else "provider_failed"
     return "internal_error"
@@ -516,7 +537,9 @@ def run(job, settings):
                 and job["attempts"] < 3
             )
             reason = (
-                "quota_paused"
+                "request_unknown"
+                if isinstance(error, api.OpenAIRequestError) and error.request_unknown
+                else "quota_paused"
                 if getattr(error, "is_quota", False)
                 else "provider_retry"
                 if retry

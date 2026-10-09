@@ -35,8 +35,10 @@ class OpenAIRequestError(AIInputError):
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
         self.is_quota = is_quota
-        self.retryable = retryable
         self.telemetry = dict(telemetry or {})
+        # A timeout can occur after the provider has accepted a billable request.
+        self.request_unknown = not is_quota and not isinstance(self.telemetry.get("http_status"), int)
+        self.retryable = retryable and not self.request_unknown
 
 
 class ModelOutputError(ValueError):

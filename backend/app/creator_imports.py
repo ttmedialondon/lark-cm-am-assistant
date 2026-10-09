@@ -34,6 +34,7 @@ REASONS = {
     "preparation_failed": "证据准备异常，可以重新检查。",
     "interrupted": "分析中断，未自动重复付费请求。",
     "provider_error": "AI 请求异常，可以重新检查。",
+    "request_unknown": "请求结果未知，未自动重复调用；请核实后重新检查。",
     "invalid_result": "AI 结果未通过证据校验，请人工核对。",
     "rate_limited": "AI 暂时限速，等待重试。",
     "other_batch": "相同账号已在其他批次分析，请稍后重新检查。",
@@ -1313,7 +1314,8 @@ def run_claimed_import(job, settings):
                         (delay, job["id"]),
                     )
         else:
-            _finish(job, settings, response={"telemetry": exc.telemetry}, reason="provider_error")
+            _finish(job, settings, response={"telemetry": exc.telemetry},
+                    reason="request_unknown" if exc.request_unknown else "provider_error")
     except (ValueError, PermissionError, TypeError, KeyError) as exc:
         _finish(job, settings, response=response, reason=str(exc) if str(exc) in REASONS else "invalid_result")
     except Exception:

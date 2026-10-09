@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import ai_dispatch, creator_data, creator_imports  # noqa: E402
+from app import ai_dispatch, creator_imports  # noqa: E402
 from app import creator_handle_matching as matching  # noqa: E402
 from app.config import get_settings  # noqa: E402
 from app.db import connection  # noqa: E402
@@ -77,12 +77,8 @@ def main():
                     break
                 reservation = uuid4()
                 conn.execute(
-                    "INSERT INTO creator_handle_requests(id,job_id,quota_scope,reserved_tokens) VALUES(%s,NULL,%s,%s)",
-                    (
-                        reservation,
-                        matching.evidence_hash([config["provider"], config["project_id"], config["model"]]),
-                        len(creator_data.encode(pack).encode()) + matching.MAX_OUTPUT + 512,
-                    ),
+                    "INSERT INTO creator_handle_requests(id,job_id) VALUES(%s,NULL)",
+                    (reservation,),
                 )
             result, telemetry, error, diagnostic = matching.review(pack, config, contact_id, settings)
             usage = telemetry.get("usage", {})

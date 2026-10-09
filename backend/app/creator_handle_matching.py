@@ -148,12 +148,15 @@ def touch_chats(conn, chat_ids):
 
 
 def _recover(conn):
-    # Uncertain requests retain their usage estimate. A late response cannot pass its token fence.
+    # A running request may already have been billed; only unfinished local preparation can restart.
     conn.execute("""UPDATE creator_handle_jobs SET
-        status=CASE WHEN desired_version<>snapshot_version THEN 'queued'
-          WHEN status='preparing' THEN 'queued' WHEN attempts<3 THEN 'retry_wait' ELSE 'failed' END,
-        reason_code='lease_expired',claim_token=NULL,lease_until=NULL,not_before=NOW(),updated_at=NOW()
+        status=CASE WHEN status='preparing' THEN 'queued' ELSE 'failed' END,
+        reason_code=CASE WHEN status='preparing' THEN 'lease_expired' ELSE 'request_unknown' END,
+        claim_token=NULL,lease_until=NULL,not_before=NOW(),updated_at=NOW()
         WHERE status IN ('running','preparing') AND lease_until<NOW()""")
+    conn.execute("""UPDATE creator_handle_requests r SET error_code='request_unknown'
+        FROM creator_handle_jobs j WHERE r.job_id=j.id AND j.reason_code='request_unknown'
+        AND r.error_code='' AND r.billed_tokens IS NULL""")
     conn.execute("""UPDATE creator_handle_jobs j SET status='cancelled',desired_version=desired_version+1,
         reason_code='identity_removed',updated_at=NOW()
         WHERE j.status NOT IN ('completed','failed','cancelled') AND NOT EXISTS(
@@ -274,6 +277,21 @@ def prepare_next(settings):
             (job["contact_id"], fingerprint, job["id"], job["source"], config_hash),
         ).fetchone()
         storage = creator_data.cipher(settings)
+        if pack and job["source"] != "manual" and not cached:
+            unknown = conn.execute("""SELECT 1 FROM creator_handle_requests r
+                JOIN creator_handle_jobs j ON j.id=r.job_id
+                WHERE j.contact_id=%s AND r.material_fingerprint=%s
+                AND (r.error_code='request_unknown' OR r.error_code='' AND r.billed_tokens IS NULL) LIMIT 1""",
+                (job["contact_id"], evidence_hash(pack))).fetchone()
+            if not unknown:
+                # Older attempts have no frozen hash. Their failed encrypted material remains readable locally.
+                prior = conn.execute("""SELECT pack_ciphertext FROM creator_handle_jobs WHERE contact_id=%s
+                    AND status='failed' AND reason_code='request_unknown' AND pack_ciphertext IS NOT NULL""",
+                    (job["contact_id"],)).fetchall()
+                unknown = any(json.loads(storage.decrypt(row["pack_ciphertext"])) == pack for row in prior)
+            if unknown:
+                cached = {"status": "failed", "reason_code": "request_unknown", "result_ciphertext": None,
+                          "stats": prepared["stats"], "attempts": 0}
         if cached:
             cached["stats"] = {**cached["stats"], **prepared["stats"]}
         if cached and cached["result_ciphertext"]:
@@ -323,7 +341,9 @@ def prepare_next(settings):
                 else "completed"
                 if prepared["reason"] == "already_confirmed"
                 else "waiting_evidence",
-                "failure_cached"
+                "request_unknown"
+                if cached and cached["reason_code"] == "request_unknown"
+                else "failure_cached"
                 if cached and cached["status"] == "failed"
                 else "cached"
                 if cached
@@ -358,6 +378,8 @@ def _invalidate(conn, job):
     enabled = _enabled(_config(conn))
     conn.execute(
         """UPDATE creator_handle_jobs SET status=%s,reason_code='snapshot_changed',
+        source=CASE WHEN status='running' AND EXISTS(SELECT 1 FROM creator_handle_requests r
+          WHERE r.job_id=creator_handle_jobs.id AND r.error_code='request_unknown') THEN 'incremental' ELSE source END,
         claim_token=NULL,lease_until=NULL,not_before=NOW(),result_ciphertext=NULL,updated_at=NOW() WHERE id=%s""",
         ("queued" if enabled else "cancelled", job["id"]),
     )
@@ -537,28 +559,17 @@ def claim():
         if job["config_fingerprint"] != _config_hash(config) or job["snapshot_version"] != job["desired_version"]:
             _invalidate(conn, job)
             return None
-        # Usage estimate only: neither tokens nor recent request counts limit admission.
-        # UTF-8 bytes are a conservative input-token upper bound, not a price estimate.
         from .config import get_settings
 
         storage = creator_data.cipher(get_settings())
-        raw = storage.decrypt(job["pack_ciphertext"])
-        pack = json.loads(raw)
+        pack = json.loads(storage.decrypt(job["pack_ciphertext"]))
         if _confirmation_changed(conn, job, pack):
             _invalidate(conn, job)
             return None
-        tokens = (
-            len(raw.encode())
-            + len(evidence.instructions().encode())
-            + len(creator_data.encode(evidence.output_format(pack)).encode())
-            + MAX_OUTPUT
-            + 512
-        )
         reservation = uuid4()
-        scope = evidence_hash([config["provider"], config["project_id"], config["model"]])
         conn.execute(
-            "INSERT INTO creator_handle_requests(id,job_id,quota_scope,reserved_tokens) VALUES(%s,%s,%s,%s)",
-            (reservation, job["id"], scope, tokens),
+            "INSERT INTO creator_handle_requests(id,job_id,material_fingerprint) VALUES(%s,%s,%s)",
+            (reservation, job["id"], evidence_hash(pack)),
         )
         token = uuid4()
         conn.execute(
@@ -609,6 +620,8 @@ def _output_error(error):
         code = str(error).replace(" ", "_")
         return code if code in OUTPUT_ERRORS else "invalid_output"
     if isinstance(error, api.OpenAIRequestError):
+        if error.request_unknown:
+            return "request_unknown"
         status = error.telemetry.get("http_status")
         if isinstance(status, int) and 100 <= status <= 599:
             return f"http_{status}"
@@ -722,17 +735,9 @@ def run(job, settings):
             raise ValueError("catalog_changed")
         network_started = True
         result, telemetry, error, diagnostic = review(job["pack"], job["config"], job["contact_id"], settings)
-        ai_dispatch.observe_limits(telemetry)
-        if error:
-            raise error
     except Exception as exc:
         error = exc
         telemetry = getattr(exc, "telemetry", {}) or telemetry
-        if isinstance(exc, api.OpenAIRequestError):
-            if exc.is_quota:
-                ai_dispatch.pause_for_quota()
-            elif exc.retryable:
-                ai_dispatch.throttle(api.retry_delay(exc.retry_after_seconds, job["attempts"]))
     with connection() as conn, conn.transaction():
         # Same lock order as settings saves: config, then jobs.
         _config(conn, lock=True)
@@ -751,6 +756,14 @@ def run(job, settings):
             "UPDATE creator_handle_jobs SET input_tokens=input_tokens+%s,output_tokens=output_tokens+%s WHERE id=%s",
             (input_tokens, output_tokens, job["id"]),
         )
+    # Commit actual usage before admission or source/authorization queries can fail.
+    ai_dispatch.observe_limits(telemetry)
+    if isinstance(error, api.OpenAIRequestError):
+        if error.is_quota:
+            ai_dispatch.pause_for_quota()
+        elif error.retryable:
+            ai_dispatch.throttle(api.retry_delay(error.retry_after_seconds, job["attempts"]))
+    with connection() as conn, conn.transaction():
         current = _current(conn, job)
         if not current:
             return
@@ -767,7 +780,9 @@ def run(job, settings):
             delay = api.retry_delay(getattr(error, "retry_after_seconds", None), job["attempts"]) if retry else 0
             state = "retry_wait" if retry else "failed"
             reason = (
-                "quota_paused"
+                "request_unknown"
+                if isinstance(error, api.OpenAIRequestError) and error.request_unknown
+                else "quota_paused"
                 if getattr(error, "is_quota", False)
                 else "provider_retry"
                 if retry

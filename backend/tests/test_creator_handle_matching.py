@@ -52,6 +52,7 @@ def matching_flow(pg, pilot, monkeypatch):
         pack = {
             "target": "U1",
             "creator_known": True,
+            "synthetic_material_revision": state.material_version,
             "handles": [
                 {"id": "H1", "handle": "first.handle", "catalog_verified": "first.handle" in _catalog},
                 {"id": "H2", "handle": "backup_2", "catalog_verified": "backup_2" in _catalog},
@@ -349,7 +350,8 @@ def test_provider_delay_quota_pause_and_uncertain_usage_survive_retries(pg, matc
     flow = matching_flow
     flow.enable()
     job = _prepared_job(pg, flow)
-    flow.error = openai_client.OpenAIRequestError("synthetic overload", retry_after_seconds=7200, retryable=True)
+    flow.error = openai_client.OpenAIRequestError("synthetic overload", retry_after_seconds=7200, retryable=True,
+                                                telemetry={"http_status": 429})
     matching.run(job, flow.settings)
     row = pg.execute(
         "SELECT status,EXTRACT(EPOCH FROM not_before-NOW()) seconds FROM creator_handle_jobs WHERE id=%s", (job["id"],)
@@ -369,6 +371,56 @@ def test_provider_delay_quota_pause_and_uncertain_usage_survive_retries(pg, matc
         "reason_code": "quota_paused",
     }
     assert len(flow.calls) == 2
+    ai_dispatch.resume(pg)
+    unknown = _prepared_job(pg, flow)
+    flow.error = openai_client.OpenAIRequestError("synthetic timeout", retryable=True)
+    matching.run(unknown, flow.settings)
+    assert matching.claim() is None and len(flow.calls) == 3
+    assert pg.execute("SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s",
+                      (unknown["id"],)).fetchone() == {"status": "failed", "reason_code": "request_unknown"}
+    logged = pg.execute("SELECT error_code,billed_tokens FROM creator_handle_requests WHERE id=%s",
+                        (unknown["reservation_id"],)).fetchone()
+    assert logged == {"error_code": "request_unknown", "billed_tokens": None}
+    flow.enable("sk-rotated-after-unknown")
+    blocked = _enqueue(pg, flow.contact, "incremental")
+    assert matching.prepare_next(flow.settings) and matching.claim() is None
+    assert pg.execute("SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s", (blocked,)).fetchone() == {
+        "status": "failed", "reason_code": "request_unknown",
+    }
+    assert len(flow.calls) == 3
+    flow.error = None
+    retried = _prepared_job(pg, flow)  # Explicit Owner recheck is still allowed.
+    matching.run(retried, flow.settings)
+    assert len(flow.calls) == 4
+
+
+def test_config_change_during_unknown_call_does_not_redispatch_same_material(pg, matching_flow, monkeypatch):
+    flow = matching_flow
+    flow.enable()
+    job = _prepared_job(pg, flow)
+    flow.error = openai_client.OpenAIRequestError("synthetic timeout", retryable=True)
+    flow.before_response = lambda: flow.enable("sk-rotated-during-call")
+    matching.run(job, flow.settings)
+    flow.before_response = None
+    assert matching.prepare_next(flow.settings) and matching.claim() is None
+    assert len(flow.calls) == 1
+    assert pg.execute("SELECT reason_code FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone() == {
+        "reason_code": "request_unknown",
+    }
+    # New actual message content is distinct material, not another attempt at the frozen pack.
+    original_build = matching.evidence.build
+
+    def changed(*args, **kwargs):
+        material = original_build(*args, **kwargs)
+        material["pack"]["messages"][0]["text"] += " I confirm it is mine."
+        material["fingerprint"] += "-new-message"
+        return material
+
+    monkeypatch.setattr(matching.evidence, "build", changed)
+    flow.error = None
+    fresh = _prepared_job(pg, flow, "incremental")
+    matching.run(fresh, flow.settings)
+    assert len(flow.calls) == 2
 
 
 def test_legacy_limits_do_not_block_restart_and_retry_fences(pg, matching_flow):
@@ -379,27 +431,43 @@ def test_legacy_limits_do_not_block_restart_and_retry_fences(pg, matching_flow):
         "UPDATE ai_feature_configs SET rpm_limit=1,daily_token_budget=1000,tpm_limit=1000 WHERE feature=%s",
         (matching.FEATURE,),
     )
+    historical_id = uuid4()
+    # Simulate the applied-090 schema, then upgrade without deleting accounting history.
+    pg.execute("ALTER TABLE creator_handle_requests ALTER COLUMN quota_scope SET NOT NULL, "
+               "ALTER COLUMN reserved_tokens SET NOT NULL")
+    pg.execute("CREATE INDEX creator_handle_request_budget ON creator_handle_requests(quota_scope,created_at)")
+    pg.execute("INSERT INTO creator_handle_requests(id,quota_scope,reserved_tokens,billed_tokens) "
+               "VALUES(%s,'historical-project',10000,123)", (historical_id,))
+    historical = pg.execute("SELECT * FROM creator_handle_requests WHERE id=%s", (historical_id,)).fetchone()
+    pg.execute((Path(__file__).parents[1] / "migrations/091_retire_handle_budget_estimates.sql").read_text())
     job = _prepared_job(pg, flow)
-    assert pg.execute("SELECT reserved_tokens FROM creator_handle_requests").fetchone()["reserved_tokens"] > 1000
+    assert pg.execute("SELECT quota_scope,reserved_tokens FROM creator_handle_requests WHERE id=%s",
+                      (job["reservation_id"],)).fetchone() == {
+        "quota_scope": None, "reserved_tokens": None,
+    }
     pg.execute("UPDATE creator_handle_jobs SET lease_until=NOW()-INTERVAL '1 second' WHERE id=%s", (job["id"],))
-    recovered = matching.claim()
-    assert recovered["attempts"] == 2 and recovered["claim_token"] != job["claim_token"]
-    assert pg.execute("SELECT count(*) n FROM creator_handle_requests").fetchone()["n"] == 2
-    assert pg.execute("SELECT sum(reserved_tokens) n FROM creator_handle_requests").fetchone()["n"] > 1000
+    assert matching.claim() is None
+    assert pg.execute("SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone() == {
+        "status": "failed", "reason_code": "request_unknown",
+    }
+    assert pg.execute("SELECT count(*) n FROM creator_handle_requests WHERE job_id IS NOT NULL").fetchone()["n"] == 1
     matching.run(job, flow.settings)
     assert not flow.calls
+    recovered = _prepared_job(pg, flow)  # Only an explicit owner recheck allows another request.
     matching.run(recovered, flow.settings)
     assert len(flow.calls) == 1
     assert (
-        pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone()["status"]
+        pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (recovered["id"],)).fetchone()["status"]
         == "completed"
     )
+    assert pg.execute("SELECT * FROM creator_handle_requests WHERE id=%s", (historical_id,)).fetchone() == historical
     # Reopen only fixture-generated pairs to exercise provider failure caching for unlinked candidates.
     pg.execute(
         "DELETE FROM contact_social_accounts WHERE contact_id=%s AND source='creator_handle_auto_verified'",
         (flow.contact,),
     )
-    flow.error = openai_client.OpenAIRequestError("synthetic transient failure", retryable=True)
+    flow.error = openai_client.OpenAIRequestError("synthetic transient failure", retryable=True,
+                                                telemetry={"http_status": 503})
     flow.material_version += 1
     retry = _prepared_job(pg, flow)
     for attempt in range(1, 4):

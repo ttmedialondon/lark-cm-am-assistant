@@ -47,7 +47,6 @@ app.mount("/static", StaticFiles(directory=str(APP_ROOT / "static")), name="stat
 
 SESSION_COOKIE = "__Host-lark_message_stats"
 OAUTH_STATE_COOKIE = "__Host-lark_oauth_state"
-SEND_OAUTH_ATTEMPT_COOKIE = "__Host-lark_send_oauth_attempt"
 SESSION_DAYS = 30
 PROFILE_SCOPE_UPGRADE_REASON = "profile_scope_upgrade_required"
 SEND_OAUTH_SCOPES = ("im:message", "im:message.send_as_user")
@@ -98,7 +97,7 @@ def index(request: Request):
 
 
 @app.get("/auth/lark/start")
-def start_lark_authorization(request: Request, send: bool = False, account_id: str | None = None, auto: bool = False):
+def start_lark_authorization(request: Request, send: bool = False, account_id: str | None = None):
     settings = get_settings()
     if not settings.app_secret_configured:
         return _template(
@@ -120,13 +119,6 @@ def start_lark_authorization(request: Request, send: bool = False, account_id: s
                 request, "error.html",
                 {"title": "发送授权账号不一致", "detail": "请目标人员使用本人账号登录后授权。"}, 403,
             )
-        # This marker only stops repeated automatic redirects; it never proves authorization.
-        if auto and request.cookies.get(SEND_OAUTH_ATTEMPT_COOKIE) == str(authorization["id"]):
-            return _template(request, "error.html", {
-                "title": "授权未完成", "detail": "群发暂不可用，请重新完成本人授权。",
-                "return_url": f"/auth/lark/start?send=1&account_id={authorization['id']}",
-                "return_label": "重试授权",
-            }, 409)
         settings = replace(settings, oauth_scopes=tuple(dict.fromkeys((
             *settings.oauth_scopes, *(authorization.get("scopes") or ()), *SEND_OAUTH_SCOPES,
         ))))
@@ -159,11 +151,6 @@ def start_lark_authorization(request: Request, send: bool = False, account_id: s
         samesite="lax",
         path="/",
     )
-    if send:
-        response.set_cookie(
-            SEND_OAUTH_ATTEMPT_COOKIE, str(authorization["id"]), max_age=600,
-            httponly=True, secure=True, samesite="lax", path="/",
-        )
     return response
 
 
@@ -353,8 +340,6 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
 
     response = RedirectResponse(url=destination, status_code=303)
     response.delete_cookie(OAUTH_STATE_COOKIE, path="/")
-    if send_upgrade:
-        response.delete_cookie(SEND_OAUTH_ATTEMPT_COOKIE, path="/", secure=True, httponly=True, samesite="lax")
     response.set_cookie(
         SESSION_COOKIE,
         session_token,

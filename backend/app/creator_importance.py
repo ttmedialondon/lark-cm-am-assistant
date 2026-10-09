@@ -17,7 +17,6 @@ from .db import connection
 from .message_mentions import mention_names, mention_targets
 
 FEATURE = "creator_importance"
-HISTORY_DAYS = 90
 MAX_MESSAGES = 80
 MAX_CHARS = 24_000
 TIERS = {"focus": "重点", "priority": "优先", "normal": "常规", "dormant": "久未联系", "pending": "待评估"}
@@ -88,7 +87,8 @@ def roster_sql(cm_id):
         CASE WHEN v.valid THEN days.business_days ELSE 0 END business_days,
         CASE WHEN v.valid THEN s.signal_at END last_substantive_progress_at,
         CASE WHEN v.valid THEN s.last_message_at END last_message_at,
-        v.valid AND COALESCE((p.coverage->'priority'->>'historical')::boolean,FALSE) has_history
+        v.valid AND COALESCE((p.coverage->'priority'->>'historical')::boolean,FALSE) has_history,
+        p.manual_tier,p.manual_reason_ciphertext
         FROM creator_importance_profiles p
         CROSS JOIN LATERAL(SELECT (""" + _PROFILE_VALID + """) valid) v
         CROSS JOIN LATERAL(SELECT
@@ -305,7 +305,8 @@ def configuration_changed(conn):
     conn.execute("""UPDATE creator_importance_jobs SET claim_token=NULL,lease_until=NULL,
         status=CASE WHEN %s THEN 'queued' ELSE 'cancelled' END,attempts=0,
         reason_code='configuration_changed',not_before=NOW(),updated_at=NOW()
-        WHERE status<>'completed' AND (%s OR status NOT IN ('failed','cancelled'))""", (enabled, enabled))
+        WHERE status<>'completed' AND reason_code<>'request_unknown'
+        AND (%s OR status NOT IN ('failed','cancelled'))""", (enabled, enabled))
     if enabled:
         conn.execute("""SELECT enqueue_creator_importance(pair.contact_id,pair.cm_id)
             FROM (SELECT contact_id,responsible_authorization_id cm_id FROM contact_assignments WHERE ended_at IS NULL
@@ -313,7 +314,8 @@ def configuration_changed(conn):
               WHERE ended_at IS NULL AND relationship='owner') pair
             WHERE creator_importance_is_eligible(pair.contact_id,pair.cm_id)
               AND NOT EXISTS(SELECT 1 FROM creator_importance_jobs j WHERE j.contact_id=pair.contact_id
-                AND j.responsible_authorization_id=pair.cm_id AND j.status NOT IN ('failed','cancelled'))""")
+                AND j.responsible_authorization_id=pair.cm_id
+                AND (j.status NOT IN ('failed','cancelled') OR j.reason_code='request_unknown'))""")
 
 
 _READABLE = """FROM chat_messages m JOIN authorization_message_observations o USING(chat_id,message_id)
@@ -625,6 +627,14 @@ def prepare_next(settings):
                 result = facts.validate(_cipher(settings).decrypt(cached["response_ciphertext"]), pack, state["facts"])
                 _finish_batch(conn, current, material, settings, result)
                 return True
+            unknown = conn.execute("""SELECT 1 FROM creator_importance_requests WHERE job_id=%s
+                AND (material_fingerprint=%s OR material_fingerprint IS NULL)
+                AND (error_code='request_unknown' OR finished_at IS NULL) LIMIT 1""",
+                (job["id"], _hash(pack))).fetchone()
+            if unknown:
+                conn.execute("""UPDATE creator_importance_jobs SET status='failed',reason_code='request_unknown',
+                    claim_token=NULL,lease_until=NULL,finished_at=NOW(),updated_at=NOW() WHERE id=%s""", (job["id"],))
+                return True
             conn.execute("""UPDATE creator_importance_jobs SET status='ready',pack_ciphertext=%s,refs=%s::jsonb,
                 fingerprint=%s,config_fingerprint=%s,claim_token=NULL,lease_until=NULL,attempts=0,
                 reason_code='prepared',stats=%s::jsonb,updated_at=NOW() WHERE id=%s""",
@@ -683,9 +693,11 @@ def claim():
         if not job:
             return None
         reservation = uuid4()
-        conn.execute("INSERT INTO creator_importance_requests(id,job_id,fingerprint) VALUES(%s,%s,%s)",
-                     (reservation, job["id"], job["fingerprint"]))
-        return {**job, "material": json.loads(_cipher(settings).decrypt(job["pack_ciphertext"])),
+        material = json.loads(_cipher(settings).decrypt(job["pack_ciphertext"]))
+        conn.execute("INSERT INTO creator_importance_requests(id,job_id,fingerprint,material_fingerprint) "
+                     "VALUES(%s,%s,%s,%s)",
+                     (reservation, job["id"], job["fingerprint"], _hash(material["pack"])))
+        return {**job, "material": material,
                 "reservation_id": reservation, "config": dict(config)}
 
 
@@ -713,7 +725,7 @@ def run(job, settings):
             and not isinstance(exc, api.OpenAIRequestError) else exc
         telemetry = getattr(error, "telemetry", {}) or telemetry
     status = telemetry.get("http_status")
-    unknown = isinstance(error, api.OpenAIRequestError) and not isinstance(status, int)
+    unknown = isinstance(error, api.OpenAIRequestError) and error.request_unknown
     retry = isinstance(error, api.OpenAIRequestError) and error.retryable and not unknown and job["attempts"] < 3
     code = "" if not error else "request_unknown" if unknown else "invalid_output" \
         if isinstance(error, api.ModelOutputError) else (

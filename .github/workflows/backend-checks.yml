@@ -11,6 +11,29 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: ttmedia_test
+          POSTGRES_USER: ttmedia_test
+          POSTGRES_PASSWORD: fixture-only
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://ttmedia_test:fixture-only@127.0.0.1:5432/ttmedia_test
+      TEST_DATABASE_URL: postgresql://ttmedia_test:fixture-only@127.0.0.1:5432/ttmedia_test
+      IDENTITY_NAMES_TEST_DATABASE_URL: postgresql://ttmedia_test:fixture-only@127.0.0.1:5432/ttmedia_test
+      OFFHOURS_SUMMARY_TEST_DATABASE_URL: postgresql://ttmedia_test:fixture-only@127.0.0.1:5432/ttmedia_test
+      CREATOR_WORKFLOW_AI_TEST_DATABASE_URL: postgresql://ttmedia_test:fixture-only@127.0.0.1:5432/ttmedia_test
+      LARK_APP_ID: cli_fixture
+      LARK_APP_SECRET: fixture-only
+      LARK_REDIRECT_URI: http://localhost/auth/lark/callback
+      TOKEN_ENCRYPTION_KEY_B64: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
     defaults:
       run:
         working-directory: backend
@@ -21,7 +44,11 @@ jobs:
           python-version: '3.12'
           cache: pip
           cache-dependency-path: backend/requirements-dev.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m ruff check .
       - run: python -m pytest
+      - run: node --test tests/test_creator_broadcast_client.mjs

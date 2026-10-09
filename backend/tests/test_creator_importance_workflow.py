@@ -541,6 +541,9 @@ def test_paid_retry_cache_and_stale_results_keep_billing_without_repeat(pg, rank
         at=flow.now - timedelta(minutes=1),
     )
     last = prepared()
+    # A request created before migration 092 has no frozen material hash.
+    pg.execute("UPDATE creator_importance_requests SET material_fingerprint=NULL WHERE id=%s",
+               (last["reservation_id"],))
     pg.execute("UPDATE creator_importance_jobs SET lease_until=NOW()-INTERVAL '1 second' WHERE id=%s", (last["id"],))
     importance._recover(pg)
     assert importance.claim() is None
@@ -562,10 +565,27 @@ def test_paid_retry_cache_and_stale_results_keep_billing_without_repeat(pg, rank
     ).fetchone()
     assert pending["status"] == "failed" and pending["reason_code"] == "request_unknown"
     assert "own_private/after_unknown" in pending["pending_messages"] and len(flow.calls) == calls
-    # Only an explicit configuration save (or source reset) may reopen terminal failures.
+    # Saving configuration must not silently repeat a possibly charged frozen batch.
     importance.configuration_changed(pg)
     restarted = pg.execute(
         "SELECT status,attempts,pending_messages FROM creator_importance_jobs WHERE id=%s", (last["id"],)
     ).fetchone()
-    assert restarted["status"] == "queued" and restarted["attempts"] == 0
+    assert restarted["status"] == "failed" and restarted["attempts"] == 1
     assert "own_private/after_unknown" in restarted["pending_messages"]
+    # The config save may enroll the separate CM; this assertion concerns the frozen owner's pair only.
+    pg.execute("UPDATE creator_importance_jobs SET status='cancelled' WHERE responsible_authorization_id=%s",
+               (flow.other,))
+    assert not importance.prepare_next(flow.settings) and importance.claim() is None
+    # A metadata-only edit clears the old job pack via the source-reset trigger, not the old request ledger.
+    source = last["material"]["sources"][0]
+    pg.execute("UPDATE chat_messages SET message_update_time=NOW() WHERE chat_id=%s AND message_id=%s",
+               (source["chat_id"], source["message_id"]))
+    pg.execute("UPDATE creator_importance_jobs SET status='cancelled' WHERE responsible_authorization_id=%s",
+               (flow.other,))
+    for _ in range(20):
+        flow.due()
+        if not importance.prepare_next(flow.settings):
+            break
+        assert importance.claim() is None and len(flow.calls) == calls
+    assert pg.execute("SELECT status,reason_code FROM creator_importance_jobs WHERE id=%s",
+                      (last["id"],)).fetchone() == {"status": "failed", "reason_code": "request_unknown"}

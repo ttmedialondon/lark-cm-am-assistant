@@ -251,10 +251,21 @@ def test_creator_group_queue_real_authorization_manual_lock_and_billing_fences(p
                       (timeout_job["id"],)).fetchone() == {
         "status": "failed", "reason_code": "request_unknown", "attempts": 1,
     }
+    # This fixture wraps all operations in one transaction; mimic separate real request timestamps.
+    pg.execute("UPDATE creator_group_jobs SET created_at=clock_timestamp() WHERE id=%s", (timeout_job["id"],))
     matching.touch_chats(pg, ["oc_topic"], settings)
-    assert not matching.prepare_next(settings) and matching.claim() is None
+    before = len(calls)
+    pg.execute("UPDATE creator_group_jobs SET not_before=NOW() WHERE chat_id='oc_topic' AND status='queued'")
+    assert matching.prepare_next(settings) and matching.claim() is None
+    assert len(calls) == before  # Same material is re-prepared locally, never paid again.
     assert pg.execute("SELECT input_tokens,error_code FROM creator_group_requests WHERE job_id=%s",
                       (timeout_job["id"],)).fetchone() == {"input_tokens": 40, "error_code": "request_unknown"}
+    history = pg.execute("SELECT enqueue_creator_group('oc_topic','history',TRUE) id").fetchone()["id"]
+    assert matching.prepare_next(settings) and matching.claim() is None and len(calls) == before
+    reused = pg.execute("SELECT status,reason_code FROM creator_group_jobs WHERE id=%s", (history,)).fetchone()
+    assert (reused["status"], reused["reason_code"]) in {
+        ("failed", "request_unknown"), ("completed", "cached"),
+    }  # Reusing a known valid result is also safe; neither path submits another paid request.
 
     matching.action(pg, owner, timeout_job["id"], "recheck")
     rotated_job = prepared()
@@ -427,6 +438,36 @@ def test_creator_group_queue_real_authorization_manual_lock_and_billing_fences(p
     assert len(calls) == before + 1
     assert float(classification("oc_missing_old")["confidence"]) == .96  # New evidence gets a new score, not old .98.
     pg.execute("ROLLBACK TO SAVEPOINT group_context_reprocessing")
+
+    # An unclassified group's unknown attempt must not freeze genuinely new conversation material.
+    fresh_chat = "oc_new_material_after_unknown"
+    seed_group(fresh_chat)
+    monkeypatch.setattr(matching.api, "call_openai", unknown_transport)
+    frozen = prepared()
+    matching.run(frozen, settings)
+    pg.execute("UPDATE creator_group_jobs SET created_at=clock_timestamp() WHERE id=%s", (frozen["id"],))
+    before = len(calls)
+    matching.touch_chats(pg, [fresh_chat], settings)
+    pg.execute("UPDATE creator_group_jobs SET not_before=NOW() WHERE chat_id=%s AND status='queued'", (fresh_chat,))
+    assert matching.prepare_next(settings) and matching.claim() is None and len(calls) == before
+    history = pg.execute("SELECT enqueue_creator_group(%s,'history',TRUE) id", (fresh_chat,)).fetchone()["id"]
+    assert matching.prepare_next(settings) and matching.claim() is None and len(calls) == before
+    assert pg.execute("SELECT reason_code FROM creator_group_jobs WHERE id=%s", (history,)).fetchone() == {
+        "reason_code": "request_unknown",
+    }
+    pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,
+        body_ciphertext,message_create_time) VALUES(%s,'om_new_material','ou_creator','user','text',%s,NOW())""",
+        (fresh_chat, cipher.encrypt(json.dumps({"text": "Please send a product sample for our next campaign."}))))
+    pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+        VALUES(%s,%s,'om_new_material')""", (owner, fresh_chat))
+    matching.touch_chats(pg, [fresh_chat], settings)
+    pg.execute("UPDATE creator_group_jobs SET not_before=NOW() WHERE chat_id=%s AND status='queued'", (fresh_chat,))
+    fresh_material = prepared()
+    assert fresh_material["pack"] != frozen["pack"]
+    monkeypatch.setattr(matching.api, "call_openai", respond)
+    answer.update(purpose="support", confidence=.96, refs=["M1"])
+    matching.run(fresh_material, settings)
+    assert len(calls) == before + 1
 
     # The HTTP boundary also applies live owner checks, CSRF and independent manual classification.
     actor = {"id": owner, "status": "active"}

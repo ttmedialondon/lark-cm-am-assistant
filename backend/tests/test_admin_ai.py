@@ -1,11 +1,13 @@
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.testclient import TestClient
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from app import admin, admin_permissions, admin_reporting, ai_feature_config
 from app import creator_handle_matching_routes as matching_routes
@@ -110,8 +112,9 @@ def test_owner_can_view_only_safe_ai_config_fields(monkeypatch):
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store, max-age=0"
     assert contexts[-1][0] == "admin/ai.html"
-    assert contexts[-1][1]["config"]["api_key_label"] == "已配置 · …abcd"
-    assert "api_key_ciphertext" not in contexts[-1][1]["config"]
+    for item in contexts[-1][1]["configs"]:
+        assert item["config"]["api_key_label"] == "已配置 · …abcd"
+        assert "api_key_ciphertext" not in item["config"]
     assert contexts[-1][1]["ai_dispatch"]["state"] == "paused"
     assert contexts[-1][1]["summary_settings"]["status_label"] == "未开启"
     assert [item["feature"] for item in contexts[-1][1]["configs"]] == [
@@ -296,10 +299,13 @@ def test_matching_routes_recheck_live_owner_and_csrf_before_queue_writes(pg, mon
 
     monkeypatch.setattr(matching_routes, "connection", connection)
     monkeypatch.setattr(matching_routes, "get_settings", lambda: SimpleNamespace(token_encryption_key=b"k" * 32))
+    templates = Environment(loader=FileSystemLoader(Path(__file__).parents[1] / "app/templates"),
+                            autoescape=select_autoescape(["html"]))
     app = FastAPI()
     app.include_router(matching_routes.create_router(
         current_authorization=lambda _: session["auth"], csrf_token=lambda _: "csrf",
-        render_template=lambda request, name, context: contexts.append(context) or PlainTextResponse("rendered"),
+        render_template=lambda request, name, context: contexts.append(context) or HTMLResponse(
+            templates.get_template(name).render(**context)),
     ))
     client = TestClient(app)
     path = "/admin/ai/creator-handle-matching"
@@ -333,6 +339,14 @@ def test_matching_routes_recheck_live_owner_and_csrf_before_queue_writes(pg, mon
     assert response.status_code == 303 and response.headers["location"] == path + "?page=8"
     assert response.headers["cache-control"] == "no-store, max-age=0"
     assert pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (job,)).fetchone()["status"] == "cancelled"
+    pg.execute("UPDATE creator_handle_jobs SET status='failed',reason_code='request_unknown' WHERE id=%s", (job,))
+    pg.execute("INSERT INTO creator_handle_requests(id,job_id,error_code) VALUES(%s,%s,'request_unknown')",
+               (uuid4(), job))
+    unknown = client.get(path)
+    assert unknown.status_code == 200 and "失败：1" in unknown.text
+    assert unknown.text.count("请求结果未知，需核实后重新检查") == 1
+    assert "request_unknown" not in unknown.text
+    assert contexts[-1]["matching"]["jobs"][0]["status"] == "failed"
     pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (owner,))
     assert client.get(path).status_code == 403  # Session does not retain an obsolete Owner grant.
     assert client.post(path + f"/jobs/{job}/cancel", data={"csrf_token": "csrf", "page": "8"}).status_code == 403

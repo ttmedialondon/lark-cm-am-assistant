@@ -236,8 +236,8 @@ def enqueue(conn, actor, event_id, settings, *, parent_id=None, text=None):
 
 def claim():
     with connection() as conn, conn.transaction():
-        conn.execute("""UPDATE summary_reply_tasks SET status=CASE WHEN attempts<3 THEN 'queued' ELSE 'failed' END,
-            lease_until=NULL,error_message='处理被中断，请重试。',scheduled_at=NOW()
+        conn.execute("""UPDATE summary_reply_tasks SET status='failed',
+            lease_until=NULL,error_message='请求结果未知，未自动重复调用；请核实后重新生成。'
             WHERE status='running' AND lease_until<NOW()""")
         if not core._enabled(conn) or not core.ai_dispatch.can_claim(conn):
             return None
@@ -418,7 +418,10 @@ def run(job, settings):
             retry = exc.retryable and not exc.is_quota and job["attempts"] < 3
             if retry:
                 core.ai_dispatch.throttle(api.retry_delay(exc.retry_after_seconds, job["attempts"]))
-        message = "有新消息、事件或权限变化，请刷新后重新生成。" if stale else "生成未完成，请稍后重试。"
+        message = ("有新消息、事件或权限变化，请刷新后重新生成。" if stale
+                   else "请求结果未知，未自动重复调用；请核实后重新生成。"
+                   if isinstance(exc, api.OpenAIRequestError) and exc.request_unknown
+                   else "生成未完成，请稍后重试。")
         with connection() as conn, conn.transaction():
             conn.execute(
                 """UPDATE summary_reply_tasks SET status=%s,error_message=%s,lease_until=NULL,
