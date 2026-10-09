@@ -25,7 +25,7 @@
   }
 
   function priority(event) { return priorities.includes(event.priority) ? event.priority : null; }
-  function needsReview(event) { return event.handling_status === "uncertain" || event.needs_review || !priority(event); }
+  function needsReview(event) { return event.handling_status ? event.handling_status === "uncertain" : event.needs_review || !priority(event); }
   function events() { return Array.isArray(data.events) ? data.events : []; }
 
   const replyStates = new Map();

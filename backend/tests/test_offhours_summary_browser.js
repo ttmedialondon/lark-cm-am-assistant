@@ -20,7 +20,7 @@ const report = (extra = {}) => ({responsible: {id: "remi-id", name: "Remi"}, ena
   events: [event("P2", {reply_evidence_refs: [], replied_by: []}),
     event("P0", {reply_evidence_refs: ["M2"], replied_by: ["Remi"]}),
     event("P3", {reply_evidence_refs: [], replied_by: []}),
-    event("P1", {reply_evidence_refs: ["M2"], replied_by: ["Shang Ma"],
+    event("P1", {reply_evidence_refs: ["M2"], replied_by: ["Shang Ma"], needs_review: true,
       latest_progress: "Shang Ma 已回复会催付款，尚未到账。"}),
     event(null, {creator_handle: null, title: "资料尚不足以判断", needs_review: true})], ...extra});
 
@@ -435,6 +435,17 @@ test("grades are sorted and filters/search/evidence work without writes", async 
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
     await page.screenshot({path: path.join(process.env.OH_SCREENSHOT_DIR, "offhours-summary-mobile.png"), fullPage: true});
   }
+  const resolved = state.data.events.find(event => event.handling_status === "resolved");
+  resolved.priority = null; resolved.needs_review = true;
+  await page.locator("#oh-refresh").click();
+  await page.waitForFunction(() => document.getElementById("oh-count-P0").textContent === "0");
+  assert.equal(await page.locator("#oh-review-count").textContent(), "2");
+  await page.locator('.oh-filter[data-priority="review"]').click();
+  assert.deepEqual(await page.locator(".oh-event-title").allTextContents(), ["P2 fixture event", "资料尚不足以判断"]);
+  await page.locator('.oh-filter[data-priority="unresolved"]').click();
+  assert.deepEqual(await page.locator(".oh-event-title").allTextContents(), ["P1 fixture event"]);
+  assert(state.calls.every(call => call.method === "GET"));
+  assert.deepEqual(errors, []);
 });
 
 test("disabled state contains no pretend counts or seeded results", async t => {
