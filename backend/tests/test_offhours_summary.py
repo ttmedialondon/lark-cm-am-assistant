@@ -199,6 +199,37 @@ def test_reply_and_resolution_remain_independent_through_context_and_merge():
     previous_chunks = {c["fingerprint"] for c in summary_dialogues.segments(data)}
     data["pack"]["policy"] = ai.POLICY_VERSION
     assert not previous_chunks & {c["fingerprint"] for c in summary_dialogues.segments(data)}
+    # Untargeted multi-creator broadcasts stay as context, not one paid analysis per member.
+    people = {f"U{i}": {"name": f"Creator {i}", "handles": []} for i in range(1, 128)}
+    broadcast = {"ref": "B0", "message_id": "broadcast-0", "speaker": "CM", "is_staff": True,
+                 "text": "New campaign is available", "in_window": True}
+    raw = [{**broadcast, "ref": f"B{i}", "message_id": f"broadcast-{i}"} for i in range(8)]
+    material = {"users": people, "refs": {m["ref"]: {} for m in raw}, "pack": {
+        "policy": ai.POLICY_VERSION, "users": people, "staff": {"CM": {"name": "Remi"}},
+        "is_private": False, "unique_group_user": None, "messages": raw}}
+    assert summary_dialogues.parts(material, "U1")[0][0]["message_id"] == "broadcast-0"
+    assert summary_dialogues.segments(material) == []
+    reply = {"ref": "R", "message_id": "creator-reply", "speaker": "U1", "text": "Can I join this campaign?",
+             "in_window": True, "parent_message_id": "broadcast-0"}
+    material["pack"]["messages"] = [*raw, reply]
+    material["refs"]["R"] = {}
+    chunks = summary_dialogues.segments(material)
+    assert len(chunks) == 1 and chunks[0]["pack"]["core_refs"] == ["R.0"]
+    assert "broadcast-0" in {m["message_id"] for m in chunks[0]["pack"]["messages"]}
+    # Actual targets, private chats, confirmed single-creator groups and natural answers remain analyzable.
+    material["pack"]["messages"] = [{**broadcast, "mentions": [{"target": "U2", "ambiguous": False}]}]
+    targeted = summary_dialogues.segments(material)
+    assert len(targeted) == 1 and set(targeted[0]["users"]) == {"U2"}
+    material["pack"].update(messages=[broadcast], is_private=True, users={"U1": people["U1"]})
+    material["users"] = {"U1": people["U1"]}
+    assert summary_dialogues.segments(material)[0]["pack"]["core_refs"] == ["B0.0"]
+    material["pack"].update(is_private=False, unique_group_user="U1")
+    assert summary_dialogues.segments(material)[0]["pack"]["core_refs"] == ["B0.0"]
+    material["refs"]["S"] = {}
+    material["pack"].update(unique_group_user=None,
+        messages=[broadcast, reply, {**broadcast, "ref": "S", "message_id": "staff-answer",
+                                     "text": "I'll check that campaign for you"}])
+    assert summary_dialogues.segments(material)[0]["pack"]["core_refs"] == ["R.0", "S.0"]
 
 
 @pytest.fixture
@@ -633,10 +664,10 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
             assert len(evidence["users"]) == 1
             assert set(evidence["users"]["U1"]["open_ids"]) == {"ou_person", "ou_person_alias"}
             ai.run_claimed_summary(job, s.settings)
-    assert len(s.calls) == 3
+    assert len(s.calls) == 2
     assert any(p["is_private"] for p in s.calls)
     assert {p["chat_name"] for p in s.calls if not p["is_private"]} == {
-        groups["group_named"][0], groups["group_ai"][0],
+        groups["group_named"][0],
     }
     ai.schedule_if_due(pg, force=True)
     finish_merges(pg, s)

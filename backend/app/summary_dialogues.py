@@ -78,7 +78,8 @@ def segments(evidence):
     result = []
     for user in evidence["users"]:
         messages, refs = parts(evidence, user)
-        current = [m for m in messages if m["in_window"]]
+        current = [m for m in messages if m["in_window"] and
+                   (m["speaker"] == user or m.get("addressed_user") == user)]
         batches, batch, size = [], [], 0
         for m in current:
             length = len(json.dumps(m, ensure_ascii=False))
