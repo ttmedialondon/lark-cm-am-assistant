@@ -646,6 +646,7 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
                     "events": [sample_event(evidence_refs=[message["ref"]])],
                 }
             ),
+            "response_id": "resp-new-summary",
             "usage": {"input_tokens": 1},
         }
 
@@ -663,7 +664,23 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
             evidence = ai._load_chat(pg, job, job["chat_id"], job["cutoff"], settings=s.settings)
             assert len(evidence["users"]) == 1
             assert set(evidence["users"]["U1"]["open_ids"]) == {"ou_person", "ou_person_alias"}
+            if job["chat_id"] == "group_ai":
+                checkpoint = {"chunks": {"previous-paid-empty-chunk": []}}
+                paid_usage = {"input_tokens": 1234, "output_tokens": 56}
+                pg.execute("""UPDATE offhours_summary_tasks SET checkpoint_ciphertext=%s,
+                    usage=%s::jsonb,response_id='resp-paid-broadcast' WHERE id=%s""",
+                    (summary_dialogues.encode(checkpoint, s.settings), json.dumps(paid_usage), job["id"]))
+                job.update(pg.execute("SELECT * FROM offhours_summary_tasks WHERE id=%s", (job["id"],)).fetchone())
+                before = len(s.calls)
             ai.run_claimed_summary(job, s.settings)
+            if job["chat_id"] == "group_ai":
+                saved = pg.execute("SELECT * FROM offhours_summary_tasks WHERE id=%s", (job["id"],)).fetchone()
+                assert len(s.calls) == before and saved["status"] == "succeeded"
+                assert saved["response_id"] == "resp-paid-broadcast" and saved["usage"] == paid_usage
+                assert summary_dialogues.decode(saved["checkpoint_ciphertext"], s.settings) == checkpoint
+            else:
+                assert pg.execute("SELECT response_id FROM offhours_summary_tasks WHERE id=%s",
+                                  (job["id"],)).fetchone()["response_id"] == "resp-new-summary"
     assert len(s.calls) == 2
     assert any(p["is_private"] for p in s.calls)
     assert {p["chat_name"] for p in s.calls if not p["is_private"]} == {

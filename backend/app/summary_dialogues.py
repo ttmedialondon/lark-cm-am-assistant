@@ -541,7 +541,7 @@ def step(job, settings):
                 total,
                 finished,
                 cfg["model"],
-                (response or {}).get("response_id"),
+                response.get("response_id") if response else job.get("response_id"),
                 ((response or {}).get("usage") or {}).get("input_tokens", 0),
                 ((response or {}).get("usage") or {}).get("output_tokens", 0),
                 job["id"],
