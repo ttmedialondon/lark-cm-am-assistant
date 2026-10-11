@@ -52,7 +52,7 @@
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="feature" value="{{ feature.feature }}">
           <div class="col-md-3"><label class="form-label" for="ai-provider-{{ feature.id_suffix }}">提供商</label><input class="form-control" id="ai-provider-{{ feature.id_suffix }}" value="{{ config.provider_label }}" readonly></div>
           <div class="col-md-3"><label class="form-label" for="ai-project-id-{{ feature.id_suffix }}">Project ID</label><input class="form-control" id="ai-project-id-{{ feature.id_suffix }}" name="project_id" value="{{ config.project_id }}" maxlength="160" required autocomplete="off"></div>
-          <div class="col-md-3"><label class="form-label" for="ai-model-{{ feature.id_suffix }}">模型</label><input class="form-control" id="ai-model-{{ feature.id_suffix }}" name="model" value="{{ config.model or 'gpt-5.6-luna' }}" maxlength="160" required autocomplete="off"></div>
+          <div class="col-md-3"><label class="form-label" for="ai-model-{{ feature.id_suffix }}">模型</label><input class="form-control" id="ai-model-{{ feature.id_suffix }}" name="model" value="{{ config.model or 'gpt-6-luna' }}" maxlength="160" required autocomplete="off"></div>
           <div class="col-md-3"><label class="form-label">AI 处理方式</label><div class="form-control-plaintext">{{ feature.processing_label }}</div></div>
           {% if feature.feature == 'offhours_summary' %}
           {% if not summary_settings.recurring_enabled %}

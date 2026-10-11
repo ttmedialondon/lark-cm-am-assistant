@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -146,6 +147,54 @@ def test_blank_feature_key_can_be_enabled_on_real_postgres(pg):
     after = pg.execute(f"SELECT {columns} FROM ai_feature_configs WHERE feature='offhours_summary'").fetchone()
     assert saved["enabled"] and saved["key_suffix"] == "1234" and after == before
     assert not {"rpm_limit", "tpm_limit", "daily_token_budget"}.intersection(saved)
+
+
+def test_luna_upgrade_preserves_credentials_switches_and_unknown_requests(pg):
+    owner, contact, job, request = (uuid4() for _ in range(4))
+    pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,%s,'test')",
+               (owner, "ou_" + owner.hex))
+    for feature, provider, model, enabled in (
+        ("creator_handle_matching", "openai", "gpt-5.6-luna", True),
+        ("creator_importance", "openai", "gpt-5.6-luna", False),
+        ("desktop_reply", "openai", "custom-model", True),
+        ("creator_workflow", "other", "gpt-5.6-luna", False),
+    ):
+        pg.execute("""INSERT INTO ai_feature_configs(feature,provider,project_id,model)
+                      VALUES(%s,%s,'proj_fixture',%s) ON CONFLICT(feature) DO NOTHING""",
+                   (feature, provider, model))
+        updated = pg.execute("""UPDATE ai_feature_configs SET provider=%s,model=%s,enabled=%s,
+            api_key_ciphertext='synthetic-encrypted-key',key_suffix='1234',
+            key_updated_at='2026-09-01T12:00:00Z',key_updated_by_authorization_id=%s,
+            auto_confirm_threshold=0.950,automatic_queue_checked_at='2026-09-02T12:00:00Z',
+            last_tested_at='2026-09-03T12:00:00Z',last_test_status='succeeded'
+            WHERE feature=%s""", (provider, model, enabled, owner, feature))
+        assert updated.rowcount == 1
+    pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,'Synthetic creator')", (contact,))
+    pg.execute("""INSERT INTO creator_handle_jobs(id,contact_id,status,reason_code)
+                  VALUES(%s,%s,'failed','request_unknown')""", (job, contact))
+    pg.execute("INSERT INTO creator_handle_requests(id,job_id,error_code) VALUES(%s,%s,'request_unknown')",
+               (request, job))
+    snapshot_query = "SELECT feature,to_jsonb(c) AS config FROM ai_feature_configs c"
+    before = {row["feature"]: row["config"] for row in pg.execute(snapshot_query)}
+    history = (
+        pg.execute("SELECT * FROM creator_handle_jobs WHERE id=%s", (job,)).fetchone(),
+        pg.execute("SELECT * FROM creator_handle_requests WHERE id=%s", (request,)).fetchone(),
+    )
+    migration = (Path(__file__).parents[1] / "migrations/093_upgrade_luna_model.sql").read_text()
+    pg.execute(migration)
+    after = {row["feature"]: row["config"] for row in pg.execute(snapshot_query)}
+    for feature, old in before.items():
+        expected = dict(old)
+        if old["provider"] == "openai" and old["model"] == "gpt-5.6-luna":
+            expected.update(model="gpt-6-luna", last_tested_at=None, last_test_status="never",
+                            updated_at=after[feature]["updated_at"])
+        assert after[feature] == expected
+    assert history == (
+        pg.execute("SELECT * FROM creator_handle_jobs WHERE id=%s", (job,)).fetchone(),
+        pg.execute("SELECT * FROM creator_handle_requests WHERE id=%s", (request,)).fetchone(),
+    )
+    pg.execute(migration)
+    assert {row["feature"]: row["config"] for row in pg.execute(snapshot_query)} == after
 
 
 def test_auto_confirmation_never_allows_a_threshold_below_ninety_percent() -> None:
