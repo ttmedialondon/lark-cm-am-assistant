@@ -118,6 +118,8 @@ def _authorize_run(conn, run, *, actor_id=None, read_cache=None, executing=False
                            owner_only=actor_id is None and run_feature(run) == FEATURE,
                            read_cache=read_cache)
     if run_feature(run) == ASSISTANT_FEATURE:
+        if not owner and actor != cm["id"]:
+            raise PermissionError("运营助手只允许本人或 Owner 查看该 CM 的聊天。")
         turn = conn.execute("""SELECT t.created_at,t.status,t.error_code,s.actor_id FROM assistant_turns t
             JOIN assistant_sessions s ON s.id=t.session_id WHERE t.id=%s FOR SHARE OF t,s""",
             (run["assistant_turn_id"],)).fetchone()
@@ -1256,7 +1258,9 @@ def ensure_assistant_run(conn, actor_id, turn, cm_id, start, end, contact_ids, s
     turn_id = UUID(str(turn["id"] if isinstance(turn, dict) else turn))
     start, end = _parse_window(start.isoformat() if isinstance(start, datetime) else start,
                                end.isoformat() if isinstance(end, datetime) else end)
-    _authorize(conn, actor_id, cm_id=cm_id)
+    cm, owner = _authorize(conn, actor_id, cm_id=cm_id)
+    if not owner and actor_id != cm["id"]:
+        raise PermissionError("运营助手只允许本人或 Owner 查看该 CM 的聊天。")
     submitted = conn.execute("""SELECT t.created_at,t.status FROM assistant_turns t
         JOIN assistant_sessions s ON s.id=t.session_id WHERE t.id=%s AND s.actor_id=%s FOR SHARE OF t,s""",
         (turn_id, actor_id)).fetchone()

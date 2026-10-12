@@ -6,7 +6,7 @@ from uuid import UUID
 
 from . import admin_reporting, contact_handles, creator_importance, creator_responsibility_matching
 from . import offhours_summary as summaries
-from .assistant_search import unreadable_reason
+from .assistant_search import authorize_all, unreadable_reason
 from .creator_group_evidence import PURPOSES
 from .evidence_access import BODY_READ_SCOPE_SQL
 
@@ -18,7 +18,7 @@ def _iso(value):
 
 
 def _scope(conn, actor_id, context):
-    cm, _owner = summaries._authorize(conn, actor_id, cm_id=context["scope"]["cm_id"])
+    cm = authorize_all(conn, actor_id, context["scope"]["cm_id"])
     roster = summaries._roster(conn, cm["id"])
     visible = {row["contact_id"] for row in roster}
     selected = context["scope"].get("creator_ids")
@@ -555,7 +555,6 @@ def activity(conn, actor_id, context, args, settings, *, now=None):
 def validate_result(conn, actor_id, context, result, settings):
     """Invalidate changed business sources, not routine synchronization progress."""
     if result.get("kind") == "activity" and result.get("audience") == "all":
-        from .assistant_search import authorize_all
         cm = authorize_all(conn, actor_id, context["scope"]["cm_id"])
     else:
         cm, _roster, _visible = _scope(conn, actor_id, context)

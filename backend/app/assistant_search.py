@@ -59,22 +59,21 @@ def _time(value):
 
 def _audience(value):
     if not isinstance(value, str) or value not in {"all", "creators"}:
-        raise ValueError("消息范围无效，请选择全部授权消息或达人消息。")
+        raise ValueError("消息查询参数无效，请重新提问。")
     return value
 
 
 def authorize_all(conn, actor_id, cm_id):
     cm, owner = core._authorize(conn, actor_id, cm_id=cm_id)
     if not owner and UUID(str(actor_id)) != cm["id"]:
-        raise PermissionError("只有本人或Owner可以查看该CM的全量消息；达人管理权限不包含其他人员的全部聊天。")
+        raise PermissionError("运营助手只允许本人或 Owner 查看该 CM 的聊天。")
     return cm
 
 
 def _scope(conn, actor_id, context, creator_ids, chat_ids, settings, audience="creators"):
     actor_id = UUID(str(actor_id))
     cm_id = UUID(context["scope"]["cm_id"])
-    cm = authorize_all(conn, actor_id, cm_id) if audience == "all" else core._authorize(
-        conn, actor_id, cm_id=cm_id)[0]
+    cm = authorize_all(conn, actor_id, cm_id)
     if audience == "all":
         chats = conn.execute(_CHAT_SQL + " ORDER BY c.chat_id", (cm_id,)).fetchall()
         roster, speakers, selected = [], None, None

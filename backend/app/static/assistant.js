@@ -12,8 +12,8 @@
     completed: "已完成", cancelled: "已停止", failed: "这次未能完成", unknown: "请求结果尚未确认，请勿重复提交"};
   let saved = {}, active = null, source = null, submitting = false, restoring = false, denied = false;
   let pending = null, pendingScopeVersion = null, restoreTimer = null, revision = 0, sourceVersion = 0, sourceFocus = null, followBottom = true;
-  let cmScopes = [], scopesReady = false, scopeRequest = null;
-  let pendingPageContext = null, selectedReply = null, currentDraft = null, activeReplyAction = null, activeReplyText = null;
+  let cmScopes = [], scopesReady = false, scopeRequest = null, canManageCM = false;
+  let pendingPageContext = null, currentDraft = null, activeReplyAction = null, activeReplyText = null;
   let draftTimer = null, draftStatusVersion = 0;
   try { saved = JSON.parse(localStorage.getItem(storageKey) || "{}"); } catch { /* IDs can remain in memory. */ }
   if (!saved || typeof saved !== "object" || !uuid.test(saved.session_id || "")) saved = {};
@@ -98,17 +98,16 @@
     $("oa-cm").disabled = denied || busy || Boolean(saved.client_request_id);
     input.disabled = denied || submitting;
     $("oa-composer-note").textContent = active ? "可以继续输入，完成后发送" : "Enter 发送 · Shift + Enter 换行";
-    for (const button of app.querySelectorAll("[data-ask], [data-quick], [data-scope-edit]")) button.disabled = denied || busy || Boolean(saved.client_request_id);
-    for (const field of $("oa-scope-editor").querySelectorAll("input,select,button")) field.disabled = denied || busy;
+    for (const button of app.querySelectorAll("[data-ask], [data-quick]")) button.disabled = denied || busy || Boolean(saved.client_request_id);
     $("oa-form").setAttribute("aria-busy", String(busy));
   }
   function clearProtected() {
     denied = true; revision++; source?.close(); source = null; active = null; pending = null;
     activeContext = {}; scopeVersion++; currentScopeTurn = null;
     closeSources(false);
-    closeReply(); currentDraft = selectedReply = null; $("oa-reply-body").replaceChildren();
+    closeReply(); currentDraft = null; $("oa-reply-body").replaceChildren();
     delete saved.client_request_id; persist();
-    history.replaceChildren(node("p", "oa-answer", "登录或查看权限已变化，请重新登录后打开助手。"));
+    history.replaceChildren(node("p", "oa-answer", "连接或访问权限已变化，请重新登录后打开助手。"));
     cmScopes = []; scopesReady = false; $("oa-cm").replaceChildren(); $("oa-person").hidden = true;
     $("oa-scope").replaceChildren(); $("oa-scope").hidden = true;
     input.value = ""; controls();
@@ -138,17 +137,18 @@
         const value = await request("/scopes");
         if (denied) return false;
         cmScopes = value.scopes || [];
-        const selected = (saved.client_request_id && cmScopes.find(person => person.cm_id === saved.cm_id)) ||
-          cmScopes.find(person => person.cm_id === pageContext.cm_id) ||
-          cmScopes.find(person => person.cm_id === value.selected_cm_id);
-        if (!selected) { status("暂无可查看的已授权人员。", true); return false; }
+        canManageCM = location.pathname.startsWith("/admin/") && value.can_switch_cm === true;
+        const selected = (canManageCM && saved.client_request_id && cmScopes.find(person => person.cm_id === saved.cm_id)) ||
+          (canManageCM && cmScopes.find(person => person.cm_id === pageContext.cm_id)) ||
+          cmScopes.find(person => person.cm_id === value.selected_cm_id) || (canManageCM && cmScopes[0]);
+        if (!selected) { status("Lark 连接未就绪，请重新连接后使用。", true); return false; }
+        if (!canManageCM && saved.cm_id && saved.cm_id !== selected.cm_id) { saved = {}; pending = null; persist(); }
         $("oa-cm").replaceChildren(...cmScopes.map(person => {
           const option = node("option", "", person.cm_name || "未命名人员"); option.value = person.cm_id; return option;
         }));
-        $("oa-person").hidden = value.can_switch_cm !== true;
-        if (activeContext.cm_id !== selected.cm_id) activeContext = {audience: "all", creator_ids: null};
+        $("oa-person").hidden = !canManageCM;
+        if (activeContext.cm_id !== selected.cm_id) activeContext = {};
         activeContext.cm_id = selected.cm_id; activeContext.cm_name = selected.cm_name;
-        activeContext.audience ||= "all";
         $("oa-cm").value = selected.cm_id; scopesReady = true;
         scope({}); await restore(); return scopesReady && !denied;
       } catch (error) { if (!denied) status(error.message, true); return false; }
@@ -159,10 +159,10 @@
   function resetSession(person, keepInput = false) {
     revision++; source?.close(); source = null; clearTimeout(restoreTimer);
     saved = {cm_id: person.cm_id}; pending = null; pendingScopeVersion = null; persist();
-    activeContext = {}; selectContext({...person, audience: "all", creator_ids: null}); currentScopeTurn = null;
+    activeContext = {}; selectContext(person); currentScopeTurn = null;
     $("oa-cm").value = person.cm_id;
     closeSources(false); $("oa-new-result").hidden = true;
-    closeReply(); currentDraft = selectedReply = null; $("oa-reply-body").replaceChildren(); $("oa-scope-editor").hidden = true;
+    closeReply(); currentDraft = null; $("oa-reply-body").replaceChildren();
     history.replaceChildren(node("p", "oa-answer", "开始一个新问题。"));
     scope({}); status(""); if (!keepInput) input.value = ""; controls();
   }
@@ -175,6 +175,7 @@
   }
   function switchCM(cmId) {
     if (denied || !scopesReady || active || submitting || restoring || saved.client_request_id) return false;
+    if (!canManageCM && cmId !== activeContext.cm_id) return false;
     const person = cmScopes.find(person => person.cm_id === cmId);
     if (!person) { status("没有该人员的查看权限。", true); return false; }
     if (person.cm_id !== activeContext.cm_id) resetSession(person, true);
@@ -191,38 +192,14 @@
     return new Intl.DateTimeFormat("zh-CN", {timeZone: "Europe/London", month: "2-digit", day: "2-digit",
       hour: "2-digit", minute: "2-digit", hourCycle: "h23"}).format(new Date(value));
   }
-  function londonInput(value) {
-    const parts = new Intl.DateTimeFormat("en-CA", {timeZone: "Europe/London", year: "numeric", month: "2-digit", day: "2-digit",
-      hour: "2-digit", minute: "2-digit", hourCycle: "h23"}).formatToParts(new Date(value));
-    const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
-    return `${values.year}-${values.month}-${values.day}T${values.hour}:${values.minute}`;
-  }
-  function londonTime(value) {
-    const local = Date.parse(`${value}:00Z`);
-    if (!Number.isFinite(local)) throw new Error("请选择有效的英国时间。");
-    let guess = local;
-    for (let i = 0; i < 3; i++) guess += local - Date.parse(`${londonInput(guess)}:00Z`);
-    if (londonInput(guess) !== value) throw new Error("此英国时间因夏令时切换不存在，请重新选择。");
-    return new Date(guess).toISOString();
-  }
-  function periodRange(period) {
-    const now = new Date(), today = londonInput(now).slice(0, 10), start = londonTime(`${today}T00:00`);
-    const previous = days => {
-      const day = new Date(`${today}T12:00:00Z`); day.setUTCDate(day.getUTCDate() - days);
-      return londonTime(`${day.toISOString().slice(0, 10)}T00:00`);
-    };
-    return {start: period === "today" ? start : previous(period === "week" ? 6 : 1),
-      end: period === "yesterday" ? start : now.toISOString()};
-  }
   function selectContext(value, explicit = true) {
     if (!value || !Object.keys(value).length) return;
     if (explicit) scopeVersion++;
-    if (["cm_id", "creator_ids", "chat_ids", "event_ref", "message_ref"].some(key => Object.hasOwn(value, key))) {
+    if (["cm_id", "event_ref", "message_ref"].some(key => Object.hasOwn(value, key))) {
       const cmId = value.cm_id || activeContext.cm_id;
-      activeContext = {cm_id: cmId, cm_name: cmId === activeContext.cm_id ? activeContext.cm_name : undefined,
-        audience: value.audience || (value.creator_ids != null || value.event_ref ? "creators" : "all")};
+      activeContext = {cm_id: cmId, cm_name: cmId === activeContext.cm_id ? activeContext.cm_name : undefined};
     }
-    for (const key of ["cm_id", "cm_name", "audience", "creator_ids", "creator_name", "creator_names", "chat_ids", "chat_names", "event_ref", "event_title", "message_ref", "start", "end", "reply_status", "sort", "reply_action", "draft_ref", "edited_draft"]) {
+    for (const key of ["cm_id", "cm_name", "audience", "creator_name", "creator_names", "chat_names", "event_ref", "event_title", "message_ref", "start", "end", "reply_status", "sort"]) {
       if (Object.hasOwn(value, key)) activeContext[key] = value[key];
     }
     contextChosen = true;
@@ -235,11 +212,7 @@
   }
   function scope(value) {
     if (!value || typeof value !== "object") return;
-    const matching = (!value.cm_id || !activeContext.cm_id || value.cm_id === activeContext.cm_id) &&
-      ["creator_ids", "chat_ids"].every(key => !Object.hasOwn(value, key) ||
-        JSON.stringify([...(value[key] || [])].sort()) === JSON.stringify([...(activeContext[key] || [])].sort())) &&
-      ((value.event_ref || null) === (activeContext.event_ref || null) ||
-        (activeContext.event_ref && value.event_ref?.startsWith(`${activeContext.event_ref}:`)));
+    const matching = !value.cm_id || !activeContext.cm_id || value.cm_id === activeContext.cm_id;
     if (matching) {
       if (!activeContext.cm_id && value.cm_id) activeContext.cm_id = value.cm_id;
       if (activeContext.event_ref && value.event_ref) activeContext.event_ref = value.event_ref;
@@ -247,25 +220,16 @@
       for (const key of ["start", "end"]) if (value[key]) activeContext[key] = value[key];
       for (const key of ["reply_status", "sort"]) if (Object.hasOwn(value, key)) activeContext[key] = value[key];
     }
-    const current = [...new Set([activeContext.cm_name, activeContext.creator_name, ...(activeContext.creator_names || []),
+    const current = [...new Set([canManageCM ? activeContext.cm_name : null, activeContext.creator_name, ...(activeContext.creator_names || []),
       ...(activeContext.chat_names || []), activeContext.event_title || (activeContext.event_ref ? "当前事项" : null),
-      activeContext.audience === "all" ? "全部授权消息" : activeContext.audience === "creators" ? "我的达人" : null,
+      activeContext.audience === "creators" ? "我的达人" : null,
       activeContext.page_label].filter(Boolean))];
     const values = activeContext.start && activeContext.end ? [`${date(activeContext.start)} – ${date(activeContext.end)} · 英国时间`] : [];
     if (matching && !values.length && value.label) values.push(value.label);
     if (activeContext.reply_status === "unreplied") values.push("未回复");
     if (activeContext.sort === "importance") values.push("重要度优先");
-    const edit = node("button", "oa-chip oa-scope-edit", "修改范围"); edit.type = "button"; edit.dataset.scopeEdit = "true";
-    edit.addEventListener("click", () => {
-      $("oa-audience").value = activeContext.audience || "all";
-      $("oa-start").value = londonInput(activeContext.start || new Date());
-      $("oa-end").value = londonInput(activeContext.end || new Date());
-      $("oa-period").value = activeContext.start ? "custom" : "today";
-      $("oa-custom-time").hidden = $("oa-period").value !== "custom";
-      $("oa-scope-editor").hidden = false; $("oa-audience").focus(); controls();
-    });
     $("oa-scope").replaceChildren(...current.map(text => node("span", "oa-chip oa-chip--page", text)),
-      ...[...new Set(values)].filter(text => !current.includes(text)).map(text => node("span", "oa-chip", text)), edit);
+      ...[...new Set(values)].filter(text => !current.includes(text)).map(text => node("span", "oa-chip", text)));
     $("oa-scope").hidden = !current.length && !values.length;
   }
   function atBottom() { return panel.hidden ? followBottom : history.scrollHeight - history.scrollTop - history.clientHeight < 64; }
@@ -286,34 +250,30 @@
       message.append(node("p", "", text)); history.append(message);
     }
   }
-  function gapList(values, summary, conversationCount) {
-    let groups = summary;
-    if (!Array.isArray(groups) || !groups.length) {
-      const reasons = new Map(), conversations = new Set();
-      for (const gap of Array.isArray(values) ? values : []) {
-        const reason = typeof gap === "string" ? gap : gap.message || gap.reason || "资料暂不可读取";
-        if (!reasons.has(reason)) reasons.set(reason, {reason, chats: new Set(), names: new Set(), items: 0});
-        const group = reasons.get(reason);
-        if (gap.chat_id) {
-          group.chats.add(gap.chat_id); conversations.add(gap.chat_id);
-          if (gap.name || gap.conversation_name) group.names.add(gap.name || gap.conversation_name);
-        }
-        else group.items += Number.isFinite(gap.count) && gap.count > 0 ? gap.count : 1;
-      }
-      groups = [...reasons.values()].map(group => ({reason: group.reason, conversations: group.chats.size,
-        names: [...group.names].slice(0, 5), items: group.items}));
-      conversationCount = conversations.size;
+  function gapList(values, summary, precise = false) {
+    const groups = new Map(), counts = new Map();
+    const labels = {"历史同步未覆盖检索起点": "该时段消息尚未同步完成", "历史回填尚未完成": "该时段消息尚未同步完成",
+      "请求早于已确认历史同步范围": "该时段消息尚未同步完成", "非文字消息未分析": "图片、附件等消息暂无法解析",
+      "群开启受限模式，Lark禁止读取消息（231203）": "群开启受限模式，无法读取消息"};
+    const reasonFor = gap => {
+      const raw = typeof gap === "string" ? gap : gap.message || gap.reason || "消息暂不可读取";
+      return Number(gap.code || gap.error_code) === 231203 ? "群开启受限模式，无法读取消息" : labels[raw] || raw;
+    };
+    if (precise) for (const gap of summary || []) {
+      const label = [[gap.conversations, "个会话"], [gap.items, "项记录"]]
+        .filter(([number]) => Number.isFinite(number) && number > 0).map(([number, unit]) => `${number} ${unit}`).join(" · ");
+      if (label) counts.set(reasonFor(gap), label);
     }
-    if (!groups.length) return null;
-    const counts = (conversations, items) => [conversations > 0 ? `${conversations} 个会话` : "",
-      items > 0 ? `${items} 项记录` : ""].filter(Boolean).join(" · ");
-    const details = node("details", "oa-gaps"), items = groups.reduce((total, group) => total + (group.items || 0), 0);
-    const total = counts(conversationCount, items);
-    details.append(node("summary", "", `部分资料尚不完整${total ? ` · ${total}` : ""}`));
-    for (const group of groups) {
-      const row = node("div", "", [group.reason || "资料暂不可读取", counts(group.conversations, group.items)].filter(Boolean).join(" · "));
-      const names = (group.names || []).slice(0, 5), remaining = (group.conversations || 0) - names.length;
-      if (names.length) row.append(node("p", "oa-gap-names", `会话：${names.join("、")}${remaining > 0 ? `；另有 ${remaining} 个会话` : ""}`));
+    for (const gap of [...(Array.isArray(summary) ? summary : []), ...(Array.isArray(values) ? values : [])]) {
+      const reason = reasonFor(gap);
+      if (!groups.has(reason)) groups.set(reason, new Set());
+      for (const name of [...(gap.names || []), gap.name, gap.conversation_name].filter(Boolean)) groups.get(reason).add(name);
+    }
+    if (!groups.size) return null;
+    const details = node("details", "oa-gaps"); details.append(node("summary", "", "读取情况"));
+    for (const [reason, names] of groups) {
+      const row = node("div", "", [reason, counts.get(reason)].filter(Boolean).join(" · "));
+      if (names.size) row.append(node("p", "oa-gap-names", `会话：${[...names].join("、")}`));
       details.append(row);
     }
     return details;
@@ -364,10 +324,9 @@
     }
   }
   function replyButton(reference, title, message = false) {
-    const context = message ? {message_ref: reference, event_ref: null, audience: "all"} : {event_ref: reference, message_ref: null, event_title: title};
+    const context = message ? {message_ref: reference} : {event_ref: reference, event_title: title};
     const button = node("button", "oa-reply-action", "帮我回复"); button.type = "button"; button.dataset.ask = "true";
     button.addEventListener("click", () => {
-      selectedReply = context;
       if (!currentDraft) $("oa-reply-title").textContent = title || "帮我回复";
       openReply();
       if (!currentDraft) $("oa-reply-body").replaceChildren(node("p", "oa-coverage", "正在读取问答并起草…"));
@@ -375,7 +334,7 @@
     });
     return button;
   }
-  function rawMessages(content, value, replyable = true) {
+  function rawMessages(content, value, replyable = true, reading = true) {
     for (const message of value.messages || []) {
       const item = node("figure");
       item.append(node("figcaption", "", [message.conversation_name || message.chat_name, message.sender_name || (message.is_staff ? "内部同事" : message.speaker === "other" ? "对方" : null),
@@ -387,7 +346,7 @@
       content.append(item);
     }
     if (!value.messages?.length) content.append(node("p", "oa-coverage", "当前没有可读取的原文。"));
-    const gaps = gapList(value.gaps, value.gap_summary, value.gap_conversation_count); if (gaps) content.append(gaps);
+    if (reading) { const gaps = gapList(value.gaps, value.gap_summary); if (gaps) content.append(gaps); }
   }
   function evidenceCard(reference, title = "消息原文", count = null) {
     const button = node("button", "oa-evidence", Number.isFinite(count) ? `查看原文 · ${count} 条` : "查看原文");
@@ -552,7 +511,7 @@
     const draw = value => {
       currentPage = value;
       body.replaceChildren();
-      rawMessages(body, value);
+      rawMessages(body, value, true, false);
       const pageCount = value.page_count || data.page_count || 1;
       pageLabel.textContent = `第 ${pageNumber} / ${pageCount} 页`;
       previous.disabled = pageNumber <= 1; next.disabled = !(value.has_more ?? pageNumber < pageCount);
@@ -574,11 +533,10 @@
     previous.addEventListener("click", () => void load(-1)); next.addEventListener("click", () => void load(1));
     footer.append(previous, pageLabel, next); details.append(body, footer);
     if (data.window?.start && data.window?.end) details.append(node("p", "oa-card-meta", `${date(data.window.start)} – ${date(data.window.end)} · 英国时间`));
-    if (data.coverage?.source_complete === false) details.append(node("p", "oa-coverage", "部分会话或记录暂不可读取。"));
     card.append(details); draw(data); return card;
   }
   function dataCard(data) {
-    const titles = {creators: "达人资料", groups: "群聊目录", sync: "同步状态", activity: "活动统计", messages: "消息命中",
+    const titles = {creators: "达人资料", groups: "群聊目录", sync: "连接与消息读取", activity: "活动统计", messages: "消息命中",
       window_messages: "总结来源", message_context: "原文与问答"};
     if (!data || !titles[data.kind]) return null;
     if (data.kind === "window_messages") return windowSources(data);
@@ -593,7 +551,7 @@
         if (person.last_contact_at) name.append(node("small", "", `最近联系 ${date(person.last_contact_at)}`));
         return [name, [person.importance?.label || person.importance?.tier_label,
           ...(person.responsible || []).map(owner => owner.name)].filter(Boolean).join(" · ") || "—",
-          askButton("查看情况", `查看 ${person.name || "这位达人"} 的最新情况`, {creator_ids: [person.id], creator_names: [person.name || "未命名达人"]})];
+          askButton("查看情况", `查看 ${person.name || "这位达人"}${person.handles?.length ? `（${person.handles.join("、")}）` : ""} 的最新情况`)];
       });
       if (rows.length) card.append(table(["达人", "分层 · 负责人", ""], rows));
       else card.append(node("p", "oa-coverage", "当前范围没有匹配的达人。"));
@@ -612,12 +570,11 @@
       if (data.summary?.detail) card.append(node("p", "oa-coverage", data.summary.detail));
       const rows = [];
       for (const [key, label] of Object.entries({discovered_conversation_count: "已发现会话", syncable_conversation_count: "可同步会话",
-        backfill_complete_count: "历史回填完成", syncing_conversation_count: "正在同步", not_readable_conversation_count: "无法读取"})) {
+        backfill_complete_count: "历史消息已读取", syncing_conversation_count: "正在同步", not_readable_conversation_count: "无法读取"})) {
         const count = (data.conversations?.counts || data.conversations)?.[key]; if (Number.isFinite(count)) rows.push([label, count]);
       }
       if (rows.length) card.append(table(["范围", "会话数"], rows));
-      if (data.watermarks?.latest) card.append(node("p", "oa-coverage", `最新同步水位 ${date(data.watermarks.latest)}`));
-      if (data.watermarks?.oldest) card.append(node("p", "oa-coverage", `最早同步水位 ${date(data.watermarks.oldest)}`));
+      if (data.watermarks?.latest) card.append(node("p", "oa-coverage", `最近同步时间 ${date(data.watermarks.latest)}`));
       if (typeof data.definition === "string") card.append(node("p", "oa-coverage", data.definition));
     } else if (data.kind === "activity") {
       const all = data.audience === "all" || data.scope?.audience === "all";
@@ -638,7 +595,6 @@
         date(message.time || message.sent_at)].filter(Boolean).join(" · ")));
       const text = message.text || "这条消息没有可显示的文字。";
       card.append(node("p", "", text.length > 420 ? `${text.slice(0, 420)}…` : text));
-      card.append(node("p", "oa-coverage", "包含引用消息与有限相邻问答，不是完整会话。"));
       const ref = data.message_ref || data.evidence_ref || message.message_ref;
       if (ref) card.append(evidenceCard(ref, message.conversation_name || message.chat_name || "原文与问答"), replyButton(ref, message.conversation_name || message.chat_name || "当前消息", true));
     } else if (data.kind === "messages") {
@@ -648,7 +604,6 @@
           date(message.time || message.sent_at)].filter(Boolean).join(" · ")));
         const text = message.text || (message.unreadable ? "正文暂不可读取" : "这条消息没有可显示的文字。");
         hit.append(node("p", "", text.length > 420 ? `${text.slice(0, 420)}…` : text));
-        if (message.unavailable_or_truncated) hit.append(node("p", "oa-coverage", "正文不完整，请查看来源范围。"));
         const ref = message.evidence_ref || message.message_ref;
         if (ref) {
           hit.append(evidenceCard(ref, message.conversation_name || message.chat_name || "消息原文"));
@@ -663,9 +618,7 @@
       }
       if (counts.length) card.append(node("p", "oa-coverage", `本页：${counts.join(" · ")}，不是全库总量。`));
       if (coverage.scan_complete === false) card.append(node("p", "oa-coverage", "扫描尚未结束，可继续下一页。"));
-      if (coverage.source_complete === false) card.append(node("p", "oa-coverage", "来源覆盖不完整，未命中不代表没有发生。"));
     }
-    const gaps = gapList(data.gaps, data.gap_summary, data.gap_conversation_count); if (gaps) card.append(gaps);
     if (data.checked_at) card.append(node("p", "oa-coverage", `查询于 ${date(data.checked_at)}`));
     if (data.kind === "messages" && data.next_source_url) {
       const actions = node("div", "oa-card-actions"), next = node("button", "", "下一页"); next.type = "button";
@@ -688,7 +641,8 @@
   }
   function renderResult(container, result) {
     container.replaceChildren(answer(result.answer));
-    scope({...result.scope, ...result.window});
+    const queryWindow = result.window || [...(result.data || [])].reverse().find(data => data.actual?.window || data.window);
+    scope({...result.scope, ...(queryWindow?.actual?.window || queryWindow?.window || queryWindow)});
     const groups = new Map([["reply", {label: "需要我回复", element: node("details", "oa-event-group")}],
       ["followup", {label: "需要内部跟进", element: node("details", "oa-event-group")}],
       ["waiting", {label: "等待对方", element: node("details", "oa-event-group")}],
@@ -745,9 +699,11 @@
       const openDraft = node("button", "oa-evidence", "查看回复草稿"); openDraft.type = "button";
       openDraft.addEventListener("click", () => { showDraft(draft, container.dataset.turnId); openReply(); }); container.append(openDraft);
     }
-    if (!sourcePages.length) {
-      const gaps = gapList(result.gaps, result.gap_summary, result.gap_conversation_count); if (gaps) container.append(gaps);
-    }
+    const readingSources = (result.data || []).filter(data => data.gaps?.length || data.gap_summary?.length);
+    const reading = gapList([...(result.gaps || []), ...readingSources.flatMap(data => data.gaps || []), ...(result.draft?.context?.gaps || [])],
+      result.gap_summary || readingSources.flatMap(data => data.gap_summary || []),
+      readingSources.length === 1 && !result.gaps?.length && !result.draft?.context?.gaps?.length);
+    if (reading) container.append(reading);
     const coverage = result.coverage;
     if (coverage && typeof coverage === "object") {
       const counts = [];
@@ -855,7 +811,7 @@
       if (changed.length) {
         closeSources(false);
         if (changed.some(view => view.id === currentDraft?.turnId)) {
-          closeReply(); currentDraft = selectedReply = null; $("oa-reply-body").replaceChildren();
+          closeReply(); currentDraft = null; $("oa-reply-body").replaceChildren();
         }
         for (const child of [...history.children]) {
           if (changed.some(view => child.dataset.turnId === view.id || child.dataset.requestId === view.client_request_id)) child.remove();
@@ -866,17 +822,17 @@
       const sessionCM = latestScope?.cm_id || saved.cm_id;
       const unconfirmed = saved.client_request_id && !received.some(view => view.client_request_id === saved.client_request_id);
       if (turns.length && sessionCM && sessionCM !== activeContext.cm_id) {
-        if (running || unconfirmed) {
+        if (canManageCM && (running || unconfirmed)) {
           const person = cmScopes.find(person => person.cm_id === sessionCM);
           if (!person) { clearProtected(); return; }
-          selectContext({...person, audience: "all", creator_ids: null}); $("oa-cm").value = person.cm_id;
+          selectContext(person); $("oa-cm").value = person.cm_id;
         } else { resetSession(cmScopes.find(person => person.cm_id === activeContext.cm_id), true); return; }
       }
       if (!turns.length) {
         closeSources(false); currentScopeTurn = null;
-        closeReply(); currentDraft = selectedReply = null; $("oa-reply-body").replaceChildren();
+        closeReply(); currentDraft = null; $("oa-reply-body").replaceChildren();
         history.replaceChildren(node("p", "oa-answer", "开始一个新问题。"));
-        selectContext({cm_id: activeContext.cm_id, cm_name: activeContext.cm_name, audience: "all", creator_ids: null}); scope({});
+        selectContext({cm_id: activeContext.cm_id, cm_name: activeContext.cm_name}); scope({});
         if (!saved.client_request_id) status("");
       }
       saved.cm_id = activeContext.cm_id; persist();
@@ -914,14 +870,15 @@
     if (!saved.client_request_id) saved.client_request_id = crypto.randomUUID();
     saved.cm_id = activeContext.cm_id;
     if (!pending) {
-      if (!Object.keys(selectedContext).length) for (const key of ["start", "end", "reply_status", "sort"]) delete activeContext[key];
-      for (const key of ["reply_action", "draft_ref", "edited_draft"]) delete activeContext[key];
       activeReplyAction = selectedContext.reply_action || null;
       activeReplyText = selectedContext.edited_draft ?? null;
-      selectContext(selectedContext); scope({});
+      const context = {cm_id: activeContext.cm_id, ...Object.fromEntries(
+        ["event_ref", "message_ref", "reply_action", "draft_ref", "edited_draft", "query_ref", "cursor"]
+          .filter(key => Object.hasOwn(selectedContext, key)).map(key => [key, selectedContext[key]]))};
+      selectContext({...context, cm_name: activeContext.cm_name, ...(selectedContext.event_title ? {event_title: selectedContext.event_title} : {})}); scope({});
       pendingScopeVersion = scopeVersion;
       pending = {session_id: saved.session_id, client_request_id: saved.client_request_id, message: text,
-        context: {...activeContext, ...(selectedContext.query_ref ? {query_ref: selectedContext.query_ref, cursor: selectedContext.cursor} : {})}};
+        context};
     }
     persist(); submitting = true; controls(); userMessage(pending.client_request_id, pending.message); scrollToBottom();
     status("正在保存请求…");
@@ -970,31 +927,10 @@
     if (!switchCM($("oa-cm").value)) $("oa-cm").value = activeContext.cm_id || "";
     else input.focus();
   });
-  $("oa-period").addEventListener("change", () => { $("oa-custom-time").hidden = $("oa-period").value !== "custom"; });
-  $("oa-scope-cancel").addEventListener("click", () => { $("oa-scope-editor").hidden = true; });
-  $("oa-scope-editor").addEventListener("submit", event => {
-    event.preventDefault();
-    try {
-      const range = $("oa-period").value === "custom" ? {start: londonTime($("oa-start").value), end: londonTime($("oa-end").value)} : periodRange($("oa-period").value);
-      if (range.start >= range.end) throw new Error("结束时间应晚于开始时间。");
-      const audience = $("oa-audience").value, sameAudience = audience === activeContext.audience;
-      const selected = sameAudience ? Object.fromEntries(["creator_ids", "creator_names", "chat_ids", "chat_names", "event_ref", "event_title", "message_ref"]
-        .filter(key => Object.hasOwn(activeContext, key)).map(key => [key, activeContext[key]])) : {};
-      $("oa-scope-editor").hidden = true;
-      void ask(activeContext.reply_status === "unreplied" && audience === "creators" ? "查看当前时段我的达人待回复事项，按重要度优先展示。" : "总结当前范围及时段的重点事项。",
-        {cm_id: activeContext.cm_id, audience, creator_ids: null, chat_ids: null, event_ref: null, message_ref: null, ...selected, ...range});
-    } catch (error) { status(error.message, true); }
-  });
   for (const button of app.querySelectorAll("[data-quick]")) button.addEventListener("click", () => {
-    if (button.dataset.quick === "reply") {
-      if (!selectedReply && !activeContext.event_ref && !activeContext.message_ref) { status("先在事项或消息旁选择「帮我回复」。"); return; }
-      openReply(); void ask("针对当前选中的消息起草英文回复，并给出中文参考。", {...(selectedReply || activeContext), reply_action: "generate"});
-    } else {
-      const unreplied = button.dataset.quick === "unreplied";
-      void ask(unreplied ? "查看昨天至现在我负责达人的未回复事项，按达人重要度优先展示。" : "总结今天全部授权消息里的重点事项。",
-        {cm_id: activeContext.cm_id, audience: unreplied ? "creators" : "all", creator_ids: null, chat_ids: null, event_ref: null, message_ref: null,
-          ...periodRange(unreplied ? "yesterday_now" : "today")});
-    }
+    const prompt = {unreplied: "查看昨天至现在我负责达人的未回复事项，按达人重要度优先展示。",
+      today: "总结今天聊天里的重点事项。", reply: "帮我给刚才讨论的消息写一条英文回复，并给出中文参考。"};
+    void ask(prompt[button.dataset.quick]);
   });
   $("oa-new").addEventListener("click", () => {
     if (denied || !scopesReady || active || submitting || restoring || saved.client_request_id) return;

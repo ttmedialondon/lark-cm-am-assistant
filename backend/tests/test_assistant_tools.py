@@ -469,13 +469,53 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
                (s.ids["reviewer"],))
     with pytest.raises(PermissionError):
         tools.current_context(pg, s.ids["reviewer"], {"cm_id": str(s.ids["cm"])}, s.settings)
-    manager_context = tools.current_context(pg, s.ids["reviewer"], {
-        "cm_id": str(s.ids["cm"]), "audience": "creators",
-    }, s.settings)
+    for name in ("reviewer", "tester"):
+        for audience in ("creators", "all"):
+            with pytest.raises(PermissionError):
+                tools.current_context(pg, s.ids[name], {
+                    "cm_id": str(s.ids["cm"]), "audience": audience,
+                }, s.settings)
+            forged = {**context, "scope": {**context["scope"], "audience": audience}}
+            with pytest.raises(PermissionError):
+                tools.execute(pg, s.ids[name], turn, "activity_stats", {
+                    **all_stats_args, "audience": audience}, s.settings, forged)
+            with pytest.raises(PermissionError):
+                assistant_search.window_messages(pg, s.ids[name], forged, {
+                    **all_args, "audience": audience}, s.settings)
+            with pytest.raises(PermissionError):
+                assistant_queries.creators(pg, s.ids[name], forged, {
+                    "query": None, "importance": None, "cursor": None}, s.settings)
+
+    # Old references remain actor-owned after an Owner downgrade, but no longer allow another CM's text.
+    owner_session, owner_turn_id = uuid4(), uuid4()
+    pg.execute("INSERT INTO assistant_sessions(id,actor_id) VALUES(%s,%s)", (owner_session, s.ids["owner"]))
+    pg.execute("INSERT INTO assistant_turns(id,session_id,client_request_id,input_ciphertext,created_at) "
+               "VALUES(%s,%s,%s,'fixture',%s)", (owner_turn_id, owner_session, uuid4(), now))
+    owner_turn = pg.execute("SELECT * FROM assistant_turns WHERE id=%s", (owner_turn_id,)).fetchone()
+    owner_page = tools.execute(pg, s.ids["owner"], owner_turn, "search_chat_history", search_args,
+                               s.settings, context)
+    owner_ref = owner_page["messages"][0]["message_ref"]
+    owner_turn["checkpoint_ciphertext"] = summary_dialogues.encode({"tool_results": [owner_page]}, s.settings)
+    pg.execute("UPDATE assistant_turns SET checkpoint_ciphertext=%s WHERE id=%s",
+               (owner_turn["checkpoint_ciphertext"], owner_turn_id))
+    owner_draft = tools.execute(pg, s.ids["owner"], owner_turn, "draft_reply", {
+        "event_ref": None, "message_ref": owner_ref, "draft_ref": None, "edited_draft": None,
+        "action": "generate", "instruction": None, "language": "en"}, s.settings, context)
+    owner_turn["checkpoint_ciphertext"] = summary_dialogues.encode({
+        "tool_results": [owner_page, owner_draft]}, s.settings)
+    pg.execute("UPDATE assistant_turns SET checkpoint_ciphertext=%s WHERE id=%s",
+               (owner_turn["checkpoint_ciphertext"], owner_turn_id))
+    assert tools.evidence(pg, s.ids["owner"], owner_ref, s.settings)["message"]["text"]
+    pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-manage')",
+               (s.ids["owner"],))
+    pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (s.ids["owner"],))
     with pytest.raises(PermissionError):
-        tools.execute(pg, s.ids["reviewer"], turn, "summarize_messages", all_args, s.settings, manager_context)
+        tools.evidence(pg, s.ids["owner"], owner_ref, s.settings)
     with pytest.raises(PermissionError):
-        tools.execute(pg, s.ids["reviewer"], turn, "activity_stats", all_stats_args, s.settings, manager_context)
+        tools.validate_tool_results(pg, s.ids["owner"], owner_turn, [owner_page], s.settings, context)
+    with pytest.raises(PermissionError):
+        tools._validate_reply_material(pg, s.ids["owner"], owner_draft, s.settings, context, turn=owner_turn)
+    pg.execute("UPDATE admin_roles SET is_active=TRUE WHERE authorization_id=%s", (s.ids["owner"],))
     all_final = {"answer": "当前授权全量消息包含未入库人员和应用通知。", "event_refs": [], "result_refs": [],
                  "data_refs": [result["query_ref"] for result in results if result.get("query_ref")], "draft_ref": None}
     all_view = tools.build_result(pg, s.ids["cm"], turn, all_final, s.settings, context, results)
@@ -562,6 +602,11 @@ def test_five_tools_keep_reports_private_resume_and_recheck_sources(pg, seeded, 
     result = tools.resume_wait(pg, s.ids["cm"], turn, waiting["waiting"], s.settings, context)
     assert result and len(result["events"]) == 1 and result["events"][0]["handling_status"] == "unresolved"
     assert not result["pending"] and result["coverage"]["messages"] == 1
+    historical_scope = {**context["scope"], "audience": "creators", "creator_ids": [str(s.ids["person"])]}
+    historical_snapshot = assistant_queries.creators(pg, s.ids["cm"], {**context, "scope": historical_scope},
+        {"query": None, "importance": None, "cursor": None}, s.settings)["_snapshot"]
+    tools.validate_tool_results(pg, s.ids["cm"], turn, [{**result, "scope": historical_scope,
+        "_creator_snapshot": historical_snapshot}], s.settings, context)
     assert tools.execute(pg, s.ids["cm"], turn, "summarize_messages", args, s.settings, context)[
         "result_id"] == result["result_id"]
     event_ref = result["events"][0]["event_ref"]

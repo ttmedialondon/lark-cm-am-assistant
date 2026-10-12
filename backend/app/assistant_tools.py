@@ -39,11 +39,12 @@ TOOLS = [
     _function("find_creators", "按姓名或 TikTok handle 查找当前可见的正式达人；返回稳定编号与负责人。",
               {"query": _STRING}),
     _function("query_unreplied_creator_events", "查询时段内负责达人的未回复事项。默认覆盖当前CM全部正式负责达人，"
-              "页面明确选择了达人时仅查询该选择。后端完整处理并按达人重要度优先排序，常规达人仍保留。"
+              "仅用户明确要求特定达人时使用对应查询，不从宽泛问题挑选子集。后端完整处理并按达人重要度优先排序，常规达人仍保留。"
               "不要先query_creators挑几位重点达人。返回总量及最多25项预览，完整结果由系统展示；"
               "口径是已抽取事项中未见CM/AM回复，不等于未解决，也不是逐条消息的绝对未回复证明。",
               {"start": _STRING, "end": _STRING}),
-    _function("summarize_messages", "总结指定时段聊天。默认audience=all读取当前CM全部授权消息，不要求联系人是达人。"
+    _function("summarize_messages", "根据问题时间总结本人聊天。默认audience=all包含所有可读会话和发言人，"
+              "不要求联系人是达人。"
               "仅用户明确要求达人时用creators；此模式复用达人事件报告。all由系统完整读取请求时段并分段归纳，"
               "一次调用即可，不需模型或用户翻页；仍须说明实际同步缺口。时间用带时区ISO8601；"
               "chat_ids=null全会话、creator_ids=null不指定某达人。",
@@ -60,7 +61,7 @@ TOOLS = [
               "原时段结论和最新材料必须分开，不把相似主题当作同一事项。",
               {"event_ref": _STRING, "mode": {"type": "string", "enum": ["period", "latest"]}}),
     _function("draft_reply", "准备回复材料，不发送。generate选择实际event_ref或已取得message_ref其中一个；"
-              "普通授权文字消息不要求达人身份，已解决事项可以礼貌回应。其他action选择已生成draft_ref并传用户edited_draft。"
+              "普通可读文字消息不要求达人身份，已解决事项可以礼貌回应。其他action选择已生成draft_ref并传用户edited_draft。"
               "取得材料后调用save_reply_draft保存草稿及中文参考；translate只更新中文，不改变英文。",
               {"event_ref": _NULL_STRING, "message_ref": _NULL_STRING, "draft_ref": _NULL_STRING,
                "edited_draft": _NULL_STRING, "action": {"type": "string", "enum": list(assistant_replies.ACTIONS)},
@@ -82,8 +83,9 @@ TOOLS = [
               {"query": _NULL_STRING, "creator_ids": _IDS,
                "purpose": _choice(list(assistant_queries.PURPOSES)),
                "cursor": _NULL_STRING}),
-    _function("get_sync_status", "只读查询当前CM授权、消息同步水位、回填与不可读缺口；不刷新或修改授权。", {}),
-    _function("search_chat_history", "检索Lark消息正文，不检索旧助手问答。默认audience=all读取全部授权聊天和发言人；"
+    _function("get_sync_status", "只读查询当前账号连接、消息同步进度与具体读取问题；不刷新或修改连接。", {}),
+    _function("search_chat_history", "检索Lark消息正文，不检索旧助手问答。"
+              "默认audience=all读取本人可读聊天和所有发言人；"
               "用户明确要求达人时才creators。query为1–8个关键词或同义词，任一命中；可限定群和时间。返回本页覆盖和游标，"
               "有next_cursor时不能声称查完，matched是本页命中不是全库总数。",
               {"query": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 120},
@@ -93,7 +95,7 @@ TOOLS = [
                "cursor": _NULL_STRING}),
     _function("read_message_context", "根据已取得message_ref查看完整原文和问答；不能用名字或猜测的引用读消息。",
               {"message_ref": _STRING}),
-    _function("activity_stats", "数据库统计消息量与实际联系人数。默认audience=all为当前CM全部授权消息，"
+    _function("activity_stats", "数据库统计消息量与实际联系人数。默认audience=all为本人可读消息，"
               "按day/person/conversation分组；仅明确要求达人时creators，可按day/creator。comparison=previous比较前一等长时段，"
               "不同于业务履约或全局未解决事项数，不把群成员数当联系人数。",
               {"start": _STRING, "end": _STRING, "audience": {"type": "string", "enum": ["all", "creators"]},
@@ -146,7 +148,7 @@ def scopes_for(conn, actor_id):
     people = conn.execute("""SELECT id,display_name FROM authorizations WHERE status='active'
         AND body_consent_at IS NOT NULL AND (%s OR id=%s) ORDER BY display_name,id""", (owner, actor_id)).fetchall()
     ids = {person["id"] for person in people}
-    selected = actor_id if actor_id in ids else people[0]["id"] if people else None
+    selected = actor_id if actor_id in ids else None
     return {"scopes": [{"cm_id": str(person["id"]), "cm_name": person["display_name"] or "未命名人员"}
                        for person in people], "selected_cm_id": str(selected) if selected else None,
             "can_switch_cm": owner}
@@ -161,14 +163,13 @@ def current_context(conn, actor_id, selected_context, settings, *, now=None):
     selection = scopes_for(conn, actor_id)
     requested_cm = selected_context.get("cm_id") or selection["selected_cm_id"]
     if not requested_cm:
-        raise ValueError("当前没有可查询的有效消息授权。")
+        raise ValueError("当前账号的消息连接尚未就绪，请检查账号连接。")
     cm_id = UUID(str(requested_cm))
     audience = selected_context.get("audience") or (
         "creators" if selected_context.get("creator_ids") is not None or selected_context.get("event_ref") else "all")
     if audience not in {"all", "creators"}:
         raise ValueError("消息范围无效。")
-    cm = assistant_search.authorize_all(conn, actor_id, cm_id) if audience == "all" else summaries._authorize(
-        conn, actor_id, cm_id=cm_id)[0]
+    cm = assistant_search.authorize_all(conn, actor_id, cm_id)
     actor = conn.execute("SELECT display_name,body_consent_at FROM authorizations WHERE id=%s", (actor_id,)).fetchone()
     roster = summaries._roster(conn, cm_id)
     visible = {str(row["contact_id"]) for row in roster}
@@ -277,7 +278,7 @@ def _creator_ids(values, visible):
 
 def _scope(conn, actor_id, context):
     cm_id = UUID(context["scope"]["cm_id"])
-    cm, _ = summaries._authorize(conn, actor_id, cm_id=cm_id)
+    cm = assistant_search.authorize_all(conn, actor_id, cm_id)
     roster = summaries._roster(conn, cm_id)
     visible = {str(row["contact_id"]) for row in roster}
     _creator_ids(context["scope"].get("creator_ids"), visible)
@@ -307,6 +308,7 @@ def _saved_query(conn, actor_id, ref, settings):
 def _validate_query(conn, actor_id, context, result, settings):
     if result.get("scope", {}).get("cm_id") != context["scope"]["cm_id"]:
         raise PermissionError("查询不属于当前范围。")
+    context = {**context, "scope": result["scope"]}
     if result.get("kind") in {"messages", "window_messages", "message_context"}:
         refs = result.get("_message_refs", {})
         restored = {**result, "messages": [{**message,
@@ -497,6 +499,7 @@ def _validate_reply_material(conn, actor_id, result, settings, context, *, turn=
     source = saved["source"]
     if saved["scope"]["cm_id"] != context["scope"]["cm_id"]:
         raise PermissionError("草稿不属于当前人员范围。")
+    assistant_search.authorize_all(conn, actor_id, saved["scope"]["cm_id"])
     if source["kind"] == "message":
         current = _saved_message(conn, actor_id, source["ref"], settings, turn=turn)
         # Re-sealing a compact reference changes its nonce, not its authenticated scope.
@@ -686,6 +689,7 @@ def _event_id(conn, actor_id, ref, settings, context=None):
         raise ValueError("事件材料已更新，请重新读取报告。")
     if context and str(task["responsible_authorization_id"]) != context["scope"]["cm_id"]:
         raise PermissionError("事件不属于当前查询范围。")
+    assistant_search.authorize_all(conn, actor_id, task["responsible_authorization_id"])
     # The core verifies current roster, source messages and consent, not just an old stored report.
     summary_replies.source(conn, actor_id, f"{task_id}:{index}", settings, require_unresolved=False)
     return f"{task_id}:{index}"
@@ -803,12 +807,18 @@ def _named_selection(conn, turn, settings, context, ids):
         return True
     checkpoint = json.loads(summaries._cipher(settings.token_encryption_key).decrypt(
         turn["checkpoint_ciphertext"])) if turn.get("checkpoint_ciphertext") else {}
+    previous = checkpoint.get("followup_scope", {})
+    if (previous.get("cm_id") == context["scope"]["cm_id"] and previous.get("creator_ids") is not None
+            and set(ids) == set(previous["creator_ids"])):
+        return True
     question = json.loads(summaries._cipher(settings.token_encryption_key).decrypt(
         turn["input_ciphertext"]))["message"].casefold()
     for result in checkpoint.get("tool_results", []):
         request = result.get("_request", {})
+        if request.get("name") != "query_creators":
+            continue
         query = (request.get("args", {}).get("query") or "").strip()
-        if (request.get("name") == "query_creators" and query and query.casefold() in question
+        if (query and query.casefold() in question
                 and result.get("scope", {}).get("cm_id") == context["scope"]["cm_id"]):
             selected.update(person["id"] for person in result.get("creators", []) if person.get("exact_match"))
     return set(ids) <= selected
@@ -820,8 +830,6 @@ def execute(conn, actor_id, turn, name, args, settings, context):
     if name == "draft_reply":
         args = {"message_ref": None, "draft_ref": None, "edited_draft": None, "action": "generate", **args}
     _validate(name, args)
-    if "start" in args and "end" in args and context["scope"].get("window"):
-        args = {**args, **context["scope"]["window"]}
     cm, roster, visible = _scope(conn, actor_id, context)
     if (context["scope"].get("window") and context["scope"].get("audience") == "creators"
             and context["scope"].get("creator_ids") is not None
@@ -921,6 +929,8 @@ def execute(conn, actor_id, turn, name, args, settings, context):
             events = [event for event in events if topic in " ".join(str(event[field] or "")
                 for field in ("title", "summary", "latest_progress", "conversation_name")).casefold()]
         filters = {key: args[key] for key in ("priority", "reply_status", "handling_status", "importance", "topic")}
+        if ids is not None:
+            filters["creator_ids"] = ids
         result.update(events=events, total=len(events), scope={**result["scope"], **filters})
         if original:
             result.update(_assistant_turn_id=str(turn["id"]),
@@ -1068,7 +1078,11 @@ def _validate_tool_results(conn, actor_id, turn, results, settings, context):
                                if result.get("draft") else None)}
             continue
         if result.get("_creator_snapshot"):
-            assistant_queries.creators(conn, actor_id, context,
+            saved_scope = result.get("scope", context["scope"])
+            if saved_scope.get("cm_id") != context["scope"]["cm_id"]:
+                raise PermissionError("达人查询不属于当前人员范围。")
+            saved_scope = {**saved_scope, "creator_ids": result["_creator_snapshot"]["query"]["creator_ids"]}
+            assistant_queries.creators(conn, actor_id, {**context, "scope": saved_scope},
                 {"query": None, "importance": None, "cursor": None}, settings,
                 snapshot=result["_creator_snapshot"])
         for person in result.get("creators", []):
@@ -1174,8 +1188,6 @@ def build_result(conn, actor_id, turn, final, settings, context, tool_results):
     if current:
         result_scope = current[-1]["scope"]
         coverage = current[-1]["coverage"]
-        if not coverage.get("source_complete"):
-            answer += "\n\n来源覆盖不完整，未检出不代表没有相关事项。"
     return {"turn_id": str(turn["id"]), "status": "completed", "answer": answer,
             "data_refs": list(dict.fromkeys(data_refs)),
             "data": [public_query(data[ref]) for ref in dict.fromkeys(data_refs)],

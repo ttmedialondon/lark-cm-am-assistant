@@ -83,7 +83,9 @@ def source(conn, actor_id, event_id, settings, *, require_unresolved=True, featu
     if not task or not task["is_current"] or task["status"] != "succeeded" or task["chat_id"] is not None:
         raise core.SummaryInputError("事件已更新，请刷新报告后重新生成。")
     run = conn.execute("SELECT * FROM offhours_summary_runs WHERE id=%s", (task["run_id"],)).fetchone()
-    cm, _ = core._authorize_run(conn, run, actor_id=actor_id)
+    cm, owner = core._authorize_run(conn, run, actor_id=actor_id)
+    if feature == core.ASSISTANT_FEATURE and not owner and UUID(str(actor_id)) != cm["id"]:
+        raise PermissionError("运营助手只允许本人或 Owner 查看该 CM 的聊天。")
     if require_unresolved and not core._enabled(conn, feature or core.run_feature(run)):
         raise core.SummaryInputError("消息总结 AI 已关闭，暂不能生成建议。")
     roster = core._roster(conn, cm["id"])
@@ -490,11 +492,12 @@ def read(conn, actor, job_id, settings, *, fresh=False):
     ).fetchone()
     if not job:
         raise PermissionError("回复建议不存在或无权查看。")
-    source(conn, actor, event_id(job), settings, require_unresolved=False)
+    feature = job.get("feature", core.FEATURE)
+    source(conn, actor, event_id(job), settings, require_unresolved=False, feature=feature)
     result = None
     if job["status"] == "succeeded":
         if fresh:
-            current = collect(conn, actor, event_id(job), settings, require_unresolved=False)
+            current = collect(conn, actor, event_id(job), settings, require_unresolved=False, feature=feature)
             checkpoint = dialogues.decode(job["checkpoint_ciphertext"], settings)
             if current["fingerprint"] != checkpoint["fingerprint"]:
                 return {"id": str(job["id"]), "status": "stale", "error": "收到新消息或资料变化，请重新生成建议。"}

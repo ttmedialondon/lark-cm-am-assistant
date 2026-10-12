@@ -1937,6 +1937,70 @@ def test_assistant_window_uses_cm_identity_separate_switch_and_frozen_cutoff(pg,
                             for model, key, _ in observed)
     assert observed[-1][2]["draft_request"] == {"instruction": "Use English", "language": "en"}
 
+    # Assistant policy is stricter than the retained scheduled-report pilot/management policy.
+    from app import assistant_tools
+    pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-manage')",
+               (s.ids["owner"],))
+    legacy_ref = f"{legacy_event['id']}:{legacy_event['version']}"
+    assert replies.read_event_context(pg, s.ids["tester"], legacy_event["id"], s.settings)["messages"]
+    with pytest.raises(PermissionError):
+        assistant_tools.evidence(pg, s.ids["tester"], legacy_ref, s.settings)
+    with pytest.raises(PermissionError):
+        replies.enqueue(pg, s.ids["tester"], legacy_event["id"], s.settings, feature=ai.ASSISTANT_FEATURE)
+
+    owner_reply = replies.enqueue(pg, s.ids["owner"], legacy_event["id"], s.settings,
+                                 feature=ai.ASSISTANT_FEATURE, instruction="Owner test")
+    for _ in range(8):
+        reply_job = replies.claim()
+        if not reply_job:
+            break
+        replies.run(reply_job, s.settings)
+    assert replies.read(pg, s.ids["owner"], owner_reply, s.settings, fresh=True)["status"] == "succeeded"
+    queued_reply = replies.enqueue(pg, s.ids["owner"], legacy_event["id"], s.settings,
+                                  feature=ai.ASSISTANT_FEATURE, instruction="Queued Owner test")
+    reply_job = replies.claim()
+    assert str(reply_job["id"]) == queued_reply
+    owner_session, owner_turn = uuid4(), uuid4()
+    pg.execute("INSERT INTO assistant_sessions(id,actor_id) VALUES(%s,%s)", (owner_session, s.ids["owner"]))
+    pg.execute("""INSERT INTO assistant_turns(id,session_id,client_request_id,status,input_ciphertext)
+        VALUES(%s,%s,%s,'waiting','synthetic')""", (owner_turn, owner_session, uuid4()))
+    owner_run = ai.ensure_assistant_run(pg, s.ids["owner"], owner_turn, s.ids["cm"], s.start, s.end,
+                                        [s.ids["person"]], s.settings)["run"]["id"]
+    assert ai.prepare_next_summary(s.settings)
+    summary_job = ai.claim_next_summary()
+    assert str(summary_job["run_id"]) == owner_run
+    count = len(observed)
+    pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (s.ids["owner"],))
+    replies.run(reply_job, s.settings)
+    ai.run_claimed_summary(summary_job, s.settings)
+    assert len(observed) == count
+    assert pg.execute("SELECT status FROM summary_reply_tasks WHERE id=%s", (queued_reply,)).fetchone()[
+        "status"] == "stale"
+    with pytest.raises(PermissionError):
+        replies.read(pg, s.ids["owner"], owner_reply, s.settings, fresh=True)
+    with pytest.raises(PermissionError):
+        ai.read_assistant_run(pg, s.ids["owner"], owner_run, s.settings)
+    with pytest.raises(PermissionError):
+        ai.ensure_assistant_run(pg, s.ids["owner"], owner_turn, s.ids["cm"], s.start, s.end,
+                                [s.ids["person"]], s.settings)
+    assert ai._authorize(pg, s.ids["owner"], cm_id=s.ids["cm"])[0]["id"] == s.ids["cm"]
+    pg.execute("UPDATE admin_roles SET is_active=TRUE WHERE authorization_id=%s", (s.ids["owner"],))
+
+    # A request already accepted by the provider cannot save or expose its late cross-CM result.
+    late_reply = replies.enqueue(pg, s.ids["owner"], legacy_event["id"], s.settings,
+                                feature=ai.ASSISTANT_FEATURE, instruction="Late Owner result")
+    def downgraded_reply(*args, **kwargs):
+        output = reply_model(*args, **kwargs)
+        pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (s.ids["owner"],))
+        return output
+    monkeypatch.setattr(openai_client, "call_openai", downgraded_reply)
+    replies.run(replies.claim(), s.settings)
+    late = pg.execute("SELECT status,result_ciphertext FROM summary_reply_tasks WHERE id=%s",
+                      (late_reply,)).fetchone()
+    assert late["status"] == "stale" and late["result_ciphertext"] is None
+    with pytest.raises(PermissionError):
+        replies.read(pg, s.ids["owner"], late_reply, s.settings)
+
 
 def test_assistant_unknown_material_cannot_be_replayed_by_a_new_turn(pg, seeded, monkeypatch):
     s = seeded

@@ -19,11 +19,6 @@
 .oa-scope { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 22px 13px; }
 .oa-chip { border-radius: 6px; background: #f2f5fa; color: #63728a; padding: 4px 8px; font-size: 12px; }
 .oa-chip--page { background: #edf2fb; color: #365078; }
-.oa-scope-edit { background: transparent; border: 0; color: var(--oa-accent); }
-.oa-scope-editor { padding: 0 22px 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; background: #fbfcfe; }
-.oa-scope-editor label { display: grid; gap: 4px; color: var(--oa-muted); font-size: 12px; }
-.oa-scope-editor select, .oa-scope-editor input { min-width: 0; width: 100%; border: 1px solid var(--oa-line); background: #fff; border-radius: 8px; padding: 8px; color: var(--oa-ink); font: inherit; }
-.oa-custom-time { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .oa-quick { display: flex; gap: 8px; padding: 0 22px 14px; }
 .oa-quick button { flex: 1; border: 1px solid var(--oa-line); border-radius: 9px; padding: 8px; background: #fff; color: #486183; font-size: 12px; }
 .oa-quick button:hover { background: #f0f4fc; border-color: #d2def3; }

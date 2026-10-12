@@ -348,6 +348,13 @@ def test_model_first_lookup_replay_history_and_actor_isolation(pg, chat, monkeyp
     own_scopes = assistant.tools.scopes_for(pg, chat.ids['cm'])
     assert own_scopes == {'can_switch_cm': False, 'selected_cm_id': str(chat.ids['cm']),
                          'scopes': [{'cm_id': str(chat.ids['cm']), 'cm_name': 'cm'}]}
+    consent = pg.execute('SELECT body_consent_at FROM authorizations WHERE id=%s',
+                         (chat.ids['owner'],)).fetchone()['body_consent_at']
+    pg.execute('UPDATE authorizations SET body_consent_at=NULL WHERE id=%s', (chat.ids['owner'],))
+    assert assistant.tools.scopes_for(pg, chat.ids['owner'])['selected_cm_id'] is None
+    with pytest.raises(ValueError, match='连接尚未就绪'):
+        assistant.tools.current_context(pg, chat.ids['owner'], {}, chat.settings)
+    pg.execute('UPDATE authorizations SET body_consent_at=%s WHERE id=%s', (consent, chat.ids['owner']))
     assert assistant.tools.current_context(pg, chat.ids['tester'], {}, chat.settings)['scope']['cm_id'] == str(
         chat.ids['tester'])
     for candidate in owner_scopes['scopes']:
@@ -423,6 +430,21 @@ def test_model_first_lookup_replay_history_and_actor_isolation(pg, chat, monkeyp
     assert assistant.turn_view(pg, chat.ids['reviewer'], other['id'], chat.settings)['status'] == 'queued'
     assert all(pg.execute(f'SELECT count(*) n FROM {table}').fetchone()['n'] == count
                for table, count in untouched.items()) and len(calls) == 2
+    owner_request = {**payload('检查其他 CM 的消息'), 'context': {'cm_id': str(chat.ids['cm'])}}
+    owner_turn = assistant.submit(pg, chat.ids['owner'], owner_request, chat.settings)
+    row = pg.execute('SELECT checkpoint_ciphertext FROM assistant_turns WHERE id=%s',
+                     (owner_turn['id'],)).fetchone()
+    checkpoint = summary_dialogues.decode(row['checkpoint_ciphertext'], chat.settings)
+    checkpoint['progress'] = {'messages': 999, 'conversations': 100}
+    pg.execute('UPDATE assistant_turns SET checkpoint_ciphertext=%s WHERE id=%s',
+               (summary_dialogues.encode(checkpoint, chat.settings), owner_turn['id']))
+    pg.execute('UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s', (chat.ids['owner'],))
+    denied = assistant.turn_view(pg, chat.ids['owner'], owner_turn['id'], chat.settings)
+    assert denied['error_code'] == 'permission' and denied['result'] is None
+    assert denied['scope'] == {} and denied['message'] == denied['progress'] == ''
+    pg.execute('UPDATE admin_roles SET is_active=TRUE WHERE authorization_id=%s', (chat.ids['owner'],))
+    assistant.cancel(pg, chat.ids['owner'], owner_turn['id'], chat.settings)
+    assert len(calls) == 2
     pg.execute('UPDATE authorizations SET status=\'revoked\' WHERE id=%s', (chat.ids['cm'],))
     with pytest.raises(PermissionError):
         assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
@@ -519,7 +541,7 @@ def test_repeated_tool_call_uses_current_turn_cache(pg, chat, monkeypatch):
     assistant.cancel(pg, chat.ids['cm'], turn['id'], chat.settings)
 
 
-def test_selected_creator_changes_do_not_reuse_other_persons_context(pg, chat, monkeypatch):
+def test_natural_queries_replace_stale_filters_and_keep_valid_followup_sources(pg, chat, monkeypatch):
     pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
                "VALUES(%s,%s,%s,'manual')", (uuid4(), chat.ids['other'], chat.ids['cm']))
     calls = []
@@ -528,9 +550,11 @@ def test_selected_creator_changes_do_not_reuse_other_persons_context(pg, chat, m
         calls.append(items.copy())
         outputs = [item for item in items if item.get('type') == 'function_call_output']
         if not outputs:
+            question = json.loads(next(item['content'] for item in reversed(items)
+                                       if item.get('role') == 'user'))['question']
             return {'text': '', 'output': [{'type': 'function_call', 'call_id': str(uuid4()),
                 'name': 'query_creators', 'arguments': json.dumps({
-                    'query': None, 'importance': None, 'cursor': None,
+                    'query': 'alice' if '@alice' in question else 'other', 'importance': None, 'cursor': None,
                 })}], 'usage': {}}
         result = json.loads(outputs[-1]['output'])
         final = {'answer': result['creators'][0]['name'], 'event_refs': [], 'result_refs': [],
@@ -538,20 +562,32 @@ def test_selected_creator_changes_do_not_reuse_other_persons_context(pg, chat, m
         return {'text': json.dumps(final), 'output': [], 'usage': {}}
 
     monkeypatch.setattr(openai_client, 'call_openai_tools', model)
-    first = payload('查询当前达人资料')
-    first['context'] = {'creator_ids': [str(chat.ids['person'])]}
+    first = payload('查询 @alice 达人资料')
+    first['context'] = {'creator_ids': [str(chat.ids['other'])], 'audience': 'creators', 'chat_ids': ['not-visible'],
+                        'start': (chat.start - timedelta(days=8)).isoformat(), 'end': chat.start.isoformat()}
     turn = assistant.submit(pg, chat.ids['cm'], first, chat.settings)
+    assert turn['scope']['audience'] == 'all' and turn['scope']['creator_ids'] is None
+    assert 'chat_ids' not in turn['scope'] and 'window' not in turn['scope']
     for _ in range(3):
         finish(chat)
     assert assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)['status'] == 'completed'
-    second = {**first, 'client_request_id': str(uuid4()),
-              'context': {'creator_ids': [str(chat.ids['other'])]}}
+    second = {**first, 'client_request_id': str(uuid4()), 'message': '改查 other 达人资料', 'context': {}}
     turn = assistant.submit(pg, chat.ids['cm'], second, chat.settings)
     for _ in range(3):
         finish(chat)
     view = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
     assert view['status'] == 'completed' and view['result']['data'][0]['creators'][0]['id'] == str(chat.ids['other'])
-    assert not any(item.get('role') == 'assistant' for item in calls[2])
+    assert any(item.get('role') == 'assistant' for item in calls[2])
+    row = assistant._turn(pg, chat.ids['cm'], turn['id'])
+    checkpoint = summary_dialogues.decode(row['checkpoint_ciphertext'], chat.settings)
+    assert checkpoint['followup_scope']['creator_ids'] == [str(chat.ids['person'])]
+    mixed = {**checkpoint, 'tool_results': [{'scope': checkpoint['context']['scope'],
+        '_request': {'name': 'search_chat_history', 'args': {'query': ['sample']}}}, *checkpoint['tool_results']]}
+    continued = {**row, 'input_ciphertext': summary_dialogues.encode({'message': '改成上周'}, chat.settings),
+                 'checkpoint_ciphertext': summary_dialogues.encode(mixed, chat.settings)}
+    context = assistant._context(pg, row, checkpoint, chat.settings)
+    assert assistant.tools._named_selection(pg, continued, chat.settings, context, [str(chat.ids['person'])])
+    assert not assistant.tools._named_selection(pg, continued, chat.settings, context, [str(chat.ids['other'])])
 
     def full_model(_cfg, _key, items, _actor, **_kwargs):
         calls.append(items.copy())
@@ -564,27 +600,29 @@ def test_selected_creator_changes_do_not_reuse_other_persons_context(pg, chat, m
                 })}], 'usage': {}}
         result = json.loads(outputs[-1]['output'])
         assert result['total_messages'] == 2 and result['scope']['creator_ids'] is None
-        final = {'answer': '全量授权消息。', 'event_refs': [], 'result_refs': [],
+        final = {'answer': '本人聊天。', 'event_refs': [], 'result_refs': [],
                  'data_refs': [result['query_ref']], 'draft_ref': None}
         return {'text': json.dumps(final), 'output': [], 'usage': {}}
 
     monkeypatch.setattr(openai_client, 'call_openai_tools', full_model)
     third = {**first, 'client_request_id': str(uuid4()), 'message': '总结全部聊天',
-             'context': {'audience': 'all'}}
+             'context': first['context']}
     turn = assistant.submit(pg, chat.ids['cm'], third, chat.settings)
     for _ in range(3):
         finish(chat)
     view = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
     assert view['status'] == 'completed' and view['result']['scope']['audience'] == 'all'
-    assert not any(item.get('role') == 'assistant' for item in calls[4])
+    assert any(item.get('role') == 'assistant' for item in calls[4])
+    assert view['result']['data'][0]['window']['start'] == chat.start.isoformat()
     stored = pg.execute('SELECT checkpoint_ciphertext,usage FROM assistant_turns WHERE id=%s', (turn['id'],)).fetchone()
     checkpoint = summary_dialogues.decode(stored['checkpoint_ciphertext'], chat.settings)
-    checkpoint['tool_results'][0]['gaps'] = [{'chat_id': 'chat', 'reason': '历史同步未覆盖检索起点'}]
-    checkpoint['tool_results'][0]['coverage']['source_complete'] = False
+    material = next(result for result in checkpoint['tool_results'] if result.get('kind') == 'window_messages')
+    material['gaps'] = [{'chat_id': 'chat', 'reason': '历史同步未覆盖检索起点'}]
+    material['coverage']['source_complete'] = False
     pg.execute('UPDATE assistant_turns SET checkpoint_ciphertext=%s WHERE id=%s',
                (summary_dialogues.encode(checkpoint, chat.settings), turn['id']))
     restored = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
-    assert restored['result']['answer'] == '全量授权消息。' and restored['result']['data'][0]['gaps'] == []
+    assert restored['result']['answer'] == '本人聊天。' and restored['result']['data'][0]['gaps'] == []
     assert restored['result']['data'][0]['coverage']['source_complete'] is True
     assert len(calls) == 6 and pg.execute('SELECT usage FROM assistant_turns WHERE id=%s', (turn['id'],)).fetchone()[
         'usage'] == stored['usage']
@@ -595,7 +633,10 @@ def test_selected_creator_changes_do_not_reuse_other_persons_context(pg, chat, m
     next_row = assistant._turn(pg, chat.ids['cm'], next_turn['id'])
     next_checkpoint = summary_dialogues.decode(next_row['checkpoint_ciphertext'], chat.settings)
     next_context = assistant._context(pg, next_row, next_checkpoint, chat.settings)
-    assert assistant._history(pg, next_row, chat.settings, next_context) == ([], [])
+    history, retained = assistant._history(pg, next_row, chat.settings, next_context)
+    previous = [json.loads(item['content']) for item in history if item.get('role') == 'assistant']
+    assert previous[-1]['answer'] == '' and previous[-1]['scope']['audience'] == 'all'
+    assert previous[-1]['data'][0]['window']['start'] == chat.start.isoformat() and retained
     assert len(calls) == 6
     assistant.cancel(pg, chat.ids['cm'], next_turn['id'], chat.settings)
 
@@ -812,6 +853,21 @@ def test_unreplied_creator_query_covers_whole_roster_and_attaches_all_events(pg,
         expected = result['event_refs'][:1] if tier == 'focus' else result['event_refs'][1:]
         assert filtered_view['event_refs'] == expected
         assert filtered_view['coverage']['matched_events'] == count
+    named_lookup = assistant.tools.execute(pg, chat.ids['cm'], stored, 'find_creators',
+        {'query': '@alice'}, chat.settings, filter_context)
+    selected_checkpoint = {**filter_checkpoint, 'tool_results': [*filter_checkpoint['tool_results'], named_lookup]}
+    selected_row = {**assistant._turn(pg, chat.ids['cm'], turn['id']),
+        'input_ciphertext': summary_dialogues.encode({'message': '只看 @alice'}, chat.settings),
+        'checkpoint_ciphertext': summary_dialogues.encode(selected_checkpoint, chat.settings)}
+    selected = assistant.tools.execute(pg, chat.ids['cm'], selected_row, 'filter_events', {
+        'result_id': result['result_refs'][0], 'creator_ids': [str(chat.ids['person'])], 'importance': None,
+        'priority': None, 'reply_status': 'unreplied', 'handling_status': None, 'topic': None, 'cursor': None,
+    }, chat.settings, filter_context)
+    assert selected['scope']['creator_ids'] == [str(chat.ids['person'])]
+    selected_view = assistant.tools.build_result(pg, chat.ids['cm'], selected_row, final,
+        chat.settings, filter_context, [*selected_checkpoint['tool_results'], selected])
+    assert selected_view['scope']['creator_ids'] == [str(chat.ids['person'])]
+    assert len(selected_view['events']) == 1 and len(api_calls) == 3
     pg.execute('UPDATE assistant_turns SET checkpoint_ciphertext=%s WHERE id=%s',
                (stored['checkpoint_ciphertext'], turn['id']))
     assert len(assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)['result']['events']) == 31

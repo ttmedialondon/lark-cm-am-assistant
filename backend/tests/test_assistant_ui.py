@@ -143,7 +143,7 @@ const {chromium} = require('playwright');
     const page = await browser.newPage({viewport:{width:1280,height:900}});
     const errors = [], posts = [], sourceReads = [], remiId='22222222-2222-4222-8222-222222222222';
     let view, html = input.html, failFirstPost = true, scopeReads=0, sessionGone=false, turnsEmpty=false;
-    let holdEvidence=false, denyEvidence=false, evidenceStarted, olderTurns=[], newDraftMessages=false;
+    let holdEvidence=false, denyEvidence=false, evidenceStarted, olderTurns=[], newDraftMessages=false, selfReady=true;
     const pendingEvidence=[];
     const ownId=()=>html.match(/data-user-id="([^"]+)"/)[1];
     page.on('pageerror', error => errors.push(error.message));
@@ -160,14 +160,14 @@ const {chromium} = require('playwright');
     await page.route('**/*', async route => {
       const url = new URL(route.request().url());
       if (url.origin !== 'http://localhost') return route.abort();
-      if (url.pathname === '/') return route.fulfill({contentType:'text/html',body:html});
+      if (['/','/admin/messages'].includes(url.pathname)) return route.fulfill({contentType:'text/html',body:html});
       if (url.pathname.startsWith('/static/')) return route.fulfill({
         contentType:url.pathname.endsWith('.js')?'text/javascript':'text/css',
         body:fs.readFileSync(path.join(input.backend,'app',url.pathname))});
       if (url.pathname==='/assistant/scopes') {
         scopeReads++; const owner=ownId()!=='33333333-3333-4333-8333-333333333333';
-        return route.fulfill({json:{scopes:[{cm_id:ownId(),cm_name:'CM'},
-          ...(owner?[{cm_id:remiId,cm_name:'Remi'}]:[])],selected_cm_id:ownId(),can_switch_cm:owner}});
+        return route.fulfill({json:{scopes:[...(selfReady?[{cm_id:ownId(),cm_name:'CM'}]:[]),
+          ...(owner?[{cm_id:remiId,cm_name:'Remi'}]:[])],selected_cm_id:selfReady?ownId():null,can_switch_cm:owner}});
       }
       if (route.request().method()==='POST') {
         const body=route.request().postDataJSON(); posts.push({url:url.pathname,body});
@@ -205,7 +205,7 @@ const {chromium} = require('playwright');
       }
       return route.abort();
     });
-    await page.goto('http://localhost/');
+    await page.goto('http://localhost/admin/messages');
     assert.equal(scopeReads,0);
     await page.evaluate(cm_id=>document.dispatchEvent(new CustomEvent('ttmedia:assistant',
       {detail:{context:{cm_id}}})),remiId);
@@ -270,17 +270,18 @@ const {chromium} = require('playwright');
     assert.equal(await page.locator('.oa-event p').textContent(),'对方询问样品寄送进度。');
     assert.match(await page.locator('.oa-message--assistant > .oa-coverage').textContent(),
       /负责达人 201 位 · 匹配事项 12 项 · 部分结果/);
-    assert.match(await page.locator('.oa-scope').textContent(),/全部授权消息/);
+    assert.doesNotMatch(await page.locator('.oa-scope').textContent(),/授权|修改范围/);
     assert.match(await page.locator('.oa-data').textContent(),/来源 · 20 条消息/);
     assert.equal(await page.locator('.oa-data details.oa-coverage').getAttribute('open'),null);
-    assert.equal(await page.locator('.oa-data .oa-gaps summary').textContent(),
-      '部分资料尚不完整 · 1272 个会话 · 5 项记录');
-    assert.equal(await page.locator('.oa-data .oa-gaps > div').count(),2);
-    assert.match(await page.locator('.oa-data .oa-gaps > div').first().textContent(),
-      /历史同步未覆盖检索起点 · 1272 个会话.*另有 1267 个会话/);
-    assert.equal(await page.locator('.oa-data .oa-gap-names').textContent(),
-      '会话：受限群一、<img src=x onerror=alert(1)>、群三、群四、群五；另有 1267 个会话');
-    assert.equal(await page.locator('.oa-data .oa-gaps img').count(),0);
+    assert.equal(await page.locator('.oa-history .oa-gaps').count(),1);
+    assert.equal(await page.locator('.oa-history .oa-gaps summary').textContent(),'读取情况');
+    assert.equal(await page.locator('.oa-history .oa-gaps').getAttribute('open'),null);
+    assert.equal(await page.locator('.oa-history .oa-gaps > div').count(),2);
+    assert.match(await page.locator('.oa-history .oa-gaps').textContent(),/该时段消息尚未同步完成 · 1272 个会话/);
+    assert.match(await page.locator('.oa-history .oa-gap-names').textContent(),
+      /受限群一、<img src=x onerror=alert\(1\)>、群三、群四、群五/);
+    assert.equal(await page.locator('.oa-history .oa-gaps img').count(),0);
+    assert.doesNotMatch(await page.locator('.oa-history').textContent(),/部分资料尚不完整|来源覆盖不完整/);
     assert.equal(await page.locator('.oa-source-page strong, .oa-source-page a').count(),0);
     assert.match(await page.locator('.oa-source-page').textContent(),/\*\*本人原文\*\*/);
     assert.equal(await page.locator('.oa-draft textarea').inputValue(),'**I will check.**');
@@ -309,8 +310,7 @@ const {chromium} = require('playwright');
     await page.waitForFunction(() => window.sources.length===1); assert.equal(posts.length,3);
     assert.notEqual(posts[2].body.session_id,posts[0].body.session_id);
     assert.equal(posts[2].body.context.cm_id,remiId);
-    assert.equal(posts[2].body.context.audience,'all');
-    assert.equal(posts[2].body.context.creator_ids,null);
+    assert.deepEqual(posts[2].body.context,{cm_id:remiId});
     assert.equal(await page.locator('#oa-cm').isDisabled(),true);
     await page.locator('#oa-stop').click(); await page.waitForFunction(() => document.getElementById('oa-stop').hidden);
     assert.equal(posts.length,4); assert(posts[3].url.endsWith('/cancel'));
@@ -326,7 +326,7 @@ const {chromium} = require('playwright');
     await page.waitForFunction(()=>document.getElementById('oa-stop').hidden);
     assert.equal(await page.locator('.oa-event, .oa-draft, .oa-data').count(),0);
     assert.equal(await page.locator('#oa-sources').isHidden(),true);
-    assert.match(await page.locator('#oa-scope').textContent(),/Remi.*全部授权消息/);
+    assert.match(await page.locator('#oa-scope').textContent(),/Remi/);
     assert.doesNotMatch(await page.locator('#oa-scope').textContent(),/旧事项/);
     assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('ttmedia.assistant.'+
       document.getElementById('operations-assistant').dataset.userId)).session_id),posts[4].body.session_id);
@@ -429,24 +429,62 @@ const {chromium} = require('playwright');
     await page.evaluate(value=>window.sources.at(-1).emit('result',value),result);
     await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
     assert.equal(await page.locator('.oa-event, .oa-draft, .oa-data, #oa-sources-body blockquote').count(),0);
-    assert.match(await page.locator('#oa-history').textContent(),/查看权限已变化.*重新登录/);
+    assert.match(await page.locator('#oa-history').textContent(),/连接或访问权限已变化.*重新登录/);
     assert.equal(await page.locator('#oa-input').isDisabled(),true);
     holdEvidence=false; denyEvidence=false;
+    // An Owner's ordinary entry does not expose cross-CM selection or honor stale cross-CM browser state.
+    await page.evaluate(cm_id=>{
+      localStorage.setItem('ttmedia.assistant.'+document.getElementById('operations-assistant').dataset.userId,
+        JSON.stringify({cm_id,session_id:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'}));
+    },remiId);
+    const ordinaryReads=[];
+    page.on('request',request=>{if(request.url().includes('/sessions/')) ordinaryReads.push(request.url());});
+    await page.goto('http://localhost/'); await page.locator('#oa-launcher').click();
+    await page.waitForFunction(()=>document.getElementById('oa-cm').options.length===2);
+    assert.equal(await page.locator('#oa-person').isHidden(),true);
+    assert.equal(await page.locator('#oa-cm').inputValue(),ownId());
+    assert.equal(await page.locator('#oa-scope-editor, #oa-audience, #oa-period, [data-scope-edit]').count(),0);
+    assert(!ordinaryReads.some(url=>url.includes('aaaaaaaa-aaaa')));
+    const ownerPosts=posts.length;
+    await page.evaluate(cm_id=>document.dispatchEvent(new CustomEvent('ttmedia:assistant',
+      {detail:{context:{cm_id}}})),remiId);
+    assert.equal(await page.locator('#oa-cm').inputValue(),ownId());
+    assert.equal(posts.length,ownerPosts);
+    selfReady=false;
+    await page.reload(); await page.locator('#oa-launcher').click();
+    await page.waitForFunction(()=>document.getElementById('oa-status').textContent.includes('Lark 连接未就绪'));
+    assert.equal(await page.locator('#oa-person').isHidden(),true);
+    assert.equal(await page.locator('#oa-send').isDisabled(),true);
+    assert.equal(await page.locator('.oa-gaps').count(),0);
+    selfReady=true;
     html=html.replace(/data-user-id="[^"]+"/,'data-user-id="33333333-3333-4333-8333-333333333333"');
     const reads=[]; page.on('request',request => {if(request.url().includes('/sessions/')) reads.push(request.url());});
-    await page.reload(); await page.locator('#oa-launcher').click();
+    await page.goto('http://localhost/admin/messages'); await page.locator('#oa-launcher').click();
     await page.waitForFunction(()=>document.getElementById('oa-cm').options.length===1);
     assert.equal(await page.locator('#oa-person').isHidden(),true);
     assert.equal(await page.locator('#oa-cm').inputValue(),ownId());
     assert.equal(await page.locator('.oa-event').count(),0); assert(!reads.some(url=>url.includes(previous)));
+    const deniedSwitchPosts=posts.length;
+    await page.evaluate(cm_id=>{
+      document.getElementById('operations-assistant').dataset.canSwitchCm='true';
+      const select=document.getElementById('oa-cm'), option=document.createElement('option');
+      option.value=cm_id; option.textContent='Injected person'; select.append(option);
+      select.value=cm_id; select.dispatchEvent(new Event('change'));
+    },remiId);
+    assert.equal(await page.locator('#oa-cm').inputValue(),ownId());
+    assert.equal(await page.locator('#oa-person').isHidden(),true);
+    assert.equal(posts.length,deniedSwitchPosts);
+    await page.goto('http://localhost/'); await page.locator('#oa-launcher').click();
+    await page.waitForFunction(()=>document.getElementById('oa-cm').options.length===1);
+    assert.equal(await page.locator('#oa-person').isHidden(),true);
 
     // Complete worklist, non-AI source pagination, arbitrary message drafts, and hand-edited translation.
     const postCount=posts.length;
     assert.equal(await page.locator('[data-quick]').count(),3);
     await page.locator('[data-quick="today"]').click();
     await page.waitForFunction(()=>window.sources.length===1);
-    assert.equal(posts.length,postCount+1); assert.equal(posts.at(-1).body.context.audience,'all');
-    assert.equal(posts.at(-1).body.context.event_ref,null);
+    assert.equal(posts.length,postCount+1); assert.deepEqual(posts.at(-1).body.context,{cm_id:ownId()});
+    assert.equal(posts.at(-1).body.message,'总结今天聊天里的重点事项。');
     const fullResult={answer:'找到 12 项事项，已按重要度排序。',
       scope:{cm_id:ownId(),cm_name:'CM',audience:'all',reply_status:'unreplied',sort:'importance'},
       events:Array.from({length:12},(_,i)=>({event_ref:`event-${i}`,title:`事项 ${i+1}`,creator_name:`达人 ${i+1}`,
@@ -456,8 +494,17 @@ const {chromium} = require('playwright');
         waiting_seconds:3600,conversations:[{name:'客服群',type:'group'}]})),
       data:[{kind:'window_messages',query_ref:'q.fixture',source_url:'/assistant/sources/q.fixture?page=1',
         page:1,page_count:4,has_more:true,total_messages:353,total_conversations:43,
+        window:{start:'2026-10-11T23:00:00Z',end:'2026-10-12T11:00:00Z'},
+        gaps:[{chat_id:'oc_restricted',name:'TikTok Shop 受限群',reason:'群开启受限模式，Lark禁止读取消息（231203）'}],
+        gap_summary:[{reason:'群开启受限模式，Lark禁止读取消息（231203）',
+          conversations:1,names:['TikTok Shop 受限群']}],
         messages:[{conversation_name:'客服群',sender_name:'达人',message_ref:'m.fixture.first',text:'First source.'}]},
         {kind:'messages',query_ref:'q.search',next_source_url:'/assistant/sources/q.search?page=2&cursor=fixture',
+          gaps:[{chat_id:'oc_restricted',name:'TikTok Shop 受限群',reason:'群开启受限模式，Lark禁止读取消息（231203）'},
+            {chat_id:'oc_unknown',name:'未知不可读群',reason:'Lark未允许读取'},
+            {reason:'非文字消息未分析'}],
+          gap_summary:[{reason:'群开启受限模式，Lark禁止读取消息（231203）',
+            conversations:1,names:['TikTok Shop 受限群']}],
           messages:[{conversation_name:'普通消息群',sender_name:'商家',
             message_ref:'m.fixture.search',text:'Matching source.'}]}]};
     const deliver=async result=>{view={...view,status:'completed',result}; await page.evaluate(value=>{
@@ -473,6 +520,15 @@ const {chromium} = require('playwright');
     assert.equal(await page.locator('.oa-event-group').last().getAttribute('open'),null);
     assert.match(await page.locator('.oa-event-group').last().textContent(),/已解决／无需处理.*未见回复.*已解决/);
     assert.equal(await page.locator('.oa-source-entry').count(),1);
+    assert.equal(await page.locator('.oa-history .oa-gaps').count(),1);
+    assert.equal(await page.locator('.oa-history .oa-gaps > div').count(),3);
+    assert.equal(await page.locator('.oa-history .oa-gaps summary').textContent(),'读取情况');
+    assert.match(await page.locator('.oa-history .oa-gap-names').first().textContent(),/TikTok Shop 受限群/);
+    assert.match(await page.locator('.oa-history .oa-gaps').textContent(),/群开启受限模式，无法读取消息/);
+    assert.match(await page.locator('.oa-history .oa-gaps').textContent(),/图片、附件等消息暂无法解析/);
+    assert.match(await page.locator('.oa-history .oa-gaps').textContent(),/Lark未允许读取会话：未知不可读群/);
+    assert.match(await page.locator('#oa-scope').textContent(),/10\/12 00:00.*10\/12 12:00/);
+    assert.doesNotMatch(await page.locator('.oa-history .oa-gaps').textContent(),/2 个会话|部分授权/);
     await page.reload(); await page.locator('#oa-launcher').click();
     await page.locator('.oa-event').first().waitFor();
     assert.match(await page.locator('#oa-scope').textContent(),/未回复.*重要度优先/);
@@ -566,7 +622,7 @@ const {chromium} = require('playwright');
     await page.setViewportSize({width:390,height:844});
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth <=
       document.documentElement.clientWidth),true);
-    if (input.screenshot) await page.screenshot({path:input.screenshot.replace('.png','-mobile.png'),fullPage:true});
+    if (input.screenshot) await page.screenshot({path:input.screenshot.replace('.png','-mobile.png'),fullPage:false});
     await page.setViewportSize({width:1280,height:900});
     olderTurns.push(view);
     await nextStream(()=>page.locator('.oa-hit .oa-reply-action').click());
@@ -582,44 +638,31 @@ const {chromium} = require('playwright');
     assert.equal(await page.locator('#oa-reply-title').textContent(),'普通消息群');
     assert.equal(await page.locator('#oa-reply textarea').inputValue(),'Reply to the second chat.');
     await page.locator('#oa-reply-close').click();
-    await page.getByRole('button',{name:'修改范围',exact:true}).click();
-    await page.locator('#oa-audience').selectOption('creators');
-    await page.locator('#oa-period').selectOption('custom');
-    await page.locator('#oa-start').fill('2026-10-11T00:00'); await page.locator('#oa-end').fill('2026-10-12T12:00');
-    await nextStream(()=>page.getByRole('button',{name:'应用并查询',exact:true}).click());
-    assert.equal(posts.at(-1).body.context.start,'2026-10-10T23:00:00.000Z');
-    assert.equal(posts.at(-1).body.context.end,'2026-10-12T11:00:00.000Z');
-    assert.equal(posts.at(-1).body.context.audience,'creators');
-    assert.match(posts.at(-1).body.message,/达人待回复事项/);
-    assert.equal(posts.at(-1).body.context.reply_action,undefined);
+    assert.equal(await page.locator('#oa-scope button, #oa-scope-editor, #oa-audience, #oa-period').count(),0);
+    await page.locator('#oa-input').fill('查看10月11日到10月12日我负责达人的未回复事项，重要度优先');
+    await nextStream(()=>page.locator('#oa-input').press('Enter'));
+    assert.deepEqual(posts.at(-1).body.context,{cm_id:ownId()});
     await deliver({...fullResult,scope:{...fullResult.scope,audience:'creators'},window:{
-      start:posts.at(-1).body.context.start,end:posts.at(-1).body.context.end}});
+      start:'2026-10-10T23:00:00Z',end:'2026-10-12T11:00:00Z'}});
     assert.match(await page.locator('#oa-scope').textContent(),/我的达人.*10\/11.*10\/12/);
+    assert.doesNotMatch(await page.locator('#oa-scope').textContent(),/授权|修改范围/);
     if (input.screenshot) await page.screenshot({path:input.screenshot,fullPage:true});
     const aliceScope={cm_id:ownId(),audience:'creators',creator_ids:['44444444-4444-4444-8444-444444444444'],
       creator_names:['Alice'],chat_ids:['oc_alice'],chat_names:['Alice group'],event_ref:'alice-event'};
     await page.evaluate(context=>document.dispatchEvent(new CustomEvent('ttmedia:assistant',
       {detail:{context}})),aliceScope);
     await page.waitForFunction(()=>document.getElementById('oa-scope').textContent.includes('Alice'));
-    await page.getByRole('button',{name:'修改范围',exact:true}).click();
-    await page.locator('#oa-period').selectOption('yesterday');
-    await nextStream(()=>page.getByRole('button',{name:'应用并查询',exact:true}).click());
-    assert.deepEqual(posts.at(-1).body.context.creator_ids,aliceScope.creator_ids);
-    assert.deepEqual(posts.at(-1).body.context.chat_ids,aliceScope.chat_ids);
-    assert.equal(posts.at(-1).body.context.event_ref,aliceScope.event_ref);
-    await deliver({answer:'Alice 的事项已整理。',scope:aliceScope,events:[],data:[],window:{
-      start:posts.at(-1).body.context.start,end:posts.at(-1).body.context.end}});
-    await page.getByRole('button',{name:'修改范围',exact:true}).click();
-    await page.locator('#oa-audience').selectOption('all');
-    await nextStream(()=>page.getByRole('button',{name:'应用并查询',exact:true}).click());
-    assert.equal(posts.at(-1).body.context.creator_ids,null);
-    assert.equal(posts.at(-1).body.context.chat_ids,null);
-    assert.equal(posts.at(-1).body.context.event_ref,null);
-    await deliver({answer:'全部授权消息已整理。',scope:{cm_id:ownId(),audience:'all'},events:[],data:[]});
     await page.locator('#oa-input').fill('总结昨天整天');
     await nextStream(()=>page.locator('#oa-input').press('Enter'));
-    assert.equal(posts.at(-1).body.context.start,undefined);
-    assert.equal(posts.at(-1).body.context.end,undefined);
+    assert.deepEqual(posts.at(-1).body.context,{cm_id:ownId()});
+    await deliver({answer:'昨天的事项已整理。',scope:{cm_id:ownId(),audience:'all'},events:[],data:[]});
+    await nextStream(()=>page.locator('[data-quick="unreplied"]').click());
+    assert.deepEqual(posts.at(-1).body.context,{cm_id:ownId()});
+    assert.match(posts.at(-1).body.message,/我负责达人的未回复事项/);
+    await deliver({answer:'待回复事项已整理。',scope:{cm_id:ownId(),audience:'creators'},events:[],data:[]});
+    await nextStream(()=>page.locator('[data-quick="reply"]').click());
+    assert.deepEqual(posts.at(-1).body.context,{cm_id:ownId()});
+    assert.match(posts.at(-1).body.message,/刚才讨论的消息/);
     assert.deepEqual(errors,[]); console.log('assistant browser workflow passed');
   } finally {await browser.close();}
 })().catch(error=>{console.error(error);process.exit(1);});
