@@ -201,11 +201,25 @@ def current_context(conn, actor_id, selected_context, settings, *, now=None):
             event_ref = f"{task_id}:{int(index)}:{task['input_fingerprint']}"
         _event_id(conn, actor_id, event_ref, settings, {"scope": scope})
         scope["event_ref"] = event_ref
+        if audience == "creators":
+            task_id, _index, _version = _event_parts(event_ref)
+            task = conn.execute("SELECT contact_id FROM offhours_summary_tasks WHERE id=%s", (task_id,)).fetchone()
+            if selected is not None and str(task["contact_id"]) not in selected:
+                raise PermissionError("事件不属于已选达人范围。")
+            if selected is None:
+                scope["creator_ids"] = _creator_ids([str(task["contact_id"])], visible)
+                scope["creator_names"] = list(dict.fromkeys(row["name"] or "未命名达人" for row in roster
+                    if str(row["contact_id"]) in scope["creator_ids"]))
     message_ref = selected_context.get("message_ref")
     if message_ref:
         source = _saved_message(conn, actor_id, message_ref, settings)
-        assistant_search.read(conn, actor_id, {"scope": scope}, {"message_ref": source}, settings)
+        data = assistant_search.read(conn, actor_id, {"scope": scope}, {"message_ref": source}, settings)
         scope["message_ref"] = message_ref
+        if chat_ids is not None and not set(data["scope"]["chat_ids"]) <= set(chat_ids):
+            raise PermissionError("消息不属于已选会话范围。")
+        if chat_ids is None:
+            scope.update(chat_ids=data["scope"]["chat_ids"],
+                         chat_names=[data["message"].get("conversation_name") or "会话"])
     selected_window = selected_context.get("window") or {}
     if not isinstance(selected_window, dict):
         raise ValueError("时间范围无效。")
@@ -317,9 +331,15 @@ def _validate_query(conn, actor_id, context, result, settings):
 
 def _query(conn, actor_id, turn, name, args, settings, context, visible):
     args = dict(args)
+    pinned_chats = (context["scope"].get("chat_ids") if context["scope"].get("window")
+                    and args.get("audience", context["scope"].get("audience")) == context["scope"].get("audience")
+                    else None)
     if args.get("audience") == "all":
+        excluded = {"creator_names", "creator_name", "event_ref", "event_title"}
+        if pinned_chats is None:
+            excluded.update({"chat_ids", "chat_names", "message_ref"})
         context = {**context, "scope": {key: value for key, value in context["scope"].items()
-                                      if key not in {"creator_names", "event_ref", "chat_ids", "chat_names"}}}
+                                      if key not in excluded}}
         context["scope"].update(audience="all", creator_ids=None)
         args["creator_ids"] = None
     elif args.get("audience") == "creators":
@@ -336,8 +356,11 @@ def _query(conn, actor_id, turn, name, args, settings, context, visible):
         start, end = _window(args["start"], args["end"], turn["created_at"])
         args.update(start=start.isoformat(), end=end.isoformat())
     if (name in {"search_chat_history", "activity_stats", "summarize_messages"}
-            and args["chat_ids"] is None and args["audience"] != "all"):
+            and args["chat_ids"] is None and (args["audience"] != "all" or pinned_chats is not None)):
         args["chat_ids"] = context["scope"].get("chat_ids")
+    if (pinned_chats is not None and args.get("chat_ids") is not None
+            and not set(args["chat_ids"]) <= set(pinned_chats)):
+        raise ValueError("请在页面已选会话范围内查询，或先修改范围。")
     if name in {"search_chat_history", "activity_stats", "summarize_messages"} and args["chat_ids"] is not None:
         context = {**context, "scope": {**context["scope"], "chat_ids": args["chat_ids"]}}
     if name == "read_message_context":
@@ -370,7 +393,13 @@ def _query(conn, actor_id, turn, name, args, settings, context, visible):
         result = (_QUERIES[name](conn, actor_id, context, args, settings, snapshot=snapshot)
                   if name == "query_creators" else _QUERIES[name](conn, actor_id, context, args, settings))
     if name == "query_creators" and args["query"] and result["total"] == 1:
-        result["scope"] = {**context["scope"], "creator_ids": [person["id"] for person in result["creators"]],
+        ids = [person["id"] for person in result["creators"]]
+        selected = context["scope"].get("creator_ids")
+        if (context["scope"].get("window") and selected is not None and not set(ids) <= set(selected)):
+            raise ValueError("请在页面已选达人范围内查询，或先修改范围。")
+        scope = context["scope"] if ids == selected else {key: value for key, value in context["scope"].items()
+            if key in {"cm_id", "cm_name", "audience", "window"}}
+        result["scope"] = {**scope, "creator_ids": ids,
                            "creator_names": [person["name"] for person in result["creators"]]}
     if name == "query_creators":
         result["scope"] = {**result["scope"], "audience": "creators"}
@@ -794,6 +823,11 @@ def execute(conn, actor_id, turn, name, args, settings, context):
     if "start" in args and "end" in args and context["scope"].get("window"):
         args = {**args, **context["scope"]["window"]}
     cm, roster, visible = _scope(conn, actor_id, context)
+    if (context["scope"].get("window") and context["scope"].get("audience") == "creators"
+            and context["scope"].get("creator_ids") is not None
+            and args.get("audience", "creators") == "creators" and args.get("creator_ids") is not None
+            and not set(_creator_ids(args["creator_ids"], visible)) <= set(context["scope"]["creator_ids"])):
+        raise ValueError("请在页面已选达人范围内查询，或先修改范围。")
     if name == "draft_reply":
         return _prepare_reply(conn, actor_id, turn, args, settings, context)
     if name == "save_reply_draft":

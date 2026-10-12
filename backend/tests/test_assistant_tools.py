@@ -48,6 +48,18 @@ def test_creator_snapshot_keeps_all_pages_stable_and_live_sources_protected(pg, 
     pg.execute("INSERT INTO assistant_turns(id,session_id,client_request_id,input_ciphertext) "
                "VALUES(%s,%s,%s,'fixture')", (turn_id, session, uuid4()))
     context = tools.current_context(pg, s.ids["cm"], {}, s.settings)
+    selected = tools.current_context(pg, s.ids["cm"], {
+        "audience": "creators", "creator_ids": [str(ids[0])],
+        "start": s.start.isoformat(), "end": datetime.now(UTC).isoformat()}, s.settings)
+    current_turn = pg.execute("SELECT * FROM assistant_turns WHERE id=%s", (turn_id,)).fetchone()
+    with pytest.raises(ValueError, match="已选达人"):
+        tools.execute(pg, s.ids["cm"], current_turn, "activity_stats", {
+            "audience": "creators", "start": s.start.isoformat(), "end": datetime.now(UTC).isoformat(),
+            "creator_ids": [str(value) for value in ids], "chat_ids": None,
+            "group_by": "day", "comparison": None, "cursor": None}, s.settings, selected)
+    with pytest.raises(ValueError, match="已选达人"):
+        tools.execute(pg, s.ids["cm"], current_turn, "query_creators", {
+            "query": "Creator 00", "importance": None, "cursor": None}, s.settings, selected)
     args = {"query": None, "importance": None, "cursor": None}
     first = assistant_queries.creators(pg, s.ids["cm"], context, args, s.settings)
     expected = json.loads(json.dumps(first["_snapshot"]["creators"]))
@@ -321,6 +333,15 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
     assert pg.execute("SELECT count(*) n FROM summary_reply_tasks").fetchone()["n"] == 0
     selected_scope = tools.current_context(pg, s.ids["cm"], {
         "start": s.start.isoformat(), "end": now.isoformat(), "message_ref": visitor_ref}, s.settings)
+    assert selected_scope["scope"]["chat_ids"] == ["business"]
+    with pytest.raises(PermissionError, match="已选会话"):
+        tools.current_context(pg, s.ids["cm"], {
+            "message_ref": visitor_ref, "chat_ids": []}, s.settings)
+    bounded = tools.execute(pg, s.ids["cm"], turn, "activity_stats", all_stats_args, s.settings, selected_scope)
+    assert bounded["scope"]["chat_ids"] == ["business"]
+    with pytest.raises(ValueError, match="已选会话"):
+        tools.execute(pg, s.ids["cm"], turn, "activity_stats", {**all_stats_args, "chat_ids": ["chat", "business"]},
+                      s.settings, selected_scope)
     assert tools.current_context(pg, s.ids["cm"], selected_scope["scope"], s.settings)["scope"]["window"] \
         == selected_scope["scope"]["window"]
     pg.execute("UPDATE chat_messages SET is_deleted=TRUE WHERE message_id='latest-parent'")
@@ -414,6 +435,13 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
     }, s.settings)
     unpinned = tools.execute(pg, s.ids["cm"], turn, "summarize_messages", all_args, s.settings, pinned_context)
     assert unpinned["total_messages"] == 6 and unpinned["scope"]["chat_ids"] is None
+    message_context = tools.current_context(pg, s.ids["cm"], {"message_ref": visitor_ref}, s.settings)
+    unpinned_message = tools.execute(pg, s.ids["cm"], turn, "summarize_messages", all_args,
+                                    s.settings, message_context)
+    assert unpinned_message["scope"]["chat_ids"] is None and "message_ref" not in unpinned_message["scope"]
+    changed_time = tools.current_context(pg, s.ids["cm"], {
+        **unpinned_message["scope"], "start": all_args["start"], "end": all_args["end"]}, s.settings)
+    assert changed_time["scope"].get("chat_ids") is None and "message_ref" not in changed_time["scope"]
     assert assistant_queries.activity(pg, s.ids["cm"], pinned_context, all_stats_args, s.settings)[
         "metrics"]["messages"] == 6
     default_args = {key: value for key, value in all_args.items() if key != "audience"}
@@ -472,6 +500,12 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
     named_args = {"query": "Paged Creator", "importance": None, "cursor": None}
     named = run("query_creators", named_args)
     assert named["total"] == 26 and named["scope"]["creator_ids"] is None
+    new_person = tools.execute(pg, s.ids["cm"], turn, "query_creators", {
+        "query": "Paged Creator 00", "importance": None, "cursor": None}, s.settings, message_context)
+    assert new_person["total"] == 1 and not any(key in new_person["scope"] for key in (
+        "event_ref", "message_ref", "chat_ids", "chat_names"))
+    assert tools.current_context(pg, s.ids["cm"], new_person["scope"], s.settings)["scope"]["creator_ids"] \
+        == new_person["scope"]["creator_ids"]
     continuation = tools.current_context(pg, s.ids["cm"], {
         **named["scope"], "query_ref": named["query_ref"], "cursor": named["next_cursor"],
     }, s.settings)
@@ -531,6 +565,14 @@ def test_five_tools_keep_reports_private_resume_and_recheck_sources(pg, seeded, 
     assert tools.execute(pg, s.ids["cm"], turn, "summarize_messages", args, s.settings, context)[
         "result_id"] == result["result_id"]
     event_ref = result["events"][0]["event_ref"]
+    selected_event = tools.current_context(pg, s.ids["cm"], {
+        "event_ref": event_ref, "start": args["start"], "end": args["end"]}, s.settings, now=now)
+    assert selected_event["scope"]["creator_ids"] == [str(s.ids["person"])]
+    assert selected_event["scope"]["creator_names"]
+    with pytest.raises(PermissionError, match="已选达人"):
+        tools.current_context(pg, s.ids["cm"], {"event_ref": event_ref, "creator_ids": []}, s.settings)
+    selected_result = tools.execute(pg, s.ids["cm"], turn, "summarize_messages", args, s.settings, selected_event)
+    assert selected_result["scope"]["creator_ids"] == [str(s.ids["person"])]
     assert "Sample please" not in json.dumps(result)
     assert pg.execute("SELECT * FROM offhours_summary_settings").fetchone() == before_global
 

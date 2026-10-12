@@ -494,11 +494,33 @@ const {chromium} = require('playwright');
     const draft={draft_ref:'d.fixture',message_ref:'m.fixture.second',source_ref:'m.fixture.second',language:'en',
       draft:'I will check and get back to you.',chinese_translation:'我会核对后回复你。',
       context:{chat_name:'商家客服群',chat_url:'https://applink.larksuite.com/client/chat/open?openChatId=oc_fixture',
-        message:{chat_name:'商家客服群',sender_name:'未分类商家',text:'Can you check the dispatch status?'},
-        messages:[{chat_name:'商家客服群',sender_name:'未分类商家',text:'Can you check the dispatch status?'}]},
+        message:{chat_id:'oc_fixture',message_id:'target',chat_name:'商家客服群',sender_name:'未分类商家',
+          text:'Can you check the dispatch status?'},
+        messages:Array.from({length:8},(_,i)=>({chat_id:'oc_fixture',message_id:i===0?'target':`context-${i}`,
+          ref:`R${i+1}`,chat_name:'商家客服群',sender_name:i===1?'CM':'未分类商家',
+          text:i===0?'Can you check the dispatch status?':i===1?'Please check the dispatch status.':
+            `Other context ${i}. ${'Full original body. '.repeat(30)}`}))},
+      evidence:[{chat_id:'oc_fixture',message_id:'target',ref:'R1',chat_name:'商家客服群',
+        sender_name:'未分类商家',text:'Can you check the dispatch status?'},
+        {chat_id:'oc_fixture',message_id:'context-1',ref:'R2',chat_name:'商家客服群',sender_name:'CM',
+          text:'Please check the dispatch status.'},
+        {chat_id:'oc_fixture',message_id:'context-1',ref:'R2',chat_name:'商家客服群',sender_name:'CM',
+          text:'Please check the dispatch status.'}],
       checks:['请确认能完成这项跟进。']};
     const draftResult={answer:'草稿已准备好。',scope:fullResult.scope,draft};
-    await deliver(draftResult); await page.locator('#oa-reply textarea').fill('I will check the status today.');
+    await deliver(draftResult);
+    assert.equal(await page.locator('.oa-reply-context > figure').count(),2);
+    assert.equal(await page.locator('.oa-reply-more').getAttribute('open'),null);
+    assert.equal(await page.locator('.oa-reply-more > summary').textContent(),'更多上下文（6）');
+    assert.equal(await page.locator('.oa-reply-more figure').count(),6);
+    assert.equal(await page.locator('#oa-reply textarea').isVisible(),true);
+    assert.equal(await page.evaluate(()=>document.querySelector('#oa-reply textarea').getBoundingClientRect().bottom <=
+      document.getElementById('oa-reply-body').getBoundingClientRect().bottom),true);
+    await page.locator('.oa-reply-more > summary').click();
+    assert.equal(await page.locator('.oa-reply-more blockquote').first().textContent(),
+      `Other context 2. ${'Full original body. '.repeat(30)}`);
+    await page.locator('.oa-reply-more > summary').click();
+    await page.locator('#oa-reply textarea').fill('I will check the status today.');
     olderTurns.push(view);
     await nextStream(()=>page.getByRole('button',{name:'更新中文',exact:true}).click());
     assert.equal(posts.at(-1).body.context.edited_draft,'I will check the status today.');

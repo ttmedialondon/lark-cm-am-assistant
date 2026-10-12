@@ -417,9 +417,21 @@
     const copy = node("button", "", draft.context?.chat_url ? "复制并打开 Lark" : "复制回复"), feedback = node("span", "oa-copy-feedback");
     copy.type = "button"; feedback.setAttribute("role", "status");
     if (draft.context?.message) {
-      const context = node("details", "oa-reply-context"); context.open = true;
+      const context = node("details", "oa-reply-context"); context.open = true; context.tabIndex = 0;
       context.append(node("summary", "", draft.context.chat_name || "原文与最新进展"));
-      rawMessages(context, {messages: draft.context.messages?.length ? draft.context.messages : [draft.context.message]}, false); card.append(context);
+      const messageKey = message => message.chat_id && message.message_id ? `${message.chat_id}:${message.message_id}` :
+        message.ref ? `ref:${message.ref}` : JSON.stringify([message.conversation_name || message.chat_name,
+          message.sender_name, message.time || message.sent_at, message.text]);
+      const necessary = new Map([draft.context.message, ...(draft.evidence || [])].map(message => [messageKey(message), message]));
+      rawMessages(context, {messages: [...necessary.values()]}, false);
+      const remaining = [...new Map((draft.context.messages || []).map(message => [messageKey(message), message])).values()]
+        .filter(message => !necessary.has(messageKey(message)));
+      if (remaining.length) {
+        const more = node("details", "oa-reply-more");
+        more.append(node("summary", "", `更多上下文（${remaining.length}）`));
+        rawMessages(more, {messages: remaining}, false); context.append(more);
+      }
+      card.append(context);
     }
     card.append(label, editor);
     const translation = node("p", "oa-translation", draft.chinese_translation || "");
