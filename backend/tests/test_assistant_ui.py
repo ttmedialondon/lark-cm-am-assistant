@@ -173,9 +173,12 @@ const {chromium} = require('playwright');
     assert.deepEqual(posts[0].body,posts[1].body);
     await page.locator('#oa-collapse').click(); assert.equal(await page.evaluate(() => window.sources[0].closed),false);
     const result={answer:'<script>bad()</script>',events:[{event_ref:'ref',title:'样品进展',creator_handle:'fixture',
-      handling_status:'unresolved',evidence_ref:'ref'}],scope:{cm_name:'CM'},
+      handling_status:'unresolved',evidence_ref:'ref'}],scope:{cm_name:'CM',audience:'all',creator_ids:null},
       window:{start:'2026-10-12T07:00:00Z',end:'2026-10-12T11:00:00Z'},
-      draft:{draft:'I will check.',chinese_translation:'我会核对。',language:'en'}};
+      draft:{draft:'I will check.',chinese_translation:'我会核对。',language:'en'},
+      data:[{kind:'window_messages',scope:{audience:'all'},total_messages:20,
+        messages:[{conversation_name:'业务群',sender_name:'未识别联系人',time:'2026-10-12T09:00:00Z',
+          text:'<script>source()</script>',evidence_ref:'raw-ref'}],coverage:{source_complete:true},gaps:[]}]};
     view={...view,status:'completed',result};
     await page.evaluate(value => {
       window.sources[0].emit('result',value);window.sources[0].emit('done',{status:'completed'});
@@ -183,7 +186,10 @@ const {chromium} = require('playwright');
     await page.locator('#oa-launcher').click();
     assert.equal(await page.locator('.oa-answer').textContent(),result.answer);
     assert.equal(await page.locator('.oa-history script').count(),0);
-    await page.locator('.oa-evidence').click(); await page.locator('#oa-sources-body blockquote').waitFor();
+    assert.match(await page.locator('.oa-scope').textContent(),/全部授权消息/);
+    assert.match(await page.locator('.oa-data').textContent(),/本页 1 条.*时段 20 条/);
+    assert.equal(await page.locator('.oa-data details').getAttribute('open'),null);
+    await page.locator('.oa-event .oa-evidence').click(); await page.locator('#oa-sources-body blockquote').waitFor();
     assert.equal(await page.locator('#oa-sources-body img').count(),0);
     await page.locator('#oa-sources-close').click();
     await page.locator('.oa-draft textarea').fill('Edited reply');

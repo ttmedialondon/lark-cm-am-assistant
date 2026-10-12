@@ -289,12 +289,108 @@ def _activity(conn, cm, ids, start, end, group_by, chat_ids=None):
             "metrics": metrics, "rows": values, "source_chat_ids": source_chats}
 
 
+_ALL_ACTIVITY_SQL = """WITH visible AS MATERIALIZED (
+    SELECT m.chat_id,m.message_id,m.message_create_time,m.sender_open_id,m.sender_id,m.sender_id_type,
+        m.parent_id,m.root_id,m.mentions_json,m.body_ciphertext IS NOT NULL readable,
+        CASE WHEN COALESCE(m.sender_type,i.identity_type) IN ('app','bot') THEN 'app'
+             WHEN m.sender_type='system' OR m.message_type='system' THEN 'system'
+             WHEN COALESCE(m.sender_type,i.identity_type)='user' THEN 'user' ELSE 'unknown' END sender_kind,
+        i.contact_id,COALESCE(NULLIF(p.display_name,''),NULLIF(i.display_name,'')) sender_name,
+        a.open_id cm_open_id,a.id cm_id,a.body_consent_at,a.display_name cm_name,
+        COALESCE(own.contact_id::text,a.open_id) cm_person,
+        ac.p2p_counterpart_open_id,COALESCE(c.chat_mode,'group') chat_mode,c.name chat_name
+    FROM authorization_message_observations o JOIN chat_messages m USING(chat_id,message_id)
+    JOIN authorization_chats ac ON ac.authorization_id=o.authorization_id AND ac.chat_id=m.chat_id
+    JOIN authorizations a ON a.id=o.authorization_id JOIN chats c ON c.chat_id=m.chat_id
+    LEFT JOIN lark_identities i ON i.open_id=m.sender_open_id
+    LEFT JOIN contacts p ON p.id=i.contact_id LEFT JOIN lark_identities own ON own.open_id=a.open_id
+    WHERE a.id=%s AND a.status='active' AND a.body_consent_at IS NOT NULL AND o.observed_at>=a.body_consent_at
+      AND ac.is_visible AND ac.sync_enabled AND COALESCE(c.chat_status,'normal')='normal'
+      AND ac.sync_status IS DISTINCT FROM 'not_readable' AND NOT m.is_deleted
+      AND m.message_create_time>=%s AND m.message_create_time<%s
+      AND (%s::text[] IS NULL OR m.chat_id=ANY(%s::text[]))
+), messages AS MATERIALIZED (
+    SELECT v.*,sender_kind='user' AND sender_open_id=cm_open_id is_own,
+        CASE WHEN sender_kind='user' AND sender_open_id IS NOT NULL
+             THEN COALESCE(contact_id::text,sender_open_id)
+             WHEN sender_kind='app' THEN 'app:'||COALESCE(sender_id_type||':'||sender_id,sender_open_id,'unknown')
+             ELSE 'unknown:'||sender_kind END person,
+        CASE WHEN sender_kind='user' THEN COALESCE(sender_name,
+                  CASE WHEN sender_open_id=cm_open_id THEN cm_name END,'未知用户')
+             WHEN sender_kind='app' THEN COALESCE(sender_name,'应用／机器人')
+             WHEN sender_kind='system' THEN '系统消息' ELSE '未知发送者' END person_name
+    FROM visible v
+), targets AS (
+    SELECT chat_id,message_id,p2p_counterpart_open_id open_id FROM messages WHERE is_own AND chat_mode='p2p'
+    UNION SELECT m.chat_id,m.message_id,mentions.open_id FROM messages m CROSS JOIN LATERAL (
+      SELECT MIN(item->>'id') open_id FROM jsonb_array_elements(
+        CASE WHEN jsonb_typeof(m.mentions_json)='array' THEN m.mentions_json ELSE '[]'::jsonb END) item
+      WHERE item->>'key' ~ '^@_user_[0-9]+$' GROUP BY item->>'key'
+      HAVING COUNT(DISTINCT (COALESCE(item->>'id_type',''),COALESCE(item->>'id','')))=1
+        AND MIN(item->>'id_type')='open_id'
+    ) mentions WHERE m.is_own
+    UNION SELECT m.chat_id,m.message_id,parent.sender_open_id FROM messages m
+      JOIN chat_messages parent ON parent.chat_id=m.chat_id
+        AND parent.message_id=COALESCE(NULLIF(m.parent_id,''),NULLIF(m.root_id,''))
+      JOIN authorization_message_observations po ON po.chat_id=parent.chat_id AND po.message_id=parent.message_id
+        AND po.authorization_id=m.cm_id AND po.observed_at>=m.body_consent_at
+      WHERE m.is_own AND NOT parent.is_deleted AND COALESCE(parent.sender_type,'user')='user'
+        AND parent.message_type IS DISTINCT FROM 'system' AND parent.message_create_time<=m.message_create_time
+), recipients AS MATERIALIZED (
+    SELECT DISTINCT t.chat_id,t.message_id,COALESCE(i.contact_id::text,i.open_id) person
+    FROM targets t JOIN lark_identities i ON i.open_id=t.open_id AND i.identity_type='user'
+    JOIN messages m USING(chat_id,message_id)
+    WHERE COALESCE(i.contact_id::text,i.open_id)<>m.cm_person
+) """
+
+
+def _activity_all(conn, cm, start, end, group_by, chat_ids):
+    key = {"day": "(m.message_create_time AT TIME ZONE 'Europe/London')::date",
+           "person": "m.person", "conversation": "m.chat_id"}[group_by]
+    rows = conn.execute(_ALL_ACTIVITY_SQL + f"""SELECT {key} bucket,GROUPING({key}) total,
+        count(DISTINCT (m.chat_id,m.message_id)) messages,
+        count(DISTINCT (m.chat_id,m.message_id)) FILTER(WHERE m.is_own) own_messages,
+        count(DISTINCT (m.chat_id,m.message_id)) FILTER(WHERE m.readable) readable_messages,
+        count(DISTINCT m.chat_id) conversations,
+        count(DISTINCT m.person) FILTER(WHERE m.sender_kind='user' AND m.sender_open_id IS NOT NULL) active_people,
+        count(DISTINCT r.person) contacted_people,
+        count(DISTINCT (m.chat_id,m.message_id)) FILTER(WHERE m.sender_kind='app') app_messages,
+        count(DISTINCT (m.chat_id,m.message_id)) FILTER(WHERE m.sender_kind='system') system_messages,
+        count(DISTINCT (m.chat_id,m.message_id)) FILTER(WHERE m.sender_kind='unknown'
+            OR m.sender_kind='user' AND m.sender_open_id IS NULL) unknown_sender_messages,
+        MIN(m.person_name) person_name,MIN(m.chat_name) conversation_name,
+        array_agg(DISTINCT m.chat_id) source_chats
+        FROM messages m LEFT JOIN recipients r USING(chat_id,message_id)
+        GROUP BY GROUPING SETS ((),({key})) ORDER BY bucket NULLS FIRST""",
+        (cm["id"], start, end, chat_ids, chat_ids)).fetchall()
+    metrics, values, source_chats = {}, [], []
+    for row in rows:
+        counts = {name: row[name] for name in ("messages", "own_messages", "readable_messages", "conversations",
+            "active_people", "contacted_people", "app_messages", "system_messages", "unknown_sender_messages")}
+        if row["total"]:
+            metrics, source_chats = counts, row["source_chats"] or []
+        else:
+            value = {group_by: str(row["bucket"]), **counts}
+            if group_by in {"person", "conversation"}:
+                value[group_by + "_name"] = row[group_by + "_name"] or "未命名会话"
+            values.append(value)
+    return {"window": {"start": _iso(start), "end": _iso(end), "timezone": summaries.TIMEZONE},
+            "metrics": metrics, "rows": values, "source_chat_ids": source_chats}
+
+
 def activity(conn, actor_id, context, args, settings, *, now=None):
     now = now or datetime.now(UTC)
-    cm, roster, visible = _scope(conn, actor_id, context)
-    ids = _ids(args, context, visible)
+    audience = args.get("audience", "all")
+    if audience not in {"all", "creators"}:
+        raise ValueError("统计对象无效。")
+    if audience == "creators":
+        cm, roster, visible = _scope(conn, actor_id, context)
+        ids = _ids(args, context, visible)
+    else:
+        cm, _ = summaries._authorize(conn, actor_id, cm_id=context["scope"]["cm_id"])
+        ids = []
     selected_chats = args.get("chat_ids")
-    if selected_chats is None:
+    if selected_chats is None and audience == "creators":
         selected_chats = context["scope"].get("chat_ids")
     if selected_chats is not None:
         if not isinstance(selected_chats, list) or not all(isinstance(value, str) for value in selected_chats):
@@ -312,9 +408,14 @@ def activity(conn, actor_id, context, args, settings, *, now=None):
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("统计起止时间无效。") from exc
     group_by = args.get("group_by")
-    if group_by not in {"day", "creator"} or args.get("comparison") not in {None, "previous"}:
+    groups = {"day", "person", "conversation"} if audience == "all" else {"day", "creator"}
+    if group_by not in groups or args.get("comparison") not in {None, "previous"}:
         raise ValueError("统计分组或比较范围无效。")
-    result = _activity(conn, cm, ids, start, end, group_by, selected_chats)
+    def collect(period_start, period_end):
+        return (_activity_all(conn, cm, period_start, period_end, group_by, selected_chats)
+                if audience == "all" else _activity(conn, cm, ids, period_start, period_end, group_by, selected_chats))
+
+    result = collect(start, end)
     comparison = None
     coverage_start = start
     comparison_basis = "london_wall_time"
@@ -330,41 +431,60 @@ def activity(conn, actor_id, context, args, settings, *, now=None):
               != previous_local.replace(tzinfo=None)):
             coverage_start = start - (end - start)
             comparison_basis = "elapsed_time_dst_transition"
-        comparison = _activity(conn, cm, ids, coverage_start, start, group_by, selected_chats)
-    related = summaries._related_chats(conn, roster, cm_id=cm["id"])
-    chat_ids = {chat["chat_id"] for chat in related if set(chat["contact_ids"]) & set(ids)}
-    chat_ids.update(result["source_chat_ids"])
-    if comparison:
-        chat_ids.update(comparison["source_chat_ids"])
-    # Keep disabled/unreadable known conversations in the coverage, not in message counts.
-    opens = sorted({row["open_id"] for row in roster if row["contact_id"] in ids})
-    chat_ids.update(row["chat_id"] for row in conn.execute("""SELECT ac.chat_id FROM authorization_chats ac
+        comparison = collect(coverage_start, start)
+    if audience == "creators":
+        related = summaries._related_chats(conn, roster, cm_id=cm["id"])
+        chat_ids = {chat["chat_id"] for chat in related if set(chat["contact_ids"]) & set(ids)}
+        chat_ids.update(result["source_chat_ids"])
+        if comparison:
+            chat_ids.update(comparison["source_chat_ids"])
+        # Keep disabled/unreadable known conversations in the coverage, not in message counts.
+        opens = sorted({row["open_id"] for row in roster if row["contact_id"] in ids})
+        chat_ids.update(row["chat_id"] for row in conn.execute("""SELECT ac.chat_id FROM authorization_chats ac
         WHERE ac.authorization_id=%s AND ac.is_visible AND (ac.p2p_counterpart_open_id=ANY(%s::text[])
           OR EXISTS(SELECT 1 FROM chat_members m WHERE m.chat_id=ac.chat_id AND m.member_type='user'
                     AND m.open_id=ANY(%s::text[]))
           OR EXISTS(SELECT 1 FROM authorization_message_observations o JOIN chat_messages m USING(chat_id,message_id)
             WHERE o.authorization_id=ac.authorization_id AND o.chat_id=ac.chat_id
             AND m.sender_open_id=ANY(%s::text[]) AND NOT m.is_deleted))""",
-        (cm["id"], opens, opens, opens)).fetchall())
-    chats = [chat for chat in _chat_states(conn, cm["id"]) if chat["chat_id"] in chat_ids
+            (cm["id"], opens, opens, opens)).fetchall())
+    chats = [chat for chat in _chat_states(conn, cm["id"]) if (audience == "all" or chat["chat_id"] in chat_ids)
              and (selected_chats is None or chat["chat_id"] in selected_chats)]
     watermarks, gaps = _coverage(chats, coverage_start, end)
     cursor = _cursor(args)
     count = len(result["rows"])
     result["rows"] = result["rows"][cursor:cursor + PAGE_SIZE]
-    return {"kind": "activity", "scope": context["scope"], **result, "group_by": group_by,
+    scope = context["scope"] if audience == "creators" else {"cm_id": str(cm["id"]),
+        "cm_name": cm["display_name"] or "CM", "creator_ids": None,
+        "chat_ids": selected_chats, "chat_names": [chat["name"] or "会话" for chat in chats
+                                                   if selected_chats is not None]}
+    definition = {"messages": "当前CM可读来源内的正式达人发言，以及本人直接指向达人的消息；按会话＋消息ID去重。",
+        "active_creators": "有发言或收到本人明确指向消息的达人；不按群成员推算。",
+        "contacted_creators": "收到本人私聊、明确@或回复消息的不同达人；不是业务履约量。",
+        "rows": "逐达人消息可能一条涉及多人，分组数不能相加代替总量；仅列有活动的分组。"}
+    if audience == "all":
+        definition = {"messages": "当前CM授权观察、正常且启用同步的可读会话内全部消息，含应用和系统；"
+                                 "按会话＋消息ID去重。",
+            "active_people": "本时段实际发言的可识别人类，含当前CM；同一contact_id合并，否则按open_id去重，"
+                             "不由群成员推算。",
+            "contacted_people": "当前CM实际私聊、唯一明确@或直接回复的不同真人；不含本人，不推断群广播受众。",
+            "app_messages": "发送类型为app或bot的应用／机器人消息。",
+            "system_messages": "明确标识system的发送者或消息类型；不将未知类型猜成系统。",
+            "unknown_sender_messages": "发送类型未知，或人类发送者缺少open_id；消息仍计数，不编造人数。",
+            "rows": "按实际发送者或会话分组；同一个人可出现在多天／会话中，分组人数不可相加代替总人数。"}
+    return {"kind": "activity", "scope": {**scope, "audience": audience}, **result,
+        "audience": audience, "group_by": group_by,
         "total_rows": count, "next_cursor": str(cursor + PAGE_SIZE) if cursor + PAGE_SIZE < count else None,
         "comparison": comparison, "comparison_basis": comparison_basis,
-        "coverage": {"creators": len(ids), "conversations": len(chats),
+        "coverage": {**({"creators": len(ids)} if audience == "creators" else {}), "conversations": len(chats),
         "watermarks": watermarks}, "gaps": gaps, "checked_at": _iso(now),
         "authorization": _authorization(cm),
-        "access_fingerprint": summaries._hash([(chat["chat_id"], chat["sync_enabled"], chat["chat_status"])
-                                               for chat in chats]),
-        "definition": {"messages": "当前CM可读来源内的正式达人发言，以及本人直接指向达人的消息；按会话＋消息ID去重。",
+        "access_fingerprint": summaries._hash([(chat["chat_id"], chat["sync_enabled"], chat["chat_status"],
+            chat["sync_status"] != "not_readable") for chat in chats]),
+        "_legacy_access_fingerprint": summaries._hash([(chat["chat_id"], chat["sync_enabled"], chat["chat_status"])
+                                                     for chat in chats]),
+        "definition": {**definition,
             "readable_messages": "有正文密文的消息数；未解密核验文本，不代表附件内容已分析。",
-            "active_creators": "有发言或收到本人明确指向消息的达人；不按群成员推算。",
-            "contacted_creators": "收到本人私聊、明确@或回复消息的不同达人；不是业务履约量。",
-            "rows": "逐达人消息可能一条涉及多人，分组数不能相加代替总量；仅列有活动的分组。",
             "comparison": "previous为相邻前一英国墙钟等长时段；涉及重复小时或不存在的钟面时间时按实际经过时间比较。",
             "day_counts": {"current": ((end - start) if comparison_basis.startswith("elapsed_time") else
                 end.astimezone(summaries.LONDON).replace(tzinfo=None)
@@ -377,7 +497,10 @@ def activity(conn, actor_id, context, args, settings, *, now=None):
 
 def validate_result(conn, actor_id, context, result, settings):
     """Invalidate changed business sources, not routine synchronization progress."""
-    cm, _roster, _visible = _scope(conn, actor_id, context)
+    if result.get("kind") == "activity" and result.get("audience") == "all":
+        cm, _ = summaries._authorize(conn, actor_id, cm_id=context["scope"]["cm_id"])
+    else:
+        cm, _roster, _visible = _scope(conn, actor_id, context)
     if result.get("authorization") != _authorization(cm):
         raise ValueError("消息授权已变化，请重新查询。")
     request = result["_request"]
@@ -387,8 +510,10 @@ def validate_result(conn, actor_id, context, result, settings):
     if function is None:
         raise ValueError("查询引用无效。")
     now = datetime.fromisoformat(result["checked_at"])
-    fresh = function(conn, actor_id, context, request["args"], settings, now=now)
     kind = result["kind"]
+    legacy_activity = kind == "activity" and "audience" not in result
+    args = {**request["args"], "audience": "creators"} if legacy_activity else request["args"]
+    fresh = function(conn, actor_id, context, args, settings, now=now)
     if fresh["kind"] != kind:
         raise ValueError("查询引用无效。")
     if kind == "sync":
@@ -396,9 +521,12 @@ def validate_result(conn, actor_id, context, result, settings):
             raise ValueError("会话读取范围已变化，请重新查询。")
         return
     if kind == "activity":
-        keys = ("window", "metrics", "rows", "comparison", "access_fingerprint")
+        keys = ("audience", "window", "metrics", "rows", "comparison", "access_fingerprint")
         previous = {key: result.get(key) for key in keys}
         current = {key: fresh.get(key) for key in keys}
+        if legacy_activity:
+            previous["audience"] = "creators"
+            current["access_fingerprint"] = fresh["_legacy_access_fingerprint"]
     else:
         def stable(value):
             output = {key: value.get(key) for key in ("total", "next_cursor", kind)}

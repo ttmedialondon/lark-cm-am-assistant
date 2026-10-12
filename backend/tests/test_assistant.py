@@ -199,6 +199,36 @@ def test_selected_creator_changes_do_not_reuse_other_persons_context(pg, chat, m
     assert view['status'] == 'completed' and view['result']['data'][0]['creators'][0]['id'] == str(chat.ids['other'])
     assert not any(item.get('role') == 'assistant' for item in calls[2])
 
+    def full_model(_cfg, _key, items, _actor, **_kwargs):
+        calls.append(items.copy())
+        outputs = [item for item in items if item.get('type') == 'function_call_output']
+        if not outputs:
+            return {'text': '', 'output': [{'type': 'function_call', 'call_id': str(uuid4()),
+                'name': 'summarize_messages', 'arguments': json.dumps({
+                    'audience': 'all', 'start': chat.start.isoformat(), 'end': chat.end.isoformat(),
+                    'creator_ids': None, 'chat_ids': None, 'cursor': None,
+                })}], 'usage': {}}
+        result = json.loads(outputs[-1]['output'])
+        assert result['total_messages'] == 2 and result['scope']['creator_ids'] is None
+        final = {'answer': '全量授权消息。', 'event_refs': [], 'result_refs': [],
+                 'data_refs': [result['query_ref']], 'draft_ref': None}
+        return {'text': json.dumps(final), 'output': [], 'usage': {}}
+
+    monkeypatch.setattr(openai_client, 'call_openai_tools', full_model)
+    third = {**first, 'client_request_id': str(uuid4()), 'message': '总结全部聊天',
+             'context': {'audience': 'all'}}
+    turn = assistant.submit(pg, chat.ids['cm'], third, chat.settings)
+    for _ in range(3):
+        finish(chat)
+    view = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
+    assert view['status'] == 'completed' and view['result']['scope']['audience'] == 'all'
+    assert not any(item.get('role') == 'assistant' for item in calls[4])
+    next_turn = assistant.submit(pg, chat.ids['cm'], {
+        **third, 'client_request_id': str(uuid4()), 'message': '继续追问', 'context': {},
+    }, chat.settings)
+    assert next_turn['scope']['audience'] == 'all' and next_turn['scope']['creator_ids'] is None
+    assistant.cancel(pg, chat.ids['cm'], next_turn['id'], chat.settings)
+
 
 def test_cancel_during_provider_call_keeps_receipt_without_showing_late_result(pg, chat, monkeypatch):
     turn = assistant.submit(pg, chat.ids['cm'], payload(), chat.settings)

@@ -30,9 +30,11 @@ def _choice(values):
 TOOLS = [
     _function("find_creators", "按姓名或 TikTok handle 查找当前可见的正式达人；返回稳定编号与负责人。",
               {"query": _STRING}),
-    _function("summarize_messages", "读取指定起止时间及达人的完整聊天事件；缺少有效报告时自动分析。"
-              "时间用带时区的 ISO 8601；无时区按英国时间。creator_ids=null 为当前范围全部达人。",
-              {"start": _STRING, "end": _STRING, "creator_ids": _IDS}),
+    _function("summarize_messages", "总结指定时段聊天。默认audience=all读取当前CM全部授权消息，不要求联系人是达人。"
+              "仅用户明确要求达人时用creators；此模式复用达人事件报告。all按页返回原消息，必须继续cursor至空后总结，"
+              "未读完只能给部分总结。时间用带时区ISO8601；chat_ids=null全会话、creator_ids=null不指定某达人。",
+              {"start": _STRING, "end": _STRING, "audience": {"type": "string", "enum": ["all", "creators"]},
+               "creator_ids": _IDS, "chat_ids": _IDS, "cursor": _NULL_STRING}),
     _function("filter_events", "筛选已有报告，计数与分页，不重新分析聊天。主题只检索事件，不检索全部历史。",
               {"result_id": _STRING, "creator_ids": _IDS, "priority": _choice(["P0", "P1", "P2", "P3"]),
                "reply_status": _choice(["replied", "unreplied"]),
@@ -53,25 +55,29 @@ TOOLS = [
                "purpose": _choice(list(assistant_queries.PURPOSES)),
                "cursor": _NULL_STRING}),
     _function("get_sync_status", "只读查询当前CM授权、消息同步水位、回填与不可读缺口；不刷新或修改授权。", {}),
-    _function("search_chat_history", "检索Lark业务历史消息正文，不检索旧助手问答。query为1–8个关键词或同义词，"
-              "任一命中；支持指定达人/群/时间。仅扫描有权读取的相关聊天；返回本页覆盖与下一页游标，"
+    _function("search_chat_history", "检索Lark消息正文，不检索旧助手问答。默认audience=all读取全部授权聊天和发言人；"
+              "用户明确要求达人时才creators。query为1–8个关键词或同义词，任一命中；可限定群和时间。返回本页覆盖和游标，"
               "有next_cursor时不能声称查完，matched是本页命中不是全库总数。",
               {"query": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 120},
                          "minItems": 1, "maxItems": 8},
-               "start": _STRING, "end": _STRING, "creator_ids": _IDS, "chat_ids": _IDS,
+               "start": _STRING, "end": _STRING, "audience": {"type": "string", "enum": ["all", "creators"]},
+               "creator_ids": _IDS, "chat_ids": _IDS,
                "cursor": _NULL_STRING}),
     _function("read_message_context", "根据已取得message_ref查看完整原文和问答；不能用名字或猜测的引用读消息。",
               {"message_ref": _STRING}),
-    _function("activity_stats", "由数据库统计指定时段消息量、实际活跃/联系达人数、群数，按英国日期或达人分组，"
-              "comparison=previous对比相邻前一等长时段；不是业务履约或未解决唯一事项统计。",
-              {"start": _STRING, "end": _STRING, "creator_ids": _IDS, "chat_ids": _IDS,
-               "group_by": {"type": "string", "enum": ["day", "creator"]},
+    _function("activity_stats", "数据库统计消息量与实际联系人数。默认audience=all为当前CM全部授权消息，"
+              "按day/person/conversation分组；仅明确要求达人时creators，可按day/creator。comparison=previous比较前一等长时段，"
+              "不同于业务履约或全局未解决事项数，不把群成员数当联系人数。",
+              {"start": _STRING, "end": _STRING, "audience": {"type": "string", "enum": ["all", "creators"]},
+               "creator_ids": _IDS, "chat_ids": _IDS,
+               "group_by": {"type": "string", "enum": ["day", "person", "conversation", "creator"]},
                "comparison": _choice(["previous"]), "cursor": _NULL_STRING}),
 ]
 _SCHEMAS = {tool["name"]: tool["parameters"] for tool in TOOLS}
 _QUERIES = {"query_creators": assistant_queries.creators, "list_groups": assistant_queries.groups,
             "get_sync_status": assistant_queries.sync_status, "activity_stats": assistant_queries.activity,
-            "search_chat_history": assistant_search.query, "read_message_context": assistant_search.read}
+            "search_chat_history": assistant_search.query, "read_message_context": assistant_search.read,
+            "summarize_messages": assistant_search.window_messages}
 
 
 def _validate(name, args):
@@ -116,8 +122,13 @@ def current_context(conn, actor_id, selected_context, settings, *, now=None):
             selection["cms"].append({"id": str(cm_id), "name": cm["display_name"] or "CM"})
     roster = summaries._roster(conn, cm_id)
     visible = {str(row["contact_id"]) for row in roster}
-    selected = _creator_ids(selected_context.get("creator_ids"), visible)
-    scope = {"cm_id": str(cm_id), "cm_name": cm["display_name"] or "CM", "creator_ids": selected}
+    audience = selected_context.get("audience") or (
+        "creators" if selected_context.get("creator_ids") is not None or selected_context.get("event_ref") else "all")
+    if audience not in {"all", "creators"}:
+        raise ValueError("消息范围无效。")
+    selected = _creator_ids(selected_context.get("creator_ids") if audience == "creators" else None, visible)
+    scope = {"cm_id": str(cm_id), "cm_name": cm["display_name"] or "CM", "creator_ids": selected,
+             "audience": audience}
     if selected:
         scope["creator_names"] = list(dict.fromkeys(row["name"] or "未命名达人" for row in roster
             if str(row["contact_id"]) in selected))
@@ -210,7 +221,7 @@ def _saved_query(conn, actor_id, ref, settings):
 def _validate_query(conn, actor_id, context, result, settings):
     if result.get("scope", {}).get("cm_id") != context["scope"]["cm_id"]:
         raise PermissionError("查询不属于当前范围。")
-    if result.get("kind") in {"messages", "message_context"}:
+    if result.get("kind") in {"messages", "window_messages", "message_context"}:
         refs = result.get("_message_refs", {})
         restored = {**result, "messages": [{**message,
             "message_ref": refs.get(message.get("message_ref"), message.get("message_ref")),
@@ -230,6 +241,13 @@ def _validate_query(conn, actor_id, context, result, settings):
 
 def _query(conn, actor_id, turn, name, args, settings, context, visible):
     args = dict(args)
+    if args.get("audience") == "all":
+        context = {**context, "scope": {key: value for key, value in context["scope"].items()
+                                      if key not in {"creator_names", "event_ref", "chat_ids", "chat_names"}}}
+        context["scope"].update(audience="all", creator_ids=None)
+        args["creator_ids"] = None
+    elif args.get("audience") == "creators":
+        context = {**context, "scope": {**context["scope"], "audience": "creators"}}
     if "creator_ids" in args:
         ids = _creator_ids(args["creator_ids"], visible)
         args["creator_ids"] = context["scope"].get("creator_ids") if ids is None else ids
@@ -238,12 +256,13 @@ def _query(conn, actor_id, turn, name, args, settings, context, visible):
             context = {**context, "scope": {**context["scope"], "creator_ids": args["creator_ids"],
                 "creator_names": list(dict.fromkeys(row["name"] or "未命名达人" for row in roster
                     if str(row["contact_id"]) in args["creator_ids"]))}}
-    if name in {"search_chat_history", "activity_stats"}:
+    if name in {"search_chat_history", "activity_stats", "summarize_messages"}:
         start, end = _window(args["start"], args["end"], turn["created_at"])
         args.update(start=start.isoformat(), end=end.isoformat())
-    if name in {"search_chat_history", "activity_stats"} and args["chat_ids"] is None:
+    if (name in {"search_chat_history", "activity_stats", "summarize_messages"}
+            and args["chat_ids"] is None and args["audience"] != "all"):
         args["chat_ids"] = context["scope"].get("chat_ids")
-    if name in {"search_chat_history", "activity_stats"} and args["chat_ids"] is not None:
+    if name in {"search_chat_history", "activity_stats", "summarize_messages"} and args["chat_ids"] is not None:
         context = {**context, "scope": {**context["scope"], "chat_ids": args["chat_ids"]}}
     if name == "read_message_context":
         source = _saved_message(conn, actor_id, args["message_ref"], settings)
@@ -260,10 +279,12 @@ def _query(conn, actor_id, turn, name, args, settings, context, visible):
     if name == "query_creators" and args["query"] and result["total"] == 1:
         result["scope"] = {**context["scope"], "creator_ids": [person["id"] for person in result["creators"]],
                            "creator_names": [person["name"] for person in result["creators"]]}
+    if name == "query_creators":
+        result["scope"] = {**result["scope"], "audience": "creators"}
     request = {"name": name, "args": args}
     signature = json.dumps([context["scope"]["cm_id"], request], sort_keys=True, ensure_ascii=False)
     ref = f"q.{turn['id']}.{hashlib.sha256(signature.encode()).hexdigest()[:20]}"
-    if name == "search_chat_history":
+    if name in {"search_chat_history", "summarize_messages"}:
         refs = {}
         for index, message in enumerate(result["messages"]):
             short = "m." + ref[2:] + f".{index}"
@@ -410,15 +431,18 @@ def _read_results(conn, actor_id, run_ids, settings, context):
 def execute(conn, actor_id, turn, name, args, settings, context):
     _validate(name, args)
     cm, roster, visible = _scope(conn, actor_id, context)
-    if name in _QUERIES:
+    if name in _QUERIES and not (name == "summarize_messages" and args["audience"] == "creators"):
         return _query(conn, actor_id, turn, name, args, settings, context, visible)
     if name == "find_creators":
         return _query(conn, actor_id, turn, "query_creators",
                       {"query": args["query"], "importance": None, "cursor": None}, settings, context, visible)
     if name == "summarize_messages":
-        if context["scope"].get("chat_ids") is not None:
+        context = {**context, "scope": {**context["scope"], "audience": "creators"}}
+        if args["chat_ids"] is not None or context["scope"].get("chat_ids") is not None:
             return {"error": "事件总结目前按达人范围处理，不支持仅指定群。"
-                    "请用search_chat_history查这个群的消息，或明确改为达人范围。"}
+                    "请用audience=all总结或检索这个群，或改为达人范围。"}
+        if args["cursor"] is not None:
+            return {"error": "达人事件报告请使用filter_events分页。"}
         ids = _creator_ids(args["creator_ids"], visible)
         if ids is None:
             ids = context["scope"].get("creator_ids")

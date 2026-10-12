@@ -61,7 +61,8 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
     groups = run("list_groups", {"query": None, "creator_ids": None, "purpose": "category", "cursor": None})
     assert groups["total"] == 1 and not groups["groups"][0]["sync_enabled"]
     assert run("get_sync_status", {})["authorization_status"] == "active"
-    args = {"start": s.start.isoformat(), "end": now.isoformat(), "creator_ids": None, "chat_ids": None,
+    args = {"audience": "creators", "start": s.start.isoformat(), "end": now.isoformat(),
+            "creator_ids": None, "chat_ids": None,
             "group_by": "day", "comparison": "previous", "cursor": None}
     stats = run("activity_stats", args)
     assert stats["metrics"]["messages"] == 2 and stats["metrics"]["contacted_creators"] == 1
@@ -78,7 +79,8 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
         assert datetime.fromisoformat(transition["comparison"]["window"]["end"]) - datetime.fromisoformat(
             transition["comparison"]["window"]["start"]) == timedelta(minutes=minutes)
         assert transition["definition"]["day_counts"]["previous"] == minutes / 1440
-    search_args = {"query": ["sample"], "start": s.start.isoformat(), "end": now.isoformat(),
+    search_args = {"audience": "creators", "query": ["sample"],
+                   "start": s.start.isoformat(), "end": now.isoformat(),
                    "creator_ids": None, "chat_ids": None, "cursor": None}
     monkeypatch.setattr(assistant_search, "SCAN_LIMIT", 1)
     monkeypatch.setattr(assistant_search, "PAGE_SIZE", 1)
@@ -112,6 +114,111 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
     with pytest.raises(ValueError):
         tools.build_result(pg, s.ids["cm"], turn, {**final, "data_refs": [f"q.{uuid4()}.invented"]},
                            s.settings, context, results)
+
+    # Full-CM material does not depend on a formal creator, contact or user sender.
+    visitor = uuid4()
+    pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,'Unconfirmed visitor')", (visitor,))
+    pg.execute("INSERT INTO lark_identities(open_id,contact_id,display_name) "
+               "VALUES('ou_unconfirmed',%s,'Unconfirmed visitor'),('ou_unlinked',NULL,'Unlinked visitor')",
+               (visitor,))
+    for chat, visible, enabled in [("business", True, True), ("hidden", False, True),
+                                   ("disabled", True, False)]:
+        pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES(%s,%s,'group')", (chat, chat))
+        pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,is_visible,sync_enabled,
+            backfill_complete,backfill_window_start_at,last_incremental_at,sync_status)
+            VALUES(%s,%s,%s,%s,TRUE,%s,%s,'succeeded')""",
+            (s.ids["cm"], chat, visible, enabled, s.start - timedelta(days=9), s.end))
+
+    def all_message(message_id, chat, sender, sender_type="user", *, before_consent=False):
+        pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_id,sender_id_type,
+            sender_type,message_type,body_ciphertext,message_create_time)
+            VALUES(%s,%s,%s,%s,%s,%s,'text',%s,%s)""",
+            (chat, message_id, sender, sender or "cli_test_bot", "open_id" if sender else "app_id",
+             sender_type, s.cipher.encrypt(json.dumps({"text": "All-scope " + message_id})),
+             s.start + timedelta(hours=4)))
+        observed = pg.execute("SELECT body_consent_at FROM authorizations WHERE id=%s",
+                              (s.ids["cm"],)).fetchone()["body_consent_at"] - timedelta(seconds=1) \
+            if before_consent else now
+        pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id,observed_at)
+            VALUES(%s,%s,%s,%s)""", (s.ids["cm"], chat, message_id, observed))
+
+    all_message("all-unconfirmed", "business", "ou_unconfirmed")
+    all_message("all-no-contact", "business", "ou_unlinked")
+    all_message("all-app", "business", None, "app")
+    all_message("all-before-consent", "business", "ou_unconfirmed", before_consent=True)
+    all_message("all-hidden", "hidden", "ou_unconfirmed")
+    all_message("all-disabled", "disabled", "ou_unconfirmed")
+    monkeypatch.setattr(assistant_search, "WINDOW_PAGE_SIZE", 2)
+    tables = ("contacts", "lark_identities", "contact_roles", "contact_assignments", "contact_social_accounts",
+              "creator_account_assignments", "offhours_summary_runs")
+    before = {table: pg.execute(f"SELECT count(*) n FROM {table}").fetchone()["n"] for table in tables}
+    all_args = {"audience": "all", "start": s.start.isoformat(), "end": now.isoformat(),
+                "creator_ids": None, "chat_ids": None, "cursor": None}
+    with pytest.raises(ValueError):
+        run("summarize_messages", {key: value for key, value in all_args.items() if key != "audience"})
+    all_found, all_pages, cursor = [], [], None
+    for _ in range(12):
+        page = run("summarize_messages", {**all_args, "cursor": cursor})
+        all_pages.append(page)
+        all_found.extend(page["messages"])
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+    expected = {"m1", "outside", "reply", "all-unconfirmed", "all-no-contact", "all-app"}
+    assert cursor is None and len(all_pages) > 1 and {message["message_id"] for message in all_found} == expected
+    assert len(all_found) == len(expected) and all(len(message["message_ref"]) < 130 for message in all_found)
+    app_ref = next(message["message_ref"] for message in all_found if message["message_id"] == "all-app")
+    assert tools.evidence(pg, s.ids["cm"], app_ref, s.settings)["message"]["text"] == "All-scope all-app"
+    run("read_message_context", {"message_ref": app_ref})
+    all_search_args = {**all_args, "query": ["All-scope"]}
+    search_found, cursor = [], None
+    for _ in range(12):
+        page = run("search_chat_history", {**all_search_args, "cursor": cursor})
+        search_found.extend(page["messages"])
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+    assert cursor is None and {message["message_id"] for message in search_found} == {
+        "all-unconfirmed", "all-no-contact", "all-app",
+    }
+    all_stats_args = {**all_args, "group_by": "day", "comparison": None}
+    assert run("activity_stats", all_stats_args)["metrics"]["messages"] == 6
+    assert run("activity_stats", args)["metrics"]["messages"] == 2
+    pinned_context = tools.current_context(pg, s.ids["cm"], {
+        "creator_ids": [str(s.ids["person"])], "chat_ids": ["category"], "audience": "creators",
+    }, s.settings)
+    unpinned = tools.execute(pg, s.ids["cm"], turn, "summarize_messages", all_args, s.settings, pinned_context)
+    assert unpinned["total_messages"] == 6 and unpinned["scope"]["chat_ids"] is None
+    assert assistant_queries.activity(pg, s.ids["cm"], pinned_context, all_stats_args, s.settings)[
+        "metrics"]["messages"] == 6
+    default_args = {key: value for key, value in all_args.items() if key != "audience"}
+    assert assistant_search.window_messages(pg, s.ids["cm"], context, default_args, s.settings)[
+        "total_messages"] == 6
+    assert assistant_queries.activity(pg, s.ids["cm"], context, {
+        **default_args, "group_by": "day", "comparison": None,
+    }, s.settings)["metrics"]["messages"] == 6
+    default_search, cursor = [], None
+    for _ in range(12):
+        page = assistant_search.query(pg, s.ids["cm"], context, {
+            **default_args, "query": ["All-scope"], "cursor": cursor,
+        }, s.settings)
+        default_search.extend(page["messages"])
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+    assert cursor is None and {message["message_id"] for message in default_search} == {
+        "all-unconfirmed", "all-no-contact", "all-app",
+    }
+    empty = run("summarize_messages", {**all_args, "start": (s.start + timedelta(hours=6)).isoformat(),
+                                       "end": (s.start + timedelta(hours=7)).isoformat()})
+    assert empty["messages"] == [] and empty["next_cursor"] is None and empty["gaps"] == []
+    all_final = {"answer": "当前授权全量消息包含未入库人员和应用通知。", "event_refs": [], "result_refs": [],
+                 "data_refs": [result["query_ref"] for result in results], "draft_ref": None}
+    all_view = tools.build_result(pg, s.ids["cm"], turn, all_final, s.settings, context, results)
+    for blocked in ("Private owner-only sample", "all-before-consent", "all-hidden", "all-disabled"):
+        assert blocked not in json.dumps(all_view)
+    assert before == {table: pg.execute(f"SELECT count(*) n FROM {table}").fetchone()["n"] for table in tables}
+    assert before["offhours_summary_runs"] == 0
     pg.execute("UPDATE chat_messages SET is_deleted=TRUE WHERE message_id='m1'")
     with pytest.raises((PermissionError, ValueError)):
         tools.build_result(pg, s.ids["cm"], turn, final, s.settings, context, results)
@@ -169,7 +276,8 @@ def test_five_tools_keep_reports_private_resume_and_recheck_sources(pg, seeded, 
     with pytest.raises(PermissionError):
         tools.current_context(pg, s.ids["reviewer"], {"cm_id": str(s.ids["cm"])}, s.settings)
 
-    args = {"start": s.start.isoformat(), "end": (now - timedelta(seconds=1)).isoformat(), "creator_ids": None}
+    args = {"audience": "creators", "start": s.start.isoformat(), "end": (now - timedelta(seconds=1)).isoformat(),
+            "creator_ids": None, "chat_ids": None, "cursor": None}
     before_global = pg.execute("SELECT * FROM offhours_summary_settings").fetchone()
     waiting = tools.execute(pg, s.ids["cm"], turn, "summarize_messages", args, s.settings, context)
     assert waiting["waiting"]["kind"] == "summary"
@@ -251,7 +359,7 @@ def test_five_tools_keep_reports_private_resume_and_recheck_sources(pg, seeded, 
 
     # A longer request splits completely, and no global report settings change.
     longer = tools.execute(pg, s.ids["cm"], turn, "summarize_messages", {
-        "start": (s.start - timedelta(days=8)).isoformat(), "end": args["end"], "creator_ids": None,
+        **args, "start": (s.start - timedelta(days=8)).isoformat(),
     }, s.settings, context)
     assert len(longer["waiting"]["ids"]) == 2
     monkeypatch.setattr(openai_client, "call_openai", summary_model)

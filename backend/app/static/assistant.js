@@ -81,9 +81,10 @@
     if (explicit) scopeVersion++;
     if (["cm_id", "creator_ids", "chat_ids", "event_ref"].some(key => Object.hasOwn(value, key))) {
       const cmId = value.cm_id || activeContext.cm_id;
-      activeContext = {cm_id: cmId, cm_name: cmId === activeContext.cm_id ? activeContext.cm_name : undefined};
+      activeContext = {cm_id: cmId, cm_name: cmId === activeContext.cm_id ? activeContext.cm_name : undefined,
+        audience: value.audience || (value.creator_ids != null || value.event_ref ? "creators" : "all")};
     }
-    for (const key of ["cm_id", "cm_name", "creator_ids", "creator_name", "creator_names", "chat_ids", "chat_names", "event_ref", "event_title"]) {
+    for (const key of ["cm_id", "cm_name", "audience", "creator_ids", "creator_name", "creator_names", "chat_ids", "chat_names", "event_ref", "event_title"]) {
       if (Object.hasOwn(value, key)) activeContext[key] = value[key];
     }
     contextChosen = true;
@@ -107,7 +108,9 @@
       for (const key of ["cm_name", "creator_names", "chat_names"]) if (value[key]) activeContext[key] = value[key];
     }
     const current = [...new Set([activeContext.cm_name, activeContext.creator_name, ...(activeContext.creator_names || []),
-      ...(activeContext.chat_names || []), activeContext.event_title || (activeContext.event_ref ? "当前事项" : null), activeContext.page_label].filter(Boolean))];
+      ...(activeContext.chat_names || []), activeContext.event_title || (activeContext.event_ref ? "当前事项" : null),
+      activeContext.audience === "all" ? "全部授权消息" : activeContext.audience === "creators" ? "达人范围" : null,
+      activeContext.page_label].filter(Boolean))];
     const values = matching && value.start && value.end ? [`${date(value.start)} – ${date(value.end)} · 英国时间`] : [];
     if (matching && !values.length && value.label) values.push(value.label);
     $("oa-scope").replaceChildren(...current.map(text => node("span", "oa-chip oa-chip--page", text)),
@@ -218,10 +221,12 @@
     }
     value.append(head, body); wrap.append(value); return wrap;
   }
-  function metrics(values, previous = null) {
+  function metrics(values, previous = null, all = false) {
     const list = node("div", "oa-metrics");
-    for (const [key, label] of Object.entries({messages: "关联消息", own_messages: "本人消息", active_creators: "活跃达人",
-      contacted_creators: "已联系达人", conversations: "会话"})) {
+    const labels = all ? {messages: "消息", own_messages: "本人消息", active_people: "活跃人员",
+      contacted_people: "联系人数", conversations: "会话"} : {messages: "关联消息", own_messages: "本人消息",
+      active_creators: "活跃达人", contacted_creators: "已联系达人", conversations: "会话"};
+    for (const [key, label] of Object.entries(labels)) {
       if (!Number.isFinite(values?.[key])) continue;
       const item = node("div", "oa-metric"); item.append(node("span", "", label), node("strong", "", values[key]));
       if (Number.isFinite(previous?.[key])) item.append(node("small", "", `前一时段 ${previous[key]}`));
@@ -230,7 +235,8 @@
     return list;
   }
   function dataCard(data) {
-    const titles = {creators: "达人资料", groups: "关联群聊", sync: "同步状态", activity: "活动统计", messages: "消息命中", message_context: "原文与问答"};
+    const titles = {creators: "达人资料", groups: "群聊目录", sync: "同步状态", activity: "活动统计", messages: "消息命中",
+      window_messages: "总结来源", message_context: "原文与问答"};
     if (!data || !titles[data.kind]) return null;
     const card = node("section", "oa-data"); card.dataset.queryRef = data.query_ref || "";
     card.append(node("h4", "", titles[data.kind]));
@@ -270,14 +276,16 @@
       if (data.watermarks?.oldest) card.append(node("p", "oa-coverage", `最早同步水位 ${date(data.watermarks.oldest)}`));
       if (typeof data.definition === "string") card.append(node("p", "oa-coverage", data.definition));
     } else if (data.kind === "activity") {
-      card.append(metrics(data.metrics, data.comparison?.metrics));
-      const rows = (data.rows || []).map(row => [data.group_by === "creator" ? row.creator_name || "未命名达人" : row.day,
+      const all = data.audience === "all" || data.scope?.audience === "all";
+      card.append(metrics(data.metrics, data.comparison?.metrics, all));
+      const groupLabels = {creator: "达人", person: "人员", conversation: "会话", day: "日期"};
+      const rows = (data.rows || []).map(row => [row.creator_name || row.person_name || row.conversation_name || row.day || "未命名",
         Number.isFinite(row.messages) ? row.messages : "—", Number.isFinite(row.own_messages) ? row.own_messages : "—"]);
-      if (rows.length) card.append(table([data.group_by === "creator" ? "达人" : "日期", "关联消息", "本人消息"], rows));
+      if (rows.length) card.append(table([groupLabels[data.group_by] || "分组", all ? "消息" : "关联消息", "本人消息"], rows));
       if (data.rows?.length > 25) card.append(node("p", "oa-coverage", `共 ${data.rows.length} 行，显示前 25 行。`));
       if (data.definition && typeof data.definition === "object") {
         const details = node("details", "oa-coverage"); details.append(node("summary", "", "统计口径"));
-        for (const key of ["messages", "active_creators", "contacted_creators", "rows"]) if (data.definition[key]) details.append(node("p", "", data.definition[key]));
+        for (const key of ["messages", "active_creators", "contacted_creators", "active_people", "contacted_people", "rows"]) if (data.definition[key]) details.append(node("p", "", data.definition[key]));
         card.append(details);
       }
     } else if (data.kind === "message_context") {
@@ -289,8 +297,14 @@
       card.append(node("p", "oa-coverage", "包含引用消息与有限相邻问答，不是完整会话。"));
       const ref = data.message_ref || data.evidence_ref || message.message_ref;
       if (ref) card.append(evidenceCard(ref, message.conversation_name || message.chat_name || "原文与问答"));
-    } else if (data.kind === "messages") {
-      for (const message of (data.messages || []).slice(0, 25)) {
+    } else if (["messages", "window_messages"].includes(data.kind)) {
+      const window = data.kind === "window_messages";
+      const messageList = window ? node("details", "oa-coverage") : card;
+      if (window) {
+        messageList.append(node("summary", "", `查看本页原消息（${data.messages?.length || 0}）`));
+        card.append(messageList);
+      }
+      for (const message of (data.messages || []).slice(0, window ? 100 : 25)) {
         const hit = node("div", "oa-hit");
         hit.append(node("div", "oa-card-meta", [message.conversation_name || message.chat_name, message.sender_name,
           date(message.time || message.sent_at)].filter(Boolean).join(" · ")));
@@ -299,14 +313,18 @@
         if (message.unavailable_or_truncated) hit.append(node("p", "oa-coverage", "正文不完整，请查看来源范围。"));
         const ref = message.evidence_ref || message.message_ref;
         if (ref) hit.append(evidenceCard(ref, message.conversation_name || message.chat_name || "消息原文"));
-        card.append(hit);
+        messageList.append(hit);
       }
-      if (!data.messages?.length) card.append(node("p", "oa-coverage", "这次扫描未找到可读的匹配消息。"));
+      if (!data.messages?.length) card.append(node("p", "oa-coverage", window ? "该时段尚无已同步消息。" : "这次扫描未找到可读的匹配消息。"));
       const coverage = data.coverage || {}, counts = [];
       for (const [key, label] of [["scanned", "扫描"], ["readable", "可读"], ["unreadable", "不可读"], ["matched", "命中"]]) {
         if (Number.isFinite(coverage[key])) counts.push(`${label} ${coverage[key]}`);
       }
-      if (counts.length) card.append(node("p", "oa-coverage", `本页：${counts.join(" · ")}，不是全库总量。`));
+      if (counts.length && !window) card.append(node("p", "oa-coverage", `本页：${counts.join(" · ")}，不是全库总量。`));
+      if (window) {
+        const total = coverage.total_messages ?? data.total_messages;
+        card.append(node("p", "oa-coverage", `${data.scope?.audience === "creators" ? "达人消息" : "全部授权消息"} · 本页 ${data.messages?.length || 0} 条${Number.isFinite(total) ? ` / 时段 ${total} 条` : ""}`));
+      }
       if (coverage.scan_complete === false) card.append(node("p", "oa-coverage", "扫描尚未结束，可继续下一页。"));
       if (coverage.source_complete === false) card.append(node("p", "oa-coverage", "来源覆盖不完整，未命中不代表没有发生。"));
     }
