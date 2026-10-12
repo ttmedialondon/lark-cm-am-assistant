@@ -5,6 +5,7 @@ from uuid import UUID
 
 from . import admin_reporting, contact_handles, creator_importance, creator_responsibility_matching
 from . import offhours_summary as summaries
+from .assistant_search import unreadable_reason
 from .creator_group_evidence import PURPOSES
 
 PAGE_SIZE = 25
@@ -155,7 +156,7 @@ def groups(conn, actor_id, context, args, settings, *, now=None):
 def _chat_states(conn, cm_id):
     return conn.execute("""SELECT c.chat_id,c.name,COALESCE(c.chat_status,'normal') chat_status,
         COALESCE(c.chat_mode,'group') chat_mode,ac.sync_enabled,ac.sync_status,ac.backfill_complete,
-        ac.backfill_window_start_at,ac.last_backfill_at,ac.last_incremental_at,ac.p2p_counterpart_open_id
+        ac.backfill_window_start_at,ac.last_backfill_at,ac.last_incremental_at,ac.p2p_counterpart_open_id,ac.last_error
         FROM authorization_chats ac JOIN chats c USING(chat_id)
         WHERE ac.authorization_id=%s AND ac.is_visible ORDER BY c.chat_id""", (cm_id,)).fetchall()
 
@@ -176,7 +177,7 @@ def _coverage(chats, start=None, end=None):
             if not chat["backfill_complete"]:
                 reasons.append("历史回填尚未完成")
             if chat["sync_status"] not in {"succeeded", "syncing"}:
-                reasons.append("Lark未允许读取" if chat["sync_status"] == "not_readable" else "同步尚未成功")
+                reasons.append(unreadable_reason(chat) if chat["sync_status"] == "not_readable" else "同步尚未成功")
             # NULL is an unbounded history start, not a missing sync boundary.
             if start is not None and chat["backfill_window_start_at"] is not None \
                     and chat["backfill_window_start_at"] > start:
@@ -522,7 +523,7 @@ def validate_result(conn, actor_id, context, result, settings):
     if kind == "sync":
         if not set(result["source_chat_ids"]) <= set(fresh["source_chat_ids"]):
             raise ValueError("会话读取范围已变化，请重新查询。")
-        return
+        return {key: fresh[key] for key in ("gaps", "watermarks")}
     if kind == "activity":
         keys = ("audience", "window", "metrics", "rows", "comparison", "access_fingerprint")
         previous = {key: result.get(key) for key in keys}
@@ -545,3 +546,5 @@ def validate_result(conn, actor_id, context, result, settings):
         previous, current = stable(result), stable(fresh)
     if previous != current:
         raise ValueError("查询依据已变化，请重新查询。")
+    if kind == "activity":
+        return {key: fresh[key] for key in ("gaps", "coverage")}

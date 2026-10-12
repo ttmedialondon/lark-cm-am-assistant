@@ -91,7 +91,8 @@ def _actor(conn, actor):
 def _turn(conn, actor, turn_id, *, lock=False):
     actor = _actor(conn, actor)
     row = conn.execute('''SELECT t.*,s.actor_id FROM assistant_turns t
-        JOIN assistant_sessions s ON s.id=t.session_id WHERE t.id=%s AND s.actor_id=%s'''
+        JOIN assistant_sessions s ON s.id=t.session_id WHERE t.id=%s AND s.actor_id=%s
+        AND t.error_code IS DISTINCT FROM 'cleared' '''
         + (' FOR UPDATE OF t' if lock else ''), (UUID(str(turn_id)), actor)).fetchone()
     if not row:
         raise LookupError('对话不存在或无权查看。')
@@ -114,6 +115,8 @@ def submit(conn, actor, payload, settings):
     duplicate = conn.execute('SELECT * FROM assistant_turns WHERE session_id=%s AND client_request_id=%s',
                              (session_id, request_id)).fetchone()
     if duplicate:
+        if duplicate['error_code'] == 'cleared':
+            raise ValueError('这条对话已清空，请重新提问。')
         original = codec.decode(duplicate['input_ciphertext'], settings)
         if original['message'] != message.strip() or original.get('selected_context', {}) != payload.get('context', {}):
             raise ValueError('同一请求编号不能用于不同问题。')
@@ -180,9 +183,38 @@ def session_view(conn, actor, session_id, settings):
     if not conn.execute('SELECT 1 FROM assistant_sessions WHERE id=%s AND actor_id=%s',
                         (session_id, actor)).fetchone():
         raise LookupError('对话不存在或无权查看。')
-    ids = conn.execute('SELECT id FROM assistant_turns WHERE session_id=%s ORDER BY created_at,id',
+    ids = conn.execute("SELECT id FROM assistant_turns WHERE session_id=%s "
+                       "AND error_code IS DISTINCT FROM 'cleared' ORDER BY created_at,id",
                        (session_id,)).fetchall()
     return {'id': str(session_id), 'turns': [turn_view(conn, actor, row['id'], settings) for row in ids]}
+
+
+def clear_conversations(conn, actor, settings):
+    """Clear only this actor's chat content; keep billing and request IDs for replay safety."""
+    actor = _actor(conn, actor)
+    sessions = conn.execute('SELECT id FROM assistant_sessions WHERE actor_id=%s FOR UPDATE', (actor,)).fetchall()
+    turns = conn.execute('''SELECT t.* FROM assistant_turns t JOIN assistant_sessions s ON s.id=t.session_id
+        WHERE s.actor_id=%s AND t.error_code IS DISTINCT FROM 'cleared' FOR UPDATE OF t''', (actor,)).fetchall()
+    if any(turn['status'] == 'running' and turn['lease_until'] and turn['lease_until'] > datetime.now(UTC)
+           for turn in turns):
+        raise ValueError('仍有请求正在处理，请完成或停止后再清空。')
+    for turn in turns:
+        if turn['status'] in ACTIVE:
+            cancel(conn, actor, turn['id'], settings)
+        else:
+            _stop_dependents(conn, turn['id'])
+    if turns:
+        conn.execute('''UPDATE assistant_turns SET status='cancelled',error_code='cleared',lease_until=NULL,
+            input_ciphertext=%s,checkpoint_ciphertext=%s,result_ciphertext=NULL,
+            finished_at=COALESCE(finished_at,NOW()) WHERE id=ANY(%s::uuid[])''',
+            (codec.encode({'message': '对话已清空', 'selected_context': {}}, settings),
+             codec.encode({}, settings), [turn['id'] for turn in turns]))
+    conn.execute('UPDATE assistant_sessions SET context_ciphertext=NULL,updated_at=NOW() WHERE actor_id=%s', (actor,))
+    counts = {'sessions': len(sessions), 'turns': len(turns)}
+    if turns:
+        conn.execute('INSERT INTO audit_events(id,authorization_id,action,metadata) VALUES(%s,%s,%s,%s::jsonb)',
+                     (uuid4(), actor, 'assistant_conversations_cleared', json.dumps(counts)))
+    return counts
 
 
 def _stop_dependents(conn, turn_id):
@@ -347,6 +379,8 @@ def _history(conn, row, settings, context):
         except (PermissionError, LookupError, ValueError):
             continue
         if checked:
+            if any(result.get('_coverage_refreshed') for result in checkpoint.get('tool_results', [])):
+                continue  # A saved answer may describe obsolete gaps; do not feed it to another paid request.
             old_scope = checked.get('scope', {})
             if old_scope.get('audience', 'creators') != context['scope'].get('audience', 'all'):
                 continue

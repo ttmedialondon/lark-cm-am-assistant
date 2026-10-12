@@ -8,7 +8,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from . import assistant_queries, assistant_search, summary_periods, summary_replies
+from . import assistant_queries, assistant_search, summary_replies
 from . import offhours_summary as summaries
 
 
@@ -104,28 +104,42 @@ def _validate(name, args):
                 raise ValueError("工具参数长度无效。")
 
 
+def scopes_for(conn, actor_id):
+    actor_id = UUID(str(actor_id))
+    actor = conn.execute("""SELECT a.status,r.role,r.is_active FROM authorizations a
+        LEFT JOIN admin_roles r ON r.authorization_id=a.id WHERE a.id=%s""", (actor_id,)).fetchone()
+    if not actor or actor["status"] != "active":
+        raise PermissionError("当前登录授权已失效。")
+    owner = actor["role"] == "owner" and bool(actor["is_active"])
+    people = conn.execute("""SELECT id,display_name FROM authorizations WHERE status='active'
+        AND body_consent_at IS NOT NULL AND (%s OR id=%s) ORDER BY display_name,id""", (owner, actor_id)).fetchall()
+    ids = {person["id"] for person in people}
+    selected = actor_id if actor_id in ids else people[0]["id"] if people else None
+    return {"scopes": [{"cm_id": str(person["id"]), "cm_name": person["display_name"] or "未命名人员"}
+                       for person in people], "selected_cm_id": str(selected) if selected else None,
+            "can_switch_cm": owner}
+
+
 def current_context(conn, actor_id, selected_context, settings, *, now=None):
     selected_context = selected_context or {}
     if not isinstance(selected_context, dict):
         raise ValueError("页面范围无效。")
     actor_id = UUID(str(actor_id))
     now = now or datetime.now(UTC)
-    cm_id, _start, _end, selection = summary_periods.selection(
-        conn, actor_id, selected_context.get("cm_id"), now=now,
-    )
-    cm, _ = summaries._authorize(conn, actor_id, cm_id=cm_id)
-    actor = conn.execute("SELECT display_name,body_consent_at FROM authorizations WHERE id=%s", (actor_id,)).fetchone()
-    if not selected_context.get("cm_id") and actor["body_consent_at"]:
-        cm_id = actor_id
-        cm, _ = summaries._authorize(conn, actor_id, cm_id=cm_id)
-        if not any(str(choice["id"]) == str(cm_id) for choice in selection["cms"]):
-            selection["cms"].append({"id": str(cm_id), "name": cm["display_name"] or "CM"})
-    roster = summaries._roster(conn, cm_id)
-    visible = {str(row["contact_id"]) for row in roster}
+    selection = scopes_for(conn, actor_id)
+    requested_cm = selected_context.get("cm_id") or selection["selected_cm_id"]
+    if not requested_cm:
+        raise ValueError("当前没有可查询的有效消息授权。")
+    cm_id = UUID(str(requested_cm))
     audience = selected_context.get("audience") or (
         "creators" if selected_context.get("creator_ids") is not None or selected_context.get("event_ref") else "all")
     if audience not in {"all", "creators"}:
         raise ValueError("消息范围无效。")
+    cm = assistant_search.authorize_all(conn, actor_id, cm_id) if audience == "all" else summaries._authorize(
+        conn, actor_id, cm_id=cm_id)[0]
+    actor = conn.execute("SELECT display_name,body_consent_at FROM authorizations WHERE id=%s", (actor_id,)).fetchone()
+    roster = summaries._roster(conn, cm_id)
+    visible = {str(row["contact_id"]) for row in roster}
     selected = _creator_ids(selected_context.get("creator_ids") if audience == "creators" else None, visible)
     scope = {"cm_id": str(cm_id), "cm_name": cm["display_name"] or "CM", "creator_ids": selected,
              "audience": audience}
@@ -169,7 +183,7 @@ def current_context(conn, actor_id, selected_context, settings, *, now=None):
     return {
         "actor": {"id": str(actor_id), "name": actor["display_name"] or "CM"},
         "scope": scope,
-        "available_scopes": [{"cm_id": cm["id"], "cm_name": cm["name"]} for cm in selection["cms"]],
+        "available_scopes": selection["scopes"],
         "timezone": summaries.TIMEZONE,
         "now": now.astimezone(summaries.LONDON).isoformat(),
         "defaults": {"morning_start": now.astimezone(summaries.LONDON).replace(
@@ -205,7 +219,8 @@ def _saved_query(conn, actor_id, ref, settings):
         if prefix != "q" or len(ref) > 120:
             raise ValueError
         row = conn.execute("""SELECT t.checkpoint_ciphertext FROM assistant_turns t
-            JOIN assistant_sessions s ON s.id=t.session_id WHERE t.id=%s AND s.actor_id=%s""",
+            JOIN assistant_sessions s ON s.id=t.session_id WHERE t.id=%s AND s.actor_id=%s
+            AND t.error_code IS DISTINCT FROM 'cleared'""",
             (UUID(turn_id), actor_id)).fetchone()
         if row:
             from . import summary_dialogues
@@ -234,9 +249,13 @@ def _validate_query(conn, actor_id, context, result, settings):
                 messages=[{**message, "message_ref": source if message.get("message_ref") else None,
                     "evidence_ref": source if message.get("evidence_ref") else None}
                     for message in result["messages"]])
-        assistant_search.validate_result(conn, actor_id, context, restored, settings)
+        metadata = assistant_search.validate_result(conn, actor_id, context, restored, settings)
     else:
-        assistant_queries.validate_result(conn, actor_id, context, result, settings)
+        metadata = assistant_queries.validate_result(conn, actor_id, context, result, settings)
+    if metadata:
+        if result.get("gaps", []) != metadata["gaps"]:
+            result["_coverage_refreshed"] = True
+        result.update(metadata)
 
 
 def _query(conn, actor_id, turn, name, args, settings, context, visible):
@@ -320,14 +339,16 @@ def public_query(result, *, for_model=False):
         groups, conversations = {}, set()
         for gap in value["gaps"]:
             reason = gap if isinstance(gap, str) else gap.get("message") or gap.get("reason") or "资料暂不可读取"
-            group = groups.setdefault(reason, {"chats": set(), "items": 0})
+            group = groups.setdefault(reason, {"chats": {}, "items": 0})
             if isinstance(gap, dict) and gap.get("chat_id"):
-                group["chats"].add(gap["chat_id"])
+                group["chats"][gap["chat_id"]] = gap.get("name") or group["chats"].get(gap["chat_id"]) or "未命名会话"
                 conversations.add(gap["chat_id"])
             else:
                 group["items"] += gap.get("count", 1) if isinstance(gap, dict) else 1
         value["gap_summary"] = [{"reason": reason, "conversations": len(group["chats"]),
-                                 "items": group["items"]} for reason, group in groups.items()]
+                                 "items": group["items"],
+                                 "names": list(group["chats"].values()) if len(group["chats"]) <= 5 else []}
+                                for reason, group in groups.items()]
         value["gap_conversation_count"] = len(conversations)
         value["gaps"] = value["gaps"][:8 if for_model else 25]
     if for_model and value.get("kind") == "message_context":

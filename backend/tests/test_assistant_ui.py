@@ -21,7 +21,7 @@ BACKEND = Path(__file__).parents[1]
 @pytest.fixture
 def api(monkeypatch):
     actor, session, turn = uuid4(), uuid4(), uuid4()
-    state = SimpleNamespace(active=True, submits=[], cancels=[], reads=0)
+    state = SimpleNamespace(active=True, submits=[], cancels=[], reads=0, scope_reads=0)
     view = {"id": str(turn), "session_id": str(session), "client_request_id": str(uuid4()),
             "message": "总结今天上午", "status": "completed", "scope": {"cm_name": "CM"},
             "progress": "", "result": {"answer": "已整理", "events": []}, "error": None}
@@ -46,11 +46,18 @@ def api(monkeypatch):
         state.cancels.append(reference)
         return {**view, "status": "cancelled"}
 
+    def scopes(_conn, current):
+        assert current == actor
+        state.scope_reads += 1
+        return {"scopes": [{"cm_id": str(actor), "cm_name": "CM"}],
+                "selected_cm_id": str(actor), "can_switch_cm": False}
+
     monkeypatch.setattr(routes.assistant, "submit", submit)
     monkeypatch.setattr(routes.assistant, "turn_view", read)
     monkeypatch.setattr(routes.assistant, "cancel", cancel)
     monkeypatch.setattr(routes.assistant, "session_view", lambda *_: {"id": str(session), "turns": [view]})
     monkeypatch.setattr(routes.assistant_tools, "evidence", lambda *_: {"messages": [{"text": "原文"}]})
+    monkeypatch.setattr(routes.assistant_tools, "scopes_for", scopes)
     app = FastAPI()
     app.include_router(routes.create_router(
         current_authorization=lambda _: {"id": actor, "status": "active"} if state.active else None,
@@ -60,6 +67,9 @@ def api(monkeypatch):
 
 
 def test_submission_csrf_json_limit_and_read_only_progress(api):
+    scopes = api.client.get("/assistant/scopes")
+    assert scopes.status_code == 200 and scopes.json()["can_switch_cm"] is False
+    assert api.state.scope_reads == 1 and api.state.submits == api.state.cancels == []
     body = {"session_id": str(api.session), "client_request_id": str(uuid4()), "message": "今天上午"}
     assert api.client.post("/assistant/turns", json=body).status_code == 403
     headers = {"X-CSRF-Token": "fixture-csrf"}
@@ -80,9 +90,10 @@ def test_submission_csrf_json_limit_and_read_only_progress(api):
     assert api.client.get("/assistant/evidence/fixture-ref").json()["messages"] == [{"text": "原文"}]
     api.state.active = False
     for path in (f"/assistant/sessions/{api.session}", f"/assistant/turns/{api.turn}/events",
-                 "/assistant/evidence/fixture-ref"):
+                 "/assistant/evidence/fixture-ref", "/assistant/scopes"):
         denied = api.client.get(path)
         assert denied.status_code == 401 and "原文" not in denied.text
+    assert api.state.scope_reads == 1
 
 
 def test_sse_changes_only_and_revoked_stream_clears_without_cancel(api, monkeypatch):
@@ -130,7 +141,9 @@ const {chromium} = require('playwright');
   const browser = await chromium.launch({headless:true, channel:'chrome'});
   try {
     const page = await browser.newPage({viewport:{width:1280,height:900}});
-    const errors = [], posts = []; let view, html = input.html, failFirstPost = true;
+    const errors = [], posts = [], remiId='22222222-2222-4222-8222-222222222222';
+    let view, html = input.html, failFirstPost = true, scopeReads=0, sessionGone=false, turnsEmpty=false;
+    const ownId=()=>html.match(/data-user-id="([^"]+)"/)[1];
     page.on('pageerror', error => errors.push(error.message));
     await page.addInitScript(() => {
       window.sources = [];
@@ -148,26 +161,40 @@ const {chromium} = require('playwright');
       if (url.pathname.startsWith('/static/')) return route.fulfill({
         contentType:url.pathname.endsWith('.js')?'text/javascript':'text/css',
         body:fs.readFileSync(path.join(input.backend,'app',url.pathname))});
+      if (url.pathname==='/assistant/scopes') {
+        scopeReads++; const owner=ownId()!=='33333333-3333-4333-8333-333333333333';
+        return route.fulfill({json:{scopes:[{cm_id:ownId(),cm_name:'CM'},
+          ...(owner?[{cm_id:remiId,cm_name:'Remi'}]:[])],selected_cm_id:ownId(),can_switch_cm:owner}});
+      }
       if (route.request().method()==='POST') {
         const body=route.request().postDataJSON(); posts.push({url:url.pathname,body});
         assert.equal(route.request().headers()['x-csrf-token'],'fixture-csrf');
         if (url.pathname.endsWith('/cancel')) view={...view,status:'cancelled',result:null};
         else if (view?.client_request_id !== body.client_request_id) view={
           id:require('node:crypto').randomUUID(),session_id:body.session_id,client_request_id:body.client_request_id,
-          message:body.message,status:'queued',scope:{cm_name:'CM'},result:null};
+          message:body.message,status:'queued',scope:{cm_id:body.context.cm_id,
+            cm_name:body.context.cm_id===remiId?'Remi':'CM'},result:null};
         if (failFirstPost) {failFirstPost=false; return route.abort();}
         return route.fulfill({status:202,json:view});
       }
-      if (url.pathname.includes('/sessions/')) return route.fulfill({json:{id:view.session_id,turns:[view]}});
+      if (url.pathname.includes('/sessions/')) return route.fulfill(sessionGone?
+        {status:404,json:{error:'对话不存在或无权查看。'}}:{json:{id:view.session_id,turns:turnsEmpty?[]:[view]}});
       if (url.pathname.includes('/evidence/')) return route.fulfill({json:{messages:[{
         chat_name:'群',sender_name:'达人',time:'2026-10-12T09:00:00Z',
         text:'<img src=x onerror=alert(1)> **本人原文**'}],gaps:[]}});
       return route.abort();
     });
     await page.goto('http://localhost/');
+    assert.equal(scopeReads,0);
     await page.locator('#oa-launcher').click(); await page.locator('#oa-input').fill('总结今天上午');
     await page.locator('#oa-input').press('Enter');
     await page.getByRole('button',{name:'重试提交',exact:true}).waitFor();
+    assert.equal(scopeReads,1);
+    assert.equal(await page.locator('#oa-cm').inputValue(),ownId());
+    assert.equal(await page.locator('#oa-cm').isDisabled(),true);
+    await page.evaluate(value=>{const select=document.getElementById('oa-cm');
+      select.value=value;select.dispatchEvent(new Event('change'));},remiId);
+    assert.equal(await page.locator('#oa-cm').inputValue(),ownId());
     await page.locator('#oa-send').click();
     await page.waitForFunction(() => window.sources.length===1);
     assert.equal(posts.length,2); assert.match(posts[0].body.session_id,/^[0-9a-f-]{36}$/);
@@ -177,7 +204,7 @@ const {chromium} = require('playwright');
       '2. **活动报名**：暂未回复。\n\n<script>bad()</script> [不安全](javascript:alert(1)) ' +
       '[数据](data:text/html;base64,PHNjcmlwdD4=)\n`**原样代码**`\n\n- 核对群聊\n- 联系同事',
       events:[{event_ref:'ref',title:'样品进展',creator_handle:'fixture',
-      handling_status:'unresolved',evidence_ref:'ref'}],scope:{cm_name:'CM',audience:'all',creator_ids:null},
+      handling_status:'unresolved',evidence_ref:'ref'}],scope:{cm_id:ownId(),cm_name:'CM',audience:'all',creator_ids:null},
       window:{start:'2026-10-12T07:00:00Z',end:'2026-10-12T11:00:00Z'},
       draft:{draft:'**I will check.**',chinese_translation:'我会核对。',language:'en'},
       data:[{kind:'window_messages',scope:{audience:'all'},total_messages:20,
@@ -185,7 +212,8 @@ const {chromium} = require('playwright');
           text:'<script>source()</script> **本人原文**',evidence_ref:'raw-ref'}],coverage:{source_complete:false},
         gaps:Array.from({length:25},(_,i)=>({chat_id:`chat-${i}`,reason:'历史同步未覆盖检索起点'})),
         gap_count:1273,gap_conversation_count:1272,gap_summary:[
-          {reason:'历史同步未覆盖检索起点',conversations:1272,items:0},
+          {reason:'历史同步未覆盖检索起点',conversations:1272,items:0,
+            names:['受限群一','<img src=x onerror=alert(1)>','群三','群四','群五']},
           {reason:'附件正文不可读取',conversations:0,items:5}]}]};
     view={...view,status:'completed',result};
     await page.evaluate(value => {
@@ -207,8 +235,12 @@ const {chromium} = require('playwright');
     assert.equal(await page.locator('.oa-data details.oa-coverage').getAttribute('open'),null);
     assert.equal(await page.locator('.oa-data .oa-gaps summary').textContent(),
       '部分资料尚不完整 · 1272 个会话 · 5 项记录');
-    assert.deepEqual(await page.locator('.oa-data .oa-gaps div').allTextContents(),[
-      '历史同步未覆盖检索起点 · 1272 个会话','附件正文不可读取 · 5 项记录']);
+    assert.equal(await page.locator('.oa-data .oa-gaps > div').count(),2);
+    assert.match(await page.locator('.oa-data .oa-gaps > div').first().textContent(),
+      /历史同步未覆盖检索起点 · 1272 个会话.*另有 1267 个会话/);
+    assert.equal(await page.locator('.oa-data .oa-gap-names').textContent(),
+      '会话：受限群一、<img src=x onerror=alert(1)>、群三、群四、群五；另有 1267 个会话');
+    assert.equal(await page.locator('.oa-data .oa-gaps img').count(),0);
     assert.equal(await page.locator('.oa-hit strong, .oa-hit a').count(),0);
     assert.match(await page.locator('.oa-hit').textContent(),/\*\*本人原文\*\*/);
     assert.equal(await page.locator('.oa-draft textarea').inputValue(),'**I will check.**');
@@ -223,19 +255,55 @@ const {chromium} = require('playwright');
     assert.equal(posts.length,2);
     await page.reload(); await page.locator('#oa-launcher').click(); await page.locator('.oa-event').waitFor();
     assert.equal(posts.length,2);
-    await page.locator('#oa-input').fill('再看最新进展'); await page.locator('#oa-input').press('Enter');
+    await page.locator('#oa-input').fill('再看最新进展');
+    await page.locator('.oa-event .oa-evidence').click(); await page.locator('#oa-sources-body blockquote').waitFor();
+    await page.locator('#oa-cm').selectOption(remiId);
+    assert.equal(await page.locator('#oa-input').inputValue(),'再看最新进展');
+    assert.equal(await page.locator('.oa-event, .oa-draft, .oa-data').count(),0);
+    assert.equal(await page.locator('#oa-sources').isHidden(),true);
+    assert.equal(posts.length,2);
+    await page.locator('#oa-input').press('Enter');
     await page.waitForFunction(() => window.sources.length===1); assert.equal(posts.length,3);
+    assert.notEqual(posts[2].body.session_id,posts[0].body.session_id);
+    assert.equal(posts[2].body.context.cm_id,remiId);
+    assert.equal(posts[2].body.context.audience,'all');
+    assert.equal(posts[2].body.context.creator_ids,null);
+    assert.equal(await page.locator('#oa-cm').isDisabled(),true);
     await page.locator('#oa-stop').click(); await page.waitForFunction(() => document.getElementById('oa-stop').hidden);
     assert.equal(posts.length,4); assert(posts[3].url.endsWith('/cancel'));
+    await page.locator('#oa-input').fill('再查一次'); await page.locator('#oa-input').press('Enter');
+    await page.waitForFunction(()=>window.sources.length===2); assert.equal(posts.length,5);
+    view={...view,status:'completed',result:{...result,scope:{cm_id:remiId,cm_name:'Remi',audience:'creators',
+      creator_ids:['44444444-4444-4444-8444-444444444444'],event_ref:'old-event',event_title:'旧事项'}}};
+    await page.evaluate(value=>window.sources.at(-1).emit('result',value),view.result);
+    assert.match(await page.locator('#oa-scope').textContent(),/旧事项/);
+    await page.locator('.oa-event .oa-evidence').click(); await page.locator('#oa-sources-body blockquote').waitFor();
+    turnsEmpty=true;
+    await page.evaluate(()=>window.sources.at(-1).dispatchEvent(new Event('error')));
+    await page.waitForFunction(()=>document.getElementById('oa-stop').hidden);
+    assert.equal(await page.locator('.oa-event, .oa-draft, .oa-data').count(),0);
+    assert.equal(await page.locator('#oa-sources').isHidden(),true);
+    assert.match(await page.locator('#oa-scope').textContent(),/Remi.*全部授权消息/);
+    assert.doesNotMatch(await page.locator('#oa-scope').textContent(),/旧事项/);
+    assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('ttmedia.assistant.'+
+      document.getElementById('operations-assistant').dataset.userId)).session_id),posts[4].body.session_id);
+    assert.equal(posts.length,5);
     await page.locator('#oa-fullscreen').click();
     assert.equal(await page.locator('#oa-panel').getAttribute('aria-modal'),'true');
     await page.locator('#oa-input').press('Escape');
     assert.equal(await page.locator('#oa-panel').getAttribute('aria-modal'),'false');
     const previous = await page.evaluate(() => JSON.parse(localStorage.getItem('ttmedia.assistant.'+
       document.getElementById('operations-assistant').dataset.userId)).session_id);
+    sessionGone=true; await page.reload(); await page.locator('#oa-launcher').click();
+    await page.waitForFunction(()=>document.getElementById('oa-status').textContent.includes('上次会话已不可读取'));
+    assert.equal(await page.locator('#oa-cm').isDisabled(),false);
+    assert.equal(posts.length,5);
     html=html.replace(/data-user-id="[^"]+"/,'data-user-id="33333333-3333-4333-8333-333333333333"');
     const reads=[]; page.on('request',request => {if(request.url().includes('/sessions/')) reads.push(request.url());});
     await page.reload(); await page.locator('#oa-launcher').click();
+    await page.waitForFunction(()=>document.getElementById('oa-cm').options.length===1);
+    assert.equal(await page.locator('#oa-person').isHidden(),true);
+    assert.equal(await page.locator('#oa-cm').inputValue(),ownId());
     assert.equal(await page.locator('.oa-event').count(),0); assert(!reads.some(url=>url.includes(previous)));
     assert.deepEqual(errors,[]); console.log('assistant browser workflow passed');
   } finally {await browser.close();}

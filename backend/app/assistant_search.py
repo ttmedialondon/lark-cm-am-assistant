@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import re
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -33,6 +34,7 @@ _BASE_SQL = core._MESSAGE_SQL.split("    ORDER BY", 1)[0].replace(
     "      AND o.observed_at"
 )
 _ORDER = " ORDER BY m.message_create_time DESC,m.chat_id DESC,m.message_id DESC LIMIT %s FOR SHARE OF m,o,ac,c"
+_CHAT_SQL = core._CHAT_SQL.replace("ac.sync_status,", "ac.sync_status,ac.last_error,")
 
 
 def _cipher(settings):
@@ -84,7 +86,7 @@ def _scope(conn, actor_id, context, creator_ids, chat_ids, settings, audience="c
     cm = authorize_all(conn, actor_id, cm_id) if audience == "all" else core._authorize(
         conn, actor_id, cm_id=cm_id)[0]
     if audience == "all":
-        chats = conn.execute(core._CHAT_SQL + " ORDER BY c.chat_id", (cm_id,)).fetchall()
+        chats = conn.execute(_CHAT_SQL + " ORDER BY c.chat_id", (cm_id,)).fetchall()
         roster, speakers, selected = [], None, None
     else:
         roster = core._roster(conn, cm_id)
@@ -195,15 +197,23 @@ def _coverage(chats, start, end):
                                             and chat["backfill_window_start_at"] > start):
             reasons.append("历史同步未覆盖检索起点")
         if chat["sync_status"] == "not_readable":
-            reasons.append("Lark未允许读取")
+            reasons.append(unreadable_reason(chat))
         elif chat["sync_status"] not in {"succeeded", "syncing"}:
             reasons.append("同步尚未成功")
         if chat["sync_status"] != "not_readable" and (not watermark or watermark < end):
             reasons.append("同步尚未覆盖检索截止")
-        sources.append({"chat_id": chat["chat_id"], "last_sync_at": watermark.isoformat() if watermark else None,
+        sources.append({"chat_id": chat["chat_id"], "name": chat["name"] or "未命名会话",
+                        "last_sync_at": watermark.isoformat() if watermark else None,
                         "source_complete": not reasons})
-        gaps.extend({"chat_id": chat["chat_id"], "reason": reason} for reason in reasons)
+        gaps.extend({"chat_id": chat["chat_id"], "name": chat["name"] or "未命名会话", "reason": reason}
+                    for reason in reasons)
     return sources, gaps
+
+
+def unreadable_reason(chat):
+    reason = chat.get("last_error") or ""
+    return reason if reason == "群开启受限模式，Lark禁止读取消息（231203）" or re.fullmatch(
+        r"Lark暂不允许读取此会话消息(?:（错误码 [0-9]{1,10}）)?", reason) else "Lark未允许读取"
 
 
 def _scope_version(cm, roster, chats, selected, audience="creators"):
@@ -329,7 +339,7 @@ def validate_result(conn, actor_id, context, result, settings):
         if ([gap for gap in result.get("gaps", []) if not gap.get("chat_id")]
                 != [gap for gap in fresh.get("gaps", []) if not gap.get("chat_id")]):
             raise ValueError("引用消息的可读上下文已变化。")
-        return
+        return {key: fresh[key] for key in ("sources", "gaps", "context_complete")}
     value = _open(result.get("snapshot"), "s.", settings)
     if value.get("actor_id") != str(actor_id) or context["scope"]["cm_id"] != value.get("cm_id"):
         raise PermissionError("检索结果不属于当前账号或范围。")
@@ -361,6 +371,11 @@ def validate_result(conn, actor_id, context, result, settings):
             raise PermissionError("命中消息已删除或当前授权无法读取。")
         if _version(rows[0]) != ref.get("version"):
             raise ValueError("命中消息已更新，请重新检索。")
+    sources, gaps = _coverage(chats, start, end)
+    gaps.extend(gap for gap in result.get("gaps", []) if not gap.get("chat_id"))
+    return {"sources": sources, "gaps": gaps,
+            "coverage": {**result.get("coverage", {}),
+                         "source_complete": (bool(chats) or audience == "all") and not gaps}}
 
 
 def read(conn, actor_id, context, args, settings):

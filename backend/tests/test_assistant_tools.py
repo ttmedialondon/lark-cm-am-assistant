@@ -219,13 +219,47 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
         assert public["gap_count"] == 33 and public["gap_conversation_count"] == 30
         assert len(public["gaps"]) == sample_size
         assert public["gap_summary"] == [
-            {"reason": "历史回填尚未完成", "conversations": 30, "items": 0},
-            {"reason": "同步水位未覆盖请求截止", "conversations": 1, "items": 0},
-            {"reason": "本页存在不可读正文或附件", "conversations": 0, "items": 6},
+            {"reason": "历史回填尚未完成", "conversations": 30, "items": 0, "names": []},
+            {"reason": "同步水位未覆盖请求截止", "conversations": 1, "items": 0, "names": ["未命名会话"]},
+            {"reason": "本页存在不可读正文或附件", "conversations": 0, "items": 6, "names": []},
         ]
+    pg.execute("""UPDATE authorization_chats SET sync_status='not_readable',
+        last_error='群开启受限模式，Lark禁止读取消息（231203）' WHERE authorization_id=%s AND chat_id='business'""",
+        (s.ids["cm"],))
+    blocked = run("summarize_messages", {**all_args, "chat_ids": ["business"]})
+    restricted = tools.public_query(blocked)
+    assert restricted["gap_summary"] == [{"reason": "群开启受限模式，Lark禁止读取消息（231203）",
+                                           "conversations": 1, "items": 0, "names": ["business"]}]
+    assert blocked["messages"] == []
+    assert assistant_search.unreadable_reason({"last_error": "Lark暂不允许读取此会话消息（错误码 230001）"}) == (
+        "Lark暂不允许读取此会话消息（错误码 230001）")
+    assert assistant_search.unreadable_reason({"last_error": "private provider response"}) == "Lark未允许读取"
+    results.remove(blocked)
     pg.execute("""UPDATE authorization_chats SET backfill_complete=TRUE,backfill_window_start_at=%s,
-        sync_status='succeeded',last_incremental_at=%s WHERE authorization_id=%s AND chat_id='business'""",
+        sync_status='succeeded',last_incremental_at=%s,last_error=NULL
+        WHERE authorization_id=%s AND chat_id='business'""",
         (s.start - timedelta(days=9), s.end, s.ids["cm"]))
+    # Refresh saved coverage only; source text, counts and the paid answer stay unchanged.
+    saved = all_pages[0]
+    saved["gaps"] = [{"chat_id": "business", "reason": "历史同步未覆盖检索起点"},
+                     {"reason": "本页存在不可读正文或附件", "count": 1}]
+    saved["coverage"]["source_complete"] = False
+    original_fields = json.dumps({key: saved[key] for key in (
+        "messages", "total_messages", "total_conversations", "query_ref", "snapshot", "checked_at")})
+    saved_final = {**final, "answer": "历史回答保持原样。", "data_refs": [saved["query_ref"]]}
+    repaired = tools.build_result(pg, s.ids["cm"], turn, saved_final, s.settings, context, [saved])
+    assert repaired["answer"] == saved_final["answer"] and saved["_coverage_refreshed"]
+    assert repaired["data"][0]["gaps"] == [{"reason": "本页存在不可读正文或附件", "count": 1}]
+    assert repaired["data"][0]["coverage"]["source_complete"] is False
+    assert json.dumps({key: saved[key] for key in (
+        "messages", "total_messages", "total_conversations", "query_ref", "snapshot", "checked_at")}) == original_fields
+    assert "_coverage_refreshed" not in repaired["data"][0]
+    saved_stats = run("activity_stats", all_stats_args)
+    saved_stats["gaps"].append({"chat_id": "business", "reason": "历史同步未覆盖检索起点"})
+    metrics = dict(saved_stats["metrics"])
+    tools.validate_tool_results(pg, s.ids["cm"], turn, [saved_stats], s.settings, context)
+    assert saved_stats["metrics"] == metrics and saved_stats["_coverage_refreshed"]
+    assert not any(gap.get("chat_id") == "business" for gap in saved_stats["gaps"])
     pinned_context = tools.current_context(pg, s.ids["cm"], {
         "creator_ids": [str(s.ids["person"])], "chat_ids": ["category"], "audience": "creators",
     }, s.settings)
@@ -256,7 +290,11 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
     assert empty["messages"] == [] and empty["next_cursor"] is None and empty["gaps"] == []
     pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-manage')",
                (s.ids["reviewer"],))
-    manager_context = tools.current_context(pg, s.ids["reviewer"], {"cm_id": str(s.ids["cm"])}, s.settings)
+    with pytest.raises(PermissionError):
+        tools.current_context(pg, s.ids["reviewer"], {"cm_id": str(s.ids["cm"])}, s.settings)
+    manager_context = tools.current_context(pg, s.ids["reviewer"], {
+        "cm_id": str(s.ids["cm"]), "audience": "creators",
+    }, s.settings)
     with pytest.raises(PermissionError):
         tools.execute(pg, s.ids["reviewer"], turn, "summarize_messages", all_args, s.settings, manager_context)
     with pytest.raises(PermissionError):

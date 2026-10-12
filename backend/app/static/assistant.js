@@ -12,9 +12,11 @@
     completed: "已完成", cancelled: "已停止", failed: "这次未能完成", unknown: "请求结果尚未确认，请勿重复提交"};
   let saved = {}, active = null, source = null, submitting = false, restoring = false, denied = false;
   let pending = null, pendingScopeVersion = null, restoreTimer = null, revision = 0, sourceVersion = 0, sourceFocus = null, followBottom = true;
+  let cmScopes = [], scopesReady = false, scopeRequest = null;
   try { saved = JSON.parse(localStorage.getItem(storageKey) || "{}"); } catch { /* IDs can remain in memory. */ }
   if (!saved || typeof saved !== "object" || !uuid.test(saved.session_id || "")) saved = {};
   if (saved.client_request_id && !uuid.test(saved.client_request_id)) delete saved.client_request_id;
+  if (saved.cm_id && !uuid.test(saved.cm_id)) delete saved.cm_id;
   const pageContext = JSON.parse($("oa-page-context").textContent);
   let activeContext = {...pageContext}, contextChosen = false, scopeVersion = 0, currentScopeTurn = null;
   $("oa-page-context").textContent = "";
@@ -85,12 +87,13 @@
     $("oa-status").classList.toggle("is-error", error);
   }
   function controls() {
-    const busy = submitting || restoring || Boolean(active);
+    const busy = !scopesReady || submitting || restoring || Boolean(active);
     $("oa-send").disabled = denied || busy || !input.value.trim();
     $("oa-send").textContent = saved.client_request_id && !busy ? "重试提交" : "发送 ↑";
     $("oa-stop").hidden = !active;
     $("oa-stop").disabled = false;
-    $("oa-new").disabled = busy;
+    $("oa-new").disabled = denied || busy || Boolean(saved.client_request_id);
+    $("oa-cm").disabled = denied || busy || Boolean(saved.client_request_id);
     input.disabled = denied || submitting;
     $("oa-composer-note").textContent = active ? "可以继续输入，完成后发送" : "Enter 发送 · Shift + Enter 换行";
     for (const button of app.querySelectorAll("[data-prompt], [data-ask]")) button.disabled = denied || busy || Boolean(saved.client_request_id);
@@ -102,6 +105,7 @@
     closeSources(false);
     delete saved.client_request_id; persist();
     history.replaceChildren(node("p", "oa-answer", "登录或查看权限已变化，请重新登录后打开助手。"));
+    cmScopes = []; scopesReady = false; $("oa-cm").replaceChildren(); $("oa-person").hidden = true;
     $("oa-scope").replaceChildren(); $("oa-scope").hidden = true;
     input.value = ""; controls();
   }
@@ -120,6 +124,49 @@
       throw error;
     }
     return value;
+  }
+  async function loadScopes() {
+    if (denied) return false;
+    if (scopesReady) return true;
+    if (scopeRequest) return scopeRequest;
+    scopeRequest = (async () => {
+      try {
+        const value = await request("/scopes");
+        if (denied) return false;
+        cmScopes = value.scopes || [];
+        const selected = (saved.client_request_id && cmScopes.find(person => person.cm_id === saved.cm_id)) ||
+          cmScopes.find(person => person.cm_id === pageContext.cm_id) ||
+          cmScopes.find(person => person.cm_id === value.selected_cm_id);
+        if (!selected) { status("暂无可查看的已授权人员。", true); return false; }
+        $("oa-cm").replaceChildren(...cmScopes.map(person => {
+          const option = node("option", "", person.cm_name || "未命名人员"); option.value = person.cm_id; return option;
+        }));
+        $("oa-person").hidden = value.can_switch_cm !== true;
+        if (activeContext.cm_id !== selected.cm_id) activeContext = {audience: "all", creator_ids: null};
+        activeContext.cm_id = selected.cm_id; activeContext.cm_name = selected.cm_name;
+        activeContext.audience ||= "all";
+        $("oa-cm").value = selected.cm_id; scopesReady = true;
+        scope({}); await restore(); return scopesReady && !denied;
+      } catch (error) { if (!denied) status(error.message, true); return false; }
+      finally { scopeRequest = null; controls(); }
+    })();
+    return scopeRequest;
+  }
+  function resetSession(person, keepInput = false) {
+    revision++; source?.close(); source = null; clearTimeout(restoreTimer);
+    saved = {cm_id: person.cm_id}; pending = null; pendingScopeVersion = null; persist();
+    activeContext = {}; selectContext({...person, audience: "all", creator_ids: null}); currentScopeTurn = null;
+    $("oa-cm").value = person.cm_id;
+    closeSources(false); $("oa-new-result").hidden = true;
+    history.replaceChildren(node("p", "oa-answer", "开始一个新问题。"));
+    scope({}); status(""); if (!keepInput) input.value = ""; controls();
+  }
+  function switchCM(cmId) {
+    if (denied || !scopesReady || active || submitting || restoring || saved.client_request_id) return false;
+    const person = cmScopes.find(person => person.cm_id === cmId);
+    if (!person) { status("没有该人员的查看权限。", true); return false; }
+    if (person.cm_id !== activeContext.cm_id) resetSession(person, true);
+    return true;
   }
   function date(value) {
     if (!value || Number.isNaN(new Date(value).getTime())) return "";
@@ -184,12 +231,16 @@
       const reasons = new Map(), conversations = new Set();
       for (const gap of Array.isArray(values) ? values : []) {
         const reason = typeof gap === "string" ? gap : gap.message || gap.reason || "资料暂不可读取";
-        if (!reasons.has(reason)) reasons.set(reason, {reason, chats: new Set(), items: 0});
+        if (!reasons.has(reason)) reasons.set(reason, {reason, chats: new Set(), names: new Set(), items: 0});
         const group = reasons.get(reason);
-        if (gap.chat_id) { group.chats.add(gap.chat_id); conversations.add(gap.chat_id); }
+        if (gap.chat_id) {
+          group.chats.add(gap.chat_id); conversations.add(gap.chat_id);
+          if (gap.name || gap.conversation_name) group.names.add(gap.name || gap.conversation_name);
+        }
         else group.items += Number.isFinite(gap.count) && gap.count > 0 ? gap.count : 1;
       }
-      groups = [...reasons.values()].map(group => ({reason: group.reason, conversations: group.chats.size, items: group.items}));
+      groups = [...reasons.values()].map(group => ({reason: group.reason, conversations: group.chats.size,
+        names: [...group.names].slice(0, 5), items: group.items}));
       conversationCount = conversations.size;
     }
     if (!groups.length) return null;
@@ -198,8 +249,12 @@
     const details = node("details", "oa-gaps"), items = groups.reduce((total, group) => total + (group.items || 0), 0);
     const total = counts(conversationCount, items);
     details.append(node("summary", "", `部分资料尚不完整${total ? ` · ${total}` : ""}`));
-    for (const group of groups) details.append(node("div", "", [group.reason || "资料暂不可读取",
-      counts(group.conversations, group.items)].filter(Boolean).join(" · ")));
+    for (const group of groups) {
+      const row = node("div", "", [group.reason || "资料暂不可读取", counts(group.conversations, group.items)].filter(Boolean).join(" · "));
+      const names = (group.names || []).slice(0, 5), remaining = (group.conversations || 0) - names.length;
+      if (names.length) row.append(node("p", "oa-gap-names", `会话：${names.join("、")}${remaining > 0 ? `；另有 ${remaining} 个会话` : ""}`));
+      details.append(row);
+    }
     return details;
   }
   function sourceLayout() {
@@ -526,17 +581,36 @@
       if (denied || version !== revision) return;
       const turns = value.turns || [];
       const latest = turns.at(-1);
+      const latestScope = latest?.result?.scope || latest?.scope;
+      const sessionCM = latestScope?.cm_id || saved.cm_id;
+      const running = turns.find(view => !terminal.has(view.status));
+      const unconfirmed = saved.client_request_id && !turns.some(view => view.client_request_id === saved.client_request_id);
+      if (turns.length && sessionCM && sessionCM !== activeContext.cm_id) {
+        if (running || unconfirmed) {
+          const person = cmScopes.find(person => person.cm_id === sessionCM);
+          if (!person) { clearProtected(); return; }
+          selectContext({...person, audience: "all", creator_ids: null}); $("oa-cm").value = person.cm_id;
+        } else { resetSession(cmScopes.find(person => person.cm_id === activeContext.cm_id), true); return; }
+      }
+      if (!turns.length) {
+        closeSources(false); currentScopeTurn = null;
+        history.replaceChildren(node("p", "oa-answer", "开始一个新问题。"));
+        selectContext({cm_id: activeContext.cm_id, cm_name: activeContext.cm_name, audience: "all", creator_ids: null}); scope({});
+        if (!saved.client_request_id) status("");
+      }
+      saved.cm_id = activeContext.cm_id; persist();
       const restoreScope = !contextChosen && readScopeVersion === scopeVersion &&
         !["creator_ids", "chat_ids", "event_ref"].some(key => pageContext[key]);
-      const latestScope = latest?.result?.scope || latest?.scope;
-      if (restoreScope && latestScope?.cm_id === pageContext.cm_id) selectContext(latestScope, false);
+      if (restoreScope && latestScope?.cm_id === activeContext.cm_id) selectContext(latestScope, false);
       if (latest) adoptTurnScope(latest);
-      for (const view of turns) turn(view);
+      for (const view of turns) {
+        const cmId = view.result?.scope?.cm_id || view.scope?.cm_id || sessionCM;
+        if (!cmId || cmId === activeContext.cm_id || view.error_code === "permission") turn(view);
+      }
       if (denied) return;
       if (turns.some(view => view.client_request_id === saved.client_request_id)) {
         delete saved.client_request_id; pending = null; persist();
       }
-      const running = turns.find(view => !terminal.has(view.status));
       if (running) watch(running, restoreScope ? scopeVersion : null);
       else { source?.close(); source = null; active = null; controls(); }
       if (saved.client_request_id) status("上次提交尚未确认，重新输入后重试会复用原请求编号。", true);
@@ -545,14 +619,19 @@
     } catch (error) {
       if (denied || version !== revision) return;
       if (error.status === 404 && !saved.client_request_id) { saved = {}; persist(); }
-      status(error.status === 404 ? "上次请求尚未保存，可重新输入并提交。" : error.message, true);
+      if (error.status !== 404) scopesReady = false;
+      status(error.status === 404 ? (saved.client_request_id ? "上次请求尚未保存，可重新输入并提交。" :
+        "上次会话已不可读取，可开始新对话。") : error.message, true);
     } finally { restoring = false; controls(); }
   }
   async function ask(text, selectedContext = {}) {
     if (denied || active || submitting || restoring) return;
+    if (!await loadScopes() || denied || active || submitting || restoring) return;
+    if (selectedContext.cm_id && !switchCM(selectedContext.cm_id)) return;
     text = text.trim(); if (!text) return;
     if (!saved.session_id) saved.session_id = crypto.randomUUID();
     if (!saved.client_request_id) saved.client_request_id = crypto.randomUUID();
+    saved.cm_id = activeContext.cm_id;
     if (!pending) {
       selectContext(selectedContext); scope({});
       pendingScopeVersion = scopeVersion;
@@ -582,6 +661,7 @@
     if (matchMedia("(max-width: 600px)").matches) fullscreen(true);
     if (followBottom) scrollToBottom();
     if ($("oa-sources").hidden) input.focus(); else $("oa-sources-close").focus();
+    void loadScopes();
   }
   function collapse() {
     panel.hidden = true; $("oa-launcher").hidden = false; $("oa-launcher").setAttribute("aria-expanded", "false");
@@ -597,13 +677,13 @@
   $("oa-launcher").addEventListener("click", open);
   $("oa-collapse").addEventListener("click", collapse);
   $("oa-fullscreen").addEventListener("click", () => fullscreen(!panel.classList.contains("is-fullscreen")));
+  $("oa-cm").addEventListener("change", () => {
+    if (!switchCM($("oa-cm").value)) $("oa-cm").value = activeContext.cm_id || "";
+    else input.focus();
+  });
   $("oa-new").addEventListener("click", () => {
-    if (active || submitting) return;
-    revision++; source?.close(); source = null; saved = {}; pending = null; persist();
-    activeContext = {...pageContext}; contextChosen = false; scopeVersion++; currentScopeTurn = null;
-    closeSources(false); $("oa-new-result").hidden = true;
-    history.replaceChildren(node("p", "oa-answer", "开始一个新问题。"));
-    scope({}); status(""); input.value = ""; controls(); input.focus();
+    if (denied || !scopesReady || active || submitting || restoring || saved.client_request_id) return;
+    resetSession(cmScopes.find(person => person.cm_id === activeContext.cm_id)); input.focus();
   });
   $("oa-form").addEventListener("submit", event => { event.preventDefault(); void ask(input.value); });
   input.addEventListener("input", controls);
@@ -627,7 +707,7 @@
       else collapse();
     }
     if (event.key !== "Tab" || !panel.classList.contains("is-fullscreen")) return;
-    const elements = [...panel.querySelectorAll("button:not(:disabled), textarea:not(:disabled), summary, a[href], [tabindex='0']")]
+    const elements = [...panel.querySelectorAll("button:not(:disabled), select:not(:disabled), textarea:not(:disabled), summary, a[href], [tabindex='0']")]
       .filter(element => element.getClientRects().length && !element.closest("[inert]"));
     const first = elements[0], last = elements.at(-1);
     if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
@@ -642,18 +722,20 @@
   window.addEventListener("resize", () => {
     if (matchMedia("(max-width: 600px)").matches) fullscreen(true); else sourceLayout();
   });
-  document.addEventListener("ttmedia:assistant", event => {
+  document.addEventListener("ttmedia:assistant", async event => {
     const detail = event.detail;
     if (!detail || denied) return;
     const context = detail.context && typeof detail.context === "object" && !Array.isArray(detail.context) ? detail.context : {};
-    if (typeof detail.message !== "string" || !detail.message.trim()) { selectContext(context); scope({}); return; }
     open();
+    if (!await loadScopes()) return;
     if (active || submitting || restoring) { status("当前问题还在处理，完成后请再查看。"); return; }
     if (saved.client_request_id) { status("上次提交尚未确认，请先恢复或重试原请求。", true); return; }
+    if (context.cm_id && !switchCM(context.cm_id)) return;
+    if (typeof detail.message !== "string" || !detail.message.trim()) { selectContext(context); scope({}); return; }
     input.value = detail.message; controls();
     void ask(detail.message, context);
   });
   window.addEventListener("pagehide", () => { source?.close(); clearTimeout(restoreTimer); });
   if (app.dataset.configured !== "true") status("助手尚未配置，请联系管理员。", true);
-  scope({}); controls(); void restore();
+  scope({}); controls();
 })();

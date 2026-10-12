@@ -810,6 +810,75 @@ def test_all_due_accounts_rotate_through_three_page_slots_and_resume_cursors(pg,
     assert seen == {actor for _job, actor in jobs}
     assert resumed
 
+    monkeypatch.setattr(worker, "get_settings", lambda: SimpleNamespace(sync_interval_seconds=300))
+    job = next(job for job in worker._running_jobs() if job.authorization_id == jobs[-1][1])
+    authorization = {"open_id": "ou_fair_7", "body_consent_at": None}
+    pg.execute("INSERT INTO chats(chat_id,chat_status) VALUES('oc_restricted','normal')")
+    pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,backfill_complete,
+               last_backfill_at,last_incremental_at,sync_status,incremental_job_id,incremental_page_token,
+               incremental_window_start_at,incremental_window_end_at)
+               VALUES(%s,'oc_restricted',TRUE,NOW()-INTERVAL '2 days',NOW()-INTERVAL '1 day','succeeded',
+                      %s,'keep-page-2',NOW()-INTERVAL '1 day',NOW())""", (job.authorization_id, job.id))
+    before = pg.execute("SELECT * FROM authorization_chats WHERE chat_id='oc_restricted'").fetchone()
+    claim = worker._claim_next_page(job, authorization, settings)
+    assert claim.chat_id == "oc_restricted" and claim.expected_page_token == "keep-page-2"
+    error = worker.LarkApiError(403, 231203, "Restricted Mode; raw_private_value must not be persisted")
+    worker._handle_claim_api_error(claim, error)
+    blocked = pg.execute("SELECT * FROM authorization_chats WHERE chat_id='oc_restricted'").fetchone()
+    assert blocked["sync_status"] == "not_readable"
+    assert blocked["last_error"] == "群开启受限模式，Lark禁止读取消息（231203）"
+    assert blocked["page_claim_id"] is None
+    assert blocked["page_retry_at"] == pg.execute("SELECT NOW()+INTERVAL '1 day' AS due").fetchone()["due"]
+    for field in ("backfill_complete", "last_backfill_at", "last_incremental_at", "incremental_page_token",
+                  "incremental_window_start_at", "incremental_window_end_at"):
+        assert blocked[field] == before[field]
+    assert pg.execute("SELECT status FROM authorizations WHERE id=%s", (job.authorization_id,)).fetchone()[
+        "status"] == "active"
+    assert not worker._has_claimable_page_in_connection(pg, job)
+    assert not worker._yield_job_to_retry_if_idle(pg, job)
+    worker._finish_and_schedule_incremental(job)
+    assert pg.execute("SELECT status FROM sync_jobs WHERE id=%s", (job.id,)).fetchone()["status"] == "succeeded"
+    following = pg.execute("SELECT * FROM sync_jobs WHERE authorization_id=%s AND status='queued'",
+                           (job.authorization_id,)).fetchone()
+    assert following["scheduled_at"] == pg.execute("SELECT NOW()+INTERVAL '300 seconds' AS due").fetchone()["due"]
+    pg.execute("""UPDATE sync_jobs SET status='running',discovery_status='succeeded',
+               lease_until=NOW()+INTERVAL '10 minutes' WHERE id=%s""", (following["id"],))
+    next_job = next(job for job in worker._running_jobs() if job.id == following["id"])
+    # Legacy rows without a retry time are rechecked once, not permanently skipped.
+    pg.execute("UPDATE authorization_chats SET page_retry_at=NULL WHERE chat_id='oc_restricted'")
+    recovered = worker._claim_next_page(next_job, authorization, settings)
+    assert recovered.chat_id == "oc_restricted" and recovered.mode == "incremental"
+    assert recovered.start_at == before["last_incremental_at"] - worker.timedelta(seconds=600)
+    pending = pg.execute("SELECT * FROM authorization_chats WHERE chat_id='oc_restricted'").fetchone()
+    assert pending["sync_status"] == "not_readable" and pending["last_error"] == blocked["last_error"]
+    worker._handle_claim_api_error(claim, error)  # A late failure cannot replace the new lease.
+    assert pg.execute("SELECT page_claim_id FROM authorization_chats WHERE chat_id='oc_restricted'").fetchone()[
+        "page_claim_id"] == recovered.claim_id
+    assert worker._record_claimed_page(recovered, [], None, None).committed
+    restored = pg.execute("SELECT * FROM authorization_chats WHERE chat_id='oc_restricted'").fetchone()
+    assert restored["sync_status"] == "succeeded" and restored["last_error"] is None
+    assert restored["page_retry_at"] is None and restored["incremental_page_token"] is None
+
+    # A denied initial backfill keeps its original cursor without falsely completing history.
+    pg.execute("INSERT INTO chats(chat_id,chat_status) VALUES('oc_backfill_denied','normal')")
+    pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,backfill_page_token,
+               backfill_window_start_at,backfill_window_end_at)
+               VALUES(%s,'oc_backfill_denied','keep-history-page',NOW()-INTERVAL '7 days',NOW())""",
+               (job.authorization_id,))
+    denied = worker._claim_next_page(next_job, authorization, settings)
+    assert denied.mode == "backfill" and denied.expected_page_token == "keep-history-page"
+    worker._handle_claim_api_error(denied, worker.LarkApiError(400, 231203, "Other refusal; private raw body"))
+    denied_row = pg.execute("SELECT * FROM authorization_chats WHERE chat_id='oc_backfill_denied'").fetchone()
+    assert not denied_row["backfill_complete"] and denied_row["backfill_page_token"] == "keep-history-page"
+    assert denied_row["last_error"] == "Lark暂不允许读取此会话消息（错误码 231203）"
+    assert not worker._has_pending_backfill_in_connection(pg, job.authorization_id)
+    assert worker._select_backfill_chat_for_claim(pg, job.authorization_id) is None
+    worker._finish_and_schedule_incremental(next_job)
+    assert pg.execute("SELECT status FROM sync_jobs WHERE id=%s", (next_job.id,)).fetchone()["status"] == "succeeded"
+    pg.execute("UPDATE authorization_chats SET page_retry_at=NOW() WHERE chat_id='oc_backfill_denied'")
+    assert worker._has_pending_backfill_in_connection(pg, job.authorization_id)
+    assert worker._select_backfill_chat_for_claim(pg, job.authorization_id)["chat_id"] == "oc_backfill_denied"
+
 
 def test_discovery_is_single_flight_and_does_not_block_page_reaping(monkeypatch):
     settings = SimpleNamespace(worker_idle_seconds=3, token_encryption_key=b"r" * 32)

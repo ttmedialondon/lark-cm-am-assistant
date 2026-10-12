@@ -985,7 +985,9 @@ def _mark_one_member_snapshot_unavailable() -> None:
 
 
 def _handle_claim_api_error(claim: PageClaim, exc: LarkApiError) -> None:
-    if exc.likely_auth_problem:
+    if exc.lark_code == 231203:
+        _mark_chat_not_readable(claim, code=exc.lark_code, restricted="restricted mode" in str(exc).lower())
+    elif exc.likely_auth_problem:
         _mark_attention(claim.job, "Lark authorization or permission needs attention.", claim=claim)
     elif exc.retryable:
         _release_retryable_page_claim(
@@ -998,7 +1000,7 @@ def _handle_claim_api_error(claim: PageClaim, exc: LarkApiError) -> None:
             http_status=exc.status_code,
         )
     else:
-        _mark_chat_not_readable(claim)
+        _mark_chat_not_readable(claim, code=exc.lark_code)
 
 
 def _finish_completed_jobs(futures: dict[Future[dict[str, Any]], PageClaim]) -> None:
@@ -1833,11 +1835,15 @@ def _claim_next_page(
                 backfill_window_start_at = CASE WHEN %s = 'backfill' THEN %s ELSE backfill_window_start_at END,
                 backfill_window_end_at = CASE WHEN %s = 'backfill' THEN %s ELSE backfill_window_end_at END,
                 incremental_job_id = CASE WHEN %s = 'incremental' THEN %s ELSE incremental_job_id END,
+                incremental_page_token = CASE WHEN %s = 'incremental' THEN %s ELSE incremental_page_token END,
                 incremental_window_start_at = CASE WHEN %s = 'incremental' THEN %s ELSE incremental_window_start_at END,
                 incremental_window_end_at = CASE WHEN %s = 'incremental' THEN %s ELSE incremental_window_end_at END,
                 page_claim_id = %s, page_claim_job_id = %s, page_claim_mode = %s,
                 page_claimed_at = NOW(), page_lease_until = NOW() + INTERVAL '10 minutes',
-                page_retry_at = NULL, sync_status = 'syncing', last_error = NULL
+                page_retry_at = CASE WHEN sync_status = 'not_readable' THEN NOW() + INTERVAL '1 day'
+                    ELSE NULL END,
+                last_error = CASE WHEN sync_status = 'not_readable' THEN last_error ELSE NULL END,
+                sync_status = CASE WHEN sync_status = 'not_readable' THEN sync_status ELSE 'syncing' END
             WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
             """,
             (
@@ -1848,6 +1854,8 @@ def _claim_next_page(
                 end_at,
                 mode,
                 job.id,
+                mode,
+                expected_page_token,
                 mode,
                 start_at,
                 mode,
@@ -1919,7 +1927,6 @@ def _select_backfill_chat_for_claim(conn: psycopg.Connection, authorization_id: 
         JOIN chats c ON c.chat_id = access.chat_id
         WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
           AND COALESCE(c.chat_status, 'normal') = 'normal'
-          AND access.sync_status <> 'not_readable'
           AND (access.page_claim_id IS NULL OR access.page_lease_until < NOW())
           AND (access.page_retry_at IS NULL OR access.page_retry_at <= NOW())
           AND (access.manual_backfill_requested_at IS NOT NULL OR NOT access.backfill_complete)
@@ -1943,7 +1950,7 @@ def _select_incremental_chat_for_claim(
         JOIN chats c ON c.chat_id = access.chat_id
         WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
           AND COALESCE(c.chat_status, 'normal') = 'normal'
-          AND access.backfill_complete AND access.sync_status <> 'not_readable'
+          AND access.backfill_complete
           AND (access.page_claim_id IS NULL OR access.page_lease_until < NOW())
           AND (access.page_retry_at IS NULL OR access.page_retry_at <= NOW())
           AND (
@@ -1969,9 +1976,11 @@ def _has_pending_backfill_in_connection(conn: psycopg.Connection, authorization_
             JOIN chats c ON c.chat_id = access.chat_id
             WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
               AND COALESCE(c.chat_status, 'normal') = 'normal'
+              AND (access.sync_status <> 'not_readable'
+                   OR access.page_retry_at IS NULL OR access.page_retry_at <= NOW())
               AND (
                     access.manual_backfill_requested_at IS NOT NULL
-                    OR (NOT access.backfill_complete AND access.sync_status <> 'not_readable')
+                    OR NOT access.backfill_complete
               )
         ) AS pending
         """,
@@ -2281,24 +2290,38 @@ def _record_claimed_page(
     return PageCommit(True, inserted, own_inserted)
 
 
-def _mark_chat_not_readable(claim: PageClaim) -> None:
+def _mark_chat_not_readable(claim: PageClaim, *, code: int | None, restricted: bool = False) -> None:
+    detail = (
+        "群开启受限模式，Lark禁止读取消息（231203）"
+        if restricted
+        else "Lark暂不允许读取此会话消息" + (f"（错误码 {code}）" if code is not None else "")
+    )
     with connection() as conn, conn.transaction():
         lock_sync_material(conn)
+        current_job = conn.execute(
+            """
+            SELECT 1 FROM sync_jobs
+            WHERE id = %s AND status = 'running' AND discovery_generation = %s
+            FOR UPDATE
+            """,
+            (claim.job.id, claim.job.discovery_generation),
+        ).fetchone()
+        if not current_job:
+            return
+        # Keep successful watermarks and cursors; a changed group restriction gets one daily recheck.
         conn.execute(
             """
             UPDATE authorization_chats
-            SET sync_status = 'not_readable', backfill_complete = TRUE,
-                incremental_page_token = NULL,
-                manual_backfill_requested_at = NULL,
-                manual_backfill_started_at = NULL,
-                last_error = 'This conversation is not readable with the current authorization.',
+            SET sync_status = 'not_readable', last_error = %s,
                 page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
-                page_claimed_at = NULL, page_lease_until = NULL, page_retry_at = NULL
+                page_claimed_at = NULL, page_lease_until = NULL,
+                page_retry_at = NOW() + INTERVAL '1 day'
             WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
               AND page_claim_id = %s AND page_claim_job_id = %s AND page_claim_mode = %s
               AND page_lease_until > NOW()
             """,
             (
+                detail,
                 claim.job.authorization_id,
                 claim.chat_id,
                 claim.generation,
@@ -2390,7 +2413,7 @@ def _yield_job_to_retry_if_idle(conn: psycopg.Connection, job: SyncJob) -> bool:
         """
         SELECT MIN(page_retry_at) AS retry_at
         FROM authorization_chats
-        WHERE authorization_id = %s AND page_retry_at > NOW()
+        WHERE authorization_id = %s AND page_retry_at > NOW() AND sync_status <> 'not_readable'
         """,
         (job.authorization_id,),
     ).fetchone()
@@ -2432,7 +2455,6 @@ def _has_claimable_page_in_connection(conn: psycopg.Connection, job: SyncJob) ->
             JOIN chats c ON c.chat_id = access.chat_id
             WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
               AND COALESCE(c.chat_status, 'normal') = 'normal'
-              AND access.sync_status <> 'not_readable'
               AND (access.page_claim_id IS NULL OR access.page_lease_until < NOW())
               AND (access.page_retry_at IS NULL OR access.page_retry_at <= NOW())
               AND {pending}
@@ -2537,7 +2559,9 @@ def _finish_and_schedule_incremental(job: SyncJob) -> None:
                     JOIN chats c ON c.chat_id = access.chat_id
                     WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
                       AND COALESCE(c.chat_status, 'normal') = 'normal'
-                      AND access.backfill_complete AND access.sync_status <> 'not_readable'
+                      AND access.backfill_complete
+                      AND (access.sync_status <> 'not_readable'
+                           OR access.page_retry_at IS NULL OR access.page_retry_at <= NOW())
                       AND (
                         (access.incremental_job_id = %s AND access.incremental_page_token IS NOT NULL)
                         OR access.incremental_job_id IS DISTINCT FROM %s

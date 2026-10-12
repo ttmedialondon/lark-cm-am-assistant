@@ -63,6 +63,15 @@ def create_router(*, current_authorization, csrf_token):
         with connection() as conn, conn.transaction():
             return function(conn, actor_id, reference, get_settings())
 
+    @router.get("/scopes")
+    def scopes(request: Request):
+        try:
+            actor_id = actor(request)
+            with connection() as conn, conn.transaction():
+                return json_response(assistant_tools.scopes_for(conn, actor_id))
+        except (HTTPException, PermissionError, LookupError, ValueError) as exc:
+            return failure(exc)
+
     @router.post("/turns")
     async def submit(request: Request):
         try:

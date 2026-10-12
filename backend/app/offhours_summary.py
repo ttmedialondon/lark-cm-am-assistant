@@ -117,10 +117,10 @@ def _authorize_run(conn, run, *, actor_id=None, read_cache=None, executing=False
                            owner_only=actor_id is None and run_feature(run) == FEATURE,
                            read_cache=read_cache)
     if run_feature(run) == ASSISTANT_FEATURE:
-        turn = conn.execute("""SELECT t.created_at,t.status,s.actor_id FROM assistant_turns t
+        turn = conn.execute("""SELECT t.created_at,t.status,t.error_code,s.actor_id FROM assistant_turns t
             JOIN assistant_sessions s ON s.id=t.session_id WHERE t.id=%s FOR SHARE OF t,s""",
             (run["assistant_turn_id"],)).fetchone()
-        if (not turn or turn["actor_id"] != actor
+        if (not turn or turn["error_code"] == "cleared" or turn["actor_id"] != actor
                 or turn["actor_id"] != run["requested_by_authorization_id"]):
             raise PermissionError("无权读取此助手报告。")
         if executing and turn["status"] not in ("queued", "running", "waiting"):
