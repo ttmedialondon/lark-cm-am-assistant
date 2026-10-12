@@ -22,6 +22,8 @@ from fastapi.templating import Jinja2Templates
 from . import (
     admin,
     admin_permissions,
+    assistant,
+    assistant_routes,
     creator_access,
     creator_broadcast,
     creator_group_routes,
@@ -73,6 +75,17 @@ def _template(request: Request, name: str, context: dict[str, Any], status_code:
                 or _is_remi_tester(authorization, {"is_owner": owner})
             )),
         }}
+        with connection() as conn:
+            assistant_configured = assistant.configured(conn)
+        context.update(
+            assistant_enabled=active and context['business_nav']['can_summary'],
+            assistant_configured=assistant_configured,
+            assistant_user_id=str(authorization['id']),
+            csrf_token=_admin_csrf_token(authorization),
+        )
+        selected_cm = (context.get('summary_data', {}).get('responsible', {}).get('id')
+                       or context.get('creator_data', {}).get('selected_cm_id'))
+        context['assistant_context'] = {'cm_id': str(selected_cm)} if selected_cm else {}
     return templates.TemplateResponse(request, name, context, status_code=status_code)
 
 
@@ -625,6 +638,9 @@ app.include_router(
 app.include_router(offhours_summary_routes.create_router(
     current_authorization=_current_authorization,
     render_template=_template, csrf_token=_admin_csrf_token,
+))
+app.include_router(assistant_routes.create_router(
+    current_authorization=_current_authorization, csrf_token=_admin_csrf_token,
 ))
 app.include_router(creator_handles_routes.create_router(
     current_authorization=_current_authorization, render_template=_template, csrf_token=_admin_csrf_token,

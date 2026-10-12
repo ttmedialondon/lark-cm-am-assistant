@@ -23,6 +23,7 @@ from . import (
     admin_reporting,
     ai_dispatch,
     ai_feature_config,
+    assistant,
     creator_group_matching,
     creator_handle_matching,
     creator_importance,
@@ -56,6 +57,12 @@ class TemplateRenderer(Protocol):
 CurrentAuthorization = Callable[[Request], dict[str, Any] | None]
 CsrfToken = Callable[[dict[str, Any]], str]
 AI_FEATURES = {
+    "operations_assistant": {
+        "title": "运营对话助手",
+        "description": "用自然语言查询达人、总结消息、追问进展并起草回复。",
+        "enabled_label": "启用运营助手",
+        "processing_label": "按提问调用业务工具，不自动发送",
+    },
     "creator_import": {
         "title": "达人名单匹配",
         "description": "仅处理手动启动的 达人导入批次，不扫描全员或推断负责人。",
@@ -881,6 +888,8 @@ def create_admin_router(
                     creator_group_matching.configuration_changed(conn)
                 elif feature == creator_importance.FEATURE:
                     creator_importance.configuration_changed(conn)
+                elif feature == assistant.FEATURE:
+                    assistant.configuration_changed(conn)
                 conn.execute(
                     "INSERT INTO audit_events (id, authorization_id, action, metadata) VALUES (%s, %s, %s, %s::jsonb)",
                     (

@@ -148,7 +148,22 @@ def _transport_error(started):
     )
 
 
-def _read_response(response, started):
+def call_openai_tools(config, api_key, items, actor_id, *, instructions, tools, output_format):
+    """One durable assistant step; the feature owns continuation and retries."""
+    headers, payload = _request_parts(
+        config, api_key, {}, actor_id, instructions, output_format, 4000, 'low', 60.0,
+    )
+    payload.update(input=items, tools=tools, tool_choice='auto',
+                   include=['reasoning.encrypted_content'])
+    started = time.perf_counter()
+    try:
+        response = asyncio.run(_post_with_deadline(headers, payload, 60.0))
+    except (httpx.HTTPError, TimeoutError) as exc:
+        raise _transport_error(started) from exc
+    return _read_response(response, started, full_output=True)
+
+
+def _read_response(response, started, *, full_output=False):
     telemetry = _openai_telemetry(response, started)
     if response.status_code < 200 or response.status_code >= 300:
         is_quota = _is_quota_response(response)
@@ -175,15 +190,25 @@ def _read_response(response, started):
     if data.get("status") not in {None, "completed"}:
         raise ModelOutputError("unfinished response", telemetry=telemetry)
     try:
-        text = _response_text(data)
+        if full_output and any(item.get('type') == 'function_call' for item in _json_list(data.get('output'))
+                               if isinstance(item, Mapping)):
+            text = ''
+        else:
+            text = _response_text(data)
     except (TypeError, ValueError, KeyError) as exc:
         raise ModelOutputError("invalid response", telemetry=telemetry) from exc
-    return {
+    result = {
         "text": text,
         "response_id": response_id,
         "usage": safe_usage,
         "telemetry": telemetry,
     }
+    if full_output:
+        output = data.get('output')
+        if not isinstance(output, list) or not all(isinstance(item, dict) for item in output):
+            raise ModelOutputError('invalid tool response', telemetry=telemetry)
+        result['output'] = output
+    return result
 
 
 async def _post_with_deadline(headers: dict, payload: dict, total_timeout: float) -> httpx.Response:

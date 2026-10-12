@@ -41,6 +41,7 @@ def test_shared_gate_allows_four_and_rejects_five_valid_running_leases() -> None
     assert "contact_assignment_assessments" not in combined_query
     assert "creator_workflow_ai_tasks" not in combined_query
     assert "offhours_summary_tasks" in combined_query
+    assert "assistant_turns" in combined_query
     assert "creator_import_rows" in combined_query
     assert "creator_handle_jobs" in combined_query
     assert "creator_responsibility_jobs" in combined_query

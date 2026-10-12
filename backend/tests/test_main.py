@@ -66,6 +66,9 @@ def test_session_touch_is_throttled_without_caching_revocation(pg, monkeypatch):
 
 def test_dashboard_navigation_preserves_access_and_connection_controls(monkeypatch) -> None:
     monkeypatch.setattr(main.creator_broadcast, "preview_open", lambda: False)
+    monkeypatch.setattr(main, "connection", lambda: nullcontext(None))
+    monkeypatch.setattr(main.assistant, "configured", lambda _: True)
+    monkeypatch.setattr(main, "_admin_csrf_token", lambda _: "fixture-csrf")
     authorization = {"id": uuid4(), "status": "active", "display_name": "CM", "body_consent_at": True,
                      "p2p_discovery_status": "succeeded"}
     context = {
@@ -78,6 +81,7 @@ def test_dashboard_navigation_preserves_access_and_connection_controls(monkeypat
     request = _request_with_session("fixture-session")
     rendered = main._template(request, "dashboard.html", context).body.decode()
     assert "工作台" in rendered and "权限与数据使用" in rendered
+    assert 'id="operations-assistant"' in rendered and 'id="oa-launcher"' in rendered
     assert 'href="/creators"' in rendered and 'href="/dashboard/offhours-summary"' in rendered
     assert "/creators/broadcast" not in rendered and 'href="/admin"' not in rendered
     assert 'hx-trigger="every 10s [!document.hidden]"' in rendered
@@ -99,6 +103,7 @@ def test_dashboard_navigation_preserves_access_and_connection_controls(monkeypat
     }).body.decode()
     assert "/creators/broadcast" not in restricted and "/dashboard/offhours-summary" not in restricted
     assert "重新使用 Lark 授权" in restricted
+    assert 'id="operations-assistant"' not in restricted
     assert "business_nav" not in context
     for retired in ("/dashboard/creators", "creator-setup-preview", "creator-candidates",
                     "待我确认的达人候选", "历史联系人归属"):

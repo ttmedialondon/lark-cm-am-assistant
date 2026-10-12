@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+from contextlib import nullcontext
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -204,6 +205,8 @@ def test_navigation_keeps_exact_grants_when_switching_between_pages(permissions)
 ])
 def test_frontend_entry_uses_current_page_permissions(monkeypatch, permissions, owner, expected):
     monkeypatch.setattr(main.creator_broadcast, "preview_open", lambda: False)
+    monkeypatch.setattr(main, "connection", lambda: nullcontext(None))
+    monkeypatch.setattr(main.assistant, "configured", lambda _: True)
     _, actor, _ = _client(monkeypatch, permissions=permissions, owner=owner)
     actor.update(body_consent_at=True, p2p_discovery_status="succeeded")
     monkeypatch.setattr(main, "_current_authorization", lambda _: actor)

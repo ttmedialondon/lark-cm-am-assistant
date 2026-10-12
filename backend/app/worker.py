@@ -17,6 +17,7 @@ import psycopg
 
 from . import (
     ai_dispatch,
+    assistant,
     creator_broadcast_delivery,
     creator_group_matching,
     creator_handle_matching,
@@ -246,6 +247,7 @@ def _dispatch_ai_turn(
     if len(futures) >= ai_dispatch.MAX_CONCURRENT_REQUESTS:
         return False, next_queue
     queues = (
+        (assistant.claim, assistant.run),
         (
             offhours_summary.claim_next_summary,
             offhours_summary.run_claimed_summary,
@@ -306,7 +308,7 @@ def _prepare_creator_preview(settings: Settings, next_queue: int) -> tuple[bool,
     """Give each local preparation queue a turn; an idle queue does not delay the other."""
 
     # Retired handle scanning is not produced or dispatched; historical review stays available.
-    queues = (creator_imports.prepare_next_import,
+    queues = (assistant.prepare, creator_imports.prepare_next_import,
               offhours_summary.prepare_next_summary,
               creator_handle_matching.prepare_next,
               creator_responsibility_matching.prepare_next,

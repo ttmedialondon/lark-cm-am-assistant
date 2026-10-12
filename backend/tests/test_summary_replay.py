@@ -65,7 +65,7 @@ def test_v5_replay_preserves_reports_and_usage_and_bounds_the_window(pg, seeded)
         else:
             assert after == before[name]
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(summaries, '_enabled', lambda conn: True)
+        patch.setattr(summaries, '_enabled', lambda conn, feature=summaries.FEATURE: True)
         with pytest.raises(summaries.SummaryInputError):
             summaries._current(pg, lease)
         pg.execute("UPDATE offhours_summary_runs SET coverage=coverage || jsonb_build_object('cutoff',window_end) "

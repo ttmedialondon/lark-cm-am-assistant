@@ -22,6 +22,7 @@ from .message_mentions import mention_names, mention_targets, resolve_mentions, 
 from .message_text import evidence_body
 
 FEATURE = "offhours_summary"
+ASSISTANT_FEATURE = "operations_assistant"
 POLICY_VERSION = "shift-handling-v5"
 REMI_ID = UUID("24d1ef13-3762-4359-ba11-d26c03cf1f7f")
 TEST_VIEWERS = frozenset({UUID("9d5f4370-6463-4c3a-a2ed-67753a1cabc0"), UUID("1225b4a0-fbd8-431e-962e-25e66943a8a0")})
@@ -106,26 +107,52 @@ def _authorize_live(conn, actor_id, *, owner_only=False, cm_id=REMI_ID):
     return dict(cm), owner
 
 
-def _config(conn):
+def run_feature(run):
+    return ASSISTANT_FEATURE if run.get("origin") == "assistant" else FEATURE
+
+
+def _authorize_run(conn, run, *, actor_id=None, read_cache=None, executing=False):
+    actor = UUID(str(actor_id or run["requested_by_authorization_id"]))
+    cm, owner = _authorize(conn, actor, cm_id=run["responsible_authorization_id"],
+                           owner_only=actor_id is None and run_feature(run) == FEATURE,
+                           read_cache=read_cache)
+    if run_feature(run) == ASSISTANT_FEATURE:
+        turn = conn.execute("""SELECT t.created_at,t.status,s.actor_id FROM assistant_turns t
+            JOIN assistant_sessions s ON s.id=t.session_id WHERE t.id=%s FOR SHARE OF t,s""",
+            (run["assistant_turn_id"],)).fetchone()
+        if (not turn or turn["actor_id"] != actor
+                or turn["actor_id"] != run["requested_by_authorization_id"]):
+            raise PermissionError("无权读取此助手报告。")
+        if executing and turn["status"] not in ("queued", "running", "waiting"):
+            raise SummaryInputError("助手请求已停止。")
+    return cm, owner
+
+
+def _config(conn, feature=FEATURE):
     return conn.execute(
         """SELECT provider,project_id,model,enabled,api_key_ciphertext
                         FROM ai_feature_configs WHERE feature=%s""",
-        (FEATURE,),
+        (feature,),
     ).fetchone()
 
 
-def _enabled(conn):
-    row = _config(conn)
+def _enabled(conn, feature=FEATURE):
+    row = _config(conn, feature)
     return bool(row and row["enabled"] and row["provider"] == "openai" and row["api_key_ciphertext"])
 
 
-def _stop_tasks(conn, message):
+def _stop_tasks(conn, message, *, origin="scheduled"):
     # Closing a feature cannot prove that its in-flight paid request was never accepted.
-    conn.execute("""UPDATE offhours_summary_tasks SET lease_until=NULL,finished_at=NOW(),
-        status=CASE WHEN status='running' THEN 'failed' ELSE 'cancelled' END,
-        error_message=CASE WHEN status='running'
+    conn.execute("""UPDATE offhours_summary_tasks t SET lease_until=NULL,finished_at=NOW(),
+        status=CASE WHEN t.status='running' THEN 'failed' ELSE 'cancelled' END,
+        error_message=CASE WHEN t.status='running'
             THEN '请求结果未知，未自动重复调用；请核实后重新生成。' ELSE %s END
-        WHERE status IN ('queued','running')""", (message,))
+        FROM offhours_summary_runs r WHERE r.id=t.run_id AND r.origin=%s
+        AND t.status IN ('queued','running')""", (message, origin))
+
+
+def stop_assistant_tasks(conn):
+    _stop_tasks(conn, "运营助手已关闭。", origin="assistant")
 
 
 def _parse_window(start, end):
@@ -186,7 +213,7 @@ def save_settings_and_enqueue(conn, actor_id, fields):
         return {"enabled": cfg["enabled"], "queued": 0, "run_id": str(recurring["run_id"])}
     start, end = _parse_window(fields.get("window_start", DEFAULT_START), fields.get("window_end", DEFAULT_END))
     if cfg["enabled"] and conn.execute("""SELECT 1 FROM offhours_summary_tasks t
-            JOIN offhours_summary_runs r ON r.id=t.run_id WHERE r.period IS NULL
+            JOIN offhours_summary_runs r ON r.id=t.run_id WHERE r.period IS NULL AND r.origin='scheduled'
             AND r.responsible_authorization_id=%s AND r.window_start=%s AND r.window_end=%s
             AND (t.status='running' OR t.error_message LIKE '请求结果未知%%') LIMIT 1""",
             (REMI_ID, start, end)).fetchone():
@@ -468,8 +495,7 @@ def _body(row, cipher, names=None):
 
 def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, related_chats=None, read_cache=None):
     cm_id = run.get("responsible_authorization_id", REMI_ID)
-    cm, _ = _authorize(conn, run["requested_by_authorization_id"], owner_only=True,
-                       cm_id=cm_id, read_cache=read_cache)
+    cm, _ = _authorize_run(conn, run, read_cache=read_cache)
     conn.execute(
         """SELECT chat_id FROM authorization_chats WHERE authorization_id=%s AND chat_id=%s FOR SHARE""",
         (cm_id, chat_id),
@@ -621,11 +647,16 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
     }
     # Contact IDs stay server-side, but are part of the fingerprint: identical
     # display names/handles must not conceal a reassignment to another person.
+    fingerprint = _hash([pack, users, mention_fingerprints] if mention_fingerprints else [pack, users])
+    selected = run.get("selected_contact_ids")
+    if selected is not None:
+        fingerprint = _hash([fingerprint, sorted(str(person) for person in selected)])
     return {
         "pack": pack,
         "users": users,
         "refs": refs,
-        "fingerprint": _hash([pack, users, mention_fingerprints] if mention_fingerprints else [pack, users]),
+        "fingerprint": fingerprint,
+        "selected_contact_ids": selected,
         "incomplete": incomplete,
         "synced": watermark >= cutoff,
         "history_complete": complete,
@@ -638,6 +669,13 @@ def schedule_if_due(conn, *, force=False):
     from .summary_periods import backfill_due, seed_due
 
     now = datetime.now(UTC)
+    assistant_run = conn.execute("""SELECT r.*,r.id AS run_id FROM offhours_summary_runs r
+        JOIN assistant_turns t ON t.id=r.assistant_turn_id
+        WHERE r.origin='assistant' AND r.next_check_at<=%s
+        AND t.status IN ('queued','running','waiting')
+        ORDER BY r.next_check_at,r.created_at FOR UPDATE OF r SKIP LOCKED LIMIT 1""", (now,)).fetchone()
+    if assistant_run and _enabled(conn, ASSISTANT_FEATURE):
+        return _schedule_run(conn, dict(assistant_run), now)
     backfilled = backfill_due(conn, now)
     seed_due(conn, now)
     recurring = conn.execute("SELECT recurring_enabled FROM offhours_summary_settings WHERE id").fetchone()
@@ -645,7 +683,7 @@ def schedule_if_due(conn, *, force=False):
         if not _enabled(conn):
             return 0
         state = conn.execute("""SELECT *,id AS run_id FROM offhours_summary_runs
-            WHERE period IS NOT NULL AND next_check_at<=%s
+            WHERE origin='scheduled' AND period IS NOT NULL AND next_check_at<=%s
               AND report_date >= (NOW() AT TIME ZONE 'Europe/London')::date-6
             ORDER BY next_check_at,window_start DESC,id FOR UPDATE SKIP LOCKED LIMIT 1""", (now,)).fetchone()
         if state:
@@ -670,12 +708,20 @@ def schedule_if_due(conn, *, force=False):
 def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None):
     inserted = 0
     cm_id = state["responsible_authorization_id"]
-    _authorize(conn, state["requested_by_authorization_id"], owner_only=True, cm_id=cm_id)
+    _authorize_run(conn, state, executing=True)
+    assistant = run_feature(state) == ASSISTANT_FEATURE
+    if assistant:
+        submitted = conn.execute("SELECT created_at FROM assistant_turns WHERE id=%s",
+                                 (state["assistant_turn_id"],)).fetchone()["created_at"]
+        now = min(now, submitted)
     cutoff = min(now, state["window_end"])
     roster = _roster(conn, cm_id) if roster is None else roster
     # Discover every related conversation before applying the bounded content limit.
     chats = _related_chats(conn, roster, cm_id=cm_id) if chats is None else chats
+    targets = set(state["selected_contact_ids"]) if state.get("selected_contact_ids") is not None else None
     selected_chats = chats if contact_ids is None else [c for c in chats if c['contact_ids'] & contact_ids]
+    if targets is not None:
+        selected_chats = [c for c in selected_chats if c['contact_ids'] & targets]
     deferred = False
     gaps = []
     count, messages, synced = 0, 0, True
@@ -721,16 +767,28 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
             (state["run_id"], chat["chat_id"], evidence["fingerprint"]),
         )
         new_id = uuid4()
+        cached = conn.execute("""SELECT t.* FROM offhours_summary_tasks t
+            JOIN offhours_summary_runs r ON r.id=t.run_id
+            WHERE r.origin='assistant' AND r.requested_by_authorization_id=%s
+              AND r.responsible_authorization_id=%s AND t.chat_id=%s AND t.input_fingerprint=%s
+              AND (t.status='succeeded' OR t.status='failed' AND t.error_message LIKE '请求结果未知%%')
+            ORDER BY (t.status='succeeded') DESC,t.created_at DESC LIMIT 1""",
+            (state["requested_by_authorization_id"], cm_id, chat["chat_id"], evidence["fingerprint"])
+        ).fetchone() if assistant else None
         selected = conn.execute(
-            """INSERT INTO offhours_summary_tasks(id,run_id,chat_id,input_fingerprint,cutoff,checkpoint_ciphertext)
-                     VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(run_id,chat_id,input_fingerprint)
+            """INSERT INTO offhours_summary_tasks(id,run_id,chat_id,input_fingerprint,cutoff,checkpoint_ciphertext,
+                     status,error_message,result_ciphertext,model,response_id)
+                     VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(run_id,chat_id,input_fingerprint)
                      DO UPDATE SET is_current=TRUE,
                      cutoff=CASE WHEN offhours_summary_tasks.status='cancelled' THEN EXCLUDED.cutoff
                             ELSE offhours_summary_tasks.cutoff END,
                      status=CASE WHEN offhours_summary_tasks.status='cancelled' THEN 'queued'
                             ELSE offhours_summary_tasks.status END RETURNING id""",
             (new_id, state["run_id"], chat["chat_id"], evidence["fingerprint"], chat_cutoff,
-             previous["checkpoint_ciphertext"] if previous else None),
+             cached["checkpoint_ciphertext"] if cached else previous["checkpoint_ciphertext"] if previous else None,
+             cached["status"] if cached else "queued", cached["error_message"] if cached else None,
+             cached["result_ciphertext"] if cached else None, cached["model"] if cached else None,
+             cached["response_id"] if cached else None),
         ).fetchone()
         inserted += selected["id"] == new_id
         selected_ids.append(selected["id"])
@@ -744,7 +802,7 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
          None if contact_ids is None else [c['chat_id'] for c in selected_chats],
          None if contact_ids is None else [c['chat_id'] for c in selected_chats]),
     )
-    if contact_ids is not None:
+    if contact_ids is not None and not assistant:
         # Accurate whole-report totals from authorized IDs/times only; never decrypt
         # unrelated conversations merely to refresh the coverage counters.
         opens = sorted({r['open_id'] for r in roster})
@@ -776,14 +834,16 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
     if not synced:
         gaps.append("部分会话同步进度尚未覆盖所选时段，当前仅总结已同步内容。")
     if now < state["window_end"]:
-        gaps.append("时段未结束；新同步消息会在开启期间继续纳入。")
+        gaps.append("时段未结束；仅分析本次请求截止前的已同步消息。" if assistant else
+                    "时段未结束；新同步消息会在开启期间继续纳入。")
     if not roster:
         gaps.append("尚无已确认且关联有效 Lark 用户的达人。")
     if roster and not count:
         gaps.append("尚未找到已同步的时段内相关消息；这不代表 Lark 中没有消息。")
     coverage = {
         "policy": POLICY_VERSION,
-        "confirmed_creators": len({r["contact_id"] for r in roster}),
+        "confirmed_creators": len({r["contact_id"] for r in roster} if targets is None else
+                                  {r["contact_id"] for r in roster} & targets),
         "conversations": count,
         "private_conversations": private_count,
         "group_conversations": count - private_count,
@@ -799,6 +859,9 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
         "UPDATE offhours_summary_runs SET coverage=%s::jsonb,updated_at=NOW() WHERE id=%s",
         (json.dumps(coverage, ensure_ascii=False), state["run_id"]),
     )
+    if assistant:
+        conn.execute("UPDATE offhours_summary_runs SET next_check_at=NULL WHERE id=%s", (state["run_id"],))
+        return None if deferred else inserted
     if contact_ids is not None:
         return None if deferred else inserted
     continue_checking = now < state["refresh_until"]
@@ -818,14 +881,21 @@ def claim_next_summary():
                      error_message='请求结果未知，未自动重复调用；请核实后重新生成。'
                      WHERE status='running' AND lease_until<NOW()""",
         )
-        if not _enabled(conn) or not ai_dispatch.can_claim(conn):
+        if not ai_dispatch.can_claim(conn):
             return None
         row = conn.execute("""SELECT t.*,r.requested_by_authorization_id,r.responsible_authorization_id,
-                            r.window_start,r.window_end FROM offhours_summary_tasks t
+                            r.window_start,r.window_end,r.origin,r.assistant_turn_id,r.selected_contact_ids
+                            FROM offhours_summary_tasks t
                             JOIN offhours_summary_runs r ON r.id=t.run_id
-                            JOIN offhours_summary_settings s ON s.id
-                            WHERE (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL))
-                              AND (r.period IS NULL OR r.report_date >= (NOW() AT TIME ZONE 'Europe/London')::date-6)
+                            LEFT JOIN offhours_summary_settings s ON s.id
+                            JOIN ai_feature_configs cfg ON cfg.feature=CASE WHEN r.origin='assistant'
+                                THEN 'operations_assistant' ELSE 'offhours_summary' END
+                            LEFT JOIN assistant_turns aturn ON aturn.id=r.assistant_turn_id
+                            WHERE cfg.enabled AND cfg.provider='openai' AND cfg.api_key_ciphertext IS NOT NULL
+                              AND ((r.origin='scheduled' AND
+                                (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL))
+                                AND (r.period IS NULL OR r.report_date >= (NOW() AT TIME ZONE 'Europe/London')::date-6))
+                              OR (r.origin='assistant' AND aturn.status IN ('queued','running','waiting')))
                               AND t.status='queued' AND t.is_current AND t.scheduled_at<=NOW()
                             ORDER BY t.scheduled_at,t.created_at FOR UPDATE OF t SKIP LOCKED LIMIT 1""").fetchone()
         if not row:
@@ -1073,11 +1143,14 @@ def _validate(raw, evidence):
 
 def _current(conn, job):
     row = conn.execute(
-        """SELECT t.status,t.attempts,t.lease_until>NOW() AS leased FROM offhours_summary_tasks t
+        """SELECT t.status,t.attempts,t.lease_until>NOW() AS leased,r.origin FROM offhours_summary_tasks t
                         JOIN offhours_summary_runs r ON r.id=t.run_id
-                        JOIN offhours_summary_settings s ON s.id WHERE t.id=%s
-                        AND t.is_current AND (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL))
-                        AND (r.period IS NULL OR r.report_date >= (NOW() AT TIME ZONE 'Europe/London')::date-6)
+                        LEFT JOIN offhours_summary_settings s ON s.id
+                        LEFT JOIN assistant_turns aturn ON aturn.id=r.assistant_turn_id WHERE t.id=%s
+                        AND t.is_current AND ((r.origin='scheduled' AND
+                          (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL))
+                          AND (r.period IS NULL OR r.report_date >= (NOW() AT TIME ZONE 'Europe/London')::date-6))
+                          OR (r.origin='assistant' AND aturn.status IN ('queued','running','waiting')))
                         FOR UPDATE OF t""",
         (job["id"],),
     ).fetchone()
@@ -1086,7 +1159,7 @@ def _current(conn, job):
         or row["status"] != "running"
         or row["attempts"] != job["attempts"]
         or not row["leased"]
-        or not _enabled(conn)
+        or not _enabled(conn, run_feature(row))
     ):
         raise SummaryInputError("任务或配置已失效。")
 
@@ -1103,7 +1176,11 @@ def _finish(job, status, error, *, delay=0):
     # Scheduling locks must never be acquired while holding a task update lock.
     if status == "cancelled":
         with connection() as conn, conn.transaction():
-            if not _enabled(conn):
+            feature = run_feature(job)
+            if not _enabled(conn, feature):
+                return
+            if feature == ASSISTANT_FEATURE:
+                conn.execute("UPDATE offhours_summary_runs SET next_check_at=NOW() WHERE id=%s", (job["run_id"],))
                 return
             conn.execute("UPDATE offhours_summary_runs SET next_check_at=NOW() "
                          "WHERE id=%s AND period IS NOT NULL AND refresh_until>NOW()", (job["run_id"],))
@@ -1128,9 +1205,92 @@ def prepare_next_summary(settings):
         return inserted > 0
 
 
-def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None):
+def ensure_assistant_run(conn, actor_id, turn, cm_id, start, end, contact_ids, settings):
+    actor_id, cm_id = UUID(str(actor_id)), UUID(str(cm_id or actor_id))
+    turn_id = UUID(str(turn["id"] if isinstance(turn, dict) else turn))
+    start, end = _parse_window(start.isoformat() if isinstance(start, datetime) else start,
+                               end.isoformat() if isinstance(end, datetime) else end)
+    _authorize(conn, actor_id, cm_id=cm_id)
+    submitted = conn.execute("""SELECT t.created_at,t.status FROM assistant_turns t
+        JOIN assistant_sessions s ON s.id=t.session_id WHERE t.id=%s AND s.actor_id=%s FOR SHARE OF t,s""",
+        (turn_id, actor_id)).fetchone()
+    if not submitted or submitted["status"] not in ("queued", "running", "waiting"):
+        raise PermissionError("助手请求不存在或已停止。")
+    if not _enabled(conn, ASSISTANT_FEATURE):
+        raise SummaryInputError("运营助手尚未启用。")
+    cutoff = min(submitted["created_at"], end)
+    if cutoff <= start:
+        raise SummaryInputError("所选时段尚未开始。")
+    selected = sorted({UUID(str(person)) for person in contact_ids}, key=str) if contact_ids is not None else None
+    roster = _roster(conn, cm_id)
+    if selected is not None and (not selected or not set(selected).issubset({r["contact_id"] for r in roster})):
+        raise PermissionError("选择的达人不在当前获准范围。")
+    signature = _hash([str(actor_id), str(cm_id), start, end, selected])
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,194))", (signature,))
+    candidates = conn.execute("""SELECT * FROM offhours_summary_runs
+        WHERE responsible_authorization_id=%s AND window_start=%s AND window_end=%s
+          AND selected_contact_ids IS NOT DISTINCT FROM %s::uuid[]
+          AND (origin='scheduled' OR requested_by_authorization_id=%s)
+        ORDER BY (assistant_turn_id=%s) DESC NULLS LAST,created_at DESC LIMIT 20""",
+        (cm_id, start, end, selected, actor_id, turn_id)).fetchall()
+    for candidate in candidates:
+        same_turn = candidate["assistant_turn_id"] == turn_id
+        prior_cutoff = (candidate.get("coverage") or {}).get("cutoff")
+        if not same_turn and (not prior_cutoff or datetime.fromisoformat(prior_cutoff) != cutoff):
+            continue
+        try:
+            view = read_assistant_run(conn, actor_id, candidate["id"], settings)
+        except (PermissionError, SummaryInputError, InvalidTag, ValueError):
+            continue
+        if same_turn or view["run"]["status"] in ("completed", "unknown"):
+            return view
+    run_id = uuid4()
+    conn.execute("""INSERT INTO offhours_summary_runs(id,requested_by_authorization_id,
+        responsible_authorization_id,window_start,window_end,origin,assistant_turn_id,selected_contact_ids,
+        next_check_at,refresh_until) VALUES(%s,%s,%s,%s,%s,'assistant',%s,%s,NOW(),%s)""",
+        (run_id, actor_id, cm_id, start, end, turn_id, selected, cutoff))
+    return read_assistant_run(conn, actor_id, run_id, settings)
+
+
+def read_assistant_run(conn, actor_id, run_id, settings):
+    view = get_summary_view(conn, actor_id, run_id=run_id, settings=settings)
+    if view["run"]["status"] in ("completed", "unknown"):
+        run = conn.execute("SELECT * FROM offhours_summary_runs WHERE id=%s", (UUID(str(run_id)),)).fetchone()
+        roster = _roster(conn, run["responsible_authorization_id"])
+        chats = _related_chats(conn, roster, settings=settings, cm_id=run["responsible_authorization_id"])
+        targets = set(run["selected_contact_ids"]) if run["selected_contact_ids"] is not None else None
+        cutoff = datetime.fromisoformat(view["run"]["cutoff"])
+        material = {}
+        for chat in chats:
+            if targets is not None and not chat["contact_ids"] & targets:
+                continue
+            data = _load_chat(conn, run, chat["chat_id"], cutoff, settings=settings, roster=roster, related_chats=chats)
+            if data:
+                material[chat["chat_id"]] = data["fingerprint"]
+        saved = {t["chat_id"]: t["input_fingerprint"] for t in conn.execute(
+            """SELECT chat_id,input_fingerprint FROM offhours_summary_tasks
+            WHERE run_id=%s AND is_current AND chat_id IS NOT NULL""",
+            (run["id"],)).fetchall()}
+        if material != saved:
+            view["run"]["status"] = "partial"
+            view["run"]["gaps"].append("会话或消息资料已变化，需按当前材料重新分析。")
+            view["events"] = []
+    return view
+
+
+def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None, run_id=None, settings=None):
+    explicit = conn.execute("SELECT * FROM offhours_summary_runs WHERE id=%s",
+                            (UUID(str(run_id)),)).fetchone() if run_id else None
+    if run_id and not explicit:
+        raise SummaryInputError("报告不存在。")
+    if explicit:
+        cm_id = explicit["responsible_authorization_id"]
     cm, owner = _authorize(conn, actor_id, cm_id=cm_id)
-    if period is not None:
+    if explicit:
+        row = explicit
+        _authorize_run(conn, row, actor_id=actor_id)
+        start, end = row["window_start"], row["window_end"]
+    elif period is not None:
         from .summary_periods import window
         start, end = window(day, period)
         row = conn.execute("SELECT * FROM offhours_summary_runs WHERE responsible_authorization_id=%s "
@@ -1138,12 +1298,12 @@ def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None):
     else:
         row = conn.execute("""SELECT r.* FROM offhours_summary_settings s
                         JOIN offhours_summary_runs r ON r.id=s.run_id WHERE s.id""").fetchone()
-    if period is None:
+    if period is None and not explicit:
         start, end = (row["window_start"], row["window_end"]) if row else _parse_window(DEFAULT_START, DEFAULT_END)
     view = {
         "responsible": {"id": str(cm_id), "name": cm["display_name"] or "CM"},
         "can_manage": owner,
-        "enabled": _enabled(conn),
+        "enabled": _enabled(conn, run_feature(row or {})),
         "window": {
             "start": start.isoformat(),
             "end": end.isoformat(),
@@ -1167,7 +1327,7 @@ def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None):
         """SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND is_current ORDER BY chat_id""",
         (row["id"],),
     ).fetchall()
-    settings = get_settings()
+    settings = settings or get_settings()
     roster = _roster(conn, cm_id)
     related_chats = _related_chats(conn, roster, settings=settings, cm_id=cm_id)
     from . import summary_dialogues
@@ -1192,17 +1352,19 @@ def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None):
     if chat_tasks and all(t["status"] == "succeeded" for t in chat_tasks):
         if not any(t["chat_id"] is None for t in tasks):
             counts["queued"] += 1  # Preparation must still create the within-period merge.
-    if row.get("period") and (not coverage.get("cutoff") or coverage.get("policy") != POLICY_VERSION):
+    if (row.get("period") or run_feature(row) == ASSISTANT_FEATURE) and (
+            not coverage.get("cutoff") or coverage.get("policy") != POLICY_VERSION):
         status = "queued"
         gaps.append("正在准备该时段的群聊和私聊材料。")
     elif counts["queued"] or counts["running"]:
         status = "running"
         gaps.append("AI 正在处理；未完成的会话不能当作没有重要消息。")
     elif counts["failed"]:
-        status = "partial"
+        status = ("unknown" if any((t.get("error_message") or "").startswith("请求结果未知") for t in tasks)
+                  else "partial")
     else:
         status = "completed"
-    if not view["enabled"]:
+    if not view["enabled"] and not explicit:
         status = "disabled"
     view["window"]["is_partial"] = bool(view["window"]["is_partial"] or gaps)
     view["run"] = {

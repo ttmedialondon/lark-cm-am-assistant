@@ -77,6 +77,9 @@ def parts(evidence, user):
 def segments(evidence):
     result = []
     for user in evidence["users"]:
+        selected = evidence.get("selected_contact_ids")
+        if selected is not None and UUID(evidence["users"][user]["contact_id"]) not in selected:
+            continue
         messages, refs = parts(evidence, user)
         current = [m for m in messages if m["in_window"] and
                    (m["speaker"] == user or m.get("addressed_user") == user)]
@@ -145,21 +148,23 @@ def _blocked_people(chats, tasks):
 
 
 def schedule_merges(conn, settings):
-    if not core._enabled(conn):
-        return 0
     inserted = 0
     runs = conn.execute(
-        """SELECT r.* FROM offhours_summary_runs r JOIN offhours_summary_settings s ON s.id
-        WHERE (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL))
-        AND (r.period IS NULL OR r.report_date >= (NOW() AT TIME ZONE 'Europe/London')::date-6)
+        """SELECT r.* FROM offhours_summary_runs r LEFT JOIN offhours_summary_settings s ON s.id
+        JOIN ai_feature_configs cfg ON cfg.feature=CASE WHEN r.origin='assistant'
+            THEN 'operations_assistant' ELSE 'offhours_summary' END
+        LEFT JOIN assistant_turns aturn ON aturn.id=r.assistant_turn_id
+        WHERE cfg.enabled AND cfg.provider='openai' AND cfg.api_key_ciphertext IS NOT NULL
+        AND ((r.origin='scheduled' AND (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL))
+          AND (r.period IS NULL OR r.report_date >= (NOW() AT TIME ZONE 'Europe/London')::date-6))
+          OR (r.origin='assistant' AND aturn.status IN ('queued','running','waiting')))
         AND r.coverage->>'policy'=%s AND EXISTS(SELECT 1 FROM offhours_summary_tasks t
             WHERE t.run_id=r.id AND t.is_current AND t.chat_id IS NOT NULL)""",
         (core.POLICY_VERSION,),
     ).fetchall()
     for run in runs:
         try:
-            core._authorize(conn, run['requested_by_authorization_id'], owner_only=True,
-                            cm_id=run['responsible_authorization_id'])
+            core._authorize_run(conn, run, executing=True)
         except (PermissionError, core.SummaryInputError):
             continue
         tasks = conn.execute(
@@ -185,7 +190,7 @@ def schedule_merges(conn, settings):
             "SELECT id,contact_id,input_fingerprint,status FROM offhours_summary_tasks "
             "WHERE run_id=%s AND is_current AND contact_id IS NOT NULL", (run['id'],),
         ).fetchall()}
-        fingerprints = {person: core._hash([(str(t['id']), t['input_fingerprint']) for t in sources])
+        fingerprints = {person: core._hash(_source_hashes(run, sources))
                         for person, sources in people.items()}
         candidates = {person: sources for person, sources in people.items() if person not in blocked and (
             person not in existing_merges or existing_merges[person]['status'] == 'cancelled'
@@ -242,14 +247,27 @@ def schedule_merges(conn, settings):
                 (run["id"], person, fingerprint),
             )
             new_id = uuid4()
+            cached = conn.execute("""SELECT t.* FROM offhours_summary_tasks t
+                JOIN offhours_summary_runs r ON r.id=t.run_id
+                WHERE r.origin='assistant' AND r.requested_by_authorization_id=%s
+                  AND r.responsible_authorization_id=%s AND t.contact_id=%s AND t.input_fingerprint=%s
+                  AND (t.status='succeeded' OR t.status='failed' AND t.error_message LIKE '请求结果未知%%')
+                ORDER BY (t.status='succeeded') DESC,t.created_at DESC LIMIT 1""",
+                (run["requested_by_authorization_id"], run["responsible_authorization_id"], person, fingerprint)
+            ).fetchone() if core.run_feature(run) == core.ASSISTANT_FEATURE else None
             task = conn.execute(
-                """INSERT INTO offhours_summary_tasks(id,run_id,contact_id,input_fingerprint,cutoff)
-                VALUES(%s,%s,%s,%s,%s) ON CONFLICT(run_id,contact_id,input_fingerprint) WHERE contact_id IS NOT NULL
+                """INSERT INTO offhours_summary_tasks(id,run_id,contact_id,input_fingerprint,cutoff,
+                status,error_message,checkpoint_ciphertext,result_ciphertext,model,response_id)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(run_id,contact_id,input_fingerprint) WHERE contact_id IS NOT NULL
                 DO UPDATE SET is_current=TRUE,
                 status=CASE WHEN offhours_summary_tasks.status='cancelled' THEN 'queued'
                     ELSE offhours_summary_tasks.status END
                 RETURNING id""",
-                (new_id, run["id"], person, fingerprint, max(t["cutoff"] for t in sources)),
+                (new_id, run["id"], person, fingerprint, max(t["cutoff"] for t in sources),
+                 cached["status"] if cached else "queued", cached["error_message"] if cached else None,
+                 cached["checkpoint_ciphertext"] if cached else None, cached["result_ciphertext"] if cached else None,
+                 cached["model"] if cached else None, cached["response_id"] if cached else None),
             ).fetchone()
             inserted += task["id"] == new_id
             selected.append(task["id"])
@@ -262,11 +280,14 @@ def schedule_merges(conn, settings):
     return inserted
 
 
+def _source_hashes(run, sources):
+    values = [(t["chat_id"] if core.run_feature(run) == core.ASSISTANT_FEATURE else str(t["id"]),
+               t["input_fingerprint"]) for t in sources]
+    return sorted(values) if core.run_feature(run) == core.ASSISTANT_FEATURE else values
+
+
 def merge_input(conn, run, task, settings, roster=None, chats=None, *, read_cache=None):
-    core._authorize(
-        conn, run["requested_by_authorization_id"], owner_only=True,
-        cm_id=run["responsible_authorization_id"], read_cache=read_cache,
-    )
+    core._authorize_run(conn, run, read_cache=read_cache)
     roster = roster if roster is not None else core._roster(conn, run["responsible_authorization_id"])
     chats = (
         chats
@@ -310,11 +331,13 @@ def merge_input(conn, run, task, settings, roster=None, chats=None, *, read_cach
             cache[key] = data["fingerprint"] if data else None
         if cache[key] != source["input_fingerprint"]:
             raise core.SummaryInputError("会话资料已变化。")
-        source_hashes.append((str(source["id"]), source["input_fingerprint"]))
+        source_hashes.extend(_source_hashes(run, [source]))
         person = next(iter(users.values()))
         for event in saved["events"]:
             if event["user"] in users:
                 events.append(event)
+    if core.run_feature(run) == core.ASSISTANT_FEATURE:
+        source_hashes.sort()
     if core._hash(source_hashes) != task["input_fingerprint"] or person is None:
         raise core.SummaryInputError("合并资料已变化。")
     return events, person
@@ -428,7 +451,7 @@ def combine(raw, left, right):
 def step(job, settings):
     with core.connection() as conn, conn.transaction():
         core._current(conn, job)
-        cfg = core._config(conn)
+        cfg = core._config(conn, core.run_feature(job))
         if job["chat_id"]:
             data = checked_chat(conn, job, settings)
             chunks = segments(data)
@@ -614,6 +637,7 @@ def view_events(conn, run, task, settings, roster, chats, *, read_cache=None):
         {
             **event,
             "id": f"{task['id']}:{i}",
+            "version": task["input_fingerprint"],
             "contact_id": str(task["contact_id"]),
             "creator_handle": event["handle"],
             "creator_handles": person["handles"],

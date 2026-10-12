@@ -8,9 +8,14 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/core@1.4.0/dist/css/tabler.min.css">
     <link rel="stylesheet" href="/static/app.css?v=20261008-loading">
     <script src="/static/site-ui.js?v=20261008-loading" defer></script>
+    {% if assistant_enabled|default(false) %}
+    <link rel="stylesheet" href="/static/assistant.css?v=20261012">
+    <script src="/static/assistant.js?v=20261012" defer></script>
+    {% endif %}
     {% block extra_head %}{% endblock %}
   </head>
   <body>
     {% block body %}{% endblock %}
+    {% if assistant_enabled|default(false) %}{% include "partials/assistant.html" %}{% endif %}
   </body>
 </html>

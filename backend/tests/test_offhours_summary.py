@@ -1805,3 +1805,117 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
     pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='chat'")
     with pytest.raises(ai.SummaryInputError):
         replies.read(pg, s.ids["cm"], job_id, s.settings, fresh=True)
+
+
+def test_assistant_window_uses_cm_identity_separate_switch_and_frozen_cutoff(pg, seeded, monkeypatch):
+    from app import summary_replies as replies
+    s = seeded
+    monkeypatch.setattr(replies, "connection", lambda: nullcontext(pg))
+    s.save()
+    s.save(False)
+    settings_before = pg.execute("SELECT * FROM offhours_summary_settings").fetchone()
+    save_feature_config(pg, api_key_cipher(s.settings.token_encryption_key), ai.ASSISTANT_FEATURE,
+        provider="openai", project_id="assistant-test", model="assistant-model", enabled=True,
+        api_key="assistant-synthetic-key", updated_by_authorization_id=s.ids["owner"])
+    session_id, turn_id = uuid4(), uuid4()
+    pg.execute("INSERT INTO assistant_sessions(id,actor_id) VALUES(%s,%s)", (session_id, s.ids["cm"]))
+    pg.execute("""INSERT INTO assistant_turns(id,session_id,client_request_id,status,input_ciphertext)
+        VALUES(%s,%s,%s,'waiting','synthetic')""", (turn_id, session_id, uuid4()))
+    turn = pg.execute("SELECT * FROM assistant_turns WHERE id=%s", (turn_id,)).fetchone()
+    view = ai.ensure_assistant_run(pg, s.ids["cm"], turn, s.ids["cm"], s.start, s.end,
+                                   [s.ids["person"]], s.settings)
+    run_id = view["run"]["id"]
+    assert view["run"]["status"] == "queued" and view["responsible"]["id"] == str(s.ids["cm"])
+    assert ai.ensure_assistant_run(pg, s.ids["cm"], turn, s.ids["cm"], s.start, s.end,
+                                   [s.ids["person"]], s.settings)["run"]["id"] == run_id
+    s.add("after-assistant", who="cm", text="This arrived after the fixed request cutoff",
+          at=turn["created_at"] + timedelta(seconds=1))
+    assert ai.prepare_next_summary(s.settings)
+    ai._stop_tasks(pg, "old function stopped")
+    assert pg.execute("SELECT status FROM offhours_summary_tasks WHERE run_id=%s AND is_current",
+                      (run_id,)).fetchone()["status"] == "queued"
+    job = ai.claim_next_summary()
+    assert job["origin"] == "assistant" and job["cutoff"] == turn["created_at"]
+    ai.run_claimed_summary(job, s.settings)
+    assert ai.prepare_next_summary(s.settings)
+    ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
+    result = ai.read_assistant_run(pg, s.ids["cm"], run_id, s.settings)
+    assert result["run"]["status"] == "completed" and len(result["events"]) == 1
+    assert "after-assistant" not in json.dumps(s.calls)
+    assert pg.execute("SELECT * FROM offhours_summary_settings").fetchone() == settings_before
+    with pytest.raises(PermissionError):
+        ai.read_assistant_run(pg, s.ids["owner"], run_id, s.settings)
+    event = result["events"][0]
+    context = replies.read_event_context(pg, s.ids["cm"], event["id"], s.settings, mode="period")
+    assert context["version"] == event["version"]
+    assert all(m["message_id"] != "after-assistant" for m in context["messages"])
+    ai._stop_tasks(pg, "old function stopped")
+    assert ai.read_assistant_run(pg, s.ids["cm"], run_id, s.settings)["events"]
+    # Drafting from a scheduled report must also use the explicit assistant credential.
+    s.save()
+    ai.stop_assistant_tasks(pg)
+    ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
+    finish_merges(pg, s)
+    legacy_event = ai.get_summary_view(pg, s.ids["cm"])["events"][0]
+    reply_id = replies.enqueue(pg, s.ids["cm"], legacy_event["id"], s.settings,
+                               feature=ai.ASSISTANT_FEATURE, instruction="Use English", language="en")
+    s.save(False)
+    observed = []
+    def reply_model(cfg, key, pack, actor, **kwargs):
+        observed.append((cfg["model"], key, pack))
+        if "core_refs" in pack:
+            return {"text": json.dumps({"processed_refs": pack["core_refs"],
+                "relevant_refs": pack["core_refs"], "style_refs": []})}
+        return {"text": json.dumps({"outcome": "ready", "language": "en", "draft": "I can check that.",
+            "chinese_translation": "我可以核对。", "explanation": "资料明确。", "checks": [],
+            "evidence_refs": [m["ref"] for m in pack["messages"]]})}
+    monkeypatch.setattr(openai_client, "call_openai", reply_model)
+    for _ in range(8):
+        reply_job = replies.claim()
+        if not reply_job:
+            break
+        replies.run(reply_job, s.settings)
+    assert replies.read(pg, s.ids["cm"], reply_id, s.settings)["status"] == "succeeded"
+    assert observed and all(model == "assistant-model" and key == "assistant-synthetic-key"
+                            for model, key, _ in observed)
+    assert observed[-1][2]["draft_request"] == {"instruction": "Use English", "language": "en"}
+
+
+def test_assistant_unknown_material_cannot_be_replayed_by_a_new_turn(pg, seeded, monkeypatch):
+    s = seeded
+    save_feature_config(pg, api_key_cipher(s.settings.token_encryption_key), ai.ASSISTANT_FEATURE,
+        provider="openai", project_id="assistant-test", model="assistant-model", enabled=True,
+        api_key="assistant-synthetic-key", updated_by_authorization_id=s.ids["owner"])
+    def request():
+        session_id, turn_id = uuid4(), uuid4()
+        pg.execute("INSERT INTO assistant_sessions(id,actor_id) VALUES(%s,%s)", (session_id, s.ids["cm"]))
+        pg.execute("""INSERT INTO assistant_turns(id,session_id,client_request_id,status,input_ciphertext)
+            VALUES(%s,%s,%s,'waiting','synthetic')""", (turn_id, session_id, uuid4()))
+        return ai.ensure_assistant_run(pg, s.ids["cm"], turn_id, s.ids["cm"], s.start, s.end, None, s.settings)
+    calls = []
+    original_model = openai_client.call_openai
+    def timeout(*_args, **_kwargs):
+        calls.append("paid attempt")
+        raise openai_client.OpenAIRequestError("synthetic timeout", retryable=True)
+    monkeypatch.setattr(openai_client, "call_openai", timeout)
+    first = request()
+    assert ai.prepare_next_summary(s.settings)
+    ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
+    assert ai.read_assistant_run(pg, s.ids["cm"], first["run"]["id"], s.settings)["run"]["status"] == "unknown"
+    repeated = request()
+    if repeated["run"]["id"] != first["run"]["id"]:
+        ai.prepare_next_summary(s.settings)
+    assert ai.claim_next_summary() is None and len(calls) == 1
+    assert ai.read_assistant_run(pg, s.ids["cm"], repeated["run"]["id"], s.settings)["run"]["status"] == "unknown"
+    # A real message change is new material, so the frozen request cannot hide it.
+    s.add("new-material", text="Please check sample SKU-200", at=s.start + timedelta(hours=2))
+    monkeypatch.setattr(openai_client, "call_openai", original_model)
+    changed = request()
+    assert changed["run"]["id"] != first["run"]["id"]
+    assert ai.prepare_next_summary(s.settings)
+    fresh = ai.claim_next_summary()
+    assert fresh is not None
+    ai.run_claimed_summary(fresh, s.settings)
+    ai.prepare_next_summary(s.settings)
+    ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
+    assert ai.read_assistant_run(pg, s.ids["cm"], changed["run"]["id"], s.settings)["run"]["status"] == "completed"

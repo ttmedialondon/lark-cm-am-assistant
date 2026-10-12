@@ -60,8 +60,10 @@ def test_admin_summary_form_has_native_window_inputs_and_disabled_default_withou
         'name="auto_confirm_threshold"' not in form for form in forms
         if form not in (responsibility_form, group_form)
     )
-    assert 'name="feature" value="creator_import"' in forms[0]
-    assert 'name="enabled"' not in forms[0]
+    import_form = next(form for form in forms if 'name="feature" value="creator_import"' in form)
+    assistant_form = next(form for form in forms if 'name="feature" value="operations_assistant"' in form)
+    assert 'name="auto_confirm_threshold"' not in assistant_form
+    assert 'name="enabled"' not in import_form
     summary_form = next(form for form in forms if 'name="feature" value="offhours_summary"' in form)
     assert 'name="csrf_token" value="fixture-csrf"' in summary_form
     assert ('type="datetime-local" id="summary-window-start" name="window_start" value="2026-09-09T18:00"'

@@ -1,0 +1,20 @@
+<div id="operations-assistant" data-user-id="{{ assistant_user_id }}" data-csrf="{{ csrf_token }}" data-configured="{{ 'true' if assistant_configured else 'false' }}">
+  <button type="button" class="oa-launcher" id="oa-launcher" aria-controls="oa-panel" aria-expanded="false"><span aria-hidden="true">✦</span> 问助手</button>
+  <section class="oa-panel" id="oa-panel" role="dialog" aria-label="运营助手" aria-modal="false" hidden>
+    <header class="oa-header">
+      <div class="oa-brand"><span aria-hidden="true">✦</span><h2>运营助手</h2></div>
+      <div class="oa-header-actions"><button type="button" id="oa-new" aria-label="开始新对话" title="新对话">＋</button><button type="button" id="oa-fullscreen" aria-label="全屏" title="全屏">⤢</button><button type="button" id="oa-collapse" aria-label="收起助手" title="收起">−</button></div>
+    </header>
+    <div class="oa-scope" id="oa-scope" aria-label="当前查询范围" hidden></div>
+    <div class="oa-history" id="oa-history" role="log" aria-label="对话记录" aria-live="polite" aria-relevant="additions">
+      <div class="oa-welcome" id="oa-welcome"><div class="oa-welcome-symbol" aria-hidden="true">✦</div><h3>今天有什么需要了解？</h3><p>问我聊天事件、最新进展，或请我起草回复。</p><div class="oa-prompts"><button type="button" data-prompt="总结今天上午的聊天事件">总结今天上午</button><button type="button" data-prompt="有哪些还没解决的事项？">查看未解决事项</button><button type="button" data-prompt="我想查看一位达人的最新进展">查询达人进展</button></div></div>
+    </div>
+    <div class="oa-status" id="oa-status" role="status" aria-live="polite" hidden></div>
+    <form class="oa-composer" id="oa-form">
+      <label class="visually-hidden" for="oa-input">向运营助手提问</label>
+      <textarea id="oa-input" rows="2" maxlength="6000" placeholder="提问，或继续追问…" autocomplete="off"></textarea>
+      <div class="oa-composer-bottom"><span id="oa-composer-note">Enter 发送 · Shift + Enter 换行</span><button type="button" class="oa-stop" id="oa-stop" hidden>停止</button><button type="submit" class="oa-send" id="oa-send">发送 <span aria-hidden="true">↑</span></button></div>
+    </form>
+  </section>
+  <script type="application/json" id="oa-page-context">{{ assistant_context|default({})|tojson }}</script>
+</div>

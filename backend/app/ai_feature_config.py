@@ -64,7 +64,7 @@ def save_feature_config(
     provider = _required_text(provider, "服务商", 40).casefold()
     project_id = _required_text(project_id, "Project ID", 160)
     if (feature in {"creator_handle_matching", "creator_responsibility_matching",
-                    "creator_group_classification", "creator_importance"}
+                    "creator_group_classification", "creator_importance", "operations_assistant"}
             and enabled and project_id.casefold() == "unconfigured"):
         raise FeatureConfigInputError("启用前请填写真实的 OpenAI Project ID。")
     model = _required_text(model, "模型", 160)

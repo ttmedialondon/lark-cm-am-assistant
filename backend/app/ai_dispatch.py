@@ -38,6 +38,9 @@ def can_claim(conn: psycopg.Connection) -> bool:
         """
         SELECT COUNT(*) AS count
         FROM (
+            SELECT id FROM assistant_turns
+            WHERE status = 'running' AND lease_until > NOW()
+            UNION ALL
             SELECT id FROM summary_reply_tasks
             WHERE status = 'running' AND lease_until > NOW()
             UNION ALL
