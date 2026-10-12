@@ -35,10 +35,12 @@ from . import (
 from .config import get_settings
 from .contact_taxonomy import ROLE_LABELS, ROLE_ORDER
 from .db import connection, lock_sync_material
+from .evidence_access import BODY_READ_SCOPES
 from .http_helpers import (
     csrf_matches as _csrf_matches,
 )
 from .http_helpers import (
+    error_response,
     form_body,
     form_fields,
 )
@@ -293,11 +295,9 @@ def create_admin_router(
                 "ai_dispatch": dispatch_status,
                 "summary_settings": summary_settings,
                 "importance_metrics": importance_metrics,
-                "summary_saved": request.query_params.get("saved") == "offhours-summary",
-                "matching_saved": request.query_params.get("saved") == "creator-handle-matching",
-                "responsibility_saved": request.query_params.get("saved") == "creator-responsibility-matching",
-                "groups_saved": request.query_params.get("saved") == "creator-group-classification",
-                "importance_saved": request.query_params.get("saved") == "creator-importance",
+                "config_saved": request.query_params.get("saved") in {
+                    feature.replace("_", "-") for feature in AI_FEATURES
+                },
                 "form_error": error,
             },
             status_code,
@@ -466,24 +466,41 @@ def create_admin_router(
         if not source:
             return Response("未找到人员", status_code=404)
         user = source["user"]
-        if user.get("authorization_status") != "active" or not user.get("body_consent_at"):
+        if (user.get("authorization_status") != "active" or not user.get("body_consent_at")
+                or not BODY_READ_SCOPES.issubset(user.get("scopes") or [])):
             return Response("该人员当前无有效正文授权", status_code=403)
+        return_url = "/admin/messages?" + urlencode({"user_id": str(user_id)})
+        if not message_export.has_exportable_messages(user_id):
+            return error_response(ValueError("该人员暂无已同步且可导出的文字消息。"),
+                                  request=request, render_template=render_template,
+                                  return_url=return_url, return_label="返回消息记录")
 
         def check_access():
             refreshed, denied = access(request)
             if denied is not None:
                 raise PermissionError("导出访问权限已变化")
             limits = refreshed["message_source_ids"]
-            latest = admin_reporting.message_user(user_id)
+            with connection() as conn:
+                latest = conn.execute("SELECT status,body_consent_at,scopes FROM authorizations WHERE id=%s",
+                                      (user_id,)).fetchone()
             if (limits is not None and user_id not in limits) or not latest or (
-                latest["user"].get("authorization_status") != "active"
-                or latest["user"].get("body_consent_at") != user["body_consent_at"]
+                latest["status"] != "active"
+                or latest["body_consent_at"] != user["body_consent_at"]
+                or not BODY_READ_SCOPES.issubset(latest["scopes"])
             ):
                 raise PermissionError("消息来源授权已变化")
 
+        iterator = message_export.stream_export(user_id, context["authorization"]["id"], check_access)
+        try:
+            first_chunk = next(iterator)
+        except (ValueError, PermissionError) as exc:
+            iterator.close()
+            return error_response(exc, request=request, render_template=render_template,
+                                  return_url=return_url, return_label="返回消息记录")
+
         async def chunks():
-            iterator = message_export.stream_export(user_id, context["authorization"]["id"], check_access)
             try:
+                yield first_chunk
                 while (chunk := await run_in_threadpool(next, iterator, None)) is not None:
                     yield chunk
             finally:
@@ -546,6 +563,8 @@ def create_admin_router(
                 source_unavailable_reason = "该人员的 Lark 授权当前不可用，暂时无法查看其会话和记录。"
             elif not selected_user.get("body_consent_at"):
                 source_unavailable_reason = "该人员尚未完成消息正文授权，暂时无法查看其会话和记录。"
+            elif not BODY_READ_SCOPES.issubset(selected_user.get("scopes") or []):
+                source_unavailable_reason = "该人员的 Lark 消息读取权限已变化，请重新授权。"
         if selected_user and not source_unavailable_reason:
             conversation_page_data = admin_reporting.message_conversations(
                 selected_user["id"], conversation_page, conversation_query, conversation_type
@@ -861,6 +880,10 @@ def create_admin_router(
                 threshold = form.get("auto_confirm_threshold", "0.950")
             enabled = feature != "creator_import" and form.get("enabled") == "1"
             with connection() as conn, conn.transaction():
+                if feature == "creator_import":
+                    current_import = ai_feature_config.get_feature_config(conn, feature) or {}
+                    threshold = str(form.get("auto_confirm_threshold",
+                                             current_import.get("auto_confirm_threshold", "0.950")))
                 if feature == offhours_summary.FEATURE:
                     lock_sync_material(conn, read=True)
                 key_rotated = bool(form.get("api_key", "").strip())
@@ -911,17 +934,8 @@ def create_admin_router(
                 )
         except ai_feature_config.FeatureConfigInputError as exc:
             return render_ai_config(request, access_context, error=str(exc), status_code=400)
-        saved_url = (
-            "/admin/ai?saved=offhours-summary#offhours-summary" if feature == offhours_summary.FEATURE else
-            "/admin/ai?saved=creator-handle-matching#creator-handle-matching"
-            if feature == "creator_handle_matching" else
-            "/admin/ai?saved=creator-responsibility-matching#creator-responsibility-matching"
-            if feature == creator_responsibility_matching.FEATURE else
-            "/admin/ai?saved=creator-group-classification#creator-group-classification"
-            if feature == creator_group_matching.FEATURE else
-            "/admin/ai?saved=creator-importance#creator-importance"
-            if feature == creator_importance.FEATURE else "/admin/ai"
-        )
+        anchor = feature.replace("_", "-")
+        saved_url = f"/admin/ai?saved={anchor}#{anchor}"
         response = RedirectResponse(url=saved_url, status_code=303)
         response.headers["Cache-Control"] = "no-store, max-age=0"
         return response

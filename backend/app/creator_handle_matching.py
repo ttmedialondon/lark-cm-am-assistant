@@ -10,7 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from uuid import uuid4
 
-from . import ai_dispatch, ai_feature_config, contact_handles, creator_data, creator_imports
+from . import admin_permissions, ai_dispatch, ai_feature_config, contact_handles, creator_data, creator_imports
 from . import creator_handle_evidence as evidence
 from . import openai_client as api
 from .creator_access import require_owner
@@ -855,7 +855,7 @@ def enqueue_history(conn, actor):
 
 
 def page_data(conn, actor, settings, page=1):
-    require_owner(conn, actor)
+    access = admin_permissions.require_page(conn, actor, "ai")
     counts = conn.execute("""SELECT status,count(*) n FROM (
         SELECT DISTINCT ON(contact_id) status FROM creator_handle_jobs
         ORDER BY contact_id,created_at DESC,id DESC) latest GROUP BY status""").fetchall()
@@ -883,7 +883,7 @@ def page_data(conn, actor, settings, page=1):
         if (
             not reused and job["result_ciphertext"]
             and job["catalog_version"] == version
-            and evidence.still_valid(conn, job["refs"], settings)
+            and evidence.still_valid(conn, job["refs"], settings, ciphertext_only=not access["is_owner"])
         ):
             view = json.loads(storage.decrypt(job["result_ciphertext"]))
             job["suggestions"] = [
@@ -929,9 +929,10 @@ def page_data(conn, actor, settings, page=1):
                 and all(rows[link["handle"]]["associated"] and rows[link["handle"]]["check"] is None
                         for link in job["suggestions"])):
             job.update(display_status="completed", display_reason_code="already_confirmed")
-        for field in ("pack_ciphertext", "result_ciphertext", "refs"):
+        for field in ("pack_ciphertext", "result_ciphertext", "refs", "config_fingerprint", "claim_token"):
             job.pop(field, None)
-    return {"jobs": jobs, "counts": counts, "enabled": _enabled(_config(conn)), "page": page}
+    return {"jobs": jobs, "counts": counts, "enabled": _enabled(_config(conn)), "page": page,
+            "admin_access": access}
 
 
 def action(conn, actor, job_id, operation):

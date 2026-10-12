@@ -88,7 +88,10 @@ def _template(request: Request, name: str, context: dict[str, Any], status_code:
             csrf_token=_admin_csrf_token(authorization),
         )
         selected_cm = (context.get('summary_data', {}).get('responsible', {}).get('id')
-                       or context.get('creator_data', {}).get('selected_cm_id'))
+                       or context.get('creator_data', {}).get('selected_cm_id')
+                       or context.get('broadcast_data', {}).get('selected_cm_id'))
+        if selected_cm == 'all':
+            selected_cm = authorization['id']
         context['assistant_context'] = {'cm_id': str(selected_cm)} if selected_cm else {}
     return templates.TemplateResponse(request, name, context, status_code=status_code)
 
@@ -317,10 +320,12 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 diagnostic_authorization_id = previous["id"] if previous else authorization_id
                 if send_upgrade:
                     if (not previous or previous["id"] != state_row["authorization_id"]
-                            or previous["status"] not in {"active", "attention_required"} or not previous["body_consent_at"]):
+                            or previous["status"] not in {"active", "attention_required"}
+                            or not previous["body_consent_at"]):
                         return _template(
                             request, "error.html",
-                            {"title": "发送授权账号不一致", "detail": "请使用发起增权的本人账号重新授权，原有授权保持不变。"},
+                            {"title": "发送授权账号不一致",
+                             "detail": "请使用发起增权的本人账号重新授权，原有授权保持不变。"},
                             403,
                         )
                 if previous and (send_upgrade or previous["status"] == "active") and conn.execute(

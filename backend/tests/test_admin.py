@@ -276,7 +276,8 @@ def test_selecting_a_user_lists_conversations_without_reading_message_content(mo
     monkeypatch.setattr(
         admin_reporting,
         "message_users",
-        lambda *_args: _page([{"id": selected_id, "display_name": "CM", "body_consent_at": object()}]),
+        lambda *_args: _page([{"id": selected_id, "display_name": "CM", "body_consent_at": object(),
+                              "scopes": ["im:chat:read", "im:message:readonly"]}]),
     )
     monkeypatch.setattr(
         admin_reporting,
@@ -310,7 +311,8 @@ def test_message_conversation_search_and_type_stay_with_the_selected_user(monkey
     monkeypatch.setattr(
         admin_reporting,
         "message_users",
-        lambda *_args: _page([{"id": selected_id, "display_name": "CM", "body_consent_at": object()}]),
+        lambda *_args: _page([{"id": selected_id, "display_name": "CM", "body_consent_at": object(),
+                              "scopes": ["im:chat:read", "im:message:readonly"]}]),
     )
     monkeypatch.setattr(
         admin_reporting,
@@ -349,7 +351,8 @@ def test_owner_reads_only_an_explicit_visible_conversation(monkeypatch):
     monkeypatch.setattr(
         admin_reporting,
         "message_users",
-        lambda *_args: _page([{"id": selected_id, "display_name": "CM", "body_consent_at": object()}]),
+        lambda *_args: _page([{"id": selected_id, "display_name": "CM", "body_consent_at": object(),
+                              "scopes": ["im:chat:read", "im:message:readonly"]}]),
     )
     monkeypatch.setattr(
         admin_reporting,
@@ -386,7 +389,8 @@ def test_unknown_conversation_does_not_fall_back_to_all_messages(monkeypatch):
     monkeypatch.setattr(
         admin_reporting,
         "message_users",
-        lambda *_args: _page([{"id": selected_id, "display_name": "CM", "body_consent_at": object()}]),
+        lambda *_args: _page([{"id": selected_id, "display_name": "CM", "body_consent_at": object(),
+                              "scopes": ["im:chat:read", "im:message:readonly"]}]),
     )
     monkeypatch.setattr(
         admin_reporting,

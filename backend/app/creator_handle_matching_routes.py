@@ -1,4 +1,4 @@
-"""Owner-only queue controls, using the existing session/CSRF boundary."""
+"""AI page readers can view tasks; queue controls retain the owner/CSRF boundary."""
 
 from uuid import UUID
 
@@ -28,6 +28,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
             auth = actor(request)
             with connection() as conn:
                 data = matching.page_data(conn, auth["id"], get_settings(), max(1, page))
+            access = data.pop("admin_access")
             return secure_response(
                 render_template(
                     request,
@@ -36,16 +37,17 @@ def create_router(*, current_authorization, render_template, csrf_token):
                         "authorization": auth,
                         "matching": data,
                         "csrf_token": csrf_token(auth),
-                        "admin_role": "owner",
+                        "admin_role": "owner" if access["is_owner"] else "viewer",
                         "active_page": "ai",
-                        "admin_landing_path": "/admin",
-                        "admin_permissions": admin_permissions.PAGE_KEYS,
+                        "admin_landing_path": access["landing_path"],
+                        "admin_permissions": access["permissions"],
                         "permission_pages": admin_permissions.PAGES,
                     },
                 )
             )
         except (ValueError, LookupError, PermissionError) as exc:
-            return error_response(exc)
+            return error_response(exc, request=request, render_template=render_template,
+                                  return_url="/admin/ai", return_label="返回 AI 功能")
 
     @router.post("/enqueue")
     @router.post("/jobs/{job_id}/{operation}")
@@ -75,6 +77,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
                 target += f"?page={page_number}"
             return secure_response(RedirectResponse(target, status_code=303))
         except (ValueError, LookupError, PermissionError) as exc:
-            return error_response(exc)
+            return error_response(exc, request=request, render_template=render_template,
+                                  return_url="/admin/ai", return_label="返回 AI 功能")
 
     return router

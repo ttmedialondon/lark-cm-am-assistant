@@ -521,7 +521,7 @@ def _review_reason(row, visible):
     if row["contact_id"] and not visible:
         return "对应用户当前不可访问，请重新选择可访问的 Lark 用户。"
     if row["status"] in {"pending", "preparing", "queued", "running"}:
-        return "系统正在核对群聊及账号归属；Curva 未核验的结果保留待核对。"
+        return "系统正在核对群聊及账号归属；证据不足或存在冲突的结果保留待核对。"
     return REASONS.get(row["reason_code"], REASONS["manual_review"])
 
 
@@ -611,13 +611,18 @@ def candidate_items(conn, cm_id, rows):
     return candidates
 
 
-def page_data(actor_id, cm_id, q="", page=1, *, include_candidates=True):
+def page_data(actor_id, cm_id, q="", page=1, *, include_candidates=True, batch_id=None):
     with connection() as conn:
         cm_id, _ = creator_access.access(conn, actor_id, cm_id)
-        return _page_data(conn, cm_id, q, page, include_candidates=include_candidates)
+        if batch_id is not None:
+            batch = _batch(conn, actor_id, batch_id)
+            if batch["cm_authorization_id"] != cm_id:
+                raise PermissionError("该导入批次不属于当前负责人。")
+            batch_id = batch["id"]
+        return _page_data(conn, cm_id, q, page, include_candidates=include_candidates, batch_id=batch_id)
 
 
-def _page_data(conn, cm_id, q="", page=1, *, include_candidates=True):
+def _page_data(conn, cm_id, q="", page=1, *, include_candidates=True, batch_id=None):
     """Read candidates using the caller's already-authorized CM and connection."""
     q, page = str(q or "").strip()[:120], max(1, min(int(page), 10000))
     decorated = batch_summaries(conn, cm_id)
@@ -625,6 +630,9 @@ def _page_data(conn, cm_id, q="", page=1, *, include_candidates=True):
         WHERE r.cm_authorization_id=%s AND b.policy_version=%s
         AND b.status<>'preview' AND r.review_status<>'confirmed'"""
     params = (cm_id, POLICY_VERSION)
+    if batch_id is not None:
+        base += " AND r.batch_id=%s"
+        params += (batch_id,)
     if q:
         base += (
             """ AND (POSITION(lower(%s) IN lower(r.handle))>0 OR EXISTS (
@@ -728,7 +736,8 @@ def row_evidence(actor_id, row_id):
                 try:
                     raw_decision = json.loads(decision["response"]["text"])
                     ai_outcome = raw_decision.get("outcome") if isinstance(raw_decision, dict) else None
-                    decision = {**decision, **validator(decision["response"]["text"], pack)}
+                    decision = {**decision, **validator(decision["response"]["text"], pack,
+                        threshold=decision.get("auto_confirm_threshold", 0.95))}
                 except (ValueError, TypeError, KeyError):
                     result["warnings"].append(phase + "：AI 输出格式或引用未通过校验。")
             result["warnings"].extend(phase + "：" + note for note in decision.get("blocking_reasons", []))
@@ -1201,18 +1210,17 @@ def _finish(job, settings, *, response=None, result=None, reason=""):
         results[stage] = {**(result or {}), "response": response}
         if reason:
             results[stage]["invalidated"] = True
-        matched = bool(result and not reason and result["outcome"] == "matched" and result["confidence"] >= 0.95)
+        threshold = float(config["auto_confirm_threshold"]) if result and not reason else 0.95
+        results[stage]["auto_confirm_threshold"] = threshold
+        matched = bool(result and not reason and result["outcome"] == "matched"
+                       and result["confidence"] >= threshold)
         contact_id = None
         if matched and stage == "person":
             contact_id = creator_import_evidence.resolve_contact(chain["person"]["refs"], result.get("user_ref"))
             matched = bool(contact_id and not result.get("conflicts"))
-        catalog_verified = bool(stage == "person" and
-            chain.get("person", {}).get("pack", {}).get("catalog_check", {}).get("status") == "verified")
         next_stage = "person" if matched and stage == "group" else "completed"
         status = "pending" if next_stage == "person" else "invalid" if reason else "succeeded"
         reason = reason or ("" if matched else (result or {}).get("reason_code") or f"{stage}_review")
-        if matched and stage == "person" and not catalog_verified:
-            reason = "catalog_review_required"
         if reason == "person_not_found" and any(
             g.get("member_snapshot_status") != "succeeded" for g in chain["person"]["pack"]["groups"]
         ):
@@ -1238,7 +1246,7 @@ def _finish(job, settings, *, response=None, result=None, reason=""):
                 row["id"],
             ),
         )
-        if matched and stage == "person" and catalog_verified:
+        if matched and stage == "person":
             try:
                 with conn.transaction():
                     saved = conn.execute("SELECT * FROM creator_import_rows WHERE id=%s", (row["id"],)).fetchone()
@@ -1299,7 +1307,8 @@ def run_claimed_import(job, settings):
             max_output_tokens=5000,
         )
         validator = creator_import_evidence.group_validate if group else creator_import_evidence.person_validate
-        _finish(job, settings, response=response, result=validator(response["text"], pack))
+        _finish(job, settings, response=response,
+                result=validator(response["text"], pack, threshold=float(config["auto_confirm_threshold"])))
     except openai_client.OpenAIRequestError as exc:
         if exc.is_quota:
             ai_dispatch.pause_for_quota()

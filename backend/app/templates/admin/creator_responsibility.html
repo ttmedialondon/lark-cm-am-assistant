@@ -43,8 +43,8 @@
       <td>{{ result.association_label or '仅展示' }}{% if result.association_reason %}<div class="text-secondary small">{{ result.association_reason }}</div>{% endif %}</td>
       <td>{{ result.scope or '—' }}{% if result.scope_note %}<div class="small">{{ result.scope_note }}</div>{% endif %}{% if result.period %}<div class="text-secondary small">{{ period_labels.get(result.period, result.period) }}</div>{% endif %}</td>
       <td>
-        {% if result.support_refs %}<div>支持：{% for ref in result.support_refs %}<a href="{{ evidence_link }}#evidence-{{ ref }}">{{ ref }}</a>{{ '、' if not loop.last else '' }}{% endfor %}</div>{% endif %}
-        {% if result.counter_refs %}<div>反证：{% for ref in result.counter_refs %}<a href="{{ evidence_link }}#evidence-{{ ref }}">{{ ref }}</a>{{ '、' if not loop.last else '' }}{% endfor %}</div>{% endif %}
+        {% if result.support_refs %}<div>支持：{% for ref in result.support_refs %}{% if admin_role == 'owner' %}<a href="{{ evidence_link }}#evidence-{{ ref }}">{{ ref }}</a>{% else %}{{ ref }}{% endif %}{{ '、' if not loop.last else '' }}{% endfor %}</div>{% endif %}
+        {% if result.counter_refs %}<div>反证：{% for ref in result.counter_refs %}{% if admin_role == 'owner' %}<a href="{{ evidence_link }}#evidence-{{ ref }}">{{ ref }}</a>{% else %}{{ ref }}{% endif %}{{ '、' if not loop.last else '' }}{% endfor %}</div>{% endif %}
         {% if not result.support_refs and not result.counter_refs %}<span class="text-secondary">无引用</span>{% endif %}
       </td>
     </tr>
@@ -75,8 +75,10 @@
         <div><h2 class="mb-1">达人负责人匹配</h2><div class="text-secondary">{{ '已启用' if matching.enabled else '未启用' }} · 高置信度自动关联，其余待核实</div></div>
         <div class="d-flex flex-wrap gap-2">
           <a class="btn" href="{{ base }}?page={{ matching.page }}">刷新</a>
-          <a class="btn" href="/admin/ai">API Key 配置</a>
+          <a class="btn" href="/admin/ai">{{ 'API Key 配置' if admin_role == 'owner' else 'AI 功能' }}</a>
+          {% if admin_role == 'owner' %}
           <form method="post" action="{{ base }}/enqueue"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary" type="submit" {% if not matching.enabled %}disabled{% endif %}>开始匹配（全部待处理）</button></form>
+          {% endif %}
         </div>
       </div>
       <div class="d-flex flex-wrap gap-3 mb-3">{% for status, count in matching.counts.items() %}<span>{{ status_labels.get(status, status) }}：{{ count }}</span>{% else %}<span class="text-secondary">暂无任务</span>{% endfor %}</div>
@@ -85,10 +87,12 @@
           <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
             <div><span class="fw-medium">{{ job.name or '未命名' }}</span><span class="text-secondary ms-2">{{ job.status_label or status_labels.get(job.status, job.status) }}</span>{% if job.outdated and job.results %}<span class="badge bg-yellow-lt ms-2">旧版结果</span>{% endif %}{% if job.reason %}<div class="text-secondary small">{{ reason_labels.get(job.reason, job.reason) }}</div>{% endif %}</div>
             <div class="d-flex flex-wrap align-items-center gap-2">
+              {% if admin_role == 'owner' %}
               {% if job.stats.get('messages') and not job.stale %}<a class="btn btn-sm" href="{{ base }}/jobs/{{ job.id }}/evidence">查看原文</a>{% endif %}
               {% if job.status in ['failed', 'retry_wait'] %}<form method="post" action="{{ base }}/jobs/{{ job.id }}/retry"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="page" value="{{ matching.page }}"><button class="btn btn-sm" type="submit" {% if not matching.enabled %}disabled{% endif %}>重试</button></form>{% endif %}
               {% if job.status not in ['queued', 'preparing', 'ready', 'running', 'retry_wait'] %}<form method="post" action="{{ base }}/jobs/{{ job.id }}/recheck"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="page" value="{{ matching.page }}"><button class="btn btn-sm" type="submit" {% if not matching.enabled %}disabled{% endif %}>重新检查</button></form>{% endif %}
               {% if job.status not in ['completed', 'failed', 'cancelled'] %}<form method="post" action="{{ base }}/jobs/{{ job.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="page" value="{{ matching.page }}"><button class="btn btn-sm" type="submit">取消</button></form>{% endif %}
+              {% endif %}
             </div>
           </div>
           {{ confirmed_assignments(job.existing_assignments) }}

@@ -20,10 +20,11 @@ def encode(value):
 def config(conn):
     # Creator matching is explicitly started per batch; saving credentials never starts a scan.
     return conn.execute(
-        """SELECT provider,project_id,model,api_key_ciphertext FROM ai_feature_configs
+        """SELECT provider,project_id,model,api_key_ciphertext,auto_confirm_threshold FROM ai_feature_configs
            WHERE feature='creator_import' AND provider='openai' AND api_key_ciphertext IS NOT NULL"""
     ).fetchone()
 
 
 def config_fingerprint(config):
-    return hashlib.sha256(encode({k: config.get(k) for k in ("provider", "project_id", "model")}).encode()).hexdigest()
+    return hashlib.sha256(encode({k: config.get(k) for k in
+        ("provider", "project_id", "model", "auto_confirm_threshold")}).encode()).hexdigest()

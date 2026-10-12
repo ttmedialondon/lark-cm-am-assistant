@@ -7,6 +7,7 @@ from . import admin_reporting, contact_handles, creator_importance, creator_resp
 from . import offhours_summary as summaries
 from .assistant_search import unreadable_reason
 from .creator_group_evidence import PURPOSES
+from .evidence_access import BODY_READ_SCOPE_SQL
 
 PAGE_SIZE = 25
 
@@ -220,7 +221,7 @@ def sync_status(conn, actor_id, context, args, settings, *, now=None):
 
 
 # Only actual sender, private counterpart and explicit @/reply links count; group membership alone never does.
-_ACTIVITY_SQL = """WITH people AS MATERIALIZED (
+_ACTIVITY_SQL = f"""WITH people AS MATERIALIZED (
     SELECT open_id,contact_id FROM lark_identities WHERE identity_type='user' AND contact_id=ANY(%s::uuid[])
 ), visible AS MATERIALIZED (
     SELECT m.chat_id,m.message_id,m.message_create_time,m.sender_open_id,m.parent_id,m.root_id,m.mentions_json,
@@ -231,6 +232,7 @@ _ACTIVITY_SQL = """WITH people AS MATERIALIZED (
     JOIN authorizations a ON a.id=o.authorization_id JOIN chats c ON c.chat_id=m.chat_id
     WHERE a.id=%s AND a.status='active' AND a.body_consent_at IS NOT NULL AND o.observed_at>=a.body_consent_at
       AND ac.is_visible AND ac.sync_enabled AND COALESCE(c.chat_status,'normal')='normal' AND NOT m.is_deleted
+      AND {BODY_READ_SCOPE_SQL} AND ac.sync_status IS DISTINCT FROM 'not_readable'
       AND COALESCE(m.sender_type,'user')='user' AND m.message_create_time>=%s AND m.message_create_time<%s
       AND (m.sender_open_id=a.open_id OR m.sender_open_id IN (SELECT open_id FROM people))
 ), links AS (
@@ -291,7 +293,7 @@ def _activity(conn, cm, ids, start, end, group_by, chat_ids=None):
             "metrics": metrics, "rows": values, "source_chat_ids": source_chats}
 
 
-_ALL_ACTIVITY_SQL = """WITH visible AS MATERIALIZED (
+_ALL_ACTIVITY_SQL = f"""WITH visible AS MATERIALIZED (
     SELECT m.chat_id,m.message_id,m.message_create_time,m.sender_open_id,m.sender_id,m.sender_id_type,
         m.parent_id,m.root_id,m.mentions_json,m.body_ciphertext IS NOT NULL readable,
         CASE WHEN COALESCE(m.sender_type,i.identity_type) IN ('app','bot') THEN 'app'
@@ -307,6 +309,7 @@ _ALL_ACTIVITY_SQL = """WITH visible AS MATERIALIZED (
     LEFT JOIN lark_identities i ON i.open_id=m.sender_open_id
     LEFT JOIN contacts p ON p.id=i.contact_id LEFT JOIN lark_identities own ON own.open_id=a.open_id
     WHERE a.id=%s AND a.status='active' AND a.body_consent_at IS NOT NULL AND o.observed_at>=a.body_consent_at
+      AND {BODY_READ_SCOPE_SQL}
       AND ac.is_visible AND ac.sync_enabled AND COALESCE(c.chat_status,'normal')='normal'
       AND ac.sync_status IS DISTINCT FROM 'not_readable' AND NOT m.is_deleted
       AND m.message_create_time>=%s AND m.message_create_time<%s

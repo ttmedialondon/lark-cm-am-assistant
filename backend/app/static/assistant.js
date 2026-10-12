@@ -13,6 +13,7 @@
   let saved = {}, active = null, source = null, submitting = false, restoring = false, denied = false;
   let pending = null, pendingScopeVersion = null, restoreTimer = null, revision = 0, sourceVersion = 0, sourceFocus = null, followBottom = true;
   let cmScopes = [], scopesReady = false, scopeRequest = null;
+  let pendingPageContext = null;
   try { saved = JSON.parse(localStorage.getItem(storageKey) || "{}"); } catch { /* IDs can remain in memory. */ }
   if (!saved || typeof saved !== "object" || !uuid.test(saved.session_id || "")) saved = {};
   if (saved.client_request_id && !uuid.test(saved.client_request_id)) delete saved.client_request_id;
@@ -168,6 +169,12 @@
     if (person.cm_id !== activeContext.cm_id) resetSession(person, true);
     return true;
   }
+  function syncPageContext() {
+    if (!pendingPageContext || denied || !scopesReady || active || submitting || restoring || saved.client_request_id) return;
+    const context = pendingPageContext; pendingPageContext = null;
+    if (context.cm_id && !switchCM(context.cm_id)) return;
+    selectContext(context); scope({});
+  }
   function date(value) {
     if (!value || Number.isNaN(new Date(value).getTime())) return "";
     return new Intl.DateTimeFormat("zh-CN", {timeZone: "Europe/London", month: "2-digit", day: "2-digit",
@@ -219,6 +226,7 @@
   function updatedScroll(follow) { followBottom = follow; if (follow) scrollToBottom(); else $("oa-new-result").hidden = false; }
   function userMessage(requestId, text) {
     $("oa-welcome")?.remove();
+    for (const placeholder of history.querySelectorAll(":scope > p.oa-answer")) placeholder.remove();
     let message = [...history.children].find(child => child.dataset.requestId === requestId);
     if (!message) {
       message = node("article", "oa-message oa-message--user"); message.dataset.requestId = requestId;
@@ -531,6 +539,7 @@
     source?.close(); source = null; active = null; controls();
     if (state === "completed") status("");
     else status(labels[state] || "这轮处理已结束", state !== "cancelled");
+    syncPageContext();
   }
   function watch(view, restoredVersion = scopeVersion) {
     if (denied) return;
@@ -622,7 +631,7 @@
       if (error.status !== 404) scopesReady = false;
       status(error.status === 404 ? (saved.client_request_id ? "上次请求尚未保存，可重新输入并提交。" :
         "上次会话已不可读取，可开始新对话。") : error.message, true);
-    } finally { restoring = false; controls(); }
+    } finally { restoring = false; controls(); syncPageContext(); }
   }
   async function ask(text, selectedContext = {}) {
     if (denied || active || submitting || restoring) return;
@@ -654,7 +663,7 @@
         delete saved.client_request_id; pending = null; persist();
       }
       status(error.message + (saved.client_request_id ? " 重试将复用这次请求。" : ""), true);
-    } finally { if (version === revision) { submitting = false; controls(); } }
+    } finally { if (version === revision) { submitting = false; controls(); syncPageContext(); } }
   }
   function open() {
     panel.hidden = false; $("oa-launcher").hidden = true; $("oa-launcher").setAttribute("aria-expanded", "true");
@@ -726,14 +735,19 @@
     const detail = event.detail;
     if (!detail || denied) return;
     const context = detail.context && typeof detail.context === "object" && !Array.isArray(detail.context) ? detail.context : {};
-    open();
+    const message = typeof detail.message === "string" ? detail.message.trim() : "";
+    if (!message) {
+      pendingPageContext = context;
+      if (await loadScopes()) syncPageContext();
+      return;
+    }
+    pendingPageContext = null; open();
     if (!await loadScopes()) return;
     if (active || submitting || restoring) { status("当前问题还在处理，完成后请再查看。"); return; }
     if (saved.client_request_id) { status("上次提交尚未确认，请先恢复或重试原请求。", true); return; }
     if (context.cm_id && !switchCM(context.cm_id)) return;
-    if (typeof detail.message !== "string" || !detail.message.trim()) { selectContext(context); scope({}); return; }
-    input.value = detail.message; controls();
-    void ask(detail.message, context);
+    input.value = message; controls();
+    void ask(message, context);
   });
   window.addEventListener("pagehide", () => { source?.close(); clearTimeout(restoreTimer); });
   if (app.dataset.configured !== "true") status("助手尚未配置，请联系管理员。", true);

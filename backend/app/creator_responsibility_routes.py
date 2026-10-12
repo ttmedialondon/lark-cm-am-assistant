@@ -1,4 +1,4 @@
-"""Owner-only formal matching queue and on-demand audited evidence."""
+"""AI page readers can view tasks; queue controls and raw evidence remain owner-only."""
 
 from uuid import UUID
 
@@ -22,7 +22,8 @@ def create_router(*, current_authorization, render_template, csrf_token):
             raise PermissionError("请重新登录。")
         return auth
 
-    def render(request, auth, data, evidence=None):
+    def render(request, auth, data, evidence=None, access=None):
+        access = access if access is not None else data.pop("admin_access")
         return secure_response(
             render_template(
                 request,
@@ -32,10 +33,10 @@ def create_router(*, current_authorization, render_template, csrf_token):
                     "matching": data,
                     "evidence": evidence,
                     "csrf_token": csrf_token(auth),
-                    "admin_role": "owner",
+                    "admin_role": "owner" if access["is_owner"] else "viewer",
                     "active_page": "ai",
-                    "admin_landing_path": "/admin",
-                    "admin_permissions": admin_permissions.PAGE_KEYS,
+                    "admin_landing_path": access["landing_path"],
+                    "admin_permissions": access["permissions"],
                     "permission_pages": admin_permissions.PAGES,
                 },
             )
@@ -49,7 +50,8 @@ def create_router(*, current_authorization, render_template, csrf_token):
                 data = matching.page_data(conn, auth["id"], get_settings(), max(1, page))
             return render(request, auth, data)
         except (ValueError, LookupError, PermissionError) as exc:
-            return error_response(exc)
+            return error_response(exc, request=request, render_template=render_template,
+                                  return_url="/admin/ai", return_label="返回 AI 功能")
 
     @router.get("/jobs/{job_id}/evidence")
     def evidence(request: Request, job_id: UUID):
@@ -57,9 +59,11 @@ def create_router(*, current_authorization, render_template, csrf_token):
             auth = actor(request)
             with connection() as conn, conn.transaction():
                 data = matching.task_evidence(conn, auth["id"], get_settings(), job_id)
-            return render(request, auth, None, data)
+                access = admin_permissions.require_page(conn, auth["id"], "ai")
+            return render(request, auth, None, data, access=access)
         except (ValueError, LookupError, PermissionError) as exc:
-            return error_response(exc)
+            return error_response(exc, request=request, render_template=render_template,
+                                  return_url="/admin/ai", return_label="返回 AI 功能")
 
     @router.post("/enqueue")
     @router.post("/jobs/{job_id}/{operation}")
@@ -91,6 +95,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
                 target += f"?page={page_number}"
             return secure_response(RedirectResponse(target, status_code=303))
         except (ValueError, LookupError, PermissionError) as exc:
-            return error_response(exc)
+            return error_response(exc, request=request, render_template=render_template,
+                                  return_url="/admin/ai", return_label="返回 AI 功能")
 
     return router

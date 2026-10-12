@@ -4,7 +4,7 @@
 <div class="page">
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
-    <details class="mb-3 text-secondary"><summary>配置说明</summary><p class="mt-2">每项功能可使用独立 Project 与 service-account key，按功能核算费用。密钥加密保存，完整值不回显；后台功能共用并发和限速控制。桌面回复独立调用，由自己的功能开关控制。</p></details>
+    <details class="mb-3 text-secondary"><summary>配置说明</summary><p class="mt-2">各功能独立配置和核算费用。密钥加密保存，不显示完整值。后台任务使用队列；桌面回复独立调用。</p></details>
     {% if ai_dispatch.state == 'paused' %}
     <div class="alert alert-danger d-flex align-items-center justify-content-between" role="alert">
       <div><strong>{{ ai_dispatch.label }}</strong><div class="small">{{ ai_dispatch.message }} 后台功能停止领取新任务；桌面回复仍由其独立开关控制。</div></div>
@@ -14,11 +14,7 @@
     <div class="alert alert-warning" role="alert"><strong>{{ ai_dispatch.label }}</strong>：{{ ai_dispatch.message }} 后台功能会自动恢复；桌面回复不使用此队列。</div>
     {% endif %}
     {% if form_error %}<div class="alert alert-danger" role="alert">{{ form_error }}</div>{% endif %}
-    {% if summary_saved %}<div class="alert alert-success" role="status">配置已保存。<a href="/dashboard/offhours-summary" class="alert-link">查看总结</a></div>{% endif %}
-    {% if matching_saved and admin_role == 'owner' %}<div class="alert alert-success" role="status">配置已保存。<a href="/admin/ai/creator-handle-matching" class="alert-link">匹配任务</a></div>{% endif %}
-    {% if responsibility_saved and admin_role == 'owner' %}<div class="alert alert-success" role="status">配置已保存。<a href="/admin/ai/creator-responsibility" class="alert-link">负责人匹配</a></div>{% endif %}
-    {% if groups_saved and admin_role == 'owner' %}<div class="alert alert-success" role="status">配置已保存。<a href="/admin/ai/creator-groups" class="alert-link">群用途匹配</a></div>{% endif %}
-    {% if importance_saved and admin_role == 'owner' %}<div class="alert alert-success" role="status">配置已保存。<a href="/creators?sort=importance" class="alert-link">查看维护优先级</a></div>{% endif %}
+    {% if config_saved %}<div class="alert alert-success" role="status">配置已保存。</div>{% endif %}
     {% for feature in configs %}{% set config = feature.config %}
     <div class="card mb-4" id="{{ feature.id_suffix }}"><div class="card-header"><div><h3 class="card-title mb-1">{{ feature.title }}</h3><div class="text-secondary small">{{ feature.description }}</div></div></div>
       <div class="card-body">
@@ -32,16 +28,16 @@
         <details class="mb-3 text-secondary"><summary>总结范围与时段</summary><p class="mt-2">按英国时间整理已入库达人的相关群聊和私聊。上班 10:00–18:00，下班 18:00–次日10:00，可查看最近7天。时段未结束或同步不完整时显示部分结果；不自动发送回复。</p></details>
         <div class="d-flex flex-wrap justify-content-between gap-2 mb-3"><span class="text-secondary">{{ summary_settings.status_label }}</span><a href="/dashboard/offhours-summary">查看消息总结 →</a></div>
         {% endif %}
-        {% if feature.feature == 'creator_handle_matching' and admin_role == 'owner' %}
+        {% if feature.feature == 'creator_handle_matching' %}
         <div class="d-flex justify-content-between gap-2 mb-3"><span class="text-secondary">新达人及新增证据自动入队；历史全量需手动启动。</span><a href="/admin/ai/creator-handle-matching">匹配任务 →</a></div>
         {% endif %}
-        {% if feature.feature == 'creator_responsibility_matching' and admin_role == 'owner' %}
+        {% if feature.feature == 'creator_responsibility_matching' %}
         <div class="d-flex justify-content-between gap-2 mb-3"><span class="text-secondary">独立配置密钥后启用，从匹配页面启动全部待处理达人。</span><a href="/admin/ai/creator-responsibility">负责人匹配 →</a></div>
         {% endif %}
-        {% if feature.feature == 'creator_group_classification' and admin_role == 'owner' %}
+        {% if feature.feature == 'creator_group_classification' %}
         <div class="d-flex justify-content-between gap-2 mb-3"><span class="text-secondary">历史群手动启动；新群自动匹配，证据不足时补查。</span><a href="/admin/ai/creator-groups">群用途匹配 →</a></div>
         {% endif %}
-        {% if feature.feature == 'creator_importance' and admin_role == 'owner' %}
+        {% if feature.feature == 'creator_importance' %}
         <div class="d-flex flex-wrap justify-content-between gap-2 mb-2"><span class="text-secondary">历史分批分析，新消息自动更新；人工调整优先。</span><a href="/creators?sort=importance">查看维护优先级 →</a></div>
         <div class="d-flex flex-wrap gap-3 small text-secondary mb-3" aria-label="维护优先级任务与用量">
           <span>待处理 {{ importance_metrics.counts.pending }}</span><span>处理中 {{ importance_metrics.counts.running }}</span><span>已完成 {{ importance_metrics.counts.succeeded }}</span><span>异常 {{ importance_metrics.counts.failed }}</span>
@@ -59,11 +55,12 @@
           <div class="col-md-4"><label class="form-label" for="summary-window-start">开始时间（英国时间）</label><input class="form-control" type="datetime-local" id="summary-window-start" name="window_start" value="{{ summary_settings.window_start_input }}" required></div>
           <div class="col-md-4"><label class="form-label" for="summary-window-end">结束时间（英国时间）</label><input class="form-control" type="datetime-local" id="summary-window-end" name="window_end" value="{{ summary_settings.window_end_input }}" required></div>
           {% endif %}
-          <div class="col-md-4"><label class="form-label">三天规则</label><div class="form-control-plaintext">周一至周五算工作日，跳过周末</div><div class="form-hint">暂不扣法定假日。消息不完整时，不断言无人回复或处理。</div></div>
           <details class="col-12 text-secondary small"><summary>更新规则</summary>{% if summary_settings.recurring_enabled %}自动生成最近七天各时段的总结。{% else %}仅更新指定时段。{% endif %}时段结束后继续检查最多 24 小时，补充迟到消息；开启时若时段已结束，从开启起检查 24 小时。已成功的相同输入不重复分析。</details>
           {% endif %}
           <div class="col-md-8"><label class="form-label" for="ai-api-key-{{ feature.id_suffix }}">Service-account API key</label><input class="form-control" id="ai-api-key-{{ feature.id_suffix }}" name="api_key" type="password" maxlength="1024" autocomplete="new-password" spellcheck="false" placeholder="{{ '留空则保留 ' ~ config.api_key_label if config.key_configured else '首次配置时必填' }}"><div class="form-hint">填写即更换密钥；不要使用 Organization Admin Key。</div></div>
-          {% if feature.feature in ['creator_responsibility_matching', 'creator_group_classification'] %}
+          {% if feature.feature == 'creator_import' %}
+          <div class="col-md-4"><label class="form-label" for="ai-threshold-{{ feature.id_suffix }}">自动入库置信度阈值</label><input class="form-control" id="ai-threshold-{{ feature.id_suffix }}" name="auto_confirm_threshold" type="number" min="0.90" max="1.00" step="0.001" value="{{ config.auto_confirm_threshold }}" required><div class="form-hint">需有本人关联证据、有效授权且无冲突。</div></div>
+          {% elif feature.feature in ['creator_responsibility_matching', 'creator_group_classification'] %}
           <div class="col-md-4"><label class="form-label" for="ai-threshold-{{ feature.id_suffix }}">{{ '自动入库置信度阈值' if feature.feature == 'creator_group_classification' else '自动关联置信度阈值' }}</label><input class="form-control" id="ai-threshold-{{ feature.id_suffix }}" name="auto_confirm_threshold" type="number" min="0.90" max="1.00" step="0.001" value="{{ config.auto_confirm_threshold }}" required><div class="form-hint">{{ '需有可核对的聊天证据，不覆盖人工分类。' if feature.feature == 'creator_group_classification' else '仅明确、当前、达人本人级负责人关系可自动关联。' }}</div></div>
           {% endif %}
           {% if feature.feature != 'creator_import' %}

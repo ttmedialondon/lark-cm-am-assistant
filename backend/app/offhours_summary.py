@@ -18,6 +18,7 @@ from .ai_feature_config import FeatureConfigInputError
 from .config import get_settings
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection, lock_sync_material
+from .evidence_access import BODY_READ_SCOPE_SQL, BODY_READ_SCOPES
 from .message_mentions import mention_names, mention_targets, resolve_mentions, rich_mention_text
 from .message_text import evidence_body
 
@@ -102,7 +103,7 @@ def _authorize_live(conn, actor_id, *, owner_only=False, cm_id=REMI_ID):
     if (owner_only and not owner) or (not owner and actor_id != cm_id and not tester and not manager):
         raise PermissionError("只能查看自己或已获授权的 CM 总结。")
     cm = conn.execute("SELECT * FROM authorizations WHERE id=%s", (cm_id,)).fetchone()
-    if not cm or cm["status"] != "active" or not cm["body_consent_at"]:
+    if not cm or cm["status"] != "active" or not cm["body_consent_at"] or not BODY_READ_SCOPES.issubset(cm["scopes"]):
         raise SummaryInputError("该 CM 的有效授权或消息正文授权尚未就绪。")
     return dict(cm), owner
 
@@ -292,11 +293,14 @@ def _roster(conn, cm_id=REMI_ID):
     ).fetchall()
 
 
-_CHAT_SQL = """SELECT c.chat_id,c.name,c.chat_mode,ac.p2p_counterpart_open_id,ac.backfill_complete,
+_CHAT_SQL = f"""SELECT c.chat_id,c.name,c.chat_mode,ac.p2p_counterpart_open_id,ac.backfill_complete,
                       ac.backfill_window_start_at,ac.last_backfill_at,ac.last_incremental_at,ac.sync_status,
                       ac.member_snapshot_status,ac.member_count
     FROM authorization_chats ac JOIN chats c USING(chat_id)
+    JOIN authorizations a ON a.id=ac.authorization_id
     WHERE ac.authorization_id=%s AND ac.is_visible AND ac.sync_enabled
+      AND a.status='active' AND a.body_consent_at IS NOT NULL
+      AND {BODY_READ_SCOPE_SQL}
       AND COALESCE(c.chat_status,'normal')='normal'"""
 
 
@@ -433,12 +437,17 @@ def _related_chats(conn, roster, *, settings=None, cm_id=REMI_ID):
     return [chat for chat in chats.values() if chat["contact_ids"]]
 
 
-_MESSAGE_SQL = """SELECT m.*,i.display_name AS sender_name,i.contact_id FROM chat_messages m
+_MESSAGE_SQL = f"""SELECT m.*,i.display_name AS sender_name,i.contact_id FROM chat_messages m
     JOIN authorization_message_observations o ON o.chat_id=m.chat_id AND o.message_id=m.message_id
     JOIN authorizations a ON a.id=o.authorization_id
+    JOIN authorization_chats ac ON ac.authorization_id=a.id AND ac.chat_id=m.chat_id
+    JOIN chats c ON c.chat_id=m.chat_id
     LEFT JOIN lark_identities i ON i.open_id=m.sender_open_id
     WHERE a.id=%s AND m.chat_id=%s AND a.status='active' AND a.body_consent_at IS NOT NULL
       AND o.observed_at>=a.body_consent_at AND NOT m.is_deleted
+      AND {BODY_READ_SCOPE_SQL}
+      AND ac.is_visible AND ac.sync_enabled AND ac.sync_status IS DISTINCT FROM 'not_readable'
+      AND COALESCE(c.chat_status,'normal')='normal'
       AND m.message_create_time >= %s AND m.message_create_time < %s
       AND m.sender_open_id=ANY(%s::text[])
     ORDER BY m.message_create_time DESC,m.message_id DESC LIMIT %s FOR SHARE OF m,o"""
@@ -504,6 +513,8 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
     chat = conn.execute(_CHAT_SQL + " AND c.chat_id=%s", (cm_id, chat_id)).fetchone()
     if not chat:
         raise SummaryInputError("会话授权已失效。")
+    if chat["sync_status"] == "not_readable":
+        raise SummaryInputError("Lark 当前不允许读取此会话消息。")
     roster = _roster(conn, cm_id) if roster is None else roster
     if related_chats is None:
         related_chats = _related_chats(conn, roster, settings=settings, cm_id=cm_id)
@@ -729,6 +740,10 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
     selected_ids, cutoffs = [], []
     run = {**dict(state), "id": state["run_id"]}
     for chat in selected_chats:
+        if chat["sync_status"] == "not_readable":
+            synced = False
+            gaps.append("部分会话当前受 Lark 读取限制，未纳入消息总结。")
+            continue
         previous = conn.execute("""SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND chat_id=%s
             ORDER BY is_current DESC,created_at DESC LIMIT 1""", (state["run_id"], chat["chat_id"])).fetchone()
         active = previous and previous['is_current'] and previous['status'] in ('queued', 'running')
@@ -1263,6 +1278,8 @@ def read_assistant_run(conn, actor_id, run_id, settings):
         material = {}
         for chat in chats:
             if targets is not None and not chat["contact_ids"] & targets:
+                continue
+            if chat["sync_status"] == "not_readable":
                 continue
             data = _load_chat(conn, run, chat["chat_id"], cutoff, settings=settings, roster=roster, related_chats=chats)
             if data:

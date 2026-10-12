@@ -1,6 +1,7 @@
 """Message-console state transitions and rendered controls stay inside their source scope."""
 
 import re
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -54,6 +55,7 @@ def console(monkeypatch):
     actor = {"id": uuid4(), "display_name": "Page viewer", "status": "active"}
     source = admin_reporting._decorate_user({
         "id": uuid4(), "display_name": "Remi", "authorization_status": "active",
+        "scopes": ["im:chat:read", "im:message:readonly"],
         "body_consent_at": datetime(2026, 9, 1, tzinfo=UTC), "group_count": 2, "p2p_count": 1,
     })
     chat = admin_reporting._decorate_message_conversation({
@@ -110,6 +112,13 @@ def console(monkeypatch):
     monkeypatch.setattr(admin_reporting, "message_conversation", conversation)
     monkeypatch.setattr(admin_reporting, "message_page", messages)
     monkeypatch.setattr(admin_reporting, "record_message_view", lambda *args: calls["audit"].append(args))
+    monkeypatch.setattr(admin.message_export, "has_exportable_messages", lambda _: bool(state["messages"]))
+    monkeypatch.setattr(admin, "connection", lambda: nullcontext(SimpleNamespace(
+        execute=lambda *_args: SimpleNamespace(fetchone=lambda: {
+            "status": source["authorization_status"], "body_consent_at": source["body_consent_at"],
+            "scopes": source["scopes"],
+        }),
+    )))
     environment = Environment(loader=FileSystemLoader(Path(admin.__file__).parent / "templates"), autoescape=True)
 
     def render(_request, name, context, status_code=200):
@@ -176,11 +185,70 @@ def test_text_export_zip_and_source_permissions(console, monkeypatch):
     console.source['authorization_status'] = 'revoked'
     assert console.browser.get(url, params={'user_id': str(console.source['id'])}).status_code == 403
     assert len(calls) == 1
+    console.source['authorization_status'] = 'active'
+    console.state['messages'] = []
+    empty = console.browser.get(url, params={'user_id': str(console.source['id'])})
+    assert empty.status_code == 400 and '暂无已同步且可导出的文字消息' in empty.text
+    assert '返回消息记录' in empty.text and 'content-disposition' not in empty.headers
+    assert len(calls) == 1
+
+    # Whitespace-only stored text can pass EXISTS, but fails before any ZIP response starts.
+    console.state['messages'] = ['stored whitespace']
+    def empty_stream(*_args):
+        raise ValueError('该人员暂无已同步且可导出的文字消息。')
+        yield
+    monkeypatch.setattr(message_export, 'stream_export', empty_stream)
+    empty = console.browser.get(url, params={'user_id': str(console.source['id'])})
+    assert empty.status_code == 400 and '暂无已同步且可导出的文字消息' in empty.text
+
+
+def test_real_source_metadata_allows_message_page_and_export_with_current_scopes(pg, monkeypatch):
+    from io import BytesIO
+    from zipfile import ZipFile
+
+    from app import message_export
+
+    source = uuid4()
+    pg.execute("""INSERT INTO authorizations(id,open_id,display_name,access_token_ciphertext,body_consent_at)
+        VALUES(%s,'real-console','Readable source','unused',NOW()-INTERVAL '1 day')""", (source,))
+    pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'messages')", (source,))
+    pg.execute("INSERT INTO chats(chat_id,name) VALUES('console-chat','Current readable group')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'console-chat')", (source,))
+    pg.execute("""INSERT INTO chat_messages(chat_id,message_id,message_type,body_ciphertext)
+        VALUES('console-chat','console-message','text','{"text":"Exported content"}')""")
+    pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+        VALUES(%s,'console-chat','console-message')""", (source,))
+    for module in (admin, admin_reporting, admin_permissions, message_export):
+        monkeypatch.setattr(module, 'connection', lambda: nullcontext(pg))
+    monkeypatch.setattr(message_export, 'get_settings', lambda: SimpleNamespace(token_encryption_key='unused'))
+    monkeypatch.setattr(message_export, 'message_body_cipher', lambda _: SimpleNamespace(decrypt=lambda value: value))
+    actor = pg.execute("SELECT * FROM authorizations WHERE id=%s", (source,)).fetchone()
+    environment = Environment(loader=FileSystemLoader(Path(admin.__file__).parent / 'templates'), autoescape=True)
+
+    def render(_request, name, context, status_code=200):
+        return HTMLResponse(environment.get_template(name).render(**context), status_code=status_code)
+
+    app = FastAPI()
+    app.include_router(admin.create_admin_router(
+        current_authorization=lambda _: actor, render_template=render, csrf_token=lambda _: 'csrf',
+    ))
+    with TestClient(app) as browser:
+        params = {'user_id': str(source)}
+        page = browser.get('/admin/messages', params=params)
+        assert page.status_code == 200 and 'Current readable group' in page.text
+        assert '消息读取权限已变化' not in page.text
+        download = browser.get('/admin/messages/export', params=params)
+        assert download.status_code == 200
+        with ZipFile(BytesIO(download.content)) as archive:
+            assert len(archive.namelist()) == 1 and archive.testzip() is None
+        pg.execute("UPDATE authorizations SET scopes='{}'::text[] WHERE id=%s", (source,))
+        page = browser.get('/admin/messages', params=params)
+        assert '消息读取权限已变化' in page.text and 'Current readable group' not in page.text
+        assert browser.get('/admin/messages/export', params=params).status_code == 403
 
 
 def test_export_reads_all_consented_text_and_excludes_inaccessible_rows(pg, monkeypatch, tmp_path):
     import json
-    from contextlib import nullcontext
     from io import BytesIO
     from zipfile import ZipFile
 
@@ -191,6 +259,7 @@ def test_export_reads_all_consented_text_and_excludes_inaccessible_rows(pg, monk
     source = uuid4()
     pg.execute("""INSERT INTO authorizations(id,open_id,access_token_ciphertext,body_consent_at)
                   VALUES(%s,'export-user','unused',NOW() - INTERVAL '1 day')""", (source,))
+    pg.execute("INSERT INTO lark_identities(open_id) VALUES('export-user')")
     for chat in ('group', 'private', 'hidden'):
         pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES(%s,'同名',%s)",
                    (chat, 'p2p' if chat == 'private' else 'group'))
@@ -199,8 +268,8 @@ def test_export_reads_all_consented_text_and_excludes_inaccessible_rows(pg, monk
     for i in range(505):
         chat = 'group' if i < 501 else 'private' if i < 504 else 'hidden'
         kind = 'image' if i == 502 else 'text'
-        pg.execute("""INSERT INTO chat_messages(chat_id,message_id,message_type,body_ciphertext,is_deleted)
-                      VALUES(%s,%s,%s,%s,%s)""",
+        pg.execute("""INSERT INTO chat_messages(chat_id,message_id,message_type,body_ciphertext,is_deleted,
+                      message_create_time,sender_open_id) VALUES(%s,%s,%s,%s,%s,NOW(),'export-user')""",
                    (chat, str(i).zfill(4), kind, json.dumps({'text': f'message-{i}'}), i == 503))
         pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id,observed_at)
                       VALUES(%s,%s,%s,NOW() - %s * INTERVAL '1 day')""",
@@ -229,7 +298,7 @@ def test_export_reads_all_consented_text_and_excludes_inaccessible_rows(pg, monk
         for chunk in iterator:
             assert len(chunk) <= 65536
             output.write(chunk)
-    assert len(access_checks) == 2
+    assert len(access_checks) >= 2
     assert lookup_calls
     with ZipFile(path) as archive:
         assert len(archive.namelist()) == 2
@@ -254,6 +323,88 @@ def test_export_reads_all_consented_text_and_excludes_inaccessible_rows(pg, monk
     with pytest.raises(PermissionError):
         b''.join(message_export.stream_export(source, source, revoked))
     assert not pg.execute("SELECT name FROM pg_cursors WHERE name='message_export'").fetchall()
+
+    from openpyxl.worksheet._writer import ALL_TEMP_FILES
+    opened = list(ALL_TEMP_FILES)
+    checks = []
+    def withdrawn_during_generation():
+        checks.append(True)
+        if len(checks) == 2:
+            raise PermissionError('withdrawn during workbook generation')
+    with pytest.raises(PermissionError):
+        b''.join(message_export.stream_export(source, source, withdrawn_during_generation))
+    assert ALL_TEMP_FILES == opened
+
+    # Recheck the live second conversation even though the named cursor saw it before withdrawal.
+    for change in ("is_visible=FALSE", "sync_enabled=FALSE", "sync_status='not_readable'",
+                   "sync_generation=sync_generation+1"):
+        iterator = message_export.stream_export(source, source, lambda: None)
+        assert next(iterator).startswith(b'PK')
+        pg.execute("UPDATE authorization_chats SET " + change + " WHERE chat_id='private'")
+        with pytest.raises(PermissionError):
+            b''.join(iterator)
+        pg.execute("UPDATE authorization_chats SET is_visible=TRUE,sync_enabled=TRUE,sync_status='succeeded' "
+                   "WHERE chat_id='private'")
+
+    # A workbook spanning several chunks must stop if an included message is deleted or edited.
+    from random import Random
+    large = json.dumps({'text': ''.join(Random(4).choices('abcdefghijklmnopqrstuvwxyz', k=200000))})
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE chat_id='group' AND message_id='0000'", (large,))
+    for change, parameters in (("is_deleted=TRUE", ()), ("body_ciphertext=%s", ('{"text":"edited"}',))):
+        iterator = message_export.stream_export(source, source, lambda: None)
+        assert len(next(iterator)) == 65536
+        pg.execute("UPDATE chat_messages SET " + change + " WHERE chat_id='group' AND message_id='0000'", parameters)
+        with pytest.raises(PermissionError):
+            next(iterator)
+        pg.execute("UPDATE chat_messages SET is_deleted=FALSE,body_ciphertext=%s "
+                   "WHERE chat_id='group' AND message_id='0000'", (large,))
+
+    # Previously emitted conversations remain protected until the ZIP is complete.
+    original = '{"text":"message-0"}'
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE chat_id='group' AND message_id='0000'", (original,))
+    for table, change, parameters in (
+        ("authorization_chats", "is_visible=FALSE", ()),
+        ("authorization_chats", "sync_status='not_readable'", ()),
+        ("authorization_chats", "sync_generation=sync_generation+1", ()),
+        ("chat_messages", "is_deleted=TRUE", ()),
+        ("chat_messages", "body_ciphertext=%s", ('{"text":"changed later"}',)),
+    ):
+        iterator = message_export.stream_export(source, source, lambda: None)
+        assert next(iterator).startswith(b'PK')
+        assert next(iterator).startswith(b'PK')  # The second conversation is already being sent.
+        target = "chat_id='group'" + (" AND message_id='0000'" if table == "chat_messages" else "")
+        pg.execute(f"UPDATE {table} SET {change} WHERE {target}", parameters)
+        with pytest.raises(PermissionError):
+            b''.join(iterator)
+        pg.execute("UPDATE authorization_chats SET is_visible=TRUE,sync_status='succeeded' WHERE chat_id='group'")
+        pg.execute("UPDATE chat_messages SET is_deleted=FALSE WHERE chat_id='group' AND message_id='0000'")
+        pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE chat_id='group' AND message_id='0000'",
+                   (original,))
+
+    # Restricted content is retained, but every current reader excludes it until Lark restores access.
+    from app import evidence_access, offhours_summary
+    pg.execute("UPDATE authorization_chats SET sync_status='not_readable' WHERE authorization_id=%s", (source,))
+    assert not message_export.has_exportable_messages(source)
+    monkeypatch.setattr(admin_reporting, 'connection', lambda: nullcontext(pg))
+    monkeypatch.setattr(admin_reporting, 'get_settings', message_export.get_settings)
+    monkeypatch.setattr(admin_reporting, 'message_body_cipher', message_export.message_body_cipher)
+    assert not admin_reporting.message_conversations(source)['items']
+    assert not admin_reporting.message_page(source, 'group', 1)['items']
+    assert not pg.execute('SELECT m.message_id ' + evidence_access._READABLE, (source,)).fetchall()
+    assert not pg.execute(offhours_summary._MESSAGE_SQL,
+                          (source, 'group', datetime(2000, 1, 1, tzinfo=UTC),
+                           datetime(2100, 1, 1, tzinfo=UTC), ['export-user'], 10)).fetchall()
+    assert pg.execute("SELECT count(*) n FROM chat_messages WHERE body_ciphertext IS NOT NULL").fetchone()['n'] == 505
+
+    pg.execute("UPDATE authorization_chats SET sync_status='failed_retryable' WHERE authorization_id=%s", (source,))
+    assert message_export.has_exportable_messages(source)
+    assert pg.execute(offhours_summary._MESSAGE_SQL,
+                      (source, 'group', datetime(2000, 1, 1, tzinfo=UTC),
+                       datetime(2100, 1, 1, tzinfo=UTC), ['export-user'], 10)).fetchall()
+    pg.execute("UPDATE authorizations SET scopes=ARRAY['im:message.send_as_user'] WHERE id=%s", (source,))
+    assert not message_export.has_exportable_messages(source)
+    assert not admin_reporting.message_page(source, 'group', 1)['items']
+    assert not pg.execute('SELECT m.message_id ' + evidence_access._READABLE, (source,)).fetchall()
 
 
 def _query(url):

@@ -44,7 +44,8 @@ def browser(monkeypatch, *, owner=False, active=True):
     app.include_router(creator_handles_routes.create_router(
         current_authorization=authorization,
         csrf_token=lambda _auth: "csrf",
-        render_template=lambda _request, name, context: HTMLResponse(templates.get_template(name).render(**context)),
+        render_template=lambda _request, name, context, status_code=200: HTMLResponse(
+            templates.get_template(name).render(**context), status_code=status_code),
     ))
     return TestClient(app), actor
 
@@ -353,7 +354,7 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
 
     client, actor = browser(monkeypatch, owner=True)
     other = uuid4()
-    baseline = ("offline_access", "im:chat:read")
+    baseline = ("offline_access", "im:chat:read", "im:message:readonly")
     required = (*baseline, "im:message", "im:message.send_as_user")
     settings = SimpleNamespace(oauth_scopes=baseline, token_encryption_key=b"p" * 32, broadcast_preview_until=None)
     cipher = TokenCipher(settings.token_encryption_key)
@@ -466,14 +467,15 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
     assert attention["status"] == "needs_authorization" and not attention["missing_scopes"]
     assert pg.execute("SELECT status FROM authorizations WHERE id=%s",
                       (actor["id"],)).fetchone()["status"] == "attention_required"
+    before_refresh = len(state["calls"])
     pg.execute("""UPDATE authorizations SET body_consent_at=NOW(),scopes=%s,access_token_ciphertext=%s,
         access_token_expires_at=NOW()-INTERVAL '1 minute',status='active' WHERE id=%s""",
         (list(required), cipher.encrypt("fixture-owner"), actor["id"]))
     refreshed = check(str(other))
-    assert state["refreshes"] == 1 and state["calls"][-1] == "fixture-refreshed"
+    assert state["refreshes"] == 1 and len(state["calls"]) == before_refresh
     assert refreshed["status"] == "needs_authorization" and set(refreshed["missing_scopes"]) == set(required)
     assert pg.execute("SELECT scopes,status FROM authorizations WHERE id=%s", (actor["id"],)).fetchone() == {
-        "scopes": [], "status": "active"}
+        "scopes": [], "status": "attention_required"}
     assert settings.oauth_scopes == baseline
     assert pg.execute("SELECT COUNT(*) AS n FROM sync_jobs").fetchone()["n"] == 0
     actor.update(status="attention_required", body_consent_at=True)
@@ -998,7 +1000,11 @@ def test_retired_handle_ai_and_type_actions_still_require_active_auth_and_csrf(m
     assert evidence.status_code == 410
     assert evidence.headers["cache-control"] == "no-store, max-age=0"
     revoked, _ = browser(monkeypatch, active=False)
-    assert revoked.get("/creators").status_code == 403
+    denied = revoked.get("/creators")
+    assert denied.status_code == 403 and denied.headers["content-type"].startswith("text/html")
+    assert "登录授权已失效" in denied.text
+    denied_data = revoked.get("/creators/data")
+    assert denied_data.status_code == 403 and denied_data.json()["error"] == "登录授权已失效，请重新登录。"
     assert revoked.get(f"/creators/tasks/{task}/evidence").status_code == 403
     for path in actions:
         assert revoked.post(path, data={"csrf_token": "csrf"}).status_code == 403
@@ -1020,6 +1026,12 @@ def test_excel_upload_is_bounded_scoped_and_requires_explicit_start_and_confirma
     monkeypatch.setattr(creator_imports, "preview_import", preview)
     monkeypatch.setattr(creator_imports, "start_import", lambda *args: calls.append(("start", *args)))
     monkeypatch.setattr(creator_imports, "confirm_row", lambda *args: calls.append(("confirm", *args)))
+    monkeypatch.setattr(creator_imports, "defer_row", lambda *args: calls.append(("defer", *args)))
+    def candidates(actor_id, cm_id, **fields):
+        assert actor_id == actor["id"] and cm_id == actor["id"] and fields["batch_id"] == batch
+        return {"candidates": [{"id": str(row), "handle": "example"}], "total": 1}
+    monkeypatch.setattr(creator_imports, "page_data", candidates)
+    monkeypatch.setattr(creator_imports, "search_users", lambda *args: [{"id": str(person), "display_name": "Creator"}])
     url = f"/creators/imports/preview?cm_id={actor['id']}"
     headers = {"Content-Type": "application/octet-stream", "X-Filename": "CAP%20handles.xlsx"}
     assert client.post(url, content=b"xlsx", headers=headers).status_code == 400
@@ -1046,6 +1058,14 @@ def test_excel_upload_is_bounded_scoped_and_requires_explicit_start_and_confirma
     assert client.post(confirm, data={"csrf_token": "csrf", "handle": "example", "contact_id": str(person),
                                       "actor_id": str(foreign)}).status_code == 200
     assert calls[-1] == ("confirm", actor["id"], row, "example", person)
+    listed = client.get(f"/creators/imports/data?cm_id={actor['id']}&batch_id={batch}")
+    assert listed.status_code == 200 and listed.json()["candidates"][0]["id"] == str(row)
+    users = client.get(f"/creators/imports/users?cm_id={actor['id']}&q=Creator")
+    assert users.status_code == 200 and users.json()[0]["id"] == str(person)
+    defer = f"/creators/imports/rows/{row}/defer"
+    assert client.post(defer).status_code == 400
+    assert client.post(defer, data={"csrf_token": "csrf"}).status_code == 200
+    assert calls[-1] == ("defer", actor["id"], row)
     for action, name in (("pause", "pause_import"), ("resume", "resume_import"), ("recheck", "recheck_batch")):
         def scoped(actor_id, batch_id, *, action=action):
             if batch_id != batch:

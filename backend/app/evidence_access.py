@@ -6,6 +6,9 @@ import hashlib
 import json
 import re
 
+BODY_READ_SCOPES = frozenset({"im:chat:read", "im:message:readonly"})
+BODY_READ_SCOPE_SQL = "a.scopes @> ARRAY['im:chat:read','im:message:readonly']::text[]"
+
 BUSINESS = re.compile(
     r"\b(?:sample\w*|voucher\w*|campaign\w*|commission\w*|product\w*|sku|brand\w*|"
     r"live|livestream\w*|video\w*|boost\w*|affiliate\w*|collaborat\w*|agency|"
@@ -15,13 +18,15 @@ BUSINESS = re.compile(
     re.I,
 )
 
-_READABLE = """FROM chat_messages m
+_READABLE = f"""FROM chat_messages m
     JOIN authorization_message_observations o ON o.chat_id=m.chat_id AND o.message_id=m.message_id
     JOIN authorizations a ON a.id=o.authorization_id
     JOIN authorization_chats ac ON ac.authorization_id=a.id AND ac.chat_id=m.chat_id
     JOIN chats c ON c.chat_id=m.chat_id
     WHERE a.id=%s AND a.status='active' AND a.body_consent_at IS NOT NULL
+      AND {BODY_READ_SCOPE_SQL}
       AND o.observed_at>=a.body_consent_at AND ac.is_visible AND ac.sync_enabled
+      AND ac.sync_status IS DISTINCT FROM 'not_readable'
       AND COALESCE(c.chat_status,'normal')='normal' AND NOT m.is_deleted
       AND m.body_ciphertext IS NOT NULL"""
 

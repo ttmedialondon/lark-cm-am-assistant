@@ -16,7 +16,7 @@ from .crypto import message_body_cipher
 from .message_mentions import mention_targets
 
 POLICY_VERSION = "creator-import-group-person-v5"
-PROMPT_VERSION = "creator-handle-research-v1.1"
+PROMPT_VERSION = "creator-handle-research-v1.2"
 MAX_GROUPS, MAX_USERS, MAX_MESSAGES, MAX_CHARS = 8, 80, 48, 20_000
 LOCAL_SEARCH_MESSAGES = 20_000
 HISTORY_SEARCH_MESSAGES = 200_000
@@ -499,8 +499,9 @@ PERSON_INSTRUCTIONS = """你是联系人与 TikTok 账号关系的证据审阅�
 针对 imported_handle，在全部输入候选中找有本人账号证据的联系人；允许无人可确认。
 分别核对达人业务身份、本人账号关系和证据时点。不要推断或确认 CM 负责人、合作关系或重要程度。
 CM1/target_cm 是数据读取范围；上传者、同群、导入名单均不能确定负责人。
-Curva 收录说明账号进入候选底表，不说明哪个人拥有它。未提供目录核对结果时明确写“Curva 未核验”；
-不能仅因名单声称为 Curva 导出就认定核验成功。正式关联仍需独立的目录检查与人工复核。
+Curva 只是辅助目录，不说明哪个人拥有账号；未提供目录核对结果时不声称已核验。
+不能仅因名单声称为 Curva 导出就认定核验成功，也不能因未收录或未核验而否决独立的本人账号证据。
+不要求 CAP 身份或目录核验；是否正式关联由后端的证据、配置阈值、当前授权及冲突检查决定。
 
 【逐人核对】
 合并同一 U 在不同群中的证据，但不合并不同 U；不能用昵称相似推定同一人。
@@ -535,7 +536,7 @@ handle 被多个联系人声称拥有、代运营/本人无法区分、否认对
 matched 仅表示本人账号与达人业务身份证据共同支持一个候选，不是平台控制权验证或入库授权。
 必须引用该人实际发出的账号声明/确认消息；完整问答须同时引用提问与回答，且精确 handle 出现在引用中。
 不能因群内只剩一人、CM 对其说话或既有绑定而 matched。
-只有历史自述、目录未核验、关键上下文遗漏或冲突影响正式关联时返回 review，user_ref=null。
+只有历史自述、关键上下文遗漏或冲突影响正式关联时返回 review，user_ref=null。
 not_found 仅在所提供材料对全部候选明确不支持此账号归属时使用；没消息/只有弱线索用 review。
 不得把 not_target/not_found 扩大为“这个人不是达人”。
 
@@ -610,7 +611,7 @@ def _parse(raw, pack, stage):
     return result
 
 
-def group_validate(raw, pack):
+def group_validate(raw, pack, *, threshold=0.95):
     result = _parse(raw, pack, 'group')
     groups = {g['ref']: g for g in pack['groups']}
     messages = {m['ref']: m for m in pack['messages']}
@@ -631,18 +632,18 @@ def group_validate(raw, pack):
             supported = supported and ref in cited and bool(groups[ref]['match_kind'] == 'exact' or supporting)
             if groups[ref]['match_kind'] == 'history':
                 supported = supported and any(_mentions_handle(m['text'], pack['imported_handle']) for m in supporting)
-        if result['confidence'] >= 0.95 and supported:
+        if result['confidence'] >= threshold and supported:
             reason = 'group_matched'
         else:
-            if result['confidence'] < 0.95:
-                blockers.append('群对应关系自评分低于 0.95 阈值；该分数不代表准确率。')
+            if result['confidence'] < threshold:
+                blockers.append(f'群对应关系自评分低于 {threshold:g} 配置阈值；该分数不代表准确率。')
             if not supported:
                 blockers.append('选群引用或候选覆盖未通过校验，不能仅凭 AI 分数确认。')
             result.update(outcome='review', group_refs=[])
     return {**result, 'reason_code': reason, 'blocking_reasons': blockers}
 
 
-def person_validate(raw, pack):
+def person_validate(raw, pack, *, threshold=0.95):
     result = _parse(raw, pack, 'person')
     groups = {g['ref']: g for g in pack['groups']}
     if not groups:
@@ -680,11 +681,11 @@ def person_validate(raw, pack):
         cited = set(result['evidence_refs'])
         direct = bool(cited & targeted) and any(
             _mentions_handle(messages[ref]['text'], pack['imported_handle']) for ref in cited if ref in messages)
-        if result['confidence'] >= 0.95 and targets == [selected] and not result['conflicts'] and direct:
+        if result['confidence'] >= threshold and targets == [selected] and not result['conflicts'] and direct:
             reason = 'person_matched'
         else:
-            if result['confidence'] < 0.95:
-                blockers.append('用户对应关系自评分低于 0.95 阈值；该分数不代表准确率。')
+            if result['confidence'] < threshold:
+                blockers.append(f'用户对应关系自评分低于 {threshold:g} 配置阈值；该分数不代表准确率。')
             if targets != [selected]:
                 blockers.append('AI 候选人判断没有一致指向唯一用户。')
             if result['conflicts']:

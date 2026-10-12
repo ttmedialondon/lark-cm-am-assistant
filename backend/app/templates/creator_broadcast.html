@@ -79,7 +79,7 @@
       <div class="broadcast-heading mb-3"><h3 class="mb-0" id="broadcast-list-title">保存名单</h3><button class="btn btn-sm btn-outline-secondary" id="broadcast-list-cancel" type="button">关闭</button></div>
       <label class="form-label" for="broadcast-list-name">名单名称</label><input class="form-control mb-3" id="broadcast-list-name" required maxlength="80" placeholder="例如：本周活动通知">
       <label class="form-label" for="broadcast-list-notes">备注 <span class="text-secondary">（选填）</span></label><textarea class="form-control" id="broadcast-list-notes" rows="3" maxlength="500" placeholder="记录这份名单的用途"></textarea>
-      <p class="small text-secondary mt-3 mb-0" id="broadcast-list-description">只保存对象和路由，不保存消息正文，不会发送。</p><div class="small text-danger mt-2" id="broadcast-list-error" role="alert"></div>
+      <p class="small text-secondary mt-3 mb-0" id="broadcast-list-description">保存收件人和群聊，不保存正文，不发送消息。</p><div class="small text-danger mt-2" id="broadcast-list-error" role="alert"></div>
       <div class="d-flex justify-content-end mt-4"><button class="btn btn-primary" id="broadcast-list-save" type="submit">保存名单</button></div>
     </form>
   </dialog>
@@ -106,5 +106,5 @@
   </dialog>
 </div>
 <script id="broadcast-config" type="application/json">{{ broadcast_data | tojson }}</script>
-<script type="module" src="/static/creator-broadcast.mjs?v=20261009-cleanup"></script>
+<script type="module" src="/static/creator-broadcast.mjs?v=20261012-release-fixes"></script>
 {% endblock %}

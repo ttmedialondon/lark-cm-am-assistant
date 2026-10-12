@@ -5,7 +5,7 @@
 <div class="page business-page" id="creators-app" data-csrf="{{ csrf_token }}" data-tab="{{ creator_tab }}" data-actor="{{ authorization.id }}">
   {% with business_section='creators' %}{% include "partials/business_nav.html" %}{% endwith %}
   <main class="page-wrapper"><div class="page-body"><div class="container-xl">
-    <div class="business-heading"><h2 class="page-title">我的达人</h2><div class="btn-list">{% if creator_data.can_broadcast %}<a class="btn btn-outline-primary" href="/creators/broadcast">群发预览</a>{% endif %}<button type="button" id="creators-import-open" class="btn btn-primary">导入 Excel</button><button type="button" id="creators-refresh" class="btn btn-outline-secondary">刷新</button></div></div>
+    <div class="business-heading"><h2 class="page-title">我的达人</h2><div class="btn-list">{% if creator_data.can_broadcast %}<a class="btn btn-outline-primary" href="/creators/broadcast">群发消息</a>{% endif %}<button type="button" id="creators-import-open" class="btn btn-primary">导入 Excel</button><button type="button" id="creators-refresh" class="btn btn-outline-secondary">刷新</button></div></div>
     <div id="creators-notice" class="alert d-none" role="status"></div>
     <details class="card mb-3 creator-import-history" id="creators-import-batches" hidden><summary class="fw-semibold">导入记录</summary><div id="creators-import-batch-list" class="card-body"></div></details>
     <section class="card creator-roster-card"><div class="card-header d-flex align-items-center flex-wrap gap-3"><div class="btn-list me-auto" role="group" aria-label="达人列表"><button type="button" id="creators-mine" class="btn">我的达人</button><button type="button" id="creators-unassigned" class="btn" hidden>未分配达人</button></div>{% if creator_data.can_select_cm %}<div class="creator-cm-filter" id="creators-cm-filter"><label for="creators-cm" class="visually-hidden">负责人</label><select id="creators-cm" class="form-select"><option value="">暂无可用负责人</option></select></div>{% endif %}<form id="creators-search" class="d-flex gap-2" role="search"><label class="visually-hidden" for="creators-query">姓名或 handle</label><input class="form-control" id="creators-query" type="search" value="{{ creator_query }}" maxlength="120" placeholder="搜索姓名或 handle"><button class="btn btn-outline-secondary" type="submit">搜索</button></form></div>
@@ -29,7 +29,14 @@
     <div id="creators-import-preview" class="mt-3" hidden></div>
     <div class="d-flex flex-wrap gap-2 mt-3"><button type="button" id="creators-import-check" class="btn btn-outline-primary">检查表格</button><button type="button" id="creators-import-confirm" class="btn btn-primary" hidden>确认导入</button></div>
   </dialog>
+  <dialog id="creators-review-dialog" class="creator-evidence" aria-labelledby="creators-review-title">
+    <div class="d-flex align-items-center gap-3 mb-3"><h3 id="creators-review-title" class="mb-0 me-auto">核对导入账号</h3><button type="button" id="creators-review-close" class="btn btn-sm btn-outline-secondary">关闭</button></div>
+    <p class="text-secondary">核对账号与 Lark 用户后确认入库；无法确定时可暂缓。确认会保留原有账号及负责人关系。</p>
+    <div id="creators-review-message" role="status" aria-live="polite" class="small mb-3"></div>
+    <div id="creators-review-rows"></div>
+    <div class="d-flex align-items-center justify-content-between mt-3"><span id="creators-review-page-label" class="small text-secondary"></span><div class="btn-list"><button type="button" id="creators-review-previous" class="btn btn-sm btn-outline-secondary">上一页</button><button type="button" id="creators-review-next" class="btn btn-sm btn-outline-secondary">下一页</button></div></div>
+  </dialog>
 </div>
 <script id="creators-initial" type="application/json">{{ creator_data|tojson }}</script>
-<script src="/static/creator-handles.js?v=20261012-assistant" defer></script>
+<script src="/static/creator-handles.js?v=20261012-review-access" defer></script>
 {% endblock %}

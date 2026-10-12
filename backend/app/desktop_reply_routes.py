@@ -53,11 +53,11 @@ def _invalid_constant(value):
 async def read_payload(request):
     if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
         raise ReplyInputError("invalid_content_type", "请使用 application/json 提交。", 415)
-    length = request.headers.get("content-length")
-    if length is not None:
+    lengths = request.headers.getlist("content-length")
+    if lengths:
         try:
-            declared = int(length)
-            if declared < 0:
+            declared = int(lengths[0])
+            if len(lengths) != 1 or declared < 0:
                 raise ValueError
         except ValueError:
             raise ReplyInputError("invalid_content_length", "请求长度无效。") from None
@@ -119,7 +119,6 @@ def create_router(*, current_authorization, csrf_token):
                 actor = await run_in_threadpool(authenticate, request, current_authorization, csrf_token)
                 payload = await read_payload(request)
                 settings = get_settings()
-                config, api_key = await run_in_threadpool(replies.configuration, settings)
                 cipher = store.result_cipher(settings.token_encryption_key)
                 receipt = await run_in_threadpool(claim, actor, payload)
                 state = receipt["claim_status"]
@@ -134,6 +133,7 @@ def create_router(*, current_authorization, csrf_token):
                     value["request_id"] = payload["request_id"]
                     await run_in_threadpool(authenticate, request, current_authorization, csrf_token)
                     return response(value)
+                config, api_key = await run_in_threadpool(replies.configuration, settings)
                 if await request.is_disconnected():
                     raise replies.ReplyError("cancelled", "请求已取消。", 499)
                 remaining = TOTAL_TIMEOUT - (time.monotonic() - started)

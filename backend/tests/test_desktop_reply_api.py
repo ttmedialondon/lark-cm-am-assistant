@@ -101,6 +101,7 @@ def test_reply_scopes_translation_cached_id_and_actor_isolation(api):
                                                               for row in selected["conversation_context"]["messages"]]
     assert desktop_replies.SCOPE_INSTRUCTIONS["selected_messages"] in call["options"]["instructions"]
     assert desktop_replies.SCOPE_INSTRUCTIONS["recent_context"] not in call["options"]["instructions"]
+    api.pg.execute("UPDATE ai_feature_configs SET enabled=FALSE WHERE feature='desktop_reply'")
     cached = api.client.post(PATH, json=selected, headers=api.headers)
     assert cached.status_code == 200 and cached.json() == result and len(api.state.calls) == 1
     changed = copy.deepcopy(selected)
@@ -108,6 +109,7 @@ def test_reply_scopes_translation_cached_id_and_actor_isolation(api):
     conflict = api.client.post(PATH, json=changed, headers=api.headers)
     assert conflict.status_code == 409 and conflict.json()["error"]["code"] == "request_conflict"
     assert len(api.state.calls) == 1
+    api.pg.execute("UPDATE ai_feature_configs SET enabled=TRUE WHERE feature='desktop_reply'")
     foreign = api.client.post(PATH, json=selected, headers=api.other_headers)
     assert foreign.status_code == 200 and foreign.json()["suggestion"] == f"Reply for {api.other_actor}"
     assert len(api.state.calls) == 2 and api.state.calls[-1]["actor"] == api.other_actor
@@ -157,6 +159,7 @@ def test_provider_failure_is_terminal_and_does_not_retry_paid_work(api, monkeypa
     monkeypatch.setattr(openai_client, "call_openai_async", fail)
     submitted = payload()
     first = api.client.post(PATH, json=submitted, headers=api.headers)
+    api.pg.execute("UPDATE ai_feature_configs SET enabled=FALSE WHERE feature='desktop_reply'")
     duplicate = api.client.post(PATH, json=submitted, headers=api.headers)
     assert first.status_code == duplicate.status_code == status
     assert first.json() == duplicate.json() and first.json()["error"]["code"] == code
@@ -352,6 +355,10 @@ def test_wire_limit_rejects_declared_and_streamed_body_without_truncation(api):
     headers = dict(api.headers, **{"Content-Type": "application/json"})
     declared = api.client.post(PATH, content=wire, headers=headers)
     assert declared.status_code == 413 and declared.json()["error"]["code"] == "request_too_large"
+    ambiguous = api.client.post(PATH, content=raw, headers=[
+        *headers.items(), ("Content-Length", str(len(raw))), ("Content-Length", str(len(raw))),
+    ])
+    assert ambiguous.status_code == 400 and ambiguous.json()["error"]["code"] == "invalid_content_length"
 
     async def stream_request():
         async def chunks():

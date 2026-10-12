@@ -5,8 +5,8 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, urlencode, urlparse
 from uuid import uuid4
 
-import pytest
 import psycopg
+import pytest
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 from test_identity_names import pg  # noqa: F401
@@ -439,7 +439,7 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
         assert "stage=token_exchange lark_code=999999" in caplog.text
         assert provider_calls == {"exchange": before_calls["exchange"] + 1, "profile": before_calls["profile"]}
         # Exhausted conflicts and unknown connection outcomes cannot leave partial writes or leak errors.
-        for failure, attempts in ((psycopg.errors.DeadlockDetected, 3), (psycopg.OperationalError, 1)):
+        for failure, attempts in ((psycopg.errors.DeadlockDetected, 3), (psycopg.OperationalError, 1)):  # noqa: B007
             audit_attempts = 0
             monkeypatch.setattr(main, "_audit", fail_after_audit)
             before_calls = provider_calls.copy()

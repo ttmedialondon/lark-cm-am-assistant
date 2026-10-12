@@ -110,6 +110,16 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   const sendReady = () => permissionReady(permissionResult,permissionPending,$('cm').value,permissionCm,redirecting)
     && permissionResult.feature_enabled === true && $('cm').value === actor;
   const groupMode = () => purpose !== 'support';
+  function syncAssistantScope() {
+    const cmId = $('cm').value === 'all' || !$('cm').value ? actor : $('cm').value;
+    const cm = config.cms.find(person => person.id === cmId);
+    const context = {cm_id: cmId, cm_name: cm?.name, audience: 'all', creator_ids: null};
+    const initial = document.getElementById('oa-page-context');
+    if (initial?.textContent.trim()) initial.textContent = JSON.stringify(context);
+    document.dispatchEvent(new CustomEvent('ttmedia:assistant', {detail: {
+      context,
+    }}));
+  }
   const rows = () => recipients(entries, routes, groups, purpose);
   const plan = () => groupMode() ? groupPlan(groups,selectedGroups,$('mention').checked) : buildPlan(rows(), $('mention').checked, config.purposes[purpose]);
   function loading(text) {
@@ -402,6 +412,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     if (groupMode() && value === 'all') value = config.cms.some(cm => cm.id === $('app').dataset.actor) ? $('app').dataset.actor : '';
     if (canSelectCm && value && ![...$('cm').options].some(option => option.value === value)) $('cm').add(new Option('授权已失效',value));
     $('cm').value = value;
+    syncAssistantScope();
   }
   async function fetchGroups(preserve = false) {
     if (busy || !allowed()) return;
@@ -446,6 +457,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   $('input').addEventListener('input', () => { dirty = true; notice(entries.length ? '名单已修改，请重新匹配。' : ''); render(); });
   for (const id of ['message','mention']) $(id).addEventListener('input', render);
   $('cm').addEventListener('change', async () => {
+    syncAssistantScope();
     pendingRestore = false;
     entries = []; groups = []; selectedGroups = new Set(); routes = new Map(); fixedIds = null; fixedTargets = null; currentList = null; $('input').value = ''; dirty = true; notice('');
     render();

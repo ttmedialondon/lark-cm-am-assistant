@@ -3,6 +3,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const http = require("node:http");
 const {spawnSync} = require("node:child_process");
 const {chromium} = require("playwright");
 const backend = path.resolve(__dirname, "..");
@@ -102,24 +103,72 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
     {cwd: backend, input: JSON.stringify(data), encoding: "utf8"});
   assert.equal(rendered.status, 0, rendered.stderr);
   const fixture = JSON.parse(rendered.stdout), state = {data: fixture.data, calls: [], larkRequests: [], status: 200};
+  fixture.html = fixture.html.replace("<body>", '<body><div id="operations-assistant" hidden></div>');
+  const reviewCandidates = [
+    {id: "review-one", handle: "review.one", display_name: "Creator One", contact_id: contactId,
+      status_label: "待核对", reason: "账号有候选，需核对原文。", can_defer: true},
+    {id: "review-two", handle: "review.two", display_name: "—", contact_id: null,
+      status_label: "待核对", reason: "请选择对应用户。", can_defer: true},
+  ];
+  state.candidates = reviewCandidates.map(row => ({...row}));
   const url = "https://applink.larksuite.com/client/chat/open?openId=ou_creator_one";
-  const profileUrl = "http://localhost/admin/contacts/ou_creator_one";
   assert.equal(state.data.items[0].private_chat_url, url);
   assert.deepEqual(state.data.items.slice(1).map(item => item.private_chat_url), [null, null]);
+  const loginServer = http.createServer((request, response) => {
+    response.writeHead(200, {"Content-Type": "text/html", Connection: "close"});
+    response.end(new URL(request.url, "http://localhost").pathname === "/creators" ? fixture.html : "<p>Log in</p>");
+  });
+  await new Promise(resolve => loginServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => { loginServer.close(); });
+  const loginOrigin = `http://127.0.0.1:${loginServer.address().port}`;
+  const profileUrl = loginOrigin + "/admin/contacts/ou_creator_one";
   const browser = await chromium.launch({headless: true, channel: "chrome"});
   t.after(() => browser.close());
   const context = await browser.newContext(), page = await context.newPage();
   const errors = []; page.on("pageerror", error => errors.push(error.message));
   await context.route("**/*", async route => {
     const request = route.request(), target = new URL(request.url());
-    if (target.origin !== "http://localhost") {
+    if (target.origin !== loginOrigin) {
       if (target.origin === "https://applink.larksuite.com") state.larkRequests.push(request.url());
       if (process.env.OH_SCREENSHOT_DIR && target.href.endsWith("/tabler.min.css")) return route.continue();
       return route.abort();
     }
-    if (target.pathname === "/creators") return route.fulfill({contentType: "text/html", body: fixture.html});
+    if (["/creators", "/fixture-login"].includes(target.pathname)) return route.continue();
     if (target.pathname.startsWith("/static/")) return route.fulfill({contentType: target.pathname.endsWith(".js") ? "text/javascript" : target.pathname.endsWith(".svg") ? "image/svg+xml" : "text/css", body: fs.readFileSync(path.join(backend, "app", target.pathname))});
     state.calls.push({method: request.method(), url: target.pathname, search: target.search, body: request.postData()});
+    if (target.pathname === "/creators/imports/data") {
+      assert.equal(target.searchParams.get("batch_id"), "batch-1");
+      assert.equal(target.searchParams.get("cm_id"), "cm-1");
+      if (state.reviewReadStatus) return route.fulfill({status: state.reviewReadStatus, json: {error: "Fixture access revoked"}});
+      return route.fulfill({json: {candidates: state.candidates, total: state.candidates.length, page: 1, total_pages: 1}});
+    }
+    if (target.pathname === "/creators/imports/users") {
+      if (state.userGate) await state.userGate;
+      if (state.userRedirect) return route.fulfill({status: 302, headers: {Location: loginOrigin + "/fixture-login"}});
+      return route.fulfill({json: [{id: contactId, display_name: "Creator One", context_label: "Fixture group"}]});
+    }
+    if (target.pathname === "/creators/imports/rows/review-two/evidence") {
+      if (state.evidenceGate) await state.evidenceGate;
+      if (state.evidenceStatus) return route.fulfill({status: state.evidenceStatus, json: {error: "Fixture access revoked"}});
+    }
+    if (target.pathname.endsWith("/evidence")) return route.fulfill({json: {
+      person: {status_label: "对应关系待定", display_name: "Creator One", confidence: .93,
+        reason: "请结合本人账号发言核对。", evidence_refs: ["找人 M1"]}, warnings: [], conflicts: [],
+      groups: [{name: "Fixture group", selected: true, members: [], messages: [
+        {ref: "找人 M1", sender_name: "Creator One", time_label: "2026-10-12", text: "My handle is review.one"},
+        {ref: "找人 M2", sender_name: "CM", time_label: "2026-10-12", text: "Older fixture context"},
+      ]}],
+    }});
+    if (request.method() === "POST" && target.pathname.startsWith("/creators/imports/rows/")) {
+      const fields = new URLSearchParams(request.postData());
+      assert.equal(fields.get("csrf_token"), "fixture-csrf");
+      if (state.reviewSaveStatus) return route.fulfill({status: state.reviewSaveStatus, json: {error: "Fixture validation rejected"}});
+      if (target.pathname.endsWith("/confirm")) {
+        assert.equal(fields.get("contact_id"), contactId); assert.equal(fields.get("handle"), "review.corrected");
+        state.candidates = state.candidates.filter(row => row.id !== "review-one");
+      } else Object.assign(state.candidates[0], {status_label: "暂缓", can_defer: false});
+      return route.fulfill({json: {ok: true}});
+    }
     if (target.pathname === "/admin/contacts/ou_creator_one") return route.fulfill({contentType: "text/html", body: "<p>Creator One profile</p>"});
     if (request.method() === "POST" && target.pathname === `/creators/people/${contactId}/importance`) {
       const fields = new URLSearchParams(request.postData());
@@ -143,7 +192,7 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
     }
     return route.abort();
   });
-  await page.goto("http://localhost/creators");
+  await page.goto(loginOrigin + "/creators");
   const rows = page.locator("#creators-rows tr");
   await rows.nth(2).waitFor();
   assert.equal(await page.getByRole("button", {name: "候选达人", exact: true}).count(), 0);
@@ -209,6 +258,38 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
   assert(!(await page.locator("#creators-loading").isVisible()));
   releaseData(); state.dataGate = null;
   await page.waitForFunction(() => document.getElementById("creators-refresh").getAttribute("aria-busy") !== "true");
+  const ask = rows.first().getByRole("button", {name: "问助手", exact: true});
+  assert(await ask.isEnabled());
+  await page.evaluate(() => { window.assistantEvents = []; document.addEventListener("ttmedia:assistant", event => window.assistantEvents.push(event.detail)); });
+  await ask.click();
+  assert.equal(await page.evaluate(() => window.assistantEvents[0].context.creator_ids[0]), contactId);
+  await history.locator("summary").click();
+  await history.getByRole("button", {name: "核对账号", exact: true}).click();
+  const review = page.locator("#creators-review-dialog");
+  await review.locator("[data-row='review-two']").waitFor();
+  assert.equal(await review.getByText("My handle is review.one", {exact: true}).count(), 0);
+  const firstReview = review.locator("[data-row='review-one']"), secondReview = review.locator("[data-row='review-two']");
+  await secondReview.locator("summary").first().click();
+  await secondReview.getByRole("textbox", {name: "核对 handle", exact: true}).fill("keep.unsaved");
+  await firstReview.locator("summary").first().click();
+  await firstReview.getByText("查看证据", {exact: true}).click();
+  await firstReview.getByText("My handle is review.one", {exact: true}).waitFor();
+  assert(!(await firstReview.getByText("Older fixture context", {exact: true}).isVisible()));
+  await firstReview.getByRole("textbox", {name: "核对 handle", exact: true}).fill("review.corrected");
+  await firstReview.getByRole("searchbox", {name: "搜索 Lark 用户姓名", exact: true}).fill("Creator");
+  await firstReview.getByRole("button", {name: "搜索用户", exact: true}).click();
+  await firstReview.getByText("请选择对应用户。", {exact: true}).waitFor();
+  await firstReview.getByRole("combobox", {name: "对应 Lark 用户", exact: true}).selectOption(contactId);
+  if (process.env.OH_SCREENSHOT_DIR) await page.screenshot({path: path.join(process.env.OH_SCREENSHOT_DIR, "creator-import-review.png")});
+  await firstReview.getByRole("button", {name: "确认入库", exact: true}).click();
+  await page.waitForFunction(() => !document.querySelector("[data-row='review-one']"));
+  await secondReview.locator("summary").first().click();
+  assert.equal(await secondReview.getByRole("textbox", {name: "核对 handle", exact: true}).inputValue(), "keep.unsaved");
+  await secondReview.getByRole("button", {name: "暂缓", exact: true}).click();
+  await review.getByText("@review.two · — · 暂缓", {exact: true}).waitFor();
+  assert(!(await review.getByRole("button", {name: "暂缓", exact: true}).isVisible()));
+  await review.getByRole("button", {name: "关闭", exact: true}).click();
+  await history.locator("summary").click();
   assert(!(await page.locator("#creators-table").evaluate(element => element.inert)));
   assert.equal(await page.locator("#creators-table").getAttribute("data-ui-updating"), null);
   assert.equal(await page.getByText("这一条不应展示。", {exact: true}).count(), 0);
@@ -376,8 +457,69 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
   assert.equal(await page.locator('#creators-initial').textContent(), "");
   assert(!(await history.isVisible()));
   assert(!(await page.locator('#creators-importance-toolbar').isVisible()));
-  assert.equal(state.calls.filter(call => call.method === "POST").length, 3);
-  assert(!state.calls.some(call => call.url.endsWith("/evidence")));
+  assert.equal(state.calls.filter(call => call.method === "POST").length, 5);
+  assert.equal(state.calls.filter(call => call.url.endsWith("/evidence")).length, 1);
+  for (const failure of ["save", "evidence", "redirect", "review"]) {
+    state.status = 200; state.candidates = reviewCandidates.map(row => ({...row}));
+    state.reviewReadStatus = state.reviewSaveStatus = state.evidenceStatus = null; state.userRedirect = false;
+    await page.reload(); await rows.first().waitFor();
+    let releaseRoster, releaseUsers, releaseEvidence;
+    if (failure === "save") {
+      state.dataGate = new Promise(resolve => { releaseRoster = resolve; });
+      const pending = page.waitForRequest(request => new URL(request.url()).pathname === "/creators/data");
+      await page.locator("#creators-refresh").click(); await pending;
+    }
+    await history.locator("summary").click();
+    if (failure === "review") state.reviewReadStatus = 403;
+    await history.getByRole("button", {name: "核对账号", exact: true}).click();
+    if (failure !== "review") {
+      await firstReview.waitFor();
+      await firstReview.locator("summary").first().click(); await secondReview.locator("summary").first().click();
+      await firstReview.getByText("查看证据", {exact: true}).click();
+      await firstReview.getByText("My handle is review.one", {exact: true}).waitFor();
+      if (failure === "save") {
+        await firstReview.getByRole("textbox", {name: "核对 handle", exact: true}).fill("review.corrected");
+        await secondReview.getByRole("textbox", {name: "核对 handle", exact: true}).fill("keep.unsaved");
+        state.reviewSaveStatus = 400;
+        await firstReview.getByRole("button", {name: "确认入库", exact: true}).click();
+        await review.locator("#creators-review-message").getByText("Fixture validation rejected", {exact: true}).waitFor();
+        assert.equal(await firstReview.getByRole("textbox", {name: "核对 handle", exact: true}).inputValue(), "review.corrected");
+        assert.equal(await secondReview.getByRole("textbox", {name: "核对 handle", exact: true}).inputValue(), "keep.unsaved");
+        assert(await firstReview.getByText("My handle is review.one", {exact: true}).isVisible());
+        state.userGate = new Promise(resolve => { releaseUsers = resolve; });
+        state.evidenceGate = new Promise(resolve => { releaseEvidence = resolve; });
+        const userRequest = page.waitForRequest(request => new URL(request.url()).pathname === "/creators/imports/users");
+        await firstReview.getByRole("searchbox", {name: "搜索 Lark 用户姓名", exact: true}).fill("Creator");
+        await firstReview.getByRole("button", {name: "搜索用户", exact: true}).click(); await userRequest;
+        const evidenceRequest = page.waitForRequest(request => request.url().endsWith("/review-two/evidence"));
+        await secondReview.getByText("查看证据", {exact: true}).click(); await evidenceRequest;
+        state.reviewSaveStatus = 401;
+        await firstReview.getByRole("button", {name: "确认入库", exact: true}).click();
+      } else if (failure === "evidence") {
+        state.evidenceStatus = 403; await secondReview.getByText("查看证据", {exact: true}).click();
+      } else {
+        state.userRedirect = true;
+        await firstReview.getByRole("searchbox", {name: "搜索 Lark 用户姓名", exact: true}).fill("Creator");
+        await firstReview.getByRole("button", {name: "搜索用户", exact: true}).click();
+      }
+    }
+    await page.waitForFunction(() => !document.querySelectorAll("#creators-rows tr").length
+      && !document.getElementById("creators-review-dialog").open);
+    if (failure === "save") {
+      const late = ["/creators/data", "/creators/imports/users", "/creators/imports/rows/review-two/evidence"].map(pathname =>
+        page.waitForResponse(response => new URL(response.url()).pathname === pathname));
+      releaseRoster(); releaseUsers(); releaseEvidence();
+      await Promise.all((await Promise.all(late)).map(response => response.finished()));
+      state.dataGate = state.userGate = state.evidenceGate = null;
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
+      await page.waitForFunction(() => document.getElementById("creators-refresh").getAttribute("aria-busy") !== "true");
+    }
+    assert.equal(await rows.count(), 0);
+    assert.equal(await review.locator("#creators-review-rows").textContent(), "");
+    assert.equal(await page.getByText("My handle is review.one", {exact: true}).count(), 0);
+    assert.equal(await page.locator("#creators-cm option").count(), 0);
+    assert(await page.locator("#creators-app").evaluate(app => [...app.querySelectorAll("button, input, select")].every(control => control.disabled)));
+  }
   assert.deepEqual(errors, []);
 });
 

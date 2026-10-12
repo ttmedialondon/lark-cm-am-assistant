@@ -2,6 +2,7 @@
 
 import json
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -9,6 +10,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from app import ai_dispatch, ai_feature_config, config
 from app import creator_group_evidence as evidence
@@ -471,9 +473,13 @@ def test_creator_group_queue_real_authorization_manual_lock_and_billing_fences(p
 
     # The HTTP boundary also applies live owner checks, CSRF and independent manual classification.
     actor = {"id": owner, "status": "active"}
+    templates = Environment(loader=FileSystemLoader(Path(__file__).parents[1] / "app/templates"),
+                            autoescape=select_autoescape(["html"]))
     app = FastAPI()
     app.include_router(routes.create_router(
-        current_authorization=lambda _: actor, render_template=lambda *args: HTMLResponse("Synthetic page"),
+        current_authorization=lambda _: actor,
+        render_template=lambda request, name, context, status_code=200: HTMLResponse(
+            templates.get_template(name).render(**context), status_code=status_code),
         csrf_token=lambda _: "csrf",
     ))
     client = TestClient(app)
@@ -482,6 +488,15 @@ def test_creator_group_queue_real_authorization_manual_lock_and_billing_fences(p
     actor["id"] = employee
     assert client.get("/admin/ai/creator-groups").status_code == 403
     assert client.post(path, data={"csrf_token": "csrf", "purpose": "training"}).status_code == 403
+    pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission,granted_by) VALUES(%s,'ai',%s)",
+               (employee, owner))
+    readonly = client.get("/admin/ai/creator-groups")
+    assert readonly.status_code == 200 and 'method="post"' not in readonly.text
+    assert "/evidence" not in readonly.text and "Can you fix my sample request?" not in readonly.text
+    assert client.get(f"/admin/ai/creator-groups/jobs/{high['id']}/evidence").status_code == 403
+    assert client.post(path, data={"csrf_token": "csrf", "purpose": "training"}).status_code == 403
+    pg.execute("DELETE FROM admin_page_permissions WHERE authorization_id=%s", (employee,))
+    assert client.get("/admin/ai/creator-groups").status_code == 403
     actor["id"] = owner
     enable(enabled=False)
     matching.configuration_changed(pg)

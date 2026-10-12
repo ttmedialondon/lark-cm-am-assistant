@@ -133,7 +133,8 @@ def test_owner_can_view_only_safe_ai_config_fields(monkeypatch):
 
 
 @pytest.mark.parametrize("enabled", ["1", ""])
-def test_owner_post_passes_key_to_encrypted_store_without_rendering_it(monkeypatch, enabled):
+@pytest.mark.parametrize("feature", ["offhours_summary", "creator_import"])
+def test_owner_post_passes_key_to_encrypted_store_without_rendering_it(monkeypatch, enabled, feature):
     owner_id = uuid4()
     saved = []
     connections = []
@@ -148,10 +149,12 @@ def test_owner_post_passes_key_to_encrypted_store_without_rendering_it(monkeypat
     monkeypatch.setattr(admin, "connection", connection)
     monkeypatch.setattr(admin, "get_settings", lambda: SimpleNamespace(token_encryption_key=b"k" * 32))
     monkeypatch.setattr(ai_feature_config, "api_key_cipher", lambda master_key: ("cipher", master_key))
+    monkeypatch.setattr(ai_feature_config, "get_feature_config", lambda *_: {"auto_confirm_threshold": "0.980"})
 
     def save_config(*args, **kwargs):
-        assert args[0].calls == [("SELECT pg_advisory_xact_lock_shared("
-                                 "hashtextextended('lark-sync-material',0))", None)]
+        assert args[0].calls == ([("SELECT pg_advisory_xact_lock_shared("
+                                  "hashtextextended('lark-sync-material',0))", None)]
+                                if feature == "offhours_summary" else [])
         saved.append((args, kwargs))
 
     monkeypatch.setattr(ai_feature_config, "save_feature_config", save_config)
@@ -161,30 +164,32 @@ def test_owner_post_passes_key_to_encrypted_store_without_rendering_it(monkeypat
         "/admin/ai",
         data={
             "csrf_token": "csrf",
-            "feature": "offhours_summary",
+            "feature": feature,
             "project_id": "proj_summary",
             "model": "gpt-5.6-luna",
             "enabled": enabled,
-            "auto_confirm_threshold": "0.900",
+            **({"auto_confirm_threshold": "0.970"} if feature == "creator_import" and enabled
+               else {"auto_confirm_threshold": "0.900"} if feature == "offhours_summary" else {}),
             "api_key": "sk-secret-never-rendered",
         },
         follow_redirects=False,
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/admin/ai?saved=offhours-summary#offhours-summary"
+    anchor = feature.replace("_", "-")
+    assert response.headers["location"] == f"/admin/ai?saved={anchor}#{anchor}"
     assert response.headers["cache-control"] == "no-store, max-age=0"
     assert len(saved) == 1
     args, kwargs = saved[0]
-    assert args[1:] == (("cipher", b"k" * 32), "offhours_summary")
+    assert args[1:] == (("cipher", b"k" * 32), feature)
     assert kwargs == {
         "provider": "openai",
         "project_id": "proj_summary",
         "model": "gpt-5.6-luna",
-        "enabled": enabled == "1",
+        "enabled": feature != "creator_import" and enabled == "1",
         "api_key": "sk-secret-never-rendered",
         "updated_by_authorization_id": owner_id,
-        "auto_confirm_threshold": "0.900",
+        "auto_confirm_threshold": ("0.970" if enabled else "0.980") if feature == "creator_import" else "0.900",
     }
     audit = connections[0].calls[-1][1]
     assert audit[2] == "ai_feature_config_updated"
@@ -305,8 +310,8 @@ def test_matching_routes_recheck_live_owner_and_csrf_before_queue_writes(pg, mon
     app = FastAPI()
     app.include_router(matching_routes.create_router(
         current_authorization=lambda _: session["auth"], csrf_token=lambda _: "csrf",
-        render_template=lambda request, name, context: contexts.append(context) or HTMLResponse(
-            templates.get_template(name).render(**context)),
+        render_template=lambda request, name, context, status_code=200: contexts.append(context) or HTMLResponse(
+            templates.get_template(name).render(**context), status_code=status_code),
     ))
     client = TestClient(app)
     path = "/admin/ai/creator-handle-matching"
@@ -348,6 +353,20 @@ def test_matching_routes_recheck_live_owner_and_csrf_before_queue_writes(pg, mon
     assert unknown.text.count("请求结果未知，需核实后重新检查") == 1
     assert "request_unknown" not in unknown.text
     assert contexts[-1]["matching"]["jobs"][0]["status"] == "failed"
+    pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission,granted_by) VALUES(%s,'ai',%s)",
+               (member, owner))
+    session["auth"] = {"id": member, "status": "active"}
+    readonly = client.get(path)
+    assert readonly.status_code == 200 and "请求结果未知，需核实后重新检查" in readonly.text
+    assert '<form method="post"' not in readonly.text
+    assert contexts[-1]["admin_role"] == "viewer" and contexts[-1]["admin_permissions"] == frozenset({"ai"})
+    assert contexts[-1]["admin_landing_path"] == "/admin/ai"
+    assert client.post(path + f"/jobs/{job}/cancel", data={"csrf_token": "csrf"}).status_code == 403
+    pg.execute("DELETE FROM admin_page_permissions WHERE authorization_id=%s", (member,))
+    assert client.get(path).status_code == 403
+    session["auth"] = {"id": owner, "status": "active"}
+    pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission,granted_by) VALUES(%s,'ai',%s)",
+               (owner, owner))
     pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (owner,))
     assert client.get(path).status_code == 403  # Session does not retain an obsolete Owner grant.
     assert client.post(path + f"/jobs/{job}/cancel", data={"csrf_token": "csrf", "page": "8"}).status_code == 403

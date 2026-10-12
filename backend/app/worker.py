@@ -32,6 +32,7 @@ from . import (
 from .config import Settings, get_settings
 from .crypto import TokenCipher, message_body_cipher, message_body_fingerprint
 from .db import connection, lock_sync_material
+from .evidence_access import BODY_READ_SCOPES
 from .identity_names import format_display_name, update_identity_names
 from .lark_api import LarkApiError, LarkClient, TokenBundle
 from .lark_sync_admission import LarkSyncAdmission
@@ -1054,19 +1055,24 @@ def _usable_access_token(
         if not bundle.refresh_token:
             raise ReauthorizationRequired
         _store_refreshed_tokens(conn, authorization_id, bundle, cipher)
-        return bundle.access_token
+    # Persist the actual reduced grant before stopping this sync pass.
+    if bundle.scope is not None and not BODY_READ_SCOPES.issubset(bundle.scope.split()):
+        raise ReauthorizationRequired
+    return bundle.access_token
 
 
 def _store_refreshed_tokens(
     conn: psycopg.Connection, authorization_id: uuid.UUID, bundle: TokenBundle, cipher: TokenCipher
 ) -> None:
+    scopes = list(dict.fromkeys(bundle.scope.split())) if bundle.scope is not None else None
+    readable = scopes is None or BODY_READ_SCOPES.issubset(scopes)
     conn.execute(
         """
         UPDATE authorizations
         SET access_token_ciphertext = %s, refresh_token_ciphertext = %s,
             access_token_expires_at = %s, refresh_token_expires_at = %s,
             scopes = COALESCE(%s::text[], scopes),
-            status = 'active', last_error = NULL, updated_at = NOW()
+            status = %s, last_error = %s, updated_at = NOW()
         WHERE id = %s
         """,
         (
@@ -1074,7 +1080,9 @@ def _store_refreshed_tokens(
             cipher.encrypt(bundle.refresh_token or ""),
             _expiry(bundle.expires_in),
             _expiry(bundle.refresh_expires_in),
-            list(dict.fromkeys(bundle.scope.split())) if bundle.scope is not None else None,
+            scopes,
+            "active" if readable else "attention_required",
+            None if readable else "Lark 消息读取权限已变化，请重新授权。",
             authorization_id,
         ),
     )

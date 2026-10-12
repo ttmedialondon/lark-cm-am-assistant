@@ -23,6 +23,9 @@ def pg(monkeypatch):
         conn.execute(psycopg.sql.SQL("SET LOCAL search_path TO {}").format(psycopg.sql.Identifier(schema)))
         for path in sorted((Path(__file__).parents[1] / "migrations").glob("*.sql")):
             conn.execute(path.read_text())
+        # Test accounts are valid readers unless a case explicitly removes their grants.
+        conn.execute("ALTER TABLE authorizations ALTER scopes SET DEFAULT "
+                     "ARRAY['im:chat:read','im:message:readonly']::text[]")
         monkeypatch.setattr(ai_dispatch, "connection", lambda: nullcontext(conn))
         try:
             yield conn

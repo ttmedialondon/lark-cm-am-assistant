@@ -245,6 +245,8 @@ def pg(monkeypatch):
         for path in sorted((Path(__file__).parents[1] / "migrations").glob("*.sql")):
             if int(path.name[:3]) <= 51 or int(path.name[:3]) >= 54:
                 conn.execute(path.read_text())
+        conn.execute("ALTER TABLE authorizations ALTER scopes SET DEFAULT "
+                     "ARRAY['im:chat:read','im:message:readonly']::text[]")
         monkeypatch.setattr(ai, "connection", lambda: nullcontext(conn))
         monkeypatch.setattr(ai.ai_dispatch, "connection", lambda: nullcontext(conn))
         monkeypatch.setattr(ai, "get_settings", lambda: SimpleNamespace(token_encryption_key=b"x" * 32))
@@ -559,6 +561,7 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
         "group_unrelated": ("Another creator X TT Media", "ou_other", True, True),
         "group_hidden": ("alice samples", "ou_person", False, True),
         "group_quiet": ("alice archive", "ou_person", True, False),
+        "group_restricted": ("Lark restricted creator group", "ou_person", True, True),
     }
     for chat, (name, member, visible, in_window) in groups.items():
         pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES(%s,%s,'group')", (chat, name))
@@ -580,6 +583,7 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
             """INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
                    VALUES(%s,%s,%s)""", (s.ids["cm"], chat, chat + "_message"),
         )
+    pg.execute("UPDATE authorization_chats SET sync_status='not_readable' WHERE chat_id='group_restricted'")
     pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('group_named','ou_cm')")
     pg.execute(
         """UPDATE authorization_chats SET member_snapshot_status='succeeded',member_count=2,
@@ -695,15 +699,19 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
     finish_merges(pg, s)
     view = ai.get_summary_view(pg, s.ids["owner"])
     assert len(view["events"]) == 2 and view["run"]["counts"]["completed"] == 4
+    assert any("Lark 读取限制" in gap for gap in view["run"]["gaps"])
+    assert not any("group_restricted" in json.dumps(p) for p in s.calls)
+    run = pg.execute(
+        "SELECT r.* FROM offhours_summary_runs r JOIN offhours_summary_settings s ON s.run_id=r.id"
+    ).fetchone()
+    with pytest.raises(ai.SummaryInputError, match="不允许读取"):
+        ai._load_chat(pg, run, 'group_restricted', s.end, settings=s.settings)
     assert not any("group_hidden" in json.dumps(p) or "group_unrelated" in json.dumps(p) for p in s.calls)
 
     # A second, unassigned creator still prevents a uniqueness inference. The
     # conversation remains relevant, but CM-only text needs an explicit target.
     pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('group_named','ou_other')")
     pg.execute("UPDATE authorization_chats SET member_count=3 WHERE chat_id='group_named'")
-    run = pg.execute(
-        "SELECT r.* FROM offhours_summary_runs r JOIN offhours_summary_settings s ON s.run_id=r.id"
-    ).fetchone()
     related = ai._related_chats(pg, ai._roster(pg), settings=s.settings)
     assert "group_named" in {r["chat_id"] for r in related}
     evidence = ai._load_chat(pg, run, "group_named", s.end, settings=s.settings)

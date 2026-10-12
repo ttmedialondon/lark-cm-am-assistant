@@ -2,6 +2,8 @@
 
 from uuid import UUID
 
+from .evidence_access import BODY_READ_SCOPE_SQL
+
 
 def parse_id(value):
     try:
@@ -21,8 +23,9 @@ def require_owner(conn, actor_id):
 
 def authorized_cm(conn, cm_id):
     return conn.execute(
-        """SELECT id,open_id,display_name FROM authorizations
-           WHERE id=%s AND status='active' AND body_consent_at IS NOT NULL""",
+        f"""SELECT id,open_id,display_name FROM authorizations a
+           WHERE id=%s AND status='active' AND body_consent_at IS NOT NULL
+             AND {BODY_READ_SCOPE_SQL}""",
         (cm_id,),
     ).fetchone()
 

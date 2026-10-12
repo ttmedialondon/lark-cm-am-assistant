@@ -164,7 +164,7 @@ def ranking_flow(pg, monkeypatch):
 
 
 @pytest.mark.parametrize("missing", ["backfill_complete", "backfill_window_end_at", "last_backfill_at",
-                                    "recent_start", "not_readable"])
+                                    "recent_start", "not_readable", "read_scope"])
 def test_history_coverage_requires_successful_full_sync(pg, ranking_flow, missing):
     flow = ranking_flow
     flow.enable()
@@ -172,13 +172,21 @@ def test_history_coverage_requires_successful_full_sync(pg, ranking_flow, missin
         pg.execute("UPDATE authorization_chats SET backfill_window_start_at=NOW()-INTERVAL '7 days'")
     elif missing == "not_readable":
         pg.execute("UPDATE authorization_chats SET sync_status='not_readable'")
+    elif missing == "read_scope":
+        pg.execute("UPDATE authorizations SET scopes=ARRAY['im:message.send_as_user']")
     else:
         value = "FALSE" if missing == "backfill_complete" else "NULL"
         pg.execute(f"UPDATE authorization_chats SET {missing}={value}")
     job = pg.execute("""SELECT *,NOW()-INTERVAL '90 days' history_start,NOW() history_end
         FROM creator_importance_jobs WHERE responsible_authorization_id=%s""", (flow.owner,)).fetchone()
     material = importance.build_batch(pg, job, flow.settings, importance._state(job, flow.settings))
-    assert material["state"]["chat_coverage"] == {"own_private": False}
+    if missing in {"not_readable", "read_scope"}:
+        assert material["pack"] is None and not material["sources"]
+        assert not material["state"].get("chat_coverage")
+        source = pg.execute("SELECT body_ciphertext FROM chat_messages WHERE message_id='a1'").fetchone()
+        assert source["body_ciphertext"]
+    else:
+        assert material["state"]["chat_coverage"] == {"own_private": False}
     assert not flow.calls
 
 
@@ -422,6 +430,15 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
         ).fetchone()["desired_version"]
         == before
     )
+    pg.execute("UPDATE authorization_chats SET sync_status='not_readable' WHERE authorization_id=%s", (flow.owner,))
+    assert importance.view_for(pg, flow.person, flow.owner, flow.settings)["grounds"] == []
+    assert not any(importance._source_checks(pg, material["sources"], flow.person, flow.owner).values())
+    pg.execute("UPDATE authorization_chats SET sync_status='succeeded' WHERE authorization_id=%s", (flow.owner,))
+    pg.execute("UPDATE authorizations SET scopes=ARRAY['im:message.send_as_user'] WHERE id=%s", (flow.owner,))
+    assert importance.view_for(pg, flow.person, flow.owner, flow.settings)["grounds"] == []
+    assert not any(importance._source_checks(pg, material["sources"], flow.person, flow.owner).values())
+    pg.execute("UPDATE authorizations SET scopes=ARRAY['im:chat:read','im:message:readonly'] WHERE id=%s",
+               (flow.owner,))
     pg.execute("UPDATE chat_messages SET is_deleted=TRUE,body_ciphertext=NULL WHERE message_id='a2'")
     view = importance.view_for(pg, flow.person, flow.owner, flow.settings)
     assert view["tier"] == "normal" and not view["grounds"] and "依据已变化" in view["gap_label"]

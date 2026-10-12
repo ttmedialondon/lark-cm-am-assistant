@@ -54,12 +54,14 @@ def test_admin_summary_form_has_native_window_inputs_and_disabled_default_withou
     )
     assert 'name="auto_confirm_threshold"' in responsibility_form
     group_form = next(form for form in forms if 'name="feature" value="creator_group_classification"' in form)
+    import_form = next(form for form in forms if 'name="feature" value="creator_import"' in form)
     assert 'name="auto_confirm_threshold"' in group_form
     assert "自动入库置信度阈值" in group_form
     assert all(
         'name="auto_confirm_threshold"' not in form for form in forms
-        if form not in (responsibility_form, group_form)
+        if form not in (responsibility_form, group_form, import_form)
     )
+    assert 'name="auto_confirm_threshold"' in import_form
     import_form = next(form for form in forms if 'name="feature" value="creator_import"' in form)
     assistant_form = next(form for form in forms if 'name="feature" value="operations_assistant"' in form)
     assert 'name="auto_confirm_threshold"' not in assistant_form
@@ -91,7 +93,9 @@ def test_readonly_admin_has_no_save_resume_key_or_window_edit_controls():
     assert '<input ' not in html
     assert "只读配置" in html
     assert 'id="offhours-summary"' in html
-    assert 'href="/admin/ai/creator-handle-matching"' not in html
+    assert 'href="/admin/ai/creator-handle-matching"' in html
+    assert 'href="/admin/ai/creator-responsibility"' in html
+    assert 'href="/admin/ai/creator-groups"' in html
 
 
 def test_matching_template_escapes_names_and_distinguishes_associations_from_historical_operator_suggestions():
@@ -266,9 +270,14 @@ def client(monkeypatch):
         auth["session_reads"] = auth.get("session_reads", 0) + 1
         return auth
 
+    def render_page(_request, name, context, status_code=200):
+        env = Environment(loader=FileSystemLoader(APP / "templates"), autoescape=select_autoescape())
+        body = env.get_template(name).render(**context) if name == "error.html" else "private-summary-fixture"
+        return HTMLResponse(body, status_code=status_code)
+
     app.include_router(routes.create_router(
         current_authorization=authorization,
-        render_template=lambda *_: HTMLResponse("page"), csrf_token=lambda _: "test-csrf",
+        render_template=render_page, csrf_token=lambda _: "test-csrf",
     ))
     return TestClient(app), auth, calls, conn
 
@@ -304,7 +313,8 @@ def test_revoked_session_and_backend_scope_denial_never_render_data(client, monk
     result = api.get("/dashboard/offhours-summary")
     assert result.status_code == 403
     assert auth["session_reads"] == 2
-    assert "page" not in result.text
+    assert "private-summary-fixture" not in result.text
+    assert "返回工作台" in result.text
     assert result.headers["cache-control"].startswith("no-store")
 
 
@@ -319,7 +329,7 @@ def test_source_cm_authorization_loss_returns_forbidden_so_browser_clears_result
         result = api.get(path)
         assert result.status_code == 403
         assert result.headers["cache-control"].startswith("no-store")
-        assert "page" not in result.text
+        assert "private-summary-fixture" not in result.text
 
 
 def test_reply_creation_requires_session_csrf_and_server_scope(client, monkeypatch):

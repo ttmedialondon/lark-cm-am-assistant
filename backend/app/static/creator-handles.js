@@ -10,11 +10,13 @@
   let page = data.page || 1;
   let query = el("query").value.trim();
   let sort = data.sort || "importance", tier = data.tier || "";
-  let busy = false, reading = false, listLoading = false, refreshQueued = false, version = 0;
+  let busy = false, reading = false, listLoading = false, refreshQueued = false, version = 0, denied = false;
   const rows = new Map();
   const selectedContacts = new Map();
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   let importPreview = null;
+  let reviewBatch = null, reviewPage = 1, reviewPages = 1, reviewLoading = false, reviewVersion = 0;
+  const reviewDrafts = new Map();
   const rowKey = item => `${item.kind || "person"}:${item.id}`;
   const node = (tag, text = "", classes = "") => {
     const item = document.createElement(tag); item.textContent = text; item.className = classes; return item;
@@ -24,10 +26,11 @@
     el("notice").className = text ? `alert alert-${error ? "danger" : "success"}` : "alert d-none";
   }
   async function read(response) {
-    const body = response.headers.get("content-type")?.includes("application/json") ? await response.json() : {};
-    if (!response.ok || response.redirected) {
-      const error = new Error(body.error || "访问失败，请刷新或重新登录。");
-      error.status = response.redirected ? 401 : response.status; throw error;
+    if (response.redirected || [401, 403].includes(response.status)) clearProtected();
+    const body = !denied && response.headers.get("content-type")?.includes("application/json") ? await response.json() : {};
+    if (denied || !response.ok) {
+      const error = new Error(denied ? "登录或查看权限已变化，请刷新或重新登录。" : body.error || "访问失败，请刷新或重新登录。");
+      error.status = denied ? 403 : response.status; throw error;
     }
     return body;
   }
@@ -59,6 +62,24 @@
     }
   }
   function clearRows() { data = {...data, items: [], page}; rows.clear(); el("rows").replaceChildren(); }
+  function clearReview() {
+    reviewVersion++; reviewLoading = false; reviewBatch = null; reviewDrafts.clear(); el("review-rows").replaceChildren(); reviewMessage("");
+  }
+  function clearProtected() {
+    denied = true; version++; refreshQueued = false; listLoading = false;
+    selectedContacts.clear(); importPreview = null; clearRows(); clearReview();
+    el("initial").textContent = ""; el("query").value = "";
+    el("import-file").value = ""; el("import-preview").replaceChildren(); el("import-preview").hidden = true;
+    el("import-cm").textContent = ""; importMessage("");
+    el("review-title").textContent = "核对导入账号"; el("review-page-label").textContent = "";
+    el("import-dialog").close(); el("review-dialog").close();
+    data = {...data, items: [], import_batches: [], cms: [], selected_cm_id: "", read_only: true,
+      can_view_unassigned: false, can_select_cm: false, can_broadcast: false,
+      can_view_importance: false, can_adjust_importance: false, can_edit_handles: false, importance_running: false,
+      total_count: 0, total_pages: 1, page: 1};
+    if (el("cm")) el("cm").replaceChildren();
+    notice("登录或查看权限已变化，请刷新或重新登录。", true); render();
+  }
   function importMessage(text, error = false) {
     el("import-message").textContent = text;
     el("import-message").className = `small mt-3 ${error ? "text-danger" : "text-secondary"}`;
@@ -77,6 +98,16 @@
       label.append(node("div", batch.status === "preview" ? `有效 handle ${counts.valid || 0}` : `已入库 ${counts.confirmed || 0} · 待核对 ${counts.review || 0} · 待处理 ${(counts.pending || 0) + (counts.queued || 0)} · 分析中 ${(counts.preparing || 0) + (counts.running || 0)}${counts.failed ? ` · 异常 ${counts.failed}` : ""}`, "small text-secondary"));
       if (batch.error) label.append(node("div", batch.error, "small text-danger"));
       line.append(label);
+      if (batch.status !== "preview" && !data.read_only) {
+        const review = node("button", "核对账号", "btn btn-sm btn-outline-primary");
+        review.type = "button"; review.disabled = busy;
+        review.addEventListener("click", () => {
+          reviewBatch = {id: batch.id, cm_id: selectedCM()}; reviewPage = 1;
+          el("review-title").textContent = `核对账号 · ${batch.filename || "Excel 名单"}`;
+          el("review-dialog").showModal(); void loadReview();
+        });
+        line.append(review);
+      }
       for (const [action, text] of [["start", "确认导入"], ["pause", "暂停"], ["resume", "继续"], ["recheck", "重新检查未确认"]]) {
         if (!batch[`can_${action}`]) continue;
         const button = node("button", text, "btn btn-sm btn-outline-primary");
@@ -85,6 +116,112 @@
       }
       el("import-batch-list").append(line);
     }
+    for (const control of el("review-dialog").querySelectorAll("button, input, select")) control.disabled = busy || reviewLoading;
+    el("review-previous").disabled ||= reviewPage <= 1;
+    el("review-next").disabled ||= reviewPage >= reviewPages;
+  }
+  function reviewMessage(text, error = false) {
+    el("review-message").textContent = text;
+    el("review-message").className = `small mb-3 ${error ? "text-danger" : "text-secondary"}`;
+  }
+  function renderEvidence(target, material) {
+    target.replaceChildren();
+    for (const warning of [...(material.warnings || []), ...(material.conflicts || [])]) target.append(node("p", warning, "small text-danger"));
+    const cited = new Set();
+    for (const [label, decision] of [["找群", material.group_decision], ["找人", material.person]]) {
+      if (!decision?.status_label) continue;
+      target.append(node("p", `${label}：${decision.status_label}${decision.display_name ? ` · ${decision.display_name}` : ""}${decision.confidence != null ? ` · 自评分 ${Math.round(decision.confidence * 100)}%` : ""}`, "small fw-semibold mb-1"));
+      target.append(node("p", decision.reason || "", "small text-secondary"));
+      for (const ref of decision.evidence_refs || []) cited.add(ref);
+    }
+    const messageNode = message => {
+      const item = node("div", "", "border-start ps-2 my-2");
+      item.append(node("div", `${message.ref} · ${message.sender_name} · ${message.time_label}`, "small text-secondary"));
+      const body = node("div", message.text, "small"); body.style.whiteSpace = "pre-wrap"; item.append(body); return item;
+    };
+    for (const group of material.groups || []) {
+      target.append(node("div", `${group.name}${group.selected ? " · 已选群" : ""}`, "small fw-semibold mt-3"));
+      const messages = group.messages || [];
+      for (const message of messages.filter(message => cited.has(message.ref))) target.append(messageNode(message));
+      const more = node("details", "", "small mt-2"); more.append(node("summary", "更多上下文与群成员"));
+      for (const member of group.members || []) more.append(node("p", `${member.display_name} · ${member.status_label} · ${member.reason || ""}`, "small text-secondary my-2"));
+      for (const message of messages.filter(message => !cited.has(message.ref))) more.append(messageNode(message));
+      target.append(more);
+    }
+    if (!target.childElementCount) target.append(node("p", material.reason || "暂无可展示的证据。", "small text-secondary"));
+  }
+  async function loadReview() {
+    if (denied || !reviewBatch || reviewLoading) return;
+    const token = ++reviewVersion, scope = reviewBatch;
+    for (const card of el("review-rows").children) {
+      const {handle, userQuery, users} = card.reviewFields;
+      reviewDrafts.set(card.dataset.row, {handle: handle.value, query: userQuery.value, selected: users.value,
+        users: [...users.options].map(option => ({value: option.value, text: option.textContent}))});
+    }
+    reviewLoading = true; reviewMessage("正在加载待核对账号…"); renderImports();
+    el("review-rows").replaceChildren();
+    try {
+      const result = await read(await fetch(`/creators/imports/data?${new URLSearchParams({cm_id: scope.cm_id, batch_id: scope.id, page: String(reviewPage)})}`, {cache: "no-store"}));
+      if (token !== reviewVersion || !el("review-dialog").open) return;
+      reviewPage = result.page; reviewPages = result.total_pages;
+      el("review-page-label").textContent = `待核对 ${result.total} 条 · 第 ${reviewPage} / ${reviewPages} 页`;
+      reviewMessage(result.total ? "" : "本批账号已全部入库。");
+      for (const candidate of result.candidates || []) {
+        const card = node("details", "", "border rounded p-3 mb-2");
+        card.dataset.row = candidate.id;
+        card.append(node("summary", `@${candidate.handle} · ${candidate.display_name} · ${candidate.status_label}`, "fw-semibold"));
+        card.append(node("p", candidate.reason, "small text-secondary mt-2"));
+        const evidence = node("details", "", "my-2"), material = node("div");
+        evidence.append(node("summary", "查看证据", "small"), material);
+        evidence.addEventListener("toggle", async () => {
+          if (!evidence.open || evidence.dataset.loaded) return;
+          evidence.dataset.loaded = "true"; material.textContent = "正在读取证据…";
+          try {
+            const result = await read(await fetch(`/creators/imports/rows/${candidate.id}/evidence`, {cache: "no-store"}));
+            if (token === reviewVersion) renderEvidence(material, result);
+          } catch (error) { material.textContent = error.message; delete evidence.dataset.loaded; }
+        });
+        const form = node("form", "", "mt-3"), handle = node("input", "", "form-control form-control-sm");
+        handle.value = candidate.handle; handle.maxLength = 160; handle.required = true; handle.setAttribute("aria-label", "核对 handle");
+        const userQuery = node("input", "", "form-control form-control-sm"), search = node("button", "搜索用户", "btn btn-sm btn-outline-secondary");
+        userQuery.type = "search"; userQuery.maxLength = 120; userQuery.placeholder = "搜索 Lark 用户姓名"; userQuery.setAttribute("aria-label", "搜索 Lark 用户姓名"); search.type = "button";
+        const users = node("select", "", "form-select form-select-sm mt-2"); users.required = true; users.setAttribute("aria-label", "对应 Lark 用户");
+        const placeholder = node("option", "请搜索并选择对应用户"); placeholder.value = ""; users.append(placeholder);
+        if (candidate.contact_id) { const user = node("option", candidate.display_name); user.value = candidate.contact_id; users.append(user); users.value = candidate.contact_id; }
+        const draft = reviewDrafts.get(candidate.id);
+        if (draft) {
+          handle.value = draft.handle; userQuery.value = draft.query;
+          users.replaceChildren(...draft.users.map(item => { const option = node("option", item.text); option.value = item.value; return option; }));
+          users.value = draft.selected;
+        }
+        card.reviewFields = {handle, userQuery, users};
+        const status = node("div", "", "small mt-2"); status.setAttribute("role", "status");
+        const searchUsers = async () => {
+          if (busy || search.disabled || !userQuery.value.trim()) return;
+          search.disabled = true; status.textContent = "正在搜索…";
+          try {
+            const found = await read(await fetch(`/creators/imports/users?${new URLSearchParams({cm_id: scope.cm_id, q: userQuery.value.trim()})}`, {cache: "no-store"}));
+            if (token !== reviewVersion) return;
+            users.replaceChildren(placeholder);
+            for (const item of found) { const option = node("option", `${item.display_name} · ${item.context_label}`); option.value = item.id; users.append(option); }
+            status.textContent = found.length ? "请选择对应用户。" : "未找到当前负责人可访问的用户。";
+          } catch (error) { status.textContent = error.message; }
+          finally { search.disabled = busy; }
+        };
+        search.addEventListener("click", searchUsers);
+        userQuery.addEventListener("keydown", event => { if (event.key === "Enter") { event.preventDefault(); void searchUsers(); } });
+        const searchLine = node("div", "", "d-flex gap-2 mt-2"); searchLine.append(userQuery, search);
+        const confirm = node("button", "确认入库", "btn btn-sm btn-primary"), defer = node("button", "暂缓", "btn btn-sm btn-outline-secondary"); confirm.type = "submit"; defer.type = "button";
+        defer.hidden = !candidate.can_defer;
+        form.addEventListener("submit", event => { event.preventDefault(); void mutate(`/imports/rows/${candidate.id}/confirm`, {handle: handle.value.trim(), contact_id: users.value}, confirm); });
+        defer.addEventListener("click", () => void mutate(`/imports/rows/${candidate.id}/defer`, {}, defer));
+        const actions = node("div", "", "d-flex gap-2 mt-3"); actions.append(confirm, defer);
+        form.append(node("label", "达人 handle", "small mb-1"), handle, searchLine, users, status, actions); card.append(evidence, form);
+        el("review-rows").append(card);
+      }
+    } catch (error) {
+      if (token === reviewVersion) reviewMessage(error.message, true);
+    } finally { if (token === reviewVersion) { reviewLoading = false; renderImports(); } }
   }
   function makeRow(item) {
     const row = node("tr");
@@ -259,6 +396,7 @@
     renderImports();
     renderSelection();
     renderLoading();
+    if (denied) for (const control of app.querySelectorAll("button, input, select")) control.disabled = true;
   }
   function renderLoading() {
     el("loading").hidden = !listLoading || Boolean(data.items?.length);
@@ -278,7 +416,8 @@
     el("next").disabled = busy || listLoading || page >= (data.total_pages || 1);
   }
   async function refresh(automatic = false) {
-    if (automatic && (reading || busy || document.hidden || [...rows.values()].some(row => row.manualDirty || row.handleDirty) || el("import-dialog").open)) return;
+    if (denied) return;
+    if (automatic && (reading || busy || document.hidden || [...rows.values()].some(row => row.manualDirty || row.handleDirty) || el("import-dialog").open || el("review-dialog").open)) return;
     if (!automatic) { listLoading = true; render(); }
     if (reading) {
       refreshQueued = true; version++;
@@ -297,17 +436,6 @@
       }
     } catch (error) {
       if (token === version) {
-        if ([401, 403].includes(error.status)) {
-          selectedContacts.clear(); importPreview = null; clearRows();
-          el("initial").textContent = "";
-          el("import-dialog").close();
-          data = {...data, items: [], import_batches: [], cms: [], read_only: true,
-            can_view_unassigned: false, can_select_cm: false, can_broadcast: false,
-            can_view_importance: false, can_adjust_importance: false, can_edit_handles: false, importance_running: false,
-            total_count: 0, total_pages: 1, page: 1};
-          if (el("cm")) { el("cm").replaceChildren(); el("cm").disabled = true; }
-          render();
-        }
         notice(error.message, true);
       }
     }
@@ -315,11 +443,11 @@
       reading = false;
       renderSelection();
       if (refreshQueued) { refreshQueued = false; void refresh(); }
-      else { listLoading = false; renderLoading(); }
+      else { listLoading = false; render(); }
     }
   }
   async function mutate(path, fields = {}, button = null) {
-    if (busy) return;
+    if (denied || busy) return;
     busy = true; render(); notice("");
     button?.setAttribute("aria-busy", "true");
     try {
@@ -346,13 +474,19 @@
       else if (path.endsWith("/recheck")) notice("未确认账号已重新排队。");
       else if (path.endsWith("/pause")) notice("已暂停，进行中的请求仍会完成。");
       else if (path.endsWith("/resume")) notice("已继续匹配。");
+      else if (path.endsWith("/confirm")) notice("账号已入库。");
+      else if (path.endsWith("/defer")) notice("账号已暂缓。");
       else notice("已保存。");
       await refresh();
-    } catch (error) { notice(error.message, true); }
+      if (path.startsWith("/imports/rows/")) await loadReview();
+    } catch (error) {
+      notice(error.message, true);
+      if (el("review-dialog").open) reviewMessage(error.message, true);
+    }
     finally { button?.removeAttribute("aria-busy"); busy = false; render(); }
   }
   async function checkImport() {
-    if (busy) return;
+    if (denied || busy) return;
     const file = el("import-file").files[0];
     if (!file || !file.name.toLowerCase().endsWith(".xlsx")) return importMessage("请选择 .xlsx 文件。", true);
     if (file.size > 2 * 1024 * 1024) return importMessage("文件过大，请上传不超过 2 MB 的表格。", true);
@@ -379,7 +513,7 @@
     finally { el("import-check").removeAttribute("aria-busy"); busy = false; render(); }
   }
   async function startImport() {
-    if (busy || !importPreview) return;
+    if (denied || busy || !importPreview) return;
     busy = true; render(); importMessage("正在导入名单…");
     el("import-confirm").setAttribute("aria-busy", "true");
     try {
@@ -413,6 +547,10 @@
   });
   el("import-check").addEventListener("click", checkImport);
   el("import-confirm").addEventListener("click", startImport);
+  el("review-close").addEventListener("click", () => el("review-dialog").close());
+  el("review-dialog").addEventListener("cancel", event => { if (busy) event.preventDefault(); });
+  el("review-dialog").addEventListener("close", clearReview);
+  for (const [key, delta] of [["previous", -1], ["next", 1]]) el(`review-${key}`).addEventListener("click", () => { reviewPage += delta; void loadReview(); });
   el("select-page")?.addEventListener("change", () => {
     if (busy || reading || !canSelectContacts()) return;
     const ids = (data.items || []).map(selectableContact).filter(Boolean);

@@ -101,7 +101,7 @@ def test_summary_provider_request_runs_after_material_lock_released(monkeypatch)
 
 
 @pytest.mark.parametrize("oauth_first", [True, False])
-def test_oauth_and_discovery_serialize_before_source_locks_and_fence_old_jobs(pg, monkeypatch, oauth_first):
+def test_oauth_and_discovery_serialize_before_source_locks_and_fence_old_jobs(pg, monkeypatch, oauth_first):  # noqa: F811
     dsn = _dsn()
     schema = pg.execute("SELECT current_schema() AS name").fetchone()["name"]
     application_name = "oauth_lock_" + uuid4().hex

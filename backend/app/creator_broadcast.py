@@ -334,7 +334,11 @@ def permission_check(actor_id, cm_id):
                                   else "该账号授权状态需要更新，请本人重新授权。" if checked["status"] != "active"
                                   else "本人发送授权有效；发送前逐群检查权限。")
     except ReauthorizationRequired:
+        with connection() as conn:
+            checked = conn.execute(sql, (target,)).fetchone()
         result.update(status="needs_authorization", message="账号连接已失效，请本人重新授权。")
+        if checked and checked["open_id"] == row["open_id"]:
+            result["missing_scopes"] = sorted(required - set(checked["scopes"] or ()))
     except LarkApiError as exc:
         # Permission/resource denials and transient failures are not proof of missing user grants.
         if not exc.retryable and (exc.status_code == 401 or exc.lark_code in {20064, 99991668, 99991669, 99991677}):

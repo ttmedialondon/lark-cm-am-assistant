@@ -186,6 +186,14 @@ const {chromium} = require('playwright');
     });
     await page.goto('http://localhost/');
     assert.equal(scopeReads,0);
+    await page.evaluate(cm_id=>document.dispatchEvent(new CustomEvent('ttmedia:assistant',
+      {detail:{context:{cm_id}}})),remiId);
+    await page.waitForFunction(id=>document.getElementById('oa-cm').value===id,remiId);
+    assert.equal(await page.locator('#oa-panel').isHidden(),true);
+    assert.equal(posts.length,0);
+    await page.evaluate(cm_id=>document.dispatchEvent(new CustomEvent('ttmedia:assistant',
+      {detail:{context:{cm_id}}})),ownId());
+    await page.waitForFunction(id=>document.getElementById('oa-cm').value===id,ownId());
     await page.locator('#oa-launcher').click(); await page.locator('#oa-input').fill('总结今天上午');
     await page.locator('#oa-input').press('Enter');
     await page.getByRole('button',{name:'重试提交',exact:true}).waitFor();
@@ -298,6 +306,23 @@ const {chromium} = require('playwright');
     await page.waitForFunction(()=>document.getElementById('oa-status').textContent.includes('上次会话已不可读取'));
     assert.equal(await page.locator('#oa-cm').isDisabled(),false);
     assert.equal(posts.length,5);
+    sessionGone=false;
+    await page.evaluate(cm_id=>document.dispatchEvent(new CustomEvent('ttmedia:assistant',
+      {detail:{context:{cm_id}}})),remiId);
+    await page.waitForFunction(id=>document.getElementById('oa-cm').value===id,remiId);
+    await page.locator('#oa-input').fill('继续核对'); await page.locator('#oa-input').press('Enter');
+    await page.waitForFunction(()=>window.sources.length===1);
+    assert.equal(posts.length,6);
+    await page.evaluate(cm_id=>document.dispatchEvent(new CustomEvent('ttmedia:assistant',
+      {detail:{context:{cm_id}}})),ownId());
+    assert.equal(await page.locator('#oa-cm').inputValue(),remiId);
+    await page.locator('#oa-collapse').click();
+    await page.evaluate(value=>{window.sources.at(-1).emit('result',value);
+      window.sources.at(-1).emit('done',{status:'completed'});},
+      {answer:'这轮已完成',events:[],scope:{cm_id:remiId,cm_name:'Remi',audience:'all'}});
+    await page.waitForFunction(id=>document.getElementById('oa-cm').value===id,ownId());
+    assert.equal(await page.locator('#oa-panel').isHidden(),true);
+    assert.equal(posts.length,6);
     html=html.replace(/data-user-id="[^"]+"/,'data-user-id="33333333-3333-4333-8333-333333333333"');
     const reads=[]; page.on('request',request => {if(request.url().includes('/sessions/')) reads.push(request.url());});
     await page.reload(); await page.locator('#oa-launcher').click();

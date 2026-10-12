@@ -24,14 +24,6 @@ WINDOW_TEXT_LIMIT = 1800
 
 _BASE_SQL = core._MESSAGE_SQL.split("    ORDER BY", 1)[0].replace(
     "m.chat_id=%s", "m.chat_id=ANY(%s::text[])"
-).replace(
-    "    LEFT JOIN lark_identities",
-    "    JOIN authorization_chats ac ON ac.authorization_id=a.id AND ac.chat_id=m.chat_id\n"
-    "    JOIN chats c ON c.chat_id=m.chat_id\n    LEFT JOIN lark_identities"
-).replace(
-    "      AND o.observed_at",
-    "      AND ac.is_visible AND ac.sync_enabled AND COALESCE(c.chat_status,'normal')='normal'\n"
-    "      AND o.observed_at"
 )
 _ORDER = " ORDER BY m.message_create_time DESC,m.chat_id DESC,m.message_id DESC LIMIT %s FOR SHARE OF m,o,ac,c"
 _CHAT_SQL = core._CHAT_SQL.replace("ac.sync_status,", "ac.sync_status,ac.last_error,")
@@ -113,8 +105,7 @@ def _scope(conn, actor_id, context, creator_ids, chat_ids, settings, audience="c
 def _source_sql(cm_id, chats, start, end, speakers):
     values = [cm_id, chats, start, end]
     if speakers is None:
-        return (_BASE_SQL.replace("      AND m.sender_open_id=ANY(%s::text[])\n", "")
-                + " AND ac.sync_status<>'not_readable'", values)
+        return _BASE_SQL.replace("      AND m.sender_open_id=ANY(%s::text[])\n", ""), values
     return _BASE_SQL, [*values, speakers]
 
 

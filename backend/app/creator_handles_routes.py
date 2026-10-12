@@ -62,7 +62,8 @@ def create_router(*, current_authorization, render_template, csrf_token):
                 "authorization": auth, "broadcast_data": data, "csrf_token": csrf_token(auth),
             }))
         except PermissionError as exc:
-            return error(exc)
+            return error(exc, request=request, render_template=render_template,
+                         return_url="/creators", return_label="返回我的达人")
 
     @router.get("/broadcast/batches")
     @router.get("/broadcast/batches/{batch_id}")
@@ -198,6 +199,8 @@ def create_router(*, current_authorization, render_template, csrf_token):
                 "creator_tab": data["tab"], "creator_query": q[:120], "csrf_token": csrf_token(auth),
             }))
         except (ValueError, LookupError, PermissionError) as exc:
+            if request.url.path == "/creators":
+                return error(exc, request=request, render_template=render_template)
             return error(exc)
 
     @router.post("/people/{contact_id}/handle")
@@ -288,10 +291,11 @@ def create_router(*, current_authorization, render_template, csrf_token):
             return error(exc)
 
     @router.get("/imports/data")
-    def import_data(request: Request, cm_id: UUID, q: str = "", page: int = 1):
+    def import_data(request: Request, cm_id: UUID, q: str = "", page: int = 1, batch_id: UUID | None = None):
         try:
             auth = actor(current_authorization(request))
-            return payload(creator_imports.page_data(auth["id"], cm_id, q=q[:120], page=max(1, page)))
+            return payload(creator_imports.page_data(
+                auth["id"], cm_id, q=q[:120], page=max(1, page), batch_id=batch_id))
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
 

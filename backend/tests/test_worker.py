@@ -230,7 +230,7 @@ def test_token_refresh_records_actual_scope_without_inventing_missing_grants(pg,
         VALUES(%s,'ou_refresh_scope',%s,%s,NOW()-INTERVAL '1 hour',NOW()+INTERVAL '1 day',%s,
         NOW()-INTERVAL '30 days')""",
         (actor, cipher.encrypt("old-access"), cipher.encrypt("old-refresh"),
-         ["im:message:readonly", "im:message.send_as_user"]))
+         ["im:chat:read", "im:message:readonly", "im:message.send_as_user"]))
     consent = worker._authorization(actor)["body_consent_at"]
 
     class Client:
@@ -242,18 +242,40 @@ def test_token_refresh_records_actual_scope_without_inventing_missing_grants(pg,
             return TokenBundle(f"access-{self.calls}", f"refresh-{self.calls}", 3600, 86400, self.scope)
 
     client = Client()
-    for scope, expected in (("im:message:readonly im:message:readonly", ["im:message:readonly"]),
-                            (None, ["im:message:readonly"]),
+    for scope, expected in (("im:chat:read im:message:readonly im:message:readonly",
+                            ["im:chat:read", "im:message:readonly"]),
+                            (None, ["im:chat:read", "im:message:readonly"]),
+                            ("im:message:readonly", ["im:message:readonly"]),
                             ("im:message.send_as_user im:message.send_as_user", ["im:message.send_as_user"]),
                             ("", [])):
-        pg.execute("UPDATE authorizations SET access_token_expires_at=NOW()-INTERVAL '1 hour' WHERE id=%s", (actor,))
+        pg.execute("UPDATE authorizations SET status='active',access_token_expires_at=NOW()-INTERVAL '1 hour' "
+                   "WHERE id=%s", (actor,))
         client.scope = scope
-        assert worker._usable_access_token(actor, worker._authorization(actor), client,
-                                           SimpleNamespace(token_encryption_key=key)) == f"access-{client.calls}"
+        if scope is not None and not worker.BODY_READ_SCOPES.issubset(expected):
+            with pytest.raises(worker.ReauthorizationRequired):
+                worker._usable_access_token(actor, worker._authorization(actor), client,
+                                            SimpleNamespace(token_encryption_key=key))
+        else:
+            assert worker._usable_access_token(actor, worker._authorization(actor), client,
+                                               SimpleNamespace(token_encryption_key=key)) == f"access-{client.calls}"
         row = pg.execute("SELECT * FROM authorizations WHERE id=%s", (actor,)).fetchone()
         assert row["scopes"] == expected and row["body_consent_at"] == consent
-        assert row["status"] == "active"
+        assert row["status"] == ("active" if scope is None or worker.BODY_READ_SCOPES.issubset(expected)
+                                 else "attention_required")
         assert cipher.decrypt(row["refresh_token_ciphertext"]) == f"refresh-{client.calls}"
+
+    before = row
+    pg.execute("UPDATE authorizations SET status='active',access_token_expires_at=NOW()-INTERVAL '1 hour' "
+               "WHERE id=%s", (actor,))
+    def unavailable(_refresh):
+        raise worker.LarkApiError(503, None, "Temporary service issue")
+    client.refresh_token = unavailable
+    with pytest.raises(worker.LarkApiError):
+        worker._usable_access_token(actor, worker._authorization(actor), client,
+                                    SimpleNamespace(token_encryption_key=key))
+    row = pg.execute("SELECT * FROM authorizations WHERE id=%s", (actor,)).fetchone()
+    assert row["status"] == "active" and row["body_consent_at"] == consent
+    assert row["scopes"] == before["scopes"] and row["refresh_token_ciphertext"] == before["refresh_token_ciphertext"]
 
 
 def test_member_snapshot_follows_lark_pagination_and_keeps_member_facts() -> None:

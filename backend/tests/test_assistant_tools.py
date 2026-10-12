@@ -184,6 +184,11 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
     all_stats_args = {**all_args, "group_by": "day", "comparison": None}
     assert run("activity_stats", all_stats_args)["metrics"]["messages"] == 6
     assert run("activity_stats", args)["metrics"]["messages"] == 2
+    pg.execute("UPDATE authorization_chats SET sync_status='not_readable' WHERE authorization_id=%s AND chat_id='chat'",
+               (s.ids["cm"],))
+    assert assistant_queries.activity(pg, s.ids["cm"], context, args, s.settings)["metrics"]["messages"] == 0
+    pg.execute("UPDATE authorization_chats SET sync_status='succeeded' WHERE authorization_id=%s AND chat_id='chat'",
+               (s.ids["cm"],))
     # A completed unbounded backfill has no start; a new sync round does not erase that coverage.
     for complete, history_start, status, watermark, expected_gap in [
         (True, None, "syncing", s.end, None),

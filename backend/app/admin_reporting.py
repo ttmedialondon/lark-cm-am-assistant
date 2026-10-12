@@ -27,6 +27,7 @@ from .config import get_settings
 from .contact_taxonomy import CONTACT_ROLE_CODES, ORGANIZATION_KIND_LABELS, ROLE_LABELS, role_label
 from .crypto import TokenCipher, message_body_cipher
 from .db import connection
+from .evidence_access import BODY_READ_SCOPE_SQL
 from .identity_profiles import safe_avatar_url
 from .lark_api import private_chat_url
 from .message_mentions import mention_names
@@ -48,7 +49,7 @@ GROUP_PURPOSE_BADGES = {
     "category": "cyan", "campaign": "orange", "unknown": "secondary",
 }
 ORGANIZATION_STATUSES = frozenset({"all", "verified", "candidate", "unresolved"})
-MESSAGE_CONVERSATION_DIRECTORY_SQL = """
+MESSAGE_CONVERSATION_DIRECTORY_SQL = f"""
     SELECT
         ac.authorization_id,
         ac.chat_id,
@@ -58,6 +59,7 @@ MESSAGE_CONVERSATION_DIRECTORY_SQL = """
         counterpart.display_name AS counterpart_display_name,
         ac.member_count,
         ac.member_count_status,
+        ac.sync_generation,
         a.body_consent_at
     FROM authorizations a
     JOIN authorization_chats ac ON ac.authorization_id = a.id
@@ -65,7 +67,9 @@ MESSAGE_CONVERSATION_DIRECTORY_SQL = """
     LEFT JOIN lark_identities counterpart ON counterpart.open_id = ac.p2p_counterpart_open_id
     WHERE a.id = %s
       AND a.status = 'active' AND a.body_consent_at IS NOT NULL
+      AND {BODY_READ_SCOPE_SQL}
       AND ac.is_visible AND ac.sync_enabled
+      AND ac.sync_status IS DISTINCT FROM 'not_readable'
       AND COALESCE(c.chat_status, 'normal') = 'normal'
 """
 MESSAGE_CONVERSATION_FILTER_SQL = """
@@ -220,6 +224,7 @@ def overview() -> dict[str, Any]:
                 a.display_name,
                 a.status AS authorization_status,
                 a.body_consent_at,
+                a.scopes,
                 a.p2p_discovery_status,
                 COALESCE(g.group_count, 0) AS group_count,
                 COALESCE(g.p2p_count, 0) AS p2p_count,
@@ -372,7 +377,7 @@ def message_users(page: int = 1, *, source_id: UUID | None = None,
     """Source picker metadata only: never aggregate the message ledger."""
     with connection() as conn:
         rows = conn.execute(
-            """SELECT id, display_name, status AS authorization_status, body_consent_at
+            """SELECT id, display_name, status AS authorization_status, body_consent_at, scopes
                FROM authorizations WHERE (%s::uuid IS NULL OR id=%s)
                AND (%s::uuid[] IS NULL OR id=ANY(%s::uuid[]))
                ORDER BY authorized_at DESC""", (source_id, source_id, source_ids, source_ids),
@@ -450,6 +455,7 @@ def users(page: int = 1, query: str = "", permission_filter: str = "all") -> dic
                 a.authorized_at,
                 a.updated_at,
                 a.body_consent_at,
+                a.scopes,
                 a.p2p_discovery_status,
                 r.role AS admin_role,
                 COALESCE(g.group_count, 0) AS group_count,
@@ -532,6 +538,7 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
                 a.authorized_at,
                 a.updated_at,
                 a.body_consent_at,
+                a.scopes,
                 a.p2p_discovery_status,
                 r.role AS admin_role,
                 COALESCE(g.group_count, 0) AS group_count,
@@ -1240,7 +1247,7 @@ def message_page(
     filters = (authorization_id, chat_id)
     with connection() as conn:
         metrics = conn.execute(
-            """
+            f"""
             WITH visible_messages AS (
                 SELECT m.*, o.sent_by_author, c.name, COALESCE(c.chat_mode, 'group') AS chat_mode
                 FROM authorizations a
@@ -1251,9 +1258,11 @@ def message_page(
                 JOIN chat_messages m ON m.chat_id = o.chat_id AND m.message_id = o.message_id
                 WHERE a.id = %s
                   AND a.status = 'active'
+                  AND {BODY_READ_SCOPE_SQL}
                   AND a.body_consent_at IS NOT NULL
                   AND o.observed_at >= a.body_consent_at
                   AND ac.is_visible AND ac.sync_enabled
+                  AND ac.sync_status IS DISTINCT FROM 'not_readable'
                   AND COALESCE(c.chat_status, 'normal') = 'normal'
                   AND NOT m.is_deleted
                   AND m.chat_id = %s
@@ -1270,7 +1279,7 @@ def message_page(
         total_count = int(metrics["content_count"] or 0)
         page, limit, offset = _page_window(page, MESSAGE_PAGE_SIZE, total_count=total_count)
         rows = conn.execute(
-            """
+            f"""
             WITH visible_messages AS (
                 SELECT
                     m.*, o.sent_by_author, c.name, COALESCE(c.chat_mode, 'group') AS chat_mode,
@@ -1284,9 +1293,11 @@ def message_page(
                 LEFT JOIN lark_identities identity ON identity.open_id = m.sender_open_id
                 WHERE a.id = %s
                   AND a.status = 'active'
+                  AND {BODY_READ_SCOPE_SQL}
                   AND a.body_consent_at IS NOT NULL
                   AND o.observed_at >= a.body_consent_at
                   AND ac.is_visible AND ac.sync_enabled
+                  AND ac.sync_status IS DISTINCT FROM 'not_readable'
                   AND COALESCE(c.chat_status, 'normal') = 'normal'
                   AND NOT m.is_deleted
                   AND m.chat_id = %s

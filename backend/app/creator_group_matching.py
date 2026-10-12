@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from psycopg.errors import LockNotAvailable
 
-from . import ai_dispatch, ai_feature_config, creator_data
+from . import admin_permissions, ai_dispatch, ai_feature_config, creator_data
 from . import creator_group_evidence as evidence
 from . import openai_client as api
 from .creator_access import require_owner
@@ -552,7 +552,7 @@ def _diagnostics(job, result, config, *, pack=None):
 
 
 def page_data(conn, actor, settings, page=1):
-    require_owner(conn, actor)
+    access = admin_permissions.require_page(conn, actor, "ai")
     config = _config(conn)
     latest = ("WITH latest AS (SELECT DISTINCT ON(chat_id) * FROM creator_group_jobs "
               "ORDER BY chat_id,created_at DESC,id DESC) ")
@@ -606,7 +606,7 @@ def page_data(conn, actor, settings, page=1):
     threshold = config["auto_confirm_threshold"]
     return {"jobs": rows, "counts": counts, "summary_counts": summary_counts, "page": page, "has_more": more,
             "enabled": _enabled(config), "purposes": PURPOSES, "prompt_version": evidence.PROMPT_VERSION,
-            "threshold": float(threshold), "threshold_label": f"{threshold:.0%}"}
+            "threshold": float(threshold), "threshold_label": f"{threshold:.0%}", "admin_access": access}
 
 
 def task_evidence(conn, actor, settings, job_id):

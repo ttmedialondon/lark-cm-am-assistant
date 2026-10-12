@@ -14,6 +14,7 @@ from . import openai_client as api
 from .config import get_settings
 from .crypto import TokenCipher, message_body_cipher, message_body_fingerprint
 from .db import connection
+from .evidence_access import BODY_READ_SCOPE_SQL
 from .message_mentions import mention_names, mention_targets
 
 FEATURE = "creator_importance"
@@ -51,7 +52,7 @@ def _config_hash(config):
 
 
 # The same predicate protects SQL ordering and decrypted detail reads. It never reads another CM's observation.
-_VALID_SOURCE = """EXISTS(SELECT 1 FROM chat_messages m
+_VALID_SOURCE = f"""EXISTS(SELECT 1 FROM chat_messages m
     JOIN authorization_message_observations o USING(chat_id,message_id)
     JOIN authorization_chats ac ON ac.authorization_id=o.authorization_id AND ac.chat_id=m.chat_id
     JOIN authorizations a ON a.id=o.authorization_id JOIN chats ch ON ch.chat_id=m.chat_id
@@ -59,7 +60,9 @@ _VALID_SOURCE = """EXISTS(SELECT 1 FROM chat_messages m
     WHERE o.authorization_id=p.responsible_authorization_id
       AND m.chat_id=s->>'chat_id' AND m.message_id=s->>'message_id'
       AND a.status='active' AND a.body_consent_at=(s->>'consent_at')::timestamptz
+      AND {BODY_READ_SCOPE_SQL}
       AND o.observed_at>=a.body_consent_at AND ac.is_visible AND ac.sync_enabled
+      AND ac.sync_status IS DISTINCT FROM 'not_readable'
       AND COALESCE(ch.chat_status,'normal')='normal' AND NOT m.is_deleted AND m.body_ciphertext IS NOT NULL
       AND m.body_fingerprint=s->>'body_fingerprint' AND m.sender_open_id=s->>'sender_open_id'
       AND m.sender_type='user'
@@ -90,7 +93,7 @@ def roster_sql(cm_id):
         v.valid AND COALESCE((p.coverage->'priority'->>'historical')::boolean,FALSE) has_history,
         p.manual_tier,p.manual_reason_ciphertext
         FROM creator_importance_profiles p
-        CROSS JOIN LATERAL(SELECT (""" + _PROFILE_VALID + """) valid) v
+        CROSS JOIN LATERAL(SELECT (""" + _PROFILE_VALID + f""") valid) v
         CROSS JOIN LATERAL(SELECT
           (p.coverage->'priority'->>'primary_at')::timestamptz primary_at) times
         CROSS JOIN LATERAL(SELECT count(DISTINCT day) business_days
@@ -107,8 +110,10 @@ def roster_sql(cm_id):
                 JOIN authorizations a ON a.id=o.authorization_id JOIN chats ch ON ch.chat_id=o.chat_id
                 WHERE o.chat_id=m.chat_id AND o.message_id=m.message_id
                   AND o.authorization_id=p.responsible_authorization_id AND a.status='active'
+                  AND {BODY_READ_SCOPE_SQL}
                   AND a.body_consent_at IS NOT NULL AND o.observed_at>=a.body_consent_at
                   AND ac.is_visible AND ac.sync_enabled AND COALESCE(ch.chat_status,'normal')='normal'
+                  AND ac.sync_status IS DISTINCT FROM 'not_readable'
                 -- Keep the indexed sender/time lookup ahead of the authorization check, not a scan of every chat.
                 OFFSET 0)
               ORDER BY m.message_create_time DESC LIMIT 1) latest
@@ -127,7 +132,9 @@ def roster_sql(cm_id):
               ORDER BY m.message_create_time DESC LIMIT 1) latest
             WHERE target.contact_id=p.contact_id AND target.identity_type='user'
               AND a.id=p.responsible_authorization_id AND a.status='active' AND a.body_consent_at IS NOT NULL
+              AND {BODY_READ_SCOPE_SQL}
               AND ac.is_visible AND ac.sync_enabled AND COALESCE(ch.chat_status,'normal')='normal'
+              AND ac.sync_status IS DISTINCT FROM 'not_readable'
             ORDER BY latest.message_create_time DESC LIMIT 1)
           ) activity) activity ON v.valid
         CROSS JOIN LATERAL(SELECT times.*,
@@ -318,12 +325,14 @@ def configuration_changed(conn):
                 AND (j.status NOT IN ('failed','cancelled') OR j.reason_code='request_unknown'))""")
 
 
-_READABLE = """FROM chat_messages m JOIN authorization_message_observations o USING(chat_id,message_id)
+_READABLE = f"""FROM chat_messages m JOIN authorization_message_observations o USING(chat_id,message_id)
     JOIN authorization_chats ac ON ac.authorization_id=o.authorization_id AND ac.chat_id=m.chat_id
     JOIN authorizations a ON a.id=o.authorization_id JOIN chats ch ON ch.chat_id=m.chat_id
     LEFT JOIN lark_identities i ON i.open_id=m.sender_open_id
     WHERE o.authorization_id=%s AND a.status='active' AND a.body_consent_at IS NOT NULL
+      AND {BODY_READ_SCOPE_SQL}
       AND o.observed_at>=a.body_consent_at AND ac.is_visible AND ac.sync_enabled
+      AND ac.sync_status IS DISTINCT FROM 'not_readable'
       AND COALESCE(ch.chat_status,'normal')='normal' AND NOT m.is_deleted
       AND m.sender_type='user'
       AND (i.contact_id=%s AND i.identity_type='user' OR m.sender_open_id=a.open_id)

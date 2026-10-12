@@ -70,6 +70,8 @@ def pg(monkeypatch):
         for path in sorted((Path(__file__).parents[1] / "migrations").glob("*.sql")):
             if int(path.name[:3]) > 33:
                 conn.execute(path.read_text())
+        conn.execute("ALTER TABLE authorizations ALTER scopes SET DEFAULT "
+                     "ARRAY['im:chat:read','im:message:readonly']::text[]")
         monkeypatch.setattr(worker, "connection", lambda: nullcontext(conn))
         try:
             yield conn

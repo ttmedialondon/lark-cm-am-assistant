@@ -45,8 +45,13 @@ def json_response(value, status_code=200):
     return secure_response(JSONResponse(jsonable_encoder(value), status_code=status_code))
 
 
-def error_response(exc):
+def error_response(exc, *, request=None, render_template=None, return_url="/dashboard", return_label="返回工作台"):
     code = 403 if isinstance(exc, PermissionError) else 404 if isinstance(exc, LookupError) else 400
+    if render_template is not None:
+        title = {403: "无法访问", 404: "未找到内容", 400: "操作未完成"}[code]
+        return secure_response(render_template(request, "error.html", {
+            "title": title, "detail": str(exc), "return_url": return_url, "return_label": return_label,
+        }, code))
     return json_response({"error": str(exc)}, code)
 
 

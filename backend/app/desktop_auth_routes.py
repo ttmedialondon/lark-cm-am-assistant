@@ -24,6 +24,7 @@ from .http_helpers import csrf_matches, form_body
 
 MAX_BODY_BYTES = 4096
 _PKCE = re.compile(r"[A-Za-z0-9_-]{43}")
+_VERIFIER = re.compile(r"[A-Za-z0-9._~-]{43,128}")
 _STATE = re.compile(r"[A-Za-z0-9_-]{32,128}")
 _REDIRECT = re.compile(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})/callback")
 
@@ -153,7 +154,8 @@ def _consume(conn, row):
 def _exchange(value):
     if not isinstance(value, dict) or set(value) != {"code", "code_verifier", "redirect_uri"}:
         raise invalid()
-    if any(not isinstance(value[key], str) or not _PKCE.fullmatch(value[key]) for key in ("code", "code_verifier")):
+    if (not isinstance(value["code"], str) or not _PKCE.fullmatch(value["code"])
+            or not isinstance(value["code_verifier"], str) or not _VERIFIER.fullmatch(value["code_verifier"])):
         raise invalid()
     redirect = _redirect(value["redirect_uri"])
     challenge = _challenge(value["code_verifier"])
@@ -180,7 +182,7 @@ def _poll_lock(conn, challenge):
 def _poll(value):
     if (not isinstance(value, dict) or set(value) != {"code_verifier", "redirect_uri"}
             or value["redirect_uri"] != "desktop_poll" or not isinstance(value["code_verifier"], str)
-            or not _PKCE.fullmatch(value["code_verifier"])):
+            or not _VERIFIER.fullmatch(value["code_verifier"])):
         raise invalid()
     challenge = _challenge(value["code_verifier"])
     with connection() as conn, conn.transaction():

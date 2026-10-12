@@ -27,7 +27,7 @@
       {% if evidence.result %}<div class="card mb-3"><div class="card-body">{{ purpose_badge(evidence.result.purpose, evidence.result.purpose_label) }} · {{ evidence.result.confidence_label }}{% if evidence.result.tags %}<div class="text-secondary small">{{ evidence.result.tags|join(' · ') }}</div>{% endif %}</div></div>{% endif %}
       {% for message in evidence.pack.messages %}<div class="card mb-2" id="evidence-{{ message.id }}"><div class="card-body"><div class="d-flex flex-wrap gap-2 text-secondary small mb-2"><span>{{ message.id }}</span><span>{{ message.speaker }}</span><span>{{ message.at or '时间未记录' }}</span>{% if message.reply %}<span>回复 {{ message.reply }}</span>{% endif %}</div><div style="white-space:pre-wrap;overflow-wrap:anywhere">{{ message.text }}</div></div></div>{% else %}<div class="text-secondary">没有可读消息；本次材料仅包括群名称与结构。</div>{% endfor %}
     {% else %}
-      <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-3"><div><h2 class="mb-1">达人群分类</h2><div class="text-secondary small">高置信度自动入库，其余待核实。</div></div><div class="d-flex gap-2"><a class="btn" href="{{ base }}?page={{ matching.page }}">刷新</a><form method="post" action="{{ base }}/enqueue"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary" type="submit" {% if not matching.enabled %}disabled{% endif %}>匹配待处理群</button></form></div></div>
+      <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-3"><div><h2 class="mb-1">达人群分类</h2><div class="text-secondary small">高置信度自动入库，其余待核实。</div></div><div class="d-flex gap-2"><a class="btn" href="{{ base }}?page={{ matching.page }}">刷新</a>{% if admin_role == 'owner' %}<form method="post" action="{{ base }}/enqueue"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary" type="submit" {% if not matching.enabled %}disabled{% endif %}>匹配待处理群</button></form>{% endif %}</div></div>
       {% set summary = matching.summary_counts|default({}) %}
       <div class="d-flex flex-wrap gap-3 mb-3 text-secondary small">{% for state,label in {'classified':'已分类','pending':'处理中','review':'待核实','error':'异常'}.items() %}<span>{{ label }} {{ summary.get(state,0) }}</span>{% endfor %}</div>
       <div class="card table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>群名</th><th>类型</th><th>置信度</th><th>状态</th><th>操作</th></tr></thead><tbody>
@@ -40,6 +40,7 @@
           <td>{{ confidence }}</td>
           <td><span class="badge bg-{{ {'classified':'green','pending':'blue','review':'yellow','error':'red'}.get(state,'secondary') }}-lt">{{ job.display_status|default({'classified':'已分类','pending':'处理中','review':'待核实','error':'异常'}.get(state,'待处理')) }}</span>{% if state in ['review','error'] and job.admission_reason_label %}<div class="text-secondary small mt-1">{{ job.admission_reason_label }}</div>{% endif %}</td>
           <td>
+            {% if admin_role == 'owner' %}
             {% if state == 'review' and result and result.purpose != 'unknown' %}<form method="post" action="{{ base }}/chats/{{ job.chat_id|urlencode }}/classification" class="mb-2"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="page" value="{{ matching.page }}"><input type="hidden" name="source_job_id" value="{{ job.id }}"><input type="hidden" name="purpose" value="{{ result.purpose }}"><input type="hidden" name="tags" value="{{ result.tags|join(', ') }}"><button class="btn btn-sm btn-outline-primary" type="submit">采用建议</button></form>{% endif %}
             <details><summary class="text-secondary">调整</summary><div class="mt-3">
               {{ admission(job.admission_reason_label, job.admission_details) }}
@@ -55,6 +56,7 @@
                 {% if job.status in ['queued','preparing','ready','running','retry_wait','waiting_evidence'] %}<form method="post" action="{{ base }}/jobs/{{ job.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="page" value="{{ matching.page }}"><button class="btn btn-sm" type="submit">取消任务</button></form>{% endif %}
               </div>
             </div></details>
+            {% endif %}
           </td>
         </tr>
       {% else %}<tr><td colspan="5" class="text-secondary text-center py-4">暂无待处理群。</td></tr>{% endfor %}

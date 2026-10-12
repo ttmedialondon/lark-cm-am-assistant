@@ -8,7 +8,7 @@ from copy import deepcopy
 from decimal import Decimal
 from uuid import uuid4
 
-from . import ai_dispatch, ai_feature_config, creator_data
+from . import admin_permissions, ai_dispatch, ai_feature_config, creator_data
 from . import creator_responsibility_evidence as evidence
 from . import openai_client as api
 from .creator_access import require_owner
@@ -644,9 +644,8 @@ def _results(conn, view, existing=()):
 
 
 def page_data(conn, actor, settings, page=1):
-    require_owner(conn, actor)
+    access = admin_permissions.require_page(conn, actor, "ai")
     config = _config(conn)
-    _recover(conn)
     latest = (
         "WITH latest AS (SELECT DISTINCT ON(contact_id) * FROM creator_responsibility_jobs "
         "ORDER BY contact_id,created_at DESC,id DESC) "
@@ -684,6 +683,9 @@ def page_data(conn, actor, settings, page=1):
                 job["results"] = _results(
                     conn, json.loads(creator_data.cipher(settings).decrypt(ciphertext)), job["existing_assignments"]
                 )
+                for result in job["results"]:
+                    for field in ("reason", "scope_note", "association_reason"):
+                        result.pop(field, None)
             else:
                 job.update(reason="规则或材料已更新，请重新分析", stale=True)
     if any(job["results"] for job in jobs):
@@ -698,6 +700,7 @@ def page_data(conn, actor, settings, page=1):
         "page": page,
         "has_more": has_more,
         "prompt_version": evidence.PROMPT_VERSION,
+        "admin_access": access,
     }
 
 

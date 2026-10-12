@@ -899,7 +899,7 @@ def test_post_response_sql_failure_keeps_usage_and_never_redispatches_unknown_or
     assert len(flow.calls) == 2
 
 
-def test_owner_only_routes_csrf_lazy_evidence_and_safe_audit(pg, pilot, responsibility_flow, monkeypatch):
+def test_ai_readonly_routes_csrf_lazy_evidence_and_safe_audit(pg, pilot, responsibility_flow, monkeypatch):
     """Rendering suggestions cannot read bodies; explicit evidence reads remain audited and escaped."""
     flow = responsibility_flow
     owner = pilot.ids["owner"]
@@ -914,7 +914,8 @@ def test_owner_only_routes_csrf_lazy_evidence_and_safe_audit(pg, pilot, responsi
         routes.create_router(
             current_authorization=lambda _: session["auth"],
             csrf_token=lambda _: "csrf",
-            render_template=lambda request, name, context: HTMLResponse(env.get_template(name).render(**context)),
+            render_template=lambda request, name, context, status_code=200: HTMLResponse(
+                env.get_template(name).render(**context), status_code=status_code),
         )
     )
     client = TestClient(app)
@@ -937,6 +938,13 @@ def test_owner_only_routes_csrf_lazy_evidence_and_safe_audit(pg, pilot, responsi
     assert matching.prepare_next(flow.settings)
     job = matching.claim()
     matching.run(job, flow.settings)
+    row = pg.execute("SELECT result_ciphertext FROM creator_responsibility_jobs WHERE id=%s",
+                     (job["id"],)).fetchone()
+    storage = creator_data.cipher(flow.settings)
+    result = json.loads(storage.decrypt(row["result_ciphertext"]))
+    result["result"]["suggestions"][0].update(reason="PRIVATE TEST BODY", scope_note="PRIVATE TEST BODY")
+    pg.execute("UPDATE creator_responsibility_jobs SET result_ciphertext=%s WHERE id=%s",
+               (storage.encrypt(json.dumps(result)), job["id"]))
     before = _snapshot(pg, ("contact_assignments", "creator_account_assignments"))
     response = client.get(path)
     assert response.status_code == 200 and response.headers["cache-control"] == "no-store, max-age=0"
@@ -982,6 +990,19 @@ def test_owner_only_routes_csrf_lazy_evidence_and_safe_audit(pg, pilot, responsi
     assert client.get(path).status_code == 403
     assert client.get(read_path).status_code == 403
     assert client.post(path + "/enqueue", data={"csrf_token": "csrf"}).status_code == 403
+    pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission,granted_by) VALUES(%s,'ai',%s)",
+               (pilot.ids["cm"], owner))
+    pg.execute("UPDATE creator_responsibility_jobs SET status='running',lease_until=NOW()-INTERVAL '1 second' "
+               "WHERE id=%s", (job["id"],))
+    jobs_before = _snapshot(pg, ("creator_responsibility_jobs", "creator_responsibility_requests"))
+    readonly = client.get(path)
+    assert readonly.status_code == 200 and "99%" in readonly.text and "PRIVATE TEST BODY" not in readonly.text
+    assert '<form method="post"' not in readonly.text and "/evidence" not in readonly.text
+    assert _snapshot(pg, jobs_before.keys()) == jobs_before
+    assert client.get(read_path).status_code == 403
+    assert client.post(path + f"/jobs/{job['id']}/recheck", data={"csrf_token": "csrf"}).status_code == 403
+    pg.execute("DELETE FROM admin_page_permissions WHERE authorization_id=%s", (pilot.ids["cm"],))
+    assert client.get(path).status_code == 403
     session["auth"] = {"id": owner, "status": "active"}
     pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (owner,))
     assert client.get(path).status_code == 403

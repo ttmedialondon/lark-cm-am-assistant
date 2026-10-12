@@ -7,7 +7,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import offhours_summary, summary_periods, summary_replies
 from .db import connection
-from .http_helpers import conditional_response, secure_response
+from .http_helpers import conditional_response, error_response, secure_response
 from .http_helpers import csrf_matches as _csrf_matches
 
 
@@ -70,7 +70,7 @@ def create_router(*, current_authorization, render_template, csrf_token=lambda a
                 )
             )
         except (PermissionError, offhours_summary.SummaryInputError) as exc:
-            return denied(exc)
+            return secure(error_response(PermissionError(str(exc)), request=request, render_template=render_template))
 
     @router.get("/data")
     def data(request: Request):

@@ -34,8 +34,9 @@ sudo bash -euo pipefail -c '
   backup_path="/var/backups/lark-message-stats/pre-release-$(date -u +%Y%m%dT%H%M%SZ).dump"
   sudo -u postgres pg_dump --format=custom --dbname=lark_message_stats > "$backup_path"
   test -s "$backup_path"
-  pg_restore --list "$backup_path" >/dev/null
+  pg_restore --file=/dev/null "$backup_path"
   sha256sum "$backup_path" > "$backup_path.sha256"
+  sha256sum --check "$backup_path.sha256"
   chmod 0600 "$backup_path" "$backup_path.sha256"
   echo "Verified backup: $backup_path"
 '

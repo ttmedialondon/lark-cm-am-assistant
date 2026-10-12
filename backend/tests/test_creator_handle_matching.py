@@ -44,7 +44,7 @@ def matching_flow(pg, pilot, monkeypatch):
     monkeypatch.setattr(matching, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(config, "get_settings", lambda: state.settings)
     monkeypatch.setattr(matching, "catalog", lambda: (state.catalog_handles, "catalog-v1"))
-    monkeypatch.setattr(matching.evidence, "still_valid", lambda *_: state.valid)
+    monkeypatch.setattr(matching.evidence, "still_valid", lambda *_, **__: state.valid)
 
     def prepare(_conn, _settings, contact, _catalog, *, recheck=False):
         pairs = contact_handles.confirmed_pairs(_conn, [contact])

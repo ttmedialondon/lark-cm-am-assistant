@@ -26,7 +26,7 @@ PAGES = (
     },
     {
         "key": "creator-manage", "label": "达人完整管理", "path": "/creators",
-        "description": "管理所有 CM 的达人：候选审批、证据链、导入及扫描操作",
+        "description": "管理各 CM 的达人名单、导入及待核对记录",
     },
 )
 PAGE_KEYS = frozenset(page["key"] for page in PAGES)
@@ -89,6 +89,22 @@ def access_for(authorization_id: UUID) -> dict[str, Any]:
 
 def permission_keys_for(authorization_id: UUID) -> frozenset[str]:
     return access_for(authorization_id)["permissions"]
+
+
+def require_page(conn, authorization_id: UUID, permission: str) -> dict[str, Any]:
+    """Check a current page grant on the caller's connection without opening another one."""
+    row = conn.execute(
+        """SELECT a.status,r.role,r.is_active AS role_active,
+                  (SELECT array_agg(source_authorization_id ORDER BY source_authorization_id)
+                   FROM admin_message_source_limits WHERE authorization_id=a.id) AS message_source_ids,
+                  ARRAY(SELECT permission FROM admin_page_permissions WHERE authorization_id=a.id) AS permissions
+           FROM authorizations a LEFT JOIN admin_roles r ON r.authorization_id=a.id WHERE a.id=%s""",
+        (authorization_id,),
+    ).fetchone()
+    access = _access(row)
+    if permission not in access["permissions"]:
+        raise PermissionError("您尚未获准查看此后台页面。")
+    return access
 
 
 def set_permissions(actor_id: UUID, target_id: UUID, keys: Iterable[str]) -> None:
