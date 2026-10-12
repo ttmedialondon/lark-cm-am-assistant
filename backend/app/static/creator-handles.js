@@ -106,6 +106,15 @@
     const saved = node("div", "", "mb-2"); handleCell.append(saved);
     const actions = node("td");
     const parts = {row, name, lark, avatar, initial, saved, actions, importanceBadge, manualDirty: false, handleDirty: false};
+    if (document.getElementById("operations-assistant")) {
+      parts.ask = node("button", "问助手", "btn btn-sm btn-outline-secondary mb-2"); parts.ask.type = "button";
+      parts.ask.addEventListener("click", () => document.dispatchEvent(new CustomEvent("ttmedia:assistant", {detail: {
+        message: "查看这位达人的账号、负责人和维护情况", context: {
+          cm_id: selectedCM() || app.dataset.actor, creator_ids: [item.contact_id], creator_name: item.display_name,
+        },
+      }})));
+      actions.append(parts.ask);
+    }
     if (data.can_adjust_importance) {
       const editor = node("details", "", "creator-inline-editor creator-importance-editor"); editor.append(node("summary", "调整重要度"));
       const form = node("form", "", "mt-2"), manualTier = node("select", "", "form-select form-select-sm"), manualReason = node("input", "", "form-control form-control-sm mt-2");
@@ -180,6 +189,10 @@
       const key = rowKey(item);
       if (!rows.has(key)) rows.set(key, makeRow(item));
       const parts = rows.get(key);
+      if (parts.ask) {
+        parts.ask.hidden = tab !== "mine" || item.kind !== "confirmed" || !uuid.test(item.contact_id || "");
+        parts.ask.disabled = busy || reading;
+      }
       if (el("rows").children[index] !== parts.row) el("rows").insertBefore(parts.row, el("rows").children[index] || null);
       if (parts.selection) {
         parts.selectionId = selectableContact(item);
@@ -429,6 +442,9 @@
       el("cm").value = data.selected_cm_id;
     }
     el("cm").addEventListener("change", () => {
+      document.dispatchEvent(new CustomEvent("ttmedia:assistant", {detail: {
+        context: {cm_id: selectedCM(), cm_name: selectedCMName()},
+      }}));
       selectedContacts.clear();
       tab = "mine";
       data = {...data, tab, items: [], import_batches: [], page: 1, total_count: 0, total_pages: 0};

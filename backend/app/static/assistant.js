@@ -11,11 +11,12 @@
   const labels = {queued: "正在等待处理", running: "正在整理", waiting: "等待分析完成",
     completed: "已完成", cancelled: "已停止", failed: "这次未能完成", unknown: "请求结果尚未确认，请勿重复提交"};
   let saved = {}, active = null, source = null, submitting = false, restoring = false, denied = false;
-  let pending = null, restoreTimer = null, revision = 0;
+  let pending = null, pendingScopeVersion = null, restoreTimer = null, revision = 0, sourceVersion = 0, sourceFocus = null, followBottom = true;
   try { saved = JSON.parse(localStorage.getItem(storageKey) || "{}"); } catch { /* IDs can remain in memory. */ }
   if (!saved || typeof saved !== "object" || !uuid.test(saved.session_id || "")) saved = {};
   if (saved.client_request_id && !uuid.test(saved.client_request_id)) delete saved.client_request_id;
   const pageContext = JSON.parse($("oa-page-context").textContent);
+  let activeContext = {...pageContext}, contextChosen = false, scopeVersion = 0, currentScopeTurn = null;
   $("oa-page-context").textContent = "";
 
   function node(tag, className, text) {
@@ -42,11 +43,13 @@
     $("oa-new").disabled = busy;
     input.disabled = denied || submitting;
     $("oa-composer-note").textContent = active ? "可以继续输入，完成后发送" : "Enter 发送 · Shift + Enter 换行";
-    for (const button of app.querySelectorAll("[data-prompt], .oa-followup button")) button.disabled = denied || busy;
+    for (const button of app.querySelectorAll("[data-prompt], [data-ask]")) button.disabled = denied || busy || Boolean(saved.client_request_id);
     $("oa-form").setAttribute("aria-busy", String(busy));
   }
   function clearProtected() {
     denied = true; revision++; source?.close(); source = null; active = null; pending = null;
+    activeContext = {}; scopeVersion++; currentScopeTurn = null;
+    closeSources(false);
     delete saved.client_request_id; persist();
     history.replaceChildren(node("p", "oa-answer", "登录或查看权限已变化，请重新登录后打开助手。"));
     $("oa-scope").replaceChildren(); $("oa-scope").hidden = true;
@@ -73,16 +76,47 @@
     return new Intl.DateTimeFormat("zh-CN", {timeZone: "Europe/London", month: "2-digit", day: "2-digit",
       hour: "2-digit", minute: "2-digit", hourCycle: "h23"}).format(new Date(value));
   }
+  function selectContext(value, explicit = true) {
+    if (!value || !Object.keys(value).length) return;
+    if (explicit) scopeVersion++;
+    if (["cm_id", "creator_ids", "chat_ids", "event_ref"].some(key => Object.hasOwn(value, key))) {
+      const cmId = value.cm_id || activeContext.cm_id;
+      activeContext = {cm_id: cmId, cm_name: cmId === activeContext.cm_id ? activeContext.cm_name : undefined};
+    }
+    for (const key of ["cm_id", "cm_name", "creator_ids", "creator_name", "creator_names", "chat_ids", "chat_names", "event_ref", "event_title"]) {
+      if (Object.hasOwn(value, key)) activeContext[key] = value[key];
+    }
+    contextChosen = true;
+  }
+  function adoptTurnScope(view) {
+    const value = view.result?.scope || view.scope;
+    if (view.status !== "completed" || !value || currentScopeTurn?.id !== view.id ||
+        currentScopeTurn.version !== scopeVersion || (value.cm_id && activeContext.cm_id && value.cm_id !== activeContext.cm_id)) return;
+    selectContext(value, false); scope(value);
+  }
   function scope(value) {
     if (!value || typeof value !== "object") return;
-    const values = [value.cm_name || value.responsible?.name,
-      value.start && value.end ? `${date(value.start)} – ${date(value.end)} · 英国时间` : null,
-      ...(Array.isArray(value.creator_names) ? value.creator_names : [])].filter(Boolean);
-    if (!values.length && value.label) values.push(value.label);
-    $("oa-scope").replaceChildren(...values.map(text => node("span", "oa-chip", text)));
-    $("oa-scope").hidden = !values.length;
+    const matching = (!value.cm_id || !activeContext.cm_id || value.cm_id === activeContext.cm_id) &&
+      ["creator_ids", "chat_ids"].every(key => !Object.hasOwn(value, key) ||
+        JSON.stringify([...(value[key] || [])].sort()) === JSON.stringify([...(activeContext[key] || [])].sort())) &&
+      ((value.event_ref || null) === (activeContext.event_ref || null) ||
+        (activeContext.event_ref && value.event_ref?.startsWith(`${activeContext.event_ref}:`)));
+    if (matching) {
+      if (!activeContext.cm_id && value.cm_id) activeContext.cm_id = value.cm_id;
+      if (activeContext.event_ref && value.event_ref) activeContext.event_ref = value.event_ref;
+      for (const key of ["cm_name", "creator_names", "chat_names"]) if (value[key]) activeContext[key] = value[key];
+    }
+    const current = [...new Set([activeContext.cm_name, activeContext.creator_name, ...(activeContext.creator_names || []),
+      ...(activeContext.chat_names || []), activeContext.event_title || (activeContext.event_ref ? "当前事项" : null), activeContext.page_label].filter(Boolean))];
+    const values = matching && value.start && value.end ? [`${date(value.start)} – ${date(value.end)} · 英国时间`] : [];
+    if (matching && !values.length && value.label) values.push(value.label);
+    $("oa-scope").replaceChildren(...current.map(text => node("span", "oa-chip oa-chip--page", text)),
+      ...[...new Set(values)].filter(text => !current.includes(text)).map(text => node("span", "oa-chip", text)));
+    $("oa-scope").hidden = !current.length && !values.length;
   }
-  function scrollToBottom() { history.scrollTop = history.scrollHeight; }
+  function atBottom() { return panel.hidden ? followBottom : history.scrollHeight - history.scrollTop - history.clientHeight < 64; }
+  function scrollToBottom() { followBottom = true; history.scrollTop = history.scrollHeight; $("oa-new-result").hidden = true; }
+  function updatedScroll(follow) { followBottom = follow; if (follow) scrollToBottom(); else $("oa-new-result").hidden = false; }
   function userMessage(requestId, text) {
     $("oa-welcome")?.remove();
     let message = [...history.children].find(child => child.dataset.requestId === requestId);
@@ -95,42 +129,61 @@
     if (!Array.isArray(values) || !values.length) return null;
     const details = node("details", "oa-gaps");
     details.append(node("summary", "", `部分资料尚不完整 · ${values.length} 项`));
-    for (const gap of values) details.append(node("div", "", typeof gap === "string" ? gap : gap.message || gap.reason || "资料暂不可读取"));
+    for (const gap of values) details.append(node("div", "", typeof gap === "string" ? gap :
+      [gap.name, gap.message || gap.reason || "资料暂不可读取"].filter(Boolean).join("：")));
     return details;
   }
-  function evidenceCard(reference) {
-    const details = node("details", "oa-evidence"), content = node("div");
-    details.append(node("summary", "", "查看原文"), content);
-    let reading = false;
-    details.addEventListener("toggle", async () => {
-      if (!details.open || reading || denied) return;
-      reading = true; content.replaceChildren(node("p", "oa-coverage", "正在读取原文…"));
+  function sourceLayout() {
+    const overlay = !$("oa-sources").hidden && !(panel.classList.contains("is-fullscreen") && matchMedia("(min-width: 861px)").matches);
+    $("oa-chat").inert = overlay;
+    if (overlay) $("oa-chat").setAttribute("aria-hidden", "true");
+    else $("oa-chat").removeAttribute("aria-hidden");
+  }
+  function closeSources(focus = true) {
+    sourceVersion++; $("oa-sources").hidden = true; panel.classList.remove("has-sources");
+    $("oa-sources-body").replaceChildren(); sourceLayout();
+    if (focus && sourceFocus?.isConnected) sourceFocus.focus();
+    sourceFocus = null;
+  }
+  function evidenceCard(reference, title = "消息原文", count = null) {
+    const button = node("button", "oa-evidence", Number.isFinite(count) ? `查看原文 · ${count} 条` : "查看原文");
+    button.type = "button"; button.setAttribute("aria-controls", "oa-sources");
+    button.addEventListener("click", async () => {
+      if (denied) return;
+      const version = ++sourceVersion, content = $("oa-sources-body");
+      sourceFocus = button; $("oa-sources").hidden = false; panel.classList.add("has-sources");
+      $("oa-source-title").textContent = title; $("oa-sources-close").focus(); sourceLayout();
+      content.replaceChildren(node("p", "oa-coverage", "正在读取原文…"));
       try {
         const value = await request(`/evidence/${encodeURIComponent(reference)}`);
-        if (denied) return;
+        if (denied || version !== sourceVersion) return;
         content.replaceChildren();
         for (const message of value.messages || []) {
           const item = node("figure");
-          item.append(node("figcaption", "", [message.chat_name, message.sender_name, date(message.time || message.created_at)].filter(Boolean).join(" · ")),
+          item.append(node("figcaption", "", [message.conversation_name || message.chat_name, message.sender_name,
+            date(message.time || message.sent_at || message.created_at),
+            {matched: "引用消息", parent: "回复对象", root: "话题起点", nearby_context: "相邻消息"}[message.relation]].filter(Boolean).join(" · ")),
             node("blockquote", "", message.text || "这条消息没有可显示的文字。"));
           content.append(item);
         }
         if (!value.messages?.length) content.append(node("p", "oa-coverage", "当前没有可读取的原文。"));
         const gaps = gapList(value.gaps); if (gaps) content.append(gaps);
-      } catch (error) { if (!denied) content.replaceChildren(node("p", "oa-gaps", error.message)); }
-      finally { reading = false; }
+        content.scrollTop = 0;
+      } catch (error) { if (!denied && version === sourceVersion) content.replaceChildren(node("p", "oa-gaps", error.message)); }
     });
-    return details;
+    return button;
   }
   function draftCard(draft, turnId) {
     if (!draft || typeof draft.draft !== "string" || !draft.draft.trim()) return null;
     const card = node("section", "oa-draft"), editor = node("textarea"), label = node("label", "", "回复草稿 · 可编辑");
     editor.value = draft.draft; editor.rows = 5; editor.setAttribute("aria-label", "回复草稿");
+    card.dataset.original = draft.draft;
     const copy = node("button", "", "复制回复"), feedback = node("span", "oa-copy-feedback");
     copy.type = "button"; feedback.setAttribute("role", "status");
     card.append(label, editor);
     if (draft.chinese_translation && draft.language !== "zh") card.append(node("p", "oa-translation", draft.chinese_translation));
     editor.addEventListener("input", () => {
+      card.dataset.edited = String(editor.value !== draft.draft);
       copy.disabled = !editor.value.trim();
       feedback.textContent = editor.value !== draft.draft && draft.chinese_translation ? "译文对应生成时原稿" : "";
     });
@@ -151,10 +204,128 @@
     card.append(copy, feedback);
     return card;
   }
+  function askButton(label, prompt, context = {}) {
+    const button = node("button", "", label); button.type = "button"; button.dataset.ask = "true";
+    button.addEventListener("click", () => void ask(prompt, context)); return button;
+  }
+  function table(headers, rows) {
+    const wrap = node("div", "oa-table-wrap"), value = node("table", "oa-table"), head = node("thead"), body = node("tbody");
+    const title = node("tr"); headers.forEach(text => title.append(node("th", "", text))); head.append(title);
+    for (const cells of rows.slice(0, 25)) {
+      const row = node("tr");
+      for (const cell of cells) { const item = node("td"); item.append(cell instanceof Node ? cell : node("span", "", cell ?? "—")); row.append(item); }
+      body.append(row);
+    }
+    value.append(head, body); wrap.append(value); return wrap;
+  }
+  function metrics(values, previous = null) {
+    const list = node("div", "oa-metrics");
+    for (const [key, label] of Object.entries({messages: "关联消息", own_messages: "本人消息", active_creators: "活跃达人",
+      contacted_creators: "已联系达人", conversations: "会话"})) {
+      if (!Number.isFinite(values?.[key])) continue;
+      const item = node("div", "oa-metric"); item.append(node("span", "", label), node("strong", "", values[key]));
+      if (Number.isFinite(previous?.[key])) item.append(node("small", "", `前一时段 ${previous[key]}`));
+      list.append(item);
+    }
+    return list;
+  }
+  function dataCard(data) {
+    const titles = {creators: "达人资料", groups: "关联群聊", sync: "同步状态", activity: "活动统计", messages: "消息命中", message_context: "原文与问答"};
+    if (!data || !titles[data.kind]) return null;
+    const card = node("section", "oa-data"); card.dataset.queryRef = data.query_ref || "";
+    card.append(node("h4", "", titles[data.kind]));
+    if (data.window?.start && data.window?.end) card.append(node("p", "oa-card-meta",
+      `${date(data.window.start)} – ${date(data.window.end)} · 英国时间`));
+    if (data.kind === "creators") {
+      const rows = (data.creators || []).map(person => {
+        const name = node("div", "", person.name || "未命名达人");
+        if (person.handles?.length) name.append(node("small", "", person.handles.join(" · ")));
+        if (person.last_contact_at) name.append(node("small", "", `最近联系 ${date(person.last_contact_at)}`));
+        return [name, [person.importance?.label || person.importance?.tier_label,
+          ...(person.responsible || []).map(owner => owner.name)].filter(Boolean).join(" · ") || "—",
+          askButton("查看情况", `查看 ${person.name || "这位达人"} 的最新情况`, {creator_ids: [person.id], creator_names: [person.name || "未命名达人"]})];
+      });
+      if (rows.length) card.append(table(["达人", "分层 · 负责人", ""], rows));
+      else card.append(node("p", "oa-coverage", "当前范围没有匹配的达人。"));
+      if (Number.isFinite(data.total)) card.append(node("p", "oa-coverage", `共 ${data.total} 位 · 本页 ${rows.length} 位`));
+    } else if (data.kind === "groups") {
+      const rows = (data.groups || []).map(group => {
+        const name = node("div", "", group.name || "未命名群聊");
+        if (typeof group.sync_enabled === "boolean") name.append(node("small", "", group.sync_enabled ? "已启用同步" : "未启用同步"));
+        return [name, group.purpose_label || group.purpose || "—", Number.isFinite(group.member_count) ? group.member_count : "—"];
+      });
+      if (rows.length) card.append(table(["群聊", "用途", "成员"], rows));
+      else card.append(node("p", "oa-coverage", "当前范围没有匹配的群聊。"));
+      if (Number.isFinite(data.total)) card.append(node("p", "oa-coverage", `共 ${data.total} 个 · 本页 ${rows.length} 个`));
+    } else if (data.kind === "sync") {
+      if (data.summary?.label) card.append(node("p", "", data.summary.label));
+      if (data.summary?.detail) card.append(node("p", "oa-coverage", data.summary.detail));
+      const rows = [];
+      for (const [key, label] of Object.entries({discovered_conversation_count: "已发现会话", syncable_conversation_count: "可同步会话",
+        backfill_complete_count: "历史回填完成", syncing_conversation_count: "正在同步", not_readable_conversation_count: "无法读取"})) {
+        const count = (data.conversations?.counts || data.conversations)?.[key]; if (Number.isFinite(count)) rows.push([label, count]);
+      }
+      if (rows.length) card.append(table(["范围", "会话数"], rows));
+      if (data.watermarks?.latest) card.append(node("p", "oa-coverage", `最新同步水位 ${date(data.watermarks.latest)}`));
+      if (data.watermarks?.oldest) card.append(node("p", "oa-coverage", `最早同步水位 ${date(data.watermarks.oldest)}`));
+      if (typeof data.definition === "string") card.append(node("p", "oa-coverage", data.definition));
+    } else if (data.kind === "activity") {
+      card.append(metrics(data.metrics, data.comparison?.metrics));
+      const rows = (data.rows || []).map(row => [data.group_by === "creator" ? row.creator_name || "未命名达人" : row.day,
+        Number.isFinite(row.messages) ? row.messages : "—", Number.isFinite(row.own_messages) ? row.own_messages : "—"]);
+      if (rows.length) card.append(table([data.group_by === "creator" ? "达人" : "日期", "关联消息", "本人消息"], rows));
+      if (data.rows?.length > 25) card.append(node("p", "oa-coverage", `共 ${data.rows.length} 行，显示前 25 行。`));
+      if (data.definition && typeof data.definition === "object") {
+        const details = node("details", "oa-coverage"); details.append(node("summary", "", "统计口径"));
+        for (const key of ["messages", "active_creators", "contacted_creators", "rows"]) if (data.definition[key]) details.append(node("p", "", data.definition[key]));
+        card.append(details);
+      }
+    } else if (data.kind === "message_context") {
+      const message = data.message || {};
+      card.append(node("div", "oa-card-meta", [message.conversation_name || message.chat_name, message.sender_name,
+        date(message.time || message.sent_at)].filter(Boolean).join(" · ")));
+      const text = message.text || "这条消息没有可显示的文字。";
+      card.append(node("p", "", text.length > 420 ? `${text.slice(0, 420)}…` : text));
+      card.append(node("p", "oa-coverage", "包含引用消息与有限相邻问答，不是完整会话。"));
+      const ref = data.message_ref || data.evidence_ref || message.message_ref;
+      if (ref) card.append(evidenceCard(ref, message.conversation_name || message.chat_name || "原文与问答"));
+    } else if (data.kind === "messages") {
+      for (const message of (data.messages || []).slice(0, 25)) {
+        const hit = node("div", "oa-hit");
+        hit.append(node("div", "oa-card-meta", [message.conversation_name || message.chat_name, message.sender_name,
+          date(message.time || message.sent_at)].filter(Boolean).join(" · ")));
+        const text = message.text || (message.unreadable ? "正文暂不可读取" : "这条消息没有可显示的文字。");
+        hit.append(node("p", "", text.length > 420 ? `${text.slice(0, 420)}…` : text));
+        if (message.unavailable_or_truncated) hit.append(node("p", "oa-coverage", "正文不完整，请查看来源范围。"));
+        const ref = message.evidence_ref || message.message_ref;
+        if (ref) hit.append(evidenceCard(ref, message.conversation_name || message.chat_name || "消息原文"));
+        card.append(hit);
+      }
+      if (!data.messages?.length) card.append(node("p", "oa-coverage", "这次扫描未找到可读的匹配消息。"));
+      const coverage = data.coverage || {}, counts = [];
+      for (const [key, label] of [["scanned", "扫描"], ["readable", "可读"], ["unreadable", "不可读"], ["matched", "命中"]]) {
+        if (Number.isFinite(coverage[key])) counts.push(`${label} ${coverage[key]}`);
+      }
+      if (counts.length) card.append(node("p", "oa-coverage", `本页：${counts.join(" · ")}，不是全库总量。`));
+      if (coverage.scan_complete === false) card.append(node("p", "oa-coverage", "扫描尚未结束，可继续下一页。"));
+      if (coverage.source_complete === false) card.append(node("p", "oa-coverage", "来源覆盖不完整，未命中不代表没有发生。"));
+    }
+    const gaps = gapList(data.gaps); if (gaps) card.append(gaps);
+    if (data.checked_at) card.append(node("p", "oa-coverage", `查询于 ${date(data.checked_at)}`));
+    if (data.next_cursor && data.query_ref) {
+      const actions = node("div", "oa-card-actions");
+      actions.append(askButton("继续下一页", "继续查看这次查询的下一页", {...data.scope, query_ref: data.query_ref, cursor: data.next_cursor})); card.append(actions);
+    }
+    return card;
+  }
   function renderResult(container, result) {
+    const previousDraft = container.querySelector(".oa-draft");
+    const keepDraft = typeof result.draft?.draft === "string" && result.draft.draft.trim() && previousDraft &&
+      (previousDraft.dataset.edited === "true" || previousDraft.contains(document.activeElement));
+    const focusedEditor = keepDraft && previousDraft.querySelector("textarea") === document.activeElement ? document.activeElement : null;
+    const selection = focusedEditor ? [focusedEditor.selectionStart, focusedEditor.selectionEnd] : null;
     container.replaceChildren(node("p", "oa-answer", result.answer || ""));
-    scope({...result.scope, ...result.window, creator_names: [...new Set((result.events || [])
-      .map(event => event.creator_handle || event.creator_name || event.lark_user_name).filter(Boolean))].slice(0, 3)});
+    scope({...result.scope, ...result.window});
     (result.events || []).forEach((event, index) => {
       const card = node("section", "oa-event"), meta = node("div", "oa-event-meta");
       for (const text of [event.creator_handle || event.lark_user_name || event.creator_name, event.priority,
@@ -164,10 +335,24 @@
       card.append(meta, node("h4", "", `${index + 1}. ${event.title || "聊天事项"}`));
       if (event.summary) card.append(node("p", "", event.summary));
       if (event.latest_progress) card.append(node("p", "", event.latest_progress));
-      if (event.evidence_ref || event.event_ref) card.append(evidenceCard(event.evidence_ref || event.event_ref));
+      const actions = node("div", "oa-card-actions");
+      if (event.evidence_ref || event.event_ref) actions.append(evidenceCard(event.evidence_ref || event.event_ref, event.title || "聊天事项原文", event.evidence_count));
+      if (event.event_ref) actions.append(askButton("最新进展", "查看这个事项的最新进展", {event_ref: event.event_ref, event_title: event.title || "聊天事项"}),
+        askButton("起草回复", "针对这个事项起草一条回复", {event_ref: event.event_ref, event_title: event.title || "聊天事项"}));
+      if (actions.children.length) card.append(actions);
       container.append(card);
     });
-    const draft = draftCard(result.draft, container.dataset.turnId); if (draft) container.append(draft);
+    for (const data of result.data || []) { const card = dataCard(data); if (card) container.append(card); }
+    const draft = keepDraft ? previousDraft : draftCard(result.draft, container.dataset.turnId);
+    if (draft) {
+      container.append(draft);
+      if (focusedEditor) { focusedEditor.focus({preventScroll: true}); focusedEditor.setSelectionRange(...selection); }
+      if (keepDraft && result.draft?.draft && previousDraft.dataset.original !== result.draft.draft && !draft.querySelector(".oa-draft-update")) {
+        const replace = node("button", "oa-draft-update", "使用新生成的草稿"); replace.type = "button";
+        replace.addEventListener("click", () => { const value = draftCard(result.draft, container.dataset.turnId); if (value) draft.replaceWith(value); });
+        draft.append(replace);
+      }
+    }
     const gaps = gapList(result.gaps); if (gaps) container.append(gaps);
     const coverage = result.coverage;
     if (coverage && typeof coverage === "object") {
@@ -181,8 +366,7 @@
     if (result.events?.length) {
       const followup = node("div", "oa-followup");
       for (const [label, prompt] of [["只看未解决", "只看刚才结果中还没解决的事项"], ["查看最新进展", "刚才这些事项后来有什么进展？"]]) {
-        const button = node("button", "", label); button.type = "button";
-        button.addEventListener("click", () => ask(prompt)); followup.append(button);
+        followup.append(askButton(label, prompt));
       }
       container.append(followup);
     }
@@ -190,6 +374,7 @@
   function turn(view) {
     if (denied) return;
     if (view.error_code === "permission") { clearProtected(); return; }
+    if (view.scope) scope(view.scope);
     if (view.message) userMessage(view.client_request_id, view.message);
     let container = [...history.children].find(child => child.dataset.turnId === view.id);
     if (!container) {
@@ -202,16 +387,16 @@
     } else if (terminal.has(view.status)) {
       container.replaceChildren(node("p", "oa-answer", typeof view.error === "string" ? view.error : view.error?.message || labels[view.status]));
     }
-    if (view.scope && !view.result) scope(view.scope);
   }
   function finish(state) {
     source?.close(); source = null; active = null; controls();
     if (state === "completed") status("");
     else status(labels[state] || "这轮处理已结束", state !== "cancelled");
   }
-  function watch(view) {
+  function watch(view, restoredVersion = scopeVersion) {
     if (denied) return;
     source?.close();
+    if (currentScopeTurn?.id !== view.id) currentScopeTurn = {id: view.id, version: restoredVersion};
     if (terminal.has(view.status)) { finish(view.status); return; }
     active = view.id; controls();
     const watching = view.id;
@@ -225,7 +410,9 @@
     });
     source.addEventListener("result", event => {
       if (active !== watching || denied) return;
-      turn({...view, status: "completed", result: JSON.parse(event.data)}); controls(); scrollToBottom();
+      const follow = atBottom();
+      const completed = {...view, status: "completed", result: JSON.parse(event.data)};
+      adoptTurnScope(completed); turn(completed); controls(); updatedScroll(follow);
     });
     source.addEventListener("error", event => {
       if (active !== watching) return;
@@ -248,42 +435,56 @@
     if (!saved.session_id || denied || restoring) return;
     restoring = true; controls();
     const version = revision;
+    const readScopeVersion = scopeVersion;
+    const follow = !history.querySelector(".oa-message") || atBottom();
     try {
       const value = await request(`/sessions/${encodeURIComponent(saved.session_id)}`);
       if (denied || version !== revision) return;
       const turns = value.turns || [];
+      const latest = turns.at(-1);
+      const restoreScope = !contextChosen && readScopeVersion === scopeVersion &&
+        !["creator_ids", "chat_ids", "event_ref"].some(key => pageContext[key]);
+      const latestScope = latest?.result?.scope || latest?.scope;
+      if (restoreScope && latestScope?.cm_id === pageContext.cm_id) selectContext(latestScope, false);
+      if (latest) adoptTurnScope(latest);
       for (const view of turns) turn(view);
       if (denied) return;
       if (turns.some(view => view.client_request_id === saved.client_request_id)) {
         delete saved.client_request_id; pending = null; persist();
       }
       const running = turns.find(view => !terminal.has(view.status));
-      if (running) watch(running);
+      if (running) watch(running, restoreScope ? scopeVersion : null);
       else { source?.close(); source = null; active = null; controls(); }
       if (saved.client_request_id) status("上次提交尚未确认，重新输入后重试会复用原请求编号。", true);
       else if (turns.length && !running) status("");
-      scrollToBottom();
+      updatedScroll(follow);
     } catch (error) {
       if (denied || version !== revision) return;
       if (error.status === 404 && !saved.client_request_id) { saved = {}; persist(); }
       status(error.status === 404 ? "上次请求尚未保存，可重新输入并提交。" : error.message, true);
     } finally { restoring = false; controls(); }
   }
-  async function ask(text) {
+  async function ask(text, selectedContext = {}) {
     if (denied || active || submitting || restoring) return;
     text = text.trim(); if (!text) return;
     if (!saved.session_id) saved.session_id = crypto.randomUUID();
     if (!saved.client_request_id) saved.client_request_id = crypto.randomUUID();
-    pending ||= {session_id: saved.session_id, client_request_id: saved.client_request_id,
-      message: text, context: pageContext};
+    if (!pending) {
+      selectContext(selectedContext); scope({});
+      pendingScopeVersion = scopeVersion;
+      pending = {session_id: saved.session_id, client_request_id: saved.client_request_id, message: text,
+        context: {...activeContext, ...(selectedContext.query_ref ? {query_ref: selectedContext.query_ref, cursor: selectedContext.cursor} : {})}};
+    }
     persist(); submitting = true; controls(); userMessage(pending.client_request_id, pending.message); scrollToBottom();
     status("正在保存请求…");
     const version = revision;
+    const submittedScopeVersion = pendingScopeVersion;
     try {
       const value = await request("/turns", pending);
       if (denied || version !== revision) return;
       delete saved.client_request_id; pending = null; persist(); input.value = "";
-      turn(value); watch(value);
+      currentScopeTurn = {id: value.id, version: submittedScopeVersion};
+      adoptTurnScope(value); turn(value); watch(value);
     } catch (error) {
       if (denied || version !== revision) return;
       if (error.status === 400 || error.status === 413 || error.status === 415 || error.status === 422) {
@@ -295,7 +496,8 @@
   function open() {
     panel.hidden = false; $("oa-launcher").hidden = true; $("oa-launcher").setAttribute("aria-expanded", "true");
     if (matchMedia("(max-width: 600px)").matches) fullscreen(true);
-    input.focus();
+    if (followBottom) scrollToBottom();
+    if ($("oa-sources").hidden) input.focus(); else $("oa-sources-close").focus();
   }
   function collapse() {
     panel.hidden = true; $("oa-launcher").hidden = false; $("oa-launcher").setAttribute("aria-expanded", "false");
@@ -306,6 +508,7 @@
     panel.classList.toggle("is-fullscreen", enabled); panel.setAttribute("aria-modal", String(enabled));
     $("oa-fullscreen").setAttribute("aria-label", enabled ? "退出全屏" : "全屏");
     $("oa-fullscreen").title = enabled ? "退出全屏" : "全屏";
+    sourceLayout();
   }
   $("oa-launcher").addEventListener("click", open);
   $("oa-collapse").addEventListener("click", collapse);
@@ -313,8 +516,10 @@
   $("oa-new").addEventListener("click", () => {
     if (active || submitting) return;
     revision++; source?.close(); source = null; saved = {}; pending = null; persist();
+    activeContext = {...pageContext}; contextChosen = false; scopeVersion++; currentScopeTurn = null;
+    closeSources(false); $("oa-new-result").hidden = true;
     history.replaceChildren(node("p", "oa-answer", "开始一个新问题。"));
-    $("oa-scope").replaceChildren(); $("oa-scope").hidden = true; status(""); input.value = ""; controls(); input.focus();
+    scope({}); status(""); input.value = ""; controls(); input.focus();
   });
   $("oa-form").addEventListener("submit", event => { event.preventDefault(); void ask(input.value); });
   input.addEventListener("input", controls);
@@ -327,18 +532,44 @@
   $("oa-stop").addEventListener("click", async () => {
     if (!active) return;
     const stopping = active; $("oa-stop").disabled = true;
-    try { const value = await request(`/turns/${encodeURIComponent(stopping)}/cancel`, {}); if (!denied && active === stopping) { turn(value); watch(value); } }
+    try { const value = await request(`/turns/${encodeURIComponent(stopping)}/cancel`, {}); if (!denied && active === stopping) { adoptTurnScope(value); turn(value); watch(value); } }
     catch (error) { if (!denied) { status(error.message, true); $("oa-stop").disabled = false; } }
   });
   panel.addEventListener("keydown", event => {
-    if (event.key === "Escape") { event.preventDefault(); if (panel.classList.contains("is-fullscreen") && !matchMedia("(max-width: 600px)").matches) fullscreen(false); else collapse(); }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      if (!$("oa-sources").hidden) closeSources();
+      else if (panel.classList.contains("is-fullscreen") && !matchMedia("(max-width: 600px)").matches) fullscreen(false);
+      else collapse();
+    }
     if (event.key !== "Tab" || !panel.classList.contains("is-fullscreen")) return;
-    const elements = [...panel.querySelectorAll("button:not(:disabled), textarea:not(:disabled), summary")].filter(element => element.getClientRects().length);
+    const elements = [...panel.querySelectorAll("button:not(:disabled), textarea:not(:disabled), summary, a[href], [tabindex='0']")]
+      .filter(element => element.getClientRects().length && !element.closest("[inert]"));
     const first = elements[0], last = elements.at(-1);
     if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
   });
+  $("oa-sources-close").addEventListener("click", () => closeSources());
+  $("oa-new-result").addEventListener("click", scrollToBottom);
+  history.addEventListener("scroll", () => {
+    if (panel.hidden) return;
+    followBottom = atBottom(); if (followBottom) $("oa-new-result").hidden = true;
+  });
+  window.addEventListener("resize", () => {
+    if (matchMedia("(max-width: 600px)").matches) fullscreen(true); else sourceLayout();
+  });
+  document.addEventListener("ttmedia:assistant", event => {
+    const detail = event.detail;
+    if (!detail || denied) return;
+    const context = detail.context && typeof detail.context === "object" && !Array.isArray(detail.context) ? detail.context : {};
+    if (typeof detail.message !== "string" || !detail.message.trim()) { selectContext(context); scope({}); return; }
+    open();
+    if (active || submitting || restoring) { status("当前问题还在处理，完成后请再查看。"); return; }
+    if (saved.client_request_id) { status("上次提交尚未确认，请先恢复或重试原请求。", true); return; }
+    input.value = detail.message; controls();
+    void ask(detail.message, context);
+  });
   window.addEventListener("pagehide", () => { source?.close(); clearTimeout(restoreTimer); });
   if (app.dataset.configured !== "true") status("助手尚未配置，请联系管理员。", true);
-  controls(); void restore();
+  scope({}); controls(); void restore();
 })();

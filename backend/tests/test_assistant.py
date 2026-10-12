@@ -165,6 +165,41 @@ def test_repeated_tool_call_uses_current_turn_cache(pg, chat, monkeypatch):
     assistant.cancel(pg, chat.ids['cm'], turn['id'], chat.settings)
 
 
+def test_selected_creator_changes_do_not_reuse_other_persons_context(pg, chat, monkeypatch):
+    pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
+               "VALUES(%s,%s,%s,'manual')", (uuid4(), chat.ids['other'], chat.ids['cm']))
+    calls = []
+
+    def model(_cfg, _key, items, _actor, **_kwargs):
+        calls.append(items.copy())
+        outputs = [item for item in items if item.get('type') == 'function_call_output']
+        if not outputs:
+            return {'text': '', 'output': [{'type': 'function_call', 'call_id': str(uuid4()),
+                'name': 'query_creators', 'arguments': json.dumps({
+                    'query': None, 'importance': None, 'cursor': None,
+                })}], 'usage': {}}
+        result = json.loads(outputs[-1]['output'])
+        final = {'answer': result['creators'][0]['name'], 'event_refs': [], 'result_refs': [],
+                 'data_refs': [result['query_ref']], 'draft_ref': None}
+        return {'text': json.dumps(final), 'output': [], 'usage': {}}
+
+    monkeypatch.setattr(openai_client, 'call_openai_tools', model)
+    first = payload('查询当前达人资料')
+    first['context'] = {'creator_ids': [str(chat.ids['person'])]}
+    turn = assistant.submit(pg, chat.ids['cm'], first, chat.settings)
+    for _ in range(3):
+        finish(chat)
+    assert assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)['status'] == 'completed'
+    second = {**first, 'client_request_id': str(uuid4()),
+              'context': {'creator_ids': [str(chat.ids['other'])]}}
+    turn = assistant.submit(pg, chat.ids['cm'], second, chat.settings)
+    for _ in range(3):
+        finish(chat)
+    view = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
+    assert view['status'] == 'completed' and view['result']['data'][0]['creators'][0]['id'] == str(chat.ids['other'])
+    assert not any(item.get('role') == 'assistant' for item in calls[2])
+
+
 def test_cancel_during_provider_call_keeps_receipt_without_showing_late_result(pg, chat, monkeypatch):
     turn = assistant.submit(pg, chat.ids['cm'], payload(), chat.settings)
 

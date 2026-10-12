@@ -8,10 +8,134 @@ from uuid import uuid4
 import pytest
 from test_offhours_summary import finish_merges, pg, seeded  # noqa: F401
 
+from app import assistant_queries, assistant_search, openai_client, summary_dialogues, summary_replies
 from app import assistant_tools as tools
 from app import offhours_summary as summaries
-from app import openai_client, summary_dialogues, summary_replies
 from app.ai_feature_config import api_key_cipher, save_feature_config
+
+
+def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeypatch):  # noqa: F811
+    s = seeded
+    pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
+               "VALUES(%s,%s,%s,'manual')", (uuid4(), s.ids["person"], s.ids["owner"]))
+    account = uuid4()
+    pg.execute("INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) "
+               "VALUES(%s,'tiktok','alice_shop','@alice_shop')", (account,))
+    pg.execute("INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source) "
+               "VALUES(%s,%s,'owner','confirmed','cm_confirmation')", (s.ids["person"], account))
+    s.add("original", who="cm", text="Would you like a sample?", at=s.start - timedelta(minutes=5))
+    pg.execute("UPDATE chat_messages SET parent_id='original' WHERE message_id='m1'")
+    s.add("reply", who="cm", text="I will check the sample.", at=s.start + timedelta(hours=2))
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'chat')", (s.ids["owner"],))
+    pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+               "VALUES(%s,'chat','m1')", (s.ids["owner"],))
+    s.add("owner-only", text="Private owner-only sample", at=s.start + timedelta(hours=3))
+    pg.execute("UPDATE authorization_message_observations SET authorization_id=%s WHERE message_id='owner-only'",
+               (s.ids["owner"],))
+    pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('category','Beauty Category','group')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id,sync_enabled) VALUES(%s,'category',FALSE)",
+               (s.ids["cm"],))
+    pg.execute("INSERT INTO chat_group_classifications(chat_id,purpose,source,confirmed_by_authorization_id) "
+               "VALUES('category','category','manual',%s)", (s.ids["owner"],))
+    session_id, turn_id = uuid4(), uuid4()
+    pg.execute("INSERT INTO assistant_sessions(id,actor_id) VALUES(%s,%s)", (session_id, s.ids["cm"]))
+    now = datetime.now(UTC)
+    pg.execute("INSERT INTO assistant_turns(id,session_id,client_request_id,input_ciphertext,created_at) "
+               "VALUES(%s,%s,%s,'fixture',%s)", (turn_id, session_id, uuid4(), now))
+    turn = pg.execute("SELECT * FROM assistant_turns WHERE id=%s", (turn_id,)).fetchone()
+    context = tools.current_context(pg, s.ids["cm"], {}, s.settings, now=now)
+    results = []
+
+    def run(name, args):
+        value = tools.execute(pg, s.ids["cm"], turn, name, args, s.settings, context)
+        results.append(value)
+        pg.execute("UPDATE assistant_turns SET checkpoint_ciphertext=%s WHERE id=%s",
+                   (summary_dialogues.encode({"tool_results": results}, s.settings), turn_id))
+        return value
+
+    person = run("query_creators", {"query": "alice", "importance": None, "cursor": None})
+    assert person["total"] == 1 and set(person["creators"][0]["handles"]) == {"@alice", "@alice_shop"}
+    assert {p["id"] for p in person["creators"][0]["responsible"]} == {
+        str(s.ids["cm"]), str(s.ids["owner"]),
+    }
+    groups = run("list_groups", {"query": None, "creator_ids": None, "purpose": "category", "cursor": None})
+    assert groups["total"] == 1 and not groups["groups"][0]["sync_enabled"]
+    assert run("get_sync_status", {})["authorization_status"] == "active"
+    args = {"start": s.start.isoformat(), "end": now.isoformat(), "creator_ids": None, "chat_ids": None,
+            "group_by": "day", "comparison": "previous", "cursor": None}
+    stats = run("activity_stats", args)
+    assert stats["metrics"]["messages"] == 2 and stats["metrics"]["contacted_creators"] == 1
+    assert stats["comparison"]["metrics"]["messages"] == 1
+    assert run("activity_stats", {**args, "chat_ids": ["category"]})["metrics"]["messages"] == 0
+    for start, end, minutes in [
+        ("2026-10-25T00:30:00+00:00", "2026-10-25T01:30:00+00:00", 60),
+        ("2026-10-25T01:20:00+00:00", "2026-10-25T01:40:00+00:00", 20),
+        ("2026-03-29T01:10:00+00:00", "2026-03-29T01:30:00+00:00", 20),
+    ]:
+        transition = assistant_queries.activity(pg, s.ids["cm"], context, {
+            **args, "start": start, "end": end,
+        }, s.settings, now=datetime(2026, 10, 26, tzinfo=UTC))
+        assert datetime.fromisoformat(transition["comparison"]["window"]["end"]) - datetime.fromisoformat(
+            transition["comparison"]["window"]["start"]) == timedelta(minutes=minutes)
+        assert transition["definition"]["day_counts"]["previous"] == minutes / 1440
+    search_args = {"query": ["sample"], "start": s.start.isoformat(), "end": now.isoformat(),
+                   "creator_ids": None, "chat_ids": None, "cursor": None}
+    monkeypatch.setattr(assistant_search, "SCAN_LIMIT", 1)
+    monkeypatch.setattr(assistant_search, "PAGE_SIZE", 1)
+    found, cursor = [], None
+    for _ in range(5):
+        page = run("search_chat_history", {**search_args, "cursor": cursor})
+        found.extend(page["messages"])
+        assert page["coverage"]["counts_scope"] == "this_page"
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+    assert cursor is None and {m["message_id"] for m in found} == {"m1", "reply"}
+    assert all(len(message["message_ref"]) < 130 for message in found)
+    ref = next(m["message_ref"] for m in found if m["message_id"] == "m1")
+    original = run("read_message_context", {"message_ref": ref})
+    assert any(m["text"] == "Would you like a sample?" for m in original["messages"])
+    tools.validate_tool_results(pg, s.ids["cm"], turn, results, s.settings, context)
+    final = {"answer": "这是当前可见资料。", "event_refs": [], "result_refs": [],
+             "data_refs": [result["query_ref"] for result in results], "draft_ref": None}
+    view = tools.build_result(pg, s.ids["cm"], turn, final, s.settings, context, results)
+    assert {value["kind"] for value in view["data"]} == {
+        "creators", "groups", "sync", "activity", "messages", "message_context",
+    }
+    assert not any("snapshot" in value or "_message_refs" in value for value in view["data"])
+    assert "Private owner-only sample" not in json.dumps(view)
+    assert tools.evidence(pg, s.ids["cm"], ref, s.settings)["message"]["text"] == "Sample please"
+    with pytest.raises(LookupError):
+        tools.evidence(pg, s.ids["reviewer"], ref, s.settings)
+    with pytest.raises(PermissionError):
+        run("search_chat_history", {**search_args, "creator_ids": [str(s.ids["other"])]})
+    with pytest.raises(ValueError):
+        tools.build_result(pg, s.ids["cm"], turn, {**final, "data_refs": [f"q.{uuid4()}.invented"]},
+                           s.settings, context, results)
+    pg.execute("UPDATE chat_messages SET is_deleted=TRUE WHERE message_id='m1'")
+    with pytest.raises((PermissionError, ValueError)):
+        tools.build_result(pg, s.ids["cm"], turn, final, s.settings, context, results)
+    with pytest.raises((PermissionError, ValueError)):
+        tools.evidence(pg, s.ids["cm"], ref, s.settings)
+    for index in range(26):
+        person_id = uuid4()
+        pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)", (person_id, f"Paged Creator {index:02}"))
+        pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) VALUES(%s,'creator','confirmed','manual')",
+                   (person_id,))
+        pg.execute("INSERT INTO lark_identities(open_id,contact_id,display_name) VALUES(%s,%s,%s)",
+                   (f"ou_paged_{index}", person_id, f"Paged Creator {index:02}"))
+        pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
+                   "VALUES(%s,%s,%s,'manual')", (uuid4(), person_id, s.ids["cm"]))
+    named_args = {"query": "Paged Creator", "importance": None, "cursor": None}
+    named = run("query_creators", named_args)
+    assert named["total"] == 26 and named["scope"]["creator_ids"] is None
+    continuation = tools.current_context(pg, s.ids["cm"], {
+        **named["scope"], "query_ref": named["query_ref"], "cursor": named["next_cursor"],
+    }, s.settings)
+    last_page = tools.execute(pg, s.ids["cm"], turn, "query_creators", {
+        **named_args, "cursor": named["next_cursor"],
+    }, s.settings, continuation)
+    assert last_page["total"] == 26 and len(last_page["creators"]) == 1 and last_page["next_cursor"] is None
 
 
 def test_five_tools_keep_reports_private_resume_and_recheck_sources(pg, seeded, monkeypatch):  # noqa: F811
@@ -30,7 +154,11 @@ def test_five_tools_keep_reports_private_resume_and_recheck_sources(pg, seeded, 
     turn = pg.execute("SELECT * FROM assistant_turns WHERE id=%s", (turn_id,)).fetchone()
     context = tools.current_context(pg, s.ids["cm"], {}, s.settings, now=now)
     assert context["scope"]["cm_id"] == str(s.ids["cm"])
-    assert len(tools.TOOLS) == 5
+    assert {tool["name"] for tool in tools.TOOLS} == {
+        "find_creators", "summarize_messages", "filter_events", "read_event_context", "draft_reply",
+        "query_creators", "list_groups", "get_sync_status", "search_chat_history", "read_message_context",
+        "activity_stats",
+    }
     assert all(tool["strict"] and not tool["parameters"]["additionalProperties"] for tool in tools.TOOLS)
     found = tools.execute(pg, s.ids["cm"], turn, "find_creators", {"query": "@alice"}, s.settings, context)
     assert found["total"] == 1 and found["creators"][0]["id"] == str(s.ids["person"])
