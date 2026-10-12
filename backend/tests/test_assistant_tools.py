@@ -184,6 +184,48 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
     all_stats_args = {**all_args, "group_by": "day", "comparison": None}
     assert run("activity_stats", all_stats_args)["metrics"]["messages"] == 6
     assert run("activity_stats", args)["metrics"]["messages"] == 2
+    # A completed unbounded backfill has no start; a new sync round does not erase that coverage.
+    for complete, history_start, status, watermark, expected_gap in [
+        (True, None, "syncing", s.end, None),
+        (False, None, "pending", s.end, "历史"),
+        (True, s.start + timedelta(minutes=1), "succeeded", s.end, "历史"),
+        (True, None, "not_readable", s.end, "Lark未允许读取"),
+        (True, None, "syncing", s.start + timedelta(hours=1), "截止"),
+    ]:
+        pg.execute("""UPDATE authorization_chats SET backfill_complete=%s,backfill_window_start_at=%s,
+            sync_status=%s,last_incremental_at=%s,last_backfill_at=NULL
+            WHERE authorization_id=%s AND chat_id='business'""",
+            (complete, history_start, status, watermark, s.ids["cm"]))
+        scoped = {**all_args, "chat_ids": ["business"]}
+        material = assistant_search.window_messages(pg, s.ids["cm"], context, scoped, s.settings)
+        activity = assistant_queries.activity(pg, s.ids["cm"], context, {
+            **scoped, "group_by": "day", "comparison": None,
+        }, s.settings)
+        for value in (material, activity):
+            if expected_gap is None:
+                assert value["gaps"] == []
+            else:
+                assert any(expected_gap in gap["reason"] for gap in value["gaps"])
+            assert value.get("total_messages", value.get("metrics", {}).get("messages")) == (
+                0 if status == "not_readable" else 3)
+        assert material["sources"][0]["source_complete"] == (expected_gap is None)
+        assert material["coverage"]["source_complete"] == (expected_gap is None)
+    gaps = [{"chat_id": f"gap-{index}", "reason": "历史回填尚未完成"} for index in range(30)]
+    gaps += [{"chat_id": "gap-0", "reason": "历史回填尚未完成"},
+             {"chat_id": "gap-0", "reason": "同步水位未覆盖请求截止"},
+             {"reason": "本页存在不可读正文或附件", "count": 6}]
+    for for_model, sample_size in [(True, 8), (False, 25)]:
+        public = tools.public_query({**material, "gaps": gaps}, for_model=for_model)
+        assert public["gap_count"] == 33 and public["gap_conversation_count"] == 30
+        assert len(public["gaps"]) == sample_size
+        assert public["gap_summary"] == [
+            {"reason": "历史回填尚未完成", "conversations": 30, "items": 0},
+            {"reason": "同步水位未覆盖请求截止", "conversations": 1, "items": 0},
+            {"reason": "本页存在不可读正文或附件", "conversations": 0, "items": 6},
+        ]
+    pg.execute("""UPDATE authorization_chats SET backfill_complete=TRUE,backfill_window_start_at=%s,
+        sync_status='succeeded',last_incremental_at=%s WHERE authorization_id=%s AND chat_id='business'""",
+        (s.start - timedelta(days=9), s.end, s.ids["cm"]))
     pinned_context = tools.current_context(pg, s.ids["cm"], {
         "creator_ids": [str(s.ids["person"])], "chat_ids": ["category"], "audience": "creators",
     }, s.settings)

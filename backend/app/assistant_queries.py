@@ -175,10 +175,11 @@ def _coverage(chats, start=None, end=None):
                 watermarks.append(watermark)
             if not chat["backfill_complete"]:
                 reasons.append("历史回填尚未完成")
-            if chat["sync_status"] != "succeeded":
+            if chat["sync_status"] not in {"succeeded", "syncing"}:
                 reasons.append("Lark未允许读取" if chat["sync_status"] == "not_readable" else "同步尚未成功")
-            if start is not None and (not chat["backfill_window_start_at"]
-                                     or chat["backfill_window_start_at"] > start):
+            # NULL is an unbounded history start, not a missing sync boundary.
+            if start is not None and chat["backfill_window_start_at"] is not None \
+                    and chat["backfill_window_start_at"] > start:
                 reasons.append("请求早于已确认历史同步范围")
             if watermark is None or (end is not None and watermark < end):
                 reasons.append("尚无同步水位" if watermark is None else "同步水位未覆盖请求截止")

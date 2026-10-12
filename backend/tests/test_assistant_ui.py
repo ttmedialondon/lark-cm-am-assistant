@@ -160,7 +160,8 @@ const {chromium} = require('playwright');
       }
       if (url.pathname.includes('/sessions/')) return route.fulfill({json:{id:view.session_id,turns:[view]}});
       if (url.pathname.includes('/evidence/')) return route.fulfill({json:{messages:[{
-        chat_name:'群',sender_name:'达人',time:'2026-10-12T09:00:00Z',text:'<img src=x onerror=alert(1)>'}],gaps:[]}});
+        chat_name:'群',sender_name:'达人',time:'2026-10-12T09:00:00Z',
+        text:'<img src=x onerror=alert(1)> **本人原文**'}],gaps:[]}});
       return route.abort();
     });
     await page.goto('http://localhost/');
@@ -172,25 +173,49 @@ const {chromium} = require('playwright');
     assert.equal(posts.length,2); assert.match(posts[0].body.session_id,/^[0-9a-f-]{36}$/);
     assert.deepEqual(posts[0].body,posts[1].body);
     await page.locator('#oa-collapse').click(); assert.equal(await page.evaluate(() => window.sources[0].closed),false);
-    const result={answer:'<script>bad()</script>',events:[{event_ref:'ref',title:'样品进展',creator_handle:'fixture',
+    const result={answer:'昨天值得优先关注：\n1. **账号权限故障**：请跟进 [帮助](https://example.com/help)\n' +
+      '2. **活动报名**：暂未回复。\n\n<script>bad()</script> [不安全](javascript:alert(1)) ' +
+      '[数据](data:text/html;base64,PHNjcmlwdD4=)\n`**原样代码**`\n\n- 核对群聊\n- 联系同事',
+      events:[{event_ref:'ref',title:'样品进展',creator_handle:'fixture',
       handling_status:'unresolved',evidence_ref:'ref'}],scope:{cm_name:'CM',audience:'all',creator_ids:null},
       window:{start:'2026-10-12T07:00:00Z',end:'2026-10-12T11:00:00Z'},
-      draft:{draft:'I will check.',chinese_translation:'我会核对。',language:'en'},
+      draft:{draft:'**I will check.**',chinese_translation:'我会核对。',language:'en'},
       data:[{kind:'window_messages',scope:{audience:'all'},total_messages:20,
         messages:[{conversation_name:'业务群',sender_name:'未识别联系人',time:'2026-10-12T09:00:00Z',
-          text:'<script>source()</script>',evidence_ref:'raw-ref'}],coverage:{source_complete:true},gaps:[]}]};
+          text:'<script>source()</script> **本人原文**',evidence_ref:'raw-ref'}],coverage:{source_complete:false},
+        gaps:Array.from({length:25},(_,i)=>({chat_id:`chat-${i}`,reason:'历史同步未覆盖检索起点'})),
+        gap_count:1273,gap_conversation_count:1272,gap_summary:[
+          {reason:'历史同步未覆盖检索起点',conversations:1272,items:0},
+          {reason:'附件正文不可读取',conversations:0,items:5}]}]};
     view={...view,status:'completed',result};
     await page.evaluate(value => {
       window.sources[0].emit('result',value);window.sources[0].emit('done',{status:'completed'});
     },result);
     await page.locator('#oa-launcher').click();
-    assert.equal(await page.locator('.oa-answer').textContent(),result.answer);
+    assert.deepEqual(await page.locator('.oa-answer strong').allTextContents(),['账号权限故障','活动报名']);
+    assert.equal(await page.locator('.oa-answer ol li').count(),2);
+    assert.equal(await page.locator('.oa-answer ul li').count(),2);
+    assert.equal(await page.locator('.oa-answer a').count(),1);
+    assert.equal(await page.locator('.oa-answer a').getAttribute('href'),'https://example.com/help');
+    assert.equal(await page.locator('.oa-answer a').getAttribute('rel'),'noopener noreferrer');
+    assert.match(await page.locator('.oa-answer').textContent(),/<script>bad\(\)<\/script>/);
+    assert.match(await page.locator('.oa-answer').textContent(),/javascript:alert\(1\)/);
+    assert.equal(await page.locator('.oa-answer code').textContent(),'**原样代码**');
     assert.equal(await page.locator('.oa-history script').count(),0);
     assert.match(await page.locator('.oa-scope').textContent(),/全部授权消息/);
     assert.match(await page.locator('.oa-data').textContent(),/本页 1 条.*时段 20 条/);
-    assert.equal(await page.locator('.oa-data details').getAttribute('open'),null);
+    assert.equal(await page.locator('.oa-data details.oa-coverage').getAttribute('open'),null);
+    assert.equal(await page.locator('.oa-data .oa-gaps summary').textContent(),
+      '部分资料尚不完整 · 1272 个会话 · 5 项记录');
+    assert.deepEqual(await page.locator('.oa-data .oa-gaps div').allTextContents(),[
+      '历史同步未覆盖检索起点 · 1272 个会话','附件正文不可读取 · 5 项记录']);
+    assert.equal(await page.locator('.oa-hit strong, .oa-hit a').count(),0);
+    assert.match(await page.locator('.oa-hit').textContent(),/\*\*本人原文\*\*/);
+    assert.equal(await page.locator('.oa-draft textarea').inputValue(),'**I will check.**');
     await page.locator('.oa-event .oa-evidence').click(); await page.locator('#oa-sources-body blockquote').waitFor();
     assert.equal(await page.locator('#oa-sources-body img').count(),0);
+    assert.equal(await page.locator('#oa-sources-body strong').count(),0);
+    assert.match(await page.locator('#oa-sources-body blockquote').textContent(),/\*\*本人原文\*\*/);
     await page.locator('#oa-sources-close').click();
     await page.locator('.oa-draft textarea').fill('Edited reply');
     await page.getByRole('button',{name:'复制回复',exact:true}).click();

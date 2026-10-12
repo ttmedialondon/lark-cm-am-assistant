@@ -317,6 +317,18 @@ def public_query(result, *, for_model=False):
                                if key not in {"source_chat_ids", "rows"}}
     if isinstance(value.get("gaps"), list):
         value["gap_count"] = len(value["gaps"])
+        groups, conversations = {}, set()
+        for gap in value["gaps"]:
+            reason = gap if isinstance(gap, str) else gap.get("message") or gap.get("reason") or "资料暂不可读取"
+            group = groups.setdefault(reason, {"chats": set(), "items": 0})
+            if isinstance(gap, dict) and gap.get("chat_id"):
+                group["chats"].add(gap["chat_id"])
+                conversations.add(gap["chat_id"])
+            else:
+                group["items"] += gap.get("count", 1) if isinstance(gap, dict) else 1
+        value["gap_summary"] = [{"reason": reason, "conversations": len(group["chats"]),
+                                 "items": group["items"]} for reason, group in groups.items()]
+        value["gap_conversation_count"] = len(conversations)
         value["gaps"] = value["gaps"][:8 if for_model else 25]
     if for_model and value.get("kind") == "message_context":
         def compact(message):

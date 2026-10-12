@@ -25,6 +25,56 @@
     if (text != null) element.textContent = String(text);
     return element;
   }
+  function answer(text) {
+    const value = node("div", "oa-answer");
+    function inline(parent, text) {
+      const tokens = /`([^`\n]+)`|\*\*([^*\n]+)\*\*|__([^_\n]+)__|\[([^\]\n]+)\]\(([^)\s]+)\)/g;
+      let start = 0;
+      for (const token of text.matchAll(tokens)) {
+        parent.append(document.createTextNode(text.slice(start, token.index)));
+        if (token[1]) parent.append(node("code", "", token[1]));
+        else if (token[2] || token[3]) parent.append(node("strong", "", token[2] || token[3]));
+        else {
+          let url;
+          try { url = new URL(token[5]); } catch { /* Invalid links stay readable. */ }
+          if (url && ["https:", "http:"].includes(url.protocol)) {
+            const link = node("a", "", token[4]); link.href = url.href;
+            link.target = "_blank"; link.rel = "noopener noreferrer"; parent.append(link);
+          } else parent.append(document.createTextNode(token[0]));
+        }
+        start = token.index + token[0].length;
+      }
+      parent.append(document.createTextNode(text.slice(start)));
+    }
+    // shortcut: render the answer's text formatting only; use a maintained parser if full CommonMark is needed.
+    let paragraph = null, list = null, code = null;
+    for (const line of String(text || "").replace(/\r\n?/g, "\n").split("\n")) {
+      if (/^\s*```/.test(line)) {
+        paragraph = list = null;
+        if (code) code = null;
+        else { const pre = node("pre"); code = node("code"); pre.append(code); value.append(pre); }
+      } else if (code) code.append(document.createTextNode(`${line}\n`));
+      else if (!line.trim()) paragraph = list = null;
+      else {
+        const item = line.match(/^\s*(?:(\d+)[.)]|[-+*])\s+(.+)$/), heading = line.match(/^(#{1,6})\s+(.+)$/);
+        if (item) {
+          const tag = item[1] ? "ol" : "ul";
+          if (list?.tagName.toLowerCase() !== tag) {
+            list = node(tag); if (item[1]) list.start = Number(item[1]); value.append(list);
+          }
+          const entry = node("li"); inline(entry, item[2]); list.append(entry); paragraph = null;
+        } else if (heading) {
+          const title = node(`h${heading[1].length}`); inline(title, heading[2]); value.append(title); paragraph = list = null;
+        } else {
+          list = null;
+          if (!paragraph) { paragraph = node("p"); value.append(paragraph); }
+          else paragraph.append(node("br"));
+          inline(paragraph, line);
+        }
+      }
+    }
+    return value;
+  }
   function persist() {
     try { localStorage.setItem(storageKey, JSON.stringify(saved)); }
     catch { status("浏览器未允许保存会话编号，刷新后可能无法自动恢复。", true); }
@@ -128,12 +178,28 @@
       message.append(node("p", "", text)); history.append(message);
     }
   }
-  function gapList(values) {
-    if (!Array.isArray(values) || !values.length) return null;
-    const details = node("details", "oa-gaps");
-    details.append(node("summary", "", `部分资料尚不完整 · ${values.length} 项`));
-    for (const gap of values) details.append(node("div", "", typeof gap === "string" ? gap :
-      [gap.name, gap.message || gap.reason || "资料暂不可读取"].filter(Boolean).join("：")));
+  function gapList(values, summary, conversationCount) {
+    let groups = summary;
+    if (!Array.isArray(groups) || !groups.length) {
+      const reasons = new Map(), conversations = new Set();
+      for (const gap of Array.isArray(values) ? values : []) {
+        const reason = typeof gap === "string" ? gap : gap.message || gap.reason || "资料暂不可读取";
+        if (!reasons.has(reason)) reasons.set(reason, {reason, chats: new Set(), items: 0});
+        const group = reasons.get(reason);
+        if (gap.chat_id) { group.chats.add(gap.chat_id); conversations.add(gap.chat_id); }
+        else group.items += Number.isFinite(gap.count) && gap.count > 0 ? gap.count : 1;
+      }
+      groups = [...reasons.values()].map(group => ({reason: group.reason, conversations: group.chats.size, items: group.items}));
+      conversationCount = conversations.size;
+    }
+    if (!groups.length) return null;
+    const counts = (conversations, items) => [conversations > 0 ? `${conversations} 个会话` : "",
+      items > 0 ? `${items} 项记录` : ""].filter(Boolean).join(" · ");
+    const details = node("details", "oa-gaps"), items = groups.reduce((total, group) => total + (group.items || 0), 0);
+    const total = counts(conversationCount, items);
+    details.append(node("summary", "", `部分资料尚不完整${total ? ` · ${total}` : ""}`));
+    for (const group of groups) details.append(node("div", "", [group.reason || "资料暂不可读取",
+      counts(group.conversations, group.items)].filter(Boolean).join(" · ")));
     return details;
   }
   function sourceLayout() {
@@ -170,7 +236,7 @@
           content.append(item);
         }
         if (!value.messages?.length) content.append(node("p", "oa-coverage", "当前没有可读取的原文。"));
-        const gaps = gapList(value.gaps); if (gaps) content.append(gaps);
+        const gaps = gapList(value.gaps, value.gap_summary, value.gap_conversation_count); if (gaps) content.append(gaps);
         content.scrollTop = 0;
       } catch (error) { if (!denied && version === sourceVersion) content.replaceChildren(node("p", "oa-gaps", error.message)); }
     });
@@ -328,7 +394,7 @@
       if (coverage.scan_complete === false) card.append(node("p", "oa-coverage", "扫描尚未结束，可继续下一页。"));
       if (coverage.source_complete === false) card.append(node("p", "oa-coverage", "来源覆盖不完整，未命中不代表没有发生。"));
     }
-    const gaps = gapList(data.gaps); if (gaps) card.append(gaps);
+    const gaps = gapList(data.gaps, data.gap_summary, data.gap_conversation_count); if (gaps) card.append(gaps);
     if (data.checked_at) card.append(node("p", "oa-coverage", `查询于 ${date(data.checked_at)}`));
     if (data.next_cursor && data.query_ref) {
       const actions = node("div", "oa-card-actions");
@@ -342,7 +408,7 @@
       (previousDraft.dataset.edited === "true" || previousDraft.contains(document.activeElement));
     const focusedEditor = keepDraft && previousDraft.querySelector("textarea") === document.activeElement ? document.activeElement : null;
     const selection = focusedEditor ? [focusedEditor.selectionStart, focusedEditor.selectionEnd] : null;
-    container.replaceChildren(node("p", "oa-answer", result.answer || ""));
+    container.replaceChildren(answer(result.answer));
     scope({...result.scope, ...result.window});
     (result.events || []).forEach((event, index) => {
       const card = node("section", "oa-event"), meta = node("div", "oa-event-meta");
@@ -371,7 +437,7 @@
         draft.append(replace);
       }
     }
-    const gaps = gapList(result.gaps); if (gaps) container.append(gaps);
+    const gaps = gapList(result.gaps, result.gap_summary, result.gap_conversation_count); if (gaps) container.append(gaps);
     const coverage = result.coverage;
     if (coverage && typeof coverage === "object") {
       const counts = [];
