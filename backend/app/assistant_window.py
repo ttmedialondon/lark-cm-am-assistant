@@ -21,6 +21,7 @@ text_part标明同一长消息的连续片段和完整长度；保留片段中�
 未见回复不代表未解决；只在证据明确时描述已解决或未解决。批次不是部分授权，不询问权限或查询范围。
 只按系统提供的原因记录受限群、未同步消息或不可读附件，不猜测图片含义或授权问题。
 summary用中文简洁列出本段事项，最多6000字符；evidence_refs只列本段实际引用的消息编号。
+R编号只在当前批次有效，引用仅放evidence_refs，不在summary正文写编号。
 输入为已有分段摘要时，仅合并其中事实与引用，不增加事实，不丢失尚待跟进的事项。
 """
 
@@ -49,7 +50,7 @@ def pages(checkpoint, job):
 
 def begin(call, args):
     return {'call': call, 'args': {**args, 'cursor': None}, 'page_refs': [],
-            'seen_cursors': [], 'phase': 'collect'}
+            'seen_cursors': [], 'phase': 'collect', 'compact_refs': True}
 
 
 def add_page(checkpoint, job, result):
@@ -208,9 +209,31 @@ def summary_input(checkpoint, job):
         for message in messages:
             conversations.setdefault(message['chat_id'], {'chat_id': message['chat_id'],
                 'name': message.get('conversation_name'), 'messages': []})['messages'].append(message)
-        return {'conversations': list(conversations.values())}, {message['message_ref'] for message in messages}
-    summaries = [job['reduce_inputs'][index] for index in job['chunks'][job['chunk_index']]]
-    return {'summaries': summaries}, {ref for summary in summaries for ref in summary['evidence_refs']}
+        material = {'conversations': list(conversations.values())}
+        refs = list(dict.fromkeys(message['message_ref'] for message in messages))
+    else:
+        summaries = [job['reduce_inputs'][index] for index in job['chunks'][job['chunk_index']]]
+        material = {'summaries': summaries}
+        refs = list(dict.fromkeys(ref for summary in summaries for ref in summary['evidence_refs']))
+    if not job.get('compact_refs'):
+        return material, {ref: ref for ref in refs}  # Preserve responses from pre-release requests.
+    aliases = {ref: f'R{index + 1}' for index, ref in enumerate(refs)}
+    if job['phase'] == 'chunks':
+        for message in messages:
+            message['message_ref'] = aliases[message['message_ref']]
+    else:
+        material['summaries'] = [{**note, 'evidence_refs': [aliases[ref] for ref in note['evidence_refs']]}
+                                 for note in summaries]
+    return material, {alias: ref for ref, alias in aliases.items()}
+
+
+def summary_format(refs):
+    evidence = {'type': 'array', 'items': {'type': 'string', 'enum': list(refs)}} if refs else {
+        'type': 'array', 'items': {'type': 'string'}, 'maxItems': 0,
+    }
+    return {**SUMMARY_FORMAT, 'schema': {**SUMMARY_FORMAT['schema'], 'properties': {
+        **SUMMARY_FORMAT['schema']['properties'], 'evidence_refs': evidence,
+    }}}
 
 
 def accept_summary(job, response, allowed_refs):
@@ -223,9 +246,9 @@ def accept_summary(job, response, allowed_refs):
     if (set(note) != {'summary', 'evidence_refs'} or not isinstance(note['summary'], str)
             or not note['summary'].strip() or len(note['summary']) > SUMMARY_CHARS
             or not isinstance(refs, list) or not all(isinstance(ref, str) for ref in refs)
-            or not set(refs) <= allowed_refs):
+            or not set(refs) <= allowed_refs.keys()):
         raise ValueError('分段归纳引用或内容无效。')
-    job['summaries'].append({**note, 'evidence_refs': list(dict.fromkeys(refs))})
+    job['summaries'].append({**note, 'evidence_refs': list(dict.fromkeys(allowed_refs[ref] for ref in refs))})
     job['chunk_index'] += 1
     return job['chunk_index'] == len(job['chunks'])
 

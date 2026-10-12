@@ -23,7 +23,8 @@ ACTIVE = ('queued', 'running', 'waiting')
 ERRORS = {
     'cancelled': '已停止。', 'unknown': '请求结果未知，未自动重复调用。',
     'provider_error': 'AI 服务暂时不可用。', 'quota': '助手 API 配额不足。',
-    'invalid_output': 'AI 返回的结果无法使用。', 'permission': '账号连接或访问权限已变化，请检查当前连接。',
+    'invalid_output': '本轮分析结果未通过校验，请重新提问。',
+    'permission': '账号连接或访问权限已变化，请检查当前连接。',
     'source_changed': '资料在处理期间已变化，请重新提问；系统未自动重复调用 AI。',
     'disabled': '运营助手尚未启用。', 'step_limit': '本轮处理步骤已达上限。',
     'internal': '本轮处理未完成，请重新提问。',
@@ -406,7 +407,7 @@ def _save(conn, job, checkpoint, settings, *, status='queued', usage=None, respo
     conn.execute('UPDATE assistant_sessions SET updated_at=NOW() WHERE id=%s', (row['session_id'],))
 
 
-def _finish_error(job, settings, code, telemetry=None):
+def _finish_error(job, settings, code, telemetry=None, *, exception=None):
     with connection() as conn, conn.transaction():
         try:
             row = _fence(conn, job)
@@ -417,17 +418,32 @@ def _finish_error(job, settings, code, telemetry=None):
             if isinstance(value, int):
                 total[key] = total.get(key, 0) + value
         checkpoint = codec.decode(row['checkpoint_ciphertext'], settings) or {}
+        receipt = checkpoint.get('response_received') or next(iter(reversed(checkpoint.get('receipts', []))), {})
+        request_id = (telemetry or {}).get('openai_request_id') or receipt.get('telemetry', {}).get('openai_request_id')
+        location, seen, cause = None, set(), exception
+        while cause is not None and id(cause) not in seen:
+            seen.add(id(cause))
+            trace = cause.__traceback__
+            while trace is not None:
+                frame = trace.tb_frame.f_code
+                if '/app/' in frame.co_filename.replace('\\', '/'):
+                    location = {'file': frame.co_filename.replace('\\', '/').rsplit('/', 1)[-1],
+                                'function': frame.co_name, 'line': trace.tb_lineno}
+                trace = trace.tb_next
+            cause = cause.__cause__ or (cause.__context__ if not cause.__suppress_context__ else None)
         checkpoint['failure'] = {'code': code, 'stage': checkpoint.get('progress'),
             'model_steps': checkpoint.get('model_steps'),
-            'openai_request_id': (telemetry or {}).get('openai_request_id')}
+            'openai_request_id': request_id, 'error_type': type(exception).__name__ if exception else None,
+            'location': location}
         conn.execute('''UPDATE assistant_turns SET status=%s,error_code=%s,usage=%s::jsonb,
             checkpoint_ciphertext=%s,
             response_id=COALESCE(%s,response_id),lease_until=NULL,finished_at=NOW() WHERE id=%s''',
             ('unknown' if code == 'unknown' else 'failed', code, json.dumps(total),
              codec.encode(checkpoint, settings), (telemetry or {}).get('response_id'), job['id']))
         _stop_dependents(conn, job['id'])
-        logging.getLogger(__name__).warning('assistant_failed turn=%s code=%s stage=%s steps=%s',
-            job['id'], code, checkpoint.get('progress'), checkpoint.get('model_steps'))
+        logging.getLogger(__name__).warning('assistant_failed turn=%s code=%s type=%s location=%s stage=%s steps=%s',
+            job['id'], code, checkpoint['failure']['error_type'], location,
+            checkpoint.get('progress'), checkpoint.get('model_steps'))
 
 
 def claim():
@@ -612,7 +628,11 @@ def _apply_response(conn, row, job, checkpoint, settings, context):
     if checkpoint.pop('summary_request', None):
         window = checkpoint['window_job']
         _, allowed_refs = windows.summary_input(checkpoint, window)
-        if windows.accept_summary(window, response, allowed_refs):
+        try:
+            complete = windows.accept_summary(window, response, allowed_refs)
+        except ValueError as exc:
+            raise api.ModelOutputError('invalid window summary') from exc
+        if complete:
             supplied = windows.reduce_or_finish(checkpoint, window)
             if supplied is not None:
                 _complete_window(checkpoint, supplied)
@@ -631,10 +651,21 @@ def _apply_response(conn, row, job, checkpoint, settings, context):
         checkpoint['progress'] = '读取记录'
         _save(conn, job, checkpoint, settings)
     else:
-        final = json.loads(response['text'])
+        try:
+            final = json.loads(response['text'])
+        except ValueError as exc:
+            raise api.ModelOutputError('invalid final JSON') from exc
+        if not isinstance(final, dict):
+            raise api.ModelOutputError('invalid final shape')
         if checkpoint.get('window_refs'):
             final['data_refs'] = list(dict.fromkeys([*final.get('data_refs', []), *checkpoint['window_refs']]))
-        result = tools.build_result(conn, row['actor_id'], row, final, settings, context, checkpoint['tool_results'])
+        try:
+            result = tools.build_result(conn, row['actor_id'], row, final, settings, context,
+                                        checkpoint['tool_results'])
+        except tools.SourceChangedError:
+            raise
+        except ValueError as exc:
+            raise api.ModelOutputError('invalid final references') from exc
         checkpoint['progress'] = ''
         _save(conn, job, checkpoint, settings, status='completed', final=final)
         selection = {'cm_id': result['scope']['cm_id']}
@@ -737,9 +768,11 @@ def step(job, settings):
         tools.validate_tool_results(conn, row['actor_id'], row, checkpoint['tool_results'], settings, context)
         cfg = _config(conn)
         if window:
-            segment, _ = windows.summary_input(checkpoint, window)
+            segment, allowed_refs = windows.summary_input(checkpoint, window)
             model_items = [{'role': 'user', 'content': windows.encoded(segment)}]
-            model_instructions, model_tools, model_format = windows.SUMMARY_INSTRUCTIONS, [], windows.SUMMARY_FORMAT
+            model_instructions, model_tools = windows.SUMMARY_INSTRUCTIONS, []
+            model_format = (windows.summary_format(allowed_refs) if window.get('compact_refs')
+                            else windows.SUMMARY_FORMAT)
             checkpoint['summary_request'] = True
             checkpoint['summary_steps'] = checkpoint.get('summary_steps', 0) + 1
         else:
@@ -802,18 +835,16 @@ def run(job, settings):
         step(job, settings)
     except api.OpenAIRequestError as exc:
         code = 'unknown' if exc.request_unknown else 'quota' if exc.is_quota else 'provider_error'
-        _finish_error(job, settings, code, exc.telemetry)
+        _finish_error(job, settings, code, exc.telemetry, exception=exc)
         if exc.retry_after_seconds is not None and not exc.is_quota:
             ai_dispatch.throttle(exc.retry_after_seconds)
     except api.ModelOutputError as exc:
-        _finish_error(job, settings, 'invalid_output', exc.telemetry)
-    except tools.SourceChangedError:
-        _finish_error(job, settings, 'source_changed')
-    except PermissionError:
-        _finish_error(job, settings, 'permission')
+        _finish_error(job, settings, 'invalid_output', exc.telemetry, exception=exc)
+    except tools.SourceChangedError as exc:
+        _finish_error(job, settings, 'source_changed', exception=exc)
+    except PermissionError as exc:
+        _finish_error(job, settings, 'permission', exception=exc)
     except LookupError:
         return
-    except (ValueError, KeyError, TypeError):
-        _finish_error(job, settings, 'invalid_output')
-    except Exception:
-        _finish_error(job, settings, 'internal')
+    except Exception as exc:
+        _finish_error(job, settings, 'internal', exception=exc)

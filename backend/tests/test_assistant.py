@@ -1,5 +1,6 @@
 import json
 from contextlib import nullcontext
+from copy import deepcopy
 from datetime import timedelta
 from uuid import uuid4
 
@@ -48,6 +49,8 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
     monkeypatch.setattr(assistant_search, 'WINDOW_PAGE_SIZE', 1)
     monkeypatch.setattr(assistant_window, 'INPUT_CHARS', 3_200)
     monkeypatch.setattr(assistant, 'MAX_MODEL_STEPS', 1)
+    empty_evidence = assistant_window.summary_format({})['schema']['properties']['evidence_refs']
+    assert empty_evidence['maxItems'] == 0 and 'enum' not in empty_evidence['items']
     calls, parts, raw_ids = [], [], set()
 
     def model(_cfg, _key, items, _actor, **kwargs):
@@ -57,6 +60,10 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
             assert len(assistant_window.encoded(segment)) <= assistant_window.INPUT_CHARS + 20
             messages = [message for conversation in segment.get('conversations', [])
                         for message in conversation['messages']]
+            refs_in_input = {message['message_ref'] for message in messages} if messages else {
+                ref for note in segment['summaries'] for ref in note['evidence_refs']}
+            enum = kwargs['output_format']['schema']['properties']['evidence_refs']['items']['enum']
+            assert refs_in_input == set(enum) and all(ref.startswith('R') and ref[1:].isdigit() for ref in enum)
             raw_ids.update(message['message_id'] for message in messages)
             for message in messages:
                 if message['message_id'] == 'window-0':
@@ -85,6 +92,23 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
     for _ in range(60):
         finish(chat)
         value = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
+        row = assistant._turn(pg, chat.ids['cm'], turn['id'])
+        checkpoint = summary_dialogues.decode(row['checkpoint_ciphertext'], chat.settings)
+        window = checkpoint.get('window_job')
+        if window and window.get('summaries'):
+            _material, refmap = assistant_window.summary_input(checkpoint, window)
+            canonical = {message['message_ref'] for page in assistant_window.pages(checkpoint, window)
+                         for message in page['messages']}
+            assert all(set(note['evidence_refs']) <= canonical for note in window['summaries'])
+            bad_job = deepcopy(window)
+            with pytest.raises(ValueError, match='引用或内容无效'):
+                assistant_window.accept_summary(bad_job, {'text': json.dumps({
+                    'summary': '不得丢掉未知引用然后照搬结论。', 'evidence_refs': [*refmap, 'R999999'],
+                }), 'output': []}, refmap)
+            assert bad_job == window
+            legacy = {**window, 'compact_refs': False}
+            _material, legacy_refs = assistant_window.summary_input(checkpoint, legacy)
+            assert all(ref == target and ref in canonical for ref, target in legacy_refs.items())
         progress.append(value['progress'])
         if value['status'] not in assistant.ACTIVE:
             break
@@ -450,7 +474,7 @@ def test_model_first_lookup_replay_history_and_actor_isolation(pg, chat, monkeyp
         assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
 
 
-def test_unknown_and_stopped_requests_never_replay_provider(pg, chat, monkeypatch):
+def test_unknown_and_stopped_requests_never_replay_provider(pg, chat, monkeypatch, caplog):
     calls = []
 
     def timeout(*args, **kwargs):
@@ -475,6 +499,28 @@ def test_unknown_and_stopped_requests_never_replay_provider(pg, chat, monkeypatc
     assistant.run(job, chat.settings)
     assert len(calls) == 1
     assert assistant.turn_view(pg, chat.ids['cm'], stopped['id'], chat.settings)['status'] == 'cancelled'
+
+    # Local result assembly is not a model-output failure, and diagnostics never include text or exception args.
+    def accepted(*args, **kwargs):
+        calls.append(True)
+        return {'text': json.dumps({'answer': 'PRIVATE_MODEL_ANSWER', 'event_refs': [], 'result_refs': [],
+            'draft_ref': None}), 'output': [], 'usage': {'input_tokens': 7, 'output_tokens': 2},
+            'response_id': 'resp-diagnostic', 'telemetry': {'openai_request_id': 'req-diagnostic'}}
+    def broken_result(*args, **kwargs):
+        raise TypeError('PRIVATE_BACKEND_CONTEXT must not enter diagnostics')
+    monkeypatch.setattr(openai_client, 'call_openai_tools', accepted)
+    monkeypatch.setattr(assistant.tools, 'build_result', broken_result)
+    local = assistant.submit(pg, chat.ids['cm'], payload('检查异常诊断'), chat.settings)
+    finish(chat)
+    local_row = assistant._turn(pg, chat.ids['cm'], local['id'])
+    failure = summary_dialogues.decode(local_row['checkpoint_ciphertext'], chat.settings)['failure']
+    assert local_row['error_code'] == 'internal' and local_row['result_ciphertext'] is None
+    assert failure['error_type'] == 'TypeError' and failure['location']['file'] == 'assistant.py'
+    assert failure['location']['function'] == '_apply_response' and failure['location']['line'] > 0
+    assert failure['openai_request_id'] == 'req-diagnostic'
+    assert local_row['usage'] == {'input_tokens': 7, 'output_tokens': 2} and len(calls) == 2
+    for private in ('PRIVATE_MODEL_ANSWER', 'PRIVATE_BACKEND_CONTEXT'):
+        assert private not in json.dumps(failure) and private not in caplog.text
 
 
 def test_waiting_releases_slot_and_resume_returns_original_call_id(pg, chat, monkeypatch):
