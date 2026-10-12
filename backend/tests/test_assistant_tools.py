@@ -281,11 +281,21 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
         "all-unconfirmed", "latest-answer", "latest-parent"}
     assert prepared["context"]["chat_url"].endswith("openChatId=business")
     assert "unrelated outsider secret" not in json.dumps(prepared)
+    model_context = tools.public_query(prepared, for_model=True)["context"]
+    assert all("message_ref" not in item and "evidence_ref" not in item
+               for item in [model_context["message"], *model_context["messages"]])
+    assert prepared["context"]["message"]["message_ref"] == continuation_ref
     draft_args = {"draft_ref": prepared["draft_ref"], "outcome": "ready", "language": "en",
         "draft": "I'll check and get back to you.", "chinese_translation": "我确认后回复你。",
         "explanation": "不编造尚未确认的进度。", "checks": ["确认能执行后续核查。"],
         "evidence_refs": [prepared["context"]["messages"][0]["ref"]]}
     draft = run("save_reply_draft", draft_args)
+    source_draft = run("save_reply_draft", {**draft_args, "evidence_refs": [continuation_ref]})
+    assert source_draft["draft"]["evidence"] and all(
+        (item["chat_id"], item["message_id"]) == ("business", "all-unconfirmed")
+        for item in source_draft["draft"]["evidence"])
+    with pytest.raises(ValueError, match="依据"):
+        run("save_reply_draft", {**draft_args, "evidence_refs": [app_ref]})
     assert not tools.reply_status(pg, s.ids["cm"], draft["draft_ref"], s.settings)["new_messages"]
     rendered = tools.build_result(pg, s.ids["cm"], turn, {
         "answer": "回复草稿已准备。", "event_refs": [], "result_refs": [], "data_refs": [],

@@ -307,23 +307,31 @@ def test_model_prepares_saves_and_returns_message_draft_without_child_job(pg, ch
                 'draft_ref': None, 'edited_draft': None, 'action': 'generate',
                 'instruction': None, 'language': 'en'}
         else:
+            correcting = latest.get('error_code') == 'invalid_tool_input'
+            if correcting:
+                assert '依据' in latest['error'] and '权限' not in latest['error']
+                latest = next(output for output in outputs if output.get('kind') == 'reply_material')
             assert latest['kind'] == 'reply_material'
             assert latest['context']['chat_url'] and latest['context']['is_full_conversation'] is False
             name, args = 'save_reply_draft', {'draft_ref': latest['draft_ref'], 'outcome': 'ready', 'language': 'en',
                 'draft': "I'll check the dispatch status and get back to you once I have confirmation.",
                 'chinese_translation': '我会确认发货状态，确认后回复你。', 'explanation': '不编造发货日期。',
-                'checks': ['确认能够执行后续核查。'], 'evidence_refs': [latest['context']['messages'][0]['ref']]}
+                'checks': ['确认能够执行后续核查。'],
+                'evidence_refs': [latest['source_ref'] if correcting else 'm.not-owned']}
         return {'text': '', 'output': [{'type': 'function_call', 'call_id': f'call-{len(calls)}',
             'name': name, 'arguments': json.dumps(args)}], 'usage': {}}
 
     monkeypatch.setattr(openai_client, 'call_openai_tools', model)
     turn = assistant.submit(pg, chat.ids['cm'], payload('找到发货询问并准备英文回复'), chat.settings)
-    for _ in range(10):
+    for _ in range(12):
         finish(chat)
         view = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
         if view['status'] not in assistant.ACTIVE:
             break
-    assert view['status'] == 'completed' and len(calls) == 4
+    assert view['status'] == 'completed' and len(calls) == 5
+    stored = assistant._turn(pg, chat.ids['cm'], turn['id'])
+    assert summary_dialogues.decode(stored['checkpoint_ciphertext'], chat.settings)['tool_errors'] == [
+        {'tool': 'save_reply_draft', 'code': 'invalid_tool_input'}]
     assert view['result']['scope']['audience'] == 'all'
     assert view['result']['draft']['outcome'] == 'ready' and view['result']['draft']['checks']
     assert view['result']['draft']['context']['message']['message_id'] == 'outside'

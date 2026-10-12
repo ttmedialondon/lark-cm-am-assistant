@@ -67,12 +67,12 @@ TOOLS = [
                "instruction": _NULL_STRING, "language": _NULL_STRING}),
     _function("save_reply_draft", "保存基于draft_reply真实材料的草稿，不发送或修改业务状态。"
               "缺少未确认事实时可写核查后告知的实用回复并在checks提示；不能编造日期、付款、发货或政策。"
-              "evidence_refs仅引用准备材料里的R编号。",
+              "evidence_refs优先引用准备材料里的R编号；source_ref仅可引用当前目标消息，不能引用其他消息编号。",
               {"draft_ref": _STRING, "outcome": {"type": "string", "enum": ["ready", "verify"]},
                "language": {"type": "string", "enum": ["en", "zh", "other"]},
                "draft": _STRING, "chinese_translation": _STRING, "explanation": _STRING,
                "checks": {"type": "array", "items": _STRING, "maxItems": 20},
-               "evidence_refs": {"type": "array", "items": _STRING, "maxItems": 100}}),
+               "evidence_refs": {"type": "array", "items": {"type": "string", "maxLength": 2048}, "maxItems": 100}}),
     _function("query_creators", "查询正式达人资料和维护名单：姓名/handle、多个负责人、多个账号、重要度、最近联系。"
               "importance可筛选重点/优先/常规/久未联系/待评估；query=null查全部，cursor继续下一页。",
               {"query": _NULL_STRING, "importance": _choice(["focus", "priority", "normal", "dormant", "pending"]),
@@ -472,13 +472,13 @@ def _validate_reply_material(conn, actor_id, result, settings, context, *, turn=
         current = _saved_message(conn, actor_id, source["ref"], settings, turn=turn)
         # Re-sealing a compact reference changes its nonce, not its authenticated scope.
         if assistant_search._open(current, "m.", settings) != assistant_search._open(source["source"], "m.", settings):
-            raise ValueError("消息引用已变化。")
+            raise SourceChangedError("消息引用已变化。")
     else:
         _event_id(conn, actor_id, source["ref"], settings, context)
     fresh = assistant_replies.material(conn, actor_id, context, source, settings,
                                       cutoff=saved["context"]["checked_at"])
     if fresh["fingerprint"] != saved["context"]["fingerprint"]:
-        raise ValueError("回复依据已变化，请重新生成。")
+        raise SourceChangedError("回复依据已变化，请重新生成。")
     return fresh
 
 
@@ -533,12 +533,21 @@ def _save_reply(conn, actor_id, turn, args, settings, context):
         raise ValueError("请先准备本轮的回复材料。")
     prepared = _saved_reply(conn, actor_id, turn, args["draft_ref"], settings)
     material = _validate_reply_material(conn, actor_id, prepared, settings, context, turn=turn)
+    saved = prepared["_reply_material"]
     known = {item["ref"]: item for item in material["messages"]}
-    if not args["evidence_refs"] or not set(args["evidence_refs"]) <= known.keys():
+    target = material["message"]
+    target_refs = [ref for ref, item in known.items()
+                   if target.get("chat_id") and target.get("message_id")
+                   and (item.get("chat_id"), item.get("message_id")) == (target["chat_id"], target["message_id"])]
+    evidence_refs = []
+    for ref in args["evidence_refs"]:
+        if ref == saved["source"]["ref"] and not target_refs:
+            raise ValueError("草稿引用了未取得的依据。")
+        evidence_refs.extend(target_refs if ref == saved["source"]["ref"] else [ref])
+    if not evidence_refs or not set(evidence_refs) <= known.keys():
         raise ValueError("草稿引用了未取得的依据。")
     if any(len(args[key].encode()) > 100_000 for key in ("draft", "chinese_translation", "explanation")):
         raise ValueError("草稿正文过长。")
-    saved = prepared["_reply_material"]
     draft = {key: args[key] for key in ("outcome", "language", "draft", "chinese_translation", "explanation", "checks")}
     if saved["request"]["action"] == "translate":
         draft.update(draft=saved["request"]["edited_draft"], outcome="ready",
@@ -553,7 +562,7 @@ def _save_reply(conn, actor_id, turn, args, settings, context):
     source = saved["source"]
     draft.update(draft_ref=args["draft_ref"], source_ref=source["ref"], **{source["kind"] + "_ref": source["ref"]},
                  context={key: value for key, value in material.items() if key != "fingerprint"},
-                 evidence=[known[ref] for ref in dict.fromkeys(args["evidence_refs"])],
+                 evidence=[known[ref] for ref in dict.fromkeys(evidence_refs)],
                  checked_at=material["checked_at"])
     return {"kind": "reply_draft", "draft_ref": args["draft_ref"], "status": "completed",
             "source_ref": source["ref"], source["kind"] + "_ref": source["ref"],
@@ -579,6 +588,13 @@ def public_query(result, *, for_model=False):
     if isinstance(value.get("comparison"), dict):
         value["comparison"] = {key: item for key, item in value["comparison"].items()
                                if key not in {"source_chat_ids", "rows"}}
+    if for_model and value.get("kind") == "reply_material":
+        context = value["context"]
+        value["context"] = {**context, "message": {key: item for key, item in context["message"].items()
+                                                  if key not in {"message_ref", "evidence_ref"}},
+                            "messages": [{key: item for key, item in message.items()
+                                          if key not in {"message_ref", "evidence_ref"}}
+                                         for message in context["messages"]]}
     if isinstance(value.get("gaps"), list):
         value["gap_count"] = len(value["gaps"])
         groups, conversations = {}, set()

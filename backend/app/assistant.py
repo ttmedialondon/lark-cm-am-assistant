@@ -686,10 +686,14 @@ def step(job, settings):
                                                call['name'], args, settings, context)
                         if not result.get('waiting'):
                             checkpoint['tool_cache'][cache_key] = result
-                except (PermissionError, LookupError, ValueError):
+                except (PermissionError, LookupError, ValueError) as exc:
                     if checkpoint.get('window_job'):
                         raise
-                    result = {'error': '参数、权限或资料已变化，请使用当前可见范围重新查询。'}
+                    code = ('permission' if isinstance(exc, PermissionError) else
+                            'source_changed' if isinstance(exc, tools.SourceChangedError) else
+                            'source_not_found' if isinstance(exc, LookupError) else 'invalid_tool_input')
+                    checkpoint.setdefault('tool_errors', []).append({'tool': call['name'], 'code': code})
+                    result = {'error': str(exc), 'error_code': code}
                 if result.get('waiting'):
                     checkpoint['waiting'] = result['waiting']
                     checkpoint['waiting_cache_key'] = cache_key
