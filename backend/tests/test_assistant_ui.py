@@ -141,9 +141,9 @@ const {chromium} = require('playwright');
   const browser = await chromium.launch({headless:true, channel:'chrome'});
   try {
     const page = await browser.newPage({viewport:{width:1280,height:900}});
-    const errors = [], posts = [], remiId='22222222-2222-4222-8222-222222222222';
+    const errors = [], posts = [], sourceReads = [], remiId='22222222-2222-4222-8222-222222222222';
     let view, html = input.html, failFirstPost = true, scopeReads=0, sessionGone=false, turnsEmpty=false;
-    let holdEvidence=false, denyEvidence=false, evidenceStarted, olderTurns=[];
+    let holdEvidence=false, denyEvidence=false, evidenceStarted, olderTurns=[], newDraftMessages=false;
     const pendingEvidence=[];
     const ownId=()=>html.match(/data-user-id="([^"]+)"/)[1];
     page.on('pageerror', error => errors.push(error.message));
@@ -155,6 +155,7 @@ const {chromium} = require('playwright');
         emit(name,value) { this.dispatchEvent(new MessageEvent(name,{data:JSON.stringify(value)})); }
       };
       Object.defineProperty(navigator, 'clipboard', {value:{writeText:async text => {window.copied=text;}}});
+      window.open = url => { window.opened=url; };
     });
     await page.route('**/*', async route => {
       const url = new URL(route.request().url());
@@ -182,6 +183,19 @@ const {chromium} = require('playwright');
       if (url.pathname.includes('/sessions/')) return route.fulfill(sessionGone?
         {status:404,json:{error:'对话不存在或无权查看。'}}:
         {json:{id:view.session_id,turns:turnsEmpty?[]:[...olderTurns,view]}});
+      if (url.pathname.startsWith('/assistant/sources/')) {
+        sourceReads.push(url.searchParams.get('page'));
+        if (url.pathname.includes('q.search')) return route.fulfill({json:{kind:'messages',query_ref:'q.search',
+          messages:[{conversation_name:'普通消息群',sender_name:'商家',
+            message_ref:'u.fixture.message',text:'Search continuation.'}],
+          coverage:{matched:1,scanned:25,readable:25},has_more:false}});
+        return route.fulfill({json:{page:Number(url.searchParams.get('page')),page_count:4,has_more:true,
+          total_messages:353,messages:[{conversation_name:'商家客服群',sender_name:'未分类商家',
+            message_ref:'m.fixture.second',text:'Can you check the dispatch status?',
+            time:'2026-10-12T09:00:00Z'}],gaps:[]}});
+      }
+      if (url.pathname.startsWith('/assistant/drafts/')) return route.fulfill({
+        json:{new_messages:newDraftMessages,checked_at:'2026-10-12T11:00:00Z'}});
       if (url.pathname.includes('/evidence/')) {
         if (denyEvidence) return route.fulfill({status:403,json:{error:'查看权限已变化。'}});
         if (holdEvidence) {evidenceStarted?.(); await new Promise(resolve=>pendingEvidence.push(resolve));}
@@ -257,7 +271,7 @@ const {chromium} = require('playwright');
     assert.match(await page.locator('.oa-message--assistant > .oa-coverage').textContent(),
       /负责达人 201 位 · 匹配事项 12 项 · 部分结果/);
     assert.match(await page.locator('.oa-scope').textContent(),/全部授权消息/);
-    assert.match(await page.locator('.oa-data').textContent(),/本页 1 条.*时段 20 条/);
+    assert.match(await page.locator('.oa-data').textContent(),/来源 · 20 条消息/);
     assert.equal(await page.locator('.oa-data details.oa-coverage').getAttribute('open'),null);
     assert.equal(await page.locator('.oa-data .oa-gaps summary').textContent(),
       '部分资料尚不完整 · 1272 个会话 · 5 项记录');
@@ -267,8 +281,8 @@ const {chromium} = require('playwright');
     assert.equal(await page.locator('.oa-data .oa-gap-names').textContent(),
       '会话：受限群一、<img src=x onerror=alert(1)>、群三、群四、群五；另有 1267 个会话');
     assert.equal(await page.locator('.oa-data .oa-gaps img').count(),0);
-    assert.equal(await page.locator('.oa-hit strong, .oa-hit a').count(),0);
-    assert.match(await page.locator('.oa-hit').textContent(),/\*\*本人原文\*\*/);
+    assert.equal(await page.locator('.oa-source-page strong, .oa-source-page a').count(),0);
+    assert.match(await page.locator('.oa-source-page').textContent(),/\*\*本人原文\*\*/);
     assert.equal(await page.locator('.oa-draft textarea').inputValue(),'**I will check.**');
     await page.locator('.oa-event .oa-evidence').click(); await page.locator('#oa-sources-body blockquote').waitFor();
     assert.equal(await page.locator('#oa-sources-body img').count(),0);
@@ -276,10 +290,12 @@ const {chromium} = require('playwright');
     assert.match(await page.locator('#oa-sources-body blockquote').textContent(),/\*\*本人原文\*\*/);
     await page.locator('#oa-sources-close').click();
     await page.locator('#oa-sources').waitFor({state:'hidden'});
+    await page.getByRole('button',{name:'查看回复草稿',exact:true}).click();
     await page.locator('.oa-draft textarea').fill('Edited reply');
     await page.getByRole('button',{name:'复制回复',exact:true}).click();
     await page.waitForFunction(() => window.copied==='Edited reply');
     assert.equal(posts.length,2);
+    await page.locator('#oa-reply-close').click();
     await page.reload(); await page.locator('#oa-launcher').click(); await page.locator('.oa-event').waitFor();
     assert.equal(posts.length,2);
     await page.locator('#oa-input').fill('再看最新进展');
@@ -423,10 +439,170 @@ const {chromium} = require('playwright');
     assert.equal(await page.locator('#oa-person').isHidden(),true);
     assert.equal(await page.locator('#oa-cm').inputValue(),ownId());
     assert.equal(await page.locator('.oa-event').count(),0); assert(!reads.some(url=>url.includes(previous)));
+
+    // Complete worklist, non-AI source pagination, arbitrary message drafts, and hand-edited translation.
+    const postCount=posts.length;
+    assert.equal(await page.locator('[data-quick]').count(),3);
+    await page.locator('[data-quick="today"]').click();
+    await page.waitForFunction(()=>window.sources.length===1);
+    assert.equal(posts.length,postCount+1); assert.equal(posts.at(-1).body.context.audience,'all');
+    assert.equal(posts.at(-1).body.context.event_ref,null);
+    const fullResult={answer:'找到 12 项事项，已按重要度排序。',
+      scope:{cm_id:ownId(),cm_name:'CM',audience:'all',reply_status:'unreplied',sort:'importance'},
+      events:Array.from({length:12},(_,i)=>({event_ref:`event-${i}`,title:`事项 ${i+1}`,creator_name:`达人 ${i+1}`,
+        action_group:i===9?'followup':i===10?'waiting':i===11?'closed':'reply',reply_status:i===10?'replied':'unreplied',
+        handling_status:i===11?'resolved':'unresolved',summary:'请核对当前情况。',
+        importance:{tier:i<3?'focus':'normal'},deadline_day:i===0?'2026-10-12':null,due_today:i===0,
+        waiting_seconds:3600,conversations:[{name:'客服群',type:'group'}]})),
+      data:[{kind:'window_messages',query_ref:'q.fixture',source_url:'/assistant/sources/q.fixture?page=1',
+        page:1,page_count:4,has_more:true,total_messages:353,total_conversations:43,
+        messages:[{conversation_name:'客服群',sender_name:'达人',message_ref:'m.fixture.first',text:'First source.'}]},
+        {kind:'messages',query_ref:'q.search',next_source_url:'/assistant/sources/q.search?page=2&cursor=fixture',
+          messages:[{conversation_name:'普通消息群',sender_name:'商家',
+            message_ref:'m.fixture.search',text:'Matching source.'}]}]};
+    const deliver=async result=>{view={...view,status:'completed',result}; await page.evaluate(value=>{
+      window.sources.at(-1).emit('result',value); window.sources.at(-1).emit('done',{status:'completed'});},result);};
+    const nextStream=async action=>{const count=await page.evaluate(()=>window.sources.length);
+      await action(); await page.waitForFunction(count=>window.sources.length===count+1,count);};
+    await deliver(fullResult);
+    assert.equal(await page.locator('.oa-event').count(),12);
+    assert.equal(await page.locator('.oa-event[open]').count(),8);
+    assert.equal(await page.locator('.oa-event-group').count(),4);
+    assert.equal(await page.locator('.oa-deadline').textContent(),'今天截止');
+    assert.match(await page.locator('#oa-scope').textContent(),/未回复.*重要度优先/);
+    assert.equal(await page.locator('.oa-event-group').last().getAttribute('open'),null);
+    assert.match(await page.locator('.oa-event-group').last().textContent(),/已解决／无需处理.*未见回复.*已解决/);
+    assert.equal(await page.locator('.oa-source-entry').count(),1);
+    await page.reload(); await page.locator('#oa-launcher').click();
+    await page.locator('.oa-event').first().waitFor();
+    assert.match(await page.locator('#oa-scope').textContent(),/未回复.*重要度优先/);
+    assert.equal(posts.length,postCount+1);
+    await page.locator('.oa-source-entry > details > summary').click();
+    await page.locator('.oa-source-pagination').getByRole('button',{name:'下一页',exact:true}).click();
+    await page.waitForFunction(()=>document.querySelector('.oa-source-pagination').textContent.includes('第 2 / 4 页'));
+    assert.deepEqual(sourceReads,['2']); assert.equal(posts.length,postCount+1);
+    await page.locator('.oa-data[data-query-ref="q.search"]').getByRole('button',{name:'下一页',exact:true}).click();
+    await page.waitForFunction(()=>document.querySelector('.oa-data[data-query-ref="q.search"]')
+      .textContent.includes('Search continuation.'));
+    assert.deepEqual(sourceReads,['2','2']); assert.equal(posts.length,postCount+1);
+    assert.equal(await page.locator('.oa-data[data-query-ref="q.search"] .oa-reply-action').count(),1);
+    await page.locator('#oa-fullscreen').click();
+    olderTurns=[view];
+    await nextStream(()=>page.locator('.oa-source-page .oa-reply-action').click());
+    assert.equal(posts.at(-1).body.context.message_ref,'m.fixture.second');
+    assert.equal(posts.at(-1).body.context.reply_action,'generate');
+    const draft={draft_ref:'d.fixture',message_ref:'m.fixture.second',source_ref:'m.fixture.second',language:'en',
+      draft:'I will check and get back to you.',chinese_translation:'我会核对后回复你。',
+      context:{chat_name:'商家客服群',chat_url:'https://applink.larksuite.com/client/chat/open?openChatId=oc_fixture',
+        message:{chat_name:'商家客服群',sender_name:'未分类商家',text:'Can you check the dispatch status?'},
+        messages:[{chat_name:'商家客服群',sender_name:'未分类商家',text:'Can you check the dispatch status?'}]},
+      checks:['请确认能完成这项跟进。']};
+    const draftResult={answer:'草稿已准备好。',scope:fullResult.scope,draft};
+    await deliver(draftResult); await page.locator('#oa-reply textarea').fill('I will check the status today.');
+    olderTurns.push(view);
+    await nextStream(()=>page.getByRole('button',{name:'更新中文',exact:true}).click());
+    assert.equal(posts.at(-1).body.context.edited_draft,'I will check the status today.');
+    assert.equal(posts.at(-1).body.context.reply_action,'translate');
+    await deliver({...draftResult,draft:{...draft,draft:'I will check the status today.',
+      chinese_translation:'我今天会核对状态。'}});
+    assert.equal(await page.locator('#oa-reply textarea').inputValue(),'I will check the status today.');
+    assert.equal(await page.locator('#oa-reply .oa-translation').textContent(),'我今天会核对状态。');
+    await page.locator('#oa-reply textarea').fill('My hand-edited reply.');
+    olderTurns.push(view);
+    await nextStream(()=>page.getByRole('button',{name:'更新中文',exact:true}).click());
+    await page.locator('#oa-reply textarea').fill('Later edit during translation.');
+    await deliver({...draftResult,draft:{...draft,draft:'My hand-edited reply.',chinese_translation:'旧快照的译文。'}});
+    assert.equal(await page.locator('#oa-reply textarea').inputValue(),'Later edit during translation.');
+    assert.equal(await page.locator('#oa-reply .oa-translation').textContent(),'我今天会核对状态。');
+    assert.match(await page.locator('.oa-translation-label').textContent(),/待更新/);
+    olderTurns.push(view);
+    await nextStream(()=>page.getByRole('button',{name:'更短',exact:true}).click());
+    await page.locator('#oa-reply textarea').fill('My hand-edited reply.');
+    await deliver({...draftResult,draft:{...draft,draft:'Short rewritten draft.'}});
+    assert.equal(await page.locator('#oa-reply textarea').inputValue(),'My hand-edited reply.');
+    assert.equal(await page.locator('.oa-draft-update').count(),1);
+    newDraftMessages=true;
+    await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
+    await page.locator('.oa-draft-new-message').waitFor();
+    assert.equal(posts.length,postCount+5);
+    assert.equal(await page.locator('#oa-reply textarea').inputValue(),'My hand-edited reply.');
+    assert.match(await page.locator('.oa-translation-label').textContent(),/待更新/);
+    olderTurns.push(view);
+    await nextStream(()=>page.getByRole('button',{name:'更新草稿',exact:true}).click());
+    await deliver({...draftResult,draft:{...draft,draft:'A new incoming suggestion.'}});
+    assert.equal(await page.locator('#oa-reply textarea').inputValue(),'My hand-edited reply.');
+    assert.equal(await page.locator('.oa-draft-update').count(),1);
+    await page.getByRole('button',{name:'复制并打开 Lark',exact:true}).click();
+    await page.waitForFunction(()=>window.copied==='My hand-edited reply.');
+    assert.equal(await page.evaluate(()=>window.opened),draft.context.chat_url);
+    assert.equal(await page.locator('.oa-copy-feedback a').getAttribute('href'),draft.context.chat_url);
+    assert.equal(await page.locator('.oa-copy-feedback a').getAttribute('rel'),'noopener noreferrer');
+    assert.equal(posts.length,postCount+6);
+    assert.match(await page.locator('.oa-copy-feedback').textContent(),/未发送/);
+    assert.match(await page.locator('.oa-translation-label').textContent(),/待更新/);
+    if (input.screenshot) await page.screenshot({path:input.screenshot.replace('.png','-reply.png'),fullPage:true});
+    await page.setViewportSize({width:390,height:844});
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth <=
+      document.documentElement.clientWidth),true);
+    if (input.screenshot) await page.screenshot({path:input.screenshot.replace('.png','-mobile.png'),fullPage:true});
+    await page.setViewportSize({width:1280,height:900});
+    olderTurns.push(view);
+    await nextStream(()=>page.locator('.oa-hit .oa-reply-action').click());
+    assert.equal(await page.locator('#oa-reply-title').textContent(),'商家客服群');
+    const secondDraft={...draft,draft_ref:'d.second',message_ref:'u.fixture.message',draft:'Reply to the second chat.',
+      context:{...draft.context,chat_name:'普通消息群',chat_url:'https://applink.larksuite.com/client/chat/open?openChatId=oc_second'}};
+    await deliver({...draftResult,draft:secondDraft});
+    assert.equal(await page.locator('#oa-reply-title').textContent(),'商家客服群');
+    assert.match(await page.locator('.oa-draft-update').textContent(),/普通消息群/);
+    await page.getByRole('button',{name:'复制并打开 Lark',exact:true}).click();
+    await page.waitForFunction(()=>window.opened.includes('oc_fixture'));
+    await page.locator('.oa-draft-update').click();
+    assert.equal(await page.locator('#oa-reply-title').textContent(),'普通消息群');
+    assert.equal(await page.locator('#oa-reply textarea').inputValue(),'Reply to the second chat.');
+    await page.locator('#oa-reply-close').click();
+    await page.getByRole('button',{name:'修改范围',exact:true}).click();
+    await page.locator('#oa-audience').selectOption('creators');
+    await page.locator('#oa-period').selectOption('custom');
+    await page.locator('#oa-start').fill('2026-10-11T00:00'); await page.locator('#oa-end').fill('2026-10-12T12:00');
+    await nextStream(()=>page.getByRole('button',{name:'应用并查询',exact:true}).click());
+    assert.equal(posts.at(-1).body.context.start,'2026-10-10T23:00:00.000Z');
+    assert.equal(posts.at(-1).body.context.end,'2026-10-12T11:00:00.000Z');
+    assert.equal(posts.at(-1).body.context.audience,'creators');
+    assert.match(posts.at(-1).body.message,/达人待回复事项/);
+    assert.equal(posts.at(-1).body.context.reply_action,undefined);
+    await deliver({...fullResult,scope:{...fullResult.scope,audience:'creators'},window:{
+      start:posts.at(-1).body.context.start,end:posts.at(-1).body.context.end}});
+    assert.match(await page.locator('#oa-scope').textContent(),/我的达人.*10\/11.*10\/12/);
+    if (input.screenshot) await page.screenshot({path:input.screenshot,fullPage:true});
+    const aliceScope={cm_id:ownId(),audience:'creators',creator_ids:['44444444-4444-4444-8444-444444444444'],
+      creator_names:['Alice'],chat_ids:['oc_alice'],chat_names:['Alice group'],event_ref:'alice-event'};
+    await page.evaluate(context=>document.dispatchEvent(new CustomEvent('ttmedia:assistant',
+      {detail:{context}})),aliceScope);
+    await page.waitForFunction(()=>document.getElementById('oa-scope').textContent.includes('Alice'));
+    await page.getByRole('button',{name:'修改范围',exact:true}).click();
+    await page.locator('#oa-period').selectOption('yesterday');
+    await nextStream(()=>page.getByRole('button',{name:'应用并查询',exact:true}).click());
+    assert.deepEqual(posts.at(-1).body.context.creator_ids,aliceScope.creator_ids);
+    assert.deepEqual(posts.at(-1).body.context.chat_ids,aliceScope.chat_ids);
+    assert.equal(posts.at(-1).body.context.event_ref,aliceScope.event_ref);
+    await deliver({answer:'Alice 的事项已整理。',scope:aliceScope,events:[],data:[],window:{
+      start:posts.at(-1).body.context.start,end:posts.at(-1).body.context.end}});
+    await page.getByRole('button',{name:'修改范围',exact:true}).click();
+    await page.locator('#oa-audience').selectOption('all');
+    await nextStream(()=>page.getByRole('button',{name:'应用并查询',exact:true}).click());
+    assert.equal(posts.at(-1).body.context.creator_ids,null);
+    assert.equal(posts.at(-1).body.context.chat_ids,null);
+    assert.equal(posts.at(-1).body.context.event_ref,null);
+    await deliver({answer:'全部授权消息已整理。',scope:{cm_id:ownId(),audience:'all'},events:[],data:[]});
+    await page.locator('#oa-input').fill('总结昨天整天');
+    await nextStream(()=>page.locator('#oa-input').press('Enter'));
+    assert.equal(posts.at(-1).body.context.start,undefined);
+    assert.equal(posts.at(-1).body.context.end,undefined);
     assert.deepEqual(errors,[]); console.log('assistant browser workflow passed');
   } finally {await browser.close();}
 })().catch(error=>{console.error(error);process.exit(1);});
 """
-    result = subprocess.run(["node", "-e", script], input=json.dumps({"html": html, "backend": str(BACKEND)}),
+    result = subprocess.run(["node", "-e", script], input=json.dumps({"html": html, "backend": str(BACKEND),
+                            "screenshot": os.environ.get("ASSISTANT_UI_SCREENSHOT")}),
                             text=True, capture_output=True, timeout=60, env=os.environ.copy())
     assert result.returncode == 0, result.stdout + result.stderr

@@ -133,6 +133,28 @@ def test_missing_media_and_multi_handle_do_not_invent_risk_or_duplicate_account(
 
 
 def test_reply_and_resolution_remain_independent_through_context_and_merge():
+    from app import assistant_worklist
+
+    first = {"chat_id": "one", "message_id": "first", "created_at": "2026-10-12T08:00:00+00:00",
+             "speaker": "U1", "is_staff": False, "text": "Please send the link by today"}
+    reminder = {**first, "message_id": "reminder", "created_at": "2026-10-12T09:00:00+00:00",
+                "text": "Any update?"}
+    metadata = assistant_worklist.decorate({"handling_status": "unresolved", "evidence": [first, reminder]},
+                                          "2026-10-12T10:00:00+00:00", today=datetime(2026, 10, 12).date())
+    assert metadata["waiting_since"] == first["created_at"] and metadata["waiting_seconds"] == 7200
+    assert metadata["due_today"] and metadata["action_group"] == "reply"
+    assert not assistant_worklist.decorate({"handling_status": "unresolved", "evidence": [first]},
+        "2026-10-12T10:00:00+00:00", today=datetime(2026, 10, 13).date())["due_today"]
+    origin = assistant_worklist.decorate({"handling_status": "unresolved", "evidence": [reminder],
+        "waiting_evidence": [first]}, "2026-10-12T10:00:00+00:00")
+    assert origin["waiting_since"] == first["created_at"]
+    answered = {**first, "message_id": "answered", "created_at": "2026-10-12T08:30:00+00:00",
+                "speaker": "CM", "is_staff": True, "text": "Here is the link"}
+    metadata = assistant_worklist.decorate({"handling_status": "unresolved", "replied_by": ["CM"],
+        "evidence": [first, reminder], "reply_evidence": [answered]}, "2026-10-12T10:00:00+00:00")
+    assert metadata["waiting_since"] == reminder["created_at"] and metadata["action_group"] == "followup"
+    assert not assistant_worklist.decorate({"handling_status": "resolved", "evidence": [first]},
+                                          "2026-10-12T10:00:00+00:00")["due_today"]
     data = pack()
     data["pack"].update(is_private=False, unique_group_user="U1",
                         staff={"CM": {"name": "Remi"}, "CM2": {"name": "Shang"}})
@@ -152,6 +174,18 @@ def test_reply_and_resolution_remain_independent_through_context_and_merge():
     pending = ai._validate(json.dumps({"events": [sample_event(
         handling_evidence_refs=["M1", "M4"], reply_evidence_refs=["M2", "M3"])]}), data)[0]
     assert pending["handling_status"] == "unresolved" and pending["replied_by"] == ["Remi", "Shang"]
+    assert pending["action_group"] == "followup"
+    origin = ai._validate(json.dumps({"events": [sample_event(waiting_since_ref="M1", evidence_refs=["M4"])]}),
+                          data)[0]
+    assert origin["waiting_since_ref"] == "M1" and "M1" in origin["evidence_refs"]
+    for ref in ("M2", {"invented": "ref"}):
+        with pytest.raises(ai.InvalidModelOutput, match="waiting"):
+            ai._validate(json.dumps({"events": [sample_event(waiting_since_ref=ref)]}), data)
+    waiting = ai._validate(json.dumps({"events": [sample_event(action_group="waiting",
+        handling_evidence_refs=["M1"], reply_evidence_refs=["M2"])]}), data)[0]
+    assert waiting["action_group"] == "waiting"
+    unsupported_wait = ai._validate(json.dumps({"events": [sample_event(action_group="waiting")]}), data)[0]
+    assert unsupported_wait["action_group"] == "followup"
     assert not pending["needs_review"]  # An unknown @ or optional attachment does not erase a readable request.
     pending["evidence"] = [data["refs"][r] for r in pending["evidence_refs"]]
     done_message = {"text": "Sample order ABC-123 delivered today", "speaker": "CM2", "is_staff": True,
@@ -166,6 +200,19 @@ def test_reply_and_resolution_remain_independent_through_context_and_merge():
         "reply_evidence_refs": [r for r, m in refs.items() if m.get("is_staff")]}
     merged = summary_dialogues.combine(json.dumps(value), pending, done)
     assert merged["handling_status"] == "resolved" and merged["replied_by"] == ["Remi", "Shang"]
+    assert merged["action_group"] == "closed"
+    outsider = {**done_message, "speaker": "U2", "is_staff": False, "message_id": "other-customer",
+                "text": "My sample order ABC-123 too", "created_at": "M6"}
+    mixed = {**pending, "evidence": [*pending["evidence"], outsider]}
+    mixed_refs = summary_dialogues.merged_evidence(mixed, done)
+    wrong_origin = {**value, "handling_status": "unresolved",
+        "quote_a_ref": next(r for r, m in mixed_refs.items() if m["message_id"] == "request"),
+        "quote_b_ref": next(r for r, m in mixed_refs.items() if m["message_id"] == "done"),
+        "handling_evidence_refs": [next(r for r, m in mixed_refs.items() if m["message_id"] == "request")],
+        "reply_evidence_refs": [r for r, m in mixed_refs.items() if m.get("is_staff")],
+        "waiting_since_ref": next(r for r, m in mixed_refs.items() if m["message_id"] == "other-customer")}
+    with pytest.raises(ai.InvalidModelOutput, match="waiting"):
+        summary_dialogues.combine(json.dumps(wrong_origin), mixed, done)
     # A later concrete counterexample reopens the issue without forgetting who replied.
     later = {**done, "evidence": [{**done_message, "text": "Sample order ABC-123 still not here",
              "speaker": "U1", "is_staff": False, "sender_name": "Alice", "message_id": "later", "created_at": "M6"}]}
@@ -182,6 +229,8 @@ def test_reply_and_resolution_remain_independent_through_context_and_merge():
         {"ref": "M5", "message_id": "bob", "speaker": "U2", "text": "My different order", "in_window": True},
         {"ref": "M6", "message_id": "broadcast", "speaker": "CM2", "text": "Latest campaign news", "in_window": True},
     ]
+    with pytest.raises(ai.InvalidModelOutput, match="waiting"):
+        ai._validate(json.dumps({"events": [sample_event(waiting_since_ref="M5")]}), data)
     data["refs"].update(M5={}, M6={})
     selected, _ = summary_dialogues.parts(data, "U1")
     assert "broadcast" not in {m["message_id"] for m in selected}

@@ -18,9 +18,7 @@ SCAN_LIMIT = 2000
 PAGE_SIZE = 12
 BATCH_SIZE = 100
 TEXT_LIMIT = 480
-CONTEXT_LIMIT = 8
 WINDOW_PAGE_SIZE = 100
-WINDOW_TEXT_LIMIT = 1800
 
 _BASE_SQL = core._MESSAGE_SQL.split("    ORDER BY", 1)[0].replace(
     "m.chat_id=%s", "m.chat_id=ANY(%s::text[])"
@@ -186,18 +184,18 @@ def _coverage(chats, start, end):
         # A completed backfill with a NULL start is the worker's full-history scan.
         if not chat["backfill_complete"] or (chat["backfill_window_start_at"] is not None
                                             and chat["backfill_window_start_at"] > start):
-            reasons.append("历史同步未覆盖检索起点")
+            reasons.append(("历史同步未覆盖检索起点", "history"))
         if chat["sync_status"] == "not_readable":
-            reasons.append(unreadable_reason(chat))
+            reasons.append((unreadable_reason(chat), "restricted"))
         elif chat["sync_status"] not in {"succeeded", "syncing"}:
-            reasons.append("同步尚未成功")
+            reasons.append(("同步尚未成功", "updating"))
         if chat["sync_status"] != "not_readable" and (not watermark or watermark < end):
-            reasons.append("同步尚未覆盖检索截止")
+            reasons.append(("最新消息仍在同步", "updating"))
         sources.append({"chat_id": chat["chat_id"], "name": chat["name"] or "未命名会话",
                         "last_sync_at": watermark.isoformat() if watermark else None,
                         "source_complete": not reasons})
-        gaps.extend({"chat_id": chat["chat_id"], "name": chat["name"] or "未命名会话", "reason": reason}
-                    for reason in reasons)
+        gaps.extend({"chat_id": chat["chat_id"], "name": chat["name"] or "未命名会话",
+                     "reason": reason, "category": category} for reason, category in reasons)
     return sources, gaps
 
 
@@ -254,7 +252,7 @@ def _collect(conn, actor_id, context, args, settings, *, terms):
                 or after[1] not in by_chat or not start <= _time(after[0]) < end):
             raise ValueError("分页引用无效，请重新检索。")
     cipher = message_body_cipher(settings.token_encryption_key)
-    messages, scanned, readable, unreadable, truncated, more = [], 0, 0, 0, 0, False
+    messages, scanned, readable, unreadable, non_text, unreadable_text, truncated, more = [], 0, 0, 0, 0, 0, 0, False
     while scanned < scan_limit and len(messages) < page_size:
         size = min(BATCH_SIZE, scan_limit - scanned)
         rows = _rows(conn, cm["id"], sorted(by_chat), start, end, speakers, limit=size + 1, after=after)
@@ -266,14 +264,16 @@ def _collect(conn, actor_id, context, args, settings, *, terms):
             after = [row["message_create_time"].isoformat(), row["chat_id"], row["message_id"]]
             text, unavailable = _text(row, cipher, names)
             unreadable += int(unavailable)
+            non_text += int(unavailable and row["message_type"] not in {"text", "post"})
+            unreadable_text += int(unavailable and row["message_type"] in {"text", "post"})
             readable += int(not unavailable)
             if terms is None or (not unavailable and any(term.casefold() in text.casefold() for term in terms)):
                 chat = by_chat[row["chat_id"]]
                 ref = _reference(actor_id, cm, chat, row, start, end, selected, settings, audience)
                 message = _message(row, chat, text, unavailable, reference=ref, terms=terms or (),
-                                   text_limit=WINDOW_TEXT_LIMIT if terms is None else TEXT_LIMIT, audience=audience)
+                                   clip=terms is not None, text_limit=TEXT_LIMIT, audience=audience)
                 if terms is None:
-                    message["truncated"] = not unavailable and len(text) > WINDOW_TEXT_LIMIT
+                    message["truncated"] = False
                     truncated += int(message["truncated"])
                 messages.append(message)
             if len(messages) >= page_size:
@@ -282,8 +282,10 @@ def _collect(conn, actor_id, context, args, settings, *, terms):
         if not more:
             break
     sources, gaps = _coverage(chats, start, end)
-    if unreadable:
-        gaps.append({"reason": "本页存在不可读正文或附件", "count": unreadable})
+    if non_text:
+        gaps.append({"reason": "非文字消息未分析", "category": "non_text", "count": non_text})
+    if unreadable_text:
+        gaps.append({"reason": "文字正文暂不可读取", "category": "unreadable", "count": unreadable_text})
     if truncated:
         gaps.append({"reason": "本页部分正文超过展示长度，可按引用读取全文", "count": truncated})
     status = "partial" if more else ("completed" if messages else
@@ -300,6 +302,7 @@ def _collect(conn, actor_id, context, args, settings, *, terms):
             "scope": scope,
             "window": {"start": start.isoformat(), "end": end.isoformat(), "timezone": core.TIMEZONE},
             "coverage": {"scanned": scanned, "readable": readable, "unreadable": unreadable,
+                         "non_text": non_text, "unreadable_text": unreadable_text,
                          "matched": len(messages), "scan_complete": not more,
                          "conversations": len(chats),
                          "returned": len(messages), "truncated": truncated,
@@ -320,7 +323,8 @@ def _collect(conn, actor_id, context, args, settings, *, terms):
 def validate_result(conn, actor_id, context, result, settings):
     """Recheck at most one page of hits, never rerun a negative full-text scan."""
     if result.get("kind") == "message_context":
-        fresh = read(conn, actor_id, context, {"message_ref": result.get("message_ref")}, settings)
+        fresh = read(conn, actor_id, context, {"message_ref": result.get("message_ref")}, settings,
+                     cutoff=_time(result["checked_at"]) if result.get("checked_at") else None)
         if "audience" not in result.get("scope", {}):
             fresh["scope"].pop("audience", None)
         fields = ("message", "messages", "window", "scope")
@@ -356,11 +360,16 @@ def validate_result(conn, actor_id, context, result, settings):
                 or ref.get("chat_id") not in by_chat or ref.get("consent_at") != cm["body_consent_at"].isoformat()
                 or _time(ref.get("start")) != start or _time(ref.get("end")) != end):
             raise PermissionError("消息引用不属于当前检索范围。")
-        rows = _rows(conn, cm["id"], [ref["chat_id"]], start, end, speakers, limit=1,
-                     extra=" AND m.message_id=%s", extra_args=(ref.get("message_id"),))
-        if not rows:
+    references = [_open(message.get("message_ref"), "m.", settings) for message in messages]
+    rows = _rows(conn, cm["id"], sorted({ref["chat_id"] for ref in references}), start, end, speakers,
+                 limit=len(references), extra=" AND m.message_id=ANY(%s::text[])",
+                 extra_args=([ref["message_id"] for ref in references],)) if references else []
+    current = {(row["chat_id"], row["message_id"]): row for row in rows}
+    for ref in references:
+        row = current.get((ref["chat_id"], ref["message_id"]))
+        if not row:
             raise PermissionError("命中消息已删除或当前授权无法读取。")
-        if _version(rows[0]) != ref.get("version"):
+        if _version(row) != ref.get("version"):
             raise ValueError("命中消息已更新，请重新检索。")
     sources, gaps = _coverage(chats, start, end)
     gaps.extend(gap for gap in result.get("gaps", []) if not gap.get("chat_id"))
@@ -369,7 +378,7 @@ def validate_result(conn, actor_id, context, result, settings):
                          "source_complete": (bool(chats) or audience == "all") and not gaps}}
 
 
-def read(conn, actor_id, context, args, settings):
+def read(conn, actor_id, context, args, settings, *, cutoff=None):
     ref = args.get("message_ref")
     value = _open(ref, "m.", settings)
     audience = _audience(value.get("audience", "creators"))
@@ -381,6 +390,11 @@ def read(conn, actor_id, context, args, settings):
     if context["scope"]["cm_id"] != value.get("cm_id"):
         raise PermissionError("消息不属于当前查询范围。")
     start, end = _time(value.get("start")), _time(value.get("end"))
+    if cutoff is not None:
+        if not isinstance(cutoff, datetime) or cutoff.utcoffset() is None or cutoff > datetime.now(UTC):
+            raise ValueError("最新消息截止时间无效。")
+        cutoff = cutoff.astimezone(UTC)
+    read_end = max(end, cutoff) if cutoff else end
     cm, _roster, chats, speakers, _selected = _scope(
         conn, actor_id, context, value.get("creator_ids"), [value.get("chat_id")], settings, audience)
     if start >= end or not chats:
@@ -396,14 +410,23 @@ def read(conn, actor_id, context, args, settings):
     if value.get("version") != _version(target):
         raise ValueError("消息已更新，请重新检索后查看。")
     collected = {target["message_id"]: (target, "matched")}
-    gaps, pending = [], [(target.get("parent_id"), "parent"), (target.get("root_id"), "root")]
-    visited = {target["message_id"]}
-    while pending and len(visited) < CONTEXT_LIMIT:
+    nearby = _rows(conn, cm["id"], [chat["chat_id"]], start, end, speakers, limit=7,
+                   extra=" AND m.message_create_time<=%s", extra_args=(target["message_create_time"],))
+    following = _rows(conn, cm["id"], [chat["chat_id"]], start, end, speakers, limit=4,
+                      extra=" AND m.message_create_time>%s", extra_args=(target["message_create_time"],),
+                      ascending=True)
+    latest = _rows(conn, cm["id"], [chat["chat_id"]], end, read_end, speakers, limit=20) if cutoff else []
+    for row in [*nearby, *following, *latest]:
+        collected.setdefault(row["message_id"], (row, "latest" if row in latest else "nearby_context"))
+    gaps, pending = [], [(message_id, relation) for row, _ in collected.values()
+        for message_id, relation in ((row.get("parent_id"), "parent"), (row.get("root_id"), "root"))]
+    visited = set(collected)
+    while pending and len(visited | collected.keys()) < 50:
         message_id, relation = pending.pop(0)
         if not message_id or message_id in visited:
             continue
         visited.add(message_id)
-        rows = _rows(conn, cm["id"], [chat["chat_id"]], datetime.min.replace(tzinfo=UTC), end,
+        rows = _rows(conn, cm["id"], [chat["chat_id"]], datetime.min.replace(tzinfo=UTC), read_end,
                      speakers, limit=1, extra=" AND m.message_id=%s", extra_args=(message_id,))
         if not rows:
             gaps.append({"reason": "引用的原问或线程消息无法在当前授权下读取", "relation": relation})
@@ -413,13 +436,6 @@ def read(conn, actor_id, context, args, settings):
         pending.extend(((row.get("parent_id"), "parent"), (row.get("root_id"), "root")))
     if any(message_id and message_id not in visited for message_id, _ in pending):
         gaps.append({"reason": "引用链超过本次上下文上限"})
-    nearby = _rows(conn, cm["id"], [chat["chat_id"]], start, end, speakers, limit=7,
-                   extra=" AND m.message_create_time<=%s", extra_args=(target["message_create_time"],))
-    following = _rows(conn, cm["id"], [chat["chat_id"]], start, end, speakers, limit=4,
-                      extra=" AND m.message_create_time>%s", extra_args=(target["message_create_time"],),
-                      ascending=True)
-    for row in [*nearby, *following]:
-        collected.setdefault(row["message_id"], (row, "nearby_context"))
     rows = [row for row, _ in collected.values()]
     names, cipher = mention_names(conn, rows), message_body_cipher(settings.token_encryption_key)
     messages = []
@@ -432,12 +448,15 @@ def read(conn, actor_id, context, args, settings):
         messages.append(message)
         if message["unavailable_or_truncated"]:
             gaps.append({"reason": "上下文正文不可读取或超过展示长度", "message_id": row["message_id"]})
-    sources, sync_gaps = _coverage(chats, start, end)
-    return {"kind": "message_context", "message_ref": ref, "evidence_ref": ref,
+    sources, sync_gaps = _coverage(chats, start, read_end)
+    result = {"kind": "message_context", "message_ref": ref, "evidence_ref": ref,
             "scope": {"cm_id": str(cm["id"]), "creator_ids": _selected, "chat_ids": [chat["chat_id"]],
                       "audience": audience},
             "message": next(message for message in messages if message["relation"] == "matched"),
-            "messages": messages, "gaps": [*gaps, *sync_gaps], "sources": sources,
+            "messages": messages, "gaps": [*gaps, *sync_gaps], "sync_gaps": sync_gaps, "sources": sources,
             "window": {"start": start.isoformat(), "end": end.isoformat(), "timezone": core.TIMEZONE},
             "context_complete": not gaps and not sync_gaps,
             "context_scope": "referenced_messages_and_bounded_nearby", "is_full_conversation": False}
+    if cutoff:
+        result.update(checked_at=cutoff.isoformat(), latest_limit=20)
+    return result

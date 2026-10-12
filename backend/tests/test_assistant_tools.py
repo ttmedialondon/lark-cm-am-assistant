@@ -1,14 +1,13 @@
 """One real PostgreSQL workflow: tools, reusable reports, drafts and revoked sources."""
 
 import json
-from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
 from test_offhours_summary import finish_merges, pg, seeded  # noqa: F401
 
-from app import assistant_queries, assistant_search, openai_client, summary_dialogues, summary_replies
+from app import assistant_queries, assistant_search, summary_dialogues
 from app import assistant_tools as tools
 from app import offhours_summary as summaries
 from app.ai_feature_config import api_key_cipher, save_feature_config
@@ -126,8 +125,9 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
     def run(name, args):
         value = tools.execute(pg, s.ids["cm"], turn, name, args, s.settings, context)
         results.append(value)
+        turn["checkpoint_ciphertext"] = summary_dialogues.encode({"tool_results": results}, s.settings)
         pg.execute("UPDATE assistant_turns SET checkpoint_ciphertext=%s WHERE id=%s",
-                   (summary_dialogues.encode({"tool_results": results}, s.settings), turn_id))
+                   (turn["checkpoint_ciphertext"], turn_id))
         return value
 
     person = run("query_creators", {"query": "alice", "importance": None, "cursor": None})
@@ -261,6 +261,62 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
     all_stats_args = {**all_args, "group_by": "day", "comparison": None}
     assert run("activity_stats", all_stats_args)["metrics"]["messages"] == 6
     assert run("activity_stats", args)["metrics"]["messages"] == 2
+    # An unconfirmed contact can receive a draft from owned text, including complete latest reply ancestors.
+    visitor_ref = next(message["message_ref"] for message in all_found if message["message_id"] == "all-unconfirmed")
+    page = next(page for page in all_pages if visitor_ref in page["_message_refs"])
+    continuation_ref = f"u.{page['query_ref'][2:]}.{page['_message_refs'][visitor_ref]}"
+    assert len(continuation_ref) <= 2048
+    assert tools.evidence(pg, s.ids["cm"], continuation_ref, s.settings)["message"]["text"] == (
+        "All-scope all-unconfirmed")
+    all_message("latest-parent", "business", "ou_cm")
+    pg.execute("UPDATE chat_messages SET message_create_time=%s WHERE message_id='latest-parent'",
+               (s.start - timedelta(minutes=5),))
+    all_message("latest-answer", "business", "ou_unconfirmed")
+    pg.execute("UPDATE chat_messages SET message_create_time=%s,parent_id='latest-parent' "
+               "WHERE message_id='latest-answer'", (datetime.now(UTC) - timedelta(microseconds=1),))
+    calls_before = len(s.calls)
+    prepared = run("draft_reply", {"event_ref": None, "message_ref": continuation_ref, "draft_ref": None,
+        "edited_draft": None, "action": "generate", "instruction": None, "language": "en"})
+    assert {message["message_id"] for message in prepared["context"]["messages"]} >= {
+        "all-unconfirmed", "latest-answer", "latest-parent"}
+    assert prepared["context"]["chat_url"].endswith("openChatId=business")
+    assert "unrelated outsider secret" not in json.dumps(prepared)
+    draft_args = {"draft_ref": prepared["draft_ref"], "outcome": "ready", "language": "en",
+        "draft": "I'll check and get back to you.", "chinese_translation": "我确认后回复你。",
+        "explanation": "不编造尚未确认的进度。", "checks": ["确认能执行后续核查。"],
+        "evidence_refs": [prepared["context"]["messages"][0]["ref"]]}
+    draft = run("save_reply_draft", draft_args)
+    assert not tools.reply_status(pg, s.ids["cm"], draft["draft_ref"], s.settings)["new_messages"]
+    rendered = tools.build_result(pg, s.ids["cm"], turn, {
+        "answer": "回复草稿已准备。", "event_refs": [], "result_refs": [], "data_refs": [],
+        "draft_ref": draft["draft_ref"]}, s.settings, context, [prepared, draft])
+    assert rendered["scope"]["audience"] == "all" and rendered["draft"]["checks"]
+    assert rendered["draft"]["draft_ref"] == rendered["draft_ref"]
+    with pytest.raises(PermissionError):
+        tools.reply_status(pg, s.ids["reviewer"], draft["draft_ref"], s.settings)
+    with pytest.raises(ValueError):
+        run("save_reply_draft", {**draft_args, "evidence_refs": ["R-not-owned"]})
+    edited = "I'll check the dispatch status."
+    translation = run("draft_reply", {"event_ref": None, "message_ref": None, "draft_ref": draft["draft_ref"],
+        "edited_draft": edited, "action": "translate", "instruction": None, "language": "en"})
+    translated = run("save_reply_draft", {**draft_args, "draft_ref": translation["draft_ref"],
+        "draft": "MODEL MUST NOT REPLACE EDIT", "chinese_translation": "我会查询发货状态。",
+        "evidence_refs": [translation["context"]["messages"][0]["ref"]]})
+    assert translated["draft"]["draft"] == edited and translated["draft"]["chinese_translation"] == "我会查询发货状态。"
+    all_message("after-draft", "business", "ou_unconfirmed")
+    pg.execute("UPDATE chat_messages SET message_create_time=%s WHERE message_id='after-draft'",
+               (datetime.now(UTC) - timedelta(microseconds=1),))
+    assert tools.reply_status(pg, s.ids["cm"], draft["draft_ref"], s.settings)["new_messages"]
+    assert len(s.calls) == calls_before
+    assert pg.execute("SELECT count(*) n FROM summary_reply_tasks").fetchone()["n"] == 0
+    selected_scope = tools.current_context(pg, s.ids["cm"], {
+        "start": s.start.isoformat(), "end": now.isoformat(), "message_ref": visitor_ref}, s.settings)
+    assert tools.current_context(pg, s.ids["cm"], selected_scope["scope"], s.settings)["scope"]["window"] \
+        == selected_scope["scope"]["window"]
+    pg.execute("UPDATE chat_messages SET is_deleted=TRUE WHERE message_id='latest-parent'")
+    with pytest.raises(ValueError):
+        tools.reply_status(pg, s.ids["cm"], draft["draft_ref"], s.settings)
+    pg.execute("UPDATE chat_messages SET is_deleted=FALSE WHERE message_id='latest-parent'")
     pg.execute("UPDATE authorization_chats SET sync_status='not_readable' WHERE authorization_id=%s AND chat_id='chat'",
                (s.ids["cm"],))
     assert assistant_queries.activity(pg, s.ids["cm"], context, args, s.settings)["metrics"]["messages"] == 0
@@ -287,7 +343,8 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
             if expected_gap is None:
                 assert value["gaps"] == []
             else:
-                assert any(expected_gap in gap["reason"] for gap in value["gaps"])
+                expected_reasons = ("截止", "最新消息仍在同步") if expected_gap == "截止" else (expected_gap,)
+                assert any(reason in gap["reason"] for reason in expected_reasons for gap in value["gaps"])
             assert value.get("total_messages", value.get("metrics", {}).get("messages")) == (
                 0 if status == "not_readable" else 3)
         assert material["sources"][0]["source_complete"] == (expected_gap is None)
@@ -382,7 +439,7 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
     with pytest.raises(PermissionError):
         tools.execute(pg, s.ids["reviewer"], turn, "activity_stats", all_stats_args, s.settings, manager_context)
     all_final = {"answer": "当前授权全量消息包含未入库人员和应用通知。", "event_refs": [], "result_refs": [],
-                 "data_refs": [result["query_ref"] for result in results], "draft_ref": None}
+                 "data_refs": [result["query_ref"] for result in results if result.get("query_ref")], "draft_ref": None}
     all_view = tools.build_result(pg, s.ids["cm"], turn, all_final, s.settings, context, results)
     for blocked in ("Private owner-only sample", "all-before-consent", "all-hidden", "all-disabled"):
         assert blocked not in json.dumps(all_view)
@@ -433,7 +490,7 @@ def test_five_tools_keep_reports_private_resume_and_recheck_sources(pg, seeded, 
     assert {tool["name"] for tool in tools.TOOLS} == {
         "find_creators", "summarize_messages", "filter_events", "read_event_context", "draft_reply",
         "query_creators", "list_groups", "get_sync_status", "search_chat_history", "read_message_context",
-        "activity_stats", "query_unreplied_creator_events",
+        "activity_stats", "query_unreplied_creator_events", "save_reply_draft",
     }
     assert all(tool["strict"] and not tool["parameters"]["additionalProperties"] for tool in tools.TOOLS)
     found = tools.execute(pg, s.ids["cm"], turn, "find_creators", {"query": "@alice"}, s.settings, context)
@@ -487,32 +544,31 @@ def test_five_tools_keep_reports_private_resume_and_recheck_sources(pg, seeded, 
         tools.execute(pg, s.ids["cm"], turn, "summarize_messages", {**args, "creator_ids": [str(s.ids["other"])]},
                       s.settings, context)
 
-    def reply_model(cfg, _key, pack, _actor, **kwargs):
-        assert cfg["model"] == "gpt-6-luna"
-        if kwargs["output_format"]["name"] == "reply_evidence":
-            payload = {"relevant_refs": pack["core_refs"], "style_refs": [], "processed_refs": pack["core_refs"]}
-        else:
-            assert pack["draft_request"] == {"instruction": "请用简短英文回复", "language": "en"}
-            payload = {"outcome": "ready", "language": "en", "draft": "Which sample would you like?",
-                "chinese_translation": "你想要哪款样品？", "explanation": "需要达人补充产品信息。", "checks": [],
-                "evidence_refs": [pack["messages"][0]["ref"]]}
-        return {"text": json.dumps(payload), "usage": {"input_tokens": 1, "output_tokens": 1}}
-
-    monkeypatch.setattr(summary_replies, "connection", lambda: nullcontext(pg))
-    summary_model = openai_client.call_openai
-    monkeypatch.setattr(openai_client, "call_openai", reply_model)
-    draft_wait = tools.execute(pg, s.ids["cm"], turn, "draft_reply", {
+    summary_row = pg.execute("SELECT * FROM offhours_summary_tasks WHERE chat_id IS NULL").fetchone()
+    closed = summary_dialogues.decode(summary_row["result_ciphertext"], s.settings)
+    closed["events"][0]["handling_status"] = "resolved"
+    pg.execute("UPDATE offhours_summary_tasks SET result_ciphertext=%s WHERE id=%s",
+               (summary_dialogues.encode(closed, s.settings), summary_row["id"]))
+    courtesy = tools.execute(pg, s.ids["cm"], turn, "draft_reply", {
+        "event_ref": event_ref, "instruction": "礼貌回应", "language": "en",
+    }, s.settings, context)
+    assert courtesy["context"]["event"]["handling_status"] == "resolved"
+    pg.execute("UPDATE offhours_summary_tasks SET result_ciphertext=%s WHERE id=%s",
+               (summary_row["result_ciphertext"], summary_row["id"]))
+    prepared = tools.execute(pg, s.ids["cm"], turn, "draft_reply", {
         "event_ref": event_ref, "instruction": "请用简短英文回复", "language": "en",
     }, s.settings, context)
-    assert tools.resume_wait(pg, s.ids["cm"], turn, draft_wait["waiting"], s.settings, context) is None
-    for _ in range(4):
-        job = summary_replies.claim()
-        if not job:
-            break
-        assert job["feature"] == "operations_assistant"
-        summary_replies.step(job, s.settings)
-    draft = tools.resume_wait(pg, s.ids["cm"], turn, draft_wait["waiting"], s.settings, context)
+    assert prepared["status"] == "prepared" and not prepared.get("waiting")
+    assert "Would you like a sample?" in json.dumps(prepared["context"])
+    turn["checkpoint_ciphertext"] = summary_dialogues.encode({"tool_results": [prepared]}, s.settings)
+    draft = tools.execute(pg, s.ids["cm"], turn, "save_reply_draft", {
+        "draft_ref": prepared["draft_ref"], "outcome": "ready", "language": "en",
+        "draft": "Which sample would you like?", "chinese_translation": "你想要哪款样品？",
+        "explanation": "需要达人补充产品信息。", "checks": [],
+        "evidence_refs": [prepared["context"]["messages"][0]["ref"]],
+    }, s.settings, context)
     assert draft["draft"]["outcome"] == "ready" and draft["draft"]["draft"] == "Which sample would you like?"
+    assert pg.execute("SELECT count(*) n FROM summary_reply_tasks").fetchone()["n"] == 0
     final = {"answer": "共有一件未解决的样品事项。", "result_refs": [result["result_id"]],
              "event_refs": [event_ref], "draft_ref": draft["draft_ref"]}
     tool_results = [found, result, filtered, period, latest, draft]
@@ -536,7 +592,6 @@ def test_five_tools_keep_reports_private_resume_and_recheck_sources(pg, seeded, 
         **args, "start": (s.start - timedelta(days=8)).isoformat(),
     }, s.settings, context)
     assert len(longer["waiting"]["ids"]) == 2
-    monkeypatch.setattr(openai_client, "call_openai", summary_model)
     long_result = None
     for _ in range(8):
         summaries.prepare_next_summary(s.settings)

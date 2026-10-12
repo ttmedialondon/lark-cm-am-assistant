@@ -7,7 +7,7 @@ import pytest
 from test_offhours_summary import finish_merges, sample_event
 from test_offhours_summary import seeded as seeded  # noqa: F401
 
-from app import assistant, config, openai_client, summary_dialogues
+from app import assistant, assistant_search, assistant_window, config, openai_client, summary_dialogues
 from app import offhours_summary as summaries
 from app.ai_feature_config import api_key_cipher
 
@@ -31,6 +31,304 @@ def finish(chat):
     assert job is not None
     assistant.run(job, chat.settings)
     return job
+
+
+def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(pg, chat, monkeypatch):
+    ids = []
+    for index in range(13):
+        message_id = f'window-{index}'
+        text = 'LONG_PRIVATE_BODY ' + ('业务明细' * 1800 if index == 0 else str(index))
+        pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,
+            body_ciphertext,message_create_time) VALUES('chat',%s,'ou_person','text',%s,%s)""",
+            (message_id, chat.cipher.encrypt(json.dumps({'text': text})),
+             chat.start + timedelta(hours=2, seconds=index)))
+        pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+            VALUES(%s,'chat',%s)""", (chat.ids['cm'], message_id))
+        ids.append(message_id)
+    monkeypatch.setattr(assistant_search, 'WINDOW_PAGE_SIZE', 1)
+    monkeypatch.setattr(assistant_window, 'INPUT_CHARS', 3_200)
+    monkeypatch.setattr(assistant, 'MAX_MODEL_STEPS', 1)
+    calls, parts, raw_ids = [], [], set()
+
+    def model(_cfg, _key, items, _actor, **kwargs):
+        calls.append(kwargs['tools'])
+        if not kwargs['tools']:
+            segment = json.loads(items[0]['content'])
+            assert len(assistant_window.encoded(segment)) <= assistant_window.INPUT_CHARS + 20
+            messages = [message for conversation in segment.get('conversations', [])
+                        for message in conversation['messages']]
+            raw_ids.update(message['message_id'] for message in messages)
+            for message in messages:
+                if message['message_id'] == 'window-0':
+                    parts.append((message['text_part'], message['text']))
+            refs = [messages[0]['message_ref']] if messages else segment['summaries'][0]['evidence_refs']
+            note = {'summary': '保留本段业务事项与当前进展。', 'evidence_refs': refs}
+            return {'text': json.dumps(note), 'output': [], 'usage': {'input_tokens': 2, 'output_tokens': 1}}
+        outputs = [item for item in items if item.get('type') == 'function_call_output']
+        if not outputs:
+            return {'text': '', 'output': [{'type': 'function_call', 'call_id': 'window-call',
+                'name': 'summarize_messages', 'arguments': json.dumps({'audience': 'all',
+                    'start': chat.start.isoformat(), 'end': chat.end.isoformat(),
+                    'creator_ids': None, 'chat_ids': None, 'cursor': None})}], 'usage': {}}
+        source = json.loads(outputs[-1]['output'])
+        assert source['page_count'] == 15 and source['coverage']['scan_complete']
+        assert source['total_messages'] == 15 and source['next_cursor'] is None
+        assert 'summaries' in source and 'messages' not in source
+        final = {'answer': '已整理本时段重点。', 'event_refs': [], 'result_refs': [],
+                 'data_refs': [source['query_ref']], 'draft_ref': None}
+        return {'text': json.dumps(final), 'output': [], 'usage': {}}
+
+    monkeypatch.setattr(openai_client, 'call_openai_tools', model)
+    submitted = payload('总结全部授权聊天')
+    turn = assistant.submit(pg, chat.ids['cm'], submitted, chat.settings)
+    progress = []
+    for _ in range(60):
+        finish(chat)
+        value = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
+        progress.append(value['progress'])
+        if value['status'] not in assistant.ACTIVE:
+            break
+    assert value['status'] == 'completed' and len(calls) > 2
+    assert raw_ids == {*ids, 'm1', 'outside'}
+    parts.sort()
+    assert parts[0][0][0] == 0 and parts[-1][0][1] == parts[-1][0][2]
+    assert all(left[0][1] == right[0][0] for left, right in zip(parts, parts[1:], strict=False))
+    assert ''.join(text for _, text in parts) == 'LONG_PRIVATE_BODY ' + '业务明细' * 1800
+    assert any(isinstance(item, dict) and item.get('messages') == 15 for item in progress)
+    assert len(value['result']['data']) == 1
+    source = value['result']['data'][0]
+    assert source['page_count'] == 15 and source['page'] == 1 and source['has_more']
+    assert source['coverage']['returned'] == 15
+    untouched = {table: pg.execute(f'SELECT count(*) n FROM {table}').fetchone()['n']
+                 for table in ('assistant_turns', 'offhours_summary_runs', 'summary_reply_tasks')}
+    read_ids = set()
+    for page in range(1, 16):
+        found = assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings, page=page)
+        read_ids.update(message['message_id'] for message in found['messages'])
+        assert found['has_more'] == (page < 15)
+    assert read_ids == raw_ids and all(pg.execute(f'SELECT count(*) n FROM {table}').fetchone()['n'] == count
+                                    for table, count in untouched.items())
+    paid_count = len(calls)
+    with pytest.raises(LookupError):
+        assistant.source_page(pg, chat.ids['reviewer'], source['query_ref'], chat.settings)
+    with pytest.raises(ValueError):
+        assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings, page=16)
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='window-0'",
+               (chat.cipher.encrypt(json.dumps({'text': 'Updated fact'})),))
+    with pytest.raises(ValueError, match='已更新'):
+        assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings, page=15)
+    assert len(calls) == paid_count
+
+
+@pytest.mark.parametrize('interruption', ['repeated_page', 'premature_end', 'permission', 'cancel'])
+def test_window_collection_never_finalizes_missing_pages_or_replays_model(pg, chat, monkeypatch, interruption):
+    monkeypatch.setattr(assistant_search, 'WINDOW_PAGE_SIZE', 1)
+    calls = []
+    monkeypatch.setattr(openai_client, 'call_openai_tools', lambda *args, **kwargs:
+        calls.append(True) or {'text': '', 'output': [{'type': 'function_call', 'call_id': 'window-call',
+            'name': 'summarize_messages', 'arguments': json.dumps({'audience': 'all',
+                'start': chat.start.isoformat(), 'end': chat.end.isoformat(),
+                'creator_ids': None, 'chat_ids': None, 'cursor': None})}], 'usage': {}})
+    turn = assistant.submit(pg, chat.ids['cm'], payload('总结全部聊天'), chat.settings)
+    finish(chat)
+    finish(chat)
+    original = assistant._turn(pg, chat.ids['cm'], turn['id'])
+    first = summary_dialogues.decode(original['checkpoint_ciphertext'], chat.settings)['tool_results'][0]
+    if interruption == 'repeated_page':
+        monkeypatch.setattr(assistant.tools, 'execute', lambda *args: first)
+    elif interruption == 'premature_end':
+        execute = assistant.tools.execute
+        monkeypatch.setattr(assistant.tools, 'execute', lambda *args:
+                            {**execute(*args), 'messages': [], 'next_cursor': None})
+    elif interruption == 'permission':
+        pg.execute("UPDATE authorizations SET scopes='{}' WHERE id=%s", (chat.ids['cm'],))
+    job = assistant.claim()
+    assert job is not None
+    if interruption == 'cancel':
+        assistant.cancel(pg, chat.ids['cm'], turn['id'], chat.settings)
+    assistant.run(job, chat.settings)
+    row = assistant._turn(pg, chat.ids['cm'], turn['id'])
+    assert row['status'] == ('cancelled' if interruption == 'cancel' else 'failed')
+    if interruption in {'repeated_page', 'premature_end'}:
+        assert row['error_code'] == 'source_changed'
+    assert row['result_ciphertext'] is None and len(calls) == 1
+    assert assistant.claim() is None
+
+
+def test_search_source_get_continues_without_model_and_cleared_refs_stay_unreadable(pg, chat, monkeypatch):
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE chat_id='chat'",
+               (chat.cipher.encrypt(json.dumps({'text': 'Find fixture facts'})),))
+    monkeypatch.setattr(assistant_search, 'PAGE_SIZE', 1)
+    calls = []
+
+    def model(_cfg, _key, items, _actor, **_kwargs):
+        calls.append(True)
+        outputs = [item for item in items if item.get('type') == 'function_call_output']
+        if not outputs:
+            return {'text': '', 'output': [{'type': 'function_call', 'call_id': 'search-call',
+                'name': 'search_chat_history', 'arguments': json.dumps({'audience': 'all',
+                    'query': ['fixture'], 'start': chat.start.isoformat(), 'end': chat.end.isoformat(),
+                    'creator_ids': None, 'chat_ids': None, 'cursor': None})}], 'usage': {}}
+        source = json.loads(outputs[-1]['output'])
+        final = {'answer': '找到相关原文。', 'event_refs': [], 'result_refs': [],
+                 'data_refs': [source['query_ref']], 'draft_ref': None}
+        return {'text': json.dumps(final), 'output': [], 'usage': {}}
+
+    monkeypatch.setattr(openai_client, 'call_openai_tools', model)
+    turn = assistant.submit(pg, chat.ids['cm'], payload('查找fixture原话'), chat.settings)
+    for _ in range(3):
+        finish(chat)
+    view = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
+    source = view['result']['data'][0]
+    assert source['has_more'] and source['next_source_url'].startswith('/assistant/sources/')
+    before = pg.execute('SELECT checkpoint_ciphertext,usage FROM assistant_turns WHERE id=%s',
+                        (turn['id'],)).fetchone()
+    continuation = assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings,
+                                         page=2, cursor=source['next_cursor'])
+    assert not continuation['has_more'] and len(continuation['messages']) == 1 and len(calls) == 2
+    assert pg.execute('SELECT checkpoint_ciphertext,usage FROM assistant_turns WHERE id=%s',
+                      (turn['id'],)).fetchone() == before
+    ref = continuation['messages'][0]['message_ref']
+    assert ref.startswith('u.') and '.p.' in ref and len(ref) <= 2048
+    raw = assistant.tools.evidence(pg, chat.ids['cm'], ref, chat.settings)
+    assert raw['message']['text'] == 'Find fixture facts'
+    row = assistant._turn(pg, chat.ids['cm'], turn['id'])
+    checkpoint = summary_dialogues.decode(row['checkpoint_ciphertext'], chat.settings)
+    context = assistant._context(pg, row, checkpoint, chat.settings)
+    prepared = assistant.tools.execute(pg, chat.ids['cm'], row, 'draft_reply', {
+        'event_ref': None, 'message_ref': ref, 'draft_ref': None, 'edited_draft': None,
+        'action': 'generate', 'instruction': None, 'language': 'en'}, chat.settings, context)
+    checkpoint['tool_results'].append(prepared)
+    row['checkpoint_ciphertext'] = summary_dialogues.encode(checkpoint, chat.settings)
+    pg.execute('UPDATE assistant_turns SET checkpoint_ciphertext=%s WHERE id=%s',
+               (row['checkpoint_ciphertext'], turn['id']))
+    draft = assistant.tools.execute(pg, chat.ids['cm'], row, 'save_reply_draft', {
+        'draft_ref': prepared['draft_ref'], 'outcome': 'ready', 'language': 'en',
+        'draft': "I'll check and get back to you.", 'chinese_translation': '我确认后回复你。',
+        'explanation': '不编造未知事实。', 'checks': ['确认能够进行核查。'],
+        'evidence_refs': [prepared['context']['messages'][0]['ref']]}, chat.settings, context)
+    checkpoint['tool_results'].append(draft)
+    row['checkpoint_ciphertext'] = summary_dialogues.encode(checkpoint, chat.settings)
+    pg.execute('UPDATE assistant_turns SET checkpoint_ciphertext=%s WHERE id=%s',
+               (row['checkpoint_ciphertext'], turn['id']))
+    assert draft['draft']['outcome'] == 'ready'
+    assert not assistant.tools.reply_status(pg, chat.ids['cm'], draft['draft_ref'], chat.settings)['new_messages']
+    message_context = assistant.tools.execute(pg, chat.ids['cm'], row, 'read_message_context',
+        {'message_ref': ref}, chat.settings, context)
+    assistant.tools.validate_tool_results(pg, chat.ids['cm'], row, [message_context], chat.settings, context)
+    assert message_context['message']['text'] == 'Find fixture facts'
+    assert len(calls) == 2 and pg.execute('SELECT count(*) n FROM summary_reply_tasks').fetchone()['n'] == 0
+    with pytest.raises(LookupError):
+        assistant.tools.evidence(pg, chat.ids['reviewer'], ref, chat.settings)
+    assistant.clear_conversations(pg, chat.ids['cm'], chat.settings)
+    with pytest.raises(LookupError):
+        assistant.tools.evidence(pg, chat.ids['cm'], ref, chat.settings)
+    assert len(calls) == 2
+
+
+def test_repeated_window_uses_validated_cache_and_history_does_not_double_source_pages(pg, chat, monkeypatch):
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='m1'",
+               (chat.cipher.encrypt(json.dumps({'text': 'Repeated window facts ' + '业务明细' * 1000})),))
+    monkeypatch.setattr(assistant_search, 'WINDOW_PAGE_SIZE', 1)
+    monkeypatch.setattr(assistant_window, 'INPUT_CHARS', 3_200)
+    monkeypatch.setattr(assistant, 'MAX_MODEL_STEPS', 1)
+    calls, repeated = [], True
+
+    def model(_cfg, _key, items, _actor, **kwargs):
+        calls.append(bool(kwargs['tools']))
+        if not kwargs['tools']:
+            segment = json.loads(items[0]['content'])
+            messages = [message for conversation in segment.get('conversations', [])
+                        for message in conversation['messages']]
+            refs = [messages[0]['message_ref']] if messages else segment['summaries'][0]['evidence_refs']
+            return {'text': json.dumps({'summary': '保留全部原文的进展。', 'evidence_refs': refs}),
+                    'output': [], 'usage': {}}
+        outputs = [item for item in items if item.get('type') == 'function_call_output']
+        if not outputs or repeated:
+            return {'text': '', 'output': [{'type': 'function_call',
+                'call_id': 'repeat-call' if outputs else 'window-call', 'name': 'summarize_messages',
+                'arguments': json.dumps({'audience': 'all', 'start': chat.start.isoformat(),
+                    'end': chat.end.isoformat(), 'creator_ids': None, 'chat_ids': None, 'cursor': None})}], 'usage': {}}
+        source = json.loads(outputs[-1]['output'])
+        final = {'answer': '本轮完整时段已整理。', 'event_refs': [], 'result_refs': [],
+                 'data_refs': [source['query_ref']], 'draft_ref': None}
+        return {'text': json.dumps(final), 'output': [], 'usage': {}}
+
+    monkeypatch.setattr(openai_client, 'call_openai_tools', model)
+    submitted = payload('总结完整时段')
+    first = assistant.submit(pg, chat.ids['cm'], submitted, chat.settings)
+    for _ in range(20):
+        finish(chat)
+        view = assistant.turn_view(pg, chat.ids['cm'], first['id'], chat.settings)
+        if view['status'] not in assistant.ACTIVE:
+            break
+    assert view['status'] == 'completed' and calls.count(True) == 2
+    saved = summary_dialogues.decode(assistant._turn(pg, chat.ids['cm'], first['id'])['checkpoint_ciphertext'],
+                                    chat.settings)
+    assert len(saved['tool_results']) == 2 and saved['summary_steps'] == calls.count(False)
+    assert saved['tool_outputs']['window-call']['query_ref'] == saved['tool_outputs']['repeat-call']['query_ref']
+    repeated = False
+    following = assistant.submit(pg, chat.ids['cm'], {
+        **submitted, 'client_request_id': str(uuid4()), 'message': '再次总结同一时段',
+    }, chat.settings)
+    for _ in range(20):
+        finish(chat)
+        view = assistant.turn_view(pg, chat.ids['cm'], following['id'], chat.settings)
+        if view['status'] not in assistant.ACTIVE:
+            break
+    assert view['status'] == 'completed' and len(view['result']['data']) == 1
+    source = view['result']['data'][0]
+    assert source['page_count'] == source['coverage']['returned'] == source['total_messages'] == 2
+    assert source['coverage']['scan_complete']
+    second = assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings, page=2)
+    assert second['page_count'] == 2 and second['coverage']['scan_complete']
+
+
+def test_model_prepares_saves_and_returns_message_draft_without_child_job(pg, chat, monkeypatch):
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='outside'",
+               (chat.cipher.encrypt(json.dumps({'text': 'When will the sample be dispatched?'})),))
+    calls = []
+
+    def model(_cfg, _key, items, _actor, **kwargs):
+        assert '本人' in kwargs['instructions'] and 'save_reply_draft' in kwargs['instructions']
+        calls.append(True)
+        outputs = [json.loads(item['output']) for item in items if item.get('type') == 'function_call_output']
+        latest = outputs[-1] if outputs else None
+        if latest and latest.get('kind') == 'reply_draft':
+            final = {'answer': '英文草稿已准备。', 'event_refs': [], 'result_refs': [],
+                     'data_refs': [], 'draft_ref': latest['draft_ref']}
+            return {'text': json.dumps(final), 'output': [], 'usage': {}}
+        if not latest:
+            name, args = 'search_chat_history', {'audience': 'all', 'query': ['dispatched'],
+                'start': chat.start.isoformat(), 'end': chat.end.isoformat(),
+                'creator_ids': None, 'chat_ids': None, 'cursor': None}
+        elif latest.get('kind') == 'messages':
+            name, args = 'draft_reply', {'event_ref': None, 'message_ref': latest['messages'][0]['message_ref'],
+                'draft_ref': None, 'edited_draft': None, 'action': 'generate',
+                'instruction': None, 'language': 'en'}
+        else:
+            assert latest['kind'] == 'reply_material'
+            assert latest['context']['chat_url'] and latest['context']['is_full_conversation'] is False
+            name, args = 'save_reply_draft', {'draft_ref': latest['draft_ref'], 'outcome': 'ready', 'language': 'en',
+                'draft': "I'll check the dispatch status and get back to you once I have confirmation.",
+                'chinese_translation': '我会确认发货状态，确认后回复你。', 'explanation': '不编造发货日期。',
+                'checks': ['确认能够执行后续核查。'], 'evidence_refs': [latest['context']['messages'][0]['ref']]}
+        return {'text': '', 'output': [{'type': 'function_call', 'call_id': f'call-{len(calls)}',
+            'name': name, 'arguments': json.dumps(args)}], 'usage': {}}
+
+    monkeypatch.setattr(openai_client, 'call_openai_tools', model)
+    turn = assistant.submit(pg, chat.ids['cm'], payload('找到发货询问并准备英文回复'), chat.settings)
+    for _ in range(10):
+        finish(chat)
+        view = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
+        if view['status'] not in assistant.ACTIVE:
+            break
+    assert view['status'] == 'completed' and len(calls) == 4
+    assert view['result']['scope']['audience'] == 'all'
+    assert view['result']['draft']['outcome'] == 'ready' and view['result']['draft']['checks']
+    assert view['result']['draft']['context']['message']['message_id'] == 'outside'
+    assert pg.execute('SELECT count(*) n FROM summary_reply_tasks').fetchone()['n'] == 0
+    assert pg.execute('SELECT count(*) n FROM offhours_summary_runs').fetchone()['n'] == 0
 
 
 def test_model_first_lookup_replay_history_and_actor_isolation(pg, chat, monkeypatch):
@@ -448,6 +746,40 @@ def test_unreplied_creator_query_covers_whole_roster_and_attaches_all_events(pg,
     stored = pg.execute('SELECT * FROM assistant_turns WHERE id=%s', (turn['id'],)).fetchone()
     saved = summary_dialogues.decode(stored['checkpoint_ciphertext'], chat.settings)['tool_results']
     final = summary_dialogues.decode(stored['result_ciphertext'], chat.settings)['final']
+    stored_context = assistant._context(pg, assistant._turn(pg, chat.ids['cm'], turn['id']),
+        summary_dialogues.decode(stored['checkpoint_ciphertext'], chat.settings), chat.settings)
+    complete = assistant.tools._read_results(pg, chat.ids['cm'], [report['id']], chat.settings, stored_context)
+    generic = {**assistant.tools._page(complete, 0), '_assistant_turn_id': str(turn['id'])}
+    whole = assistant.tools.build_result(pg, chat.ids['cm'], stored, {
+        'answer': '全部事项已整理。', 'event_refs': [], 'result_refs': [complete['result_id']],
+        'data_refs': [], 'draft_ref': None}, chat.settings, context, [generic])
+    assert len(generic['events']) == 25 and len(whole['events']) == 32
+    assert whole['worklist_summary']['events'] == 32 and len(api_calls) == 3
+    wide = assistant.tools.execute(pg, chat.ids['cm'], stored, 'search_chat_history', {
+        'audience': 'creators', 'query': ['ORDER'], 'start': chat.start.isoformat(),
+        'end': chat.end.isoformat(), 'creator_ids': list(map(str, [chat.ids['person'], *people])),
+        'chat_ids': None, 'cursor': None}, chat.settings, stored_context)
+    assert wide['next_cursor'] and max(len(ref) for ref in wide['_message_refs'].values()) > 2048
+    with_wide = summary_dialogues.decode(stored['checkpoint_ciphertext'], chat.settings)
+    with_wide['tool_results'].append(wide)
+    alternative = assistant.tools.execute(pg, chat.ids['cm'], stored, 'search_chat_history',
+        {**wide['_request']['args'], 'query': ['ORDER', 'NOT_FOUND']}, chat.settings, stored_context)
+    with_wide['tool_results'].append(alternative)
+    pg.execute('UPDATE assistant_turns SET checkpoint_ciphertext=%s WHERE id=%s',
+               (summary_dialogues.encode(with_wide, chat.settings), turn['id']))
+    wide_page = assistant.source_page(pg, chat.ids['cm'], wide['query_ref'], chat.settings,
+                                      page=2, cursor=wide['next_cursor'])
+    assert wide_page['messages'] and all(len(item['message_ref']) <= 2048 for item in wide_page['messages'])
+    wide_ref = wide_page['messages'][0]['message_ref']
+    assert assistant.tools.evidence(pg, chat.ids['cm'], wide_ref, chat.settings)['message']['text'].startswith(
+        'Please check order ORDER-')
+    _, source_turn, _digest, token = wide_ref.split('.', 3)
+    different = alternative['query_ref'].split('.')[2]
+    with pytest.raises(ValueError):
+        assistant.tools.evidence(pg, chat.ids['cm'], f'u.{source_turn}.{different}.{token}', chat.settings)
+    pg.execute('UPDATE assistant_turns SET checkpoint_ciphertext=%s WHERE id=%s',
+               (stored['checkpoint_ciphertext'], turn['id']))
+    assert len(api_calls) == 3
     filter_checkpoint = summary_dialogues.decode(stored['checkpoint_ciphertext'], chat.settings)
     filter_context = assistant._context(pg, assistant._turn(pg, chat.ids['cm'], turn['id']),
                                         filter_checkpoint, chat.settings)

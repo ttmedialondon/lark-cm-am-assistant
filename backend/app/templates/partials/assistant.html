@@ -2,15 +2,22 @@
   <button type="button" class="oa-launcher" id="oa-launcher" aria-controls="oa-panel" aria-expanded="false"><span aria-hidden="true">✦</span> 问助手</button>
   <section class="oa-panel" id="oa-panel" role="dialog" aria-label="运营助手" aria-modal="false" hidden>
     <header class="oa-header">
-      <div class="oa-brand"><span aria-hidden="true">✦</span><div><h2>运营助手</h2><p>从资料到下一步</p></div></div>
+      <div class="oa-brand"><span aria-hidden="true">✦</span><div><h2>运营助手</h2><p>看重点，接着处理</p></div></div>
       <div class="oa-header-actions"><button type="button" id="oa-new" aria-label="开始新对话" title="新对话">＋</button><button type="button" id="oa-fullscreen" aria-label="全屏" title="全屏">⤢</button><button type="button" id="oa-collapse" aria-label="收起助手" title="收起">−</button></div>
     </header>
     <div class="oa-person" id="oa-person" hidden><label for="oa-cm">人员</label><select id="oa-cm" aria-label="选择授权人员"></select></div>
     <div class="oa-scope" id="oa-scope" aria-label="当前查询范围" hidden></div>
+    <form class="oa-scope-editor" id="oa-scope-editor" hidden>
+      <label>范围<select id="oa-audience"><option value="all">全部授权消息</option><option value="creators">我的达人</option></select></label>
+      <label>时段<select id="oa-period"><option value="today">今天</option><option value="yesterday">昨天</option><option value="yesterday_now">昨天至现在</option><option value="week">最近 7 天</option><option value="custom">自定义</option></select></label>
+      <div class="oa-custom-time" id="oa-custom-time" hidden><label>开始 · 英国时间<input type="datetime-local" id="oa-start" required></label><label>结束 · 英国时间<input type="datetime-local" id="oa-end" required></label></div>
+      <div class="oa-card-actions"><button type="submit">应用并查询</button><button type="button" id="oa-scope-cancel">取消</button></div>
+    </form>
+    <nav class="oa-quick" aria-label="常用操作"><button type="button" data-quick="unreplied">达人待回复</button><button type="button" data-quick="today">今日重点</button><button type="button" data-quick="reply">帮我回复</button></nav>
     <div class="oa-workspace">
       <div class="oa-chat" id="oa-chat">
         <div class="oa-history" id="oa-history" role="log" aria-label="对话记录" aria-live="polite" aria-relevant="additions">
-          <div class="oa-welcome" id="oa-welcome"><div class="oa-welcome-symbol" aria-hidden="true">✦</div><h3>今天有什么需要了解？</h3><p>查达人、找消息、了解进展，或起草一条回复。</p><div class="oa-prompts"><button type="button" data-prompt="总结今天上午的聊天事件">总结今天上午 <span aria-hidden="true">↗</span></button><button type="button" data-prompt="有哪些还没解决的事项？">查看未解决事项 <span aria-hidden="true">↗</span></button><button type="button" data-prompt="查找最近有联系的达人">查找达人资料 <span aria-hidden="true">↗</span></button></div></div>
+          <div class="oa-welcome" id="oa-welcome"><div class="oa-welcome-symbol" aria-hidden="true">✦</div><h3>今天先处理什么？</h3><p>说出你想了解的事，或从上方开始。</p></div>
         </div>
         <button type="button" class="oa-new-result" id="oa-new-result" hidden>↓ 查看新结果</button>
         <div class="oa-status" id="oa-status" role="status" aria-live="polite" hidden></div>
@@ -23,6 +30,10 @@
       <aside class="oa-sources" id="oa-sources" aria-label="原文阅读区" hidden>
         <header class="oa-source-header"><div><span>来源</span><h3 id="oa-source-title">消息原文</h3></div><button type="button" id="oa-sources-close" aria-label="返回对话" title="返回对话">✕</button></header>
         <div class="oa-sources-body" id="oa-sources-body" tabindex="0"></div>
+      </aside>
+      <aside class="oa-reply oa-sources" id="oa-reply" aria-label="回复工作区" hidden>
+        <header class="oa-source-header"><div><span>回复工作区</span><h3 id="oa-reply-title">帮我回复</h3></div><button type="button" id="oa-reply-close" aria-label="返回对话" title="返回对话">✕</button></header>
+        <div class="oa-sources-body" id="oa-reply-body"></div>
       </aside>
     </div>
   </section>

@@ -164,9 +164,30 @@ def create_router(*, current_authorization, csrf_token):
     @router.get("/evidence/{reference}")
     def evidence(request: Request, reference: str):
         try:
-            if len(reference) > 512:
+            if len(reference) > 2048:
                 raise ValueError("原文引用无效。")
             return json_response(read(request, assistant_tools.evidence, reference))
+        except (HTTPException, PermissionError, LookupError, ValueError) as exc:
+            return failure(exc)
+
+    @router.get("/sources/{reference}")
+    def source(request: Request, reference: str, page: int = 1, cursor: str | None = None):
+        try:
+            if len(reference) > 120:
+                raise ValueError("来源引用无效。")
+            actor_id = actor(request)
+            with connection() as conn, conn.transaction():
+                return json_response(assistant.source_page(conn, actor_id, reference, get_settings(),
+                                                           page=page, cursor=cursor))
+        except (HTTPException, PermissionError, LookupError, ValueError) as exc:
+            return failure(exc)
+
+    @router.get("/drafts/{draft_ref}/status")
+    def draft_status(request: Request, draft_ref: str):
+        try:
+            if len(draft_ref) > 120:
+                raise ValueError("草稿引用无效。")
+            return json_response(read(request, assistant_tools.reply_status, draft_ref))
         except (HTTPException, PermissionError, LookupError, ValueError) as exc:
             return failure(exc)
 

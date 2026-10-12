@@ -403,7 +403,9 @@ def merge_format(refs=("E1",), left=None, right=None):
 
 def combine(raw, left, right):
     value = json.loads(raw)
-    if set(value) != set(merge_format()["schema"]["properties"]) or type(value["same"]) is not bool:
+    required = set(merge_format()["schema"]["properties"])
+    if (set(value) - required or required - set(value) - {"action_group", "waiting_since_ref"}
+            or type(value["same"]) is not bool):
         raise core.InvalidModelOutput("invalid merge envelope")
     if not value["same"]:
         return None
@@ -425,6 +427,12 @@ def combine(raw, left, right):
         if not isinstance(value[key], str) or not value[key].strip():
             raise core.InvalidModelOutput("empty merge text")
     core.validate_handling(value, messages)
+    if value["waiting_since_ref"]:
+        origins = [message for side in (left, right) for message in side["evidence"]
+                   if (side.get("user") and message.get("speaker") == side["user"])
+                   or message in side.get("waiting_evidence", [])]
+        if messages[value["waiting_since_ref"]] not in origins:
+            raise core.InvalidModelOutput("waiting evidence is not this event's customer")
     levels = ["P0", "P1", "P2", "P3"]
     # Preserve the strongest supported signal; a greeting cannot erase a concern.
     priorities = [e["priority"] for e in (left, right) if e["priority"] in levels]
@@ -432,11 +440,12 @@ def combine(raw, left, right):
     evidence = {core._hash(e): e for e in left["evidence"] + right["evidence"]}
     return {
         **left,
-        **{k: value[k] for k in ("handling_status", "handling_reason")},
+        **{k: value[k] for k in ("handling_status", "handling_reason", "action_group")},
         "handling_evidence": [messages[r] for r in value["handling_evidence_refs"]],
         "handling_evidence_refs": [],
         "reply_evidence": [messages[r] for r in value["reply_evidence_refs"]],
         "reply_evidence_refs": [],
+        "waiting_evidence": [messages[value["waiting_since_ref"]]] if value["waiting_since_ref"] else [],
         "replied_by": value["replied_by"],
         **{k: value[k] for k in ("title", "summary", "latest_progress")},
         "priority": priority,
@@ -507,6 +516,9 @@ def step(job, settings):
                     {**pending["refs"][ref], "chat_name": data["pack"]["chat_name"]}
                     for ref in e["reply_evidence_refs"]
                 ]
+                e["waiting_evidence"] = [
+                    {**pending["refs"][e["waiting_since_ref"]], "chat_name": data["pack"]["chat_name"]}
+                ] if e["waiting_since_ref"] else []
             completed[pending["fingerprint"]] = events
         finished = all(c["fingerprint"] in completed for c in chunks)
         result = {"users": data["users"], "events": [e for c in chunks for e in completed.get(c["fingerprint"], [])]}

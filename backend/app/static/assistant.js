@@ -13,7 +13,8 @@
   let saved = {}, active = null, source = null, submitting = false, restoring = false, denied = false;
   let pending = null, pendingScopeVersion = null, restoreTimer = null, revision = 0, sourceVersion = 0, sourceFocus = null, followBottom = true;
   let cmScopes = [], scopesReady = false, scopeRequest = null;
-  let pendingPageContext = null;
+  let pendingPageContext = null, selectedReply = null, currentDraft = null, activeReplyAction = null, activeReplyText = null;
+  let draftTimer = null, draftStatusVersion = 0;
   try { saved = JSON.parse(localStorage.getItem(storageKey) || "{}"); } catch { /* IDs can remain in memory. */ }
   if (!saved || typeof saved !== "object" || !uuid.test(saved.session_id || "")) saved = {};
   if (saved.client_request_id && !uuid.test(saved.client_request_id)) delete saved.client_request_id;
@@ -97,13 +98,15 @@
     $("oa-cm").disabled = denied || busy || Boolean(saved.client_request_id);
     input.disabled = denied || submitting;
     $("oa-composer-note").textContent = active ? "可以继续输入，完成后发送" : "Enter 发送 · Shift + Enter 换行";
-    for (const button of app.querySelectorAll("[data-prompt], [data-ask]")) button.disabled = denied || busy || Boolean(saved.client_request_id);
+    for (const button of app.querySelectorAll("[data-ask], [data-quick], [data-scope-edit]")) button.disabled = denied || busy || Boolean(saved.client_request_id);
+    for (const field of $("oa-scope-editor").querySelectorAll("input,select,button")) field.disabled = denied || busy;
     $("oa-form").setAttribute("aria-busy", String(busy));
   }
   function clearProtected() {
     denied = true; revision++; source?.close(); source = null; active = null; pending = null;
     activeContext = {}; scopeVersion++; currentScopeTurn = null;
     closeSources(false);
+    closeReply(); currentDraft = selectedReply = null; $("oa-reply-body").replaceChildren();
     delete saved.client_request_id; persist();
     history.replaceChildren(node("p", "oa-answer", "登录或查看权限已变化，请重新登录后打开助手。"));
     cmScopes = []; scopesReady = false; $("oa-cm").replaceChildren(); $("oa-person").hidden = true;
@@ -159,6 +162,7 @@
     activeContext = {}; selectContext({...person, audience: "all", creator_ids: null}); currentScopeTurn = null;
     $("oa-cm").value = person.cm_id;
     closeSources(false); $("oa-new-result").hidden = true;
+    closeReply(); currentDraft = selectedReply = null; $("oa-reply-body").replaceChildren(); $("oa-scope-editor").hidden = true;
     history.replaceChildren(node("p", "oa-answer", "开始一个新问题。"));
     scope({}); status(""); if (!keepInput) input.value = ""; controls();
   }
@@ -187,15 +191,38 @@
     return new Intl.DateTimeFormat("zh-CN", {timeZone: "Europe/London", month: "2-digit", day: "2-digit",
       hour: "2-digit", minute: "2-digit", hourCycle: "h23"}).format(new Date(value));
   }
+  function londonInput(value) {
+    const parts = new Intl.DateTimeFormat("en-CA", {timeZone: "Europe/London", year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", hourCycle: "h23"}).formatToParts(new Date(value));
+    const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+    return `${values.year}-${values.month}-${values.day}T${values.hour}:${values.minute}`;
+  }
+  function londonTime(value) {
+    const local = Date.parse(`${value}:00Z`);
+    if (!Number.isFinite(local)) throw new Error("请选择有效的英国时间。");
+    let guess = local;
+    for (let i = 0; i < 3; i++) guess += local - Date.parse(`${londonInput(guess)}:00Z`);
+    if (londonInput(guess) !== value) throw new Error("此英国时间因夏令时切换不存在，请重新选择。");
+    return new Date(guess).toISOString();
+  }
+  function periodRange(period) {
+    const now = new Date(), today = londonInput(now).slice(0, 10), start = londonTime(`${today}T00:00`);
+    const previous = days => {
+      const day = new Date(`${today}T12:00:00Z`); day.setUTCDate(day.getUTCDate() - days);
+      return londonTime(`${day.toISOString().slice(0, 10)}T00:00`);
+    };
+    return {start: period === "today" ? start : previous(period === "week" ? 6 : 1),
+      end: period === "yesterday" ? start : now.toISOString()};
+  }
   function selectContext(value, explicit = true) {
     if (!value || !Object.keys(value).length) return;
     if (explicit) scopeVersion++;
-    if (["cm_id", "creator_ids", "chat_ids", "event_ref"].some(key => Object.hasOwn(value, key))) {
+    if (["cm_id", "creator_ids", "chat_ids", "event_ref", "message_ref"].some(key => Object.hasOwn(value, key))) {
       const cmId = value.cm_id || activeContext.cm_id;
       activeContext = {cm_id: cmId, cm_name: cmId === activeContext.cm_id ? activeContext.cm_name : undefined,
         audience: value.audience || (value.creator_ids != null || value.event_ref ? "creators" : "all")};
     }
-    for (const key of ["cm_id", "cm_name", "audience", "creator_ids", "creator_name", "creator_names", "chat_ids", "chat_names", "event_ref", "event_title"]) {
+    for (const key of ["cm_id", "cm_name", "audience", "creator_ids", "creator_name", "creator_names", "chat_ids", "chat_names", "event_ref", "event_title", "message_ref", "start", "end", "reply_status", "sort", "reply_action", "draft_ref", "edited_draft"]) {
       if (Object.hasOwn(value, key)) activeContext[key] = value[key];
     }
     contextChosen = true;
@@ -217,20 +244,39 @@
       if (!activeContext.cm_id && value.cm_id) activeContext.cm_id = value.cm_id;
       if (activeContext.event_ref && value.event_ref) activeContext.event_ref = value.event_ref;
       for (const key of ["cm_name", "creator_names", "chat_names"]) if (value[key]) activeContext[key] = value[key];
+      for (const key of ["start", "end"]) if (value[key]) activeContext[key] = value[key];
+      for (const key of ["reply_status", "sort"]) if (Object.hasOwn(value, key)) activeContext[key] = value[key];
     }
     const current = [...new Set([activeContext.cm_name, activeContext.creator_name, ...(activeContext.creator_names || []),
       ...(activeContext.chat_names || []), activeContext.event_title || (activeContext.event_ref ? "当前事项" : null),
-      activeContext.audience === "all" ? "全部授权消息" : activeContext.audience === "creators" ? "达人范围" : null,
+      activeContext.audience === "all" ? "全部授权消息" : activeContext.audience === "creators" ? "我的达人" : null,
       activeContext.page_label].filter(Boolean))];
-    const values = matching && value.start && value.end ? [`${date(value.start)} – ${date(value.end)} · 英国时间`] : [];
+    const values = activeContext.start && activeContext.end ? [`${date(activeContext.start)} – ${date(activeContext.end)} · 英国时间`] : [];
     if (matching && !values.length && value.label) values.push(value.label);
+    if (activeContext.reply_status === "unreplied") values.push("未回复");
+    if (activeContext.sort === "importance") values.push("重要度优先");
+    const edit = node("button", "oa-chip oa-scope-edit", "修改范围"); edit.type = "button"; edit.dataset.scopeEdit = "true";
+    edit.addEventListener("click", () => {
+      $("oa-audience").value = activeContext.audience || "all";
+      $("oa-start").value = londonInput(activeContext.start || new Date());
+      $("oa-end").value = londonInput(activeContext.end || new Date());
+      $("oa-period").value = activeContext.start ? "custom" : "today";
+      $("oa-custom-time").hidden = $("oa-period").value !== "custom";
+      $("oa-scope-editor").hidden = false; $("oa-audience").focus(); controls();
+    });
     $("oa-scope").replaceChildren(...current.map(text => node("span", "oa-chip oa-chip--page", text)),
-      ...[...new Set(values)].filter(text => !current.includes(text)).map(text => node("span", "oa-chip", text)));
+      ...[...new Set(values)].filter(text => !current.includes(text)).map(text => node("span", "oa-chip", text)), edit);
     $("oa-scope").hidden = !current.length && !values.length;
   }
   function atBottom() { return panel.hidden ? followBottom : history.scrollHeight - history.scrollTop - history.clientHeight < 64; }
   function scrollToBottom() { followBottom = true; history.scrollTop = history.scrollHeight; $("oa-new-result").hidden = true; }
-  function updatedScroll(follow) { followBottom = follow; if (follow) scrollToBottom(); else $("oa-new-result").hidden = false; }
+  function updatedScroll(follow, turnId = null) {
+    const result = turnId && [...history.children].find(child => child.dataset.turnId === turnId);
+    if (follow && result) {
+      history.scrollTop += result.getBoundingClientRect().top - history.getBoundingClientRect().top;
+      followBottom = atBottom(); $("oa-new-result").hidden = true;
+    } else { followBottom = follow; if (follow) scrollToBottom(); else $("oa-new-result").hidden = false; }
+  }
   function userMessage(requestId, text) {
     $("oa-welcome")?.remove();
     for (const placeholder of history.querySelectorAll(":scope > p.oa-answer")) placeholder.remove();
@@ -273,16 +319,75 @@
     return details;
   }
   function sourceLayout() {
-    const overlay = !$("oa-sources").hidden && !(panel.classList.contains("is-fullscreen") && matchMedia("(min-width: 861px)").matches);
+    const overlay = (!$("oa-sources").hidden || !$("oa-reply").hidden) && !(panel.classList.contains("is-fullscreen") && matchMedia("(min-width: 861px)").matches);
     $("oa-chat").inert = overlay;
     if (overlay) $("oa-chat").setAttribute("aria-hidden", "true");
     else $("oa-chat").removeAttribute("aria-hidden");
   }
   function closeSources(focus = true) {
-    sourceVersion++; $("oa-sources").hidden = true; panel.classList.remove("has-sources");
+    sourceVersion++; $("oa-sources").hidden = true;
+    if ($("oa-reply").hidden) panel.classList.remove("has-sources");
     $("oa-sources-body").replaceChildren(); sourceLayout();
     if (focus && sourceFocus?.isConnected) sourceFocus.focus();
     sourceFocus = null;
+  }
+  function closeReply() {
+    clearTimeout(draftTimer); draftStatusVersion++;
+    $("oa-reply").hidden = true;
+    if ($("oa-sources").hidden) panel.classList.remove("has-sources");
+    sourceLayout();
+  }
+  function openReply() {
+    closeSources(false); $("oa-reply").hidden = false; panel.classList.add("has-sources"); sourceLayout();
+    $("oa-reply-close").focus();
+    void checkDraftMessages();
+  }
+  async function checkDraftMessages() {
+    clearTimeout(draftTimer);
+    if (denied || panel.hidden || $("oa-reply").hidden || document.hidden || !currentDraft?.data.draft_ref) return;
+    const draft = currentDraft, version = ++draftStatusVersion;
+    try {
+      const value = await request(`/drafts/${encodeURIComponent(draft.data.draft_ref)}/status`);
+      if (denied || version !== draftStatusVersion || draft !== currentDraft) return;
+      let notice = $("oa-reply-body").querySelector(".oa-draft-new-message");
+      if (value.new_messages && !notice) {
+        notice = node("div", "oa-draft-new-message"); notice.setAttribute("role", "status");
+        const refresh = node("button", "", "更新草稿"); refresh.type = "button"; refresh.dataset.ask = "true";
+        refresh.addEventListener("click", () => void ask("读取这个会话的最新问答，重新起草英文回复。", {
+          event_ref: draft.data.event_ref || null, message_ref: draft.data.message_ref || null, reply_action: "generate"}));
+        notice.append(node("span", "", "有新消息，建议核对。"), refresh); $("oa-reply-body").prepend(notice); controls();
+      } else if (!value.new_messages) notice?.remove();
+    } catch (error) {
+      if (!denied && version === draftStatusVersion) status(error.message, true);
+    } finally {
+      if (!denied && version === draftStatusVersion && draft === currentDraft && !panel.hidden && !$("oa-reply").hidden && !document.hidden) draftTimer = setTimeout(checkDraftMessages, 30000);
+    }
+  }
+  function replyButton(reference, title, message = false) {
+    const context = message ? {message_ref: reference, event_ref: null, audience: "all"} : {event_ref: reference, message_ref: null, event_title: title};
+    const button = node("button", "oa-reply-action", "帮我回复"); button.type = "button"; button.dataset.ask = "true";
+    button.addEventListener("click", () => {
+      selectedReply = context;
+      if (!currentDraft) $("oa-reply-title").textContent = title || "帮我回复";
+      openReply();
+      if (!currentDraft) $("oa-reply-body").replaceChildren(node("p", "oa-coverage", "正在读取问答并起草…"));
+      void ask("针对选中的消息起草一条英文回复，并给出中文参考。", {...context, reply_action: "generate"});
+    });
+    return button;
+  }
+  function rawMessages(content, value, replyable = true) {
+    for (const message of value.messages || []) {
+      const item = node("figure");
+      item.append(node("figcaption", "", [message.conversation_name || message.chat_name, message.sender_name || (message.is_staff ? "内部同事" : message.speaker === "other" ? "对方" : null),
+        date(message.time || message.sent_at || message.created_at),
+        {matched: "引用消息", parent: "回复对象", root: "话题起点", nearby_context: "相邻消息"}[message.relation]].filter(Boolean).join(" · ")),
+        node("blockquote", "", message.text || "这条消息没有可显示的文字。"));
+      const ref = message.message_ref || message.evidence_ref;
+      if (replyable && ref && message.text && !message.unreadable) item.append(replyButton(ref, message.conversation_name || message.chat_name || "当前消息", true));
+      content.append(item);
+    }
+    if (!value.messages?.length) content.append(node("p", "oa-coverage", "当前没有可读取的原文。"));
+    const gaps = gapList(value.gaps, value.gap_summary, value.gap_conversation_count); if (gaps) content.append(gaps);
   }
   function evidenceCard(reference, title = "消息原文", count = null) {
     const button = node("button", "oa-evidence", Number.isFinite(count) ? `查看原文 · ${count} 条` : "查看原文");
@@ -290,6 +395,7 @@
     button.addEventListener("click", async () => {
       if (denied) return;
       const version = ++sourceVersion, content = $("oa-sources-body");
+      closeReply();
       sourceFocus = button; $("oa-sources").hidden = false; panel.classList.add("has-sources");
       $("oa-source-title").textContent = title; $("oa-sources-close").focus(); sourceLayout();
       content.replaceChildren(node("p", "oa-coverage", "正在读取原文…"));
@@ -297,16 +403,7 @@
         const value = await request(`/evidence/${encodeURIComponent(reference)}`);
         if (denied || version !== sourceVersion) return;
         content.replaceChildren();
-        for (const message of value.messages || []) {
-          const item = node("figure");
-          item.append(node("figcaption", "", [message.conversation_name || message.chat_name, message.sender_name,
-            date(message.time || message.sent_at || message.created_at),
-            {matched: "引用消息", parent: "回复对象", root: "话题起点", nearby_context: "相邻消息"}[message.relation]].filter(Boolean).join(" · ")),
-            node("blockquote", "", message.text || "这条消息没有可显示的文字。"));
-          content.append(item);
-        }
-        if (!value.messages?.length) content.append(node("p", "oa-coverage", "当前没有可读取的原文。"));
-        const gaps = gapList(value.gaps, value.gap_summary, value.gap_conversation_count); if (gaps) content.append(gaps);
+        rawMessages(content, value);
         content.scrollTop = 0;
       } catch (error) { if (!denied && version === sourceVersion) content.replaceChildren(node("p", "oa-gaps", error.message)); }
     });
@@ -317,14 +414,22 @@
     const card = node("section", "oa-draft"), editor = node("textarea"), label = node("label", "", "回复草稿 · 可编辑");
     editor.value = draft.draft; editor.rows = 5; editor.setAttribute("aria-label", "回复草稿");
     card.dataset.original = draft.draft;
-    const copy = node("button", "", "复制回复"), feedback = node("span", "oa-copy-feedback");
+    const copy = node("button", "", draft.context?.chat_url ? "复制并打开 Lark" : "复制回复"), feedback = node("span", "oa-copy-feedback");
     copy.type = "button"; feedback.setAttribute("role", "status");
+    if (draft.context?.message) {
+      const context = node("details", "oa-reply-context"); context.open = true;
+      context.append(node("summary", "", draft.context.chat_name || "原文与最新进展"));
+      rawMessages(context, {messages: draft.context.messages?.length ? draft.context.messages : [draft.context.message]}, false); card.append(context);
+    }
     card.append(label, editor);
-    if (draft.chinese_translation && draft.language !== "zh") card.append(node("p", "oa-translation", draft.chinese_translation));
+    const translation = node("p", "oa-translation", draft.chinese_translation || "");
+    const translationLabel = node("div", "oa-translation-label", "中文参考");
+    translationLabel.hidden = translation.hidden = !draft.chinese_translation || draft.language === "zh"; card.append(translationLabel, translation);
     editor.addEventListener("input", () => {
       card.dataset.edited = String(editor.value !== draft.draft);
       copy.disabled = !editor.value.trim();
-      feedback.textContent = editor.value !== draft.draft && draft.chinese_translation ? "译文对应生成时原稿" : "";
+      translationLabel.textContent = editor.value !== draft.draft && draft.chinese_translation ? "中文参考 · 待更新" : "中文参考";
+      feedback.textContent = "";
     });
     copy.addEventListener("click", async () => {
       if (denied || !editor.value.trim()) return;
@@ -336,12 +441,66 @@
           card.replaceChildren(node("p", "oa-gaps", "草稿已过时或不可读取，请重新生成。")); return;
         }
         await navigator.clipboard.writeText(editor.value); feedback.textContent = "已复制，未发送";
+        if (draft.context?.chat_url) {
+          let url;
+          try { url = new URL(draft.context.chat_url); } catch { /* Invalid conversation links are not opened. */ }
+          if (url?.protocol === "https:" && ["applink.larksuite.com", "applink.feishu.cn"].includes(url.hostname)) {
+            if (!window.open(url.href, "_blank", "noopener,noreferrer")) {
+              const open = node("a", "", "打开 Lark"); open.href = url.href; open.target = "_blank"; open.rel = "noopener noreferrer";
+              feedback.replaceChildren(document.createTextNode("已复制，未发送 · "), open);
+            }
+          }
+        }
       } catch (error) {
         if (!denied) feedback.textContent = error.name === "NotAllowedError" ? "浏览器未允许复制，可选中文字手动复制" : error.message;
       } finally { if (!denied) copy.disabled = !editor.value.trim(); }
     });
+    const actions = node("div", "oa-draft-tools");
+    for (const [text, action] of [["更短", "shorter"], ["更自然", "natural"], ["礼貌催办", "follow_up"], ["换成英文", "english"], ["更新中文", "translate"]]) {
+      const button = node("button", "", text); button.type = "button"; button.dataset.ask = "true";
+      button.addEventListener("click", () => {
+        if (!draft.draft_ref || !editor.value.trim()) { feedback.textContent = "请先重新生成这条草稿。"; return; }
+        void ask(`${text}当前草稿，保留已确认事实。`, {event_ref: draft.event_ref || null, message_ref: draft.message_ref || null,
+          draft_ref: draft.draft_ref, edited_draft: editor.value, reply_action: action});
+      });
+      actions.append(button);
+    }
+    card.append(actions);
+    if (draft.checks?.length || draft.explanation) card.append(node("p", "oa-draft-checks", [draft.explanation, ...(draft.checks || [])].filter(Boolean).join(" · ")));
     card.append(copy, feedback);
     return card;
+  }
+  function showDraft(draft, turnId, requested = false) {
+    const body = $("oa-reply-body"), previous = currentDraft?.card;
+    const edited = previous?.dataset.edited === "true" || previous?.contains(document.activeElement);
+    const changedDuringAction = previous && activeReplyText != null && previous.querySelector("textarea").value !== activeReplyText;
+    if (previous && activeReplyAction === "translate") {
+      const translation = previous.querySelector(".oa-translation");
+      if (changedDuringAction) {
+        previous.querySelector(".oa-translation-label").textContent = "中文参考 · 待更新";
+        previous.querySelector(".oa-copy-feedback").textContent = "正文又有修改，请更新中文。";
+      } else {
+        translation.textContent = draft.chinese_translation || ""; translation.hidden = !draft.chinese_translation;
+        previous.querySelector(".oa-translation-label").textContent = "中文参考";
+        previous.querySelector(".oa-copy-feedback").textContent = "中文参考已更新";
+        Object.assign(currentDraft.data, draft, {draft: previous.querySelector("textarea").value});
+      }
+    } else if (previous && (edited || changedDuringAction) && (!activeReplyAction || activeReplyAction === "generate" || changedDuringAction)) {
+      currentDraft.next = {draft, turnId};
+      if (!body.querySelector(".oa-draft-update")) {
+        const replace = node("button", "oa-draft-update"); replace.type = "button";
+        replace.addEventListener("click", () => {
+          const next = currentDraft.next, card = draftCard(next.draft, next.turnId);
+          if (card) { body.replaceChildren(card); currentDraft = {card, data: next.draft, turnId: next.turnId}; $("oa-reply-title").textContent = next.draft.context?.chat_name || "回复草稿"; controls(); void checkDraftMessages(); }
+        }); body.prepend(replace);
+      }
+      body.querySelector(".oa-draft-update").textContent = `新草稿${draft.context?.chat_name ? ` · ${draft.context.chat_name}` : ""} · 点击更新`;
+    } else {
+      const card = draftCard(draft, turnId);
+      if (card) { body.replaceChildren(card); currentDraft = {card, data: draft, turnId}; $("oa-reply-title").textContent = draft.context?.chat_name || "回复草稿"; }
+    }
+    if (requested) openReply();
+    else if (!$("oa-reply").hidden) void checkDraftMessages();
   }
   function askButton(label, prompt, context = {}) {
     const button = node("button", "", label); button.type = "button"; button.dataset.ask = "true";
@@ -370,10 +529,47 @@
     }
     return list;
   }
+  function windowSources(data) {
+    const card = node("section", "oa-data oa-source-entry"), details = node("details", "oa-coverage");
+    let pageNumber = data.page || 1, currentPage = data;
+    const count = data.total_messages ?? data.coverage?.total_messages ?? data.messages?.length ?? 0;
+    details.append(node("summary", "", `来源 · ${count} 条消息${data.total_conversations ? ` · ${data.total_conversations} 个会话` : ""}`));
+    const body = node("div", "oa-source-page"), footer = node("div", "oa-source-pagination");
+    const pageLabel = node("span", "oa-coverage"), previous = node("button", "", "上一页"), next = node("button", "", "下一页");
+    previous.type = next.type = "button";
+    const draw = value => {
+      currentPage = value;
+      body.replaceChildren();
+      rawMessages(body, value);
+      const pageCount = value.page_count || data.page_count || 1;
+      pageLabel.textContent = `第 ${pageNumber} / ${pageCount} 页`;
+      previous.disabled = pageNumber <= 1; next.disabled = !(value.has_more ?? pageNumber < pageCount);
+      footer.hidden = pageCount <= 1 || !data.source_url;
+    };
+    const load = async step => {
+      if (denied) return;
+      const requestedPage = pageNumber + step, version = revision;
+      previous.disabled = next.disabled = true;
+      try {
+        const url = new URL(data.source_url, location.origin);
+        if (url.origin !== location.origin || !url.pathname.startsWith("/assistant/sources/")) throw new Error("来源地址无效。");
+        url.searchParams.set("page", requestedPage);
+        const value = await request(url.pathname.slice("/assistant".length) + url.search);
+        if (denied || version !== revision || !card.isConnected) return;
+        pageNumber = requestedPage; draw(value); controls();
+      } catch (error) { if (!denied && version === revision) { draw(currentPage); body.append(node("p", "oa-gaps", error.message)); } }
+    };
+    previous.addEventListener("click", () => void load(-1)); next.addEventListener("click", () => void load(1));
+    footer.append(previous, pageLabel, next); details.append(body, footer);
+    if (data.window?.start && data.window?.end) details.append(node("p", "oa-card-meta", `${date(data.window.start)} – ${date(data.window.end)} · 英国时间`));
+    if (data.coverage?.source_complete === false) details.append(node("p", "oa-coverage", "部分会话或记录暂不可读取。"));
+    card.append(details); draw(data); return card;
+  }
   function dataCard(data) {
     const titles = {creators: "达人资料", groups: "群聊目录", sync: "同步状态", activity: "活动统计", messages: "消息命中",
       window_messages: "总结来源", message_context: "原文与问答"};
     if (!data || !titles[data.kind]) return null;
+    if (data.kind === "window_messages") return windowSources(data);
     const card = node("section", "oa-data"); card.dataset.queryRef = data.query_ref || "";
     card.append(node("h4", "", titles[data.kind]));
     if (data.window?.start && data.window?.end) card.append(node("p", "oa-card-meta",
@@ -432,15 +628,9 @@
       card.append(node("p", "", text.length > 420 ? `${text.slice(0, 420)}…` : text));
       card.append(node("p", "oa-coverage", "包含引用消息与有限相邻问答，不是完整会话。"));
       const ref = data.message_ref || data.evidence_ref || message.message_ref;
-      if (ref) card.append(evidenceCard(ref, message.conversation_name || message.chat_name || "原文与问答"));
-    } else if (["messages", "window_messages"].includes(data.kind)) {
-      const window = data.kind === "window_messages";
-      const messageList = window ? node("details", "oa-coverage") : card;
-      if (window) {
-        messageList.append(node("summary", "", `查看本页原消息（${data.messages?.length || 0}）`));
-        card.append(messageList);
-      }
-      for (const message of (data.messages || []).slice(0, window ? 100 : 25)) {
+      if (ref) card.append(evidenceCard(ref, message.conversation_name || message.chat_name || "原文与问答"), replyButton(ref, message.conversation_name || message.chat_name || "当前消息", true));
+    } else if (data.kind === "messages") {
+      for (const message of (data.messages || []).slice(0, 25)) {
         const hit = node("div", "oa-hit");
         hit.append(node("div", "oa-card-meta", [message.conversation_name || message.chat_name, message.sender_name,
           date(message.time || message.sent_at)].filter(Boolean).join(" · ")));
@@ -448,48 +638,64 @@
         hit.append(node("p", "", text.length > 420 ? `${text.slice(0, 420)}…` : text));
         if (message.unavailable_or_truncated) hit.append(node("p", "oa-coverage", "正文不完整，请查看来源范围。"));
         const ref = message.evidence_ref || message.message_ref;
-        if (ref) hit.append(evidenceCard(ref, message.conversation_name || message.chat_name || "消息原文"));
-        messageList.append(hit);
+        if (ref) {
+          hit.append(evidenceCard(ref, message.conversation_name || message.chat_name || "消息原文"));
+          if (message.text && !message.unreadable) hit.append(replyButton(ref, message.conversation_name || message.chat_name || "当前消息", true));
+        }
+        card.append(hit);
       }
-      if (!data.messages?.length) card.append(node("p", "oa-coverage", window ? "该时段尚无已同步消息。" : "这次扫描未找到可读的匹配消息。"));
+      if (!data.messages?.length) card.append(node("p", "oa-coverage", "这次扫描未找到可读的匹配消息。"));
       const coverage = data.coverage || {}, counts = [];
       for (const [key, label] of [["scanned", "扫描"], ["readable", "可读"], ["unreadable", "不可读"], ["matched", "命中"]]) {
         if (Number.isFinite(coverage[key])) counts.push(`${label} ${coverage[key]}`);
       }
-      if (counts.length && !window) card.append(node("p", "oa-coverage", `本页：${counts.join(" · ")}，不是全库总量。`));
-      if (window) {
-        const total = coverage.total_messages ?? data.total_messages;
-        card.append(node("p", "oa-coverage", `${data.scope?.audience === "creators" ? "达人消息" : "全部授权消息"} · 本页 ${data.messages?.length || 0} 条${Number.isFinite(total) ? ` / 时段 ${total} 条` : ""}`));
-      }
+      if (counts.length) card.append(node("p", "oa-coverage", `本页：${counts.join(" · ")}，不是全库总量。`));
       if (coverage.scan_complete === false) card.append(node("p", "oa-coverage", "扫描尚未结束，可继续下一页。"));
       if (coverage.source_complete === false) card.append(node("p", "oa-coverage", "来源覆盖不完整，未命中不代表没有发生。"));
     }
     const gaps = gapList(data.gaps, data.gap_summary, data.gap_conversation_count); if (gaps) card.append(gaps);
     if (data.checked_at) card.append(node("p", "oa-coverage", `查询于 ${date(data.checked_at)}`));
-    if (data.next_cursor && data.query_ref) {
+    if (data.kind === "messages" && data.next_source_url) {
+      const actions = node("div", "oa-card-actions"), next = node("button", "", "下一页"); next.type = "button";
+      next.addEventListener("click", async () => {
+        const version = revision; next.disabled = true;
+        try {
+          const url = new URL(data.next_source_url, location.origin);
+          if (url.origin !== location.origin || !url.pathname.startsWith("/assistant/sources/")) throw new Error("来源地址无效。");
+          const value = await request(url.pathname.slice("/assistant".length) + url.search);
+          if (denied || version !== revision || !card.isConnected) return;
+          const page = dataCard(value); if (page) card.replaceWith(page); controls();
+        } catch (error) { if (!denied && version === revision) { next.disabled = false; actions.append(node("span", "oa-gaps", error.message)); } }
+      });
+      actions.append(next); card.append(actions);
+    } else if (data.kind !== "messages" && data.next_cursor && data.query_ref) {
       const actions = node("div", "oa-card-actions");
       actions.append(askButton("继续下一页", "继续查看这次查询的下一页", {...data.scope, query_ref: data.query_ref, cursor: data.next_cursor})); card.append(actions);
     }
     return card;
   }
   function renderResult(container, result) {
-    const previousDraft = container.querySelector(".oa-draft");
-    const keepDraft = typeof result.draft?.draft === "string" && result.draft.draft.trim() && previousDraft &&
-      (previousDraft.dataset.edited === "true" || previousDraft.contains(document.activeElement));
-    const focusedEditor = keepDraft && previousDraft.querySelector("textarea") === document.activeElement ? document.activeElement : null;
-    const selection = focusedEditor ? [focusedEditor.selectionStart, focusedEditor.selectionEnd] : null;
     container.replaceChildren(answer(result.answer));
     scope({...result.scope, ...result.window});
+    const groups = new Map([["reply", {label: "需要我回复", element: node("details", "oa-event-group")}],
+      ["followup", {label: "需要内部跟进", element: node("details", "oa-event-group")}],
+      ["waiting", {label: "等待对方", element: node("details", "oa-event-group")}],
+      ["closed", {label: "已解决／无需处理", element: node("details", "oa-event-group")}]]);
+    let expanded = 0;
     (result.events || []).forEach((event, index) => {
-      const card = node("section", "oa-event"), meta = node("div", "oa-event-meta");
+      const action = event.action_group || (["resolved", "not_required", "no_action"].includes(event.handling_status) ? "closed" : event.reply_status === "replied" ? "followup" : "reply");
+      const group = groups.get(action) || groups.get("followup");
+      const card = node("details", "oa-event"), header = node("summary", "oa-event-title"), meta = node("div", "oa-event-meta");
+      card.open = action !== "closed" && expanded++ < 8;
       const importance = event.importance?.tier_label || {focus: "重点", priority: "优先", normal: "常规",
         dormant: "久未联系", pending: "待评估"}[event.importance?.tier];
       for (const text of [event.creator_handle || event.lark_user_name || event.creator_name,
-        importance && `重要度：${importance}`, event.priority,
-        {unresolved: "待跟进", resolved: "已解决", uncertain: "待核对"}[event.handling_status]]) {
+        importance && `重要度：${importance}`, event.priority]) {
         if (text) meta.append(node("span", "", text));
       }
-      card.append(meta, node("h4", "", `${index + 1}. ${event.title || "聊天事项"}`));
+      header.append(meta, node("h4", "", `${index + 1}. ${event.title || "聊天事项"}`)); card.append(header);
+      const states = node("details", "oa-event-states");
+      states.append(node("summary", "", "状态详情"), node("div", "", `回复状态：${{unreplied: "未见回复", replied: "已回复", uncertain: "待核对"}[event.reply_status] || "待核对"} · 处理状态：${{unresolved: "未解决", resolved: "已解决", not_required: "无需处理", no_action: "无需处理", uncertain: "待核对"}[event.handling_status] || "待核对"}`));
       if (event.conversations?.length) {
         const conversations = node("div", "oa-card-meta");
         for (const chat of event.conversations) conversations.append(node("span", "",
@@ -498,25 +704,38 @@
       }
       if (event.summary) card.append(node("p", "", event.summary));
       if (event.latest_progress) card.append(node("p", "", event.latest_progress));
+      if (event.deadline_day) card.append(node("div", "oa-deadline", event.due_today ? "今天截止" : `截止 ${event.deadline_day}`));
+      if (action === "reply" && Number.isFinite(event.waiting_seconds) && event.waiting_seconds > 0) card.append(node("div", "oa-card-meta", `原文中已等待 ${event.waiting_seconds >= 86400 ? `${Math.floor(event.waiting_seconds / 86400)} 天` : event.waiting_seconds >= 3600 ? `${Math.floor(event.waiting_seconds / 3600)} 小时` : `${Math.max(1, Math.floor(event.waiting_seconds / 60))} 分钟`}`));
+      card.append(states);
       const actions = node("div", "oa-card-actions");
       if (event.evidence_ref || event.event_ref) actions.append(evidenceCard(event.evidence_ref || event.event_ref, event.title || "聊天事项原文", event.evidence_count));
       if (event.event_ref) actions.append(askButton("最新进展", "查看这个事项的最新进展", {event_ref: event.event_ref, event_title: event.title || "聊天事项"}),
-        askButton("起草回复", "针对这个事项起草一条回复", {event_ref: event.event_ref, event_title: event.title || "聊天事项"}));
+        replyButton(event.event_ref, event.title || "聊天事项"));
       if (actions.children.length) card.append(actions);
-      container.append(card);
+      group.element.append(card);
     });
-    for (const data of result.data || []) { const card = dataCard(data); if (card) container.append(card); }
-    const draft = keepDraft ? previousDraft : draftCard(result.draft, container.dataset.turnId);
-    if (draft) {
-      container.append(draft);
-      if (focusedEditor) { focusedEditor.focus({preventScroll: true}); focusedEditor.setSelectionRange(...selection); }
-      if (keepDraft && result.draft?.draft && previousDraft.dataset.original !== result.draft.draft && !draft.querySelector(".oa-draft-update")) {
-        const replace = node("button", "oa-draft-update", "使用新生成的草稿"); replace.type = "button";
-        replace.addEventListener("click", () => { const value = draftCard(result.draft, container.dataset.turnId); if (value) draft.replaceWith(value); });
-        draft.append(replace);
-      }
+    for (const [key, group] of groups) if (group.element.children.length) {
+      group.element.open = key !== "closed";
+      group.element.prepend(node("summary", "", `${group.label} · ${group.element.children.length} 项`)); container.append(group.element);
     }
-    const gaps = gapList(result.gaps, result.gap_summary, result.gap_conversation_count); if (gaps) container.append(gaps);
+    const sourcePages = (result.data || []).filter(data => data.kind === "window_messages");
+    let sourcesAdded = false;
+    for (const data of result.data || []) {
+      if (data.kind === "window_messages" && sourcesAdded) continue;
+      const value = data.kind === "window_messages" && sourcePages.length > 1 ? {...data,
+        messages: [...new Map(sourcePages.flatMap(page => page.messages || []).map(message => [message.message_ref || message.evidence_ref || JSON.stringify(message), message])).values()]} : data;
+      const card = dataCard(value); if (card) container.append(card);
+      if (data.kind === "window_messages") sourcesAdded = true;
+    }
+    if (result.draft?.draft?.trim()) {
+      const draft = {...result.draft, draft_ref: result.draft.draft_ref || result.draft_ref};
+      showDraft(draft, container.dataset.turnId, Boolean(activeReplyAction));
+      const openDraft = node("button", "oa-evidence", "查看回复草稿"); openDraft.type = "button";
+      openDraft.addEventListener("click", () => { showDraft(draft, container.dataset.turnId); openReply(); }); container.append(openDraft);
+    }
+    if (!sourcePages.length) {
+      const gaps = gapList(result.gaps, result.gap_summary, result.gap_conversation_count); if (gaps) container.append(gaps);
+    }
     const coverage = result.coverage;
     if (coverage && typeof coverage === "object") {
       const counts = [];
@@ -557,6 +776,7 @@
   }
   function finish(state) {
     source?.close(); source = null; active = null; controls();
+    activeReplyAction = null; activeReplyText = null;
     if (state === "completed") status("");
     else status(labels[state] || "这轮处理已结束", state !== "cancelled");
     syncPageContext();
@@ -574,13 +794,17 @@
     source.addEventListener("progress", event => {
       if (active !== watching) return;
       const progress = JSON.parse(event.data);
-      status(progress.message || labels[progress.status] || "正在整理");
+      const counts = [];
+      if (Number.isFinite(progress.messages)) counts.push(`已读取 ${progress.messages}${Number.isFinite(progress.total_messages) ? ` / ${progress.total_messages}` : ""} 条`);
+      if (Number.isFinite(progress.conversations)) counts.push(`${progress.conversations} 个会话`);
+      if (Number.isFinite(progress.segments_completed) && Number.isFinite(progress.segments_total)) counts.push(`已整理 ${progress.segments_completed} / ${progress.segments_total} 段`);
+      status([progress.message || labels[progress.status] || "正在整理", ...counts].join(" · "));
     });
     source.addEventListener("result", event => {
       if (active !== watching || denied) return;
       const follow = atBottom();
       const completed = {...view, status: "completed", result: JSON.parse(event.data)};
-      adoptTurnScope(completed); turn(completed); controls(); updatedScroll(follow);
+      adoptTurnScope(completed); turn(completed); controls(); updatedScroll(follow, completed.id);
     });
     source.addEventListener("error", event => {
       if (active !== watching) return;
@@ -618,6 +842,9 @@
       const changed = received.filter(view => view.error_code === "source_changed");
       if (changed.length) {
         closeSources(false);
+        if (changed.some(view => view.id === currentDraft?.turnId)) {
+          closeReply(); currentDraft = selectedReply = null; $("oa-reply-body").replaceChildren();
+        }
         for (const child of [...history.children]) {
           if (changed.some(view => child.dataset.turnId === view.id || child.dataset.requestId === view.client_request_id)) child.remove();
         }
@@ -635,6 +862,7 @@
       }
       if (!turns.length) {
         closeSources(false); currentScopeTurn = null;
+        closeReply(); currentDraft = selectedReply = null; $("oa-reply-body").replaceChildren();
         history.replaceChildren(node("p", "oa-answer", "开始一个新问题。"));
         selectContext({cm_id: activeContext.cm_id, cm_name: activeContext.cm_name, audience: "all", creator_ids: null}); scope({});
         if (!saved.client_request_id) status("");
@@ -656,7 +884,7 @@
       else { source?.close(); source = null; active = null; controls(); }
       if (saved.client_request_id) status("上次提交尚未确认，重新输入后重试会复用原请求编号。", true);
       else if (turns.length && !running) status("");
-      updatedScroll(follow);
+      updatedScroll(follow, latest?.id);
     } catch (error) {
       if (denied || version !== revision) return;
       if (error.status === 404 && !saved.client_request_id) { saved = {}; persist(); }
@@ -674,6 +902,10 @@
     if (!saved.client_request_id) saved.client_request_id = crypto.randomUUID();
     saved.cm_id = activeContext.cm_id;
     if (!pending) {
+      if (!Object.keys(selectedContext).length) for (const key of ["start", "end", "reply_status", "sort"]) delete activeContext[key];
+      for (const key of ["reply_action", "draft_ref", "edited_draft"]) delete activeContext[key];
+      activeReplyAction = selectedContext.reply_action || null;
+      activeReplyText = selectedContext.edited_draft ?? null;
       selectContext(selectedContext); scope({});
       pendingScopeVersion = scopeVersion;
       pending = {session_id: saved.session_id, client_request_id: saved.client_request_id, message: text,
@@ -702,10 +934,13 @@
     panel.hidden = false; $("oa-launcher").hidden = true; $("oa-launcher").setAttribute("aria-expanded", "true");
     if (matchMedia("(max-width: 600px)").matches) fullscreen(true);
     if (followBottom) scrollToBottom();
-    if ($("oa-sources").hidden) input.focus(); else $("oa-sources-close").focus();
+    if (!$("oa-reply").hidden) $("oa-reply-close").focus();
+    else if ($("oa-sources").hidden) input.focus(); else $("oa-sources-close").focus();
     void loadScopes();
+    if (!$("oa-reply").hidden) void checkDraftMessages();
   }
   function collapse() {
+    clearTimeout(draftTimer); draftStatusVersion++;
     panel.hidden = true; $("oa-launcher").hidden = false; $("oa-launcher").setAttribute("aria-expanded", "false");
     $("oa-launcher").focus();
   }
@@ -723,6 +958,32 @@
     if (!switchCM($("oa-cm").value)) $("oa-cm").value = activeContext.cm_id || "";
     else input.focus();
   });
+  $("oa-period").addEventListener("change", () => { $("oa-custom-time").hidden = $("oa-period").value !== "custom"; });
+  $("oa-scope-cancel").addEventListener("click", () => { $("oa-scope-editor").hidden = true; });
+  $("oa-scope-editor").addEventListener("submit", event => {
+    event.preventDefault();
+    try {
+      const range = $("oa-period").value === "custom" ? {start: londonTime($("oa-start").value), end: londonTime($("oa-end").value)} : periodRange($("oa-period").value);
+      if (range.start >= range.end) throw new Error("结束时间应晚于开始时间。");
+      const audience = $("oa-audience").value, sameAudience = audience === activeContext.audience;
+      const selected = sameAudience ? Object.fromEntries(["creator_ids", "creator_names", "chat_ids", "chat_names", "event_ref", "event_title", "message_ref"]
+        .filter(key => Object.hasOwn(activeContext, key)).map(key => [key, activeContext[key]])) : {};
+      $("oa-scope-editor").hidden = true;
+      void ask(activeContext.reply_status === "unreplied" && audience === "creators" ? "查看当前时段我的达人待回复事项，按重要度优先展示。" : "总结当前范围及时段的重点事项。",
+        {cm_id: activeContext.cm_id, audience, creator_ids: null, chat_ids: null, event_ref: null, message_ref: null, ...selected, ...range});
+    } catch (error) { status(error.message, true); }
+  });
+  for (const button of app.querySelectorAll("[data-quick]")) button.addEventListener("click", () => {
+    if (button.dataset.quick === "reply") {
+      if (!selectedReply && !activeContext.event_ref && !activeContext.message_ref) { status("先在事项或消息旁选择「帮我回复」。"); return; }
+      openReply(); void ask("针对当前选中的消息起草英文回复，并给出中文参考。", {...(selectedReply || activeContext), reply_action: "generate"});
+    } else {
+      const unreplied = button.dataset.quick === "unreplied";
+      void ask(unreplied ? "查看昨天至现在我负责达人的未回复事项，按达人重要度优先展示。" : "总结今天全部授权消息里的重点事项。",
+        {cm_id: activeContext.cm_id, audience: unreplied ? "creators" : "all", creator_ids: null, chat_ids: null, event_ref: null, message_ref: null,
+          ...periodRange(unreplied ? "yesterday_now" : "today")});
+    }
+  });
   $("oa-new").addEventListener("click", () => {
     if (denied || !scopesReady || active || submitting || restoring || saved.client_request_id) return;
     resetSession(cmScopes.find(person => person.cm_id === activeContext.cm_id)); input.focus();
@@ -731,9 +992,6 @@
   input.addEventListener("input", controls);
   input.addEventListener("keydown", event => {
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); void ask(input.value); }
-  });
-  for (const button of app.querySelectorAll("[data-prompt]")) button.addEventListener("click", () => {
-    input.value = button.dataset.prompt; controls(); void ask(input.value);
   });
   $("oa-stop").addEventListener("click", async () => {
     if (!active) return;
@@ -744,18 +1002,20 @@
   panel.addEventListener("keydown", event => {
     if (event.key === "Escape") {
       event.preventDefault();
-      if (!$("oa-sources").hidden) closeSources();
+      if (!$("oa-reply").hidden) closeReply();
+      else if (!$("oa-sources").hidden) closeSources();
       else if (panel.classList.contains("is-fullscreen") && !matchMedia("(max-width: 600px)").matches) fullscreen(false);
       else collapse();
     }
     if (event.key !== "Tab" || !panel.classList.contains("is-fullscreen")) return;
-    const elements = [...panel.querySelectorAll("button:not(:disabled), select:not(:disabled), textarea:not(:disabled), summary, a[href], [tabindex='0']")]
+    const elements = [...panel.querySelectorAll("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), summary, a[href], [tabindex='0']")]
       .filter(element => element.getClientRects().length && !element.closest("[inert]"));
     const first = elements[0], last = elements.at(-1);
     if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
   });
   $("oa-sources-close").addEventListener("click", () => closeSources());
+  $("oa-reply-close").addEventListener("click", () => { closeReply(); input.focus(); });
   $("oa-new-result").addEventListener("click", scrollToBottom);
   history.addEventListener("scroll", () => {
     if (panel.hidden) return;
@@ -782,7 +1042,11 @@
     input.value = message; controls();
     void ask(message, context);
   });
-  window.addEventListener("pagehide", () => { source?.close(); clearTimeout(restoreTimer); });
+  document.addEventListener("visibilitychange", () => {
+    clearTimeout(draftTimer); draftStatusVersion++;
+    if (!document.hidden) void checkDraftMessages();
+  });
+  window.addEventListener("pagehide", () => { source?.close(); clearTimeout(restoreTimer); clearTimeout(draftTimer); draftStatusVersion++; });
   if (app.dataset.configured !== "true") status("助手尚未配置，请联系管理员。", true);
   scope({}); controls();
 })();

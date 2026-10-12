@@ -975,12 +975,21 @@ resolved 必须有明确对应同一事项的完成事实，可以来自达人�
 没有看到完成证据可 unresolved，但理由必须写尚未看到完成结果，不能断言现实中无人处理。
 handling_reason 中文简短说明实际依据。handling_evidence_refs 必须引用输入中的对应原文，
 resolved 必须引用完成事实，其他状态引用未完成请求、矛盾或无需处理的消息。状态与 P0-P3 独立。
+action_group 是当前下一步的展示分组，不修改事项状态：reply=对方有待答复问题，
+followup=需要内部核查、审批或补充事实，waiting=已向对方索取资料且正在等对方，
+closed=已解决或无需处理。waiting 必须有 staff 索取资料的实际回复依据；不能仅因没有新消息而等待对方。
+resolved/not_required 必须 closed；uncertain 优先 followup。不确定下一步时，不虚构已经请求对方补资料。
+waiting_since_ref：从本份完整材料找同一事项最近一次 staff 实质回复后的第一条对方消息，
+没有 staff 回复时找该事项第一条对方请求。后续催问不能重置；其他话题不计入。没有可核实的起点时 null。
+closed/waiting 分组填 null，不把员工索取资料后的等待对方时间当作对方等待回复时间。
 """
 _INSTRUCTIONS += HANDLING_INSTRUCTIONS
 
 
 def handling_fields(refs):
     return {
+        "action_group": {"type": "string", "enum": ["reply", "followup", "waiting", "closed"]},
+        "waiting_since_ref": {"type": ["string", "null"], "enum": [*refs, None]},
         "handling_status": {"type": "string", "enum": ["resolved", "unresolved", "uncertain", "not_required"]},
         "handling_reason": {"type": "string", "minLength": 1, "maxLength": 500},
         "handling_evidence_refs": {"type": "array", "items": {"type": "string", "enum": list(refs)},
@@ -1017,6 +1026,25 @@ def validate_handling(item, messages):
     ):
         item["handling_status"] = "uncertain"
         item["handling_reason"] = "核心内容无法读取，尚不能判断事项是否完成。"
+    # Historical/in-flight output predates the presentation grouping; do not reanalyse it.
+    group = item.get("action_group", (
+        "closed" if item["handling_status"] in {"resolved", "not_required"} else
+        "followup" if item["replied_by"] or item["handling_status"] == "uncertain" else "reply"))
+    if group not in {"reply", "followup", "waiting", "closed"}:
+        raise InvalidModelOutput("invalid action group")
+    if item["handling_status"] in {"resolved", "not_required"}:
+        group = "closed"
+    elif group == "closed" or item["handling_status"] == "uncertain" or (
+            group == "waiting" and not item["reply_evidence_refs"]):
+        group = "followup"
+    item["action_group"] = group
+    waiting = item.get("waiting_since_ref")
+    if waiting is not None and (not isinstance(waiting, str) or waiting not in messages
+                                or messages[waiting].get("is_staff")
+                                or messages[waiting].get("unreadable")
+                                or "user" in item and messages[waiting].get("speaker") != item["user"]):
+        raise InvalidModelOutput("invalid waiting evidence")
+    item["waiting_since_ref"] = waiting if group in {"reply", "followup"} else None
 
 
 def _format(evidence):
@@ -1084,7 +1112,9 @@ def _validate(raw, evidence):
     for item in payload["events"]:
         if isinstance(item, dict):
             item.pop("reason", None)  # Retired field in historical/in-flight output, never a business decision.
-        if not isinstance(item, dict) or set(item) != required or item["user"] not in evidence["users"]:
+        if (not isinstance(item, dict) or set(item) - required
+                or required - set(item) - {"action_group", "waiting_since_ref"}
+                or item["user"] not in evidence["users"]):
             raise InvalidModelOutput("invalid identity")
         user = evidence["users"][item["user"]]
         if item["handle"] is not None and item["handle"] not in user["handles"]:
@@ -1106,6 +1136,7 @@ def _validate(raw, evidence):
         validate_handling(item, messages)
         item["evidence_refs"] = refs = list(dict.fromkeys(
             refs + item["handling_evidence_refs"] + item["reply_evidence_refs"]
+            + ([item["waiting_since_ref"]] if item["waiting_since_ref"] else [])
         ))
         own = [messages[r] for r in refs if messages[r]["speaker"] == item["user"]]
         if not any(messages[r]["in_window"] for r in refs):
