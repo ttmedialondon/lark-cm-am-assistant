@@ -107,7 +107,8 @@
     closeSources(false);
     closeReply(); currentDraft = null; $("oa-reply-body").replaceChildren();
     delete saved.client_request_id; persist();
-    history.replaceChildren(node("p", "oa-answer", "连接或访问权限已变化，请重新登录后打开助手。"));
+    const reconnect = node("a", "oa-evidence", "检查账号连接"); reconnect.href = "/dashboard";
+    history.replaceChildren(node("p", "oa-answer", "连接或访问权限已变化。"), reconnect);
     cmScopes = []; scopesReady = false; $("oa-cm").replaceChildren(); $("oa-person").hidden = true;
     $("oa-scope").replaceChildren(); $("oa-scope").hidden = true;
     input.value = ""; controls();
@@ -141,7 +142,11 @@
         const selected = (canManageCM && saved.client_request_id && cmScopes.find(person => person.cm_id === saved.cm_id)) ||
           (canManageCM && cmScopes.find(person => person.cm_id === pageContext.cm_id)) ||
           cmScopes.find(person => person.cm_id === value.selected_cm_id) || (canManageCM && cmScopes[0]);
-        if (!selected) { status("Lark 连接未就绪，请重新连接后使用。", true); return false; }
+        if (!selected) {
+          status("Lark 连接未就绪。", true);
+          const reconnect = node("a", "oa-evidence", "检查账号连接"); reconnect.href = "/dashboard";
+          $("oa-status").append(document.createTextNode(" "), reconnect); return false;
+        }
         if (!canManageCM && saved.cm_id && saved.cm_id !== selected.cm_id) { saved = {}; pending = null; persist(); }
         $("oa-cm").replaceChildren(...cmScopes.map(person => {
           const option = node("option", "", person.cm_name || "未命名人员"); option.value = person.cm_id; return option;

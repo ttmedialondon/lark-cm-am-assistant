@@ -118,6 +118,15 @@ def test_dashboard_navigation_preserves_access_and_connection_controls(monkeypat
         **context, "admin_role": "owner", "admin_landing_path": "/admin",
     }).body.decode()
     assert 'href="/creators/broadcast"' in owner and 'href="/admin"' in owner
+    admin_context = {**context, 'admin_role': 'owner', 'admin_role_label': 'Owner',
+        'admin_permissions': {'messages'}, 'active_page': 'messages', 'users': [],
+        'user_page': {'page': 1}, 'selected_user': None}
+    admin_page = main._template(request, 'admin/messages.html', admin_context).body.decode()
+    assert 'id="operations-assistant"' in admin_page and 'id="oa-cm"' in admin_page
+    member_page = main._template(request, 'admin/messages.html', {
+        **admin_context, 'admin_role': 'member',
+    }).body.decode()
+    assert 'id="operations-assistant"' not in member_page
     monkeypatch.setattr(main.creator_broadcast, "preview_open", lambda: True)
     demo = main._template(request, "dashboard.html", context).body.decode()
     assert 'href="/creators/broadcast"' in demo and 'href="/admin"' not in demo

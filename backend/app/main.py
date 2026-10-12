@@ -62,7 +62,8 @@ REMI_TEST_SHANG_MA_ID = uuid.UUID("1225b4a0-fbd8-431e-962e-25e66943a8a0")
 
 
 def _template(request: Request, name: str, context: dict[str, Any], status_code: int = 200):
-    if name in {"dashboard.html", "creator_handles.html", "creator_broadcast.html", "offhours_summary.html"}:
+    if (name in {"dashboard.html", "creator_handles.html", "creator_broadcast.html", "offhours_summary.html"}
+            or (name == "admin/messages.html" and context.get("admin_role") == "owner")):
         authorization = context["authorization"]
         # Reuse the page's effective access; a navigation link never grants access.
         owner = bool(context.get("admin_role") == "owner"
