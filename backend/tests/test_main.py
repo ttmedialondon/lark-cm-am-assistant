@@ -6,6 +6,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from uuid import uuid4
 
 import pytest
+import psycopg
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 from test_identity_names import pg  # noqa: F401
@@ -13,7 +14,7 @@ from test_identity_names import pg  # noqa: F401
 from app import main
 from app.config import Settings
 from app.crypto import TokenCipher
-from app.lark_api import LarkProfile
+from app.lark_api import LarkApiError, LarkProfile
 
 
 def _request_with_session(session: str | None = None) -> Request:
@@ -35,6 +36,29 @@ def test_index_keeps_authenticated_users_on_the_dashboard(monkeypatch: pytest.Mo
     response = main.index(_request_with_session("active-session"))
     assert response.status_code == 303
     assert response.headers["location"] == "/dashboard"
+
+
+def test_oauth_database_unavailable_is_recoverable_without_leaking_or_replacing_login(monkeypatch, caplog):
+    monkeypatch.setattr(main, "get_settings", lambda: SimpleNamespace(
+        app_secret_configured=True, token_encryption_key=b"o" * 32, oauth_scopes=("offline_access",),
+    ))
+
+    def unavailable():
+        raise psycopg.OperationalError("private SQL, token=fixture-token, body=fixture-body")
+
+    monkeypatch.setattr(main, "connection", unavailable)
+    client = TestClient(main.app, base_url="https://testserver")
+    for path in ("/auth/lark/start", "/auth/lark/start?send=1",
+                 "/auth/lark/callback?code=fixture-code&state=fixture-state"):
+        response = client.get(path, headers={"cookie": f"{main.OAUTH_STATE_COOKIE}=fixture-state; "
+                                            f"{main.SESSION_COOKIE}=existing-login"}, follow_redirects=False)
+        assert response.status_code == 503 and "重新授权" in response.text
+        assert response.headers["x-request-id"] in response.text
+        assert response.headers["cache-control"] == "no-store"
+        assert main.SESSION_COOKIE not in response.cookies
+    assert "oauth_database_failed" in caplog.text
+    assert all(secret not in caplog.text for secret in ("private SQL", "fixture-token", "fixture-body",
+                                                       "fixture-code", "fixture-state", "existing-login"))
 
 
 def test_session_touch_is_throttled_without_caching_revocation(pg, monkeypatch):  # noqa: F811
@@ -199,7 +223,7 @@ def test_reauthorization_restarts_an_active_job_with_a_new_generation() -> None:
     ("send", False, "active", True),
 ))
 def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapping_grants(
-    pg, monkeypatch, upgrade, owner, initial_status, broadcast_enabled,  # noqa: F811
+    pg, monkeypatch, caplog, upgrade, owner, initial_status, broadcast_enabled,  # noqa: F811
 ):
     scopes = (
         "offline_access", "im:chat:read", "im:message:readonly", "im:chat.members:read",
@@ -270,6 +294,8 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
         avatar_url="https://test.feishucdn.com/avatar.png", en_name_present=True, avatar_present=True,
     )
 
+    provider_calls = {"exchange": 0, "profile": 0}
+
     class FakeLark:
         def __init__(self, received):
             self.scopes = received.oauth_scopes
@@ -280,7 +306,10 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
             return settings.oauth_authorize_url + "?" + urlencode({"scope": " ".join(self.scopes)})
 
         def exchange_code(self, code, verifier):
+            provider_calls["exchange"] += 1
             assert verifier == "synthetic-verifier"
+            if code == "api_error":
+                raise LarkApiError(503, 999999, "new-access-full raw-body-secret")
             granted = (
                 None if code == "missing" else " ".join(scopes[:4]) if code == "partial" else
                 " ".join(initial_scopes) if code == "missing_send" else
@@ -293,6 +322,7 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
             )
 
         def user_info(self, token):
+            provider_calls["profile"] += 1
             assert token.startswith("new-access-")
             return replace(profile, open_id="ou_counterpart") if token.endswith("wrong_account") else profile
 
@@ -386,7 +416,59 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
         assert callback(revoked_link).status_code == 403 and snapshot() == revoked
         pg.execute("UPDATE authorizations SET status=%s WHERE id=%s", (initial_status, actor))
 
+    real_audit = main._audit
+    audit_attempts = 0
+
+    def fail_after_audit(conn, authorization_id, action):
+        nonlocal audit_attempts
+        real_audit(conn, authorization_id, action)
+        audit_attempts += 1
+        raise failure("private provider error, token=new-access-full, raw-body-secret")
+
+    if send and broadcast_enabled:
+        invalid_verifier = state()
+        pg.execute("UPDATE oauth_states SET code_verifier_ciphertext=%s WHERE state_hash=%s",
+                   (TokenCipher(b"z" * 32).encrypt("synthetic-verifier"), main._sha256(invalid_verifier)))
+        before_calls = provider_calls.copy()
+        invalid_response = callback(invalid_verifier)
+        assert invalid_response.status_code == 502 and snapshot() == original
+        assert provider_calls == before_calls and "stage=code_verifier" in caplog.text
+        provider_error = callback(state(), "api_error")
+        assert provider_error.status_code == 502 and snapshot() == original
+        assert provider_error.headers["x-request-id"] in provider_error.text
+        assert "stage=token_exchange lark_code=999999" in caplog.text
+        assert provider_calls == {"exchange": before_calls["exchange"] + 1, "profile": before_calls["profile"]}
+        # Exhausted conflicts and unknown connection outcomes cannot leave partial writes or leak errors.
+        for failure, attempts in ((psycopg.errors.DeadlockDetected, 3), (psycopg.OperationalError, 1)):
+            audit_attempts = 0
+            monkeypatch.setattr(main, "_audit", fail_after_audit)
+            before_calls = provider_calls.copy()
+            rejected = callback(state())
+            assert rejected.status_code == 503 and "重新授权" in rejected.text
+            assert f"/auth/lark/start?send=1&amp;account_id={actor}" in rejected.text
+            assert rejected.headers["cache-control"] == "no-store"
+            assert rejected.headers["x-request-id"] in rejected.text
+            assert main.SESSION_COOKIE not in rejected.cookies
+            assert audit_attempts == attempts and snapshot() == original
+            assert provider_calls == {key: count + 1 for key, count in before_calls.items()}
+
+    audit_attempts = 0
+
+    def fail_first_audit(conn, authorization_id, action):
+        nonlocal audit_attempts
+        real_audit(conn, authorization_id, action)
+        audit_attempts += 1
+        if audit_attempts == 1:
+            raise psycopg.errors.DeadlockDetected("token=new-access-full, raw-body-secret")
+
+    monkeypatch.setattr(main, "_audit", fail_first_audit)
+    before_calls = provider_calls.copy()
     response = callback(state())
+    assert audit_attempts == 2
+    assert provider_calls == {key: count + 1 for key, count in before_calls.items()}
+    assert "oauth_database_retry" in caplog.text and "stage=profile_provider" in caplog.text
+    assert "new-access-full" not in caplog.text and "raw-body-secret" not in caplog.text
+    monkeypatch.setattr(main, "_audit", real_audit)
     destination = "/creators/broadcast" if send and (owner or broadcast_enabled) else "/dashboard"
     assert response.status_code == 303 and response.headers["location"] == destination
     upgraded = snapshot()

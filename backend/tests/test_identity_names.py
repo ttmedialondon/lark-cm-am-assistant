@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
-from contextlib import nullcontext
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -668,3 +670,82 @@ def test_avatar_cache_permission_backoff_visibility_and_late_response_guards(pg,
     profiles.store_profile_avatar(pg, target, None, avatar_present=True)
     assert (pg.execute("SELECT avatar_url FROM lark_identities WHERE open_id=%s", (target,)).fetchone()["avatar_url"]
             is None)
+
+
+def test_avatar_provider_authorization_race_preserves_new_consent(monkeypatch):
+    """OAuth, profile refresh and the two-write provider gate used to deadlock."""
+    dsn = os.environ.get("IDENTITY_NAMES_TEST_DATABASE_URL")
+    if not dsn:
+        pytest.skip("Set IDENTITY_NAMES_TEST_DATABASE_URL for isolated PostgreSQL checks")
+    schema = "test_avatar_lock_" + uuid4().hex
+    actor = uuid4()
+    with psycopg.connect(dsn, autocommit=True, row_factory=dict_row) as setup:
+        setup.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(psycopg.sql.Identifier(schema)))
+        try:
+            setup.execute(psycopg.sql.SQL("SET search_path TO {}").format(psycopg.sql.Identifier(schema)))
+            setup.execute("""CREATE TABLE authorizations(id uuid PRIMARY KEY,open_id text,status text,
+                          access_token_ciphertext text,scopes text[],body_consent_at timestamptz)""")
+            setup.execute("""CREATE TABLE identity_profile_providers(
+                          authorization_id uuid PRIMARY KEY REFERENCES authorizations(id) ON DELETE CASCADE,
+                          scopes text[],status text NOT NULL DEFAULT 'pending',error_code text,
+                          retry_at timestamptz NOT NULL DEFAULT NOW())""")
+            setup.execute("INSERT INTO authorizations VALUES(%s,'ou_cm','active','old-token',ARRAY['read'],NOW())",
+                          (actor,))
+            setup.execute("INSERT INTO identity_profile_providers(authorization_id,scopes) VALUES(%s,ARRAY['read'])",
+                          (actor,))
+            source = setup.execute("SELECT id,open_id,access_token_ciphertext,scopes,body_consent_at "
+                                   "FROM authorizations WHERE id=%s", (actor,)).fetchone()
+
+            @contextmanager
+            def connect():
+                with psycopg.connect(dsn, row_factory=dict_row, application_name=schema) as conn:
+                    conn.execute(psycopg.sql.SQL("SET search_path TO {}").format(psycopg.sql.Identifier(schema)))
+                    conn.execute("SET statement_timeout='5s'")
+                    yield conn
+
+            def wait_for_lock(*, pid=None, exclude=None):
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    if setup.execute("SELECT 1 FROM pg_stat_activity WHERE application_name=%s "
+                                     "AND wait_event_type='Lock' AND pid=COALESCE(%s,pid) "
+                                     "AND pid<>COALESCE(%s,0)", (schema, pid, exclude)).fetchone():
+                        return
+                    time.sleep(0.01)
+                pytest.fail("Expected the authorization race to wait for its parent row")
+
+            monkeypatch.setattr(identity_profiles, "connection", connect)
+            with connect() as callback, connect() as refresh, ThreadPoolExecutor(max_workers=2) as executor:
+                callback.execute("SELECT id FROM authorizations WHERE id=%s FOR UPDATE", (actor,))
+                callback.execute("UPDATE authorizations SET access_token_ciphertext='new-token',"
+                                 "scopes=ARRAY['read','send'],body_consent_at=NOW()+INTERVAL '1 second' WHERE id=%s",
+                                 (actor,))
+                refresh_future = executor.submit(refresh.execute,
+                                                 "SELECT id FROM authorizations WHERE id=%s FOR UPDATE", (actor,))
+                gate_future = None
+                try:
+                    wait_for_lock(pid=refresh.info.backend_pid)
+                    gate_future = executor.submit(identity_profiles._provider_gate, source)
+                    wait_for_lock(exclude=refresh.info.backend_pid)
+                    # The gate waits before its provider writes, so OAuth can finish.
+                    callback.execute("UPDATE identity_profile_providers SET scopes=ARRAY['read','send'],"
+                                     "status='pending',retry_at=NOW() WHERE authorization_id=%s", (actor,))
+                    callback.commit()
+                finally:
+                    callback.rollback()
+                    refresh_future.result(timeout=6)
+                    refresh.rollback()
+                    if gate_future:
+                        blocked = gate_future.result(timeout=6)
+                assert blocked == {"status": "unavailable", "error_code": "authorization_changed", "retry_at": None}
+            provider = setup.execute("SELECT * FROM identity_profile_providers").fetchone()
+            assert provider["scopes"] == ["read", "send"] and provider["status"] == "pending"
+            current = setup.execute("SELECT id,open_id,access_token_ciphertext,scopes,body_consent_at "
+                                    "FROM authorizations WHERE id=%s", (actor,)).fetchone()
+            assert identity_profiles._provider_gate(current) is None
+            checking = setup.execute("SELECT * FROM identity_profile_providers").fetchone()
+            assert checking["status"] == "checking" and checking["scopes"] == ["read", "send"]
+            setup.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (actor,))
+            assert identity_profiles._provider_gate(current)["error_code"] == "authorization_changed"
+            assert setup.execute("SELECT * FROM identity_profile_providers").fetchone() == checking
+        finally:
+            setup.execute(psycopg.sql.SQL("DROP SCHEMA {} CASCADE").format(psycopg.sql.Identifier(schema)))

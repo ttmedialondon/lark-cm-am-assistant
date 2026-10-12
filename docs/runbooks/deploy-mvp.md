@@ -60,6 +60,13 @@ curl --fail --silent --show-error https://larkbot.ttapp.help/healthz
 
 旧令牌不会因应用权限已开通自动获得发送权限。验收必须检查新令牌实际返回的两项 scope；此入口不会发送消息，也不会开启群发队列。普通登录与既有资料权限升级仍按原流程执行；后续普通登录若未返回发送 scope，需再次使用此增权入口。
 
+#### 授权回调与并发同步
+
+- 授权最终写事务先取得已有 `lark-sync-material` 事务锁，再修改授权、同步任务及身份缓存；Lark 换令牌和读取资料在锁外执行。资料能力检查先锁并核验父授权，再写 provider，旧令牌／权限／正文同意快照不能覆盖新授权。
+- 本地保存设置 5 秒锁等待、15 秒单语句上限。仅对已回滚的死锁、序列化冲突和锁等待超时最多尝试 3 次；不重复 Lark 授权码交换，连接或提交结果不确定时不自动重试。
+- 无法完成时返回 503 和“重新授权”入口，保留现有登录会话；Lark 换令牌／资料失败返回 502。问题编号用于查找 `oauth_database_failed`、`oauth_database_retry`、`oauth_provider_failed` 日志，日志只保留请求编号、账号 UUID、阶段和错误码，不记录 SQL、异常全文、OAuth code/state、令牌或正文。
+- 普通重新授权仍建立新的正文授权边界；本人发送／资料增权仍保留原游标和业务关系。发布不代用户授权、不重新开启 AI、不自动发送消息。
+
 #### 群发页面与正式发送
 
 采用按功能增量授权，参考 [Google](https://developers.google.com/identity/protocols/oauth2/resources/granular-permissions)、[Microsoft](https://learn.microsoft.com/en-us/entra/identity-platform/consent-types-developer) 和 [Slack](https://docs.slack.dev/authentication/installing-with-oauth/) 的官方流程。不把应用已开通的全部权限都要求用户授权。

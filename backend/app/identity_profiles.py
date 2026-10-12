@@ -161,6 +161,15 @@ def _scope_current(conn, source, open_id, *, lock=False):
 
 def _provider_gate(source):
     with connection() as conn, conn.transaction():
+        # Lock the parent before provider writes; a second update can recheck its FK.
+        current = conn.execute(
+            """SELECT 1 FROM authorizations WHERE id=%s AND open_id=%s AND status='active'
+               AND access_token_ciphertext=%s AND scopes=%s AND body_consent_at=%s FOR SHARE""",
+            (source["id"], source["open_id"], source["access_token_ciphertext"],
+             source["scopes"], source["body_consent_at"]),
+        ).fetchone()
+        if not current:
+            return {"status": "unavailable", "error_code": "authorization_changed", "retry_at": None}
         row = conn.execute(
             """INSERT INTO identity_profile_providers(authorization_id,scopes) VALUES(%s,%s)
                ON CONFLICT(authorization_id) DO UPDATE SET
