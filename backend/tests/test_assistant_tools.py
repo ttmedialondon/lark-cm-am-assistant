@@ -212,6 +212,13 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
     empty = run("summarize_messages", {**all_args, "start": (s.start + timedelta(hours=6)).isoformat(),
                                        "end": (s.start + timedelta(hours=7)).isoformat()})
     assert empty["messages"] == [] and empty["next_cursor"] is None and empty["gaps"] == []
+    pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-manage')",
+               (s.ids["reviewer"],))
+    manager_context = tools.current_context(pg, s.ids["reviewer"], {"cm_id": str(s.ids["cm"])}, s.settings)
+    with pytest.raises(PermissionError):
+        tools.execute(pg, s.ids["reviewer"], turn, "summarize_messages", all_args, s.settings, manager_context)
+    with pytest.raises(PermissionError):
+        tools.execute(pg, s.ids["reviewer"], turn, "activity_stats", all_stats_args, s.settings, manager_context)
     all_final = {"answer": "当前授权全量消息包含未入库人员和应用通知。", "event_refs": [], "result_refs": [],
                  "data_refs": [result["query_ref"] for result in results], "draft_ref": None}
     all_view = tools.build_result(pg, s.ids["cm"], turn, all_final, s.settings, context, results)
@@ -348,6 +355,11 @@ def test_five_tools_keep_reports_private_resume_and_recheck_sources(pg, seeded, 
              "event_refs": [event_ref], "draft_ref": draft["draft_ref"]}
     tool_results = [found, result, filtered, period, latest, draft]
     rendered = tools.build_result(pg, s.ids["cm"], turn, final, s.settings, context, tool_results)
+    assert rendered["scope"]["audience"] == "creators"
+    sync = tools.execute(pg, s.ids["cm"], turn, "get_sync_status", {}, s.settings, context)
+    with_metadata = tools.build_result(pg, s.ids["cm"], turn, {**final, "data_refs": [sync["query_ref"]]},
+                                      s.settings, context, [*tool_results, sync])
+    assert with_metadata["scope"]["audience"] == "creators"
     assert rendered["events"][0]["evidence_ref"] == event_ref and rendered["draft"]["chinese_translation"]
     with pytest.raises(ValueError):
         tools.build_result(pg, s.ids["cm"], turn, {**final, "event_refs": [str(uuid4()) + ":0:invented"]},

@@ -387,7 +387,8 @@ def activity(conn, actor_id, context, args, settings, *, now=None):
         cm, roster, visible = _scope(conn, actor_id, context)
         ids = _ids(args, context, visible)
     else:
-        cm, _ = summaries._authorize(conn, actor_id, cm_id=context["scope"]["cm_id"])
+        from .assistant_search import authorize_all
+        cm = authorize_all(conn, actor_id, context["scope"]["cm_id"])
         ids = []
     selected_chats = args.get("chat_ids")
     if selected_chats is None and audience == "creators":
@@ -498,7 +499,8 @@ def activity(conn, actor_id, context, args, settings, *, now=None):
 def validate_result(conn, actor_id, context, result, settings):
     """Invalidate changed business sources, not routine synchronization progress."""
     if result.get("kind") == "activity" and result.get("audience") == "all":
-        cm, _ = summaries._authorize(conn, actor_id, cm_id=context["scope"]["cm_id"])
+        from .assistant_search import authorize_all
+        cm = authorize_all(conn, actor_id, context["scope"]["cm_id"])
     else:
         cm, _roster, _visible = _scope(conn, actor_id, context)
     if result.get("authorization") != _authorization(cm):

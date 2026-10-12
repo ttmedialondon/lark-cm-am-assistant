@@ -71,10 +71,18 @@ def _audience(value):
     return value
 
 
+def authorize_all(conn, actor_id, cm_id):
+    cm, owner = core._authorize(conn, actor_id, cm_id=cm_id)
+    if not owner and UUID(str(actor_id)) != cm["id"]:
+        raise PermissionError("只有本人或Owner可以查看该CM的全量消息；达人管理权限不包含其他人员的全部聊天。")
+    return cm
+
+
 def _scope(conn, actor_id, context, creator_ids, chat_ids, settings, audience="creators"):
     actor_id = UUID(str(actor_id))
     cm_id = UUID(context["scope"]["cm_id"])
-    cm, _ = core._authorize(conn, actor_id, cm_id=cm_id)
+    cm = authorize_all(conn, actor_id, cm_id) if audience == "all" else core._authorize(
+        conn, actor_id, cm_id=cm_id)[0]
     if audience == "all":
         chats = conn.execute(core._CHAT_SQL + " ORDER BY c.chat_id", (cm_id,)).fetchall()
         roster, speakers, selected = [], None, None

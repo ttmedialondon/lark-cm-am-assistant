@@ -383,11 +383,15 @@ def _card(event, version):
 
 
 def _read_results(conn, actor_id, run_ids, settings, context):
-    scopes = conn.execute("SELECT id,responsible_authorization_id FROM offhours_summary_runs "
+    scopes = conn.execute("SELECT id,responsible_authorization_id,selected_contact_ids FROM offhours_summary_runs "
                           "WHERE id=ANY(%s::uuid[])", ([UUID(str(value)) for value in run_ids],)).fetchall()
     if (len(scopes) != len(set(str(value) for value in run_ids))
             or any(str(row["responsible_authorization_id"]) != context["scope"]["cm_id"] for row in scopes)):
         raise PermissionError("报告不存在或不属于当前查询范围。")
+    selected = None if any(row["selected_contact_ids"] is None for row in scopes) else sorted({
+        str(person) for row in scopes for person in row["selected_contact_ids"]})
+    report_scope = {**context["scope"], "audience": "creators", "creator_ids": selected}
+    report_scope.pop("creator_names", None)
     events, views, gaps = [], [], []
     pending = False
     for run_id in run_ids:
@@ -420,7 +424,7 @@ def _read_results(conn, actor_id, run_ids, settings, context):
         coverage.update(chats)
     return {
         "result_id": _result_ref(run_ids), "events": events, "total": len(events), "pending": pending,
-        "scope": context["scope"], "window": {"start": views[0]["window"]["start"],
+        "scope": report_scope, "window": {"start": views[0]["window"]["start"],
             "end": views[-1]["window"]["end"], "timezone": summaries.TIMEZONE},
         "windows": [view["window"] for view in views], "coverage": coverage,
         "gaps": list(dict.fromkeys(gaps)),
@@ -658,12 +662,24 @@ def build_result(conn, actor_id, turn, final, settings, context, tool_results):
         reply = validated["drafts"][draft_ref]
         if reply["status"] == "succeeded":
             draft = reply["result"]
+    result_scope = next((result["scope"] for result in reversed(tool_results) if result.get("scope")),
+                        context["scope"])
+    if views:
+        result_scope = views[-1]["scope"]
+    elif event_refs or draft_ref:
+        result_scope = {**result_scope, "audience": "creators"}
+    message_data = [data[ref] for ref in data_refs if data[ref].get("kind") in {
+        "window_messages", "messages", "message_context", "activity"}]
+    if message_data:
+        result_scope = message_data[-1].get("scope", result_scope)
+    elif data_refs and not (views or event_refs or draft_ref):
+        result_scope = data[data_refs[-1]].get("scope", result_scope)
     return {"turn_id": str(turn["id"]), "status": "completed", "answer": final["answer"],
             "data_refs": list(dict.fromkeys(data_refs)),
             "data": [public_query(data[ref]) for ref in dict.fromkeys(data_refs)],
             "result_refs": list(dict.fromkeys(refs)), "event_refs": list(dict.fromkeys(event_refs)),
             "events": [cards[ref] for ref in dict.fromkeys(event_refs)],
-            "scope": data[data_refs[-1]].get("scope", context["scope"]) if data_refs else context["scope"],
+            "scope": result_scope,
             "window": views[-1]["window"] if views else cards[event_refs[0]]["window"] if event_refs else None,
             "coverage": views[-1]["coverage"] if views else {},
             "gaps": list(dict.fromkeys([gap for view in views for gap in view["gaps"]]
