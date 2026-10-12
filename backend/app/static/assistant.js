@@ -103,10 +103,11 @@
   }
   function clearProtected() {
     denied = true; revision++; source?.close(); source = null; active = null; pending = null;
+    activeReplyAction = activeReplyText = null;
     activeContext = {}; scopeVersion++; currentScopeTurn = null;
     closeSources(false);
     closeReply(); currentDraft = null; $("oa-reply-body").replaceChildren();
-    delete saved.client_request_id; persist();
+    saved = {}; persist();
     const reconnect = node("a", "oa-evidence", "检查账号连接"); reconnect.href = "/dashboard";
     history.replaceChildren(node("p", "oa-answer", "连接或访问权限已变化。"), reconnect);
     cmScopes = []; scopesReady = false; $("oa-cm").replaceChildren(); $("oa-person").hidden = true;
@@ -164,6 +165,7 @@
   function resetSession(person, keepInput = false) {
     revision++; source?.close(); source = null; clearTimeout(restoreTimer);
     saved = {cm_id: person.cm_id}; pending = null; pendingScopeVersion = null; persist();
+    activeReplyAction = activeReplyText = null;
     activeContext = {}; selectContext(person); currentScopeTurn = null;
     $("oa-cm").value = person.cm_id;
     closeSources(false); $("oa-new-result").hidden = true;
@@ -172,11 +174,13 @@
     scope({}); status(""); if (!keepInput) input.value = ""; controls();
   }
   function sourceChanged(message) {
+    const sessionId = saved.session_id;
     const person = cmScopes.find(person => person.cm_id === activeContext.cm_id) ||
       {cm_id: activeContext.cm_id, cm_name: activeContext.cm_name};
     active = null; submitting = false;
     resetSession(person, true);
-    status(typeof message === "string" ? message : "查询资料已变化，请重新提问。", true);
+    if (sessionId) { saved.session_id = sessionId; persist(); }
+    status(canManageCM ? (typeof message === "string" ? message : "查询资料已变化，请重新提问。") : "相关消息已更新，可以继续提问。", canManageCM);
   }
   function switchCM(cmId) {
     if (denied || !scopesReady || active || submitting || restoring || saved.client_request_id) return false;

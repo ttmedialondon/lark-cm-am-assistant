@@ -399,6 +399,8 @@ const {chromium} = require('playwright');
     assert.equal(await page.locator('#oa-sources').isHidden(),true);
     assert.match(await page.locator('#oa-status').textContent(),/资料已变化.*重新提问/);
     assert.equal(await page.locator('#oa-input').isDisabled(),false);
+    assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('ttmedia.assistant.'+
+      document.getElementById('operations-assistant').dataset.userId)).session_id),changedSession);
     // Restore an invalidated turn: do not adopt its old CM/event selection.
     await page.evaluate(session_id=>{
       const key='ttmedia.assistant.'+document.getElementById('operations-assistant').dataset.userId;
@@ -410,8 +412,9 @@ const {chromium} = require('playwright');
     assert.doesNotMatch(await page.locator('#oa-scope').textContent(),/Remi|旧事项/);
     await page.locator('#oa-input').fill('重新查未回复事项'); await page.locator('#oa-input').press('Enter');
     await page.waitForFunction(()=>window.sources.length===1); assert.equal(posts.length,8);
-    assert.notEqual(posts[7].body.session_id,changedSession);
+    assert.equal(posts[7].body.session_id,changedSession);
     assert.equal(posts[7].body.context.cm_id,ownId());
+    assert.deepEqual(posts[7].body.context,{cm_id:ownId()});
     const activeTurn=view.id, activeRequest=JSON.stringify(posts[7].body);
     olderTurns=[{...view,id:require('node:crypto').randomUUID(),status:'failed',
       client_request_id:require('node:crypto').randomUUID(),error_code:'source_changed',
@@ -448,6 +451,8 @@ const {chromium} = require('playwright');
     assert.equal(await page.getByRole('link',{name:'检查账号连接',exact:true}).getAttribute('href'),'/dashboard');
     assert.equal(await page.getByRole('link',{name:'检查账号连接',exact:true}).isVisible(),true);
     assert.equal(await page.locator('#oa-input').isDisabled(),true);
+    assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('ttmedia.assistant.'+
+      document.getElementById('operations-assistant').dataset.userId)).session_id),undefined);
     holdEvidence=false; denyEvidence=false;
     // An Owner's ordinary entry does not expose cross-CM selection or honor stale cross-CM browser state.
     await page.evaluate(cm_id=>{
@@ -715,6 +720,23 @@ const {chromium} = require('playwright');
     await nextStream(()=>page.locator('[data-quick="reply"]').click());
     assert.deepEqual(posts.at(-1).body.context,{cm_id:ownId()});
     assert.match(posts.at(-1).body.message,/刚才讨论的消息/);
+    const ordinarySession=view.session_id;
+    view={...view,status:'failed',error_code:'source_changed',result:null,
+      scope:{cm_id:ownId(),event_ref:'old-ref'},error:'旧资料已变化。'};
+    await page.evaluate(()=>window.sources.at(-1).emit('error',
+      {code:'source_changed',message:'旧资料已变化。',clear:true}));
+    assert.equal(await page.locator('#oa-status').textContent(),'相关消息已更新，可以继续提问。');
+    assert.equal(await page.locator('.oa-event, .oa-draft, .oa-data').count(),0);
+    await page.locator('#oa-input').fill('继续刚才的事项');
+    await nextStream(()=>page.locator('#oa-input').press('Enter'));
+    assert.equal(posts.at(-1).body.session_id,ordinarySession);
+    assert.deepEqual(posts.at(-1).body.context,{cm_id:ownId()});
+    await deliver({answer:'事项已更新。',scope:{cm_id:ownId()},events:[],data:[]});
+    await page.locator('#oa-new').click();
+    await page.locator('#oa-input').fill('一个新的问题');
+    await nextStream(()=>page.locator('#oa-input').press('Enter'));
+    assert.notEqual(posts.at(-1).body.session_id,ordinarySession);
+    assert.deepEqual(posts.at(-1).body.context,{cm_id:ownId()});
     assert.deepEqual(errors,[]); console.log('assistant browser workflow passed');
   } finally {await browser.close();}
 })().catch(error=>{console.error(error);process.exit(1);});
