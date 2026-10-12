@@ -319,7 +319,7 @@ def _collect(conn, actor_id, context, args, settings, *, terms):
     return result
 
 
-def validate_result(conn, actor_id, context, result, settings):
+def validate_result(conn, actor_id, context, result, settings, *, history_only=False):
     """Recheck at most one page of hits, never rerun a negative full-text scan."""
     if result.get("kind") == "message_context":
         fresh = read(conn, actor_id, context, {"message_ref": result.get("message_ref")}, settings,
@@ -340,7 +340,7 @@ def validate_result(conn, actor_id, context, result, settings):
     audience = _audience(value.get("audience", "creators"))
     cm, roster, chats, speakers, selected = _scope(
         conn, actor_id, context, value.get("creator_ids"), value.get("chat_ids"), settings, audience)
-    if _scope_version(cm, roster, chats, selected, audience) != value.get("version"):
+    if not history_only and _scope_version(cm, roster, chats, selected, audience) != value.get("version"):
         raise PermissionError("检索授权或正式达人范围已变化。")
     messages = result.get("messages")
     page_size = WINDOW_PAGE_SIZE if result.get("kind") == "window_messages" else PAGE_SIZE
@@ -348,7 +348,7 @@ def validate_result(conn, actor_id, context, result, settings):
         raise ValueError("检索结果无效。")
     by_chat = {chat["chat_id"]: chat for chat in chats}
     start, end = _time(value.get("start")), _time(value.get("end"))
-    if result.get("kind") == "window_messages":
+    if result.get("kind") == "window_messages" and not history_only:
         totals = _totals(conn, cm["id"], sorted(by_chat), start, end, speakers)
         if any(result.get(key) != count for key, count in totals.items()):
             raise ValueError("时段消息数量已变化，请重新读取。")

@@ -149,7 +149,12 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
     }
     groups = run("list_groups", {"query": None, "creator_ids": None, "purpose": "category", "cursor": None})
     assert groups["total"] == 1 and not groups["groups"][0]["sync_enabled"]
-    assert run("get_sync_status", {})["authorization_status"] == "active"
+    sync = run("get_sync_status", {})
+    assert sync["authorization_status"] == "active"
+    model_sync = tools.public_query(sync, for_model=True)
+    assert model_sync["summary"]["label"] in {"消息可查看", "部分聊天暂时无法查看"}
+    assert not set(model_sync) & {"watermarks", "job", "conversations", "definition", "gaps"}
+    assert "conversations" in tools.public_query(sync)
     args = {"audience": "creators", "start": s.start.isoformat(), "end": now.isoformat(),
             "creator_ids": None, "chat_ids": None,
             "group_by": "day", "comparison": "previous", "cursor": None}

@@ -46,7 +46,7 @@ TOOLS = [
     _function("summarize_messages", "根据问题时间总结本人聊天。默认audience=all包含所有可读会话和发言人，"
               "不要求联系人是达人。"
               "仅用户明确要求达人时用creators；此模式复用达人事件报告。all由系统完整读取请求时段并分段归纳，"
-              "一次调用即可，不需模型或用户翻页；仍须说明实际同步缺口。时间用带时区ISO8601；"
+              "一次调用即可，不需模型或用户翻页；不可读内容明显影响结论时仅简短说明，不讲后台同步机制。时间用带时区ISO8601；"
               "chat_ids=null全会话、creator_ids=null不指定某达人。",
               {"start": _STRING, "end": _STRING, "audience": {"type": "string", "enum": ["all", "creators"]},
                "creator_ids": _IDS, "chat_ids": _IDS, "cursor": _NULL_STRING}),
@@ -83,7 +83,8 @@ TOOLS = [
               {"query": _NULL_STRING, "creator_ids": _IDS,
                "purpose": _choice(list(assistant_queries.PURPOSES)),
                "cursor": _NULL_STRING}),
-    _function("get_sync_status", "只读查询当前账号连接、消息同步进度与具体读取问题；不刷新或修改连接。", {}),
+    _function("get_sync_status", "仅在用户明确询问账号连接或消息是否可查看时使用，返回业务可用性。"
+              "不用于判断合作、样品、付款等事项的进度；0条新消息也不需要调用。只读，不修改连接。", {}),
     _function("search_chat_history", "检索Lark消息正文，不检索旧助手问答。"
               "默认audience=all读取本人可读聊天和所有发言人；"
               "用户明确要求达人时才creators。query为1–8个关键词或同义词，任一命中；可限定群和时间。返回本页覆盖和游标，"
@@ -305,7 +306,7 @@ def _saved_query(conn, actor_id, ref, settings):
     raise LookupError("查询不存在或无权查看。")
 
 
-def _validate_query(conn, actor_id, context, result, settings):
+def _validate_query(conn, actor_id, context, result, settings, *, history_only=False):
     if result.get("scope", {}).get("cm_id") != context["scope"]["cm_id"]:
         raise PermissionError("查询不属于当前范围。")
     context = {**context, "scope": result["scope"]}
@@ -322,7 +323,8 @@ def _validate_query(conn, actor_id, context, result, settings):
                 messages=[{**message, "message_ref": source if message.get("message_ref") else None,
                     "evidence_ref": source if message.get("evidence_ref") else None}
                     for message in result["messages"]])
-        metadata = assistant_search.validate_result(conn, actor_id, context, restored, settings)
+        metadata = assistant_search.validate_result(conn, actor_id, context, restored, settings,
+                                                    history_only=history_only)
     else:
         metadata = assistant_queries.validate_result(conn, actor_id, context, result, settings)
     if metadata:
@@ -617,6 +619,13 @@ def public_query(result, *, for_model=False):
     value = {key: item for key, item in result.items()
              if not key.startswith("_") and key not in {
                  "authorization", "snapshot", "sources", "query_id", "source_chat_ids", "access_fingerprint"}}
+    if for_model and value.get("kind") == "sync":
+        counts = value.get("conversations", {})
+        limited = (counts.get("backfill_complete_count", 0) < counts.get("syncable_conversation_count", 0)
+                   or counts.get("not_readable_conversation_count", 0) > 0)
+        return {**{key: value[key] for key in ("kind", "query_ref", "scope", "checked_at") if key in value},
+            "summary": {"label": "部分聊天暂时无法查看" if limited else "消息可查看",
+                "detail": "可继续处理已显示的事项；尚未看到后续消息不代表事情没有进展。"}}
     if isinstance(value.get("comparison"), dict):
         value["comparison"] = {key: item for key, item in value["comparison"].items()
                                if key not in {"source_chat_ids", "rows"}}

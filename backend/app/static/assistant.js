@@ -262,9 +262,17 @@
       "群开启受限模式，Lark禁止读取消息（231203）": "群开启受限模式，无法读取消息"};
     const reasonFor = gap => {
       const raw = typeof gap === "string" ? gap : gap.message || gap.reason || "消息暂不可读取";
-      return Number(gap.code || gap.error_code) === 231203 ? "群开启受限模式，无法读取消息" : labels[raw] || raw;
+      const label = Number(gap.code || gap.error_code) === 231203 ? "群开启受限模式，无法读取消息" : labels[raw] || raw;
+      if (canManageCM || Number(gap.code || gap.error_code) === 231203) return label;
+      const plain = {"该时段消息尚未同步完成": "这段时间的消息暂时不全", "同步水位未覆盖请求截止": "这段时间的消息暂时不全",
+        "尚无同步水位": "此会话消息暂时无法查看", "未启用消息同步": "此会话消息暂时无法查看",
+        "最新消息仍在同步": "最新消息还未完整获取", "同步尚未成功": "此会话消息暂时无法查看"};
+      return [...new Set(raw.split("；").map(part => {
+        const value = labels[part.trim()] || part.trim();
+        return value.startsWith("Lark") ? "此会话消息暂时无法查看" : plain[value] || value;
+      }).filter(Boolean))].join("；");
     };
-    if (precise) for (const gap of summary || []) {
+    if (precise && canManageCM) for (const gap of summary || []) {
       const label = [[gap.conversations, "个会话"], [gap.items, "项记录"]]
         .filter(([number]) => Number.isFinite(number) && number > 0).map(([number, unit]) => `${number} ${unit}`).join(" · ");
       if (label) counts.set(reasonFor(gap), label);
@@ -275,7 +283,7 @@
       for (const name of [...(gap.names || []), gap.name, gap.conversation_name].filter(Boolean)) groups.get(reason).add(name);
     }
     if (!groups.size) return null;
-    const details = node("details", "oa-gaps"); details.append(node("summary", "", "读取情况"));
+    const details = node("details", "oa-gaps"); details.append(node("summary", "", canManageCM ? "读取情况" : "有些内容暂时无法查看"));
     for (const [reason, names] of groups) {
       const row = node("div", "", [reason, counts.get(reason)].filter(Boolean).join(" · "));
       if (names.size) row.append(node("p", "oa-gap-names", `会话：${[...names].join("、")}`));
@@ -509,7 +517,7 @@
     const card = node("section", "oa-data oa-source-entry"), details = node("details", "oa-coverage");
     let pageNumber = data.page || 1, currentPage = data;
     const count = data.total_messages ?? data.coverage?.total_messages ?? data.messages?.length ?? 0;
-    details.append(node("summary", "", `来源 · ${count} 条消息${data.total_conversations ? ` · ${data.total_conversations} 个会话` : ""}`));
+    details.append(node("summary", "", canManageCM ? `来源 · ${count} 条消息${data.total_conversations ? ` · ${data.total_conversations} 个会话` : ""}` : "查看相关消息"));
     const body = node("div", "oa-source-page"), footer = node("div", "oa-source-pagination");
     const pageLabel = node("span", "oa-coverage"), previous = node("button", "", "上一页"), next = node("button", "", "下一页");
     previous.type = next.type = "button";
@@ -544,6 +552,7 @@
     const titles = {creators: "达人资料", groups: "群聊目录", sync: "连接与消息读取", activity: "活动统计", messages: "消息命中",
       window_messages: "总结来源", message_context: "原文与问答"};
     if (!data || !titles[data.kind]) return null;
+    if (data.kind === "sync" && !canManageCM) return null;
     if (data.kind === "window_messages") return windowSources(data);
     const card = node("section", "oa-data"); card.dataset.queryRef = data.query_ref || "";
     card.append(node("h4", "", titles[data.kind]));
@@ -564,7 +573,7 @@
     } else if (data.kind === "groups") {
       const rows = (data.groups || []).map(group => {
         const name = node("div", "", group.name || "未命名群聊");
-        if (typeof group.sync_enabled === "boolean") name.append(node("small", "", group.sync_enabled ? "已启用同步" : "未启用同步"));
+        if (canManageCM && typeof group.sync_enabled === "boolean") name.append(node("small", "", group.sync_enabled ? "已启用同步" : "未启用同步"));
         return [name, group.purpose_label || group.purpose || "—", Number.isFinite(group.member_count) ? group.member_count : "—"];
       });
       if (rows.length) card.append(table(["群聊", "用途", "成员"], rows));
@@ -621,8 +630,7 @@
       for (const [key, label] of [["scanned", "扫描"], ["readable", "可读"], ["unreadable", "不可读"], ["matched", "命中"]]) {
         if (Number.isFinite(coverage[key])) counts.push(`${label} ${coverage[key]}`);
       }
-      if (counts.length) card.append(node("p", "oa-coverage", `本页：${counts.join(" · ")}，不是全库总量。`));
-      if (coverage.scan_complete === false) card.append(node("p", "oa-coverage", "扫描尚未结束，可继续下一页。"));
+      if (canManageCM && counts.length) card.append(node("p", "oa-coverage", `本页：${counts.join(" · ")}，不是全库总量。`));
     }
     if (data.checked_at) card.append(node("p", "oa-coverage", `查询于 ${date(data.checked_at)}`));
     if (data.kind === "messages" && data.next_source_url) {
@@ -715,10 +723,10 @@
       if (Number.isFinite(coverage.responsible_creators)) counts.push(`负责达人 ${coverage.responsible_creators} 位`);
       if (Number.isFinite(coverage.matched_events)) counts.push(`匹配事项 ${coverage.matched_events} 项`);
       if (coverage.analysis_complete === false) counts.push("部分结果");
-      if (Number.isFinite(coverage.conversations)) counts.push(`${coverage.conversations} 个会话`);
-      if (Number.isFinite(coverage.messages)) counts.push(`${coverage.messages} 条消息`);
+      if (canManageCM && Number.isFinite(coverage.conversations)) counts.push(`${coverage.conversations} 个会话`);
+      if (canManageCM && Number.isFinite(coverage.messages)) counts.push(`${coverage.messages} 条消息`);
       const cutoff = coverage.cutoff || result.window?.cutoff;
-      if (cutoff) counts.push(`读取至 ${date(cutoff)}`);
+      if (canManageCM && cutoff) counts.push(`读取至 ${date(cutoff)}`);
       if (counts.length) container.append(node("p", "oa-coverage", counts.join(" · ")));
     }
     if (result.events?.length) {
@@ -767,6 +775,10 @@
     source.addEventListener("progress", event => {
       if (active !== watching) return;
       const progress = JSON.parse(event.data);
+      if (!canManageCM) {
+        status({running: "正在整理事项…", waiting: "正在等待结果…"}[progress.status] || labels[progress.status] || "正在整理事项…");
+        return;
+      }
       const counts = [];
       if (Number.isFinite(progress.messages)) counts.push(`已读取 ${progress.messages}${Number.isFinite(progress.total_messages) ? ` / ${progress.total_messages}` : ""} 条`);
       if (Number.isFinite(progress.conversations)) counts.push(`${progress.conversations} 个会话`);

@@ -228,7 +228,16 @@ const {chromium} = require('playwright');
     await page.waitForFunction(() => window.sources.length===1);
     assert.equal(posts.length,2); assert.match(posts[0].body.session_id,/^[0-9a-f-]{36}$/);
     assert.deepEqual(posts[0].body,posts[1].body);
+    const progress={status:'running',message:'后台材料诊断',messages:100,total_messages:353,
+      conversations:43,segments_completed:1,segments_total:4};
+    await page.evaluate(value=>window.sources.at(-1).emit('progress',value),progress);
+    assert.match(await page.locator('#oa-status').textContent(),/后台材料诊断.*100 \/ 353 条.*43 个会话.*1 \/ 4 段/);
     await page.locator('#oa-collapse').click(); assert.equal(await page.evaluate(() => window.sources[0].closed),false);
+    const diagnosticData=[{kind:'sync',query_ref:'q.sync',summary:{label:'首次同步诊断',detail:'首次同步数量'},
+      conversations:{counts:{discovered_conversation_count:50,syncable_conversation_count:40,
+        backfill_complete_count:30,syncing_conversation_count:10,not_readable_conversation_count:2}},
+      watermarks:{latest:'2026-10-12T11:00:00Z'},definition:'测试用同步定义'},
+      {kind:'groups',query_ref:'q.groups',groups:[{name:'客服群',sync_enabled:true,purpose_label:'客服',member_count:3}]}];
     const result={answer:'昨天值得优先关注：\n1. **账号权限故障**：请跟进 [帮助](https://example.com/help)\n' +
       '2. **活动报名**：暂未回复。\n\n<script>bad()</script> [不安全](javascript:alert(1)) ' +
       '[数据](data:text/html;base64,PHNjcmlwdD4=)\n`**原样代码**`\n\n- 核对群聊\n- 联系同事',
@@ -243,11 +252,12 @@ const {chromium} = require('playwright');
       data:[{kind:'window_messages',scope:{audience:'all'},total_messages:20,
         messages:[{conversation_name:'业务群',sender_name:'未识别联系人',time:'2026-10-12T09:00:00Z',
           text:'<script>source()</script> **本人原文**',evidence_ref:'raw-ref'}],coverage:{source_complete:false},
-        gaps:Array.from({length:25},(_,i)=>({chat_id:`chat-${i}`,reason:'历史同步未覆盖检索起点'})),
+        gaps:[...Array.from({length:25},(_,i)=>({chat_id:`chat-${i}`,reason:'历史同步未覆盖检索起点'})),
+          '历史回填尚未完成；请求早于已确认历史同步范围；同步水位未覆盖请求截止'],
         gap_count:1273,gap_conversation_count:1272,gap_summary:[
           {reason:'历史同步未覆盖检索起点',conversations:1272,items:0,
             names:['受限群一','<img src=x onerror=alert(1)>','群三','群四','群五']},
-          {reason:'附件正文不可读取',conversations:0,items:5}]}]};
+          {reason:'附件正文不可读取',conversations:0,items:5}]},...diagnosticData]};
     view={...view,status:'completed',result};
     await page.evaluate(value => {
       window.sources[0].emit('result',value);window.sources[0].emit('done',{status:'completed'});
@@ -271,12 +281,17 @@ const {chromium} = require('playwright');
     assert.match(await page.locator('.oa-message--assistant > .oa-coverage').textContent(),
       /负责达人 201 位 · 匹配事项 12 项 · 部分结果/);
     assert.doesNotMatch(await page.locator('.oa-scope').textContent(),/授权|修改范围/);
-    assert.match(await page.locator('.oa-data').textContent(),/来源 · 20 条消息/);
+    assert.match(await page.locator('.oa-source-entry').textContent(),/来源 · 20 条消息/);
+    assert.match(await page.locator('.oa-data[data-query-ref="q.sync"]').textContent(),
+      /首次同步诊断.*首次同步数量.*历史消息已读取.*最近同步时间.*测试用同步定义/);
+    assert.match(await page.locator('.oa-data[data-query-ref="q.groups"]').textContent(),/已启用同步/);
     assert.equal(await page.locator('.oa-data details.oa-coverage').getAttribute('open'),null);
     assert.equal(await page.locator('.oa-history .oa-gaps').count(),1);
     assert.equal(await page.locator('.oa-history .oa-gaps summary').textContent(),'读取情况');
     assert.equal(await page.locator('.oa-history .oa-gaps').getAttribute('open'),null);
-    assert.equal(await page.locator('.oa-history .oa-gaps > div').count(),2);
+    assert.equal(await page.locator('.oa-history .oa-gaps > div').count(),3);
+    assert.match(await page.locator('.oa-history .oa-gaps').textContent(),
+      /历史回填尚未完成；请求早于已确认历史同步范围；同步水位未覆盖请求截止/);
     assert.match(await page.locator('.oa-history .oa-gaps').textContent(),/该时段消息尚未同步完成 · 1272 个会话/);
     assert.match(await page.locator('.oa-history .oa-gap-names').textContent(),
       /受限群一、<img src=x onerror=alert\(1\)>、群三、群四、群五/);
@@ -452,6 +467,21 @@ const {chromium} = require('playwright');
       {detail:{context:{cm_id}}})),remiId);
     assert.equal(await page.locator('#oa-cm').inputValue(),ownId());
     assert.equal(posts.length,ownerPosts);
+    await page.locator('#oa-input').fill('看看今天的重点'); await page.locator('#oa-input').press('Enter');
+    await page.waitForFunction(()=>window.sources.length===1);
+    await page.evaluate(value=>window.sources.at(-1).emit('progress',value),progress);
+    assert.equal(await page.locator('#oa-status').textContent(),'正在整理事项…');
+    const ownerResult={answer:'今天的重点已经整理。',scope:{cm_id:ownId(),audience:'all'},events:[],
+      coverage:{messages:20,conversations:5,cutoff:'2026-10-12T11:00:00Z'},data:result.data};
+    view={...view,status:'completed',result:ownerResult};
+    await page.evaluate(value=>{window.sources.at(-1).emit('result',value);
+      window.sources.at(-1).emit('done',{status:'completed'});},ownerResult);
+    assert.equal(await page.locator('.oa-data[data-query-ref="q.sync"]').count(),0);
+    assert.equal(await page.locator('.oa-data[data-query-ref="q.groups"] small').count(),0);
+    assert.equal(await page.locator('.oa-source-entry > details > summary').textContent(),'查看相关消息');
+    assert.equal(await page.locator('.oa-history .oa-gaps summary').textContent(),'有些内容暂时无法查看');
+    assert.doesNotMatch(await page.locator('#oa-history').textContent(),
+      /首次同步|最近同步时间|测试用同步定义|1272 个会话|读取至/);
     selfReady=false;
     await page.reload(); await page.locator('#oa-launcher').click();
     await page.waitForFunction(()=>document.getElementById('oa-status').textContent.includes('Lark 连接未就绪'));
@@ -489,6 +519,11 @@ const {chromium} = require('playwright');
     await page.waitForFunction(()=>window.sources.length===1);
     assert.equal(posts.length,postCount+1); assert.deepEqual(posts.at(-1).body.context,{cm_id:ownId()});
     assert.equal(posts.at(-1).body.message,'总结今天聊天里的重点事项。');
+    await page.evaluate(value=>window.sources.at(-1).emit('progress',value),progress);
+    assert.equal(await page.locator('#oa-status').textContent(),'正在整理事项…');
+    await page.evaluate(value=>window.sources.at(-1).emit('progress',{...value,status:'waiting'}),progress);
+    assert.equal(await page.locator('#oa-status').textContent(),'正在等待结果…');
+    assert.equal(await page.locator('#oa-stop').isVisible(),true);
     const fullResult={answer:'找到 12 项事项，已按重要度排序。',
       scope:{cm_id:ownId(),cm_name:'CM',audience:'all',reply_status:'unreplied',sort:'importance'},
       events:Array.from({length:12},(_,i)=>({event_ref:`event-${i}`,title:`事项 ${i+1}`,creator_name:`达人 ${i+1}`,
@@ -505,12 +540,16 @@ const {chromium} = require('playwright');
         messages:[{conversation_name:'客服群',sender_name:'达人',message_ref:'m.fixture.first',text:'First source.'}]},
         {kind:'messages',query_ref:'q.search',next_source_url:'/assistant/sources/q.search?page=2&cursor=fixture',
           gaps:[{chat_id:'oc_restricted',name:'TikTok Shop 受限群',reason:'群开启受限模式，Lark禁止读取消息（231203）'},
-            {chat_id:'oc_unknown',name:'未知不可读群',reason:'Lark未允许读取'},
+            {chat_id:'oc_unknown',name:'未知不可读群',reason:'Lark暂不允许读取此会话消息（错误码 999999）'},
+            {chat_id:'oc_pending',name:'这段时间不全的群',
+              reason:'历史回填尚未完成；请求早于已确认历史同步范围；同步水位未覆盖请求截止'},
+            {chat_id:'oc_not_ready',name:'暂不可读群',reason:'尚无同步水位；未启用消息同步；同步尚未成功'},
             {reason:'非文字消息未分析'}],
           gap_summary:[{reason:'群开启受限模式，Lark禁止读取消息（231203）',
             conversations:1,names:['TikTok Shop 受限群']}],
           messages:[{conversation_name:'普通消息群',sender_name:'商家',
-            message_ref:'m.fixture.search',text:'Matching source.'}]}]};
+            message_ref:'m.fixture.search',text:'Matching source.'}]},...diagnosticData],
+      coverage:{messages:353,conversations:43,cutoff:'2026-10-12T11:00:00Z'}};
     const deliver=async result=>{view={...view,status:'completed',result}; await page.evaluate(value=>{
       window.sources.at(-1).emit('result',value); window.sources.at(-1).emit('done',{status:'completed'});},result);};
     const nextStream=async action=>{const count=await page.evaluate(()=>window.sources.length);
@@ -525,12 +564,21 @@ const {chromium} = require('playwright');
     assert.match(await page.locator('.oa-event-group').last().textContent(),/已解决／无需处理.*未见回复.*已解决/);
     assert.equal(await page.locator('.oa-source-entry').count(),1);
     assert.equal(await page.locator('.oa-history .oa-gaps').count(),1);
-    assert.equal(await page.locator('.oa-history .oa-gaps > div').count(),3);
-    assert.equal(await page.locator('.oa-history .oa-gaps summary').textContent(),'读取情况');
+    assert.equal(await page.locator('.oa-history .oa-gaps > div').count(),4);
+    assert.equal(await page.locator('.oa-history .oa-gaps summary').textContent(),'有些内容暂时无法查看');
+    assert.equal(await page.locator('.oa-source-entry > details > summary').textContent(),'查看相关消息');
+    assert.equal(await page.locator('.oa-data[data-query-ref="q.sync"]').count(),0);
+    assert.equal(await page.locator('.oa-data[data-query-ref="q.groups"] small').count(),0);
+    assert.doesNotMatch(await page.locator('#oa-history').textContent(),
+      /首次同步|最近同步时间|测试用同步定义|353 条消息|43 个会话|读取至/);
     assert.match(await page.locator('.oa-history .oa-gap-names').first().textContent(),/TikTok Shop 受限群/);
     assert.match(await page.locator('.oa-history .oa-gaps').textContent(),/群开启受限模式，无法读取消息/);
     assert.match(await page.locator('.oa-history .oa-gaps').textContent(),/图片、附件等消息暂无法解析/);
-    assert.match(await page.locator('.oa-history .oa-gaps').textContent(),/Lark未允许读取会话：未知不可读群/);
+    assert.match(await page.locator('.oa-history .oa-gaps').textContent(),
+      /此会话消息暂时无法查看会话：未知不可读群、暂不可读群/);
+    assert.equal((await page.locator('.oa-history .oa-gaps').textContent()).match(/这段时间的消息暂时不全/g).length,1);
+    assert.doesNotMatch(await page.locator('.oa-history .oa-gaps').textContent(),
+      /同步水位|历史回填|未启用消息同步|同步尚未成功|错误码|999999/);
     assert.match(await page.locator('#oa-scope').textContent(),/10\/12 00:00.*10\/12 12:00/);
     assert.doesNotMatch(await page.locator('.oa-history .oa-gaps').textContent(),/2 个会话|部分授权/);
     await page.reload(); await page.locator('#oa-launcher').click();

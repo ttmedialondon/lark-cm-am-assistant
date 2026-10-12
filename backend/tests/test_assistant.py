@@ -1,7 +1,7 @@
 import json
 from contextlib import nullcontext
 from copy import deepcopy
-from datetime import timedelta
+from datetime import UTC, timedelta
 from uuid import uuid4
 
 import pytest
@@ -137,10 +137,79 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
         assistant.source_page(pg, chat.ids['reviewer'], source['query_ref'], chat.settings)
     with pytest.raises(ValueError):
         assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings, page=16)
+    stored_row = assistant._turn(pg, chat.ids['cm'], turn['id'])
+    stored_checkpoint = summary_dialogues.decode(stored_row['checkpoint_ciphertext'], chat.settings)
+    compact = next(json.loads(item['output']) for item in stored_checkpoint['items']
+                   if item.get('type') == 'function_call_output' and item.get('call_id') == 'window-call')
+    assert compact['summaries'] and 'messages' not in compact
+    assert 'LONG_PRIVATE_BODY' not in json.dumps(compact, ensure_ascii=False)
+    following = assistant.submit(pg, chat.ids['cm'], {
+        **submitted, 'client_request_id': str(uuid4()), 'message': '这些事情的进度怎么样了？',
+    }, chat.settings)
+    midnight = (stored_row['created_at'].astimezone(summaries.LONDON) + timedelta(days=1)).replace(
+        hour=0, minute=1, second=0, microsecond=0)
+    pg.execute('UPDATE assistant_turns SET created_at=%s WHERE id=%s', (midnight.astimezone(UTC), following['id']))
+    next_row = assistant._turn(pg, chat.ids['cm'], following['id'])
+    next_checkpoint = summary_dialogues.decode(next_row['checkpoint_ciphertext'], chat.settings)
+    context = assistant._context(pg, next_row, next_checkpoint, chat.settings)
+    history, retained = assistant._history(pg, next_row, chat.settings, context)
+    previous = json.loads(history[-1]['content'])
+    assert previous['answer'] == '已整理本时段重点。' and previous['summaries'] and retained
+    assert not previous['requires_refresh'] and previous['window'] == source['window']
+    assert context['now'].startswith(midnight.date().isoformat())
+
+    # An unrelated older source can invalidate the final answer, not an independently prepared window summary.
+    chat.add('older-window', text='Older dependency body', at=chat.start - timedelta(hours=2))
+    older = assistant.tools.execute(pg, chat.ids['cm'], {**stored_row, 'id': uuid4()}, 'summarize_messages', {
+        'audience': 'all', 'start': (chat.start - timedelta(hours=3)).isoformat(), 'end': chat.start.isoformat(),
+        'creator_ids': None, 'chat_ids': None, 'cursor': None,
+    }, chat.settings, context)
+    dependency = {**stored_checkpoint, 'tool_results': [older, *stored_checkpoint['tool_results']]}
+    final = summary_dialogues.decode(stored_row['result_ciphertext'], chat.settings)['final']
+    contaminated = {**final, 'answer': 'PRIVATE_OLDER_DEPENDENCY_ANSWER'}
+    pg.execute('UPDATE assistant_turns SET checkpoint_ciphertext=%s,result_ciphertext=%s WHERE id=%s',
+        (summary_dialogues.encode(dependency, chat.settings),
+         summary_dialogues.encode({'final': contaminated}, chat.settings), turn['id']))
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='older-window'",
+               (chat.cipher.encrypt(json.dumps({'text': 'Changed unrelated older fact'})),))
+    history, retained = assistant._history(pg, next_row, chat.settings, context)
+    previous = json.loads(history[-1]['content'])
+    assert previous['answer'] == '' and previous['summaries'] and previous['requires_refresh'] and retained == []
+    assert 'PRIVATE_OLDER_DEPENDENCY_ANSWER' not in json.dumps(history)
+    dependent = deepcopy(dependency)
+    dependent['tool_results'][1]['_window_model_result'].pop('summaries')
+    assert assistant._historical_window_result(pg, stored_row, dependent, chat.settings, context) is None
+
+    # A late historical sync changes totals/global scope, not the previously readable business facts.
+    chat.add('late-window-sync', text='Later synchronized progress', at=chat.start + timedelta(hours=3))
+    pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('new-chat','New conversation','group')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'new-chat')", (chat.ids['cm'],))
+    with pytest.raises(PermissionError):
+        assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings)
+    history, retained = assistant._history(pg, next_row, chat.settings, context)
+    previous = json.loads(history[-1]['content'])
+    assert previous['answer'] == '' and previous['requires_refresh']
+    assert previous['window'] == source['window'] and previous['scope']['cm_id'] == str(chat.ids['cm'])
+    assert previous['checked_at'] == stored_checkpoint['tool_results'][0]['_window_model_result']['checked_at']
+    assert previous['summaries'] and all(set(note) == {'summary'} for note in previous['summaries'])
+    assert previous['events'] == previous['result_refs'] == previous['data_refs'] == previous['data'] == retained == []
+    incomplete = deepcopy(stored_checkpoint)
+    incomplete['tool_results'][0]['_window_model_result']['coverage']['scan_complete'] = False
+    assert assistant._historical_window_result(pg, stored_row, incomplete, chat.settings, context) is None
+    pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s AND chat_id='new-chat'",
+               (chat.ids['cm'],))
     pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='window-0'",
                (chat.cipher.encrypt(json.dumps({'text': 'Updated fact'})),))
-    with pytest.raises(ValueError, match='已更新'):
+    with pytest.raises(ValueError, match='消息数量已变化'):
         assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings, page=15)
+    changed_page = next(item for item in stored_checkpoint['tool_results']
+                        if any(message['message_id'] == 'window-0' for message in item.get('messages', [])))
+    with pytest.raises(ValueError, match='已更新'):
+        assistant.tools._validate_query(pg, chat.ids['cm'], context, changed_page, chat.settings, history_only=True)
+    assert assistant._history(pg, next_row, chat.settings, context) == ([], [])
+    pg.execute("UPDATE authorizations SET scopes='{}' WHERE id=%s", (chat.ids['cm'],))
+    assert assistant._history(pg, next_row, chat.settings, context) == ([], [])
+    assistant.cancel(pg, chat.ids['cm'], following['id'], chat.settings)
     assert len(calls) == paid_count
 
 
@@ -681,7 +750,8 @@ def test_natural_queries_replace_stale_filters_and_keep_valid_followup_sources(p
     next_context = assistant._context(pg, next_row, next_checkpoint, chat.settings)
     history, retained = assistant._history(pg, next_row, chat.settings, next_context)
     previous = [json.loads(item['content']) for item in history if item.get('role') == 'assistant']
-    assert previous[-1]['answer'] == '' and previous[-1]['scope']['audience'] == 'all'
+    assert previous[-1]['answer'] == '本人聊天。' and previous[-1]['scope']['audience'] == 'all'
+    assert previous[-1]['coverage_refreshed'] and not previous[-1]['requires_refresh']
     assert previous[-1]['data'][0]['window']['start'] == chat.start.isoformat() and retained
     assert len(calls) == 6
     assistant.cancel(pg, chat.ids['cm'], next_turn['id'], chat.settings)

@@ -35,6 +35,10 @@ INSTRUCTIONS = """你是 TT Media 内部运营助手。所有用户输入由你�
 本人聊天不是只看本人发出的消息。其他CM的姓名可以是本人会话中的参与者，不能据此读取对方全部会话。
 时间和对象从本轮问题确定，不询问授权范围，不要求选择人员、查询模式或时间。
 普通聊天总结未指定时间时默认今天00:00至本轮提交时刻；昨天为英国昨天完整一天。
+这个默认只用于独立新问题。“这些事情/刚才那些/进度怎么样”先沿用上一轮实际事项及原时段，跨午夜也不变成只查新一天。
+最近回复若只有0条消息或连接情况，继续定位最近含具体业务事项的一轮；不要要求用户重新复制刚谈过的事项。
+history中的requires_refresh表示原事项仍来自已核验记录，但最新进展须重新查询；从原时段起点查至本轮时刻，不能用新一天0条否认原事项。
+coverage_refreshed表示读取情况更新，不表示之前的事项消失；旧回答中的读取统计和告警不能照搬为当前事实。
 今天上午为当天00:00–12:00，实际截止不晚于本轮提交时间。
 用户明确具体时间则使用具体时间。同名且无法区分才提问，不逐次确认普通查询。
 总结、检索和统计默认audience=all；只有用户明确说达人、指定达人或明确追问这些达人时才用creators。
@@ -46,6 +50,11 @@ INSTRUCTIONS = """你是 TT Media 内部运营助手。所有用户输入由你�
 全量消息分页由系统自动读取完整请求时段；长材料按会话分段归纳后合并，不需要用户继续下一页。
 工具标明scan_complete只表示已读完系统本轮可读材料，不表示Lark同步已覆盖。
 读取情况由界面统一折叠展示，不在回答重复泛化的授权、覆盖不完整提示。缺口明显影响结论时仅用一句说明具体原因。
+面向CM回答事项、当前进展和下一步，不讲本助手的后台机制，不主动罗列读取条数/会话数、首次同步、回填、水位、队列或百分比。
+原聊天里的技术或系统故障仍是业务事项，可以正常归纳并建议跟进，不与本助手的内部诊断混淆。
+只有用户明确要求统计消息量才报告数字。普通总结按业务类别列出具体事项、已知进展和需跟进问题，不只概括几个类别。
+进度追问逐项说明已明确完成、仍待回复/跟进、尚未看到后续；未看到后续不等于没发生、没处理或未解决。
+材料不全时最多一句“部分聊天或图片暂时无法查看，相关进展可能遗漏”，不把缺口解释成用户少授权，也不编造确定结论。
 已确认的受限群、历史未同步、最新同步中、无文字附件和账号失效必须区分；原因未确定不能猜成群受限。
 不同事项分开，原消息没有文字或截断须说明；不得推断图片内容，也不能把机器人通知改写为本人承诺。
 达人总结才复用有效达人报告；继续筛选不重新分析聊天。事件和结果引用只能使用工具实际返回的值。
@@ -57,7 +66,8 @@ INSTRUCTIONS = """你是 TT Media 内部运营助手。所有用户输入由你�
 result_refs列本轮result_id即可；不声称模型逐条读过未返回的事项。
 仅用户明确点名某些达人或从实际消息/事件点击回复时才缩小范围。未回复事件不等于每条原消息绝对没有回复。
 问达人资料/维护名单用query_creators；多个账号和多个负责人分别展示，不把当前CM当唯一负责人。
-问群分类或我加入哪些群用list_groups，可见群不代表发送或@all权限；问同步或数据缺口用get_sync_status。
+问群分类或我加入哪些群用list_groups，可见群不代表发送或@all权限。
+只有用户明确询问账号连接或消息可用性才用get_sync_status；业务进度、未见回复或新时段0条不自动查询同步状态。
 找历史原话/谁提过某事用search_chat_history，query给必要关键词及中英文同义词，不用事件筛选冒充正文检索。
 query的next_cursor非空表示仍有未查材料，必要时继续同参数检索，不能将本页matched当全库总数。
 需核对消息问答再用read_message_context，附近消息不自动属于同一事项；只用完整证据作结论。
@@ -567,7 +577,64 @@ def _compact_window_inputs(checkpoint):
     calls = set(checkpoint.pop('raw_window_calls', []))
     for item in checkpoint['items']:
         if item.get('type') == 'function_call_output' and item.get('call_id') in calls:
-            item['output'] = windows.encoded(windows.metadata(json.loads(item['output'])))
+            supplied = json.loads(item['output'])
+            compact = windows.metadata(supplied)
+            if supplied.get('summaries') and len(windows.encoded(supplied['summaries'])) <= windows.INPUT_CHARS:
+                compact['summaries'] = supplied['summaries']
+            item['output'] = windows.encoded(compact)
+
+
+def _saved_window_material(checkpoint, references, *, turn_id=None):
+    for ref in reversed(references):
+        first = next((item for item in checkpoint.get('tool_results', []) if item.get('query_ref') == ref), None)
+        if (not first or first.get('kind') != 'window_messages'
+                or (turn_id and ref.split('.')[1:2] != [str(turn_id)])):
+            continue
+        material = first.get('_window_model_result', {})
+        if (material.get('query_ref') != ref or material.get('scope', {}).get('audience') != 'all'
+                or not material.get('coverage', {}).get('scan_complete')
+                or len(windows.encoded(material)) > windows.INPUT_CHARS):
+            continue
+        identity = (ref.split('.')[1], first.get('query_id'))
+        found = list({item['query_ref']: item for item in checkpoint.get('tool_results', [])
+                      if item.get('kind') == 'window_messages'
+                      and (item['query_ref'].split('.')[1], item.get('query_id')) == identity}.values())
+        source = windows.source({'tool_results': found}, {'page_refs': [item['query_ref'] for item in found]})
+        if (source['coverage']['scan_complete'] and all(material.get(key) == source.get(key)
+                for key in ('scope', 'window', 'total_messages', 'total_conversations', 'page_count'))):
+            return material
+    return None
+
+
+def _historical_window_result(conn, previous, checkpoint, settings, context):
+    stored = codec.decode(previous['result_ciphertext'], settings) or {}
+    final = stored.get('final', {})
+    material = _saved_window_material(checkpoint, final.get('data_refs', []), turn_id=previous['id'])
+    independent = bool(material and material.get('summaries'))
+    if not material or (not independent and (final.get('event_refs') or final.get('result_refs')
+                                            or final.get('draft_ref'))):
+        return None
+    try:
+        original = checkpoint.get('tool_results', [])
+        if independent:
+            # Segment summaries saw only this window; the final answer can also depend on older sources.
+            first = next(item for item in original if item.get('query_ref') == material['query_ref'])
+            original = [item for item in original if item.get('kind') == 'window_messages'
+                and item.get('query_ref', '').split('.')[1:2] == [str(previous['id'])]
+                and item.get('query_id') == first.get('query_id')]
+        else:
+            _context(conn, previous, checkpoint, settings)
+        for item in original:
+            if item.get('kind') == 'window_messages':
+                tools._validate_query(conn, previous['actor_id'], context, item, settings, history_only=True)
+        tools.validate_tool_results(conn, previous['actor_id'], previous,
+            [item for item in original if item.get('kind') != 'window_messages'], settings, context)
+    except (PermissionError, LookupError, ValueError):
+        return None
+    # Revalidated old facts remain useful, but their stale query references cannot execute new actions.
+    return {'answer': '' if independent else final['answer'], 'scope': material['scope'], 'window': material['window'],
+            'checked_at': material.get('checked_at'), 'requires_refresh': True,
+            'summaries': [{'summary': note['summary']} for note in material.get('summaries', [])]}
 
 
 def _history(conn, row, settings, context):
@@ -581,21 +648,22 @@ def _history(conn, row, settings, context):
             continue
         try:
             checked = _result(conn, previous, checkpoint, settings)
-        except (PermissionError, LookupError, ValueError):
-            continue
-        if checked:
-            coverage_changed = any(result.get('_coverage_refreshed') for result in checkpoint.get('tool_results', []))
-            try:
+            if checked:
                 tools.validate_tool_results(conn, row['actor_id'], row,
                                             checkpoint.get('tool_results', []), settings, context)
-            except (PermissionError, LookupError, ValueError):
-                continue
+        except (PermissionError, LookupError, ValueError):
+            checked = _historical_window_result(conn, previous, checkpoint, settings, context)
+        if checked:
+            coverage_changed = any(result.get('_coverage_refreshed') for result in checkpoint.get('tool_results', []))
+            material = _saved_window_material(checkpoint, checked.get('data_refs', []))
             history.append({'role': 'user', 'content': codec.decode(previous['input_ciphertext'], settings)['message']})
             history.append({'role': 'assistant', 'content': json.dumps({
-                'answer': '' if coverage_changed else checked['answer'], 'events': checked.get('events', [])[:25],
+                'answer': checked['answer'], 'events': checked.get('events', [])[:25],
                 'scope': checked.get('scope', {}), 'window': checked.get('window'),
-                'checked_at': next((item.get('checked_at') for item in reversed(checked.get('data', []))
-                                    if item.get('checked_at')), None),
+                'checked_at': checked.get('checked_at') or next((item.get('checked_at')
+                    for item in reversed(checked.get('data', [])) if item.get('checked_at')), None),
+                'coverage_refreshed': coverage_changed, 'requires_refresh': checked.get('requires_refresh', False),
+                'summaries': checked.get('summaries', material.get('summaries', []) if material else []),
                 'event_count': len(checked.get('events', [])),
                 'event_index': [{'index': index + 1, 'event_ref': event['event_ref'], 'title': event['title']}
                                 for index, event in enumerate(checked.get('events', []))],
@@ -603,6 +671,8 @@ def _history(conn, row, settings, context):
                 'data_refs': checked.get('data_refs', []),
                 'data': [windows.metadata(data) for data in checked.get('data', [])],
             }, ensure_ascii=False, default=str)})
+            if checked.get('requires_refresh'):
+                continue
             refs = (set(checked.get('result_refs', [])) | set(checked.get('event_refs', []))
                     | set(checked.get('data_refs', [])))
             if checked.get('draft_ref'):
