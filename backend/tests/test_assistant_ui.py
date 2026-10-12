@@ -143,6 +143,8 @@ const {chromium} = require('playwright');
     const page = await browser.newPage({viewport:{width:1280,height:900}});
     const errors = [], posts = [], remiId='22222222-2222-4222-8222-222222222222';
     let view, html = input.html, failFirstPost = true, scopeReads=0, sessionGone=false, turnsEmpty=false;
+    let holdEvidence=false, denyEvidence=false, evidenceStarted, olderTurns=[];
+    const pendingEvidence=[];
     const ownId=()=>html.match(/data-user-id="([^"]+)"/)[1];
     page.on('pageerror', error => errors.push(error.message));
     await page.addInitScript(() => {
@@ -178,10 +180,15 @@ const {chromium} = require('playwright');
         return route.fulfill({status:202,json:view});
       }
       if (url.pathname.includes('/sessions/')) return route.fulfill(sessionGone?
-        {status:404,json:{error:'对话不存在或无权查看。'}}:{json:{id:view.session_id,turns:turnsEmpty?[]:[view]}});
-      if (url.pathname.includes('/evidence/')) return route.fulfill({json:{messages:[{
-        chat_name:'群',sender_name:'达人',time:'2026-10-12T09:00:00Z',
-        text:'<img src=x onerror=alert(1)> **本人原文**'}],gaps:[]}});
+        {status:404,json:{error:'对话不存在或无权查看。'}}:
+        {json:{id:view.session_id,turns:turnsEmpty?[]:[...olderTurns,view]}});
+      if (url.pathname.includes('/evidence/')) {
+        if (denyEvidence) return route.fulfill({status:403,json:{error:'查看权限已变化。'}});
+        if (holdEvidence) {evidenceStarted?.(); await new Promise(resolve=>pendingEvidence.push(resolve));}
+        return route.fulfill({json:{messages:[{
+          chat_name:'群',sender_name:'达人',time:'2026-10-12T09:00:00Z',
+          text:'<img src=x onerror=alert(1)> **本人原文**'}],gaps:[]}});
+      }
       return route.abort();
     });
     await page.goto('http://localhost/');
@@ -212,7 +219,11 @@ const {chromium} = require('playwright');
       '2. **活动报名**：暂未回复。\n\n<script>bad()</script> [不安全](javascript:alert(1)) ' +
       '[数据](data:text/html;base64,PHNjcmlwdD4=)\n`**原样代码**`\n\n- 核对群聊\n- 联系同事',
       events:[{event_ref:'ref',title:'样品进展',creator_handle:'fixture',
-      handling_status:'unresolved',evidence_ref:'ref'}],scope:{cm_id:ownId(),cm_name:'CM',audience:'all',creator_ids:null},
+      handling_status:'unresolved',evidence_ref:'ref',summary:'对方询问样品寄送进度。',importance:{tier:'focus',tier_label:'重点'},
+      conversations:[{chat_id:'group',type:'group',name:'<img src=x onerror=alert(1)> 样品群'},
+        {chat_id:'private',type:'private',name:'Fixture 私聊'}]}],
+      coverage:{responsible_creators:201,matched_events:12,preview_count:1,analysis_complete:false},
+      scope:{cm_id:ownId(),cm_name:'CM',audience:'all',creator_ids:null},
       window:{start:'2026-10-12T07:00:00Z',end:'2026-10-12T11:00:00Z'},
       draft:{draft:'**I will check.**',chinese_translation:'我会核对。',language:'en'},
       data:[{kind:'window_messages',scope:{audience:'all'},total_messages:20,
@@ -238,6 +249,13 @@ const {chromium} = require('playwright');
     assert.match(await page.locator('.oa-answer').textContent(),/javascript:alert\(1\)/);
     assert.equal(await page.locator('.oa-answer code').textContent(),'**原样代码**');
     assert.equal(await page.locator('.oa-history script').count(),0);
+    assert.match(await page.locator('.oa-event-meta').textContent(),/重要度：重点/);
+    assert.equal(await page.locator('.oa-event .oa-card-meta').textContent(),
+      '群聊：<img src=x onerror=alert(1)> 样品群私聊：Fixture 私聊');
+    assert.equal(await page.locator('.oa-event img').count(),0);
+    assert.equal(await page.locator('.oa-event p').textContent(),'对方询问样品寄送进度。');
+    assert.match(await page.locator('.oa-message--assistant > .oa-coverage').textContent(),
+      /负责达人 201 位 · 匹配事项 12 项 · 部分结果/);
     assert.match(await page.locator('.oa-scope').textContent(),/全部授权消息/);
     assert.match(await page.locator('.oa-data').textContent(),/本页 1 条.*时段 20 条/);
     assert.equal(await page.locator('.oa-data details.oa-coverage').getAttribute('open'),null);
@@ -257,6 +275,7 @@ const {chromium} = require('playwright');
     assert.equal(await page.locator('#oa-sources-body strong').count(),0);
     assert.match(await page.locator('#oa-sources-body blockquote').textContent(),/\*\*本人原文\*\*/);
     await page.locator('#oa-sources-close').click();
+    await page.locator('#oa-sources').waitFor({state:'hidden'});
     await page.locator('.oa-draft textarea').fill('Edited reply');
     await page.getByRole('button',{name:'复制回复',exact:true}).click();
     await page.waitForFunction(() => window.copied==='Edited reply');
@@ -323,6 +342,80 @@ const {chromium} = require('playwright');
     await page.waitForFunction(id=>document.getElementById('oa-cm').value===id,ownId());
     assert.equal(await page.locator('#oa-panel').isHidden(),true);
     assert.equal(posts.length,6);
+    turnsEmpty=false;
+    await page.locator('#oa-launcher').click();
+    await page.locator('#oa-input').fill('查未回复事项'); await page.locator('#oa-input').press('Enter');
+    await page.waitForFunction(()=>window.sources.length===2); assert.equal(posts.length,7);
+    const changedSession=view.session_id;
+    await page.evaluate(value=>window.sources.at(-1).emit('result',value),result);
+    await page.locator('.oa-event .oa-evidence').click(); await page.locator('#oa-sources-body blockquote').waitFor();
+    await page.locator('#oa-sources-close').click();
+    await page.locator('#oa-sources').waitFor({state:'hidden'});
+    holdEvidence=true;
+    const sourceRead=new Promise(resolve=>evidenceStarted=resolve);
+    await page.locator('.oa-event .oa-evidence').click(); await sourceRead;
+    view={...view,status:'failed',error_code:'source_changed',error:'查询资料已变化，请重新提问。',
+      result:null,scope:{cm_id:remiId,cm_name:'Remi',audience:'creators',event_ref:'旧事项'}};
+    await page.evaluate(value=>{
+      const stream=window.sources.at(-1);
+      stream.emit('error',{code:'source_changed',message:'查询资料已变化，请重新提问。',clear:true});
+      stream.emit('result',value); stream.emit('done',{status:'completed'});
+    },result);
+    const sourceResponse=page.waitForResponse(response=>response.url().includes('/evidence/')&&response.status()===200);
+    pendingEvidence.shift()(); await (await sourceResponse).finished(); holdEvidence=false;
+    await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    assert.equal(await page.locator('.oa-event, .oa-draft, .oa-data, #oa-sources-body blockquote').count(),0);
+    assert.equal(await page.locator('#oa-sources').isHidden(),true);
+    assert.match(await page.locator('#oa-status').textContent(),/资料已变化.*重新提问/);
+    assert.equal(await page.locator('#oa-input').isDisabled(),false);
+    // Restore an invalidated turn: do not adopt its old CM/event selection.
+    await page.evaluate(session_id=>{
+      const key='ttmedia.assistant.'+document.getElementById('operations-assistant').dataset.userId;
+      localStorage.setItem(key,JSON.stringify({...JSON.parse(localStorage.getItem(key)),session_id}));
+    },changedSession);
+    await page.reload(); await page.locator('#oa-launcher').click();
+    await page.waitForFunction(()=>document.getElementById('oa-status').textContent.includes('资料已变化'));
+    assert.equal(await page.locator('#oa-cm').inputValue(),ownId());
+    assert.doesNotMatch(await page.locator('#oa-scope').textContent(),/Remi|旧事项/);
+    await page.locator('#oa-input').fill('重新查未回复事项'); await page.locator('#oa-input').press('Enter');
+    await page.waitForFunction(()=>window.sources.length===1); assert.equal(posts.length,8);
+    assert.notEqual(posts[7].body.session_id,changedSession);
+    assert.equal(posts[7].body.context.cm_id,ownId());
+    const activeTurn=view.id, activeRequest=JSON.stringify(posts[7].body);
+    olderTurns=[{...view,id:require('node:crypto').randomUUID(),status:'failed',
+      client_request_id:require('node:crypto').randomUUID(),error_code:'source_changed',
+      message:'已失效的旧问题',error:'旧资料已变化，请重新提问。',
+      result:{...result,answer:'不应出现的旧正文'},scope:{cm_id:remiId,cm_name:'Remi',event_ref:'旧事项'}}];
+    await page.reload(); await page.locator('#oa-launcher').click();
+    await page.waitForFunction(()=>window.sources.length===1);
+    assert.equal(posts.length,8); assert.equal(JSON.stringify(posts[7].body),activeRequest);
+    assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('ttmedia.assistant.'+
+      document.getElementById('operations-assistant').dataset.userId)).session_id),view.session_id);
+    assert.match(await page.evaluate(()=>window.sources[0].url),new RegExp(`/turns/${activeTurn}/events$`));
+    assert.equal(await page.locator('#oa-stop').isEnabled(),true);
+    assert.equal(await page.locator('#oa-stop').isVisible(),true);
+    assert.doesNotMatch(await page.locator('#oa-history').textContent(),/不应出现的旧正文|已失效的旧问题/);
+    assert.doesNotMatch(await page.locator('#oa-scope').textContent(),/Remi|旧事项/);
+    assert.equal(await page.locator('#oa-cm').inputValue(),ownId());
+    assert.equal(await page.locator('#oa-sources').isHidden(),true);
+    olderTurns=[];
+    await page.evaluate(value=>window.sources.at(-1).emit('result',value),result);
+    holdEvidence=true;
+    const protectedRead=new Promise(resolve=>evidenceStarted=resolve);
+    await page.locator('.oa-event .oa-evidence').click(); await protectedRead;
+    await page.locator('#oa-sources-close').click();
+    await page.locator('#oa-sources').waitFor({state:'hidden'});
+    denyEvidence=true; await page.locator('.oa-event .oa-evidence').click();
+    await page.waitForFunction(()=>document.getElementById('oa-input').disabled);
+    const protectedResponse=page.waitForResponse(response=>
+      response.url().includes('/evidence/')&&response.status()===200);
+    pendingEvidence.shift()(); await (await protectedResponse).finished();
+    await page.evaluate(value=>window.sources.at(-1).emit('result',value),result);
+    await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    assert.equal(await page.locator('.oa-event, .oa-draft, .oa-data, #oa-sources-body blockquote').count(),0);
+    assert.match(await page.locator('#oa-history').textContent(),/查看权限已变化.*重新登录/);
+    assert.equal(await page.locator('#oa-input').isDisabled(),true);
+    holdEvidence=false; denyEvidence=false;
     html=html.replace(/data-user-id="[^"]+"/,'data-user-id="33333333-3333-4333-8333-333333333333"');
     const reads=[]; page.on('request',request => {if(request.url().includes('/sessions/')) reads.push(request.url());});
     await page.reload(); await page.locator('#oa-launcher').click();

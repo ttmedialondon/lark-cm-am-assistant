@@ -162,6 +162,13 @@
     history.replaceChildren(node("p", "oa-answer", "开始一个新问题。"));
     scope({}); status(""); if (!keepInput) input.value = ""; controls();
   }
+  function sourceChanged(message) {
+    const person = cmScopes.find(person => person.cm_id === activeContext.cm_id) ||
+      {cm_id: activeContext.cm_id, cm_name: activeContext.cm_name};
+    active = null; submitting = false;
+    resetSession(person, true);
+    status(typeof message === "string" ? message : "查询资料已变化，请重新提问。", true);
+  }
   function switchCM(cmId) {
     if (denied || !scopesReady || active || submitting || restoring || saved.client_request_id) return false;
     const person = cmScopes.find(person => person.cm_id === cmId);
@@ -475,11 +482,20 @@
     scope({...result.scope, ...result.window});
     (result.events || []).forEach((event, index) => {
       const card = node("section", "oa-event"), meta = node("div", "oa-event-meta");
-      for (const text of [event.creator_handle || event.lark_user_name || event.creator_name, event.priority,
+      const importance = event.importance?.tier_label || {focus: "重点", priority: "优先", normal: "常规",
+        dormant: "久未联系", pending: "待评估"}[event.importance?.tier];
+      for (const text of [event.creator_handle || event.lark_user_name || event.creator_name,
+        importance && `重要度：${importance}`, event.priority,
         {unresolved: "待跟进", resolved: "已解决", uncertain: "待核对"}[event.handling_status]]) {
         if (text) meta.append(node("span", "", text));
       }
       card.append(meta, node("h4", "", `${index + 1}. ${event.title || "聊天事项"}`));
+      if (event.conversations?.length) {
+        const conversations = node("div", "oa-card-meta");
+        for (const chat of event.conversations) conversations.append(node("span", "",
+          `${{private: "私聊", group: "群聊"}[chat.type] || "会话"}：${chat.name || "未命名会话"}`));
+        card.append(conversations);
+      }
       if (event.summary) card.append(node("p", "", event.summary));
       if (event.latest_progress) card.append(node("p", "", event.latest_progress));
       const actions = node("div", "oa-card-actions");
@@ -504,6 +520,9 @@
     const coverage = result.coverage;
     if (coverage && typeof coverage === "object") {
       const counts = [];
+      if (Number.isFinite(coverage.responsible_creators)) counts.push(`负责达人 ${coverage.responsible_creators} 位`);
+      if (Number.isFinite(coverage.matched_events)) counts.push(`匹配事项 ${coverage.matched_events} 项`);
+      if (coverage.analysis_complete === false) counts.push("部分结果");
       if (Number.isFinite(coverage.conversations)) counts.push(`${coverage.conversations} 个会话`);
       if (Number.isFinite(coverage.messages)) counts.push(`${coverage.messages} 条消息`);
       const cutoff = coverage.cutoff || result.window?.cutoff;
@@ -521,6 +540,7 @@
   function turn(view) {
     if (denied) return;
     if (view.error_code === "permission") { clearProtected(); return; }
+    if (view.error_code === "source_changed") { sourceChanged(view.error); return; }
     if (view.scope) scope(view.scope);
     if (view.message) userMessage(view.client_request_id, view.message);
     let container = [...history.children].find(child => child.dataset.turnId === view.id);
@@ -566,6 +586,7 @@
       if (active !== watching) return;
       if (typeof event.data === "string") {
         const value = JSON.parse(event.data);
+        if (value.code === "source_changed") { sourceChanged(value.message); return; }
         if (value.clear) clearProtected();
         else turn({...view, status: "failed", error: typeof value === "string" ? value : value.message});
         status(typeof value === "string" ? value : value.message || "这轮处理未能完成。", true);
@@ -588,12 +609,23 @@
     try {
       const value = await request(`/sessions/${encodeURIComponent(saved.session_id)}`);
       if (denied || version !== revision) return;
-      const turns = value.turns || [];
+      const received = value.turns || [];
+      const turns = received.filter(view => view.error_code !== "source_changed");
+      const running = turns.find(view => !terminal.has(view.status));
+      if (!running && received.at(-1)?.error_code === "source_changed") {
+        sourceChanged(received.at(-1).error); return;
+      }
+      const changed = received.filter(view => view.error_code === "source_changed");
+      if (changed.length) {
+        closeSources(false);
+        for (const child of [...history.children]) {
+          if (changed.some(view => child.dataset.turnId === view.id || child.dataset.requestId === view.client_request_id)) child.remove();
+        }
+      }
       const latest = turns.at(-1);
       const latestScope = latest?.result?.scope || latest?.scope;
       const sessionCM = latestScope?.cm_id || saved.cm_id;
-      const running = turns.find(view => !terminal.has(view.status));
-      const unconfirmed = saved.client_request_id && !turns.some(view => view.client_request_id === saved.client_request_id);
+      const unconfirmed = saved.client_request_id && !received.some(view => view.client_request_id === saved.client_request_id);
       if (turns.length && sessionCM && sessionCM !== activeContext.cm_id) {
         if (running || unconfirmed) {
           const person = cmScopes.find(person => person.cm_id === sessionCM);
@@ -617,7 +649,7 @@
         if (!cmId || cmId === activeContext.cm_id || view.error_code === "permission") turn(view);
       }
       if (denied) return;
-      if (turns.some(view => view.client_request_id === saved.client_request_id)) {
+      if (received.some(view => view.client_request_id === saved.client_request_id)) {
         delete saved.client_request_id; pending = null; persist();
       }
       if (running) watch(running, restoreScope ? scopeVersion : null);
@@ -656,7 +688,8 @@
       if (denied || version !== revision) return;
       delete saved.client_request_id; pending = null; persist(); input.value = "";
       currentScopeTurn = {id: value.id, version: submittedScopeVersion};
-      adoptTurnScope(value); turn(value); watch(value);
+      adoptTurnScope(value); turn(value);
+      if (!denied && version === revision) watch(value);
     } catch (error) {
       if (denied || version !== revision) return;
       if (error.status === 400 || error.status === 413 || error.status === 415 || error.status === 422) {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -20,6 +21,7 @@ ERRORS = {
     'cancelled': '已停止。', 'unknown': '请求结果未知，未自动重复调用。',
     'provider_error': 'AI 服务暂时不可用。', 'quota': '助手 API 配额不足。',
     'invalid_output': 'AI 返回的结果无法使用。', 'permission': '授权或查询范围已变化。',
+    'source_changed': '资料在处理期间已变化，请重新提问；系统未自动重复调用 AI。',
     'disabled': '运营助手尚未启用。', 'step_limit': '本轮处理步骤已达上限。',
     'internal': '本轮处理未完成，请重新提问。',
 }
@@ -37,6 +39,11 @@ all权限不足时不能自动退回达人结果冒充全量；须说明只能�
 有next_cursor必须继续同参数读取，直至游标为空；未读完明确说明部分总结，不说已总结全时段。
 不同事项分开，原消息没有文字或截断须说明；不得推断图片内容，也不能把机器人通知改写为本人承诺。
 达人总结才复用有效达人报告；继续筛选不重新分析聊天。事件和结果引用只能使用工具实际返回的值。
+问负责达人未回复的消息或事项，优先用query_unreplied_creator_events，一次查询完整负责范围。
+“重点优先／重要达人优先”是排序，不是筛选，不能擅自挑少数重点达人或仅查已翻到的名单页。
+该工具的total是完整匹配事项数，events仅为最多25项预览；完整卡片由后端附出，不必翻名单或列数百个引用。
+回答简述总量和最值得关注的事项，result_refs列本轮result_id即可；不声称模型逐条读过未返回的事项。
+仅用户明确点名某些达人或页面明确选择对象时才缩小范围。未回复事件不等于每条原消息绝对没有回复。
 问达人资料/维护名单用query_creators；多个账号和多个负责人分别展示，不把当前CM当唯一负责人。
 问群分类或我加入哪些群用list_groups，可见群不代表发送或@all权限；问同步或数据缺口用get_sync_status。
 找历史原话/谁提过某事用search_chat_history，query给必要关键词及中英文同义词，不用事件筛选冒充正文检索。
@@ -166,6 +173,9 @@ def turn_view(conn, actor, turn_id, settings):
         context = _context(conn, row, checkpoint, settings)
         result = _result(conn, row, checkpoint, settings)
         scope = context.get('scope', {})
+    except tools.SourceChangedError:
+        scope, error = {}, ERRORS['source_changed']
+        error_code = 'source_changed'
     except (PermissionError, LookupError, ValueError):
         scope, error = {}, ERRORS['permission']
         error_code = 'permission'
@@ -286,11 +296,18 @@ def _finish_error(job, settings, code, telemetry=None):
         for key, value in (telemetry or {}).get('usage', {}).items():
             if isinstance(value, int):
                 total[key] = total.get(key, 0) + value
+        checkpoint = codec.decode(row['checkpoint_ciphertext'], settings) or {}
+        checkpoint['failure'] = {'code': code, 'stage': checkpoint.get('progress'),
+            'model_steps': checkpoint.get('model_steps'),
+            'openai_request_id': (telemetry or {}).get('openai_request_id')}
         conn.execute('''UPDATE assistant_turns SET status=%s,error_code=%s,usage=%s::jsonb,
+            checkpoint_ciphertext=%s,
             response_id=COALESCE(%s,response_id),lease_until=NULL,finished_at=NOW() WHERE id=%s''',
             ('unknown' if code == 'unknown' else 'failed', code, json.dumps(total),
-             (telemetry or {}).get('response_id'), job['id']))
+             codec.encode(checkpoint, settings), (telemetry or {}).get('response_id'), job['id']))
         _stop_dependents(conn, job['id'])
+        logging.getLogger(__name__).warning('assistant_failed turn=%s code=%s stage=%s steps=%s',
+            job['id'], code, checkpoint.get('progress'), checkpoint.get('model_steps'))
 
 
 def claim():
@@ -332,10 +349,14 @@ def prepare(settings):
         try:
             context = _context(conn, row, checkpoint, settings)
             result = tools.resume_wait(conn, row['actor_id'], row, checkpoint['waiting'], settings, context)
-        except (PermissionError, LookupError, ValueError):
-            conn.execute("UPDATE assistant_turns SET status='failed',error_code='permission',finished_at=NOW() "
+        except (PermissionError, LookupError, ValueError) as exc:
+            code = 'permission' if isinstance(exc, PermissionError | LookupError) else 'source_changed'
+            checkpoint['failure'] = {'code': code, 'stage': '读取分析结果',
+                                     'model_steps': checkpoint.get('model_steps')}
+            conn.execute("UPDATE assistant_turns SET status='failed',error_code=%s,"
+                         "checkpoint_ciphertext=%s,finished_at=NOW() "
                          "WHERE id=%s",
-                         (row['id'],))
+                         (code, codec.encode(checkpoint, settings), row['id']))
             _stop_dependents(conn, row['id'])
             return True
         if result is None:
@@ -359,8 +380,7 @@ def _accept_tool(checkpoint, call, result):
     checkpoint['tool_outputs'][call['call_id']] = result
     checkpoint['tool_results'].append(result)
     checkpoint['items'].append({'type': 'function_call_output', 'call_id': call['call_id'],
-                               'output': json.dumps(tools.public_query(result, for_model=True)
-                                                    if result.get('query_ref') else result,
+                               'output': json.dumps(tools.public_query(result, for_model=True),
                                                     ensure_ascii=False, default=str)})
     checkpoint['pending_calls'].pop(0)
 
@@ -394,7 +414,10 @@ def _history(conn, row, settings, context):
                 continue
             history.append({'role': 'user', 'content': codec.decode(previous['input_ciphertext'], settings)['message']})
             history.append({'role': 'assistant', 'content': json.dumps({
-                'answer': checked['answer'], 'events': checked.get('events', []),
+                'answer': checked['answer'], 'events': checked.get('events', [])[:25],
+                'event_count': len(checked.get('events', [])),
+                'event_index': [{'index': index + 1, 'event_ref': event['event_ref'], 'title': event['title']}
+                                for index, event in enumerate(checked.get('events', []))],
                 'result_refs': checked.get('result_refs', []), 'draft': checked.get('draft'),
                 'data_refs': checked.get('data_refs', []),
                 'data': [tools.public_query(data, for_model=True) for data in checked.get('data', [])],
@@ -459,7 +482,9 @@ def step(job, settings):
                         tools.validate_tool_results(conn, row['actor_id'], row, [cached], settings, context)
                         result = cached
                     else:
-                        result = tools.execute(conn, row['actor_id'], row, call['name'], args, settings, context)
+                        current_turn = {**row, 'checkpoint_ciphertext': codec.encode(checkpoint, settings)}
+                        result = tools.execute(conn, row['actor_id'], current_turn,
+                                               call['name'], args, settings, context)
                         if not result.get('waiting'):
                             checkpoint['tool_cache'][cache_key] = result
                 except (PermissionError, LookupError, ValueError):
@@ -555,6 +580,8 @@ def run(job, settings):
             ai_dispatch.throttle(exc.retry_after_seconds)
     except api.ModelOutputError as exc:
         _finish_error(job, settings, 'invalid_output', exc.telemetry)
+    except tools.SourceChangedError:
+        _finish_error(job, settings, 'source_changed')
     except PermissionError:
         _finish_error(job, settings, 'permission')
     except LookupError:

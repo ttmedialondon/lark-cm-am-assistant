@@ -14,6 +14,83 @@ from app import offhours_summary as summaries
 from app.ai_feature_config import api_key_cipher, save_feature_config
 
 
+def test_creator_snapshot_keeps_all_pages_stable_and_live_sources_protected(pg, seeded):  # noqa: F811
+    from app import creator_importance_facts
+
+    s = seeded
+    ids = [s.ids["person"]]
+    for index in range(61):
+        person_id = uuid4()
+        ids.append(person_id)
+        pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)",
+                   (person_id, f"Creator {index:02}"))
+        pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) "
+                   "VALUES(%s,'creator','confirmed','manual')", (person_id,))
+        pg.execute("INSERT INTO lark_identities(open_id,contact_id,display_name) VALUES(%s,%s,%s)",
+                   (f"ou_snapshot_{index}", person_id, f"Creator {index:02}"))
+        pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
+                   "VALUES(%s,%s,%s,'manual')", (uuid4(), person_id, s.ids["cm"]))
+    pg.execute("UPDATE chat_messages SET sender_type='user',body_fingerprint=%s WHERE message_id='m1'",
+               ("1" * 64,))
+    source = pg.execute("""SELECT jsonb_build_object('chat_id',m.chat_id,'message_id',m.message_id,
+        'consent_at',a.body_consent_at,'body_fingerprint',m.body_fingerprint,
+        'sender_open_id',m.sender_open_id,'message_type',m.message_type,'created_at',m.message_create_time,
+        'parent_id',m.parent_id,'root_id',m.root_id,'thread_id',m.thread_id,
+        'mentions_fingerprint',md5(m.mentions_json::text)) source
+        FROM chat_messages m JOIN authorizations a ON a.id=%s WHERE m.message_id='m1'""",
+        (s.ids["cm"],)).fetchone()["source"]
+    for person in ids:
+        pg.execute("""INSERT INTO creator_importance_profiles(contact_id,responsible_authorization_id,
+            manual_tier,auto_valid,prompt_version,sources) VALUES(%s,%s,'normal',TRUE,%s,%s::jsonb)""",
+            (person, s.ids["cm"], creator_importance_facts.PROMPT_VERSION,
+             json.dumps([source] if person == s.ids["person"] else [])))
+    session, turn_id = uuid4(), uuid4()
+    pg.execute("INSERT INTO assistant_sessions(id,actor_id) VALUES(%s,%s)", (session, s.ids["cm"]))
+    pg.execute("INSERT INTO assistant_turns(id,session_id,client_request_id,input_ciphertext) "
+               "VALUES(%s,%s,%s,'fixture')", (turn_id, session, uuid4()))
+    context = tools.current_context(pg, s.ids["cm"], {}, s.settings)
+    args = {"query": None, "importance": None, "cursor": None}
+    first = assistant_queries.creators(pg, s.ids["cm"], context, args, s.settings)
+    expected = json.loads(json.dumps(first["_snapshot"]["creators"]))
+    assert first["total"] == 62 and len(first["creators"]) == 25
+    assert first["_snapshot"]["importance_sources"] and "_snapshot" not in tools.public_query(first, for_model=True)
+    pg.execute("UPDATE creator_importance_profiles SET manual_tier='focus' WHERE contact_id=%s", (ids[-1],))
+    pg.execute("UPDATE creator_importance_profiles SET revision=revision+1,cutoff=NOW(),evaluated_at=NOW()")
+    s.add("new-contact", at=s.start + timedelta(hours=5))
+    pages = [first]
+    while pages[-1]["next_cursor"] is not None:
+        pages.append(assistant_queries.creators(pg, s.ids["cm"], context,
+            {**args, "cursor": pages[-1]["next_cursor"]}, s.settings, snapshot=first["_snapshot"]))
+    assert len(pages) == 3 and [person for page in pages for person in page["creators"]] == expected
+    assert len({person["id"] for page in pages for person in page["creators"]}) == 62
+    assert assistant_queries.creators(pg, s.ids["cm"], context, args, s.settings)["creators"][0]["id"] == str(ids[-1])
+    for index, page in enumerate(pages):
+        page["_request"] = {"name": "query_creators", "args": {**args, "cursor": str(index * 25)}}
+        assistant_queries.validate_result(pg, s.ids["cm"], context, page, s.settings)
+    pg.execute("UPDATE assistant_turns SET checkpoint_ciphertext=%s WHERE id=%s",
+               (summary_dialogues.encode({"tool_results": pages}, s.settings), turn_id))
+    saved = summary_dialogues.decode(pg.execute("SELECT checkpoint_ciphertext FROM assistant_turns WHERE id=%s",
+                                                (turn_id,)).fetchone()["checkpoint_ciphertext"], s.settings)
+    for page in saved["tool_results"]:
+        assistant_queries.validate_result(pg, s.ids["cm"], context, page, s.settings)
+    # Legacy rows cannot use a new profile version to prove evidence they never saved.
+    legacy = {key: value for key, value in pages[0].items() if key != "_snapshot"}
+    with pytest.raises(ValueError, match="重要度"):
+        assistant_queries.validate_result(pg, s.ids["cm"], context, legacy, s.settings)
+    for sql, params in [
+        ("UPDATE contact_assignments SET ended_at=NOW() WHERE contact_id=%s", (ids[-1],)),
+        ("UPDATE contact_roles SET status='rejected' WHERE contact_id=%s", (ids[-1],)),
+        ("UPDATE lark_identities SET contact_id=NULL WHERE contact_id=%s", (ids[-1],)),
+        ("UPDATE social_accounts SET normalized_handle='alice_changed',display_handle='@alice_changed' "
+         "WHERE normalized_handle='alice'", ()),
+        ("UPDATE authorizations SET body_consent_at=NULL WHERE id=%s", (s.ids["cm"],)),
+        ("UPDATE chat_messages SET is_deleted=TRUE WHERE message_id='m1'", ()),
+    ]:
+        with pytest.raises((PermissionError, ValueError, summaries.SummaryInputError)), pg.transaction():
+            pg.execute(sql, params)
+            assistant_queries.validate_result(pg, s.ids["cm"], context, saved["tool_results"][0], s.settings)
+
+
 def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeypatch):  # noqa: F811
     s = seeded
     pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
@@ -356,7 +433,7 @@ def test_five_tools_keep_reports_private_resume_and_recheck_sources(pg, seeded, 
     assert {tool["name"] for tool in tools.TOOLS} == {
         "find_creators", "summarize_messages", "filter_events", "read_event_context", "draft_reply",
         "query_creators", "list_groups", "get_sync_status", "search_chat_history", "read_message_context",
-        "activity_stats",
+        "activity_stats", "query_unreplied_creator_events",
     }
     assert all(tool["strict"] and not tool["parameters"]["additionalProperties"] for tool in tools.TOOLS)
     found = tools.execute(pg, s.ids["cm"], turn, "find_creators", {"query": "@alice"}, s.settings, context)

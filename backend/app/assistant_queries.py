@@ -1,5 +1,6 @@
 """Scoped, read-only business facts for the operations assistant."""
 
+import json
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -58,7 +59,45 @@ def _page(kind, context, values, args, cm, now):
             "authorization": _authorization(cm)}
 
 
-def creators(conn, actor_id, context, args, settings, *, now=None):
+def _creator_facts(conn, cm, roster, ids):
+    handles = contact_handles.for_contacts(conn, ids, cm["id"])
+    assignments = creator_responsibility_matching._existing_assignments(conn, ids)
+    aliases, identities = {}, {}
+    for person in roster:
+        if person["name"]:
+            aliases.setdefault(person["contact_id"], set()).add(person["name"])
+        identities.setdefault(person["contact_id"], set()).add(
+            (person["open_id"], str(person["account_id"]), person["display_handle"]))
+    return {str(row["id"]): {"id": str(row["id"]), "name": row["display_name"] or "未命名达人",
+        "aliases": sorted(aliases.get(row["id"], [])),
+        "handles": list(dict.fromkeys(handles[row["id"]])),
+        "responsible": sorted([{"id": str(person["authorization_id"]), "name": person["name"],
+            "level": person["level"], "handle": person["handle"], "scope_label": person["scope_label"]}
+            for person in assignments.get(str(row["id"]), [])],
+            key=lambda person: (person["id"], person["level"], person["handle"] or "", person["name"])),
+        "_identities": sorted(identities.get(row["id"], []), key=str)}
+        for row in conn.execute("SELECT id,display_name FROM contacts WHERE id=ANY(%s::uuid[]) ORDER BY id",
+                                (ids,)).fetchall()}
+
+
+def _validate_creator_snapshot(conn, cm, roster, visible, snapshot):
+    if snapshot["authorization"] != _authorization(cm):
+        raise ValueError("消息授权已变化，请重新查询。")
+    ids = [UUID(person["id"]) for person in snapshot["creators"]]
+    if not set(ids) <= visible:
+        raise PermissionError("达人负责范围或身份已变化，请重新查询。")
+    facts = _creator_facts(conn, cm, roster, ids)
+    if summaries._hash(facts) != snapshot["sources"]:
+        raise ValueError("达人身份、账号或负责关系已变化，请重新查询。")
+    if conn.execute("""SELECT EXISTS(SELECT 1 FROM jsonb_to_recordset(%s::jsonb)
+        AS p(contact_id uuid,responsible_authorization_id uuid,sources jsonb)
+        CROSS JOIN LATERAL jsonb_array_elements(p.sources) s WHERE NOT ("""
+        + creator_importance._VALID_SOURCE + ")) changed",
+        (json.dumps(snapshot["importance_sources"]),)).fetchone()["changed"]:
+        raise ValueError("达人重要度的消息依据已变化，请重新查询。")
+
+
+def creators(conn, actor_id, context, args, settings, *, now=None, snapshot=None):
     now = now or datetime.now(UTC)
     cm, roster, visible = _scope(conn, actor_id, context)
     # A named lookup can change the selected person, never the allowed CM roster.
@@ -66,7 +105,6 @@ def creators(conn, actor_id, context, args, settings, *, now=None):
         **context, "scope": {**context["scope"], "creator_ids": None},
     }
     ids = _ids({}, lookup_context, visible)
-    handles = contact_handles.for_contacts(conn, ids, cm["id"])
     query = str(args.get("query") or "").strip().casefold()
     if "tiktok.com/@" in query:
         query = query.split("tiktok.com/@", 1)[1].split("?", 1)[0].split("/", 1)[0]
@@ -74,43 +112,56 @@ def creators(conn, actor_id, context, args, settings, *, now=None):
     tier = args.get("importance")
     if tier is not None and tier not in creator_importance.TIERS:
         raise ValueError("重要度筛选无效。")
+    query_scope = {"query": query, "importance": tier,
+                   "creator_ids": lookup_context["scope"].get("creator_ids")}
+    if snapshot is not None:
+        if snapshot["query"] != query_scope:
+            raise ValueError("达人查询范围已变化，请重新查询。")
+        _validate_creator_snapshot(conn, cm, roster, visible, snapshot)
+        result = _page("creators", context, snapshot["creators"], args, cm,
+                       datetime.fromisoformat(snapshot["checked_at"]))
+        result["_snapshot"] = snapshot
+        result["last_contact_definition"] = "当前授权记录中达人发言，或本人私聊／明确@／回复该达人的消息。"
+        return result
+    facts = _creator_facts(conn, cm, roster, ids)
     join, join_args = creator_importance.roster_sql(cm["id"])
     rows = conn.execute("""SELECT c.id,c.display_name,COALESCE(ip.effective_tier,'pending') tier,
-        p.cutoff,p.evaluated_at,p.revision,p.coverage->>'history_complete' history_complete,
+        p.cutoff,p.evaluated_at,p.revision,p.sources,p.coverage->>'history_complete' history_complete,
         (""" + creator_importance._PROFILE_VALID + """) source_valid
         FROM contacts c """ + join + """ LEFT JOIN creator_importance_profiles p
         ON p.contact_id=c.id AND p.responsible_authorization_id=%s
         WHERE c.id=ANY(%s::uuid[]) ORDER BY lower(c.display_name),c.id""",
         [*join_args, cm["id"], ids]).fetchall()
-    aliases = {person: sorted({row["name"] for row in roster
-                              if row["contact_id"] == person and row["name"]}) for person in ids}
     values = []
     for row in rows:
-        name = row["display_name"] or "未命名达人"
-        fields = [name.casefold(), *(value.casefold() for value in aliases[row["id"]]),
-                  *(value.lstrip("@").casefold() for value in handles[row["id"]])]
+        person = facts[str(row["id"])]
+        fields = [person["name"].casefold(), *(value.casefold() for value in person["aliases"]),
+                  *(value.lstrip("@").casefold() for value in person["handles"])]
         if (query and not any(query in value for value in fields)) or (tier and row["tier"] != tier):
             continue
-        values.append({"id": str(row["id"]), "name": name, "aliases": aliases[row["id"]],
-            "handles": list(dict.fromkeys(handles[row["id"]])), "exact_match": query in fields,
+        values.append({**{key: value for key, value in person.items() if not key.startswith("_")},
+            "exact_match": query in fields,
             "importance": {"tier": row["tier"], "tier_label": creator_importance.TIERS[row["tier"]],
                 "cutoff": _iso(row["cutoff"]), "evaluated_at": _iso(row["evaluated_at"]),
                 "history_complete": row["history_complete"] == "true",
                 "source_valid": bool(row["source_valid"]), "revision": row["revision"]}})
     values.sort(key=lambda person: (not person["exact_match"] if query else False,
         creator_importance.TIER_ORDER[person["importance"]["tier"]], person["name"].casefold(), person["id"]))
-    result = _page("creators", context, values, args, cm, now)
-    page_ids = [UUID(person["id"]) for person in result["creators"]]
-    assignments = creator_responsibility_matching._existing_assignments(conn, page_ids)
+    matched_ids = [UUID(person["id"]) for person in values]
     last = conn.execute(_ACTIVITY_SQL + """ SELECT contact_id,MAX(message_create_time) at
         FROM attributed GROUP BY contact_id""",
-        (page_ids, cm["id"], datetime.min.replace(tzinfo=UTC), now)).fetchall()
+        (matched_ids, cm["id"], datetime.min.replace(tzinfo=UTC), now)).fetchall()
     latest = {str(row["contact_id"]): _iso(row["at"]) for row in last}
-    for person in result["creators"]:
-        person["responsible"] = [{"id": str(row["authorization_id"]), "name": row["name"],
-            "level": row["level"], "handle": row["handle"], "scope_label": row["scope_label"]}
-            for row in assignments.get(person["id"], [])]
+    for person in values:
         person["last_contact_at"] = latest.get(person["id"])
+    result = _page("creators", context, values, args, cm, now)
+    matched = set(matched_ids)
+    result["_snapshot"] = {"query": query_scope, "checked_at": _iso(now),
+        "authorization": _authorization(cm), "creators": values,
+        "sources": summaries._hash({str(person): facts[str(person)] for person in matched_ids}),
+        "importance_sources": [{"contact_id": str(row["id"]), "responsible_authorization_id": str(cm["id"]),
+                                "sources": row["sources"]}
+            for row in rows if row["id"] in matched and row["source_valid"] and row["sources"]]}
     result["last_contact_definition"] = "当前授权记录中达人发言，或本人私聊／明确@／回复该达人的消息。"
     return result
 
@@ -518,6 +569,33 @@ def validate_result(conn, actor_id, context, result, settings):
         raise ValueError("查询引用无效。")
     now = datetime.fromisoformat(result["checked_at"])
     kind = result["kind"]
+    if kind == "creators":
+        if result.get("_snapshot") is not None:
+            _validate_creator_snapshot(conn, cm, _roster, _visible, result["_snapshot"])
+        else:
+            # Existing saved pages lack a snapshot; never re-sort their rows during validation.
+            ids = [UUID(person["id"]) for person in result["creators"]]
+            if not set(ids) <= _visible:
+                raise PermissionError("达人负责范围或身份已变化，请重新查询。")
+            facts = _creator_facts(conn, cm, _roster, ids)
+            keys = ("id", "name", "aliases", "handles", "responsible")
+            for person in result["creators"]:
+                previous = {key: person.get(key) for key in keys}
+                current = {key: facts[person["id"]].get(key) for key in keys}
+                previous["responsible"] = sorted(previous["responsible"], key=str)
+                current["responsible"] = sorted(current["responsible"], key=str)
+                if previous != current:
+                    raise ValueError("达人身份、账号或负责关系已变化，请重新查询。")
+            sources = conn.execute("SELECT p.contact_id,p.revision, (" + creator_importance._PROFILE_VALID
+                + ") valid FROM creator_importance_profiles p WHERE p.contact_id=ANY(%s::uuid[]) "
+                "AND p.responsible_authorization_id=%s", (ids, cm["id"])).fetchall()
+            valid = {str(row["contact_id"]): row for row in sources}
+            if any(person["importance"]["source_valid"] and (
+                    not valid.get(person["id"], {}).get("valid")
+                    or valid[person["id"]]["revision"] != person["importance"].get("revision"))
+                   for person in result["creators"]):
+                raise ValueError("达人重要度的消息依据已变化，请重新查询。")
+        return
     legacy_activity = kind == "activity" and "audience" not in result
     args = {**request["args"], "audience": "creators"} if legacy_activity else request["args"]
     fresh = function(conn, actor_id, context, args, settings, now=now)
@@ -542,9 +620,6 @@ def validate_result(conn, actor_id, context, result, settings):
                 if kind == "groups":
                     for key in ("visibility_checked_at", "membership_checked_at", "purpose_updated_at"):
                         item.pop(key, None)
-                else:
-                    item["importance"] = {key: field for key, field in item["importance"].items()
-                                          if key not in {"tier", "tier_label"}}
             return output
         previous, current = stable(result), stable(fresh)
     if previous != current:

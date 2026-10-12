@@ -105,8 +105,9 @@ def create_router(*, current_authorization, csrf_token):
             value = first
             idle = 0
             while not await request.is_disconnected():
-                if value.get("error_code") == "permission":
-                    yield event("error", {"message": "授权或查询范围已变化，请重新打开助手。", "clear": True})
+                if value.get("error_code") in {"permission", "source_changed"}:
+                    code = value["error_code"]
+                    yield event("error", {"message": assistant.ERRORS[code], "code": code, "clear": True})
                     yield event("done", {"turn_id": str(turn_id), "status": "failed"})
                     return
                 scope = value.get("scope") or (value.get("result") or {}).get("scope")

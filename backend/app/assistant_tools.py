@@ -8,8 +8,9 @@ import json
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from . import assistant_queries, assistant_search, summary_replies
+from . import assistant_queries, assistant_search, creator_importance, summary_replies
 from . import offhours_summary as summaries
+from . import summary_dialogues as codec
 
 
 def _function(name, description, properties):
@@ -30,6 +31,11 @@ def _choice(values):
 TOOLS = [
     _function("find_creators", "按姓名或 TikTok handle 查找当前可见的正式达人；返回稳定编号与负责人。",
               {"query": _STRING}),
+    _function("query_unreplied_creator_events", "查询时段内负责达人的未回复事项。默认覆盖当前CM全部正式负责达人，"
+              "页面明确选择了达人时仅查询该选择。后端完整处理并按达人重要度优先排序，常规达人仍保留。"
+              "不要先query_creators挑几位重点达人。返回总量及最多25项预览，完整结果由系统展示；"
+              "口径是已抽取事项中未见CM/AM回复，不等于未解决，也不是逐条消息的绝对未回复证明。",
+              {"start": _STRING, "end": _STRING}),
     _function("summarize_messages", "总结指定时段聊天。默认audience=all读取当前CM全部授权消息，不要求联系人是达人。"
               "仅用户明确要求达人时用creators；此模式复用达人事件报告。all按页返回原消息，必须继续cursor至空后总结，"
               "未读完只能给部分总结。时间用带时区ISO8601；chat_ids=null全会话、creator_ids=null不指定某达人。",
@@ -37,6 +43,8 @@ TOOLS = [
                "creator_ids": _IDS, "chat_ids": _IDS, "cursor": _NULL_STRING}),
     _function("filter_events", "筛选已有报告，计数与分页，不重新分析聊天。主题只检索事件，不检索全部历史。",
               {"result_id": _STRING, "creator_ids": _IDS, "priority": _choice(["P0", "P1", "P2", "P3"]),
+               "importance": {**_choice(list(creator_importance.TIERS)),
+                   "description": "仅用户明确只看某级达人时筛选；重要达人优先展示不是筛选，使用null。"},
                "reply_status": _choice(["replied", "unreplied"]),
                "handling_status": _choice(["resolved", "unresolved", "uncertain", "not_required"]),
                "topic": _NULL_STRING, "cursor": _NULL_STRING}),
@@ -78,6 +86,10 @@ _QUERIES = {"query_creators": assistant_queries.creators, "list_groups": assista
             "get_sync_status": assistant_queries.sync_status, "activity_stats": assistant_queries.activity,
             "search_chat_history": assistant_search.query, "read_message_context": assistant_search.read,
             "summarize_messages": assistant_search.window_messages}
+
+
+class SourceChangedError(ValueError):
+    """Previously read business evidence is no longer valid, not malformed AI output."""
 
 
 def _validate(name, args):
@@ -294,7 +306,24 @@ def _query(conn, actor_id, turn, name, args, settings, context, visible):
             for message in result["messages"]]
         result["message"] = next(message for message in result["messages"] if message.get("message_ref"))
     else:
-        result = _QUERIES[name](conn, actor_id, context, args, settings)
+        snapshot = None
+        if name == "query_creators":
+            checkpoint = summaries._cipher(settings.token_encryption_key).decrypt(turn["checkpoint_ciphertext"]) \
+                if turn.get("checkpoint_ciphertext") else None
+            previous = json.loads(checkpoint).get("tool_results", []) if checkpoint else []
+            if context["scope"].get("query_ref"):
+                previous.append(_saved_query(conn, actor_id, context["scope"]["query_ref"], settings))
+            for page in reversed(previous):
+                request = page.get("_request", {})
+                if (page.get("scope", {}).get("cm_id") == context["scope"]["cm_id"]
+                        and request.get("name") == name
+                        and {key: value for key, value in request.get("args", {}).items() if key != "cursor"}
+                        == {key: value for key, value in args.items() if key != "cursor"}):
+                    snapshot = page.get("_snapshot")
+                    if snapshot is not None:
+                        break
+        result = (_QUERIES[name](conn, actor_id, context, args, settings, snapshot=snapshot)
+                  if name == "query_creators" else _QUERIES[name](conn, actor_id, context, args, settings))
     if name == "query_creators" and args["query"] and result["total"] == 1:
         result["scope"] = {**context["scope"], "creator_ids": [person["id"] for person in result["creators"]],
                            "creator_names": [person["name"] for person in result["creators"]]}
@@ -441,7 +470,16 @@ def _read_results(conn, actor_id, run_ids, settings, context):
         for event in view["events"]:
             card = _card(event, versions[event["id"].split(":")[0]])
             card["window"] = view["window"]
+            card["conversations"] = list({e["chat_id"]: {"chat_id": e["chat_id"],
+                "name": e.get("chat_name") or card["creator_name"] or "未命名会话"}
+                for e in event.get("evidence", [])}.values())
             events.append(card)
+    chat_ids = list({chat["chat_id"] for event in events for chat in event["conversations"]})
+    modes = {row["chat_id"]: row["chat_mode"] for row in conn.execute(
+        "SELECT chat_id,chat_mode FROM chats WHERE chat_id=ANY(%s::text[])", (chat_ids,)).fetchall()}
+    for event in events:
+        for chat in event["conversations"]:
+            chat["type"] = "private" if modes.get(chat["chat_id"]) == "p2p" else "group"
     events.sort(key=lambda event: ({"P0": 0, "P1": 1, "P2": 2, None: 3, "P3": 4}[event["priority"]],
                                    event["window"]["start"], event["event_ref"]))
     coverage = {key: sum(view.get("coverage", {}).get(key, 0) for view in views)
@@ -455,6 +493,8 @@ def _read_results(conn, actor_id, run_ids, settings, context):
             FROM offhours_summary_tasks t JOIN chats c ON c.chat_id=t.chat_id
             WHERE t.run_id=ANY(%s::uuid[]) AND t.is_current""", ([UUID(str(value)) for value in run_ids],)).fetchone()
         coverage.update(chats)
+    coverage["analysis_complete"] = all(view["run"]["status"] == "completed" for view in views)
+    coverage["source_complete"] = coverage["analysis_complete"] and not gaps
     return {
         "result_id": _result_ref(run_ids), "events": events, "total": len(events), "pending": pending,
         "scope": report_scope, "window": {"start": views[0]["window"]["start"],
@@ -465,7 +505,53 @@ def _read_results(conn, actor_id, run_ids, settings, context):
     }
 
 
+def _unreplied_result(conn, actor_id, turn, result, snapshot, settings, context):
+    assistant_queries.creators(conn, actor_id, context,
+        {"query": None, "importance": None, "cursor": None}, settings, snapshot=snapshot)
+    people = {person["id"]: person for person in snapshot["creators"]}
+    events = []
+    for event in result["events"]:
+        if event["reply_status"] == "unreplied":
+            if event["contact_id"] not in people:
+                raise SourceChangedError("达人负责范围已变化。")
+            events.append({**event, "importance": people[event["contact_id"]]["importance"]})
+    events.sort(key=lambda event: (creator_importance.TIER_ORDER[event["importance"]["tier"]],
+        {"P0": 0, "P1": 1, "P2": 2, None: 3, "P3": 4}[event["priority"]],
+        event["window"]["start"], event["event_ref"]))
+    return {**result, "events": events[:25], "total": len(events), "next_cursor": None,
+        "scope": {**result["scope"], "creator_ids": context["scope"].get("creator_ids")},
+        "coverage": {**result["coverage"], "responsible_creators": len(people),
+            "matched_events": len(events), "preview_count": min(25, len(events))},
+        "definition": "当前负责范围内，已抽取事项中未见CM/AM回复；未回复与未解决分别判断。",
+        "_assistant_turn_id": str(turn["id"]), "_creator_snapshot": snapshot,
+        "_unreplied_event_refs": [event["event_ref"] for event in events]}
+
+
+def _named_selection(conn, turn, settings, context, ids):
+    selected = set(context["scope"].get("creator_ids") or [])
+    if context["scope"].get("event_ref"):
+        task_id, _index, _version = _event_parts(context["scope"]["event_ref"])
+        task = conn.execute("SELECT contact_id FROM offhours_summary_tasks WHERE id=%s", (task_id,)).fetchone()
+        if task:
+            selected.add(str(task["contact_id"]))
+    if set(ids) <= selected:
+        return True
+    checkpoint = json.loads(summaries._cipher(settings.token_encryption_key).decrypt(
+        turn["checkpoint_ciphertext"])) if turn.get("checkpoint_ciphertext") else {}
+    question = json.loads(summaries._cipher(settings.token_encryption_key).decrypt(
+        turn["input_ciphertext"]))["message"].casefold()
+    for result in checkpoint.get("tool_results", []):
+        request = result.get("_request", {})
+        query = (request.get("args", {}).get("query") or "").strip()
+        if (request.get("name") == "query_creators" and query and query.casefold() in question
+                and result.get("scope", {}).get("cm_id") == context["scope"]["cm_id"]):
+            selected.update(person["id"] for person in result.get("creators", []) if person.get("exact_match"))
+    return set(ids) <= selected
+
+
 def execute(conn, actor_id, turn, name, args, settings, context):
+    if name == "filter_events":
+        args = {"importance": None, **args}
     _validate(name, args)
     cm, roster, visible = _scope(conn, actor_id, context)
     if name in _QUERIES and not (name == "summarize_messages" and args["audience"] == "creators"):
@@ -473,17 +559,36 @@ def execute(conn, actor_id, turn, name, args, settings, context):
     if name == "find_creators":
         return _query(conn, actor_id, turn, "query_creators",
                       {"query": args["query"], "importance": None, "cursor": None}, settings, context, visible)
-    if name == "summarize_messages":
+    if name in {"summarize_messages", "query_unreplied_creator_events"}:
         context = {**context, "scope": {**context["scope"], "audience": "creators"}}
-        if args["chat_ids"] is not None or context["scope"].get("chat_ids") is not None:
+        unreplied = name == "query_unreplied_creator_events"
+        if args.get("chat_ids") is not None or context["scope"].get("chat_ids") is not None:
             return {"error": "事件总结目前按达人范围处理，不支持仅指定群。"
                     "请用audience=all总结或检索这个群，或改为达人范围。"}
-        if args["cursor"] is not None:
+        if args.get("cursor") is not None:
             return {"error": "达人事件报告请使用filter_events分页。"}
-        ids = _creator_ids(args["creator_ids"], visible)
+        ids = _creator_ids(args.get("creator_ids"), visible)
+        if (ids is not None and set(ids) != visible
+                and not _named_selection(conn, turn, settings, context, ids)):
+            return {"error": "用户未明确选择这些达人，不能从名单自行挑人缩小总结范围。"
+                    "查询负责达人的未回复事项请用query_unreplied_creator_events；"
+                    "其他总结用creator_ids=null，按重要度筛选可在完整报告后执行。",
+                    "error_code": "creator_selection_not_requested"}
         if ids is None:
             ids = context["scope"].get("creator_ids")
         start, end = _window(args["start"], args["end"], turn["created_at"])
+        snapshot = None
+        if unreplied:
+            snapshot = assistant_queries.creators(conn, actor_id, context,
+                {"query": None, "importance": None, "cursor": None}, settings)["_snapshot"]
+            ids = [person["id"] for person in snapshot["creators"]]
+            if not ids:
+                return _unreplied_result(conn, actor_id, turn, {"events": [], "total": 0,
+                    "pending": False, "scope": context["scope"], "gaps": [],
+                    "window": {"start": start.isoformat(), "end": end.isoformat(), "timezone": summaries.TIMEZONE},
+                    "coverage": {"analysis_complete": True, "source_complete": True,
+                                 "confirmed_creators": 0, "messages": 0, "conversations": 0}},
+                    snapshot, settings, context)
         run_ids = []
         while start < end:
             stop = min(start + timedelta(days=7),
@@ -496,13 +601,38 @@ def execute(conn, actor_id, turn, name, args, settings, context):
             start = stop
         result = _read_results(conn, actor_id, run_ids, settings, context)
         if result["pending"]:
-            return {"waiting": {"kind": "summary", "ids": [str(value) for value in run_ids]},
+            wait = {"kind": "summary", "ids": [str(value) for value in run_ids]}
+            if unreplied:
+                wait.update(purpose="unreplied_creators", creator_snapshot=snapshot)
+            return {"waiting": wait,
                     "scope": result["scope"], "window": result["window"]}
+        if unreplied:
+            return _unreplied_result(conn, actor_id, turn, result, snapshot, settings, context)
         return _page(result, 0)
     if name == "filter_events":
         ids = _creator_ids(args["creator_ids"], visible)
+        if ids is not None and set(ids) != visible and not _named_selection(conn, turn, settings, context, ids):
+            return {"error": "用户未明确选择这些达人，不能自行缩小筛选范围；"
+                    "重要度优先只排序，明确只看某级时使用importance。",
+                    "error_code": "creator_selection_not_requested"}
         result = _read_results(conn, actor_id, _run_ids(args["result_id"]), settings, context)
         events = result["events"]
+        saved = codec.decode(turn.get("checkpoint_ciphertext"), settings) or {}
+        original = next((value for value in reversed(saved.get("tool_results", []))
+            if value.get("result_id") == result["result_id"]
+            and "_unreplied_event_refs" in value and not value.get("_event_filter")), None)
+        if original:
+            order = {ref: index for index, ref in enumerate(original["_unreplied_event_refs"])}
+            events = [event for event in events if event["event_ref"] in order]
+            events.sort(key=lambda event: order[event["event_ref"]])
+        if args["importance"] is not None:
+            if original:
+                tiers = {person["id"]: creator_importance.TIER_ORDER[person["importance"]["tier"]]
+                         for person in original["_creator_snapshot"]["creators"]}
+            else:
+                tiers = creator_importance.tier_order(conn, [event["contact_id"] for event in events], cm["id"])
+            events = [event for event in events if tiers.get(event["contact_id"])
+                      == creator_importance.TIER_ORDER[args["importance"]]]
         for field in ("priority", "reply_status", "handling_status"):
             if args[field] is not None:
                 events = [event for event in events if event[field] == args[field]]
@@ -513,6 +643,13 @@ def execute(conn, actor_id, turn, name, args, settings, context):
             events = [event for event in events if topic in " ".join(str(event[field] or "")
                 for field in ("title", "summary", "latest_progress", "conversation_name")).casefold()]
         result.update(events=events, total=len(events))
+        if original:
+            result.update(_assistant_turn_id=str(turn["id"]),
+                _event_filter=True,
+                _unreplied_event_refs=[event["event_ref"] for event in events],
+                _creator_snapshot=original["_creator_snapshot"], scope=original["scope"],
+                coverage={**result["coverage"], "responsible_creators": original["coverage"]["responsible_creators"],
+                          "matched_events": len(events), "preview_count": min(25, len(events))})
         try:
             cursor = int(args["cursor"] or 0)
             if cursor < 0:
@@ -558,7 +695,11 @@ def resume_wait(conn, actor_id, turn, waiting, settings, context):
     _scope(conn, actor_id, context)
     if waiting["kind"] == "summary":
         result = _read_results(conn, actor_id, [UUID(value) for value in waiting["ids"]], settings, context)
-        return None if result["pending"] else _page(result, 0)
+        if result["pending"]:
+            return None
+        if waiting.get("purpose") == "unreplied_creators":
+            return _unreplied_result(conn, actor_id, turn, result, waiting["creator_snapshot"], settings, context)
+        return _page(result, 0)
     if waiting["kind"] != "reply" or len(waiting["ids"]) != 1:
         raise ValueError("等待任务无效。")
     _event_id(conn, actor_id, waiting["event_ref"], settings, context)
@@ -599,6 +740,13 @@ def _audit_context(conn, actor_id, event_id, mode, count):
 
 
 def validate_tool_results(conn, actor_id, turn, results, settings, context):
+    try:
+        return _validate_tool_results(conn, actor_id, turn, results, settings, context)
+    except ValueError as exc:
+        raise SourceChangedError(str(exc)) from exc
+
+
+def _validate_tool_results(conn, actor_id, turn, results, settings, context):
     """Recheck all reused source text before it goes into another paid request."""
     cm, roster, _visible = _scope(conn, actor_id, context)
     people, views, cards, drafts = {}, {}, {}, {}
@@ -632,6 +780,10 @@ def validate_tool_results(conn, actor_id, turn, results, settings, context):
         if result.get("query_ref"):
             _validate_query(conn, actor_id, context, result, settings)
             continue
+        if result.get("_creator_snapshot"):
+            assistant_queries.creators(conn, actor_id, context,
+                {"query": None, "importance": None, "cursor": None}, settings,
+                snapshot=result["_creator_snapshot"])
         for person in result.get("creators", []):
             current = people.get(person["id"])
             if (not current or current["name"] != person["name"]
@@ -671,6 +823,7 @@ def build_result(conn, actor_id, turn, final, settings, context, tool_results):
         if result.get("result_id"):
             known_results.add(result["result_id"])
         known_events.update(event["event_ref"] for event in result.get("events", []))
+        known_events.update(result.get("_unreplied_event_refs", []))
         if result.get("event_ref"):
             known_events.add(result["event_ref"])
         if result.get("draft_ref"):
@@ -688,8 +841,24 @@ def build_result(conn, actor_id, turn, final, settings, context, tool_results):
             or not isinstance(data_refs, list) or not all(isinstance(ref, str) for ref in data_refs)
             or not set(data_refs) <= data.keys()):
         raise ValueError("回答引用未取得的资料。")
+    current = list({result.get("result_id", "empty"): result for result in tool_results
+               if result.get("_assistant_turn_id") == str(turn["id"])
+               and "_unreplied_event_refs" in result}.values())
+    if current:
+        refs = list(dict.fromkeys([*refs, *(result["result_id"] for result in current if result.get("result_id"))]))
+        controlled = {event["event_ref"] for result in current if result.get("result_id")
+                      for event in validated["views"][result["result_id"]]["events"]}
+        selected = {ref for result in current for ref in result["_unreplied_event_refs"]}
+        event_refs = list(dict.fromkeys([*(ref for result in current for ref in result["_unreplied_event_refs"]),
+                                       *(ref for ref in event_refs if ref not in controlled or ref in selected)]))
     views = [validated["views"][ref] for ref in dict.fromkeys(refs)]
     cards = validated["cards"]
+    for result in current:
+        people = {person["id"]: person for person in result["_creator_snapshot"]["creators"]}
+        for ref in result["_unreplied_event_refs"]:
+            if ref not in cards or cards[ref]["contact_id"] not in people:
+                raise SourceChangedError("未回复事项的材料已变化。")
+            cards[ref] = {**cards[ref], "importance": people[cards[ref]["contact_id"]]["importance"]}
     draft = None
     if draft_ref:
         reply = validated["drafts"][draft_ref]
@@ -707,14 +876,22 @@ def build_result(conn, actor_id, turn, final, settings, context, tool_results):
         result_scope = message_data[-1].get("scope", result_scope)
     elif data_refs and not (views or event_refs or draft_ref):
         result_scope = data[data_refs[-1]].get("scope", result_scope)
-    return {"turn_id": str(turn["id"]), "status": "completed", "answer": final["answer"],
+    coverage = views[-1]["coverage"] if views else {}
+    answer = final["answer"]
+    if current:
+        result_scope = current[-1]["scope"]
+        coverage = current[-1]["coverage"]
+        if not coverage.get("source_complete"):
+            answer += "\n\n来源覆盖不完整，未检出不代表没有未回复事项。"
+    return {"turn_id": str(turn["id"]), "status": "completed", "answer": answer,
             "data_refs": list(dict.fromkeys(data_refs)),
             "data": [public_query(data[ref]) for ref in dict.fromkeys(data_refs)],
             "result_refs": list(dict.fromkeys(refs)), "event_refs": list(dict.fromkeys(event_refs)),
             "events": [cards[ref] for ref in dict.fromkeys(event_refs)],
             "scope": result_scope,
-            "window": views[-1]["window"] if views else cards[event_refs[0]]["window"] if event_refs else None,
-            "coverage": views[-1]["coverage"] if views else {},
+            "window": current[-1]["window"] if current else views[-1]["window"] if views else
+                cards[event_refs[0]]["window"] if event_refs else None,
+            "coverage": coverage,
             "gaps": list(dict.fromkeys([gap for view in views for gap in view["gaps"]]
                 + [gap for result in tool_results if result.get("event_ref") in event_refs
                    for gap in result.get("gaps", result.get("sync_gaps", []))])), "draft": draft,
