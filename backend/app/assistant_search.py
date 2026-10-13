@@ -346,6 +346,8 @@ def validate_result(conn, actor_id, context, result, settings, *, history_only=F
                      read_cache=read_cache)
         if "audience" not in result.get("scope", {}):
             fresh["scope"].pop("audience", None)
+        if "cm_name" not in result.get("scope", {}):
+            fresh["scope"].pop("cm_name", None)
         fields = ("message", "messages", "window", "scope")
         def stable(value):
             output = {key: value.get(key) for key in fields}
@@ -491,7 +493,8 @@ def read(conn, actor_id, context, args, settings, *, cutoff=None, read_cache=Non
             gaps.append({"reason": "上下文正文不可读取或超过展示长度", "message_id": row["message_id"]})
     sources, sync_gaps = _coverage(chats, start, read_end)
     result = {"kind": "message_context", "message_ref": ref, "evidence_ref": ref,
-            "scope": {"cm_id": str(cm["id"]), "creator_ids": _selected, "chat_ids": [chat["chat_id"]],
+            "scope": {"cm_id": str(cm["id"]), "cm_name": cm["display_name"] or "CM",
+                      "creator_ids": _selected, "chat_ids": [chat["chat_id"]],
                       "audience": audience},
             "message": next(message for message in messages if message["relation"] == "matched"),
             "messages": messages, "gaps": [*gaps, *sync_gaps], "sync_gaps": sync_gaps, "sources": sources,

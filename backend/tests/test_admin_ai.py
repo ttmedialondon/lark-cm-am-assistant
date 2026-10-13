@@ -1,6 +1,8 @@
+import json
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlencode
 from uuid import uuid4
 
 import pytest
@@ -9,7 +11,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.testclient import TestClient
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from app import admin, admin_permissions, admin_reporting, ai_feature_config
+from app import admin, admin_permissions, admin_reporting, ai_feature_config, assistant_rules
 from app import creator_handle_matching_routes as matching_routes
 
 
@@ -256,6 +258,80 @@ def test_summary_csrf_failure_does_not_save_or_schedule(monkeypatch):
         "csrf_token": "wrong", "feature": "offhours_summary", "enabled": "1",
     })
     assert response.status_code == 400
+
+
+def test_rule_form_rejects_bad_csrf_duplicate_and_oversized_input_before_storage(monkeypatch):
+    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _: "owner")
+    monkeypatch.setattr(admin, "connection", lambda: pytest.fail("invalid form must not reach storage"))
+    client = _client(lambda _: {"id": uuid4(), "status": "active"})
+    form = {"csrf_token": "csrf", "document": "core", "revision": "0", "content": "test"}
+    for body in (urlencode({**form, "csrf_token": "wrong"}), urlencode(form) + "&revision=0",
+                 urlencode({**form, "content": "四" * (assistant_rules.MAX_DOCUMENT_CHARS * 2)})):
+        assert client.post("/admin/assistant-rules", content=body,
+                           headers={"content-type": "application/x-www-form-urlencoded"}).status_code == 400
+
+
+def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocation(pg, monkeypatch):
+    owner, member = uuid4(), uuid4()
+    for actor in (owner, member):
+        pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,%s,'test')",
+                   (actor, "ou_" + actor.hex))
+    pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (owner,))
+    pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission,granted_by) VALUES(%s,'ai',%s)",
+               (member, owner))
+    settings = SimpleNamespace(token_encryption_key=b"k" * 32)
+    monkeypatch.setattr(admin, "connection", lambda: nullcontext(pg))
+    monkeypatch.setattr(admin_permissions, "connection", lambda: nullcontext(pg))
+    monkeypatch.setattr(admin_permissions, "access_for",
+                        lambda actor: admin_permissions.users_access_data([actor])[actor])
+    monkeypatch.setattr(admin, "get_settings", lambda: settings)
+    session = {"auth": {"id": owner, "status": "active"}}
+    templates = Environment(loader=FileSystemLoader(Path(admin.__file__).parent / "templates"),
+                            autoescape=select_autoescape(["html"]))
+    app = FastAPI()
+    app.include_router(admin.create_admin_router(
+        current_authorization=lambda _: session["auth"], csrf_token=lambda _: "csrf",
+        render_template=lambda request, name, context, status_code=200: HTMLResponse(
+            templates.get_template(name).render(**context), status_code=status_code),
+    ))
+    client, path = TestClient(app), "/admin/assistant-rules"
+    pinned = assistant_rules.snapshot(pg, settings)
+    assert pinned == assistant_rules.builtin_snapshot()
+    for key, document in pinned["documents"].items():
+        assistant_rules.validate(key, document["text"])
+    assert "previous_week_same_time_end" in assistant_rules.main_instructions(pinned)
+    assert "text_part" in assistant_rules.summary_instructions(pinned)
+    page = client.get(path)
+    assert page.status_code == 200 and 'name="revision" value="0"' in page.text
+    content = pinned["documents"]["core"]["text"].replace(
+        "## 主对话\n", "## 主对话\n测试 <script>alert(1)</script>。\n")
+    form = {"csrf_token": "csrf", "document": "core", "revision": "0", "content": content.replace("\n", "\r\n")}
+    assert client.post(path, data={**form, "csrf_token": "wrong"}).status_code == 400
+    assert pg.execute("SELECT count(*) n FROM assistant_rule_overrides").fetchone()["n"] == 0
+    saved = client.post(path, data=form, follow_redirects=False)
+    assert saved.status_code == 303 and saved.headers["location"] == path + "?document=core&saved=core"
+    row = pg.execute("SELECT * FROM assistant_rule_overrides").fetchone()
+    assert row["revision"] == 1 and row["updated_by_authorization_id"] == owner
+    assert content not in row["content_ciphertext"]
+    current = assistant_rules.snapshot(pg, settings)
+    assert current["documents"]["core"]["text"] == content and current["digest"] != pinned["digest"]
+    assert pinned == assistant_rules.builtin_snapshot()  # Saving never mutates an existing turn's snapshot.
+    conflict = client.post(path, data={**form, "content": content + "\n未保存修改。"})
+    assert conflict.status_code == 409 and "未保存修改。" in conflict.text and "当前已保存版本" in conflict.text
+    assert "<script>" not in conflict.text and "&lt;script&gt;" in conflict.text
+    assert pg.execute("SELECT revision FROM assistant_rule_overrides").fetchone()["revision"] == 1
+    for invalid in ("", content.replace("## 分段归纳\n", ""), "x" * (assistant_rules.MAX_DOCUMENT_CHARS + 1)):
+        assert client.post(path, data={**form, "revision": "1", "content": invalid}).status_code == 400
+    audit = pg.execute("SELECT metadata FROM audit_events WHERE action='assistant_rule_updated'").fetchone()["metadata"]
+    assert audit["revision"] == 1 and "content" not in audit and "测试" not in json.dumps(audit, ensure_ascii=False)
+    session["auth"] = {"id": member, "status": "active"}
+    assert client.get(path).status_code == 403 and client.post(path, data=form).status_code == 403
+    session["auth"] = {"id": owner, "status": "active"}
+    pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (owner,))
+    assert client.get(path).status_code == 403 and client.post(path, data=form).status_code == 403
+    with pg.transaction(), pytest.raises(PermissionError):
+        assistant_rules.save_override(pg, settings, owner, "core", content, 1)
+    assert pg.execute("SELECT revision FROM assistant_rule_overrides").fetchone()["revision"] == 1
 
 
 @pytest.mark.parametrize("feature", [

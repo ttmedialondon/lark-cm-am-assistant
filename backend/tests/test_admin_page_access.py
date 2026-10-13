@@ -34,11 +34,11 @@ GET_ROUTES = (
     ("ai", "/admin/ai"),
     ("jobs", "/admin/jobs"),
 )
-PRIVATE_ROUTES = ()
+PRIVATE_ROUTES = ("/admin/assistant-rules",)
 POST_ROUTES = (
     f"/admin/users/{TARGET}/permissions",
     "/admin/contacts/ou_contact/organization",
-    "/admin/ai", "/admin/ai/resume",
+    "/admin/ai", "/admin/ai/resume", "/admin/assistant-rules",
 )
 
 
@@ -145,7 +145,7 @@ def test_revocation_applies_to_the_next_request_in_the_same_session(monkeypatch,
 @pytest.mark.parametrize("owner", [False, True])
 def test_inactive_authorization_has_no_backend_access(monkeypatch, data_fence, owner):
     browser, _, _ = _client(monkeypatch, permissions=PAGES, owner=owner, status="revoked")
-    for _, path in GET_ROUTES:
+    for path in [path for _, path in GET_ROUTES] + list(PRIVATE_ROUTES):
         assert browser.get(path, follow_redirects=False).status_code == 403
 
 
@@ -174,8 +174,10 @@ def test_owner_navigation_exposes_every_page():
         active_page="users",
     )
     backend_links = {link for link in re.findall(r'href="([^"]+)"', html) if link.startswith("/admin")}
-    assert backend_links == {page["path"] for page in admin_permissions.PAGES if page["path"].startswith("/admin")}
-    assert _page_menu_targets(html) == list(dict.fromkeys(page["path"] for page in admin_permissions.PAGES))
+    assert backend_links == {page["path"] for page in admin_permissions.PAGES
+                             if page["path"].startswith("/admin")} | {"/admin/assistant-rules"}
+    assert _page_menu_targets(html) == list(dict.fromkeys(page["path"] for page in admin_permissions.PAGES)) + [
+        "/admin/assistant-rules"]
     _assert_no_navigation_role_labels(html)
 
 

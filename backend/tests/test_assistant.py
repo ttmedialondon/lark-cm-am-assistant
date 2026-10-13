@@ -9,7 +9,7 @@ import pytest
 from test_offhours_summary import finish_merges, sample_event
 from test_offhours_summary import seeded as seeded  # noqa: F401
 
-from app import assistant, assistant_search, assistant_window, config, openai_client, summary_dialogues
+from app import assistant, assistant_rules, assistant_search, assistant_window, config, openai_client, summary_dialogues
 from app import offhours_summary as summaries
 from app.ai_feature_config import api_key_cipher
 
@@ -81,6 +81,9 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
         assert kwargs['max_output_tokens'] == (16000 if not kwargs['tools'] else 8000)
         if not kwargs['tools']:
             segment = json.loads(items[0]['content'])
+            assert segment['task']['question'] == '总结全部授权聊天'
+            assert segment['task']['scope']['cm_id'] == str(chat.ids['cm'])
+            assert segment['task']['window']['start'] == chat.start.isoformat()
             assert len(assistant_window.encoded(segment)) <= assistant_window.INPUT_CHARS + 20
             messages = [message for conversation in segment.get('conversations', [])
                         for message in conversation['messages']]
@@ -705,6 +708,7 @@ def test_model_first_lookup_replay_history_and_actor_isolation(pg, chat, monkeyp
         calls.append(items.copy())
         assert cfg['model'] == 'gpt-6-luna' and key == 'fixture-only-key' and actor == chat.ids['cm']
         assert kwargs['tools'] == assistant.tools.TOOLS
+        assert 'OWNER_RULE_SNAPSHOT_MARKER' not in kwargs['instructions']
         if not any(item.get('type') == 'function_call_output' for item in items):
             output = [{'type': 'reasoning', 'id': 'rs_fixture', 'encrypted_content': 'encrypted-reasoning'},
                       {'type': 'function_call', 'call_id': 'find_fixture', 'name': 'find_creators',
@@ -720,6 +724,11 @@ def test_model_first_lookup_replay_history_and_actor_isolation(pg, chat, monkeyp
     submitted = payload()
     turn = assistant.submit(pg, chat.ids['cm'], submitted, chat.settings)
     assert turn['status'] == 'queued' and calls == []
+    pinned = summary_dialogues.decode(assistant._turn(pg, chat.ids['cm'], turn['id'])[
+        'checkpoint_ciphertext'], chat.settings)['rules']
+    assistant_rules.save_override(pg, chat.settings, chat.ids['owner'], 'answer',
+        assistant_rules.default_text('answer') + '\nOWNER_RULE_SNAPSHOT_MARKER\n', 0)
+    assert assistant_rules.snapshot(pg, chat.settings)['digest'] != pinned['digest']
     assert assistant.submit(pg, chat.ids['cm'], submitted, chat.settings)['id'] == turn['id']
     with pytest.raises(LookupError):
         assistant.session_view(pg, chat.ids['reviewer'], submitted['session_id'], chat.settings)
@@ -748,6 +757,10 @@ def test_model_first_lookup_replay_history_and_actor_isolation(pg, chat, monkeyp
                  for table in ('chat_messages', 'contacts', 'contact_assignments',
                                'authorization_message_observations')}
     other = assistant.submit(pg, chat.ids['reviewer'], payload('Other actor question'), chat.settings)
+    new_rules = summary_dialogues.decode(assistant._turn(pg, chat.ids['reviewer'], other['id'])[
+        'checkpoint_ciphertext'], chat.settings)['rules']
+    assert new_rules['documents']['answer']['revision'] == 1
+    assert 'OWNER_RULE_SNAPSHOT_MARKER' in assistant_rules.main_instructions(new_rules)
     assert assistant.clear_conversations(pg, chat.ids['cm'], chat.settings) == {'sessions': 1, 'turns': 1}
     assert assistant.session_view(pg, chat.ids['cm'], submitted['session_id'], chat.settings)['turns'] == []
     with pytest.raises(LookupError):
@@ -783,6 +796,72 @@ def test_model_first_lookup_replay_history_and_actor_isolation(pg, chat, monkeyp
         assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
 
 
+def test_owner_multi_person_loop_preserves_sources_and_revocation_boundary(pg, chat, monkeypatch):
+    other_id = chat.ids['reviewer']
+    pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,p2p_counterpart_open_id,
+        backfill_complete,backfill_window_start_at,last_incremental_at,sync_status)
+        VALUES(%s,'chat','ou_person',TRUE,%s,%s,'succeeded')""",
+        (other_id, chat.start - timedelta(days=9), chat.end))
+    pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+        SELECT %s,chat_id,message_id FROM chat_messages WHERE chat_id='chat'""", (other_id,))
+    question = '比较 cm 和 reviewer 的样品消息并列出来源'
+    calls = []
+
+    def model(_cfg, _key, items, actor, **kwargs):
+        calls.append(True)
+        assert actor == chat.ids['owner']
+        tool_map = {tool['name']: tool for tool in kwargs['tools']}
+        assert 'resolve_staff' in tool_map and 'cm_id' in tool_map['summarize_messages']['parameters']['properties']
+        output = [json.loads(item['output']) for item in items if item.get('type') == 'function_call_output']
+        if not output:
+            return {'text': '', 'output': [{'type': 'function_call', 'name': 'summarize_messages',
+                'call_id': str(cm_id), 'arguments': json.dumps({'cm_id': str(cm_id), 'audience': 'all',
+                    'start': chat.start.isoformat(), 'end': chat.end.isoformat(),
+                    'creator_ids': None, 'chat_ids': None, 'cursor': None})}
+                for cm_id in (chat.ids['cm'], other_id)], 'usage': {}}
+        assert len(output) == 2 and {item['scope']['cm_id'] for item in output} == {
+            str(chat.ids['cm']), str(other_id)}
+        refs = [message['message_ref'] for item in output for message in item['messages']
+                if message['message_id'] == 'm1']
+        final = {'answer': '样品询问已整理。', 'sections': [{'title': '样品', 'summary': '达人询问样品。',
+            'message_refs': refs}], 'event_refs': [], 'result_refs': [],
+            'data_refs': [item['query_ref'] for item in output], 'draft_ref': None}
+        return {'text': json.dumps(final), 'output': [], 'usage': {}}
+
+    monkeypatch.setattr(openai_client, 'call_openai_tools', model)
+    turn = assistant.submit(pg, chat.ids['owner'], payload(question), chat.settings)
+    for _ in range(8):
+        finish(chat)
+        if assistant.turn_view(pg, chat.ids['owner'], turn['id'], chat.settings)['status'] == 'completed':
+            break
+    view = assistant.turn_view(pg, chat.ids['owner'], turn['id'], chat.settings)
+    assert view['status'] == 'completed' and len(calls) == 2
+    assert view['result']['scope']['cm_id'] == str(chat.ids['owner'])
+    assert set(view['result']['scope']['cm_ids']) == {str(chat.ids['cm']), str(other_id)}
+    assert len(view['result']['sections'][0]['sources']) == 1
+    assert len(view['result']['data']) == 2
+    source = view['result']['data'][1]
+    assert assistant.source_page(pg, chat.ids['owner'], source['query_ref'], chat.settings)[
+        'scope']['cm_id'] == str(other_id)
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (chat.ids['owner'],))
+        denied = assistant.turn_view(pg, chat.ids['owner'], turn['id'], chat.settings)
+        assert denied['error_code'] == 'permission' and denied['result'] is None
+        with pytest.raises(PermissionError):
+            assistant.source_page(pg, chat.ids['owner'], source['query_ref'], chat.settings)
+    waiting = assistant.submit(pg, chat.ids['owner'], payload('等待另一位 CM 的总结'), chat.settings)
+    row = assistant._turn(pg, chat.ids['owner'], waiting['id'])
+    checkpoint = summary_dialogues.decode(row['checkpoint_ciphertext'], chat.settings)
+    checkpoint['waiting'] = {'kind': 'summary', 'scope': {'cm_id': str(other_id), 'audience': 'creators',
+                                                      'creator_ids': None}, 'ids': []}
+    checkpoint['progress'] = '正在分析记录'
+    pg.execute("UPDATE assistant_turns SET status='waiting',checkpoint_ciphertext=%s WHERE id=%s",
+               (summary_dialogues.encode(checkpoint, chat.settings), waiting['id']))
+    pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (chat.ids['owner'],))
+    hidden = assistant.turn_view(pg, chat.ids['owner'], waiting['id'], chat.settings)
+    assert hidden['error_code'] == 'permission' and hidden['progress'] == hidden['message'] == ''
+
+
 def test_unknown_and_stopped_requests_never_replay_provider(pg, chat, monkeypatch, caplog):
     calls = []
 
@@ -796,6 +875,10 @@ def test_unknown_and_stopped_requests_never_replay_provider(pg, chat, monkeypatc
     first = assistant.submit(pg, chat.ids['cm'], submitted, chat.settings)
     finish(chat)
     assert assistant.turn_view(pg, chat.ids['cm'], first['id'], chat.settings)['status'] == 'unknown'
+    failure = summary_dialogues.decode(assistant._turn(pg, chat.ids['cm'], first['id'])[
+        'checkpoint_ciphertext'], chat.settings)['failure']
+    assert failure['response_latency_ms'] == 500 and failure['error_chain'] == ['OpenAIRequestError']
+    assert failure['request_started_at']
     assistant.submit(pg, chat.ids['cm'], submitted, chat.settings)
     assert assistant.claim() is None and len(calls) == 1
     stopped = assistant.submit(pg, chat.ids['cm'], payload('取消这个请求'), chat.settings)
@@ -910,7 +993,15 @@ def test_repeated_tool_call_uses_current_turn_cache(pg, chat, monkeypatch):
 
     monkeypatch.setattr(assistant.tools, 'execute', execute)
 
+    provider_calls = []
+
     def model(*args, **kwargs):
+        provider_calls.append(kwargs['tools'])
+        if not kwargs['tools']:
+            assert '已结束检索' in kwargs['instructions']
+            final = {'answer': '已找到 Alice，未取得更多资料。', 'sections': [],
+                     'event_refs': [], 'result_refs': [], 'data_refs': [], 'draft_ref': None}
+            return {'text': json.dumps(final), 'output': [], 'usage': {}}
         return {'text': '', 'output': [{'type': 'function_call', 'call_id': str(uuid4()),
                  'name': 'find_creators', 'arguments': json.dumps({'query': 'alice'})}], 'usage': {}}
 
@@ -919,7 +1010,13 @@ def test_repeated_tool_call_uses_current_turn_cache(pg, chat, monkeypatch):
     for _ in range(4):
         finish(chat)
     assert executions == [True]
-    assistant.cancel(pg, chat.ids['cm'], turn['id'], chat.settings)
+    for _ in range(8):
+        finish(chat)
+        if assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)['status'] == 'completed':
+            break
+    view = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
+    assert view['status'] == 'completed' and len(provider_calls) == 5 and provider_calls[-1] == []
+    assert executions == [True]
 
 
 def test_natural_queries_replace_stale_filters_and_keep_valid_followup_sources(pg, chat, monkeypatch):

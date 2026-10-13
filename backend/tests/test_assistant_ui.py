@@ -165,7 +165,8 @@ const {chromium} = require('playwright');
     await page.route('**/*', async route => {
       const url = new URL(route.request().url());
       if (url.origin !== 'http://localhost') return route.abort();
-      if (['/','/admin/messages'].includes(url.pathname)) return route.fulfill({contentType:'text/html',body:html});
+      if (['/','/dashboard','/admin/messages'].includes(url.pathname))
+        return route.fulfill({contentType:'text/html',body:html});
       if (url.pathname.startsWith('/static/')) return route.fulfill({
         contentType:url.pathname.endsWith('.js')?'text/javascript':'text/css',
         body:fs.readFileSync(path.join(input.backend,'app',url.pathname))});
@@ -195,6 +196,8 @@ const {chromium} = require('playwright');
             message_ref:'u.fixture.message',text:'Search continuation.'}],
           coverage:{matched:1,scanned:25,readable:25},has_more:false}});
         return route.fulfill({json:{page:Number(url.searchParams.get('page')),page_count:4,has_more:true,
+          scope:{cm_id:url.pathname.endsWith('q.remi')?remiId:ownId(),
+            cm_name:url.pathname.endsWith('q.remi')?'Remi':'CM'},
           total_messages:353,messages:[{conversation_name:'商家客服群',sender_name:'未分类商家',
             message_ref:'m.fixture.second',text:'Can you check the dispatch status?',
             time:'2026-10-12T09:00:00Z'}],gaps:[]}});
@@ -512,6 +515,64 @@ const {chromium} = require('playwright');
     assert.equal(await page.locator('.oa-history .oa-gaps summary').textContent(),'有些内容暂时无法查看');
     assert.doesNotMatch(await page.locator('#oa-history').textContent(),
       /首次同步|最近同步时间|测试用同步定义|1272 个会话|读取至/);
+    assert.equal(await page.locator('.oa-queried-cms, .oa-cm-source').count(),0);
+
+    // Multi-CM sources retain their own scope while the Owner's selected person and session stay fixed.
+    const multiResult={answer:'已核对两位人员的合作事项。',scope:{cm_id:ownId(),cm_name:'CM',audience:'all',
+      cm_ids:[ownId(),remiId],cm_names:['CM','Remi']},events:[],
+      sections:result.sections.map((section,index)=>({...section,sources:section.sources.map(message=>
+        ({...message,cm_id:index?remiId:ownId(),cm_name:index?'Remi':'CM'}))})),
+      data:[{kind:'window_messages',query_ref:'q.owner',scope:{cm_id:ownId(),cm_name:'CM'},
+        total_messages:4,page_count:4,page:1,has_more:true,source_url:'/assistant/sources/q.owner?page=1',
+        messages:[{message_ref:'m.owner',cm_name:'CM',conversation_name:'本人合作群',text:'Own source.'}]},
+        {kind:'window_messages',query_ref:'q.remi',scope:{cm_id:remiId,cm_name:'Remi'},
+          total_messages:4,page_count:4,page:1,has_more:true,source_url:'/assistant/sources/q.remi?page=1',
+          messages:[{message_ref:'m.remi',cm_name:'Remi',conversation_name:'Remi 合作群',text:'Remi source.'}]},
+        {kind:'creators',query_ref:'q.creators',scope:{cm_id:remiId,cm_name:'Remi',audience:'creators'},
+          creators:[],total:1,next_cursor:'owner-next'}]};
+    view={...view,status:'completed',result:multiResult};
+    const multiSession=view.session_id, multiPosts=posts.length;
+    await page.goto('http://localhost/dashboard');
+    await page.locator('#oa-launcher').click();
+    await page.locator('.oa-queried-cms').waitFor();
+    assert.equal(await page.locator('#oa-person').isHidden(),true);
+    assert.equal(await page.locator('#oa-cm').inputValue(),ownId());
+    assert.equal(await page.locator('.oa-source-entry').count(),2);
+    assert.deepEqual(await page.locator('.oa-section-source .oa-cm-source').allTextContents(),['CM','Remi']);
+    assert.deepEqual(await page.locator('.oa-source-entry > details > summary').allTextContents(),
+      ['查看相关消息CM','查看相关消息Remi']);
+    await page.goto('http://localhost/admin/messages'); await page.locator('#oa-launcher').click();
+    await page.locator('.oa-queried-cms').waitFor();
+    assert.equal(await page.locator('.oa-queried-cms').textContent(),'查询人员：CM、Remi');
+    assert.equal(await page.locator('#oa-cm').inputValue(),ownId());
+    assert.equal(await page.locator('.oa-source-entry').count(),2);
+    assert.deepEqual(await page.locator('.oa-section-source .oa-cm-source').allTextContents(),['CM','Remi']);
+    assert.equal(await page.locator('.oa-data[data-query-ref="q.creators"] .oa-cm-source').textContent(),'Remi');
+    const remiSources=page.locator('.oa-source-entry[data-query-ref="q.remi"]');
+    await remiSources.locator('summary').click();
+    await remiSources.getByRole('button',{name:'下一页',exact:true}).click();
+    await remiSources.getByText('第 2 / 4 页',{exact:true}).waitFor();
+    assert.equal(await remiSources.locator('figcaption .oa-cm-source').textContent(),'Remi');
+    assert.equal(await page.locator('#oa-cm').inputValue(),ownId());
+    assert.equal(posts.length,multiPosts);
+    await page.reload(); await page.locator('#oa-launcher').click(); await page.locator('.oa-queried-cms').waitFor();
+    assert.equal(await page.locator('#oa-cm').inputValue(),ownId());
+    assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('ttmedia.assistant.'+
+      document.getElementById('operations-assistant').dataset.userId)).session_id),multiSession);
+    await page.getByRole('button',{name:'继续下一页',exact:true}).click();
+    await page.waitForFunction(()=>window.sources.length===1);
+    assert.equal(posts.at(-1).body.session_id,multiSession);
+    assert.deepEqual(posts.at(-1).body.context,{cm_id:ownId(),query_ref:'q.creators',cursor:'owner-next'});
+    view={...view,status:'completed',result:multiResult};
+    await page.evaluate(value=>{window.sources.at(-1).emit('result',value);
+      window.sources.at(-1).emit('done',{status:'completed'});},multiResult);
+    view={...view,result:{...multiResult,scope:{...multiResult.scope,cm_ids:[remiId],cm_names:['Remi']},
+      sections:[multiResult.sections[1]],data:[multiResult.data[1]]}};
+    await page.reload(); await page.locator('#oa-launcher').click(); await page.locator('.oa-queried-cms').waitFor();
+    assert.equal(await page.locator('.oa-queried-cms').textContent(),'查询人员：Remi');
+    assert.equal(await page.locator('#oa-cm').inputValue(),ownId());
+    assert.equal(await page.locator('.oa-source-entry').count(),1);
+    await page.goto('http://localhost/'); await page.locator('#oa-launcher').click();
     selfReady=false;
     await page.reload(); await page.locator('#oa-launcher').click();
     await page.waitForFunction(()=>document.getElementById('oa-status').textContent.includes('Lark 连接未就绪'));
@@ -544,6 +605,7 @@ const {chromium} = require('playwright');
 
     // Complete worklist, non-AI source pagination, arbitrary message drafts, and hand-edited translation.
     const postCount=posts.length;
+    const worklistSourceReads=sourceReads.length;
     assert.equal(await page.locator('[data-quick]').count(),3);
     await page.locator('[data-quick="today"]').click();
     await page.waitForFunction(()=>window.sources.length===1);
@@ -618,11 +680,11 @@ const {chromium} = require('playwright');
     await page.locator('.oa-source-entry > details > summary').click();
     await page.locator('.oa-source-pagination').getByRole('button',{name:'下一页',exact:true}).click();
     await page.waitForFunction(()=>document.querySelector('.oa-source-pagination').textContent.includes('第 2 / 4 页'));
-    assert.deepEqual(sourceReads,['2']); assert.equal(posts.length,postCount+1);
+    assert.deepEqual(sourceReads.slice(worklistSourceReads),['2']); assert.equal(posts.length,postCount+1);
     await page.locator('.oa-data[data-query-ref="q.search"]').getByRole('button',{name:'下一页',exact:true}).click();
     await page.waitForFunction(()=>document.querySelector('.oa-data[data-query-ref="q.search"]')
       .textContent.includes('Search continuation.'));
-    assert.deepEqual(sourceReads,['2','2']); assert.equal(posts.length,postCount+1);
+    assert.deepEqual(sourceReads.slice(worklistSourceReads),['2','2']); assert.equal(posts.length,postCount+1);
     assert.equal(await page.locator('.oa-data[data-query-ref="q.search"] .oa-reply-action').count(),1);
     await page.locator('#oa-fullscreen').click();
     olderTurns=[view];

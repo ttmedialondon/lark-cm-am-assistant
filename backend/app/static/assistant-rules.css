@@ -1,0 +1,2 @@
+.assistant-rules__editor { min-height: 28rem; line-height: 1.65; resize: vertical; }
+.assistant-rules__preview { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 28rem; overflow: auto; }

@@ -9,12 +9,12 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, Response
 
 
-async def form_body(request: Request) -> bytes:
+async def form_body(request: Request, *, max_bytes: int = 4096) -> bytes:
     """Read at most one byte over the form limit, including chunked requests."""
     body = bytearray()
     async for chunk in request.stream():
-        body.extend(chunk[:4097 - len(body)])
-        if len(body) > 4096:
+        body.extend(chunk[:max_bytes + 1 - len(body)])
+        if len(body) > max_bytes:
             break
     return bytes(body)
 

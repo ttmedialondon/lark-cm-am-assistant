@@ -12,7 +12,7 @@
     completed: "已完成", cancelled: "已停止", failed: "这次未能完成", unknown: "请求结果尚未确认，请勿重复提交"};
   let saved = {}, active = null, source = null, submitting = false, restoring = false, denied = false;
   let pending = null, pendingScopeVersion = null, restoreTimer = null, revision = 0, sourceVersion = 0, sourceFocus = null, followBottom = true;
-  let cmScopes = [], scopesReady = false, scopeRequest = null, canManageCM = false;
+  let cmScopes = [], scopesReady = false, scopeRequest = null, canQueryOtherCM = false, canManageCM = false;
   let pendingPageContext = null, currentDraft = null, activeReplyAction = null, activeReplyText = null;
   let draftTimer = null, draftStatusVersion = 0;
   try { saved = JSON.parse(localStorage.getItem(storageKey) || "{}"); } catch { /* IDs can remain in memory. */ }
@@ -139,7 +139,8 @@
         const value = await request("/scopes");
         if (denied) return false;
         cmScopes = value.scopes || [];
-        canManageCM = location.pathname.startsWith("/admin/") && value.can_switch_cm === true;
+        canQueryOtherCM = value.can_switch_cm === true;
+        canManageCM = location.pathname.startsWith("/admin/") && canQueryOtherCM;
         const selected = (canManageCM && saved.client_request_id && cmScopes.find(person => person.cm_id === saved.cm_id)) ||
           (canManageCM && cmScopes.find(person => person.cm_id === pageContext.cm_id)) ||
           cmScopes.find(person => person.cm_id === value.selected_cm_id) || (canManageCM && cmScopes[0]);
@@ -351,12 +352,15 @@
     });
     return button;
   }
-  function rawMessages(content, value, replyable = true, reading = true) {
+  function rawMessages(content, value, replyable = true, reading = true, multiCM = false) {
     for (const message of value.messages || []) {
       const item = node("figure");
-      item.append(node("figcaption", "", [message.conversation_name || message.chat_name, message.sender_name || (message.is_staff ? "内部同事" : message.speaker === "other" ? "对方" : null),
+      const caption = node("figcaption", "", [message.conversation_name || message.chat_name, message.sender_name || (message.is_staff ? "内部同事" : message.speaker === "other" ? "对方" : null),
         date(message.time || message.sent_at || message.created_at),
-        {matched: "引用消息", parent: "回复对象", root: "话题起点", nearby_context: "相邻消息"}[message.relation]].filter(Boolean).join(" · ")),
+        {matched: "引用消息", parent: "回复对象", root: "话题起点", nearby_context: "相邻消息"}[message.relation]].filter(Boolean).join(" · "));
+      const cmName = multiCM && (message.cm_name || value.scope?.cm_name);
+      if (cmName) caption.prepend(node("span", "oa-chip oa-cm-source", cmName), document.createTextNode(" · "));
+      item.append(caption,
         node("blockquote", "", message.text || "这条消息没有可显示的文字。"));
       const ref = message.message_ref || message.evidence_ref;
       if (replyable && ref && message.text && !message.unreadable) item.append(replyButton(ref, message.conversation_name || message.chat_name || "当前消息", true));
@@ -365,7 +369,7 @@
     if (!value.messages?.length) content.append(node("p", "oa-coverage", "当前没有可读取的原文。"));
     if (reading) { const gaps = gapList(value.gaps, value.gap_summary); if (gaps) content.append(gaps); }
   }
-  function evidenceCard(reference, title = "消息原文", count = null) {
+  function evidenceCard(reference, title = "消息原文", count = null, multiCM = false) {
     const button = node("button", "oa-evidence", Number.isFinite(count) ? `查看原文 · ${count} 条` : "查看原文");
     button.type = "button"; button.setAttribute("aria-controls", "oa-sources");
     button.addEventListener("click", async () => {
@@ -379,7 +383,7 @@
         const value = await request(`/evidence/${encodeURIComponent(reference)}`);
         if (denied || version !== sourceVersion) return;
         content.replaceChildren();
-        rawMessages(content, value);
+        rawMessages(content, value, true, true, multiCM);
         content.scrollTop = 0;
       } catch (error) { if (!denied && version === sourceVersion) content.replaceChildren(node("p", "oa-gaps", error.message)); }
     });
@@ -515,18 +519,20 @@
     }
     return list;
   }
-  function windowSources(data) {
+  function windowSources(data, multiCM = false) {
     const card = node("section", "oa-data oa-source-entry"), details = node("details", "oa-coverage");
+    card.dataset.queryRef = data.query_ref || "";
     let pageNumber = data.page || 1, currentPage = data;
     const count = data.total_messages ?? data.coverage?.total_messages ?? data.messages?.length ?? 0;
     details.append(node("summary", "", canManageCM ? `来源 · ${count} 条消息${data.total_conversations ? ` · ${data.total_conversations} 个会话` : ""}` : "查看相关消息"));
+    if (multiCM && data.scope?.cm_name) details.firstChild.append(node("span", "oa-chip oa-cm-source", data.scope.cm_name));
     const body = node("div", "oa-source-page"), footer = node("div", "oa-source-pagination");
     const pageLabel = node("span", "oa-coverage"), previous = node("button", "", "上一页"), next = node("button", "", "下一页");
     previous.type = next.type = "button";
     const draw = value => {
       currentPage = value;
       body.replaceChildren();
-      rawMessages(body, value, true, false);
+      rawMessages(body, value, true, false, multiCM);
       const pageCount = value.page_count || data.page_count || 1;
       pageLabel.textContent = `第 ${pageNumber} / ${pageCount} 页`;
       previous.disabled = pageNumber <= 1; next.disabled = !(value.has_more ?? pageNumber < pageCount);
@@ -550,14 +556,15 @@
     if (data.window?.start && data.window?.end) details.append(node("p", "oa-card-meta", `${date(data.window.start)} – ${date(data.window.end)} · 英国时间`));
     card.append(details); draw(data); return card;
   }
-  function dataCard(data) {
+  function dataCard(data, multiCM = false) {
     const titles = {creators: "达人资料", groups: "群聊目录", conversations: "会话目录", sync: "连接与消息读取", activity: "活动统计", messages: "消息命中",
       window_messages: "总结来源", message_context: "原文与问答"};
     if (!data || !titles[data.kind]) return null;
     if (data.kind === "sync" && !canManageCM) return null;
-    if (data.kind === "window_messages") return windowSources(data);
+    if (data.kind === "window_messages") return windowSources(data, multiCM);
     const card = node("section", "oa-data"); card.dataset.queryRef = data.query_ref || "";
     card.append(node("h4", "", titles[data.kind]));
+    if (multiCM && data.scope?.cm_name) card.firstChild.append(node("span", "oa-chip oa-cm-source", data.scope.cm_name));
     if (data.window?.start && data.window?.end) card.append(node("p", "oa-card-meta",
       `${date(data.window.start)} – ${date(data.window.end)} · 英国时间`));
     if (data.kind === "creators") {
@@ -617,7 +624,7 @@
       const text = message.text || "这条消息没有可显示的文字。";
       card.append(node("p", "", text.length > 420 ? `${text.slice(0, 420)}…` : text));
       const ref = data.message_ref || data.evidence_ref || message.message_ref;
-      if (ref) card.append(evidenceCard(ref, message.conversation_name || message.chat_name || "原文与问答"), replyButton(ref, message.conversation_name || message.chat_name || "当前消息", true));
+      if (ref) card.append(evidenceCard(ref, message.conversation_name || message.chat_name || "原文与问答", null, multiCM), replyButton(ref, message.conversation_name || message.chat_name || "当前消息", true));
     } else if (data.kind === "messages") {
       for (const message of (data.messages || []).slice(0, 25)) {
         const hit = node("div", "oa-hit");
@@ -627,7 +634,7 @@
         hit.append(node("p", "", text.length > 420 ? `${text.slice(0, 420)}…` : text));
         const ref = message.evidence_ref || message.message_ref;
         if (ref) {
-          hit.append(evidenceCard(ref, message.conversation_name || message.chat_name || "消息原文"));
+          hit.append(evidenceCard(ref, message.conversation_name || message.chat_name || "消息原文", null, multiCM));
           if (message.text && !message.unreadable) hit.append(replyButton(ref, message.conversation_name || message.chat_name || "当前消息", true));
         }
         card.append(hit);
@@ -649,18 +656,22 @@
           if (url.origin !== location.origin || !url.pathname.startsWith("/assistant/sources/")) throw new Error("来源地址无效。");
           const value = await request(url.pathname.slice("/assistant".length) + url.search);
           if (denied || version !== revision || !card.isConnected) return;
-          const page = dataCard(value); if (page) card.replaceWith(page); controls();
+          const page = dataCard(value, multiCM); if (page) card.replaceWith(page); controls();
         } catch (error) { if (!denied && version === revision) { next.disabled = false; actions.append(node("span", "oa-gaps", error.message)); } }
       });
       actions.append(next); card.append(actions);
     } else if (data.kind !== "messages" && data.next_cursor && data.query_ref) {
       const actions = node("div", "oa-card-actions");
-      actions.append(askButton("继续下一页", "继续查看这次查询的下一页", {...data.scope, query_ref: data.query_ref, cursor: data.next_cursor})); card.append(actions);
+      actions.append(askButton("继续下一页", "继续查看这次查询的下一页", {...(multiCM ? {} : data.scope), query_ref: data.query_ref, cursor: data.next_cursor})); card.append(actions);
     }
     return card;
   }
   function renderResult(container, result) {
     container.replaceChildren(answer(result.answer));
+    const multiCM = canQueryOtherCM && result.scope?.cm_ids?.length > 1;
+    if (multiCM || (canQueryOtherCM && result.scope?.cm_ids?.length === 1 && result.scope.cm_ids[0] !== result.scope.cm_id)) {
+      container.append(node("p", "oa-coverage oa-queried-cms", `查询人员：${(result.scope.cm_names || []).join("、")}`));
+    }
     const queryWindow = result.window || [...(result.data || [])].reverse().find(data => data.actual?.window || data.window);
     scope({...result.scope, ...(queryWindow?.actual?.window || queryWindow?.window || queryWindow)});
     for (const section of result.sections || []) {
@@ -670,11 +681,11 @@
       sources.append(node("summary", "", "查看相关消息"));
       for (const message of section.sources || []) {
         const item = node("div", "oa-section-source");
-        rawMessages(item, {messages: [message]}, false, false);
+        rawMessages(item, {messages: [message]}, false, false, multiCM);
         const ref = message.message_ref || message.evidence_ref;
         if (ref) {
           const actions = node("div", "oa-card-actions");
-          actions.append(evidenceCard(ref, message.conversation_name || message.chat_name || section.title));
+          actions.append(evidenceCard(ref, message.conversation_name || message.chat_name || section.title, null, multiCM));
           if (message.text && !message.unreadable) actions.append(replyButton(ref, message.conversation_name || message.chat_name || section.title, true));
           item.append(actions);
         }
@@ -695,6 +706,7 @@
       card.open = action !== "closed" && expanded++ < 8;
       const importance = event.importance?.tier_label || {focus: "重点", priority: "优先", normal: "常规",
         dormant: "久未联系", pending: "待评估"}[event.importance?.tier];
+      if (multiCM && event.cm_name) meta.append(node("span", "oa-chip oa-cm-source", event.cm_name));
       for (const text of [event.creator_handle || event.lark_user_name || event.creator_name,
         importance && `重要度：${importance}`, event.priority]) {
         if (text) meta.append(node("span", "", text));
@@ -714,7 +726,7 @@
       if (action === "reply" && Number.isFinite(event.waiting_seconds) && event.waiting_seconds > 0) card.append(node("div", "oa-card-meta", `原文中已等待 ${event.waiting_seconds >= 86400 ? `${Math.floor(event.waiting_seconds / 86400)} 天` : event.waiting_seconds >= 3600 ? `${Math.floor(event.waiting_seconds / 3600)} 小时` : `${Math.max(1, Math.floor(event.waiting_seconds / 60))} 分钟`}`));
       card.append(states);
       const actions = node("div", "oa-card-actions");
-      if (event.evidence_ref || event.event_ref) actions.append(evidenceCard(event.evidence_ref || event.event_ref, event.title || "聊天事项原文", event.evidence_count));
+      if (event.evidence_ref || event.event_ref) actions.append(evidenceCard(event.evidence_ref || event.event_ref, event.title || "聊天事项原文", event.evidence_count, multiCM));
       if (event.event_ref) actions.append(askButton("最新进展", "查看这个事项的最新进展", {event_ref: event.event_ref, event_title: event.title || "聊天事项"}),
         replyButton(event.event_ref, event.title || "聊天事项"));
       if (actions.children.length) card.append(actions);
@@ -727,11 +739,11 @@
     const sourcePages = (result.data || []).filter(data => data.kind === "window_messages");
     let sourcesAdded = false;
     for (const data of result.data || []) {
-      if (data.kind === "window_messages" && result.sections?.length && !canManageCM) continue;
-      if (data.kind === "window_messages" && sourcesAdded) continue;
-      const value = data.kind === "window_messages" && sourcePages.length > 1 ? {...data,
+      if (data.kind === "window_messages" && result.sections?.length && !canManageCM && !multiCM) continue;
+      if (data.kind === "window_messages" && sourcesAdded && !multiCM) continue;
+      const value = data.kind === "window_messages" && sourcePages.length > 1 && !multiCM ? {...data,
         messages: [...new Map(sourcePages.flatMap(page => page.messages || []).map(message => [message.message_ref || message.evidence_ref || JSON.stringify(message), message])).values()]} : data;
-      const card = dataCard(value); if (card) container.append(card);
+      const card = dataCard(value, multiCM); if (card) container.append(card);
       if (data.kind === "window_messages") sourcesAdded = true;
     }
     if (result.draft?.draft?.trim()) {

@@ -18,6 +18,7 @@ from . import (
 )
 from . import offhours_summary as summaries
 from . import summary_dialogues as codec
+from .db import lock_sync_material
 
 
 def _function(name, description, properties):
@@ -117,6 +118,23 @@ _QUERIES = {"query_creators": assistant_queries.creators, "list_groups": assista
             "get_sync_status": assistant_queries.sync_status, "activity_stats": assistant_queries.activity,
             "search_chat_history": assistant_search.query, "read_message_context": assistant_search.read,
             "summarize_messages": assistant_search.window_messages}
+_SCOPED_TOOLS = {"find_creators", "query_unreplied_creator_events", "summarize_messages",
+                 "query_creators", "list_groups", "find_conversations", "get_sync_status",
+                 "search_chat_history", "activity_stats"}
+_STAFF_TOOL = _function("resolve_staff", "Owner按姓名查找当前有效人员授权，返回真实cm_id和可查询状态。"
+    "先解析用户明确提到的人员，再将其cm_id传给查询工具；同名或多名候选先区分。"
+    "严格区分Janette和Jenette等不同姓名，不猜测改名；query=null可列目录。",
+    {"query": _NULL_STRING})
+_SCHEMAS["resolve_staff"] = _STAFF_TOOL["parameters"]
+
+
+def tools_for(context):
+    if not context.get("can_query_other_cm"):
+        return TOOLS
+    return [(_function(tool["name"], tool["description"] +
+        " Owner可传resolve_staff取得的cm_id查询该人员；null使用当前页面人员。多人员逐个查询，不切换页面。",
+        {**tool["parameters"]["properties"], "cm_id": _NULL_STRING})
+        if tool["name"] in _SCOPED_TOOLS else tool) for tool in TOOLS] + [_STAFF_TOOL]
 
 
 class SourceChangedError(ValueError):
@@ -125,6 +143,8 @@ class SourceChangedError(ValueError):
 
 def _validate(name, args):
     spec = _SCHEMAS.get(name)
+    if spec and name in _SCOPED_TOOLS and isinstance(args, dict) and "cm_id" in args:
+        spec = {**spec, "properties": {**spec["properties"], "cm_id": _NULL_STRING}}
     if spec is None or not isinstance(args, dict) or set(args) != set(spec["properties"]):
         raise ValueError("工具或参数无效。")
     for key, prop in spec["properties"].items():
@@ -147,20 +167,69 @@ def _validate(name, args):
                 raise ValueError("工具参数长度无效。")
 
 
-def scopes_for(conn, actor_id):
+def _owner(conn, actor_id):
     actor_id = UUID(str(actor_id))
-    actor = conn.execute("""SELECT a.status,r.role,r.is_active FROM authorizations a
-        LEFT JOIN admin_roles r ON r.authorization_id=a.id WHERE a.id=%s""", (actor_id,)).fetchone()
+    lock_sync_material(conn, read=True)
+    actor = conn.execute("SELECT status FROM authorizations WHERE id=%s FOR SHARE", (actor_id,)).fetchone()
     if not actor or actor["status"] != "active":
         raise PermissionError("当前登录授权已失效。")
-    owner = actor["role"] == "owner" and bool(actor["is_active"])
+    role = conn.execute("SELECT role,is_active FROM admin_roles WHERE authorization_id=%s FOR SHARE",
+                        (actor_id,)).fetchone()
+    return bool(role and role["role"] == "owner" and role["is_active"])
+
+
+def scopes_for(conn, actor_id):
+    actor_id = UUID(str(actor_id))
+    owner = _owner(conn, actor_id)
     people = conn.execute("""SELECT id,display_name FROM authorizations WHERE status='active'
-        AND body_consent_at IS NOT NULL AND (%s OR id=%s) ORDER BY display_name,id""", (owner, actor_id)).fetchall()
+        AND body_consent_at IS NOT NULL AND scopes @> %s::text[]
+        AND (%s OR id=%s) ORDER BY display_name,id""",
+        (sorted(summaries.BODY_READ_SCOPES), owner, actor_id)).fetchall()
     ids = {person["id"] for person in people}
     selected = actor_id if actor_id in ids else None
     return {"scopes": [{"cm_id": str(person["id"]), "cm_name": person["display_name"] or "未命名人员"}
                        for person in people], "selected_cm_id": str(selected) if selected else None,
             "can_switch_cm": owner}
+
+
+def context_for_scope(conn, actor_id, context, scope, *, read_cache=None):
+    """Use a source's real CM while rechecking the actor's current server grant."""
+    if not isinstance(scope, dict) or not scope.get("cm_id"):
+        raise ValueError("人员范围无效。")
+    cm = assistant_search.authorize_all(conn, actor_id, UUID(str(scope["cm_id"])), read_cache=read_cache)
+    return {**context, "scope": {**scope, "cm_id": str(cm["id"]),
+                                 "cm_name": cm["display_name"] or "CM"}}
+
+
+def effective_context(conn, actor_id, context, args, *, read_cache=None):
+    cm_id = args.get("cm_id")
+    if cm_id is None:
+        return context_for_scope(conn, actor_id, context, context["scope"], read_cache=read_cache)
+    if not _owner(conn, actor_id):
+        raise PermissionError("只有Owner可以指定其他人员的查询范围。")
+    cm_id = str(UUID(str(cm_id)))
+    scope = context["scope"] if cm_id == context["scope"]["cm_id"] else {
+        "cm_id": cm_id, "creator_ids": None, "audience": "all"}
+    return context_for_scope(conn, actor_id, context, scope, read_cache=read_cache)
+
+
+def _resolve_staff(conn, actor_id, args):
+    if not _owner(conn, actor_id):
+        raise PermissionError("只有Owner可以查询人员授权目录。")
+    query = str(args.get("query") or "").strip().casefold()
+    rows = conn.execute("""SELECT a.id,a.display_name,a.body_consent_at,a.scopes,
+        array_remove(ARRAY[a.display_name,i.display_name,i.name,i.en_name,c.display_name],NULL)
+        || ARRAY(SELECT display_value FROM contact_identifiers ci WHERE ci.contact_id=i.contact_id
+                 AND ci.kind='alias') names
+        FROM authorizations a LEFT JOIN lark_identities i ON i.open_id=a.open_id
+        LEFT JOIN contacts c ON c.id=i.contact_id WHERE a.status='active'
+        ORDER BY lower(a.display_name),a.id""").fetchall()
+    exact = [row for row in rows if query and query in {name.casefold() for name in row["names"]}]
+    matched = exact or [row for row in rows if not query or any(query in name.casefold() for name in row["names"])]
+    return {"kind": "staff", "query": args.get("query"), "staff": [
+        {"cm_id": str(row["id"]), "cm_name": row["display_name"] or "未命名人员",
+         "queryable": bool(row["body_consent_at"] and summaries.BODY_READ_SCOPES.issubset(row["scopes"]))}
+        for row in matched], "total": len(matched), "requires_selection": len(matched) > 1}
 
 
 def current_context(conn, actor_id, selected_context, settings, *, now=None, read_cache=None):
@@ -169,8 +238,7 @@ def current_context(conn, actor_id, selected_context, settings, *, now=None, rea
         raise ValueError("页面范围无效。")
     actor_id = UUID(str(actor_id))
     now = now or datetime.now(UTC)
-    selection = scopes_for(conn, actor_id) if not selected_context.get("cm_id") else {
-        "selected_cm_id": str(actor_id), "scopes": []}
+    selection = scopes_for(conn, actor_id)
     requested_cm = selected_context.get("cm_id") or selection["selected_cm_id"]
     if not requested_cm:
         raise ValueError("当前账号的消息连接尚未就绪，请检查账号连接。")
@@ -210,9 +278,11 @@ def current_context(conn, actor_id, selected_context, settings, *, now=None, rea
             if not task or not task["input_fingerprint"]:
                 raise ValueError("事件已更新。")
             event_ref = f"{task_id}:{int(index)}:{task['input_fingerprint']}"
-        _event_id(conn, actor_id, event_ref, settings, {"scope": scope})
+        event_context = _reference_context(conn, actor_id, {"scope": scope}, {"event_ref": event_ref}, settings,
+                                           read_cache=read_cache)
+        _event_id(conn, actor_id, event_ref, settings, event_context)
         scope["event_ref"] = event_ref
-        if audience == "creators":
+        if audience == "creators" and event_context["scope"]["cm_id"] == scope["cm_id"]:
             task_id, _index, _version = _event_parts(event_ref)
             task = conn.execute("SELECT contact_id FROM offhours_summary_tasks WHERE id=%s", (task_id,)).fetchone()
             if selected is not None and str(task["contact_id"]) not in selected:
@@ -224,12 +294,15 @@ def current_context(conn, actor_id, selected_context, settings, *, now=None, rea
     message_ref = selected_context.get("message_ref")
     if message_ref:
         source = _saved_message(conn, actor_id, message_ref, settings, read_cache=read_cache)
-        data = assistant_search.read(conn, actor_id, {"scope": scope}, {"message_ref": source}, settings,
+        message_context = _reference_context(conn, actor_id, {"scope": scope}, {"message_ref": message_ref}, settings,
+                                             read_cache=read_cache)
+        data = assistant_search.read(conn, actor_id, message_context, {"message_ref": source}, settings,
                                      read_cache=read_cache)
         scope["message_ref"] = message_ref
-        if chat_ids is not None and not set(data["scope"]["chat_ids"]) <= set(chat_ids):
+        if (message_context["scope"]["cm_id"] == scope["cm_id"] and chat_ids is not None
+                and not set(data["scope"]["chat_ids"]) <= set(chat_ids)):
             raise PermissionError("消息不属于已选会话范围。")
-        if chat_ids is None:
+        if chat_ids is None and message_context["scope"]["cm_id"] == scope["cm_id"]:
             scope.update(chat_ids=data["scope"]["chat_ids"],
                          chat_names=[data["message"].get("conversation_name") or "会话"])
     selected_window = selected_context.get("window") or {}
@@ -258,6 +331,9 @@ def current_context(conn, actor_id, selected_context, settings, *, now=None, rea
         _validate_query(conn, actor_id, {"scope": scope}, result, settings, read_cache=read_cache)
         scope["query_ref"] = query_ref
         scope["query_request"] = result["_request"]
+        if selection["can_switch_cm"] and scope["query_request"]["name"] in _SCOPED_TOOLS:
+            scope["query_request"] = {**scope["query_request"], "args": {
+                **scope["query_request"]["args"], "cm_id": result["scope"]["cm_id"]}}
         cursor = selected_context.get("cursor")
         if cursor is not None:
             if not isinstance(cursor, str) or cursor != result.get("next_cursor"):
@@ -270,9 +346,11 @@ def current_context(conn, actor_id, selected_context, settings, *, now=None, rea
         "actor": {"id": str(actor_id), "name": actor["display_name"] or "CM"},
         "scope": scope,
         "available_scopes": selection["scopes"],
+        "can_query_other_cm": selection["can_switch_cm"],
         "timezone": summaries.TIMEZONE,
         "now": local.isoformat(),
         "defaults": {"morning_start": day_start.isoformat(),
+            "analysis_start": (local - timedelta(days=90)).isoformat(),
             "morning_end": min(local, day_start.replace(hour=12)).isoformat(),
             "yesterday_start": (day_start - timedelta(days=1)).isoformat(), "yesterday_end": day_start.isoformat(),
             "week_start": week_start.isoformat(), "previous_week_start": (week_start - timedelta(days=7)).isoformat(),
@@ -324,9 +402,7 @@ def _saved_query(conn, actor_id, ref, settings):
 
 
 def _validate_query(conn, actor_id, context, result, settings, *, history_only=False, read_cache=None):
-    if result.get("scope", {}).get("cm_id") != context["scope"]["cm_id"]:
-        raise PermissionError("查询不属于当前范围。")
-    context = {**context, "scope": result["scope"]}
+    context = context_for_scope(conn, actor_id, context, result.get("scope"), read_cache=read_cache)
     if result.get("kind") in {"messages", "window_messages", "message_context"}:
         refs = result.get("_message_refs", {})
         restored = {**result, "messages": [{**message,
@@ -487,7 +563,7 @@ def _saved_message(conn, actor_id, ref, settings, *, turn=None, read_cache=None)
                            for key in ("start", "end"))
                     or value.get("chat_id") not in {chat["chat_id"] for chat in owned.get("sources", [])}):
                 raise ValueError
-            return source
+            return _authorized_message_source(conn, actor_id, source, settings, read_cache=read_cache)
         prefix, turn_id, digest, _index = ref.split(".")
         if prefix != "m" or len(ref) > 130:
             raise ValueError
@@ -501,9 +577,19 @@ def _saved_message(conn, actor_id, ref, settings, *, turn=None, read_cache=None)
         source = result.get("_message_refs", {}).get(ref)
         if not source:
             raise ValueError
-        return source
+        return _authorized_message_source(conn, actor_id, source, settings, read_cache=read_cache)
     except (TypeError, AttributeError, ValueError) as exc:
         raise ValueError("消息引用无效，请重新查询。") from exc
+
+
+def _authorized_message_source(conn, actor_id, source, settings, *, read_cache=None):
+    value = assistant_search._open(source, "m.", settings)
+    if value.get("actor_id") != str(actor_id):
+        raise PermissionError("消息不属于当前账号。")
+    cm = assistant_search.authorize_all(conn, actor_id, value.get("cm_id"), read_cache=read_cache)
+    if value.get("consent_at") != cm["body_consent_at"].isoformat():
+        raise PermissionError("消息正文授权已变化，请重新查询。")
+    return source
 
 
 def _saved_reply(conn, actor_id, turn, ref, settings):
@@ -531,9 +617,7 @@ def _saved_reply(conn, actor_id, turn, ref, settings):
 def _validate_reply_material(conn, actor_id, result, settings, context, *, turn=None, read_cache=None):
     saved = result["_reply_material"]
     source = saved["source"]
-    if saved["scope"]["cm_id"] != context["scope"]["cm_id"]:
-        raise PermissionError("草稿不属于当前人员范围。")
-    assistant_search.authorize_all(conn, actor_id, saved["scope"]["cm_id"], read_cache=read_cache)
+    context = context_for_scope(conn, actor_id, context, saved["scope"], read_cache=read_cache)
     if source["kind"] == "message":
         current = _saved_message(conn, actor_id, source["ref"], settings, turn=turn, read_cache=read_cache)
         # Re-sealing a compact reference changes its nonce, not its authenticated scope.
@@ -546,6 +630,37 @@ def _validate_reply_material(conn, actor_id, result, settings, context, *, turn=
     if fresh["fingerprint"] != saved["context"]["fingerprint"]:
         raise SourceChangedError("回复依据已变化，请重新生成。")
     return fresh
+
+
+def _reference_context(conn, actor_id, context, args, settings, *, turn=None, read_cache=None):
+    scope = None
+    if args.get("message_ref"):
+        source = _saved_message(conn, actor_id, args["message_ref"], settings, turn=turn, read_cache=read_cache)
+        value = assistant_search._open(source, "m.", settings)
+        scope = {"cm_id": value["cm_id"], "creator_ids": value.get("creator_ids"),
+                 "audience": value.get("audience", "creators")}
+    elif args.get("draft_ref"):
+        scope = _saved_reply(conn, actor_id, turn, args["draft_ref"], settings)["_reply_material"]["scope"]
+    elif args.get("event_ref"):
+        task_id, _index, _version = _event_parts(args["event_ref"])
+        row = conn.execute("""SELECT r.responsible_authorization_id FROM offhours_summary_tasks t
+            JOIN offhours_summary_runs r ON r.id=t.run_id WHERE t.id=%s""", (task_id,)).fetchone()
+        if not row:
+            raise ValueError("事件已更新。")
+        cm_id = str(row["responsible_authorization_id"])
+        scope = {**(context["scope"] if cm_id == context["scope"]["cm_id"] else {"creator_ids": None}),
+                 "cm_id": cm_id, "audience": "creators"}
+    elif args.get("result_id"):
+        ids = _run_ids(args["result_id"])
+        rows = conn.execute("SELECT id,responsible_authorization_id FROM offhours_summary_runs "
+                            "WHERE id=ANY(%s::uuid[])", (ids,)).fetchall()
+        cms = {str(row["responsible_authorization_id"]) for row in rows}
+        if len(rows) != len(set(ids)) or len(cms) != 1:
+            raise PermissionError("报告不存在或人员范围无效。")
+        cm_id = cms.pop()
+        scope = {**(context["scope"] if cm_id == context["scope"]["cm_id"] else {"creator_ids": None}),
+                 "cm_id": cm_id, "audience": "creators"}
+    return context_for_scope(conn, actor_id, context, scope, read_cache=read_cache) if scope else context
 
 
 def _prepare_reply(conn, actor_id, turn, args, settings, context, *, read_cache=None):
@@ -561,6 +676,7 @@ def _prepare_reply(conn, actor_id, turn, args, settings, context, *, read_cache=
         elif requested.get("event_ref"):
             args.update(event_ref=requested["event_ref"], message_ref=None)
     action = args["action"]
+    context = _reference_context(conn, actor_id, context, args, settings, turn=turn, read_cache=read_cache)
     if action == "generate":
         if bool(args["event_ref"]) == bool(args["message_ref"]) or args["draft_ref"] or args["edited_draft"]:
             raise ValueError("请选择一个实际事件或文字消息。")
@@ -777,6 +893,7 @@ def _read_results(conn, actor_id, run_ids, settings, context):
         ).fetchall()} if task_ids else {}
         for event in view["events"]:
             card = _card(event, versions[event["id"].split(":")[0]])
+            card.update(cm_id=context["scope"]["cm_id"], cm_name=context["scope"].get("cm_name", "CM"))
             card["window"] = view["window"]
             card.update(assistant_worklist.decorate(event, view["window"]["end"]))
             card["conversations"] = list({e["chat_id"]: {"chat_id": e["chat_id"],
@@ -874,6 +991,12 @@ def execute(conn, actor_id, turn, name, args, settings, context, *, read_cache=N
     if name == "read_message_context":
         args = {"mode": None, **args}
     _validate(name, args)
+    if name == "resolve_staff":
+        return _resolve_staff(conn, actor_id, args)
+    if name in _SCOPED_TOOLS:
+        context = effective_context(conn, actor_id, context, args, read_cache=read_cache)
+    elif name in {"read_message_context", "read_event_context", "filter_events", "save_reply_draft"}:
+        context = _reference_context(conn, actor_id, context, args, settings, turn=turn, read_cache=read_cache)
     creator_query = name not in {"find_conversations", "get_sync_status", "read_message_context",
                                 "draft_reply", "save_reply_draft"} and args.get("audience") != "all"
     cm, roster, visible = _scope(conn, actor_id, context, creators=creator_query, read_cache=read_cache)
@@ -891,7 +1014,8 @@ def execute(conn, actor_id, turn, name, args, settings, context, *, read_cache=N
                       read_cache=read_cache, window_counts=window_counts)
     if name == "find_creators":
         return _query(conn, actor_id, turn, "query_creators",
-                      {"query": args["query"], "importance": None, "cursor": None}, settings, context, visible,
+                      {"query": args["query"], "importance": None, "cursor": None,
+                       **({"cm_id": args["cm_id"]} if "cm_id" in args else {})}, settings, context, visible,
                       read_cache=read_cache)
     if name in {"summarize_messages", "query_unreplied_creator_events"}:
         context = {**context, "scope": {**context["scope"], "audience": "creators"}}
@@ -935,7 +1059,7 @@ def execute(conn, actor_id, turn, name, args, settings, context, *, read_cache=N
             start = stop
         result = _read_results(conn, actor_id, run_ids, settings, context)
         if result["pending"]:
-            wait = {"kind": "summary", "ids": [str(value) for value in run_ids]}
+            wait = {"kind": "summary", "ids": [str(value) for value in run_ids], "scope": context["scope"]}
             if unreplied:
                 wait.update(purpose="unreplied_creators", creator_snapshot=snapshot)
             return {"waiting": wait,
@@ -999,7 +1123,7 @@ def execute(conn, actor_id, turn, name, args, settings, context, *, read_cache=N
         result = summary_replies.read_event_context(conn, actor_id, event_id, settings, mode=args["mode"],
                                                     cutoff=datetime.now(UTC))
         _audit_context(conn, actor_id, event_id, args["mode"], len(result.get("messages", [])))
-        return {**result, "event_ref": args["event_ref"], "mode": args["mode"]}
+        return {**result, "event_ref": args["event_ref"], "mode": args["mode"], "scope": context["scope"]}
     raise ValueError("工具无效。")
 
 
@@ -1029,6 +1153,12 @@ def _page(result, cursor):
 
 
 def resume_wait(conn, actor_id, turn, waiting, settings, context):
+    if waiting.get("scope"):
+        context = context_for_scope(conn, actor_id, context, waiting["scope"])
+    elif waiting["kind"] == "summary":
+        context = _reference_context(conn, actor_id, context, {"result_id": _result_ref(waiting["ids"])}, settings)
+    elif waiting.get("event_ref"):
+        context = _reference_context(conn, actor_id, context, waiting, settings)
     _scope(conn, actor_id, context)
     if waiting["kind"] == "summary":
         result = _read_results(conn, actor_id, [UUID(value) for value in waiting["ids"]], settings, context)
@@ -1063,10 +1193,12 @@ def evidence(conn, actor_id, ref, settings):
         _audit_context(conn, actor_id, ref, "message", len(result.get("messages", [])))
         return public_query(result)
     event_id = _event_id(conn, actor_id, ref, settings)
+    context = _reference_context(conn, actor_id, {"scope": {"cm_id": str(actor_id), "creator_ids": None}},
+                                 {"event_ref": ref}, settings, read_cache=read_cache)
     result = summary_replies.read_event_context(conn, actor_id, event_id, settings, mode="period")
     messages = result.get("messages", result.get("event", {}).get("evidence", []))
     _audit_context(conn, actor_id, event_id, "evidence", len(messages))
-    return {**result, "event_ref": ref, "messages": [{**message,
+    return {**result, "event_ref": ref, "scope": context["scope"], "messages": [{**message,
         "time": message.get("time", message.get("created_at")),
         "sender_name": message.get("sender_name", message.get("speaker", ""))} for message in messages]}
 
@@ -1087,6 +1219,33 @@ def validate_tool_results(conn, actor_id, turn, results, settings, context, *, r
 
 def _validate_tool_results(conn, actor_id, turn, results, settings, context, *, read_cache=None, message_refs=None):
     """Recheck all reused source text before it goes into another paid request."""
+    groups = {}
+    for result in results:
+        if not isinstance(result, dict):
+            raise ValueError("工具结果无效。")
+        if result.get("kind") == "staff":
+            if _resolve_staff(conn, actor_id, {"query": result.get("query")}) != result:
+                raise ValueError("人员授权目录已变化，请重新查找。")
+            continue
+        scope = result.get("scope") or result.get("_reply_material", {}).get("scope")
+        selected_context = (context_for_scope(conn, actor_id, context, scope, read_cache=read_cache) if scope else
+            _reference_context(conn, actor_id, context, {
+                "result_id": result.get("result_id"), "event_ref": result.get("event_ref") or
+                    next((event.get("event_ref") for event in result.get("events", [])), None)}, settings,
+                read_cache=read_cache))
+        group = groups.setdefault(selected_context["scope"]["cm_id"], {"context": selected_context, "results": []})
+        group["results"].append(result)
+    validated = {"views": {}, "cards": {}, "drafts": {}}
+    for group in groups.values():
+        fresh = _validate_scoped_tool_results(conn, actor_id, turn, group["results"], settings, group["context"],
+                                              read_cache=read_cache, message_refs=message_refs)
+        for key in validated:
+            validated[key].update(fresh[key])
+    return validated
+
+
+def _validate_scoped_tool_results(conn, actor_id, turn, results, settings, context, *, read_cache=None,
+                                  message_refs=None):
     creator_data = any(result.get("result_id") or result.get("event_ref") or result.get("creators")
                        or result.get("_creator_snapshot") for result in results if isinstance(result, dict))
     cm, roster, _visible = _scope(conn, actor_id, context, creators=creator_data, read_cache=read_cache)
@@ -1195,7 +1354,9 @@ def _sections(final, tool_results):
     sections = final.get("sections", [])
     if not isinstance(sections, list) or len(sections) > 40:
         raise ValueError("分类回答格式无效。")
-    messages = {message["message_ref"]: message for result in tool_results
+    messages = {message["message_ref"]: {**message, **{
+        key: result["scope"][key] for key in ("cm_id", "cm_name") if key in result.get("scope", {})}}
+                for result in tool_results
                 for message in result.get("messages", []) if message.get("message_ref")}
     values = []
     for section in sections:
@@ -1208,10 +1369,15 @@ def _sections(final, tool_results):
                 or not all(isinstance(ref, str) for ref in section["message_refs"])
                 or not set(section["message_refs"]) <= messages.keys()):
             raise ValueError("分类回答引用未取得的消息或内容无效。")
-        refs = list(dict.fromkeys(section["message_refs"]))
-        sources = []
-        for ref in refs:
+        refs, sources, seen = [], [], set()
+        for ref in dict.fromkeys(section["message_refs"]):
             message = messages[ref]
+            identity = ((message["chat_id"], message["message_id"])
+                        if message.get("chat_id") and message.get("message_id") else ref)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            refs.append(ref)
             text = message.get("text", "")
             sources.append({**message, "text": text[:600],
                 "truncated": message.get("truncated", False) or len(text) > 600,
@@ -1250,7 +1416,8 @@ def build_result(conn, actor_id, turn, final, settings, context, tool_results, *
             or not isinstance(data_refs, list) or not all(isinstance(ref, str) for ref in data_refs)
             or not set(data_refs) <= data.keys()):
         raise ValueError("回答引用未取得的资料。")
-    current = list({result.get("result_id", "empty"): result for result in tool_results
+    current = list({(result.get("result_id", "empty"), result.get("scope", {}).get("cm_id")): result
+               for result in tool_results
                if result.get("_assistant_turn_id") == str(turn["id"])
                and ("_unreplied_event_refs" in result or "_complete_event_refs" in result)}.values())
     def selected_refs(result):
@@ -1295,6 +1462,13 @@ def build_result(conn, actor_id, turn, final, settings, context, tool_results, *
     if current:
         result_scope = current[-1]["scope"]
         coverage = current[-1]["coverage"]
+    queried_scopes = {result["scope"]["cm_id"]: result["scope"].get("cm_name", "CM")
+                     for result in tool_results if result.get("scope", {}).get("cm_id")
+                     and result.get("kind") != "staff" and (result.get("query_ref") or result.get("result_id")
+                         or result.get("event_ref") or result.get("_reply_material")
+                         or result.get("_creator_snapshot"))}
+    if queried_scopes and (len(queried_scopes) > 1 or set(queried_scopes) != {context["scope"]["cm_id"]}):
+        result_scope = {**context["scope"], "cm_ids": list(queried_scopes), "cm_names": list(queried_scopes.values())}
     return {"turn_id": str(turn["id"]), "status": "completed", "answer": answer, "sections": sections,
             "data_refs": list(dict.fromkeys(data_refs)),
             "data": [public_query(data[ref]) for ref in dict.fromkeys(data_refs)],

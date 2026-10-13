@@ -13,6 +13,100 @@ from app import offhours_summary as summaries
 from app.ai_feature_config import api_key_cipher, save_feature_config
 
 
+def test_owner_person_queries_preserve_selected_scope_and_recheck_saved_sources(pg, seeded):  # noqa: F811
+    s = seeded
+    pg.execute("UPDATE authorizations SET display_name='Jenette' WHERE id=%s", (s.ids["cm"],))
+    pg.execute("UPDATE authorizations SET display_name='Janette' WHERE id=%s", (s.ids["reviewer"],))
+    pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,p2p_counterpart_open_id,
+        p2p_counterpart_type,backfill_complete,backfill_window_start_at,last_incremental_at,sync_status)
+        VALUES(%s,'chat','ou_person','user',TRUE,%s,%s,'succeeded')""",
+        (s.ids["reviewer"], s.start - timedelta(days=9), s.end))
+    pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+        VALUES(%s,'chat','m1')""", (s.ids["reviewer"],))
+    session, turn_id, now = uuid4(), uuid4(), datetime.now(UTC)
+    pg.execute("INSERT INTO assistant_sessions(id,actor_id) VALUES(%s,%s)", (session, s.ids["owner"]))
+    pg.execute("INSERT INTO assistant_turns(id,session_id,client_request_id,input_ciphertext,created_at) "
+               "VALUES(%s,%s,%s,'fixture',%s)", (turn_id, session, uuid4(), now))
+    turn = pg.execute("SELECT * FROM assistant_turns WHERE id=%s", (turn_id,)).fetchone()
+    context = tools.current_context(pg, s.ids["owner"], {"cm_id": str(s.ids["owner"])}, s.settings)
+    assert context["can_query_other_cm"]
+    assert {person["cm_name"] for person in context["available_scopes"]} >= {"Janette", "Jenette"}
+    owner_schemas = {tool["name"]: tool["parameters"]["properties"] for tool in tools.tools_for(context)}
+    assert owner_schemas["summarize_messages"]["cm_id"]["type"] == ["string", "null"]
+    own = tools.current_context(pg, s.ids["cm"], {}, s.settings)
+    assert tools.tools_for(own) is tools.TOOLS and not own["can_query_other_cm"]
+    results = []
+
+    def run(name, args):
+        value = tools.execute(pg, s.ids["owner"], turn, name, args, s.settings, context)
+        results.append(value)
+        turn["checkpoint_ciphertext"] = summary_dialogues.encode({"tool_results": results}, s.settings)
+        pg.execute("UPDATE assistant_turns SET checkpoint_ciphertext=%s WHERE id=%s",
+                   (turn["checkpoint_ciphertext"], turn_id))
+        return value
+
+    janette = run("resolve_staff", {"query": "Janette"})
+    assert janette["total"] == 1 and janette["staff"][0]["cm_id"] == str(s.ids["reviewer"])
+    assert run("resolve_staff", {"query": "Jenette"})["staff"][0]["cm_id"] == str(s.ids["cm"])
+    assert run("resolve_staff", {"query": "ette"})["requires_selection"]
+    assert run("resolve_staff", {"query": "Jannette"})["total"] == 0
+    args = {"audience": "all", "start": s.start.isoformat(), "end": now.isoformat(),
+            "creator_ids": None, "chat_ids": None, "cursor": None}
+    pages = [run("summarize_messages", {**args, "cm_id": str(person)})
+             for person in (s.ids["cm"], s.ids["reviewer"])]
+    assert [page["scope"]["cm_name"] for page in pages] == ["Jenette", "Janette"]
+    assert "unrelated outsider secret" in json.dumps(pages[0])
+    assert "unrelated outsider secret" not in json.dumps(pages[1])
+    assert pages[0]["_request"]["args"]["cm_id"] == str(s.ids["cm"])
+    refs = [next(message["message_ref"] for message in page["messages"] if message["message_id"] == "m1")
+            for page in pages]
+    source = run("read_message_context", {"message_ref": refs[1]})
+    assert source["scope"]["cm_id"] == str(s.ids["reviewer"])
+    prepared = run("draft_reply", {"event_ref": None, "message_ref": refs[1], "draft_ref": None,
+        "edited_draft": None, "action": "generate", "instruction": None, "language": "en"})
+    draft = run("save_reply_draft", {"draft_ref": prepared["draft_ref"], "outcome": "ready", "language": "en",
+        "draft": "I will check the sample request.", "chinese_translation": "我会核查样品申请。",
+        "explanation": "Uses the actual request.", "checks": [], "evidence_refs": [prepared["source_ref"]]})
+    assert draft["scope"]["cm_id"] == str(s.ids["reviewer"])
+    selected = tools.current_context(pg, s.ids["owner"], {
+        "cm_id": str(s.ids["owner"]), "query_ref": pages[1]["query_ref"]}, s.settings)
+    assert selected["scope"]["cm_id"] == str(s.ids["owner"])
+    assert selected["scope"]["query_request"]["args"]["cm_id"] == str(s.ids["reviewer"])
+    message_selected = tools.current_context(pg, s.ids["owner"], {
+        "cm_id": str(s.ids["owner"]), "message_ref": refs[1]}, s.settings)
+    assert message_selected["scope"]["cm_id"] == str(s.ids["owner"])
+    final = {"answer": "Both people saw this sample request.", "event_refs": [], "result_refs": [],
+             "data_refs": [page["query_ref"] for page in pages], "draft_ref": draft["draft_ref"],
+             "sections": [{"title": "Samples", "summary": "A request shared by both people.", "message_refs": refs}]}
+    view = tools.build_result(pg, s.ids["owner"], turn, final, s.settings, context, results)
+    assert view["scope"]["cm_id"] == str(s.ids["owner"])
+    assert view["scope"]["cm_names"] == ["Jenette", "Janette"]
+    assert len(view["sections"][0]["sources"]) == 1
+    assert view["sections"][0]["sources"][0]["cm_name"] == "Jenette"
+    assert context["scope"]["cm_id"] == str(s.ids["owner"])
+    with pytest.raises(PermissionError):
+        tools.execute(pg, s.ids["cm"], turn, "summarize_messages", {
+            **args, "cm_id": str(s.ids["reviewer"])}, s.settings, own)
+    with pytest.raises(PermissionError):
+        tools.execute(pg, s.ids["cm"], turn, "resolve_staff", {"query": "Janette"}, s.settings, own)
+    with pytest.raises(PermissionError):
+        tools.context_for_scope(pg, s.ids["cm"], own, pages[1]["scope"])
+    for sql, values in [
+        ("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (s.ids["owner"],)),
+        ("UPDATE authorizations SET body_consent_at=NULL WHERE id=%s", (s.ids["reviewer"],)),
+        ("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (s.ids["reviewer"],)),
+    ]:
+        with pg.transaction(force_rollback=True):
+            pg.execute(sql, values)
+            for read in (
+                lambda: tools.validate_tool_results(pg, s.ids["owner"], turn, results, s.settings, context),
+                lambda: tools.evidence(pg, s.ids["owner"], refs[1], s.settings),
+                lambda: tools.reply_status(pg, s.ids["owner"], draft["draft_ref"], s.settings),
+            ):
+                with pytest.raises((PermissionError, ValueError, summaries.SummaryInputError)):
+                    read()
+
+
 def test_creator_snapshot_keeps_all_pages_stable_and_live_sources_protected(pg, seeded):  # noqa: F811
     from app import creator_importance_facts
 
@@ -58,6 +152,8 @@ def test_creator_snapshot_keeps_all_pages_stable_and_live_sources_protected(pg, 
     ]:
         timed = tools.current_context(pg, s.ids["cm"], {}, s.settings, now=datetime.fromisoformat(current))
         assert timed["defaults"] == {
+            "analysis_start": (datetime.fromisoformat(current).astimezone(summaries.LONDON)
+                               - timedelta(days=90)).isoformat(),
             "morning_start": yesterday_end, "morning_end": current,
             "yesterday_start": yesterday_start, "yesterday_end": yesterday_end,
             "week_start": week_start, "previous_week_start": previous_start, "previous_week_end": week_start,
