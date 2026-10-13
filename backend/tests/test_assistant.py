@@ -52,6 +52,7 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
     empty_evidence = assistant_window.summary_format({})['schema']['properties']['evidence_refs']
     assert empty_evidence['maxItems'] == 0 and 'enum' not in empty_evidence['items']
     calls, parts, raw_ids, reduced = [], [], set(), []
+    checked_structured_size = False
 
     def model(_cfg, _key, items, _actor, **kwargs):
         calls.append(kwargs['tools'])
@@ -117,6 +118,19 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
         window = checkpoint.get('window_job')
         if window and window.get('summaries'):
             _material, refmap = assistant_window.summary_input(checkpoint, window)
+            if not checked_structured_size:
+                ref = next(iter(refmap))
+                many_items = {'summary': '本批事项', 'evidence_refs': [ref], 'items': [
+                    {'summary': str(index) + 'x' * 150, 'evidence_refs': [ref]} for index in range(50)]}
+                size_job = deepcopy(window)
+                assistant_window.accept_summary(size_job, {'text': json.dumps(many_items), 'output': []}, refmap)
+                assert len(size_job['summaries'][-1]['items']) == 50
+                oversize = {**many_items, 'items': [{'summary': 'x' * (assistant_window.SUMMARY_CHARS + 1),
+                                                   'evidence_refs': [ref]}]}
+                with pytest.raises(ValueError, match='事项引用或内容无效'):
+                    assistant_window.accept_summary(deepcopy(window),
+                                                    {'text': json.dumps(oversize), 'output': []}, refmap)
+                checked_structured_size = True
             canonical = {message['message_ref'] for page in assistant_window.pages(checkpoint, window)
                          for message in page['messages']}
             assert all(set(note['evidence_refs']) <= canonical for note in window['summaries'])

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 
-INPUT_CHARS = 32_000
-SUMMARY_CHARS = 6_000
+INPUT_CHARS = 64_000
+SUMMARY_CHARS = 12_000
 LEGACY_SUMMARY_FORMAT = {
     'type': 'json_schema', 'name': 'operations_window_segment', 'strict': True,
     'schema': {'type': 'object', 'additionalProperties': False,
@@ -31,7 +31,7 @@ text_part标明同一长消息的连续片段和完整长度；保留片段中�
 只按系统提供的原因记录受限群、未同步消息或不可读附件，不猜测图片含义或授权问题。
 支持items的输出中，summary只作简短概括，具体不同事项分别放items；无业务事项可items=[]。
 每个item必须有本批真实引用，只引用能证明该事项的消息；不能把本批全部引用挂在每个item上。
-summary及全部items的summary合计最多6000字符；不支持items的旧输出仍在summary保留具体事项。
+summary及全部items的summary合计最多12000字符；不支持items的旧输出仍在summary保留具体事项。
 evidence_refs只列本段实际引用的消息编号，不编造引用或无证据的业务事项。
 R编号只在当前批次有效，引用仅放evidence_refs，不在summary正文写编号。
 输入为已有分段摘要时，仅合并其中事实与引用，不增加事实，不丢失尚待跟进的事项。
