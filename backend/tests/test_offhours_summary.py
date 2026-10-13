@@ -14,6 +14,7 @@ import pytest
 from psycopg.rows import dict_row
 
 from app import (
+    assistant_rules,
     creator_import_evidence,
     creator_imports,
     openai_client,
@@ -1009,7 +1010,8 @@ def test_unmentioned_name_changes_and_omitted_mentions_keep_previous_input_finge
     s.save()
     job = ai.claim_next_summary()
     before = ai._load_chat(pg, job, "chat", job["cutoff"], settings=s.settings)
-    assert before["fingerprint"] == ai._hash([before["pack"], before["users"]])
+    assert before["fingerprint"] == ai._hash([
+        ai._hash([before["pack"], before["users"]]), job["event_rules_digest"]])
     assert "mentions" not in before["pack"]["messages"][0]
     pg.execute("UPDATE lark_identities SET display_name='unrelated changed' WHERE open_id='ou_other'")
     pg.execute(
@@ -1647,6 +1649,7 @@ def finish_merges(pg, s):
 
 def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, seeded, monkeypatch):
     s = seeded
+    pinned_rules = assistant_rules.event_snapshot(pg, s.settings)
     long_body = 'Long message beginning ' + 'z' * 19000 + ' final-marker'
     for i in range(215):
         s.add(f'noise-{i}', text=f'Routine {i}', at=s.start + timedelta(minutes=i + 1))
@@ -1704,6 +1707,14 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
     def model(_cfg, _key, pack, _cm, **kwargs):
         nonlocal failed
         calls.append(pack)
+        stage = "merge" if "a" in pack else "extract"
+        assert assistant_rules.event_instructions(pinned_rules, stage) in kwargs["instructions"]
+        assert "new-event-rules-marker" not in kwargs["instructions"]
+        if len(calls) == 1:
+            for key, document in pinned_rules["documents"].items():
+                assistant_rules.save_document(pg, s.settings, s.ids["owner"], key,
+                    document["title"], document["description"], "manual", "published", "owner",
+                    document["text"] + "\nnew-event-rules-marker", document["revision"])
         if 'a' in pack:
             a, b = pack['a'], pack['b']
             return {'text': json.dumps({'same': True, 'basis_kind': 'identifier', 'basis_value': 'ABC-123',
@@ -1733,7 +1744,11 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
             'usage': {'input_tokens': 7, 'output_tokens': 2}}
 
     monkeypatch.setattr(openai_client, 'call_openai', model)
-    s.save()
+    queued = s.save()
+    saved_run = pg.execute("SELECT * FROM offhours_summary_runs WHERE id=%s", (queued["run_id"],)).fetchone()
+    assert saved_run["event_rules_digest"] == pinned_rules["digest"]
+    assert summary_dialogues.decode(saved_run["event_rules_ciphertext"], s.settings) == pinned_rules
+    assert pinned_rules["documents"]["event-extraction"]["text"] not in saved_run["event_rules_ciphertext"]
     with pg.transaction(force_rollback=True):
         old_job = ai.claim_next_summary()
         newer_lease = old_job['lease_until'] + timedelta(seconds=1)
@@ -1788,6 +1803,14 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
     assert view['events'][0]['handling_evidence'][0]['chat_id'] == 'second'
     assert view['events'][0]['replied_by'] == ['reviewer']
     assert view['events'][0]['reply_evidence'][0]['message_id'] == 'colleague'
+    assert assistant_rules.event_snapshot(pg, s.settings)["digest"] != saved_run["event_rules_digest"]
+    assert "new-event-rules-marker" not in json.dumps(ai.get_summary_view(pg, s.ids["cm"]))
+    completed = pg.execute("SELECT id,input_fingerprint,status FROM offhours_summary_tasks WHERE is_current "
+                           "ORDER BY id").fetchall()
+    assert s.save(key="")["run_id"] == queued["run_id"]
+    assert pg.execute("SELECT id,input_fingerprint,status FROM offhours_summary_tasks WHERE is_current "
+                      "ORDER BY id").fetchall() == completed
+    assert ai.claim_next_summary() is None
     # Changed access hides the merged narrative as well as its evidence.
     pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='second'")
     assert ai.get_summary_view(pg, s.ids['owner'])['events'] == []
@@ -1994,9 +2017,25 @@ def test_assistant_window_uses_cm_identity_separate_switch_and_frozen_cutoff(pg,
     from app import summary_replies as replies
     s = seeded
     monkeypatch.setattr(replies, "connection", lambda: nullcontext(pg))
-    s.save()
-    s.save(False)
+    queued = s.save()
+    # Simulate a pre-upgrade scheduled run, including its original material fingerprint.
+    pg.execute("UPDATE offhours_summary_runs SET event_rules_ciphertext=NULL,event_rules_digest=NULL WHERE id=%s",
+               (queued["run_id"],))
+    legacy_run = pg.execute("SELECT * FROM offhours_summary_runs WHERE id=%s", (queued["run_id"],)).fetchone()
+    legacy_task = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND chat_id='chat'",
+                            (queued["run_id"],)).fetchone()
+    legacy_material = ai._load_chat(pg, legacy_run, 'chat', legacy_task['cutoff'], settings=s.settings)
+    pg.execute("UPDATE offhours_summary_tasks SET input_fingerprint=%s WHERE id=%s",
+               (legacy_material["fingerprint"], legacy_task["id"]))
+    s.save(False, key="")
     settings_before = pg.execute("SELECT * FROM offhours_summary_settings").fetchone()
+    pinned_rules = assistant_rules.event_snapshot(pg, s.settings)
+    summary_instructions = []
+    original_model = openai_client.call_openai
+    def summary_model(*args, **kwargs):
+        summary_instructions.append(kwargs["instructions"])
+        return original_model(*args, **kwargs)
+    monkeypatch.setattr(openai_client, "call_openai", summary_model)
     save_feature_config(pg, api_key_cipher(s.settings.token_encryption_key), ai.ASSISTANT_FEATURE,
         provider="openai", project_id="assistant-test", model="assistant-model", enabled=True,
         api_key="assistant-synthetic-key", updated_by_authorization_id=s.ids["owner"])
@@ -2009,6 +2048,9 @@ def test_assistant_window_uses_cm_identity_separate_switch_and_frozen_cutoff(pg,
                                    [s.ids["person"]], s.settings)
     run_id = view["run"]["id"]
     assert view["run"]["status"] == "queued" and view["responsible"]["id"] == str(s.ids["cm"])
+    stored_run = pg.execute("SELECT * FROM offhours_summary_runs WHERE id=%s", (run_id,)).fetchone()
+    assert summary_dialogues.decode(stored_run["event_rules_ciphertext"], s.settings) == pinned_rules
+    assert stored_run["event_rules_digest"] == pinned_rules["digest"]
     assert ai.ensure_assistant_run(pg, s.ids["cm"], turn, s.ids["cm"], s.start, s.end,
                                    [s.ids["person"]], s.settings)["run"]["id"] == run_id
     s.add("after-assistant", who="cm", text="This arrived after the fixed request cutoff",
@@ -2020,10 +2062,19 @@ def test_assistant_window_uses_cm_identity_separate_switch_and_frozen_cutoff(pg,
     job = ai.claim_next_summary()
     assert job["origin"] == "assistant" and job["cutoff"] == turn["created_at"]
     ai.run_claimed_summary(job, s.settings)
+    document = pinned_rules["documents"]["event-priority"]
+    assistant_rules.save_document(pg, s.settings, s.ids["owner"], "event-priority",
+        document["title"], document["description"], "manual", "published", "owner",
+        document["text"] + "\nnew-event-priority-marker", document["revision"])
+    assert ai.ensure_assistant_run(pg, s.ids["cm"], turn, s.ids["cm"], s.start, s.end,
+                                   [s.ids["person"]], s.settings)["run"]["id"] == run_id
     assert ai.prepare_next_summary(s.settings)
     ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
     result = ai.read_assistant_run(pg, s.ids["cm"], run_id, s.settings)
     assert result["run"]["status"] == "completed" and len(result["events"]) == 1
+    assert len(summary_instructions) == 1
+    assert assistant_rules.event_instructions(pinned_rules, "extract") in summary_instructions[0]
+    assert "new-event-priority-marker" not in json.dumps(result)
     assert "after-assistant" not in json.dumps(s.calls)
     assert pg.execute("SELECT * FROM offhours_summary_settings").fetchone() == settings_before
     with pytest.raises(PermissionError):
@@ -2034,11 +2085,40 @@ def test_assistant_window_uses_cm_identity_separate_switch_and_frozen_cutoff(pg,
     assert all(m["message_id"] != "after-assistant" for m in context["messages"])
     ai._stop_tasks(pg, "old function stopped")
     assert ai.read_assistant_run(pg, s.ids["cm"], run_id, s.settings)["events"]
+    # Identical messages/cutoff under an edited manual must not reuse the old completed cache.
+    pg.execute("UPDATE assistant_turns SET status='completed' WHERE id=%s", (turn_id,))
+    next_turn = uuid4()
+    pg.execute("""INSERT INTO assistant_turns(id,session_id,client_request_id,status,input_ciphertext,created_at)
+        VALUES(%s,%s,%s,'waiting','synthetic',%s)""", (next_turn, session_id, uuid4(), turn["created_at"]))
+    next_view = ai.ensure_assistant_run(pg, s.ids["cm"], next_turn, s.ids["cm"], s.start, s.end,
+                                       [s.ids["person"]], s.settings)
+    assert next_view["run"]["id"] != run_id
+    assert ai.prepare_next_summary(s.settings)
+    next_job = ai.claim_next_summary()
+    assert str(next_job["run_id"]) == next_view["run"]["id"]
+    assert next_job["input_fingerprint"] != job["input_fingerprint"]
+    ai.run_claimed_summary(next_job, s.settings)
+    finish_merges(pg, s)
+    assert ai.read_assistant_run(pg, s.ids["cm"], next_view["run"]["id"], s.settings)["run"]["status"] == "completed"
+    assert len(summary_instructions) == 2 and "new-event-priority-marker" in summary_instructions[-1]
+    assert ai.read_assistant_run(pg, s.ids["cm"], run_id, s.settings)["run"]["status"] == "completed"
+    pg.execute("UPDATE assistant_turns SET status='completed' WHERE id=%s", (next_turn,))
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE assistant_rule_overrides SET content_ciphertext='broken' WHERE rule_key='event-priority'")
+        damaged_turn = uuid4()
+        pg.execute("""INSERT INTO assistant_turns(id,session_id,client_request_id,status,input_ciphertext,created_at)
+            VALUES(%s,%s,%s,'waiting','synthetic',%s)""", (damaged_turn, session_id, uuid4(), turn["created_at"]))
+        with pytest.raises(ValueError, match="invalid encrypted token"):
+            ai.ensure_assistant_run(pg, s.ids["cm"], damaged_turn, s.ids["cm"], s.start, s.end,
+                                    [s.ids["person"]], s.settings)
+        assert ai.read_assistant_run(pg, s.ids["cm"], run_id, s.settings)["run"]["status"] == "completed"
     # Drafting from a scheduled report must also use the explicit assistant credential.
-    s.save()
+    s.save(key="")
     ai.stop_assistant_tasks(pg)
     ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
     finish_merges(pg, s)
+    assert len(summary_instructions) == 3 and summary_instructions[-1].startswith(ai._INSTRUCTIONS + "\n")
+    assert "new-event-priority-marker" not in summary_instructions[-1]
     legacy_event = ai.get_summary_view(pg, s.ids["cm"])["events"][0]
     reply_id = replies.enqueue(pg, s.ids["cm"], legacy_event["id"], s.settings,
                                feature=ai.ASSISTANT_FEATURE, instruction="Use English", language="en")
@@ -2149,6 +2229,10 @@ def test_assistant_unknown_material_cannot_be_replayed_by_a_new_turn(pg, seeded,
     assert ai.prepare_next_summary(s.settings)
     ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
     assert ai.read_assistant_run(pg, s.ids["cm"], first["run"]["id"], s.settings)["run"]["status"] == "unknown"
+    document = assistant_rules.event_snapshot(pg, s.settings)["documents"]["event-extraction"]
+    assistant_rules.save_document(pg, s.settings, s.ids["owner"], "event-extraction",
+        document["title"], document["description"], "manual", "published", "owner",
+        document["text"] + "\nnew-event-rules-marker", document["revision"])
     repeated = request()
     if repeated["run"]["id"] != first["run"]["id"]:
         ai.prepare_next_summary(s.settings)

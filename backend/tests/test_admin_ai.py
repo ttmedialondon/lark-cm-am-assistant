@@ -299,6 +299,13 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     pinned = assistant_rules.snapshot(pg, settings)
     defaults = assistant_rules.builtin_snapshot()
     assert pinned["protocol"] == 2 and len(pinned["documents"]) == 16 and len(pinned["catalog"]) == 12
+    assert len(assistant_rules.library(pg, settings)) == 20
+    for owner_scope in (False, True):
+        navigation = assistant_rules.snapshot(pg, settings, owner=owner_scope)
+        assert not assistant_rules.EVENT_KEYS.intersection(navigation["documents"])
+        assert not assistant_rules.EVENT_KEYS.intersection(item["key"] for item in navigation["catalog"])
+        with pytest.raises(PermissionError):
+            assistant_rules.read_documents(navigation, ["event-extraction"])
     assert {key: pinned["documents"][key]["text"] for key in assistant_rules.KEYS} == {
         key: document["text"] for key, document in defaults["documents"].items()}
     pinned_before = json.dumps(pinned, sort_keys=True)
@@ -363,14 +370,41 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
                        follow_redirects=False).status_code == 303
     assert assistant_rules.library(pg, settings)[key]["status"] == "archived"
     assert "样品进度手册" in client.get(path).text
+    event_page = client.get(path + "?document=event-extraction")
+    assert event_page.status_code == 200 and "运营助手" in event_page.text and "事件总结" in event_page.text
+    assert "固定用途：事件总结 · 事项抽取" in event_page.text and "暂停请使用 AI 配置" in event_page.text
+    assert 'name="kind" value="manual"' in event_page.text and 'name="status" value="published"' in event_page.text
+    assert 'name="visibility" value="owner"' in event_page.text and 'value="后台专用" readonly' in event_page.text
+    assert '<select class="form-select" id="document-kind"' not in event_page.text
+    assert "查看默认规则" in event_page.text and "不全量重跑" in event_page.text
+    event_document = assistant_rules.library(pg, settings)["event-extraction"]
+    event_content = event_document["text"] + "\n测试事件手册 <script>alert(2)</script>。"
+    event_form = {"csrf_token": "csrf", "document": "event-extraction", "revision": "0", "content": event_content,
+                  **{name: event_document[name] for name in ("title", "description", "kind", "status", "visibility")}}
+    navigation_before = assistant_rules.snapshot(pg, settings, owner=True)
+    assert client.post(path, data=event_form, follow_redirects=False).status_code == 303
+    event_row = pg.execute("SELECT * FROM assistant_rule_overrides WHERE rule_key='event-extraction'").fetchone()
+    assert event_row["revision"] == 1 and event_content not in event_row["content_ciphertext"]
+    assert assistant_rules.library(pg, settings)["event-extraction"]["text"] == event_content
+    assert assistant_rules.snapshot(pg, settings, owner=True) == navigation_before
+    event_conflict = client.post(path, data={**event_form, "content": event_content + "\n未保存的事件修改。"})
+    assert event_conflict.status_code == 409 and "未保存的事件修改。" in event_conflict.text
+    assert "当前已保存版本" in event_conflict.text and "<script>alert(2)</script>" not in event_conflict.text
+    assert "&lt;script&gt;alert(2)&lt;/script&gt;" in event_conflict.text
+    for field, value in (("kind", "knowledge"), ("status", "draft"), ("status", "archived"), ("visibility", "all")):
+        assert client.post(path, data={**event_form, "revision": "1", field: value}).status_code == 400
+    assert assistant_rules.library(pg, settings)["event-extraction"]["revision"] == 1
     session["auth"] = {"id": member, "status": "active"}
     assert client.get(path).status_code == 403 and client.post(path, data=form).status_code == 403
     assert client.get(path + "?new=1").status_code == 403
     assert client.get(path + "?document=" + key).status_code == 403
     assert client.post(path, data=publish_form).status_code == 403
+    assert client.get(path + "?document=event-extraction").status_code == 403
+    assert client.post(path, data=event_form).status_code == 403
     session["auth"] = {"id": owner, "status": "active"}
     pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (owner,))
     assert client.get(path).status_code == 403 and client.post(path, data=form).status_code == 403
+    assert client.post(path, data=event_form).status_code == 403
     with pg.transaction(), pytest.raises(PermissionError):
         assistant_rules.save_override(pg, settings, owner, "core", content, 1)
     assert pg.execute("SELECT revision FROM assistant_rule_overrides WHERE rule_key='core'").fetchone()["revision"] == 1

@@ -340,14 +340,20 @@ def create_admin_router(
             "title", "description", "kind", "status", "visibility")} if draft else {})}
         edit["text"] = draft["content"] if draft else document["text"]
         core = key in {"core", "understand", "evidence", "answer"}
+        event = key in assistant_rules.EVENT_KEYS
         return render_template(request, "admin/assistant_rules.html", {
             **page_context(access_context, "assistant-rules"),
-            "library_documents": list(documents.values()), "document_key": key or "",
-            "document": document, "edit": edit, "is_core": core,
+            "document_groups": [("运营助手", [item for name, item in documents.items()
+                                            if name not in assistant_rules.EVENT_KEYS]),
+                                ("事件总结", [item for name, item in documents.items()
+                                            if name in assistant_rules.EVENT_KEYS])],
+            "document_key": key or "", "document": document, "edit": edit, "is_core": core, "is_event": event,
+            "event_usage": {"event-extraction": "事项抽取", "event-state": "处理状态",
+                            "event-priority": "紧急度分级", "event-merge": "跨群合并"}.get(key),
             "kind_labels": {"rule": "规则", "manual": "任务手册", "knowledge": "知识资料", "template": "输出模板"},
             "status_labels": {"draft": "草稿", "published": "已发布", "archived": "已停用"},
             "visibility_labels": {"all": "全体 CM", "owner": "仅 Owner"},
-            "default_text": assistant_rules.default_text(key) if core else None,
+            "default_text": assistant_rules.default_text(key) if core or event else None,
             "max_document_chars": assistant_rules.MAX_DOCUMENT_CHARS,
             "current_text": document["text"] if conflict else None,
             "form_error": error, "saved": bool(key and request.query_params.get("saved") == key),

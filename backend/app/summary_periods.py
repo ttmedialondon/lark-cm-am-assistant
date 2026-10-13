@@ -61,6 +61,7 @@ def seed_due(conn, now):
                        "WHERE c.responsible_authorization_id=a.id AND c.ended_at IS NULL) OR EXISTS "
                        "(SELECT 1 FROM creator_account_assignments c WHERE c.responsible_authorization_id=a.id "
                        "AND c.ended_at IS NULL)) ORDER BY a.id").fetchall()
+    event_rules, rules_digest = summaries._event_rules(conn, summaries.get_settings())
     for cm in cms:
         if not summaries._roster(conn, cm['id']):
             continue
@@ -71,11 +72,12 @@ def seed_due(conn, now):
                 if start >= now:
                     continue
                 conn.execute("""INSERT INTO offhours_summary_runs(id,requested_by_authorization_id,
-                    responsible_authorization_id,window_start,window_end,report_date,period,next_check_at,refresh_until)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    responsible_authorization_id,window_start,window_end,report_date,period,next_check_at,refresh_until,
+                    event_rules_ciphertext,event_rules_digest)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT(responsible_authorization_id,report_date,period) WHERE period IS NOT NULL DO NOTHING""",
                     (uuid4(), owner['id'], cm['id'], start, end, day, period, now,
-                     max(end, now) + timedelta(days=1)))
+                     max(end, now) + timedelta(days=1), event_rules, rules_digest))
     conn.execute("UPDATE offhours_summary_settings SET next_period_check_at=%s WHERE id",
                  (now + timedelta(minutes=15),))
 
@@ -119,6 +121,7 @@ def backfill_due(conn, now):
     # Retain the full roster in shared groups; only filter the conversations to visit.
     affected = [chat for chat in chats if person in chat['contact_ids']]
     deferred, blocked, waiting_sync, inserted = False, False, False, 0
+    event_rules, rules_digest = summaries._event_rules(conn, summaries.get_settings())
     run_ids = []
     for offset in range(7):
         day = now.astimezone(summaries.LONDON).date() - timedelta(days=offset)
@@ -127,13 +130,15 @@ def backfill_due(conn, now):
             if start >= now:
                 continue
             run = conn.execute("""INSERT INTO offhours_summary_runs(id,requested_by_authorization_id,
-                responsible_authorization_id,window_start,window_end,report_date,period,next_check_at,refresh_until)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                responsible_authorization_id,window_start,window_end,report_date,period,next_check_at,refresh_until,
+                event_rules_ciphertext,event_rules_digest)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT(responsible_authorization_id,report_date,period) WHERE period IS NOT NULL
                 DO UPDATE SET requested_by_authorization_id=EXCLUDED.requested_by_authorization_id
                 RETURNING *,id AS run_id""",
                 (uuid4(), owner['id'], cm, start, end, day, period,
-                 now if now < end else None, end + timedelta(days=1) if now < end else end)).fetchone()
+                 now if now < end else None, end + timedelta(days=1) if now < end else end,
+                 event_rules, rules_digest)).fetchone()
             run_ids.append(run['id'])
             count = summaries._schedule_run(conn, run, now, contact_ids={person}, roster=roster, chats=chats)
             deferred |= count is None

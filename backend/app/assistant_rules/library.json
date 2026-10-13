@@ -106,5 +106,41 @@
     "path": "templates/answer-report.md",
     "status": "published",
     "visibility": "all"
+  },
+  {
+    "key": "event-extraction",
+    "title": "事件抽取",
+    "description": "固定用于事件总结的会话分析阶段，判断同一达人在时段内发生的具体事项及真实来源。",
+    "kind": "manual",
+    "path": "manuals/event-extraction.md",
+    "status": "published",
+    "visibility": "owner"
+  },
+  {
+    "key": "event-state",
+    "title": "回复与解决状态",
+    "description": "固定用于事件抽取和跨群合并，独立判断实质回复、诉求完成及当前下一步。",
+    "kind": "manual",
+    "path": "manuals/event-state.md",
+    "status": "published",
+    "visibility": "owner"
+  },
+  {
+    "key": "event-priority",
+    "title": "事件紧急度",
+    "description": "固定用于事件抽取，按实际业务内容判断 P0–P3，区分风险、普通请求和不可读核心材料。",
+    "kind": "manual",
+    "path": "manuals/event-priority.md",
+    "status": "published",
+    "visibility": "owner"
+  },
+  {
+    "key": "event-merge",
+    "title": "跨群事项合并",
+    "description": "固定用于同一达人同一时段的事项合并，核对具体业务标识和承接关系，保留不同事项及反证。",
+    "kind": "manual",
+    "path": "manuals/event-merge.md",
+    "status": "published",
+    "visibility": "owner"
   }
 ]

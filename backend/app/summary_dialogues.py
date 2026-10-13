@@ -363,6 +363,17 @@ reference 可用双方明确承接关系，但必须有完整引用依据；仅 
 MERGE_INSTRUCTIONS += core.HANDLING_INSTRUCTIONS
 
 
+def _event_instructions(job, settings, stage):
+    ciphertext, digest = job.get("event_rules_ciphertext"), job.get("event_rules_digest")
+    if ciphertext is None and digest is None:
+        return core._INSTRUCTIONS if stage == "extract" else MERGE_INSTRUCTIONS
+    from . import assistant_rules
+    pinned = decode(ciphertext, settings)
+    if not isinstance(pinned, dict) or pinned.get("digest") != digest:
+        raise core.InvalidModelOutput("invalid event manuals snapshot")
+    return assistant_rules.event_instructions(pinned, stage)
+
+
 def merged_evidence(left, right):
     unique = {core._hash(e): e for e in left["evidence"] + right["evidence"]}
     return {
@@ -460,6 +471,7 @@ def combine(raw, left, right):
 def step(job, settings):
     with core.connection() as conn, conn.transaction():
         cfg = core._config(conn, core.run_feature(job))
+        instructions = _event_instructions(job, settings, "extract" if job["chat_id"] else "merge")
         if job["chat_id"]:
             data = checked_chat(conn, job, settings)
             chunks = segments(data)
@@ -486,7 +498,7 @@ def step(job, settings):
                 cfg,
                 pending["pack"],
                 schema,
-                core._INSTRUCTIONS + "\n只分析 core_refs 中的本时段消息，其他消息仅是上下文。"
+                instructions + "\n只分析 core_refs 中的本时段消息，其他消息仅是上下文。"
                 "processed_refs 必须逐条完整列出 core_refs。不得输出仅有上下文依据的事项。",
                 checkpoint=checkpoint,
             )
@@ -547,7 +559,7 @@ def step(job, settings):
                      "b": {k: v for k, v in candidate.items() if k != "reason"},
                      "evidence_messages": evidence_messages},
                     merge_format(evidence_messages, ledger[against], candidate),
-                    MERGE_INSTRUCTIONS,
+                    instructions,
                     checkpoint=checkpoint,
                 )
                 merged = combine(response["text"], ledger[against], candidate)
