@@ -261,16 +261,22 @@ def current_context(conn, actor_id, selected_context, settings, *, now=None):
             if not isinstance(cursor, str) or cursor != result.get("next_cursor"):
                 raise ValueError("分页引用已更新。")
             scope["cursor"] = cursor
+    local = now.astimezone(summaries.LONDON)
+    day_start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = day_start - timedelta(days=day_start.weekday())
     return {
         "actor": {"id": str(actor_id), "name": actor["display_name"] or "CM"},
         "scope": scope,
         "available_scopes": selection["scopes"],
         "timezone": summaries.TIMEZONE,
-        "now": now.astimezone(summaries.LONDON).isoformat(),
-        "defaults": {"morning_start": now.astimezone(summaries.LONDON).replace(
-            hour=0, minute=0, second=0, microsecond=0).isoformat(),
-            "morning_end": min(now, now.astimezone(summaries.LONDON).replace(
-                hour=12, minute=0, second=0, microsecond=0)).astimezone(summaries.LONDON).isoformat()},
+        "now": local.isoformat(),
+        "defaults": {"morning_start": day_start.isoformat(),
+            "morning_end": min(local, day_start.replace(hour=12)).isoformat(),
+            "yesterday_start": (day_start - timedelta(days=1)).isoformat(), "yesterday_end": day_start.isoformat(),
+            "week_start": week_start.isoformat(), "previous_week_start": (week_start - timedelta(days=7)).isoformat(),
+            "previous_week_end": week_start.isoformat(),
+            "previous_week_same_time_end": (local - timedelta(days=7)).astimezone(UTC)
+                .astimezone(summaries.LONDON).isoformat()},
     }
 
 

@@ -52,7 +52,7 @@ def test_shared_gate_allows_four_and_rejects_five_valid_running_leases() -> None
 def test_single_request_transport_preserves_retry_hints_and_safe_failure_metadata(monkeypatch) -> None:
     calls = []
     result = httpx.Response(200, json={
-        "status": "completed", "output_text": "{}", "id": "resp_test",
+        "status": "completed", "output_text": "{}", "output": [], "id": "resp_test",
         "usage": {"input_tokens": 80, "output_tokens": 20},
     })
 
@@ -83,8 +83,20 @@ def test_single_request_transport_preserves_retry_hints_and_safe_failure_metadat
     assert calls[-1][1]["json"]["reasoning"] == {"effort": "none"}
     assert calls[-1][1]["json"]["store"] is False
 
+    async def tool_post(headers, payload, total_timeout):
+        return post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=total_timeout)
+
+    monkeypatch.setattr(openai_client, "_post_with_deadline", tool_post)
+    tool_response = openai_client.call_openai_tools(
+        {"model": "test-model"}, "test-key", [], UUID(int=1), instructions="test", tools=[],
+        output_format={"type": "json_object"}, max_output_tokens=16000,
+    )
+    assert calls[-1][1]["json"]["max_output_tokens"] == 16000 and tool_response["output"] == []
+    assert tool_response["telemetry"]["response_status"] == "completed"
+
     result = httpx.Response(200, headers={"x-request-id": "req_incomplete"}, json={
         "status": "incomplete", "id": "resp_incomplete", "output_text": "PRIVATE BODY",
+        "incomplete_details": {"reason": "max_output_tokens"},
         "usage": {"input_tokens": 80, "output_tokens": 20},
     })
     with pytest.raises(openai_client.ModelOutputError) as stopped:
@@ -92,6 +104,15 @@ def test_single_request_transport_preserves_retry_hints_and_safe_failure_metadat
     assert stopped.value.telemetry["usage"] == {"input_tokens": 80, "output_tokens": 20}
     assert stopped.value.telemetry["response_id"] == "resp_incomplete"
     assert stopped.value.telemetry["openai_request_id"] == "req_incomplete"
+    assert stopped.value.telemetry["response_status"] == "incomplete"
+    assert stopped.value.telemetry["incomplete_reason"] == "max_output_tokens"
+    assert "PRIVATE BODY" not in str(stopped.value) + str(stopped.value.telemetry)
+    result = httpx.Response(200, json={
+        "status": "incomplete", "output_text": "PRIVATE BODY", "incomplete_details": {"reason": "PRIVATE BODY"},
+    })
+    with pytest.raises(openai_client.ModelOutputError) as stopped:
+        request()
+    assert stopped.value.telemetry["incomplete_reason"] is None
     assert "PRIVATE BODY" not in str(stopped.value) + str(stopped.value.telemetry)
 
     result = httpx.Response(503, headers={"Retry-After": "7200", "x-request-id": "req_test"},

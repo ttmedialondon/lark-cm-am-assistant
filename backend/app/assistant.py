@@ -35,6 +35,12 @@ INSTRUCTIONS = """你是 TT Media 内部运营助手。所有用户输入由你�
 本人聊天不是只看本人发出的消息。其他CM的姓名可以是本人会话中的参与者，不能据此读取对方全部会话。
 时间和对象从本轮问题确定，不询问授权范围，不要求选择人员、查询模式或时间。
 普通聊天总结未指定时间时默认今天00:00至本轮提交时刻；昨天为英国昨天完整一天。
+直接使用context.defaults给出的英国日历边界，不自行将“本周”算成过去七天。
+昨天使用yesterday_start至yesterday_end，结束为今天零点的半开区间，不是昨天23:59。
+本周至今使用week_start至context.now；完整上周使用previous_week_start至previous_week_end。
+本周与上周同期比较分别查week_start至context.now、previous_week_start至previous_week_same_time_end。
+周同比用两次activity_stats，comparison都设null；previous只代表紧挨的等长时段，不代表上周同星期同期。
+比较注明各自英国日期和截止；夏令时切换按边界的明确偏移计算实际时长，不移成固定168小时或滚动七天。
 这个默认只用于独立新问题。“这些事情/刚才那些/进度怎么样”先沿用上一轮实际事项，跨午夜也不变成只查新一天。
 追问当前进度时，原时段用于定位事项，截止延至本轮context.now；不必先重复总结旧截止之前的全部材料。
 最近回复若只有0条消息或连接情况，继续定位最近含具体业务事项的一轮；不要要求用户重新复制刚谈过的事项。
@@ -452,7 +458,11 @@ def _finish_error(job, settings, code, telemetry=None, *, exception=None):
                 total[key] = total.get(key, 0) + value
         checkpoint = codec.decode(row['checkpoint_ciphertext'], settings) or {}
         receipt = checkpoint.get('response_received') or next(iter(reversed(checkpoint.get('receipts', []))), {})
-        request_id = (telemetry or {}).get('openai_request_id') or receipt.get('telemetry', {}).get('openai_request_id')
+        call_telemetry = telemetry or receipt.get('telemetry', {})
+        call_usage = (telemetry or {}).get('usage', {}) if telemetry else receipt.get('usage', {})
+        failed_call_usage = {key: value for key, value in call_usage.items()
+            if key in ('input_tokens', 'output_tokens') and type(value) is int and value >= 0}
+        request_id = call_telemetry.get('openai_request_id')
         location, seen, cause = None, set(), exception
         while cause is not None and id(cause) not in seen:
             seen.add(id(cause))
@@ -467,6 +477,8 @@ def _finish_error(job, settings, code, telemetry=None, *, exception=None):
         checkpoint['failure'] = {'code': code, 'stage': checkpoint.get('progress'),
             'model_steps': checkpoint.get('model_steps'),
             'openai_request_id': request_id, 'error_type': type(exception).__name__ if exception else None,
+            'response_status': call_telemetry.get('response_status'),
+            'incomplete_reason': call_telemetry.get('incomplete_reason'), 'failed_call_usage': failed_call_usage,
             'location': location}
         conn.execute('''UPDATE assistant_turns SET status=%s,error_code=%s,usage=%s::jsonb,
             checkpoint_ciphertext=%s,
@@ -895,7 +907,8 @@ def step(job, settings):
                      (codec.encode(checkpoint, settings), row['id']))
     key = api_key_cipher(settings.token_encryption_key).decrypt(cfg['api_key_ciphertext'])
     response = api.call_openai_tools(cfg, key, model_items, row['actor_id'],
-                                     instructions=model_instructions, tools=model_tools, output_format=model_format)
+        instructions=model_instructions, tools=model_tools, output_format=model_format,
+        max_output_tokens=16000 if window else 8000)
     with connection() as conn, conn.transaction():
         try:
             row = _fence(conn, job)

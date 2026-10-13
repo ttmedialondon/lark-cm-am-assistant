@@ -55,6 +55,7 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
 
     def model(_cfg, _key, items, _actor, **kwargs):
         calls.append(kwargs['tools'])
+        assert kwargs['max_output_tokens'] == (16000 if not kwargs['tools'] else 8000)
         if not kwargs['tools']:
             segment = json.loads(items[0]['content'])
             assert len(assistant_window.encoded(segment)) <= assistant_window.INPUT_CHARS + 20
@@ -657,7 +658,8 @@ def test_unknown_and_stopped_requests_never_replay_provider(pg, chat, monkeypatc
         calls.append(True)
         return {'text': json.dumps({'answer': 'PRIVATE_MODEL_ANSWER', 'event_refs': [], 'result_refs': [],
             'draft_ref': None}), 'output': [], 'usage': {'input_tokens': 7, 'output_tokens': 2},
-            'response_id': 'resp-diagnostic', 'telemetry': {'openai_request_id': 'req-diagnostic'}}
+            'response_id': 'resp-diagnostic', 'telemetry': {'openai_request_id': 'req-diagnostic',
+                'response_status': 'completed', 'incomplete_reason': None}}
     def broken_result(*args, **kwargs):
         raise TypeError('PRIVATE_BACKEND_CONTEXT must not enter diagnostics')
     monkeypatch.setattr(openai_client, 'call_openai_tools', accepted)
@@ -670,9 +672,34 @@ def test_unknown_and_stopped_requests_never_replay_provider(pg, chat, monkeypatc
     assert failure['error_type'] == 'TypeError' and failure['location']['file'] == 'assistant.py'
     assert failure['location']['function'] == '_apply_response' and failure['location']['line'] > 0
     assert failure['openai_request_id'] == 'req-diagnostic'
+    assert failure['response_status'] == 'completed' and failure['incomplete_reason'] is None
+    assert failure['failed_call_usage'] == {'input_tokens': 7, 'output_tokens': 2}
     assert local_row['usage'] == {'input_tokens': 7, 'output_tokens': 2} and len(calls) == 2
     for private in ('PRIVATE_MODEL_ANSWER', 'PRIVATE_BACKEND_CONTEXT'):
         assert private not in json.dumps(failure) and private not in caplog.text
+
+    def incomplete(*args, **kwargs):
+        calls.append(True)
+        raise openai_client.ModelOutputError('unfinished response', telemetry={
+            'openai_request_id': 'req-incomplete', 'response_id': 'resp-incomplete',
+            'response_status': 'incomplete', 'incomplete_reason': 'max_output_tokens',
+            'usage': {'input_tokens': 8205, 'output_tokens': 4000},
+        })
+
+    monkeypatch.setattr(openai_client, 'call_openai_tools', incomplete)
+    truncated = assistant.submit(pg, chat.ids['cm'], payload('检查输出截断诊断'), chat.settings)
+    pg.execute('UPDATE assistant_turns SET usage=%s::jsonb WHERE id=%s',
+               (json.dumps({'input_tokens': 100, 'output_tokens': 30}), truncated['id']))
+    finish(chat)
+    truncated_row = assistant._turn(pg, chat.ids['cm'], truncated['id'])
+    failure = summary_dialogues.decode(truncated_row['checkpoint_ciphertext'], chat.settings)['failure']
+    assert truncated_row['error_code'] == 'invalid_output' and truncated_row['result_ciphertext'] is None
+    assert failure['openai_request_id'] == 'req-incomplete' and failure['response_status'] == 'incomplete'
+    assert failure['incomplete_reason'] == 'max_output_tokens'
+    assert failure['failed_call_usage'] == {'input_tokens': 8205, 'output_tokens': 4000}
+    assert truncated_row['usage'] == {'input_tokens': 8305, 'output_tokens': 4030}
+    assert truncated_row['response_id'] == 'resp-incomplete'
+    assert assistant.claim() is None and len(calls) == 3
 
 
 def test_waiting_releases_slot_and_resume_returns_original_call_id(pg, chat, monkeypatch):

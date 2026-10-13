@@ -148,10 +148,11 @@ def _transport_error(started):
     )
 
 
-def call_openai_tools(config, api_key, items, actor_id, *, instructions, tools, output_format):
+def call_openai_tools(config, api_key, items, actor_id, *, instructions, tools, output_format,
+                      max_output_tokens=4000):
     """One durable assistant step; the feature owns continuation and retries."""
     headers, payload = _request_parts(
-        config, api_key, {}, actor_id, instructions, output_format, 4000, 'low', 60.0,
+        config, api_key, {}, actor_id, instructions, output_format, max_output_tokens, 'low', 60.0,
     )
     payload.update(input=items, tools=tools, tool_choice='auto',
                    include=['reasoning.encrypted_content'])
@@ -186,8 +187,15 @@ def _read_response(response, started, *, full_output=False):
         "output_tokens": _nonnegative_int(usage.get("output_tokens")),
     }
     response_id = _bounded_text(data.get("id"), 160)
-    telemetry = {**telemetry, "usage": safe_usage, "response_id": response_id}
-    if data.get("status") not in {None, "completed"}:
+    status = data.get("status")
+    incomplete = data.get("incomplete_details")
+    reason = incomplete.get("reason") if isinstance(incomplete, Mapping) else None
+    telemetry = {**telemetry, "usage": safe_usage, "response_id": response_id,
+        "response_status": status if status in (
+            "completed", "failed", "in_progress", "cancelled", "queued", "incomplete") else None,
+        "incomplete_reason": reason if status == "incomplete" and reason in (
+            "max_output_tokens", "content_filter") else None}
+    if status not in (None, "completed"):
         raise ModelOutputError("unfinished response", telemetry=telemetry)
     try:
         if full_output and any(item.get('type') == 'function_call' for item in _json_list(data.get('output'))

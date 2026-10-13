@@ -48,6 +48,25 @@ def test_creator_snapshot_keeps_all_pages_stable_and_live_sources_protected(pg, 
     pg.execute("INSERT INTO assistant_turns(id,session_id,client_request_id,input_ciphertext) "
                "VALUES(%s,%s,%s,'fixture')", (turn_id, session, uuid4()))
     context = tools.current_context(pg, s.ids["cm"], {}, s.settings)
+    for current, yesterday_start, yesterday_end, week_start, previous_start, same_time in [
+        ("2026-10-13T01:23:00+01:00", "2026-10-12T00:00:00+01:00", "2026-10-13T00:00:00+01:00",
+         "2026-10-12T00:00:00+01:00", "2026-10-05T00:00:00+01:00", "2026-10-06T01:23:00+01:00"),
+        ("2026-03-30T01:23:00+01:00", "2026-03-29T00:00:00+00:00", "2026-03-30T00:00:00+01:00",
+         "2026-03-30T00:00:00+01:00", "2026-03-23T00:00:00+00:00", "2026-03-23T01:23:00+00:00"),
+        ("2026-10-26T01:23:00+00:00", "2026-10-25T00:00:00+01:00", "2026-10-26T00:00:00+00:00",
+         "2026-10-26T00:00:00+00:00", "2026-10-19T00:00:00+01:00", "2026-10-19T01:23:00+01:00"),
+    ]:
+        timed = tools.current_context(pg, s.ids["cm"], {}, s.settings, now=datetime.fromisoformat(current))
+        assert timed["defaults"] == {
+            "morning_start": yesterday_end, "morning_end": current,
+            "yesterday_start": yesterday_start, "yesterday_end": yesterday_end,
+            "week_start": week_start, "previous_week_start": previous_start, "previous_week_end": week_start,
+            "previous_week_same_time_end": same_time,
+        }
+        elapsed = (datetime.fromisoformat(yesterday_end).astimezone(UTC)
+                   - datetime.fromisoformat(yesterday_start).astimezone(UTC))
+        assert elapsed.total_seconds() / 3600 == (23 if current.startswith("2026-03")
+                                                 else 25 if current.startswith("2026-10-26") else 24)
     selected = tools.current_context(pg, s.ids["cm"], {
         "audience": "creators", "creator_ids": [str(ids[0])],
         "start": s.start.isoformat(), "end": datetime.now(UTC).isoformat()}, s.settings)
