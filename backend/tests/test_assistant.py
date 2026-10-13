@@ -47,11 +47,11 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
             VALUES(%s,'chat',%s)""", (chat.ids['cm'], message_id))
         ids.append(message_id)
     monkeypatch.setattr(assistant_search, 'WINDOW_PAGE_SIZE', 1)
-    monkeypatch.setattr(assistant_window, 'INPUT_CHARS', 3_200)
+    monkeypatch.setattr(assistant_window, 'INPUT_CHARS', 6_000)
     monkeypatch.setattr(assistant, 'MAX_MODEL_STEPS', 1)
     empty_evidence = assistant_window.summary_format({})['schema']['properties']['evidence_refs']
     assert empty_evidence['maxItems'] == 0 and 'enum' not in empty_evidence['items']
-    calls, parts, raw_ids = [], [], set()
+    calls, parts, raw_ids, reduced = [], [], set(), []
 
     def model(_cfg, _key, items, _actor, **kwargs):
         calls.append(kwargs['tools'])
@@ -64,12 +64,26 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
                 ref for note in segment['summaries'] for ref in note['evidence_refs']}
             enum = kwargs['output_format']['schema']['properties']['evidence_refs']['items']['enum']
             assert refs_in_input == set(enum) and all(ref.startswith('R') and ref[1:].isdigit() for ref in enum)
+            item_spec = kwargs['output_format']['schema']['properties']['items']['items']['properties']
+            assert item_spec['evidence_refs']['items']['enum'] == enum and item_spec['evidence_refs']['minItems'] == 1
             raw_ids.update(message['message_id'] for message in messages)
             for message in messages:
                 if message['message_id'] == 'window-0':
                     parts.append((message['text_part'], message['text']))
-            refs = [messages[0]['message_ref']] if messages else segment['summaries'][0]['evidence_refs']
-            note = {'summary': '保留本段业务事项与当前进展。', 'evidence_refs': refs}
+            pending = [{'summary': f"事项 {message['message_id']}：对方提出合作安排，待跟进。",
+                        'evidence_refs': [message['message_ref']]} for message in messages]
+            if not messages:
+                reduced.append(True)
+                pending = [item for note in segment['summaries'] for item in note['items']]
+            grouped = {}
+            for item in pending:
+                refs = grouped.setdefault(item['summary'], [])
+                refs.extend(ref for ref in item['evidence_refs'] if ref not in refs)
+            items = [{'summary': summary, 'evidence_refs': refs} for summary, refs in grouped.items()]
+            refs = list(dict.fromkeys(ref for item in items for ref in item['evidence_refs']))
+            overview = ('保留本段已知合作事项、现有进展与未跟进安排。' * 60
+                        if messages else '保留本段业务事项与当前进展。')
+            note = {'summary': overview, 'evidence_refs': refs, 'items': items}
             return {'text': json.dumps(note), 'output': [], 'usage': {'input_tokens': 2, 'output_tokens': 1}}
         outputs = [item for item in items if item.get('type') == 'function_call_output']
         if not outputs:
@@ -81,8 +95,13 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
         assert source['page_count'] == 15 and source['coverage']['scan_complete']
         assert source['total_messages'] == 15 and source['next_cursor'] is None
         assert 'summaries' in source and 'messages' not in source
+        pending = [item for note in source['summaries'] for item in note['items']]
+        assert {item['summary'].split('：')[0].removeprefix('事项 ') for item in pending} == {*ids, 'm1', 'outside'}
         final = {'answer': '已整理本时段重点。', 'event_refs': [], 'result_refs': [],
-                 'data_refs': [source['query_ref']], 'draft_ref': None}
+                 'data_refs': [source['query_ref']], 'draft_ref': None, 'sections': [{
+                     'title': '合作安排待跟进', 'summary': pending[0]['summary'],
+                     'message_refs': pending[0]['evidence_refs'],
+                 }]}
         return {'text': json.dumps(final), 'output': [], 'usage': {}}
 
     monkeypatch.setattr(openai_client, 'call_openai_tools', model)
@@ -100,19 +119,38 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
             canonical = {message['message_ref'] for page in assistant_window.pages(checkpoint, window)
                          for message in page['messages']}
             assert all(set(note['evidence_refs']) <= canonical for note in window['summaries'])
+            expected = {f"事项 {message['message_id']}：对方提出合作安排，待跟进。": message['message_ref']
+                        for page in assistant_window.pages(checkpoint, window) for message in page['messages']}
+            assert all(item['evidence_refs'] == [expected[item['summary']]]
+                       for note in window['summaries'] for item in note['items'])
             bad_job = deepcopy(window)
             with pytest.raises(ValueError, match='引用或内容无效'):
                 assistant_window.accept_summary(bad_job, {'text': json.dumps({
                     'summary': '不得丢掉未知引用然后照搬结论。', 'evidence_refs': [*refmap, 'R999999'],
+                    'items': [],
                 }), 'output': []}, refmap)
             assert bad_job == window
+            for bad_refs in ([], ['R999999']):
+                with pytest.raises(ValueError, match='事项引用或内容无效'):
+                    assistant_window.accept_summary(bad_job, {'text': json.dumps({
+                        'summary': '顶层正确也不能让无依据事项通过。', 'evidence_refs': list(refmap)[:1],
+                        'items': [{'summary': '未经核验的业务事项', 'evidence_refs': bad_refs}],
+                    }), 'output': []}, refmap)
+                assert bad_job == window
             legacy = {**window, 'compact_refs': False}
             _material, legacy_refs = assistant_window.summary_input(checkpoint, legacy)
             assert all(ref == target and ref in canonical for ref, target in legacy_refs.items())
+            old_job = {**deepcopy(window), 'structured_items': False}
+            old_shape = assistant_window.summary_format(refmap, structured_items=False)
+            assert 'items' not in old_shape['schema']['properties']
+            assistant_window.accept_summary(old_job, {'text': json.dumps({
+                'summary': '旧任务仍只有整段证据。', 'evidence_refs': list(refmap)[:1],
+            }), 'output': []}, refmap)
+            assert 'items' not in old_job['summaries'][-1]
         progress.append(value['progress'])
         if value['status'] not in assistant.ACTIVE:
             break
-    assert value['status'] == 'completed' and len(calls) > 2
+    assert value['status'] == 'completed' and len(calls) > 2 and reduced
     assert raw_ids == {*ids, 'm1', 'outside'}
     parts.sort()
     assert parts[0][0][0] == 0 and parts[-1][0][1] == parts[-1][0][2]
@@ -191,7 +229,8 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
     assert previous['answer'] == '' and previous['requires_refresh']
     assert previous['window'] == source['window'] and previous['scope']['cm_id'] == str(chat.ids['cm'])
     assert previous['checked_at'] == stored_checkpoint['tool_results'][0]['_window_model_result']['checked_at']
-    assert previous['summaries'] and all(set(note) == {'summary'} for note in previous['summaries'])
+    assert previous['summaries'] and all(set(note) <= {'summary', 'items'} for note in previous['summaries'])
+    assert all(set(item) == {'summary'} for note in previous['summaries'] for item in note.get('items', []))
     assert previous['events'] == previous['result_refs'] == previous['data_refs'] == previous['data'] == retained == []
     incomplete = deepcopy(stored_checkpoint)
     incomplete['tool_results'][0]['_window_model_result']['coverage']['scan_complete'] = False
@@ -264,7 +303,9 @@ def test_search_source_get_continues_without_model_and_cleared_refs_stay_unreada
                     'creator_ids': None, 'chat_ids': None, 'cursor': None})}], 'usage': {}}
         source = json.loads(outputs[-1]['output'])
         final = {'answer': '找到相关原文。', 'event_refs': [], 'result_refs': [],
-                 'data_refs': [source['query_ref']], 'draft_ref': None}
+                 'data_refs': [source['query_ref']], 'draft_ref': None,
+                 'sections': [{'title': '相关沟通', 'summary': '找到真实文字记录。',
+                               'message_refs': [source['messages'][0]['message_ref']]}]}
         return {'text': json.dumps(final), 'output': [], 'usage': {}}
 
     monkeypatch.setattr(openai_client, 'call_openai_tools', model)
@@ -273,6 +314,21 @@ def test_search_source_get_continues_without_model_and_cleared_refs_stay_unreada
         finish(chat)
     view = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
     source = view['result']['data'][0]
+    section = view['result']['sections'][0]
+    assert section['message_refs'] == [source['messages'][0]['message_ref']]
+    assert section['sources'][0]['text'] == 'Find fixture facts'
+    row = assistant._turn(pg, chat.ids['cm'], turn['id'])
+    checkpoint = summary_dialogues.decode(row['checkpoint_ciphertext'], chat.settings)
+    context = assistant._context(pg, row, checkpoint, chat.settings)
+    stored_final = summary_dialogues.decode(row['result_ciphertext'], chat.settings)['final']
+    invalid = {**stored_final, 'sections': [{**stored_final['sections'][0], 'message_refs': ['m.not-owned']}]}
+    with pytest.raises(ValueError, match='引用未取得'):
+        assistant.tools.build_result(pg, chat.ids['cm'], row, invalid, chat.settings,
+                                     context, checkpoint['tool_results'])
+    history, retained = assistant._history(pg, {**row, 'id': uuid4()}, chat.settings, context)
+    indexed = json.loads(history[-1]['content'])['section_index'][0]
+    assert indexed['index'] == 1 and indexed['message_refs'] == section['message_refs'] and retained
+    assert indexed['sources'][0]['message_ref'] == section['message_refs'][0]
     assert source['has_more'] and source['next_source_url'].startswith('/assistant/sources/')
     before = pg.execute('SELECT checkpoint_ciphertext,usage FROM assistant_turns WHERE id=%s',
                         (turn['id'],)).fetchone()
@@ -313,6 +369,32 @@ def test_search_source_get_continues_without_model_and_cleared_refs_stay_unreada
     assert len(calls) == 2 and pg.execute('SELECT count(*) n FROM summary_reply_tasks').fetchone()['n'] == 0
     with pytest.raises(LookupError):
         assistant.tools.evidence(pg, chat.ids['reviewer'], ref, chat.settings)
+    direct_final = {**stored_final, 'answer': '仅保留相关沟通。', 'data_refs': []}
+    for index in range(7):
+        following = assistant.submit(pg, chat.ids['cm'], {
+            'session_id': str(row['session_id']), 'client_request_id': str(uuid4()),
+            'message': f'继续只看这一类沟通 {index + 1}',
+        }, chat.settings)
+        next_row = assistant._turn(pg, chat.ids['cm'], following['id'])
+        next_checkpoint = summary_dialogues.decode(next_row['checkpoint_ciphertext'], chat.settings)
+        next_context = assistant._context(pg, next_row, next_checkpoint, chat.settings)
+        history, retained = assistant._history(pg, next_row, chat.settings, next_context)
+        indexed = json.loads(history[-1]['content'])['section_index'][0]
+        assert indexed['message_refs'] == section['message_refs'] and retained
+        next_checkpoint['tool_results'] = retained
+        rendered = assistant.tools.build_result(pg, chat.ids['cm'], next_row, direct_final,
+            chat.settings, next_context, retained)
+        assert rendered['data_refs'] == [] and rendered['sections'][0]['sources'][0]['text'] == 'Find fixture facts'
+        pg.execute("UPDATE assistant_turns SET status='completed',checkpoint_ciphertext=%s,result_ciphertext=%s "
+                   "WHERE id=%s", (summary_dialogues.encode(next_checkpoint, chat.settings),
+                    summary_dialogues.encode({'final': direct_final}, chat.settings), following['id']))
+    foreign_context = assistant.tools.current_context(pg, chat.ids['owner'], {}, chat.settings)
+    assert assistant._history(pg, {**next_row, 'id': uuid4()}, chat.settings, foreign_context) == ([], [])
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s AND chat_id='chat'",
+                   (chat.ids['cm'],))
+        assert assistant._history(pg, {**next_row, 'id': uuid4()}, chat.settings, next_context) == ([], [])
+    assert len(calls) == 2
     assistant.clear_conversations(pg, chat.ids['cm'], chat.settings)
     with pytest.raises(LookupError):
         assistant.tools.evidence(pg, chat.ids['cm'], ref, chat.settings)
@@ -334,7 +416,8 @@ def test_repeated_window_uses_validated_cache_and_history_does_not_double_source
             messages = [message for conversation in segment.get('conversations', [])
                         for message in conversation['messages']]
             refs = [messages[0]['message_ref']] if messages else segment['summaries'][0]['evidence_refs']
-            return {'text': json.dumps({'summary': '保留全部原文的进展。', 'evidence_refs': refs}),
+            return {'text': json.dumps({'summary': '保留全部原文的进展。', 'evidence_refs': refs,
+                'items': [{'summary': '保留这一事项的进展。', 'evidence_refs': refs}]}),
                     'output': [], 'usage': {}}
         outputs = [item for item in items if item.get('type') == 'function_call_output']
         if not outputs or repeated:

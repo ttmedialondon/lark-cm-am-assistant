@@ -85,6 +85,17 @@
 .oa-source-entry { background: #fafbfd; border: 1px solid var(--oa-line); padding: 12px 14px; }
 .oa-source-entry > details { margin: 0; }
 .oa-source-entry > details > summary { cursor: pointer; font-weight: 500; color: #637994; }
+.oa-summary-section { margin: 20px 0; padding-bottom: 18px; border-bottom: 1px solid var(--oa-line); }
+.oa-summary-section h4 { margin: 0 0 8px; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.oa-section-summary { line-height: 1.8; overflow-wrap: anywhere; }
+.oa-section-summary p { margin: 0 0 10px; }
+.oa-section-summary :is(ul, ol) { padding-left: 20px; margin: 8px 0 12px; }
+.oa-section-sources { color: var(--oa-muted); font-size: 12px; }
+.oa-section-sources > summary { cursor: pointer; }
+.oa-section-source { margin-top: 12px; padding: 12px; background: #f6f8fc; border-radius: 9px; }
+.oa-section-source figure { margin: 0 0 7px; }
+.oa-section-source figcaption { line-height: 1.7; margin-bottom: 7px; }
+.oa-section-source blockquote { margin: 0; color: var(--oa-ink); font-size: 13px; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; }
 .oa-source-page figure { padding: 12px 0; border-top: 1px solid var(--oa-line); margin: 12px 0; }
 .oa-source-page figcaption { font-size: 12px; color: var(--oa-muted); }
 .oa-source-page blockquote { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; padding: 0 0 0 10px; border-left: 2px solid #dce5f4; color: var(--oa-ink); }

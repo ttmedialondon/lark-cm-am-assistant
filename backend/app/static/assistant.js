@@ -553,7 +553,7 @@
     card.append(details); draw(data); return card;
   }
   function dataCard(data) {
-    const titles = {creators: "达人资料", groups: "群聊目录", sync: "连接与消息读取", activity: "活动统计", messages: "消息命中",
+    const titles = {creators: "达人资料", groups: "群聊目录", conversations: "会话目录", sync: "连接与消息读取", activity: "活动统计", messages: "消息命中",
       window_messages: "总结来源", message_context: "原文与问答"};
     if (!data || !titles[data.kind]) return null;
     if (data.kind === "sync" && !canManageCM) return null;
@@ -583,6 +583,11 @@
       if (rows.length) card.append(table(["群聊", "用途", "成员"], rows));
       else card.append(node("p", "oa-coverage", "当前范围没有匹配的群聊。"));
       if (Number.isFinite(data.total)) card.append(node("p", "oa-coverage", `共 ${data.total} 个 · 本页 ${rows.length} 个`));
+    } else if (data.kind === "conversations") {
+      const rows = (data.conversations || []).map(chat => [chat.name || "未命名会话", {group: "群聊", p2p: "私聊"}[chat.mode] || "会话",
+        (chat.matched_people || []).map(person => person.name).filter(Boolean).join("、") || "—"]);
+      if (rows.length) card.append(table(["会话", "类型", "相关人员"], rows));
+      else card.append(node("p", "oa-coverage", "没有找到相关会话。"));
     } else if (data.kind === "sync") {
       if (data.summary?.label) card.append(node("p", "", data.summary.label));
       if (data.summary?.detail) card.append(node("p", "oa-coverage", data.summary.detail));
@@ -660,6 +665,26 @@
     container.replaceChildren(answer(result.answer));
     const queryWindow = result.window || [...(result.data || [])].reverse().find(data => data.actual?.window || data.window);
     scope({...result.scope, ...(queryWindow?.actual?.window || queryWindow?.window || queryWindow)});
+    for (const section of result.sections || []) {
+      const card = node("section", "oa-summary-section"), sources = node("details", "oa-section-sources");
+      card.append(node("h4", "", section.title));
+      const summary = answer(section.summary); summary.className = "oa-section-summary"; card.append(summary);
+      sources.append(node("summary", "", "查看相关消息"));
+      for (const message of section.sources || []) {
+        const item = node("div", "oa-section-source");
+        rawMessages(item, {messages: [message]}, false, false);
+        const ref = message.message_ref || message.evidence_ref;
+        if (ref) {
+          const actions = node("div", "oa-card-actions");
+          actions.append(evidenceCard(ref, message.conversation_name || message.chat_name || section.title));
+          if (message.text && !message.unreadable) actions.append(replyButton(ref, message.conversation_name || message.chat_name || section.title, true));
+          item.append(actions);
+        }
+        sources.append(item);
+      }
+      if (sources.children.length > 1) card.append(sources);
+      container.append(card);
+    }
     const groups = new Map([["reply", {label: "需要我回复", element: node("details", "oa-event-group")}],
       ["followup", {label: "需要内部跟进", element: node("details", "oa-event-group")}],
       ["waiting", {label: "等待对方", element: node("details", "oa-event-group")}],
@@ -704,6 +729,7 @@
     const sourcePages = (result.data || []).filter(data => data.kind === "window_messages");
     let sourcesAdded = false;
     for (const data of result.data || []) {
+      if (data.kind === "window_messages" && result.sections?.length && !canManageCM) continue;
       if (data.kind === "window_messages" && sourcesAdded) continue;
       const value = data.kind === "window_messages" && sourcePages.length > 1 ? {...data,
         messages: [...new Map(sourcePages.flatMap(page => page.messages || []).map(message => [message.message_ref || message.evidence_ref || JSON.stringify(message), message])).values()]} : data;

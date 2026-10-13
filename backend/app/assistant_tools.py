@@ -83,6 +83,11 @@ TOOLS = [
               {"query": _NULL_STRING, "creator_ids": _IDS,
                "purpose": _choice(list(assistant_queries.PURPOSES)),
                "cursor": _NULL_STRING}),
+    _function("find_conversations", "按群名、普通联系人或商家姓名、Lark名称、别名定位本人可见群聊／私聊，"
+              "不要求正式达人；query=null列目录。kind=all/group/p2p。重名返回候选，先区分再选chat_id查询消息。"
+              "可见不代表可发消息或@all；后续用summarize_messages/search_chat_history限定返回的chat_id。",
+              {"query": _NULL_STRING, "kind": {"type": "string", "enum": ["all", "group", "p2p"]},
+               "cursor": _NULL_STRING}),
     _function("get_sync_status", "仅在用户明确询问账号连接或消息是否可查看时使用，返回业务可用性。"
               "不用于判断合作、样品、付款等事项的进度；0条新消息也不需要调用。只读，不修改连接。", {}),
     _function("search_chat_history", "检索Lark消息正文，不检索旧助手问答。"
@@ -94,8 +99,10 @@ TOOLS = [
                "start": _STRING, "end": _STRING, "audience": {"type": "string", "enum": ["all", "creators"]},
                "creator_ids": _IDS, "chat_ids": _IDS,
                "cursor": _NULL_STRING}),
-    _function("read_message_context", "根据已取得message_ref查看完整原文和问答；不能用名字或猜测的引用读消息。",
-              {"message_ref": _STRING}),
+    _function("read_message_context", "根据已取得message_ref查看原文和完整问答；不能用名字或猜测的引用读消息。"
+              "mode=period/null是原检索时段，latest补充至本轮时刻的有界后续与原问答；不是全会话。"
+              "事项进度可先定位会话并读完整原起点至本轮时段，再用本工具核对具体消息，不用新一天0条否定旧事项。",
+              {"message_ref": _STRING, "mode": _choice(["period", "latest"])}),
     _function("activity_stats", "数据库统计消息量与实际联系人数。默认audience=all为本人可读消息，"
               "按day/person/conversation分组；仅明确要求达人时creators，可按day/creator。comparison=previous比较前一等长时段，"
               "不同于业务履约或全局未解决事项数，不把群成员数当联系人数。",
@@ -106,6 +113,7 @@ TOOLS = [
 ]
 _SCHEMAS = {tool["name"]: tool["parameters"] for tool in TOOLS}
 _QUERIES = {"query_creators": assistant_queries.creators, "list_groups": assistant_queries.groups,
+            "find_conversations": assistant_queries.conversations,
             "get_sync_status": assistant_queries.sync_status, "activity_stats": assistant_queries.activity,
             "search_chat_history": assistant_search.query, "read_message_context": assistant_search.read,
             "summarize_messages": assistant_search.window_messages}
@@ -320,8 +328,8 @@ def _validate_query(conn, actor_id, context, result, settings, *, history_only=F
             source = result["_source_ref"]
             restored.update(message_ref=source, evidence_ref=source,
                 message={**result["message"], "message_ref": source, "evidence_ref": source},
-                messages=[{**message, "message_ref": source if message.get("message_ref") else None,
-                    "evidence_ref": source if message.get("evidence_ref") else None}
+                messages=[{**message, **{key: source if message.get(key) == result.get(key)
+                    else refs.get(message.get(key), message.get(key)) for key in ("message_ref", "evidence_ref")}}
                     for message in result["messages"]])
         metadata = assistant_search.validate_result(conn, actor_id, context, restored, settings,
                                                     history_only=history_only)
@@ -369,14 +377,12 @@ def _query(conn, actor_id, turn, name, args, settings, context, visible):
         context = {**context, "scope": {**context["scope"], "chat_ids": args["chat_ids"]}}
     if name == "read_message_context":
         source = _saved_message(conn, actor_id, args["message_ref"], settings)
-        result = assistant_search.read(conn, actor_id, context, {"message_ref": source}, settings)
+        mode = args.get("mode") or "period"
+        result = assistant_search.read(conn, actor_id, context, {"message_ref": source, "mode": mode}, settings,
+                                       cutoff=turn["created_at"] if mode == "latest" else None)
         result["_source_ref"] = source
         result["message_ref"] = args["message_ref"]
         result["evidence_ref"] = args["message_ref"]
-        result["messages"] = [{**message, "message_ref": args["message_ref"] if message.get("message_ref") else None,
-            "evidence_ref": args["message_ref"] if message.get("message_ref") else None}
-            for message in result["messages"]]
-        result["message"] = next(message for message in result["messages"] if message.get("message_ref"))
     else:
         snapshot = None
         if name == "query_creators":
@@ -417,6 +423,18 @@ def _query(conn, actor_id, turn, name, args, settings, context, visible):
             refs[short] = message["message_ref"]
             message.update(message_ref=short, evidence_ref=short)
         result["_message_refs"] = refs
+    if name == "read_message_context":
+        refs = {}
+        for index, message in enumerate(result["messages"]):
+            if message["relation"] == "matched":
+                message.update(message_ref=args["message_ref"], evidence_ref=args["message_ref"])
+            elif message.get("message_ref"):
+                short = "m." + ref[2:] + f".{index}"
+                refs[short] = message["message_ref"]
+                message.update(message_ref=short, evidence_ref=short)
+        result["message"] = next(message for message in result["messages"] if message["relation"] == "matched")
+        if refs:
+            result["_message_refs"] = refs
     return {"scope": context["scope"], **result, "query_ref": ref, "_request": request}
 
 
@@ -838,6 +856,8 @@ def execute(conn, actor_id, turn, name, args, settings, context):
         args = {"importance": None, **args}
     if name == "draft_reply":
         args = {"message_ref": None, "draft_ref": None, "edited_draft": None, "action": "generate", **args}
+    if name == "read_message_context":
+        args = {"mode": None, **args}
     _validate(name, args)
     cm, roster, visible = _scope(conn, actor_id, context)
     if (context["scope"].get("window") and context["scope"].get("audience") == "creators"
@@ -1123,9 +1143,39 @@ def _validate_tool_results(conn, actor_id, turn, results, settings, context):
     return {"views": views, "cards": cards, "drafts": drafts}
 
 
+def _sections(final, tool_results):
+    sections = final.get("sections", [])
+    if not isinstance(sections, list) or len(sections) > 40:
+        raise ValueError("分类回答格式无效。")
+    messages = {message["message_ref"]: message for result in tool_results
+                for message in result.get("messages", []) if message.get("message_ref")}
+    values = []
+    for section in sections:
+        if (not isinstance(section, dict) or set(section) != {"title", "summary", "message_refs"}
+                or not isinstance(section["title"], str) or not section["title"].strip()
+                or len(section["title"]) > 120 or not isinstance(section["summary"], str)
+                or not section["summary"].strip() or len(section["summary"]) > 2500
+                or not isinstance(section["message_refs"], list) or not section["message_refs"]
+                or len(section["message_refs"]) > 30
+                or not all(isinstance(ref, str) for ref in section["message_refs"])
+                or not set(section["message_refs"]) <= messages.keys()):
+            raise ValueError("分类回答引用未取得的消息或内容无效。")
+        refs = list(dict.fromkeys(section["message_refs"]))
+        sources = []
+        for ref in refs:
+            message = messages[ref]
+            text = message.get("text", "")
+            sources.append({**message, "text": text[:600],
+                "truncated": message.get("truncated", False) or len(text) > 600,
+                "unavailable_or_truncated": message.get("unavailable_or_truncated", False) or len(text) > 600})
+        values.append({**section, "message_refs": refs, "sources": sources})
+    return values
+
+
 def build_result(conn, actor_id, turn, final, settings, context, tool_results):
     """Render only references actually returned by tools and still readable now."""
     validated = validate_tool_results(conn, actor_id, turn, tool_results, settings, context)
+    sections = _sections(final, tool_results)
     known_results, known_events, known_drafts, data = set(), set(), set(), {}
     for result in tool_results:
         if not isinstance(result, dict):
@@ -1197,7 +1247,7 @@ def build_result(conn, actor_id, turn, final, settings, context, tool_results):
     if current:
         result_scope = current[-1]["scope"]
         coverage = current[-1]["coverage"]
-    return {"turn_id": str(turn["id"]), "status": "completed", "answer": answer,
+    return {"turn_id": str(turn["id"]), "status": "completed", "answer": answer, "sections": sections,
             "data_refs": list(dict.fromkeys(data_refs)),
             "data": [public_query(data[ref]) for ref in dict.fromkeys(data_refs)],
             "result_refs": list(dict.fromkeys(refs)), "event_refs": list(dict.fromkeys(event_refs)),

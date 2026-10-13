@@ -205,6 +205,79 @@ def groups(conn, actor_id, context, args, settings, *, now=None):
     return result
 
 
+def conversations(conn, actor_id, context, args, settings, *, now=None):
+    now = now or datetime.now(UTC)
+    cm = authorize_all(conn, actor_id, context["scope"]["cm_id"])
+    kind = args.get("kind") or "all"
+    if kind not in {"all", "group", "p2p"}:
+        raise ValueError("会话类型无效。")
+    query = str(args.get("query") or "").strip().casefold() or None
+    chats = conn.execute("""SELECT c.chat_id,c.name,
+        CASE WHEN c.chat_mode='p2p' THEN 'p2p' ELSE 'group' END mode,
+        ac.sync_enabled AND ac.sync_status IS DISTINCT FROM 'not_readable' readable
+        FROM authorization_chats ac JOIN chats c USING(chat_id)
+        WHERE ac.authorization_id=%s AND ac.is_visible
+          AND COALESCE(c.chat_status,'normal')='normal'
+          AND (%s='all' OR CASE WHEN c.chat_mode='p2p' THEN 'p2p' ELSE 'group' END=%s)
+        ORDER BY lower(c.name),c.chat_id""", (cm["id"], kind, kind)).fetchall()
+    chat_ids = [chat["chat_id"] for chat in chats]
+    pattern = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%" if query else None
+    people = conn.execute("""WITH matched_identities AS (
+        SELECT i.open_id FROM lark_identities i LEFT JOIN contacts c ON c.id=i.contact_id
+        WHERE %s::text IS NOT NULL AND EXISTS(SELECT 1 FROM unnest(array_remove(
+            ARRAY[c.display_name,i.display_name,i.name,i.en_name],NULL)
+            || ARRAY(SELECT display_value FROM contact_identifiers ci
+                     WHERE ci.contact_id=i.contact_id AND ci.kind='alias')) label WHERE label ILIKE %s)
+    ), people AS (
+        SELECT ac.chat_id,ac.p2p_counterpart_open_id open_id,NULL::text member_name
+        FROM authorization_chats ac JOIN chats c USING(chat_id)
+        WHERE ac.chat_id=ANY(%s::text[]) AND ac.authorization_id=%s
+          AND c.chat_mode='p2p' AND ac.p2p_counterpart_type='user' AND ac.p2p_counterpart_open_id IS NOT NULL
+        UNION
+        SELECT m.chat_id,m.open_id,m.display_name FROM chat_members m
+        WHERE m.chat_id=ANY(%s::text[]) AND m.member_type='user' AND %s::text IS NOT NULL
+        UNION
+        SELECT DISTINCT m.chat_id,m.sender_open_id,NULL::text FROM chat_messages m
+        JOIN matched_identities i ON i.open_id=m.sender_open_id
+        JOIN authorization_message_observations o USING(chat_id,message_id)
+        WHERE m.chat_id=ANY(%s::text[]) AND o.authorization_id=%s AND o.observed_at>=%s
+          AND NOT m.is_deleted AND m.sender_open_id IS NOT NULL
+          AND m.sender_open_id<>%s AND (m.sender_type='user' OR m.sender_type IS NULL)
+          AND %s::text IS NOT NULL
+    ) SELECT DISTINCT p.chat_id,p.open_id,i.contact_id,
+        COALESCE(c.display_name,i.display_name,p.member_name,'未命名人员') name,labels.names
+        FROM people p LEFT JOIN lark_identities i ON i.open_id=p.open_id
+        LEFT JOIN contacts c ON c.id=i.contact_id
+        CROSS JOIN LATERAL (SELECT array_remove(
+            ARRAY[c.display_name,i.display_name,i.name,i.en_name,p.member_name],NULL)
+            || ARRAY(SELECT display_value FROM contact_identifiers ci
+                     WHERE ci.contact_id=i.contact_id AND ci.kind='alias') names) labels
+        WHERE (i.identity_type='user' OR i.open_id IS NULL)
+          AND (%s::text IS NULL OR EXISTS(SELECT 1 FROM unnest(labels.names) label WHERE label ILIKE %s))
+        ORDER BY p.chat_id,p.open_id""", (query, pattern, chat_ids, cm["id"], chat_ids, query, chat_ids,
+            cm["id"], cm["body_consent_at"], cm["open_id"], query, query, pattern)).fetchall() if chat_ids else []
+    matched = {}
+    for person in people:
+        identity = str(person["contact_id"]) if person["contact_id"] else person["open_id"]
+        matched.setdefault(person["chat_id"], {})[identity] = {"id": identity, "name": person["name"]}
+    values = []
+    for chat in chats:
+        name = chat["name"] or "未命名会话"
+        name_matches = bool(query and query in name.casefold())
+        participants = list(matched.get(chat["chat_id"], {}).values())
+        if query and not name_matches and not participants:
+            continue
+        values.append({"id": chat["chat_id"], "name": name, "mode": chat["mode"],
+            "matched_people": sorted(participants, key=lambda person: (person["name"].casefold(), person["id"])),
+            "readable": bool(chat["readable"]), "match_basis": (["conversation_name"] if name_matches else [])
+            + (["participant_name"] if participants and query else [])})
+    scope = {"cm_id": str(cm["id"]), "cm_name": cm["display_name"] or "CM", "audience": "all", "creator_ids": None}
+    result = _page("conversations", {**context, "scope": scope}, values, args, cm, now)
+    result["definition"] = "当前本人可见的群聊和私聊；人员可按姓名、Lark名称或别名匹配，不要求达人身份。" \
+        "matched_people仅是本次匹配对象，非完整成员；重名需区分候选。可见不代表正文完整或发送／@all权限。"
+    return result
+
+
 def _chat_states(conn, cm_id):
     return conn.execute("""SELECT c.chat_id,c.name,COALESCE(c.chat_status,'normal') chat_status,
         COALESCE(c.chat_mode,'group') chat_mode,ac.sync_enabled,ac.sync_status,ac.backfill_complete,
@@ -554,14 +627,15 @@ def activity(conn, actor_id, context, args, settings, *, now=None):
 
 def validate_result(conn, actor_id, context, result, settings):
     """Invalidate changed business sources, not routine synchronization progress."""
-    if result.get("kind") == "activity" and result.get("audience") == "all":
+    if result.get("kind") == "conversations" or result.get("kind") == "activity" and result.get("audience") == "all":
         cm = authorize_all(conn, actor_id, context["scope"]["cm_id"])
     else:
         cm, _roster, _visible = _scope(conn, actor_id, context)
     if result.get("authorization") != _authorization(cm):
         raise ValueError("消息授权已变化，请重新查询。")
     request = result["_request"]
-    names = {"query_creators": creators, "list_groups": groups, "get_sync_status": sync_status,
+    names = {"query_creators": creators, "list_groups": groups, "find_conversations": conversations,
+             "get_sync_status": sync_status,
              "activity_stats": activity}
     function = names.get(request.get("name"))
     if function is None:

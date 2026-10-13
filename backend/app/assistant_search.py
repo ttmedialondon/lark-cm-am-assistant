@@ -322,12 +322,21 @@ def _collect(conn, actor_id, context, args, settings, *, terms):
 def validate_result(conn, actor_id, context, result, settings, *, history_only=False):
     """Recheck at most one page of hits, never rerun a negative full-text scan."""
     if result.get("kind") == "message_context":
-        fresh = read(conn, actor_id, context, {"message_ref": result.get("message_ref")}, settings,
+        fresh = read(conn, actor_id, context, {"message_ref": result.get("message_ref"), "mode": result.get("mode")},
+                     settings,
                      cutoff=_time(result["checked_at"]) if result.get("checked_at") else None)
         if "audience" not in result.get("scope", {}):
             fresh["scope"].pop("audience", None)
         fields = ("message", "messages", "window", "scope")
-        if core._hash([result.get(key) for key in fields]) != core._hash([fresh.get(key) for key in fields]):
+        def stable(value):
+            output = {key: value.get(key) for key in fields}
+            for field in ("message", "messages"):
+                messages = output[field] if field == "messages" else [output[field]]
+                normalized = [{**message, **{key: _open(message[key], "m.", settings) if message.get(key) else None
+                    for key in ("message_ref", "evidence_ref")}} for message in messages]
+                output[field] = normalized if field == "messages" else normalized[0]
+            return output
+        if core._hash(stable(result)) != core._hash(stable(fresh)):
             raise ValueError("消息上下文已变化，请重新查看。")
         # Routine sync watermarks can close a gap without changing source text or grants.
         if ([gap for gap in result.get("gaps", []) if not gap.get("chat_id")]
@@ -378,6 +387,9 @@ def validate_result(conn, actor_id, context, result, settings, *, history_only=F
 
 
 def read(conn, actor_id, context, args, settings, *, cutoff=None):
+    mode = args.get("mode") or "period"
+    if mode not in {"period", "latest"}:
+        raise ValueError("请选择原时段或最新进展。")
     ref = args.get("message_ref")
     value = _open(ref, "m.", settings)
     audience = _audience(value.get("audience", "creators"))
@@ -441,7 +453,11 @@ def read(conn, actor_id, context, args, settings, *, cutoff=None):
     for row, relation in sorted(collected.values(), key=lambda item: (
             item[0]["message_create_time"], item[0]["message_id"])):
         text, unavailable = _text(row, cipher, names)
-        message = _message(row, chat, text, unavailable, reference=ref if relation == "matched" else None,
+        reference = ref if relation == "matched" else None
+        if relation != "matched" and mode == "latest":
+            reference = _reference(actor_id, cm, chat, row, min(start, row["message_create_time"]),
+                                   read_end, _selected, settings, audience)
+        message = _message(row, chat, text, unavailable, reference=reference,
                            clip=False, audience=audience)
         message.update(relation=relation, in_window=row["message_create_time"] >= start)
         messages.append(message)
@@ -458,4 +474,9 @@ def read(conn, actor_id, context, args, settings, *, cutoff=None):
             "context_scope": "referenced_messages_and_bounded_nearby", "is_full_conversation": False}
     if cutoff:
         result.update(checked_at=cutoff.isoformat(), latest_limit=20)
+    if args.get("mode") is not None:
+        result["mode"] = mode
+    if mode == "latest":
+        result.update(latest_window={"start": end.isoformat(), "end": read_end.isoformat()},
+                      context_scope="referenced_messages_and_bounded_latest", latest_limit=20)
     return result

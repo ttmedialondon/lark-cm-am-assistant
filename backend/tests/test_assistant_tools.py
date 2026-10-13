@@ -291,6 +291,50 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
     all_message("latest-answer", "business", "ou_unconfirmed")
     pg.execute("UPDATE chat_messages SET message_create_time=%s,parent_id='latest-parent' "
                "WHERE message_id='latest-answer'", (datetime.now(UTC) - timedelta(microseconds=1),))
+    # Latest context has its own fixed cutoff and real references for every quoted follow-up, not the old target.
+    with pg.transaction(force_rollback=True):
+        latest_session, latest_turn_id, latest_cutoff = uuid4(), uuid4(), datetime.now(UTC)
+        pg.execute("INSERT INTO assistant_sessions(id,actor_id) VALUES(%s,%s)", (latest_session, s.ids["cm"]))
+        pg.execute("INSERT INTO assistant_turns(id,session_id,client_request_id,input_ciphertext,created_at) "
+                   "VALUES(%s,%s,%s,'fixture',%s)", (latest_turn_id, latest_session, uuid4(), latest_cutoff))
+        latest_turn = pg.execute("SELECT * FROM assistant_turns WHERE id=%s", (latest_turn_id,)).fetchone()
+        latest = tools.execute(pg, s.ids["cm"], latest_turn, "read_message_context", {
+            "message_ref": continuation_ref, "mode": "latest"}, s.settings, context)
+        latest_turn["checkpoint_ciphertext"] = summary_dialogues.encode({"tool_results": [latest]}, s.settings)
+        pg.execute("UPDATE assistant_turns SET checkpoint_ciphertext=%s WHERE id=%s",
+                   (latest_turn["checkpoint_ciphertext"], latest_turn_id))
+        assert latest["message_ref"] == latest["message"]["message_ref"] == continuation_ref
+        assert latest["mode"] == "latest" and latest["checked_at"] == latest_cutoff.isoformat()
+        assert latest["latest_window"]["start"] == now.isoformat() and not latest["is_full_conversation"]
+        new_ref = next(message["message_ref"] for message in latest["messages"]
+                       if message["message_id"] == "latest-answer")
+        assert new_ref != continuation_ref and new_ref in latest["_message_refs"]
+        exact = tools.evidence(pg, s.ids["cm"], new_ref, s.settings)
+        assert exact["message"]["message_id"] == "latest-answer"
+        assert exact["message"]["text"] == "All-scope latest-answer"
+        assert "latest-answer" not in {message["message_id"] for message in
+                                        tools.evidence(pg, s.ids["cm"], continuation_ref, s.settings)["messages"]}
+        all_message("after-latest-cutoff", "business", "ou_unconfirmed")
+        pg.execute("UPDATE chat_messages SET message_create_time=%s WHERE message_id='after-latest-cutoff'",
+                   (latest_cutoff + timedelta(microseconds=1),))
+        tools.validate_tool_results(pg, s.ids["cm"], latest_turn, [latest], s.settings, context)
+        assert "after-latest-cutoff" not in json.dumps(latest)
+        with pytest.raises(LookupError):
+            tools.evidence(pg, s.ids["reviewer"], new_ref, s.settings)
+        pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s AND chat_id='business'",
+                   (s.ids["cm"],))
+        with pytest.raises(PermissionError):
+            tools.validate_tool_results(pg, s.ids["cm"], latest_turn, [latest], s.settings, context)
+        with pytest.raises(PermissionError):
+            tools.evidence(pg, s.ids["cm"], new_ref, s.settings)
+        pg.execute("UPDATE authorization_chats SET is_visible=TRUE WHERE authorization_id=%s AND chat_id='business'",
+                   (s.ids["cm"],))
+        pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='latest-answer'",
+                   (s.cipher.encrypt(json.dumps({"text": "Changed follow-up"})),))
+        with pytest.raises(ValueError, match="已变化"):
+            tools.validate_tool_results(pg, s.ids["cm"], latest_turn, [latest], s.settings, context)
+        with pytest.raises(ValueError, match="已更新"):
+            tools.evidence(pg, s.ids["cm"], new_ref, s.settings)
     calls_before = len(s.calls)
     prepared = run("draft_reply", {"event_ref": None, "message_ref": continuation_ref, "draft_ref": None,
         "edited_draft": None, "action": "generate", "instruction": None, "language": "en"})
@@ -528,6 +572,59 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
         assert blocked not in json.dumps(all_view)
     assert before == {table: pg.execute(f"SELECT count(*) n FROM {table}").fetchone()["n"] for table in tables}
     assert before["offhours_summary_runs"] == 0
+    # Locate a merchant or unconfirmed person by contact/Lark names and aliases, only within this CM's directory.
+    with pg.transaction(force_rollback=True):
+        for index in range(3):
+            person_id, open_id = uuid4(), f"ou_supplier_{index}"
+            pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)", (person_id, f"Supplier {index}"))
+            if index == 0:
+                pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) "
+                           "VALUES(%s,'merchant_contact','confirmed','manual')", (person_id,))
+            pg.execute("INSERT INTO lark_identities(open_id,contact_id,display_name,name,en_name) "
+                       "VALUES(%s,%s,%s,%s,%s)", (open_id, person_id, f"Store {index}", "店主", f"Sam {index}"))
+            pg.execute("INSERT INTO contact_identifiers(id,contact_id,kind,normalized_value,display_value) "
+                       "VALUES(%s,%s,'alias','supplier sam','Supplier Sam')", (uuid4(), person_id))
+            pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES(%s,%s,'p2p')",
+                       (f"supplier-{index}", f"Direct {index}"))
+            pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,p2p_counterpart_type,
+                p2p_counterpart_open_id) VALUES(%s,%s,'user',%s)""",
+                (s.ids["cm"] if index < 2 else s.ids["owner"], f"supplier-{index}", open_id))
+        pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('supplier-group','Warehouse operations','group')")
+        pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id,sync_enabled) "
+                   "VALUES(%s,'supplier-group',FALSE)", (s.ids["cm"],))
+        pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('supplier-group','ou_supplier_0')")
+        directory_args = {"query": "Supplier Sam", "kind": "all", "cursor": None}
+        directory = tools.execute(pg, s.ids["cm"], turn, "find_conversations", directory_args, s.settings, context)
+        assert directory["kind"] == "conversations" and directory["total"] == 3
+        assert {item["id"] for item in directory["conversations"]} == {"supplier-0", "supplier-1", "supplier-group"}
+        assert directory["scope"]["audience"] == "all" and "chat_ids" not in directory["scope"]
+        assert all(item["matched_people"] for item in directory["conversations"])
+        assert not next(item for item in directory["conversations"] if item["id"] == "supplier-group")["readable"]
+        tools.validate_tool_results(pg, s.ids["cm"], turn, [directory], s.settings, context)
+        owner_directory = tools.execute(pg, s.ids["owner"], turn, "find_conversations", directory_args,
+                                        s.settings, context)
+        assert owner_directory["conversations"] == directory["conversations"]
+        with monkeypatch.context() as patch:
+            patch.setattr(assistant_queries, "PAGE_SIZE", 1)
+            first = tools.execute(pg, s.ids["cm"], turn, "find_conversations", {
+                **directory_args, "kind": "p2p"}, s.settings, context)
+            second = tools.execute(pg, s.ids["cm"], turn, "find_conversations", {
+                **directory_args, "kind": "p2p", "cursor": first["next_cursor"]}, s.settings, context)
+            assert first["total"] == second["total"] == 2 and second["next_cursor"] is None
+            assert first["conversations"][0]["id"] != second["conversations"][0]["id"]
+        for query, kind, expected in [("Sam", "p2p", 2), ("Supplier 0", "all", 2),
+                                      ("Store 1", "p2p", 1), ("Warehouse", "group", 1)]:
+            found = tools.execute(pg, s.ids["cm"], turn, "find_conversations", {
+                **directory_args, "query": query, "kind": kind}, s.settings, context)
+            assert found["total"] == expected
+        with pytest.raises(PermissionError):
+            tools.execute(pg, s.ids["reviewer"], turn, "find_conversations", directory_args, s.settings, context)
+        pg.execute("UPDATE chats SET chat_status='dissolved' WHERE chat_id='supplier-0'")
+        pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='supplier-1'")
+        assert tools.execute(pg, s.ids["cm"], turn, "find_conversations", directory_args,
+                             s.settings, context)["total"] == 1
+        with pytest.raises(ValueError):
+            tools.validate_tool_results(pg, s.ids["cm"], turn, [directory], s.settings, context)
     pg.execute("UPDATE chat_messages SET is_deleted=TRUE WHERE message_id='m1'")
     with pytest.raises((PermissionError, ValueError)):
         tools.build_result(pg, s.ids["cm"], turn, final, s.settings, context, results)
@@ -579,7 +676,7 @@ def test_five_tools_keep_reports_private_resume_and_recheck_sources(pg, seeded, 
     assert {tool["name"] for tool in tools.TOOLS} == {
         "find_creators", "summarize_messages", "filter_events", "read_event_context", "draft_reply",
         "query_creators", "list_groups", "get_sync_status", "search_chat_history", "read_message_context",
-        "activity_stats", "query_unreplied_creator_events", "save_reply_draft",
+        "activity_stats", "query_unreplied_creator_events", "save_reply_draft", "find_conversations",
     }
     assert all(tool["strict"] and not tool["parameters"]["additionalProperties"] for tool in tools.TOOLS)
     found = tools.execute(pg, s.ids["cm"], turn, "find_creators", {"query": "@alice"}, s.settings, context)
