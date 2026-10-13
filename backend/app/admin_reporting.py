@@ -423,24 +423,8 @@ def users(page: int = 1, query: str = "", permission_filter: str = "all") -> dic
                 SELECT a.id FROM authorizations a LEFT JOIN admin_roles r ON r.authorization_id=a.id
                 WHERE {filters} ORDER BY a.authorized_at DESC, a.id LIMIT %s OFFSET %s
             ), conversation_counts AS (
-                SELECT counts.* FROM page_users p CROSS JOIN LATERAL (
-                    SELECT * FROM ({CONVERSATION_COUNTS_SQL}) totals
-                    WHERE totals.authorization_id=p.id
-                ) counts
-            ), message_counts AS (
-                SELECT p.id AS authorization_id, counts.*
-                FROM page_users p CROSS JOIN LATERAL (
-                    SELECT COUNT(*) AS message_count,
-                        COUNT(*) FILTER (WHERE o.sent_by_author) AS own_message_count
-                    FROM authorization_message_observations o
-                    JOIN authorization_chats ac
-                      ON ac.authorization_id=o.authorization_id AND ac.chat_id=o.chat_id
-                    JOIN chats c ON c.chat_id=ac.chat_id
-                    WHERE o.authorization_id=p.id AND ac.is_visible
-                      AND COALESCE(c.chat_status, 'normal')='normal'
-                      AND NOT EXISTS (SELECT 1 FROM chat_messages m WHERE m.is_deleted
-                          AND m.chat_id=o.chat_id AND m.message_id=o.message_id)
-                ) counts
+                SELECT * FROM ({CONVERSATION_COUNTS_SQL}) totals
+                WHERE totals.authorization_id IN (SELECT id FROM page_users)
             ), latest_jobs AS (
                 SELECT p.id AS authorization_id, job.*
                 FROM page_users p LEFT JOIN LATERAL (
@@ -471,8 +455,6 @@ def users(page: int = 1, query: str = "", permission_filter: str = "all") -> dic
                 COALESCE(g.p2p_backfill_complete_count, 0) AS p2p_backfill_complete_count,
                 COALESCE(g.group_backfill_complete_count, 0) AS group_backfill_complete_count,
                 g.last_synced_at,
-                COALESCE(m.message_count, 0) AS message_count,
-                COALESCE(m.own_message_count, 0) AS own_message_count,
                 j.mode AS job_mode,
                 j.status AS job_status,
                 j.scheduled_at AS job_scheduled_at,
@@ -487,7 +469,6 @@ def users(page: int = 1, query: str = "", permission_filter: str = "all") -> dic
             JOIN page_users p ON p.id=a.id
             LEFT JOIN admin_roles r ON r.authorization_id = a.id
             LEFT JOIN conversation_counts g ON g.authorization_id = a.id
-            LEFT JOIN message_counts m ON m.authorization_id = a.id
             LEFT JOIN latest_jobs j ON j.authorization_id = a.id
             ORDER BY a.authorized_at DESC, a.id
             """,
@@ -807,34 +788,34 @@ def jobs(page: int = 1) -> dict[str, Any]:
 
 
 CONTACT_CATEGORY_SQL = f"""
+    WITH latest_assessments AS (
+        SELECT DISTINCT ON (job.contact_id) job.contact_id,job.status,job.result
+        FROM contact_assessments job
+        WHERE job.policy_version='{CONTACT_IDENTITY_POLICY}'
+        ORDER BY job.contact_id,job.created_at DESC,job.id DESC
+    ), primary_roles AS (
+        SELECT DISTINCT ON (role.contact_id) role.contact_id,role.role,role.source
+        FROM contact_roles role LEFT JOIN latest_assessments assessment ON assessment.contact_id=role.contact_id
+        WHERE role.status='confirmed'
+          AND (role.source NOT IN ('ai_auto_confirmed','lark_internal_tenant')
+            OR role.source='lark_internal_tenant' AND role.role='internal_colleague' AND EXISTS (
+                SELECT 1 FROM lark_identities trusted WHERE trusted.contact_id=role.contact_id
+                  AND trusted.identity_type='user' AND trusted.tenant_classification='internal')
+            OR role.source='ai_auto_confirmed' AND role.is_primary AND assessment.status='succeeded'
+              AND assessment.result->>'reason_code'='classified'
+              AND assessment.result->'roles'->0->>'role'=role.role)
+        ORDER BY role.contact_id,
+            CASE WHEN role.source NOT IN ('ai_auto_confirmed','lark_internal_tenant') THEN 0
+                 WHEN role.source='lark_internal_tenant' THEN 1 ELSE 2 END,
+            role.is_primary DESC,role.reviewed_at DESC NULLS LAST,role.updated_at DESC,role.role
+    )
     SELECT contact.id AS contact_id, contact.display_name, contact.created_at, contact.updated_at,
         primary_role.role AS primary_role, primary_role.source AS classification_source,
         COALESCE(primary_role.role,'unclassified') AS category,
         CASE WHEN primary_role.role IS NULL THEN ARRAY[]::text[] ELSE ARRAY[primary_role.role] END
             AS confirmed_roles
     FROM contacts contact
-    LEFT JOIN LATERAL (
-        SELECT job.status, job.result
-        FROM contact_assessments job
-        WHERE job.contact_id=contact.id AND job.policy_version='{CONTACT_IDENTITY_POLICY}'
-        ORDER BY job.created_at DESC,job.id DESC LIMIT 1
-    ) AS assessment ON TRUE
-    LEFT JOIN LATERAL (
-        SELECT role.role,role.source
-        FROM contact_roles role
-        WHERE role.contact_id=contact.id AND role.status='confirmed'
-          AND (role.source NOT IN ('ai_auto_confirmed','lark_internal_tenant')
-            OR role.source='lark_internal_tenant' AND role.role='internal_colleague' AND EXISTS (
-                SELECT 1 FROM lark_identities trusted WHERE trusted.contact_id=contact.id
-                  AND trusted.identity_type='user' AND trusted.tenant_classification='internal')
-            OR role.source='ai_auto_confirmed' AND role.is_primary AND assessment.status='succeeded'
-              AND assessment.result->>'reason_code'='classified'
-              AND assessment.result->'roles'->0->>'role'=role.role)
-        ORDER BY CASE WHEN role.source NOT IN ('ai_auto_confirmed','lark_internal_tenant') THEN 0
-                      WHEN role.source='lark_internal_tenant' THEN 1 ELSE 2 END,
-            role.is_primary DESC,role.reviewed_at DESC NULLS LAST,role.updated_at DESC,role.role
-        LIMIT 1
-    ) AS primary_role ON TRUE
+    LEFT JOIN primary_roles primary_role ON primary_role.contact_id=contact.id
 """
 CONTACT_DISPLAY_SQL = """
         SELECT
@@ -938,9 +919,10 @@ def contacts(
                   )
               )
               AND (%s='' OR POSITION(LOWER(%s) IN LOWER(COALESCE(person.display_name,fallback.display_name,'')))>0
-                OR EXISTS(SELECT 1 FROM contact_social_accounts l JOIN social_accounts s ON s.id=l.social_account_id
-                  WHERE l.contact_id=person.contact_id AND l.status='confirmed' AND l.relationship='owner'
-                  AND s.platform='tiktok' AND POSITION(LOWER(%s) IN LOWER(s.normalized_handle))>0))
+                OR person.contact_id IN (
+                  SELECT l.contact_id FROM contact_social_accounts l JOIN social_accounts s ON s.id=l.social_account_id
+                  WHERE l.status='confirmed' AND l.relationship='owner'
+                    AND s.platform='tiktok' AND POSITION(LOWER(%s) IN LOWER(s.normalized_handle))>0))
             ), totals AS (
                 SELECT COUNT(*) AS total_count FROM filtered
             ), page_ids AS (

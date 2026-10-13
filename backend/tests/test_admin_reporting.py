@@ -123,6 +123,13 @@ def test_people_directory_all_contacts_current_policy_priority_and_unfiltered_pr
                    "VALUES(%s,%s,%s,%s,%s::jsonb)",
                    (uuid4(), contact_id, status, "legacy" if name == "old" else admin_reporting.CONTACT_IDENTITY_POLICY,
                     json.dumps(payload)))
+    # Source priority beats an AI role marked primary; untrusted tenant claims never win.
+    for name in ("manual", "internal"):
+        pg.execute("UPDATE contact_roles SET is_primary=FALSE WHERE contact_id=%s", (people[name],))
+        pg.execute("INSERT INTO contact_roles(contact_id,role,status,source,is_primary) "
+                   "VALUES(%s,'creator','confirmed','ai_auto_confirmed',TRUE)", (people[name],))
+        pg.execute("UPDATE contact_assessments SET result=%s::jsonb WHERE contact_id=%s",
+                   (json.dumps({"reason_code": "classified", "roles": [{"role": "creator"}]}), people[name]))
     avatar_host = "https://s1-imfile.feishucdn.com/static-resource/v1/"
     for name in ("manual", "AI"):
         pg.execute("UPDATE lark_identities SET display_name='Same Lark name',avatar_url=%s WHERE open_id=%s",
@@ -188,6 +195,39 @@ def test_people_directory_all_contacts_current_policy_priority_and_unfiltered_pr
         avatar_host + "AI.png")
     pg.execute("UPDATE lark_identities SET avatar_url=NULL WHERE open_id='ou_AI'")
     assert admin_reporting.contact_detail("ou_AI", include_conversations=False)["contact"]["avatar_url"] is None
+    pg.execute("INSERT INTO contact_assessments(id,contact_id,status,policy_version,result,created_at) "
+               "VALUES(%s,%s,'invalid','legacy','{}'::jsonb,NOW()+INTERVAL '2 hours')",
+               (uuid4(), people["AI"]))
+    assert admin_reporting.contacts(query="AI")["items"][0]["category"] == "creator"
+    pg.execute("INSERT INTO contact_assessments(id,contact_id,status,policy_version,result,created_at) "
+               "VALUES(%s,%s,'invalid',%s,'{}'::jsonb,NOW()+INTERVAL '1 hour')",
+               (uuid4(), people["AI"], admin_reporting.CONTACT_IDENTITY_POLICY))
+    assert admin_reporting.contacts(query="AI")["items"][0]["category"] == "unclassified"
+    pg.execute("UPDATE lark_identities SET tenant_classification='known_external' WHERE open_id='ou_internal'")
+    internal = admin_reporting.contact_detail("ou_internal", include_conversations=False)["contact"]
+    assert internal["category"] == "creator"
+    for person, handle, platform, relationship, status in (
+        ("manual", "match.alpha", "tiktok", "owner", "confirmed"),
+        ("manual", "match.beta", "tiktok", "owner", "confirmed"),
+        ("AI", "match.gamma", "tiktok", "owner", "confirmed"),
+        ("low", "match.rejected", "tiktok", "owner", "rejected"),
+        ("queued", "match.representative", "tiktok", "representative", "confirmed"),
+        ("old", "match.youtube", "youtube", "owner", "confirmed"),
+    ):
+        account = uuid4()
+        pg.execute("INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) VALUES(%s,%s,%s,%s)",
+                   (account, platform, handle, handle))
+        pg.execute("INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source) "
+                   "VALUES(%s,%s,%s,%s,'manual')", (people[person], account, relationship, status))
+    handles = admin_reporting.contacts(query="  MATCH.  ")
+    assert handles["total_count"] == 2 and {row["contact_id"] for row in handles["items"]} == {
+        people["manual"], people["AI"]}
+    pg.execute("UPDATE contacts SET display_name='Duplicate Fixture' WHERE id=ANY(%s::uuid[])",
+               ([people["queued"], people["failed"]],))
+    duplicates = admin_reporting.contacts(query="duplicate fixture")
+    assert duplicates["total_count"] == 2 and {row["contact_id"] for row in duplicates["items"]} == {
+        people["queued"], people["failed"]}
+    assert admin_reporting.contacts(query="")["total_count"] == 8
 
 
 def test_seconds_label_prefers_human_readable_units():
@@ -323,6 +363,8 @@ def test_personnel_permission_filter_binds_values_and_keeps_global_summary(monke
         assert "NOT COALESCE(r.role = 'owner', FALSE) AND EXISTS" in query
         assert "LEFT JOIN admin_roles r ON r.authorization_id = a.id AND r.is_active" not in query
     assert "COUNT(*) FILTER (WHERE COALESCE(r.role = 'owner', FALSE)) AS owners" in calls[0][0]
+    assert all("chat_messages" not in sql and "authorization_message_observations" not in sql
+               for sql, _params in calls)
     assert page["items"] == []
     assert page["page"] == 1
     assert page["total_count"] == 0
@@ -357,8 +399,9 @@ def test_personnel_counts_preserve_deleted_hidden_and_paginated_scope(pg, monkey
                        "sent_by_author) VALUES(%s,%s,%s,TRUE)", (actor, chat, message))
     listing = admin_reporting.users(query="Reporting")
     detail = admin_reporting.user_detail(actor)
-    for user in (listing["items"][0], detail["user"]):
-        assert user["message_count"] == user["own_message_count"] == 10
+    assert detail["user"]["message_count"] == detail["user"]["own_message_count"] == 10
+    assert not {"message_count", "own_message_count"} & listing["items"][0].keys()
+    assert listing["items"][0]["group_count"] == 10 and listing["items"][0]["archived_conversation_count"] == 1
     assert detail["conversations"]["total_count"] == 10
     assert all(chat["message_count"] == 1 for chat in detail["conversations"]["items"])
     groups = admin_reporting.chats()
