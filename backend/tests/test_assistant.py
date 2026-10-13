@@ -626,15 +626,21 @@ def test_model_prepares_saves_and_returns_message_draft_without_child_job(pg, ch
     calls = []
 
     def model(_cfg, _key, items, _actor, **kwargs):
-        assert '本人' in kwargs['instructions'] and 'save_reply_draft' in kwargs['instructions']
+        assert '本人' in kwargs['instructions']
         calls.append(True)
         outputs = [json.loads(item['output']) for item in items if item.get('type') == 'function_call_output']
         latest = outputs[-1] if outputs else None
+        if not outputs:
+            assert {tool['name'] for tool in kwargs['tools']} == {'read_documents'}
+            return {'text': '', 'output': [{'type': 'function_call', 'name': 'read_documents',
+                'call_id': 'reply-guide', 'arguments': json.dumps({'document_ids': [
+                    'reply-writing', 'history-search']})}], 'usage': {}}
+        assert 'save_reply_draft' in kwargs['instructions']
         if latest and latest.get('kind') == 'reply_draft':
             final = {'answer': '英文草稿已准备。', 'event_refs': [], 'result_refs': [],
                      'data_refs': [], 'draft_ref': latest['draft_ref']}
             return {'text': json.dumps(final), 'output': [], 'usage': {}}
-        if not latest:
+        if latest.get('kind') == 'documents':
             name, args = 'search_chat_history', {'audience': 'all', 'query': ['dispatched'],
                 'start': chat.start.isoformat(), 'end': chat.end.isoformat(),
                 'creator_ids': None, 'chat_ids': None, 'cursor': None}
@@ -659,12 +665,12 @@ def test_model_prepares_saves_and_returns_message_draft_without_child_job(pg, ch
 
     monkeypatch.setattr(openai_client, 'call_openai_tools', model)
     turn = assistant.submit(pg, chat.ids['cm'], payload('找到发货询问并准备英文回复'), chat.settings)
-    for _ in range(12):
+    for _ in range(16):
         finish(chat)
         view = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
         if view['status'] not in assistant.ACTIVE:
             break
-    assert view['status'] == 'completed' and len(calls) == 5
+    assert view['status'] == 'completed' and len(calls) == 6
     stored = assistant._turn(pg, chat.ids['cm'], turn['id'])
     assert summary_dialogues.decode(stored['checkpoint_ciphertext'], chat.settings)['tool_errors'] == [
         {'tool': 'save_reply_draft', 'code': 'invalid_tool_input'}]
@@ -707,9 +713,16 @@ def test_model_first_lookup_replay_history_and_actor_isolation(pg, chat, monkeyp
     def model(cfg, key, items, actor, **kwargs):
         calls.append(items.copy())
         assert cfg['model'] == 'gpt-6-luna' and key == 'fixture-only-key' and actor == chat.ids['cm']
-        assert kwargs['tools'] == assistant.tools.TOOLS
         assert 'OWNER_RULE_SNAPSHOT_MARKER' not in kwargs['instructions']
-        if not any(item.get('type') == 'function_call_output' for item in items):
+        outputs = [json.loads(item['output']) for item in items if item.get('type') == 'function_call_output']
+        if not outputs:
+            assert {tool['name'] for tool in kwargs['tools']} == {'read_documents'}
+            return {'output': [{'type': 'function_call', 'name': 'read_documents', 'call_id': 'lookup-guide',
+                'arguments': json.dumps({'document_ids': ['creator-and-groups']})}],
+                'text': '', 'response_id': 'resp_docs', 'usage': {'input_tokens': 8, 'output_tokens': 4}}
+        assert {tool['name'] for tool in kwargs['tools']} == {
+            *[tool['name'] for tool in assistant.tools.TOOLS], 'read_documents'}
+        if outputs[-1].get('kind') == 'documents':
             output = [{'type': 'reasoning', 'id': 'rs_fixture', 'encrypted_content': 'encrypted-reasoning'},
                       {'type': 'function_call', 'call_id': 'find_fixture', 'name': 'find_creators',
                        'arguments': json.dumps({'query': 'alice'})}]
@@ -736,17 +749,21 @@ def test_model_first_lookup_replay_history_and_actor_isolation(pg, chat, monkeyp
         assistant.submit(pg, chat.ids['cm'], dict(submitted, message='别的问题'), chat.settings)
     finish(chat)
     assert len(calls) == 1
-    finish(chat)  # SQL tool execution does not add a model call.
+    finish(chat)  # Reading the pinned document does not add a model call.
     assert len(calls) == 1
+    finish(chat)
+    assert len(calls) == 2
+    finish(chat)  # SQL tool execution does not add a model call.
+    assert len(calls) == 2
     finish(chat)
     view = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
     assert view['status'] == 'completed' and view['result']['answer'] == '找到 @alice。'
-    assert len(calls) == 2 and any(item.get('encrypted_content') for item in calls[1])
+    assert len(calls) == 3 and any(item.get('encrypted_content') for item in calls[2])
     assert pg.execute('SELECT usage FROM assistant_turns').fetchone()['usage'] == {
-        'input_tokens': 22, 'output_tokens': 9,
+        'input_tokens': 30, 'output_tokens': 13,
     }
     assert assistant.submit(pg, chat.ids['cm'], submitted, chat.settings)['status'] == 'completed'
-    assert len(calls) == 2
+    assert len(calls) == 3
     session = assistant.session_view(pg, chat.ids['cm'], submitted['session_id'], chat.settings)
     assert len(session['turns']) == 1
     assert 'alice' not in pg.execute('SELECT input_ciphertext FROM assistant_turns').fetchone()['input_ciphertext']
@@ -771,11 +788,11 @@ def test_model_first_lookup_replay_history_and_actor_isolation(pg, chat, monkeyp
         assistant.submit(pg, chat.ids['cm'], submitted, chat.settings)
     receipt = pg.execute('SELECT usage,response_id,result_ciphertext,checkpoint_ciphertext FROM assistant_turns '
                          'WHERE id=%s', (turn['id'],)).fetchone()
-    assert receipt['usage'] == {'input_tokens': 22, 'output_tokens': 9} and receipt['result_ciphertext'] is None
+    assert receipt['usage'] == {'input_tokens': 30, 'output_tokens': 13} and receipt['result_ciphertext'] is None
     assert summary_dialogues.decode(receipt['checkpoint_ciphertext'], chat.settings) == {}
     assert assistant.turn_view(pg, chat.ids['reviewer'], other['id'], chat.settings)['status'] == 'queued'
     assert all(pg.execute(f'SELECT count(*) n FROM {table}').fetchone()['n'] == count
-               for table, count in untouched.items()) and len(calls) == 2
+               for table, count in untouched.items()) and len(calls) == 3
     owner_request = {**payload('检查其他 CM 的消息'), 'context': {'cm_id': str(chat.ids['cm'])}}
     owner_turn = assistant.submit(pg, chat.ids['owner'], owner_request, chat.settings)
     row = pg.execute('SELECT checkpoint_ciphertext FROM assistant_turns WHERE id=%s',
@@ -790,7 +807,7 @@ def test_model_first_lookup_replay_history_and_actor_isolation(pg, chat, monkeyp
     assert denied['scope'] == {} and denied['message'] == denied['progress'] == ''
     pg.execute('UPDATE admin_roles SET is_active=TRUE WHERE authorization_id=%s', (chat.ids['owner'],))
     assistant.cancel(pg, chat.ids['owner'], owner_turn['id'], chat.settings)
-    assert len(calls) == 2
+    assert len(calls) == 3
     pg.execute('UPDATE authorizations SET status=\'revoked\' WHERE id=%s', (chat.ids['cm'],))
     with pytest.raises(PermissionError):
         assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
@@ -811,12 +828,22 @@ def test_owner_multi_person_loop_preserves_sources_and_revocation_boundary(pg, c
         calls.append(True)
         assert actor == chat.ids['owner']
         tool_map = {tool['name']: tool for tool in kwargs['tools']}
-        assert 'resolve_staff' in tool_map and 'cm_id' in tool_map['summarize_messages']['parameters']['properties']
+        assert 'resolve_staff' in tool_map
         output = [json.loads(item['output']) for item in items if item.get('type') == 'function_call_output']
         sections = kwargs['output_format']['schema']['properties']['sections']
         assert sections['items']['properties']['message_refs']['items']['pattern'] == r'^m\.'
         assert kwargs['output_format']['schema']['properties']['data_refs']['items']['pattern'] == r'^q\.'
         if not output:
+            assert set(tool_map) == {'resolve_staff', 'read_documents'}
+            assert 'statistics' in kwargs['instructions'] and 'message-summary' in kwargs['instructions']
+            return {'text': '', 'output': [{'type': 'function_call', 'name': 'read_documents',
+                'call_id': 'related-manuals', 'arguments': json.dumps({'document_ids': [
+                    'statistics', 'message-summary', 'answer-list']})}], 'usage': {}}
+        assert 'cm_id' in tool_map['summarize_messages']['parameters']['properties']
+        documents = next(item['documents'] for item in output if item.get('kind') == 'documents')
+        assert {document['key'] for document in documents} == {'statistics', 'message-summary', 'answer-list'}
+        business = [item for item in output if item.get('kind') != 'documents']
+        if not business:
             assert sections['maxItems'] == 0
             return {'text': '', 'output': [{'type': 'function_call', 'name': 'activity_stats',
                 'call_id': f'stats-{cm_id}', 'arguments': json.dumps({'cm_id': str(cm_id), 'audience': 'all',
@@ -824,8 +851,8 @@ def test_owner_multi_person_loop_preserves_sources_and_revocation_boundary(pg, c
                     'creator_ids': None, 'chat_ids': None, 'cursor': None,
                     'group_by': 'conversation', 'comparison': None})}
                 for cm_id in (chat.ids['cm'], other_id)], 'usage': {}}
-        if all(item.get('kind') == 'activity' for item in output):
-            assert len(output) == 2 and sections['maxItems'] == 0
+        if all(item.get('kind') == 'activity' for item in business):
+            assert len(business) == 2 and sections['maxItems'] == 0
             return {'text': '', 'output': [{'type': 'function_call', 'name': 'summarize_messages',
                 'call_id': str(cm_id), 'arguments': json.dumps({'cm_id': str(cm_id), 'audience': 'all',
                     'start': chat.start.isoformat(), 'end': chat.end.isoformat(),
@@ -839,17 +866,17 @@ def test_owner_multi_person_loop_preserves_sources_and_revocation_boundary(pg, c
                 if message['message_id'] == 'm1']
         final = {'answer': '样品询问已整理。', 'sections': [{'title': '样品', 'summary': '达人询问样品。',
             'message_refs': refs}], 'event_refs': [], 'result_refs': [],
-            'data_refs': [item['query_ref'] for item in output], 'draft_ref': None}
+            'data_refs': [item['query_ref'] for item in business], 'draft_ref': None}
         return {'text': json.dumps(final), 'output': [], 'usage': {}}
 
     monkeypatch.setattr(openai_client, 'call_openai_tools', model)
     turn = assistant.submit(pg, chat.ids['owner'], payload(question), chat.settings)
-    for _ in range(12):
+    for _ in range(14):
         finish(chat)
         if assistant.turn_view(pg, chat.ids['owner'], turn['id'], chat.settings)['status'] == 'completed':
             break
     view = assistant.turn_view(pg, chat.ids['owner'], turn['id'], chat.settings)
-    assert view['status'] == 'completed' and len(calls) == 3
+    assert view['status'] == 'completed' and len(calls) == 4
     assert view['result']['scope']['cm_id'] == str(chat.ids['owner'])
     assert set(view['result']['scope']['cm_ids']) == {str(chat.ids['cm']), str(other_id)}
     assert len(view['result']['sections'][0]['sources']) == 1
@@ -875,6 +902,64 @@ def test_owner_multi_person_loop_preserves_sources_and_revocation_boundary(pg, c
     pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (chat.ids['owner'],))
     hidden = assistant.turn_view(pg, chat.ids['owner'], waiting['id'], chat.settings)
     assert hidden['error_code'] == 'permission' and hidden['progress'] == hidden['message'] == ''
+
+
+def test_document_navigation_pins_selected_versions_and_blocks_private_sources(pg, chat, monkeypatch):
+    key = assistant_rules.save_document(pg, chat.settings, chat.ids['owner'], None,
+        'Owner 私有资料', '仅用于内部报价测试', 'knowledge', 'published', 'owner', 'OWNER_FACT_OLD', 0)
+    ordinary = assistant_rules.snapshot(pg, chat.settings)
+    assert key not in ordinary['documents'] and key not in assistant_rules.main_instructions(ordinary)
+    with pytest.raises((LookupError, PermissionError, ValueError)):
+        assistant_rules.read_documents(ordinary, [key])
+    calls = []
+
+    def model(_cfg, _key, items, actor, **kwargs):
+        calls.append(True)
+        assert actor == chat.ids['owner']
+        assert 'OWNER_FACT_OLD' not in kwargs['instructions'] and 'OWNER_FACT_NEW' not in kwargs['instructions']
+        output = [json.loads(item['output']) for item in items if item.get('type') == 'function_call_output']
+        if not output:
+            assert {tool['name'] for tool in kwargs['tools']} == {'read_documents', 'resolve_staff'}
+            assistant_rules.save_document(pg, chat.settings, chat.ids['owner'], key,
+                'Owner 私有资料', '仅用于内部报价测试', 'knowledge', 'published', 'owner', 'OWNER_FACT_NEW', 1)
+            return {'text': '', 'output': [{'type': 'function_call', 'name': 'read_documents',
+                'call_id': 'private-document', 'arguments': json.dumps({'document_ids': [key]})}], 'usage': {}}
+        document = output[-1]['documents'][0]
+        assert document['text'] == 'OWNER_FACT_OLD' and document['revision'] == 1
+        assert {tool['name'] for tool in kwargs['tools']} == {'read_documents', 'resolve_staff'}
+        final = {'answer': '已读取指定文档。', 'sections': [], 'event_refs': [], 'result_refs': [], 'data_refs': [],
+                 'document_refs': [document['document_ref']], 'draft_ref': None}
+        return {'text': json.dumps(final), 'output': [], 'usage': {}}
+
+    monkeypatch.setattr(openai_client, 'call_openai_tools', model)
+    turn = assistant.submit(pg, chat.ids['owner'], payload('查看Owner私有资料'), chat.settings)
+    for _ in range(4):
+        finish(chat)
+        view = assistant.turn_view(pg, chat.ids['owner'], turn['id'], chat.settings)
+        if view['status'] == 'completed':
+            break
+    assert view['status'] == 'completed' and len(calls) == 2
+    assert view['result']['documents'][0]['text'] == 'OWNER_FACT_OLD'
+    row = assistant._turn(pg, chat.ids['owner'], turn['id'])
+    checkpoint = summary_dialogues.decode(row['checkpoint_ciphertext'], chat.settings)
+    assert {document['key'] for document in assistant._loaded_documents(checkpoint)} == {key}
+    bad_final = {'answer': '伪造来源', 'sections': [], 'document_refs': ['doc.statistics']}
+    with pytest.raises(ValueError, match='未读取'):
+        assistant.tools.build_result(pg, chat.ids['owner'], row, bad_final, chat.settings,
+            checkpoint['context'], checkpoint['tool_results'])
+    with pg.transaction(force_rollback=True):
+        assistant_rules.save_document(pg, chat.settings, chat.ids['owner'], key,
+            '公开资料', '可用于全部CM', 'knowledge', 'published', 'all', 'PUBLIC_REPLACEMENT', 2)
+        public = assistant_rules.snapshot(pg, chat.settings)['documents'][key]
+        assert public['text'] == 'PUBLIC_REPLACEMENT' and public['visibility'] == 'all'
+        pg.execute('UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s', (chat.ids['owner'],))
+        denied = assistant.turn_view(pg, chat.ids['owner'], turn['id'], chat.settings)
+        assert denied['error_code'] == 'permission' and denied['result'] is None
+    assistant_rules.save_document(pg, chat.settings, chat.ids['owner'], key,
+        'Owner 私有资料', '仅用于内部报价测试', 'knowledge', 'archived', 'owner', 'OWNER_FACT_NEW', 2)
+    denied = assistant.turn_view(pg, chat.ids['owner'], turn['id'], chat.settings)
+    assert denied['error_code'] == 'permission' and denied['result'] is None
+    assert key not in assistant_rules.snapshot(pg, chat.settings, owner=True)['documents']
 
 
 def test_unknown_and_stopped_requests_never_replay_provider(pg, chat, monkeypatch, caplog):

@@ -264,7 +264,8 @@ def test_rule_form_rejects_bad_csrf_duplicate_and_oversized_input_before_storage
     monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _: "owner")
     monkeypatch.setattr(admin, "connection", lambda: pytest.fail("invalid form must not reach storage"))
     client = _client(lambda _: {"id": uuid4(), "status": "active"})
-    form = {"csrf_token": "csrf", "document": "core", "revision": "0", "content": "test"}
+    form = {"csrf_token": "csrf", "document": "core", "revision": "0", "content": "test",
+            "title": "核心规则", "description": "权限", "kind": "rule", "status": "published", "visibility": "all"}
     for body in (urlencode({**form, "csrf_token": "wrong"}), urlencode(form) + "&revision=0",
                  urlencode({**form, "content": "四" * (assistant_rules.MAX_DOCUMENT_CHARS * 2)})):
         assert client.post("/admin/assistant-rules", content=body,
@@ -296,16 +297,23 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     ))
     client, path = TestClient(app), "/admin/assistant-rules"
     pinned = assistant_rules.snapshot(pg, settings)
-    assert pinned == assistant_rules.builtin_snapshot()
+    defaults = assistant_rules.builtin_snapshot()
+    assert pinned["protocol"] == 2 and len(pinned["documents"]) == 16 and len(pinned["catalog"]) == 12
+    assert {key: pinned["documents"][key]["text"] for key in assistant_rules.KEYS} == {
+        key: document["text"] for key, document in defaults["documents"].items()}
+    pinned_before = json.dumps(pinned, sort_keys=True)
     for key, document in pinned["documents"].items():
         assistant_rules.validate(key, document["text"])
     assert "previous_week_same_time_end" in assistant_rules.main_instructions(pinned)
     assert "text_part" in assistant_rules.summary_instructions(pinned)
     page = client.get(path)
-    assert page.status_code == 200 and 'name="revision" value="0"' in page.text
+    assert page.status_code == 200 and 'name="revision" value="0"' in page.text and "助手文档" in page.text
+    assert 'name="kind" value="rule"' in page.text and 'id="document-kind" value="规则" readonly' in page.text
     content = pinned["documents"]["core"]["text"].replace(
         "## 主对话\n", "## 主对话\n测试 <script>alert(1)</script>。\n")
-    form = {"csrf_token": "csrf", "document": "core", "revision": "0", "content": content.replace("\n", "\r\n")}
+    core = assistant_rules.library(pg, settings)["core"]
+    form = {"csrf_token": "csrf", "document": "core", "revision": "0", "content": content.replace("\n", "\r\n"),
+            **{key: core[key] for key in ("title", "description", "kind", "status", "visibility")}}
     assert client.post(path, data={**form, "csrf_token": "wrong"}).status_code == 400
     assert pg.execute("SELECT count(*) n FROM assistant_rule_overrides").fetchone()["n"] == 0
     saved = client.post(path, data=form, follow_redirects=False)
@@ -315,23 +323,57 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     assert content not in row["content_ciphertext"]
     current = assistant_rules.snapshot(pg, settings)
     assert current["documents"]["core"]["text"] == content and current["digest"] != pinned["digest"]
-    assert pinned == assistant_rules.builtin_snapshot()  # Saving never mutates an existing turn's snapshot.
+    assert json.dumps(pinned, sort_keys=True) == pinned_before  # An existing turn keeps its pinned snapshot.
     conflict = client.post(path, data={**form, "content": content + "\n未保存修改。"})
     assert conflict.status_code == 409 and "未保存修改。" in conflict.text and "当前已保存版本" in conflict.text
-    assert "<script>" not in conflict.text and "&lt;script&gt;" in conflict.text
+    assert "<script>alert(1)</script>" not in conflict.text
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in conflict.text
     assert pg.execute("SELECT revision FROM assistant_rule_overrides").fetchone()["revision"] == 1
     for invalid in ("", content.replace("## 分段归纳\n", ""), "x" * (assistant_rules.MAX_DOCUMENT_CHARS + 1)):
         assert client.post(path, data={**form, "revision": "1", "content": invalid}).status_code == 400
+    for field, value in (("kind", "knowledge"), ("status", "draft"), ("visibility", "owner")):
+        assert client.post(path, data={**form, "revision": "1", field: value}).status_code == 400
     audit = pg.execute("SELECT metadata FROM audit_events WHERE action='assistant_rule_updated'").fetchone()["metadata"]
     assert audit["revision"] == 1 and "content" not in audit and "测试" not in json.dumps(audit, ensure_ascii=False)
+    new = client.get(path + "?new=1")
+    assert new.status_code == 200 and 'name="document" value=""' in new.text
+    assert '<option value="rule"' not in new.text
+    assert '<option value="manual" selected>' in new.text and '<option value="draft" selected>' in new.text
+    assert '<option value="all" selected>' in new.text and "所有已接入 CM" in new.text
+    draft_form = {"csrf_token": "csrf", "document": "", "revision": "0", "title": "样品进度手册",
+                  "description": "回答寄样安排及后续进展。", "kind": "manual", "status": "draft",
+                  "visibility": "all", "content": "先读取实际样品询问，再核对员工回复及后续消息。"}
+    assert client.post(path, data={**draft_form, "kind": "invalid"}).status_code == 400
+    created = client.post(path, data=draft_form, follow_redirects=False)
+    assert created.status_code == 303
+    key = created.headers["location"].split("document=", 1)[1].split("&", 1)[0]
+    assert key.startswith("doc-")
+    document = assistant_rules.library(pg, settings)[key]
+    assert document["status"] == "draft" and document["revision"] == 1
+    publish_form = {**draft_form, "document": key, "revision": "1", "status": "published"}
+    assert client.post(path, data=publish_form, follow_redirects=False).status_code == 303
+    document = assistant_rules.library(pg, settings)[key]
+    assert document["status"] == "published" and document["revision"] == 2
+    stale = client.post(path, data={**publish_form, "title": "未保存标题", "description": "未保存说明",
+                                   "content": "未保存的手册正文。"})
+    assert stale.status_code == 409 and 'value="未保存标题"' in stale.text
+    assert "未保存说明" in stale.text and "未保存的手册正文。" in stale.text
+    assert assistant_rules.library(pg, settings)[key] == document
+    assert client.post(path, data={**publish_form, "revision": "2", "status": "archived"},
+                       follow_redirects=False).status_code == 303
+    assert assistant_rules.library(pg, settings)[key]["status"] == "archived"
+    assert "样品进度手册" in client.get(path).text
     session["auth"] = {"id": member, "status": "active"}
     assert client.get(path).status_code == 403 and client.post(path, data=form).status_code == 403
+    assert client.get(path + "?new=1").status_code == 403
+    assert client.get(path + "?document=" + key).status_code == 403
+    assert client.post(path, data=publish_form).status_code == 403
     session["auth"] = {"id": owner, "status": "active"}
     pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (owner,))
     assert client.get(path).status_code == 403 and client.post(path, data=form).status_code == 403
     with pg.transaction(), pytest.raises(PermissionError):
         assistant_rules.save_override(pg, settings, owner, "core", content, 1)
-    assert pg.execute("SELECT revision FROM assistant_rule_overrides").fetchone()["revision"] == 1
+    assert pg.execute("SELECT revision FROM assistant_rule_overrides WHERE rule_key='core'").fetchone()["revision"] == 1
 
 
 @pytest.mark.parametrize("feature", [

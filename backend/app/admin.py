@@ -117,15 +117,16 @@ AI_FEATURES = {
 async def assistant_rule_fields(request: Request) -> dict[str, str]:
     if request.headers.get("content-type", "").split(";", 1)[0] != "application/x-www-form-urlencoded":
         return {}
-    max_bytes = assistant_rules.MAX_DOCUMENT_CHARS * 12 + 1024
+    max_bytes = assistant_rules.MAX_DOCUMENT_CHARS * 12 + 16_384
     body = await form_body(request, max_bytes=max_bytes)
     if len(body) > max_bytes:
         return {}
     try:
-        fields = parse_qs(body.decode("utf-8"), keep_blank_values=True, errors="strict", max_num_fields=4)
+        fields = parse_qs(body.decode("utf-8"), keep_blank_values=True, errors="strict", max_num_fields=9)
     except (UnicodeError, ValueError):
         return {}
-    if (set(fields) != {"csrf_token", "document", "revision", "content"}
+    if (set(fields) != {"csrf_token", "document", "revision", "title", "description",
+                       "kind", "status", "visibility", "content"}
             or any(len(values) != 1 for values in fields.values())):
         return {}
     return {key: values[0].replace("\r\n", "\n").replace("\r", "\n") for key, values in fields.items()}
@@ -327,16 +328,29 @@ def create_admin_router(
     def render_assistant_rules(request, access_context, key, *, error=None, status_code=200, draft=None,
                                conflict=False):
         with connection() as conn:
-            pinned = assistant_rules.snapshot(conn, get_settings())
-        document = pinned["documents"][key]
+            documents = assistant_rules.library(conn, get_settings())
+        if key and key not in documents:
+            return error_response(ValueError("助手文档不存在。"), request=request,
+                                  render_template=render_template, return_url="/admin/assistant-rules")
+        document = documents[key] if key else {
+            "key": "", "title": "", "description": "", "kind": "manual", "status": "draft",
+            "visibility": "all", "text": "", "revision": 0, "updated_at": None,
+        }
+        edit = {**document, **({field: draft[field] for field in (
+            "title", "description", "kind", "status", "visibility")} if draft else {})}
+        edit["text"] = draft["content"] if draft else document["text"]
+        core = key in {"core", "understand", "evidence", "answer"}
         return render_template(request, "admin/assistant_rules.html", {
             **page_context(access_context, "assistant-rules"),
-            "rule_documents": assistant_rules.DOCUMENTS, "rule_key": key, "rule_document": document,
-            "rule_text": document["text"] if draft is None else draft,
-            "default_text": assistant_rules.default_text(key),
+            "library_documents": list(documents.values()), "document_key": key or "",
+            "document": document, "edit": edit, "is_core": core,
+            "kind_labels": {"rule": "规则", "manual": "任务手册", "knowledge": "知识资料", "template": "输出模板"},
+            "status_labels": {"draft": "草稿", "published": "已发布", "archived": "已停用"},
+            "visibility_labels": {"all": "全体 CM", "owner": "仅 Owner"},
+            "default_text": assistant_rules.default_text(key) if core else None,
             "max_document_chars": assistant_rules.MAX_DOCUMENT_CHARS,
             "current_text": document["text"] if conflict else None,
-            "form_error": error, "saved": request.query_params.get("saved") == key,
+            "form_error": error, "saved": bool(key and request.query_params.get("saved") == key),
         }, status_code)
 
 
@@ -703,15 +717,12 @@ def create_admin_router(
 
 
     @router.get("/admin/assistant-rules")
-    def admin_assistant_rules(request: Request, document: str = "core") -> Response:
+    def admin_assistant_rules(request: Request, document: str = "core", new: bool = False) -> Response:
         access_context, denied = owner_access(request)
         if denied is not None:
             return denied
         assert access_context is not None
-        if document not in assistant_rules.KEYS:
-            return error_response(ValueError("未知的助手规则文档。"), request=request,
-                                  render_template=render_template, return_url="/admin/assistant-rules")
-        return render_assistant_rules(request, access_context, document)
+        return render_assistant_rules(request, access_context, None if new else document)
 
 
     @router.get("/admin/contacts")
@@ -991,31 +1002,29 @@ def create_admin_router(
             return denied
         assert access_context is not None
         if not _csrf_matches(form, csrf_token(access_context["authorization"])):
-            return error_response(ValueError("请求校验失败，请返回助手规则页面后重试。"), request=request,
+            return error_response(ValueError("请求校验失败，请返回助手文档页面后重试。"), request=request,
                                   render_template=render_template, return_url="/admin/assistant-rules")
-        key = form["document"]
-        if key not in assistant_rules.KEYS:
-            return error_response(ValueError("未知的助手规则文档。"), request=request,
-                                  render_template=render_template, return_url="/admin/assistant-rules")
+        key = form["document"] or None
         try:
             revision = int(form["revision"])
         except ValueError:
             return render_assistant_rules(request, access_context, key,
-                error="规则版本无效，请刷新页面后重试。", status_code=400, draft=form["content"])
+                error="文档版本无效，请刷新页面后重试。", status_code=400, draft=form)
         try:
             with connection() as conn, conn.transaction():
-                assistant_rules.save_override(conn, get_settings(), access_context["authorization"]["id"],
-                                              key, form["content"], revision)
+                saved_key = assistant_rules.save_document(conn, get_settings(), access_context["authorization"]["id"],
+                    key, form["title"], form["description"], form["kind"], form["status"], form["visibility"],
+                    form["content"], revision)
         except assistant_rules.RuleConflict as exc:
             return render_assistant_rules(request, access_context, key, error=str(exc), status_code=409,
-                                          draft=form["content"], conflict=True)
+                                          draft=form, conflict=True)
         except ValueError as exc:
             return render_assistant_rules(request, access_context, key, error=str(exc), status_code=400,
-                                          draft=form["content"])
+                                          draft=form)
         except PermissionError as exc:
             return error_response(exc, request=request, render_template=render_template,
                                   return_url="/admin/assistant-rules")
-        return RedirectResponse(url=f"/admin/assistant-rules?document={key}&saved={key}", status_code=303,
+        return RedirectResponse(url=f"/admin/assistant-rules?document={saved_key}&saved={saved_key}", status_code=303,
                                 headers={"Cache-Control": "no-store, max-age=0"})
 
     @router.post("/admin/ai/resume")

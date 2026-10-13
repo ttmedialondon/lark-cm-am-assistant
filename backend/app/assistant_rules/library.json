@@ -1,0 +1,110 @@
+[
+  {
+    "key": "message-summary",
+    "title": "聊天总结与长材料归纳",
+    "description": "处理全聊天、明确达人范围和长材料总结，按原问题保留具体事项、完整问答及逐项证据，避免把待办摘要替代其他分析。",
+    "kind": "manual",
+    "path": "manuals/message-summary.md",
+    "status": "published",
+    "visibility": "all"
+  },
+  {
+    "key": "unreplied-worklist",
+    "title": "负责达人未回复清单",
+    "description": "查询完整负责名单的未回复事项，区分重要度排序与筛选、回复与处理状态，保留全量计数及真实等待和截止依据。",
+    "kind": "manual",
+    "path": "manuals/unreplied-worklist.md",
+    "status": "published",
+    "visibility": "all"
+  },
+  {
+    "key": "follow-up",
+    "title": "连续追问与最新进展",
+    "description": "沿用上一轮实际事项及稳定引用，处理跨午夜、时间改写和短追问，补查完整后续而不把有限上下文或零消息当作结案。",
+    "kind": "manual",
+    "path": "manuals/follow-up.md",
+    "status": "published",
+    "visibility": "all"
+  },
+  {
+    "key": "history-search",
+    "title": "历史原话与会话检索",
+    "description": "以关键词和中英文同义词检索聊天正文，通过目录区分联系人与同名会话，再核对原问答、分页游标及实际来源。",
+    "kind": "manual",
+    "path": "manuals/history-search.md",
+    "status": "published",
+    "visibility": "all"
+  },
+  {
+    "key": "creator-and-groups",
+    "title": "达人资料与群目录",
+    "description": "查询正式达人、多个账号和负责人以及实际可见群用途，沿用稳定资料分页，避免凭群成员、营收或目录推断关系和能力。",
+    "kind": "manual",
+    "path": "manuals/creator-and-groups.md",
+    "status": "published",
+    "visibility": "all"
+  },
+  {
+    "key": "statistics",
+    "title": "活动统计与时段比较",
+    "description": "使用数据库真实数字比较消息和联系活动，采用英国日历边界与夏令时口径，区分前一等长时段、上周同期及跨人员重叠。",
+    "kind": "manual",
+    "path": "manuals/statistics.md",
+    "status": "published",
+    "visibility": "all"
+  },
+  {
+    "key": "reply-writing",
+    "title": "回复起草与手稿改写",
+    "description": "从真实事件或文字消息准备材料并保存草稿，保留当前手改正文和中文参考，核验未确认事实，明确复制与发送的区别。",
+    "kind": "manual",
+    "path": "manuals/reply-writing.md",
+    "status": "published",
+    "visibility": "all"
+  },
+  {
+    "key": "business-analysis",
+    "title": "经营、行业与竞争分析",
+    "description": "围绕经营子问题定向查找近九十天线索，区分聊天观点与正式政策，呈现优势、反例和商业模式，标明收费及外部事实待核验。",
+    "kind": "manual",
+    "path": "manuals/business-analysis.md",
+    "status": "published",
+    "visibility": "all"
+  },
+  {
+    "key": "connection-status",
+    "title": "账号连接与消息可用性",
+    "description": "仅在用户明确询问连接或消息能否查看时检查状态，区分账号失效、会话限制、未同步和不可读内容，避免把后台诊断当业务进展。",
+    "kind": "manual",
+    "path": "manuals/connection-status.md",
+    "status": "published",
+    "visibility": "all"
+  },
+  {
+    "key": "answer-list",
+    "title": "简洁事项分类与来源",
+    "description": "将业务事项组织为有具体对象和进展的简短分类，逐类绑定真实消息来源，区分完成、待跟进与未见后续，避免重复卡片。",
+    "kind": "template",
+    "path": "templates/answer-list.md",
+    "status": "published",
+    "visibility": "all"
+  },
+  {
+    "key": "answer-comparison",
+    "title": "统计和资料比较",
+    "description": "用真实统计或资料卡展示口径一致的比较，明确人员、日期和截止，解释差异与限制，不把查询编号伪装成原消息引用。",
+    "kind": "template",
+    "path": "templates/answer-comparison.md",
+    "status": "published",
+    "visibility": "all"
+  },
+  {
+    "key": "answer-report",
+    "title": "经营分析报告",
+    "description": "围绕政策、现状与竞争、优势、商业模式和限制组织报告，区分事实与判断、支持与反例，仅使用可核验的真实来源和链接。",
+    "kind": "template",
+    "path": "templates/answer-report.md",
+    "status": "published",
+    "visibility": "all"
+  }
+]

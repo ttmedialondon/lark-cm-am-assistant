@@ -746,6 +746,19 @@
       const card = dataCard(value, multiCM); if (card) container.append(card);
       if (data.kind === "window_messages") sourcesAdded = true;
     }
+    if (result.documents?.length) {
+      const references = node("details", "oa-coverage oa-document-sources");
+      references.append(node("summary", "", `参考文档 · ${result.documents.length}`));
+      for (const document of result.documents) {
+        const source = node("section", "oa-section-source oa-document-source");
+        source.append(node("h4", "", document.title), node("small", "oa-coverage", `版本 ${document.revision}`));
+        const content = node("p", "", document.text); content.style.whiteSpace = "pre-wrap";
+        source.append(content);
+        if (document.truncated) source.append(node("small", "oa-coverage", "仅展示相关文档片段"));
+        references.append(source);
+      }
+      container.append(references);
+    }
     if (result.draft?.draft?.trim()) {
       const draft = {...result.draft, draft_ref: result.draft.draft_ref || result.draft_ref};
       showDraft(draft, container.dataset.turnId, Boolean(activeReplyAction));

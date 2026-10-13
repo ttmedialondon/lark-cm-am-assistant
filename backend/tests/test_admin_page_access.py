@@ -34,7 +34,8 @@ GET_ROUTES = (
     ("ai", "/admin/ai"),
     ("jobs", "/admin/jobs"),
 )
-PRIVATE_ROUTES = ("/admin/assistant-rules",)
+PRIVATE_ROUTES = ("/admin/assistant-rules", "/admin/assistant-rules?new=1",
+                  "/admin/assistant-rules?document=doc-00000000-0000-0000-0000-000000000001")
 POST_ROUTES = (
     f"/admin/users/{TARGET}/permissions",
     "/admin/contacts/ou_contact/organization",
@@ -178,6 +179,7 @@ def test_owner_navigation_exposes_every_page():
                              if page["path"].startswith("/admin")} | {"/admin/assistant-rules"}
     assert _page_menu_targets(html) == list(dict.fromkeys(page["path"] for page in admin_permissions.PAGES)) + [
         "/admin/assistant-rules"]
+    assert ">助手文档</a>" in html
     _assert_no_navigation_role_labels(html)
 
 
@@ -325,7 +327,7 @@ def test_every_admin_route_is_in_the_access_matrix(monkeypatch):
             path = path.replace(f"{{{parameter}}}", TARGET)
         actual.update((method, path) for method in route.methods)
     expected = {("GET", path.split("?", 1)[0]) for _, path in GET_ROUTES}
-    expected.update(("GET", path) for path in PRIVATE_ROUTES)
+    expected.update(("GET", path.split("?", 1)[0]) for path in PRIVATE_ROUTES)
     expected.update(("POST", path) for path in POST_ROUTES)
     assert actual == expected
 

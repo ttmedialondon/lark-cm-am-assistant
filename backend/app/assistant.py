@@ -49,9 +49,12 @@ OUTPUT_FORMAT = {
             'result_refs': {'type': 'array', 'items': {'type': 'string'}},
             'data_refs': {'type': 'array', 'description': '资料、统计、检索结果的实际 query_ref。',
                           'items': {'type': 'string', 'pattern': '^q\\.'}},
+            'document_refs': {'type': 'array', 'maxItems': 20,
+                'description': '仅在回答文档内容或业务知识时列已读取的 document_ref，不展示内部处理流程。',
+                'items': {'type': 'string', 'pattern': '^doc\\.'}},
             'draft_ref': {'type': ['string', 'null']},
         },
-        'required': ['answer', 'sections', 'event_refs', 'result_refs', 'data_refs', 'draft_ref'],
+        'required': ['answer', 'sections', 'event_refs', 'result_refs', 'data_refs', 'document_refs', 'draft_ref'],
     },
 }
 
@@ -123,7 +126,7 @@ def submit(conn, actor, payload, settings):
     data = {'message': message.strip(), 'selected_context': payload.get('context', {})}
     checkpoint = {'context': context, 'model_steps': 0, 'tool_results': [], 'pending_calls': [],
                   'tool_outputs': {}, 'tool_cache': {}, 'items': [], 'in_flight': False, 'progress': '等待处理',
-                  'rules': rules.snapshot(conn, settings)}
+                  'rules': rules.snapshot(conn, settings, owner=context.get('can_query_other_cm', False))}
     turn_id = uuid4()
     conn.execute('''INSERT INTO assistant_turns(id,session_id,client_request_id,input_ciphertext,
         checkpoint_ciphertext,created_at) VALUES(%s,%s,%s,%s,%s,%s)''',
@@ -139,6 +142,13 @@ def _context(conn, row, checkpoint, settings, *, read_cache=None):
         selected = {**selected, 'audience': 'creators'}  # Old answers used the creator-only material protocol.
     context = tools.current_context(conn, row['actor_id'], selected, settings, now=row['created_at'],
                                     read_cache=read_cache)
+    pinned = checkpoint.get('rules', {})
+    if pinned.get('protocol') == 2:
+        keys = [document['key'] for document in _loaded_documents(checkpoint)]
+        if not context.get('can_query_other_cm'):
+            keys.extend(key for key, value in pinned['documents'].items() if value.get('visibility') == 'owner')
+        rules.validate_access(conn, pinned, list(dict.fromkeys(keys)),
+                              owner=context.get('can_query_other_cm', False))
     scopes = [result.get('scope', {}) for result in checkpoint.get('tool_results', [])]
     scopes.extend([checkpoint.get('waiting', {}).get('scope', {}),
                    checkpoint.get('window_job', {}).get('task', {}).get('scope', {})])
@@ -148,6 +158,11 @@ def _context(conn, row, checkpoint, settings, *, read_cache=None):
             tools.context_for_scope(conn, row['actor_id'], context, scope, read_cache=read_cache)
             checked.add(scope['cm_id'])
     return context
+
+
+def _loaded_documents(checkpoint):
+    return list({document['key']: document for result in checkpoint.get('tool_results', [])
+                 if result.get('kind') == 'documents' for document in result['documents']}.values())
 
 
 def _result(conn, row, checkpoint, settings, *, context=None, read_cache=None):
@@ -606,6 +621,9 @@ def _historical_window_result(conn, previous, checkpoint, settings, context, *, 
         return None
     try:
         original = checkpoint.get('tool_results', [])
+        if checkpoint.get('rules', {}).get('protocol') == 2:
+            rules.validate_access(conn, checkpoint['rules'], [document['key']
+                for document in _loaded_documents(checkpoint)], owner=context.get('can_query_other_cm', False))
         if independent:
             # Segment summaries saw only this window; the final answer can also depend on older sources.
             first = next(item for item in original if item.get('query_ref') == material['query_ref'])
@@ -668,6 +686,8 @@ def _history(conn, row, settings, context, *, read_cache=None):
                                 for index, event in enumerate(checked.get('events', []))],
                 'result_refs': checked.get('result_refs', []), 'draft': checked.get('draft'),
                 'data_refs': checked.get('data_refs', []),
+                'document_index': [{key: document[key] for key in ('key', 'title', 'revision')}
+                                   for document in checked.get('documents', [])],
                 'data': [windows.metadata(data) for data in checked.get('data', [])],
             }, ensure_ascii=False, default=str)})
             if checked.get('requires_refresh'):
@@ -691,6 +711,8 @@ def _history(conn, row, settings, context, *, read_cache=None):
                                      for message in result.get('messages', []))
                               or any(event.get('event_ref') in refs for event in result.get('events', []))]
             for result in retained:
+                if result.get('kind') == 'documents':
+                    continue  # A new question reads its own pinned document version.
                 signature = json.dumps(result, sort_keys=True, ensure_ascii=False, default=str)
                 if signature not in seen:
                     seen.add(signature)
@@ -774,6 +796,9 @@ def step(job, settings):
                 was_cached = False
                 try:
                     args = json.loads(call['arguments'])
+                    if call['name'] == 'read_documents':
+                        tools._validate(call['name'], args)
+                        args['document_ids'] = sorted(set(args['document_ids']))
                     if call['name'] == 'summarize_messages' and args.get('audience') == 'all':
                         tools._validate('summarize_messages', args)
                         start, end = tools._window(args['start'], args['end'], row['created_at'])
@@ -806,8 +831,17 @@ def step(job, settings):
                         result = cached
                     else:
                         current_turn = {**row, 'checkpoint_ciphertext': codec.encode(checkpoint, settings)}
-                        result = tools.execute(conn, row['actor_id'], current_turn,
-                                               call['name'], args, settings, context, read_cache=read_cache)
+                        if call['name'] == 'read_documents':
+                            keys = args['document_ids']
+                            was_cached = set(keys) <= {document['key'] for document in _loaded_documents(checkpoint)}
+                            rules.validate_access(conn, checkpoint['rules'], keys,
+                                                  owner=context.get('can_query_other_cm', False))
+                            result = {'kind': 'documents', 'documents': [
+                                {**document, 'document_ref': 'doc.' + document['key']}
+                                for document in rules.read_documents(checkpoint['rules'], keys)]}
+                        else:
+                            result = tools.execute(conn, row['actor_id'], current_turn,
+                                                   call['name'], args, settings, context, read_cache=read_cache)
                         if not result.get('waiting'):
                             checkpoint['tool_cache'][cache_key] = result
                 except (PermissionError, LookupError, ValueError) as exc:
@@ -859,7 +893,8 @@ def step(job, settings):
             tools.validate_tool_results(conn, row['actor_id'], row, windows.pages(checkpoint, window),
                 settings, context, read_cache=read_cache, message_refs=set(allowed_refs.values()))
             model_items = [{'role': 'user', 'content': windows.encoded(segment)}]
-            model_instructions, model_tools = rules.summary_instructions(checkpoint['rules']), []
+            model_instructions, model_tools = rules.summary_instructions(checkpoint['rules'],
+                loaded_documents=_loaded_documents(checkpoint)), []
             model_format = windows.summary_format(allowed_refs,
                                                    structured_items=window.get('structured_items', False))
             checkpoint['summary_request'] = True
@@ -868,8 +903,17 @@ def step(job, settings):
             tools.validate_tool_results(conn, row['actor_id'], row, checkpoint['tool_results'], settings, context,
                                         read_cache=read_cache)
             model_items = checkpoint['items']
-            model_instructions = rules.main_instructions(checkpoint['rules']) + '\n' + REPLY_INSTRUCTIONS
-            model_tools, model_format = tools.tools_for(context), OUTPUT_FORMAT
+            model_instructions = rules.main_instructions(checkpoint['rules'])
+            loaded_documents = _loaded_documents(checkpoint)
+            if (checkpoint['rules'].get('protocol') != 2
+                    or any(document['key'] == 'reply-writing' for document in loaded_documents)
+                    or any(result.get('_reply_material') for result in checkpoint['tool_results'])):
+                model_instructions += '\n' + REPLY_INSTRUCTIONS
+            documents_ready = (any(document['kind'] == 'manual' for document in loaded_documents)
+                               or not any(document['kind'] == 'manual'
+                                          for document in checkpoint['rules'].get('catalog', [])))
+            model_tools, model_format = tools.tools_for(context,
+                document_mode=checkpoint['rules'].get('protocol') == 2, documents_ready=documents_ready), OUTPUT_FORMAT
             if not any(message.get('message_ref') for result in checkpoint['tool_results']
                        for message in result.get('messages', [])):
                 model_format = {**OUTPUT_FORMAT, 'schema': {**OUTPUT_FORMAT['schema'], 'properties': {

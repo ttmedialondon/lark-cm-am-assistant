@@ -261,6 +261,8 @@ const {chromium} = require('playwright');
       scope:{cm_id:ownId(),cm_name:'CM',audience:'all',creator_ids:null},
       window:{start:'2026-10-12T07:00:00Z',end:'2026-10-12T11:00:00Z'},
       draft:{draft:'**I will check.**',chinese_translation:'我会核对。',language:'en'},
+      documents:[{document_ref:'doc.fixture',key:'fixture',title:'活动规则',kind:'knowledge',revision:2,
+        text:'<img src=x onerror=alert(1)> 固定文档版本',truncated:false}],
       sections:[{title:'活动事项',summary:'活动报名需要回复。',message_refs:['m.admin.event'],
         sources:[{message_ref:'m.admin.event',conversation_name:'活动群',sender_name:'Amy',
           time:'2026-10-12T08:00:00Z',text:'I would like to attend.'}]},
@@ -296,11 +298,15 @@ const {chromium} = require('playwright');
       '群聊：<img src=x onerror=alert(1)> 样品群私聊：Fixture 私聊');
     assert.equal(await page.locator('.oa-event img').count(),0);
     assert.equal(await page.locator('.oa-event p').textContent(),'对方询问样品寄送进度。');
-    assert.match(await page.locator('.oa-message--assistant > .oa-coverage').textContent(),
+    assert.match(await page.locator('.oa-message--assistant > p.oa-coverage').textContent(),
       /负责达人 201 位 · 匹配事项 12 项 · 部分结果/);
     assert.doesNotMatch(await page.locator('.oa-scope').textContent(),/授权|修改范围/);
     assert.match(await page.locator('.oa-source-entry').textContent(),/来源 · 20 条消息/);
     assert.equal(await page.locator('.oa-summary-section').count(),2);
+    assert.equal(await page.locator('.oa-document-sources summary').textContent(),'参考文档 · 1');
+    assert.equal(await page.locator('.oa-document-sources').getAttribute('open'),null);
+    assert.match(await page.locator('.oa-document-source').textContent(),/活动规则.*版本 2.*固定文档版本/);
+    assert.equal(await page.locator('.oa-document-source img').count(),0);
     assert.equal(await page.locator('.oa-section-sources[open]').count(),0);
     assert.match(await page.locator('.oa-data[data-query-ref="q.sync"]').textContent(),
       /首次同步诊断.*首次同步数量.*历史消息已读取.*最近同步时间.*测试用同步定义/);
