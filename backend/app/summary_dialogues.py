@@ -1,7 +1,7 @@
 """Independent conversation chunks, followed by same-creator, same-shift merging.
 
-No historical event ledger, model tools, or cross-date dependencies. Checkpoints
-contain only successful chunks/pair comparisons and are encrypted like reports.
+No historical event ledger, model tools, or cross-date dependencies. Encrypted
+checkpoints retain completed work and provider receipts for local response replay.
 """
 
 from __future__ import annotations
@@ -459,12 +459,12 @@ def combine(raw, left, right):
 
 def step(job, settings):
     with core.connection() as conn, conn.transaction():
-        core._current(conn, job)
         cfg = core._config(conn, core.run_feature(job))
         if job["chat_id"]:
             data = checked_chat(conn, job, settings)
             chunks = segments(data)
         else:
+            core._current(conn, job)
             source_events, person = merge_input(conn, job, job, settings)
     checkpoint = decode(job.get("checkpoint_ciphertext"), settings) or {}
     response = None
@@ -488,6 +488,7 @@ def step(job, settings):
                 schema,
                 core._INSTRUCTIONS + "\n只分析 core_refs 中的本时段消息，其他消息仅是上下文。"
                 "processed_refs 必须逐条完整列出 core_refs。不得输出仅有上下文依据的事项。",
+                checkpoint=checkpoint,
             )
             payload = json.loads(response["text"])
             if sorted(payload.pop("processed_refs", [])) != sorted(pending["pack"]["core_refs"]):
@@ -547,6 +548,7 @@ def step(job, settings):
                      "evidence_messages": evidence_messages},
                     merge_format(evidence_messages, ledger[against], candidate),
                     MERGE_INSTRUCTIONS,
+                    checkpoint=checkpoint,
                 )
                 merged = combine(response["text"], ledger[against], candidate)
                 if merged:
@@ -563,13 +565,15 @@ def step(job, settings):
         else:
             core._current(conn, job)
             merge_input(conn, job, job, settings)
+        _retain_receipts(checkpoint, _current_checkpoint(conn, job, settings))
+        model = checkpoint.get("provider_call", {}).get("model", cfg["model"])
+        checkpoint.pop("response_received", None)
+        checkpoint.pop("provider_call", None)
         conn.execute(
             """UPDATE offhours_summary_tasks SET status=%s,checkpoint_ciphertext=%s,
             result_ciphertext=%s,processed_messages=%s,total_messages=%s,attempts=0,
             lease_until=NULL,scheduled_at=NOW(),finished_at=CASE WHEN %s THEN NOW() ELSE NULL END,
-            model=%s,response_id=%s,error_message=NULL,
-            usage=jsonb_build_object('input_tokens',COALESCE((usage->>'input_tokens')::bigint,0)+%s,
-                'output_tokens',COALESCE((usage->>'output_tokens')::bigint,0)+%s) WHERE id=%s""",
+            model=%s,error_message=NULL WHERE id=%s AND lease_until=%s""",
             (
                 "succeeded" if finished else "queued",
                 encode(checkpoint, settings),
@@ -577,32 +581,122 @@ def step(job, settings):
                 processed,
                 total,
                 finished,
-                cfg["model"],
-                response.get("response_id") if response else job.get("response_id"),
-                ((response or {}).get("usage") or {}).get("input_tokens", 0),
-                ((response or {}).get("usage") or {}).get("output_tokens", 0),
+                model,
                 job["id"],
+                job["lease_until"],
             ),
         )
 
 
-def request(job, settings, cfg, pack, schema, instructions):
+def _retain_receipts(checkpoint, persisted):
+    if checkpoint.get("receipts") or persisted.get("receipts"):
+        checkpoint["receipts"] = list({item["call_id"]: item for item in
+            [*checkpoint.get("receipts", []), *persisted.get("receipts", [])]}.values())
+    if "usage" in persisted:
+        checkpoint["usage"] = dict(persisted["usage"])
+
+
+def _current_checkpoint(conn, job, settings, *, reply=False):
+    table = "summary_reply_tasks" if reply else "offhours_summary_tasks"
+    row = conn.execute(f"SELECT checkpoint_ciphertext FROM {table} WHERE id=%s AND status='running' "
+        "AND attempts=%s AND lease_until=%s AND lease_until>NOW() FOR UPDATE",
+        (job["id"], job["attempts"], job.get("lease_until"))).fetchone()
+    if not row:
+        raise core.SummaryInputError("任务已失效。")
+    return decode(row["checkpoint_ciphertext"], settings) or {}
+
+
+def _receipt(job, settings, checkpoint, response, *, reply=False, received=False):
+    for attempt in range(3):
+        try:
+            return _store_receipt(job, settings, checkpoint, response, reply=reply, received=received)
+        except (DeadlockDetected, SerializationFailure):
+            if attempt == 2:
+                raise
+
+
+def _store_receipt(job, settings, checkpoint, response, *, reply=False, received=False):
+    table = "summary_reply_tasks" if reply else "offhours_summary_tasks"
+    call = checkpoint["provider_call"]
+    usage = {key: value for key, value in response.get("usage", {}).items()
+             if key in ("input_tokens", "output_tokens") and type(value) is int and value >= 0}
+    telemetry = response.get("telemetry", {})
+    receipt = {"call_id": call["id"], "model": call["model"], "usage": usage,
+        "response_id": response.get("response_id"), "telemetry": {key: telemetry[key] for key in (
+            "http_status", "openai_request_id", "response_status", "incomplete_reason", "response_latency_ms")
+            if key in telemetry}}
     with core.connection() as conn, conn.transaction():
-        if job["chat_id"]:
+        row = conn.execute(f"SELECT *,lease_until>NOW() AS leased FROM {table} WHERE id=%s FOR UPDATE",
+                           (job["id"],)).fetchone()
+        if not row:
+            raise core.SummaryInputError("任务已失效。")
+        persisted = decode(row["checkpoint_ciphertext"], settings) or {}
+        live = row["status"] == "running" and row["attempts"] == job["attempts"] and row["leased"] \
+            and row["lease_until"] == job.get("lease_until") \
+            and (reply or row["is_current"]) \
+            and persisted.get("provider_call", {}).get("id") == call["id"]
+        saved = checkpoint if live else persisted
+        _retain_receipts(saved, persisted)
+        receipts = saved.setdefault("receipts", [])
+        total = dict(persisted.get("usage", {}) if reply else row["usage"] or {})
+        if not any(item["call_id"] == call["id"] for item in persisted.get("receipts", [])):
+            if not any(item["call_id"] == call["id"] for item in receipts):
+                receipts.append(receipt)
+            for key, count in usage.items():
+                total[key] = total.get(key, 0) + count
+            if not reply:
+                conn.execute(f"UPDATE {table} SET usage=%s::jsonb,response_id=COALESCE(%s,response_id) WHERE id=%s",
+                             (json.dumps(total), receipt["response_id"] if live else None, job["id"]))
+        saved["usage"] = total
+        if live and received:
+            saved["response_received"] = {"signature": call["signature"], "response": response,
+                                          "checked_at": call.get("checked_at")}
+        conn.execute(f"UPDATE {table} SET checkpoint_ciphertext=%s WHERE id=%s", (encode(saved, settings), job["id"]))
+    if not live:
+        raise core.SummaryInputError("任务已失效；已保留调用用量。")
+
+
+def request(job, settings, cfg, pack, schema, instructions, *, checkpoint, reply=False, max_output_tokens=12000):
+    # The clock and sync watermark do not change the prepared business evidence.
+    signature = core._hash([{key: value for key, value in pack.items()
+                            if key not in {"checked_at", "synced_through"}}, schema, instructions])
+    pending = checkpoint.get("response_received")
+    if pending:
+        if pending["signature"] != signature:
+            raise core.SummaryInputError("调用材料或处理阶段已变化。")
+        return pending["response"]
+    if checkpoint.get("provider_call"):
+        raise openai_client.OpenAIRequestError("请求结果未知，未自动重复调用。")
+    table = "summary_reply_tasks" if reply else "offhours_summary_tasks"
+    with core.connection() as conn, conn.transaction():
+        if not reply and job["chat_id"]:
             checked_chat(conn, job, settings)
-        else:
+        elif not reply:
             core._current(conn, job)
             merge_input(conn, job, job, settings)
+        _retain_receipts(checkpoint, _current_checkpoint(conn, job, settings, reply=reply))
+        checkpoint["provider_call"] = {"id": str(uuid4()), "signature": signature, "model": cfg["model"],
+                                       "checked_at": pack.get("checked_at")}
+        conn.execute(f"UPDATE {table} SET checkpoint_ciphertext=%s WHERE id=%s AND lease_until=%s",
+                     (encode(checkpoint, settings), job["id"], job["lease_until"]))
     key = api_key_cipher(settings.token_encryption_key).decrypt(cfg["api_key_ciphertext"])
-    return openai_client.call_openai(
-        cfg,
-        key,
-        pack,
-        job["responsible_authorization_id"],
-        instructions=instructions,
-        output_format=schema,
-        max_output_tokens=12000,
-    )
+    try:
+        response = openai_client.call_openai(cfg, key, pack,
+            job["actor_id"] if reply else job["responsible_authorization_id"], instructions=instructions,
+            output_format=schema, max_output_tokens=max_output_tokens)
+    except (openai_client.OpenAIRequestError, openai_client.ModelOutputError) as exc:
+        _receipt(job, settings, checkpoint, {"usage": exc.telemetry.get("usage", {}),
+            "response_id": exc.telemetry.get("response_id"), "telemetry": exc.telemetry}, reply=reply)
+        if isinstance(exc, openai_client.OpenAIRequestError) and exc.retryable:
+            checkpoint.pop("provider_call", None)
+            with core.connection() as conn, conn.transaction():
+                _retain_receipts(checkpoint, _current_checkpoint(conn, job, settings, reply=reply))
+                conn.execute(f"UPDATE {table} SET checkpoint_ciphertext=%s WHERE id=%s AND status='running' "
+                             "AND attempts=%s AND lease_until=%s",
+                             (encode(checkpoint, settings), job["id"], job["attempts"], job["lease_until"]))
+        raise
+    _receipt(job, settings, checkpoint, response, reply=reply, received=True)
+    return response
 
 
 def run(job, settings):
@@ -620,6 +714,10 @@ def run(job, settings):
         message = ("请求结果未知，未自动重复调用；请核实后重新生成。" if exc.request_unknown
                    else "OpenAI 请求未完成；已完成分段保留。")
         core._finish(job, "queued" if retry else "failed", message, delay=delay)
+    except (DeadlockDetected, SerializationFailure) as exc:
+        core.LOGGER.info("summary local save retry: %s; no content logged", type(exc).__name__)
+        core._finish(job, "queued" if job["attempts"] < core.MAX_ATTEMPTS else "failed",
+                     "本地保存未完成；已返回的响应将继续处理。", delay=10)
     except (
         core.InvalidModelOutput,
         openai_client.ModelOutputError,
@@ -628,15 +726,12 @@ def run(job, settings):
         TypeError,
         InvalidTag,
         openai_client.AIInputError,
-        DeadlockDetected,
-        SerializationFailure,
     ) as exc:
-        retry = job["attempts"] < core.MAX_ATTEMPTS
         core.LOGGER.info(
-            "summary segment retry: %s; no content logged",
+            "summary segment failed: %s; no content logged",
             str(exc) if isinstance(exc, core.InvalidModelOutput) else type(exc).__name__,
         )
-        core._finish(job, "queued" if retry else "failed", "当前分段或合并未完成；已完成分段保留。", delay=10)
+        core._finish(job, "failed", "当前分段或合并结果无法使用；已保留用量及完成分段。")
     except Exception as exc:
         core.LOGGER.warning("summary failed: %s; no content logged", type(exc).__name__)
         core._finish(job, "failed", "分析服务异常；已完成分段保留。")

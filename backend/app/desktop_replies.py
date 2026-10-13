@@ -68,10 +68,11 @@ ready 时 evidence_refs 必须包含用于确定选中事件的 S 编号，不�
 
 
 class ReplyError(Exception):
-    def __init__(self, code, message, status=503, *, usage=None):
+    def __init__(self, code, message, status=503, *, usage=None, telemetry=None):
         super().__init__(message)
         self.code, self.message, self.status = code, message, status
         self.usage = usage or {}
+        self.telemetry = telemetry or {}
 
 
 def configuration(settings):
@@ -122,6 +123,7 @@ async def generate(payload, actor, config, api_key, *, total_timeout):
         max_output_tokens=8000, total_timeout=total_timeout,
     )
     usage = response["usage"]
+    telemetry = response.get("telemetry", {})
     try:
         result = json.loads(response["text"])
         expected = {"outcome", "context_reason", "language", "draft", "chinese_translation", "explanation",
@@ -144,7 +146,7 @@ async def generate(payload, actor, config, api_key, *, total_timeout):
             if result["draft"] or result["chinese_translation"] or result["context_reason"] not in CONTEXT_MESSAGES:
                 raise ValueError
             raise ReplyError("context_unavailable", CONTEXT_MESSAGES[result["context_reason"]], 422,
-                             usage=usage)
+                             usage=usage, telemetry=telemetry)
         if result["context_reason"] != "none":
             raise ValueError
         if not result["draft"].strip() or not result["chinese_translation"].strip():
@@ -155,7 +157,8 @@ async def generate(payload, actor, config, api_key, *, total_timeout):
         if result["language"] == "zh" and result["draft"] != result["chinese_translation"]:
             raise ValueError
     except (ValueError, TypeError) as exc:
-        raise ReplyError("invalid_ai_response", "AI 未返回有效建议，请重新发起生成。", 502, usage=usage) from exc
+        raise ReplyError("invalid_ai_response", "AI 未返回有效建议，请重新发起生成。", 502,
+                         usage=usage, telemetry=telemetry) from exc
     result = {
         "request_id": payload["request_id"], "suggestion": result["draft"],
         "chinese_translation": result["chinese_translation"], "english_translation": None, "is_mock": False,
@@ -164,5 +167,6 @@ async def generate(payload, actor, config, api_key, *, total_timeout):
         if len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > MAX_RESPONSE_BYTES:
             raise ValueError
     except (ValueError, UnicodeEncodeError) as exc:
-        raise ReplyError("invalid_ai_response", "AI 输出超出响应范围，未截断内容。", 502, usage=usage) from exc
-    return result, usage
+        raise ReplyError("invalid_ai_response", "AI 输出超出响应范围，未截断内容。", 502,
+                         usage=usage, telemetry=telemetry) from exc
+    return result, usage, telemetry

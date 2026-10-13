@@ -1,6 +1,6 @@
 # 系统技术说明
 
-更新：2026-10-09。本文记录现行后端、数据关系与运行边界。业务以 [人员身份与达人名单](../product/creator-management.md)、[消息总结](../product/message-summary.md)、[后台权限](../product/admin-access.md) 为准；功能启用状态由线上配置决定，不由历史文档或发布脚本决定。
+更新：2026-10-13。本文记录现行后端、数据关系与运行边界。业务以 [人员身份与达人名单](../product/creator-management.md)、[消息总结](../product/message-summary.md)、[后台权限](../product/admin-access.md) 为准；功能启用状态由线上配置决定，不由历史文档或发布脚本决定。
 
 ## 1. 实际架构
 
@@ -74,7 +74,28 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 
 ### 当前队列
 
-Worker 轮转名单导入、消息总结、回复建议、handle 匹配、负责人匹配、群分类、维护优先级七条 AI 队列。各功能独立加密配置，使用 PostgreSQL 任务、租约、版本和请求回执；共享最多 5 个在途请求及服务商退避，不设本地 RPM/Token 预算。准备线程独立于网络请求，桌面主动请求与群发发送不占这组名额。
+Worker 轮转运营助手、名单导入、消息总结、回复建议、handle 匹配、负责人匹配、群分类、维护优先级八条 AI 队列。各功能独立加密配置，使用 PostgreSQL 任务、租约、版本和请求回执；全局共享最多 5 个在途请求及服务商退避，不是每个功能各 5 个，不设本地 RPM/Token 预算。准备线程独立于网络请求，桌面主动请求与群发发送不占这组名额。
+
+### OpenAI 调用入口
+
+所有现行调用使用 `openai_client.py`，向同一个 Responses 接口发送单次请求并设置 `store: false`。同步、可取消异步和工具循环是三个调用方式，不是三套客户端；不叠加 SDK 自动重试。客户端统一构造请求、合并所有文字输出、提取安全用量／请求编号和识别服务商错误；业务模块保留各自材料、prompt、人工事实及入库校验。
+
+| 功能配置 | 调用模块 | 触发与执行 |
+|---|---|---|
+| `creator_import` | `creator_imports` | 用户确认导入批次后调用；没有自动启用开关，数据库 `enabled=false` 不等于禁止已明确启动的导入 |
+| `creator_handle_matching` | `creator_handle_matching` | 已启用的达人—账号匹配队列 |
+| `creator_responsibility_matching` | `creator_responsibility_matching` | 已启用的达人—负责人匹配队列 |
+| `creator_group_classification` | `creator_group_matching` | 已启用的群用途分类队列 |
+| `creator_importance` | `creator_importance` | 已启用的维护优先级评估队列 |
+| `offhours_summary` | `summary_dialogues`、`summary_replies` | 固定时段总结及用户主动起草／翻译；两条链路共用此配置 |
+| `operations_assistant` | `assistant` | 用户提问后按工具循环查询、分段总结、回复；`assistant_window` 和 `assistant_replies` 不另开 API 链路 |
+| `desktop_reply` | `desktop_replies` | 用户主动提交文字的可取消异步请求，不占后台 5 个名额 |
+
+八份现行配置、九条业务调用链。历史 `contact_assessment`、`contact_assignment`、`creator_workflow` 配置与旧请求数据只保留，不恢复生产调用或扫描入口。模型和 Key 均由现有配置决定，代码发布不更换或开启它们。
+
+各链路保留 API 实际返回的可用用量和安全回执；输出不完整或校验失败也保留这些计数与请求编号。没有返回用量时，不能据空值或零计数断言未计费。总结与回复建议先用现有加密检查点保存当前响应，再本地解析、校验和落地；本地保存失败后重放响应，不重复付费，完成后清除待处理响应。相同调用回执只累计一次，撤权或任务失效后仍不能展示旧结果。
+
+明确的临时 HTTP 错误沿用队列重试上限和 `Retry-After`；账单／配额、网络结果未知及已返回但无法使用的输出不自动重发。匹配队列每次只计算一次退避时间，共享暂停与任务等待使用同一数值。桌面失败日志只记录白名单错误、编号、用量和耗时，不记录正文、完整返回、prompt 或密钥；成功用量保存在原回执，成功诊断日志取决于部署的 INFO 日志级别。
 
 名单使用 `creator_imports`、`creator_import_evidence`、`creator_roster`；取证共用 `evidence_text`、`evidence_access`、`handle_evidence`。模型判断聊天含义，后端核对当前授权、引用、材料版本、人工事实及关系冲突。群名结合成员与聊天可构成强证据，Curva 仅作辅助目录。
 

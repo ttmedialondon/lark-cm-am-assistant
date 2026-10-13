@@ -758,11 +758,13 @@ def run(job, settings):
         )
     # Commit actual usage before admission or source/authorization queries can fail.
     ai_dispatch.observe_limits(telemetry)
+    delay = (api.retry_delay(error.retry_after_seconds, job["attempts"])
+             if isinstance(error, api.OpenAIRequestError) and error.retryable else 0)
     if isinstance(error, api.OpenAIRequestError):
         if error.is_quota:
             ai_dispatch.pause_for_quota()
         elif error.retryable:
-            ai_dispatch.throttle(api.retry_delay(error.retry_after_seconds, job["attempts"]))
+            ai_dispatch.throttle(delay)
     with connection() as conn, conn.transaction():
         current = _current(conn, job)
         if not current:
@@ -777,7 +779,6 @@ def run(job, settings):
             return
         if error:
             retry = isinstance(error, api.OpenAIRequestError) and error.retryable and job["attempts"] < 3
-            delay = api.retry_delay(getattr(error, "retry_after_seconds", None), job["attempts"]) if retry else 0
             state = "retry_wait" if retry else "failed"
             reason = (
                 "request_unknown"
@@ -793,7 +794,7 @@ def run(job, settings):
             conn.execute(
                 """UPDATE creator_handle_jobs SET status=%s,reason_code=%s,lease_until=NULL,
                 claim_token=NULL,not_before=NOW()+(%s*INTERVAL '1 second'),updated_at=NOW() WHERE id=%s""",
-                (state, reason, delay, job["id"]),
+                (state, reason, delay if retry else 0, job["id"]),
             )
         else:
             by_handle = {h["id"]: h["handle"] for h in job["pack"]["handles"]}

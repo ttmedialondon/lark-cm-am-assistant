@@ -480,11 +480,12 @@ def run(job, settings):
     # Actual usage commits before any subsequent authorization or admission failure.
     ai_dispatch.observe_limits(telemetry)
     retry = isinstance(error, api.OpenAIRequestError) and error.retryable and not unknown and job["attempts"] < 3
+    delay = api.retry_delay(error.retry_after_seconds, job["attempts"]) if retry else 0
     if isinstance(error, api.OpenAIRequestError):
         if error.is_quota:
             ai_dispatch.pause_for_quota()
         elif retry:
-            ai_dispatch.throttle(api.retry_delay(error.retry_after_seconds, job["attempts"]))
+            ai_dispatch.throttle(delay)
     with connection() as conn, conn.transaction():
         current = _current(conn, job, settings)
         if not current:
@@ -503,7 +504,7 @@ def run(job, settings):
                 "completed" if error is None else "retry_wait" if retry else "failed", reason,
                 creator_data.cipher(settings).encrypt(creator_data.encode(result)) if error is None else None,
                 creator_data.encode(_admission_stats(current, result, auto_linked) if error is None else {}),
-                api.retry_delay(error.retry_after_seconds, job["attempts"]) if retry else 0, not retry, job["id"],
+                delay, not retry, job["id"],
             ))
         conn.execute("UPDATE ai_feature_configs SET last_tested_at=NOW(),last_test_status=%s WHERE feature=%s",
                      ("failed" if error else "succeeded", FEATURE))

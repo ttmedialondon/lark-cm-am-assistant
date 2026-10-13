@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+import logging
 from contextlib import nullcontext
 from types import SimpleNamespace
 from uuid import uuid4
@@ -40,7 +41,15 @@ def model_response(draft="I will check the dates.", language="en", refs=None):
         "outcome": "ready", "context_reason": "none", "language": language, "draft": draft,
         "chinese_translation": draft if language == "zh" else "我会核对日期。",
         "explanation": "根据本次可见文字，回应核对日期的诉求。", "checks": [], "evidence_refs": refs or ["C1"],
-    }, ensure_ascii=False), "usage": {"input_tokens": 30, "output_tokens": 20}}
+    }, ensure_ascii=False), "usage": {"input_tokens": 30, "output_tokens": 20},
+        "telemetry": {"http_status": 200, "openai_request_id": "req_desktop_fixture",
+                      "response_id": "resp_desktop_fixture", "response_status": "completed",
+                      "body": "PRIVATE RESPONSE", "headers": {"authorization": "sk-fixture-only-test"}}}
+
+
+def provider_logs(caplog):
+    return [json.loads(record.message.removeprefix("desktop_reply_provider ")) for record in caplog.records
+            if record.message.startswith("desktop_reply_provider ")]
 
 
 @pytest.fixture
@@ -84,7 +93,8 @@ def api(pg, monkeypatch):
     )
 
 
-def test_reply_scopes_translation_cached_id_and_actor_isolation(api):
+def test_reply_scopes_translation_cached_id_and_actor_isolation(api, caplog, monkeypatch):
+    caplog.set_level(logging.INFO, logger="app.desktop_reply_routes")
     selected = payload()
     selected["conversation"]["label"] = "Other CM"
     first = api.client.post(PATH, json=selected, headers=api.headers)
@@ -93,6 +103,11 @@ def test_reply_scopes_translation_cached_id_and_actor_isolation(api):
     assert result == {"request_id": selected["request_id"], "suggestion": f"Reply for {api.actor}",
                       "chinese_translation": "我会核对日期。", "english_translation": None, "is_mock": False}
     assert first.headers["cache-control"] == "no-store, max-age=0"
+    records = provider_logs(caplog)
+    assert len(records) == 1 and records[0]["request_id"] == selected["request_id"]
+    assert records[0]["openai_request_id"] == "req_desktop_fixture" and records[0]["http_status"] == 200
+    assert records[0]["usage"] == {"input_tokens": 30, "output_tokens": 20}
+    assert "PRIVATE RESPONSE" not in caplog.text and "sk-fixture-only-test" not in caplog.text
     call = api.state.calls[0]
     assert call["actor"] == api.actor and call["pack"]["cm_name"] == "Trusted CM"
     assert call["pack"]["selected_messages"] == [dict(row, ref=f"S{row['ordinal']}")
@@ -104,6 +119,7 @@ def test_reply_scopes_translation_cached_id_and_actor_isolation(api):
     api.pg.execute("UPDATE ai_feature_configs SET enabled=FALSE WHERE feature='desktop_reply'")
     cached = api.client.post(PATH, json=selected, headers=api.headers)
     assert cached.status_code == 200 and cached.json() == result and len(api.state.calls) == 1
+    assert len(provider_logs(caplog)) == 1
     changed = copy.deepcopy(selected)
     changed["conversation_context"]["messages"][0]["text"] = "Changed private snapshot"
     conflict = api.client.post(PATH, json=changed, headers=api.headers)
@@ -123,6 +139,30 @@ def test_reply_scopes_translation_cached_id_and_actor_isolation(api):
     assert desktop_replies.SCOPE_INSTRUCTIONS["selected_messages"] not in api.state.calls[-1]["options"]["instructions"]
     receipts = api.pg.execute("SELECT actor_id,status FROM desktop_reply_requests").fetchall()
     assert len(receipts) == 3 and all(row["status"] == "succeeded" for row in receipts)
+    assert len(provider_logs(caplog)) == 3
+    abandoned = payload("recent_context")
+    with monkeypatch.context() as stale:
+        stale.setattr(desktop_reply_routes.store, "finish_success", lambda *args, **kwargs: False)
+        first = api.client.post(PATH, json=abandoned, headers=api.headers)
+    duplicate = api.client.post(PATH, json=abandoned, headers=api.headers)
+    assert first.status_code == duplicate.status_code == 409
+    assert first.json() == duplicate.json() and first.json()["error"]["code"] == "abandoned"
+    assert len(api.state.calls) == 4 and len(provider_logs(caplog)) == 4
+    diagnostic = provider_logs(caplog)[-1]
+    assert diagnostic["error_code"] == "abandoned" and diagnostic["response_id"] == "resp_desktop_fixture"
+    assert diagnostic["usage"] == {"input_tokens": 30, "output_tokens": 20}
+    assert not diagnostic["request_unknown"]
+    successful = payload("recent_context")
+    with monkeypatch.context() as broken:
+        def unavailable(*args, **kwargs):
+            raise RuntimeError("logging unavailable")
+        broken.setattr(desktop_reply_routes.logger, "log", unavailable)
+        first = api.client.post(PATH, json=successful, headers=api.headers)
+        duplicate = api.client.post(PATH, json=successful, headers=api.headers)
+    assert first.status_code == duplicate.status_code == 200 and first.json() == duplicate.json()
+    assert len(api.state.calls) == 5
+    assert api.pg.execute("SELECT status FROM desktop_reply_requests WHERE request_id=%s",
+                          (successful["request_id"],)).fetchone()["status"] == "succeeded"
 
 
 def test_cookie_csrf_and_untrusted_cm_identity_reject_before_ai(api):
@@ -142,17 +182,25 @@ def test_cookie_csrf_and_untrusted_cm_identity_reject_before_ai(api):
     assert accepted.status_code == 200 and len(api.state.calls) == 1
 
 
-@pytest.mark.parametrize(("timeout", "status", "code"), [
-    (False, 502, "provider_error"), (True, 504, "provider_timeout"),
+@pytest.mark.parametrize(("failure_kind", "status", "code"), [
+    ("http", 502, "provider_error"), ("timeout", 504, "provider_timeout"),
+    ("incomplete", 502, "invalid_ai_response"),
 ])
-def test_provider_failure_is_terminal_and_does_not_retry_paid_work(api, monkeypatch, timeout, status, code):
+def test_provider_failure_is_terminal_and_does_not_retry_paid_work(
+        api, monkeypatch, caplog, failure_kind, status, code):
     async def fail(*args, **kwargs):
         api.state.calls.append("attempt")
+        if failure_kind == "incomplete":
+            raise openai_client.ModelOutputError("PRIVATE RESPONSE", telemetry={
+                "http_status": 200, "openai_request_id": "req_incomplete", "response_id": "resp_incomplete",
+                "response_status": "incomplete", "incomplete_reason": "max_output_tokens",
+                "usage": {"input_tokens": 30}, "body": "PRIVATE RESPONSE", "key": "sk-fixture-only-test",
+            })
         failure = openai_client.OpenAIRequestError(
             "private prompt and credential", retryable=True,
             telemetry={"http_status": 503, "usage": {"input_tokens": 30}},
         )
-        if timeout:
+        if failure_kind == "timeout":
             raise failure from httpx.ReadTimeout("private transport detail")
         raise failure
 
@@ -168,6 +216,15 @@ def test_provider_failure_is_terminal_and_does_not_retry_paid_work(api, monkeypa
     assert row["status"] == "failed" and row["error_code"] == code and row["error_http_status"] == status
     assert row["usage"] == {"input_tokens": 30} and row["result_ciphertext"] is None
     assert "private" not in row["error_message"]
+    records = provider_logs(caplog)
+    assert len(records) == 1 and records[0]["request_id"] == submitted["request_id"]
+    assert records[0]["error_code"] == code and records[0]["usage"]["input_tokens"] == 30
+    if failure_kind == "incomplete":
+        assert records[0]["openai_request_id"] == "req_incomplete"
+        assert records[0]["response_id"] == "resp_incomplete"
+        assert records[0]["response_status"] == "incomplete"
+        assert records[0]["incomplete_reason"] == "max_output_tokens"
+    assert "PRIVATE RESPONSE" not in caplog.text and "sk-fixture-only-test" not in caplog.text
 
 
 def test_paused_background_queue_does_not_admit_or_throttle_desktop(api, monkeypatch):
@@ -197,13 +254,18 @@ def test_paused_background_queue_does_not_admit_or_throttle_desktop(api, monkeyp
 
 
 @pytest.mark.parametrize("oversized", [False, True])
-def test_invalid_model_output_is_rejected_and_cached_as_terminal_error(api, oversized):
+def test_invalid_model_output_is_rejected_and_cached_as_terminal_error(api, oversized, caplog):
     api.state.output = (
         model_response("x" * (desktop_replies.MAX_RESPONSE_BYTES + 1), refs=["S1", "S2"]) if oversized else {
             "text": json.dumps({"suggestion": "unvalidated model output"}),
             "usage": {"input_tokens": 30, "output_tokens": 20},
         }
     )
+    api.state.output["telemetry"] = {"openai_request_id": "req_test\nPRIVATE RESPONSE",
+        "response_id": "sk-fixture-only-test", "response_status": ["PRIVATE RESPONSE"],
+        "incomplete_reason": "PRIVATE RESPONSE", "body": "PRIVATE RESPONSE"}
+    if not oversized:
+        api.state.output["usage"] = {"input_tokens": True, "output_tokens": -1}
     submitted = payload()
     first = api.client.post(PATH, json=submitted, headers=api.headers)
     duplicate = api.client.post(PATH, json=submitted, headers=api.headers)
@@ -212,9 +274,17 @@ def test_invalid_model_output_is_rejected_and_cached_as_terminal_error(api, over
     assert "unvalidated model output" not in first.text and len(api.state.calls) == 1
     row = api.pg.execute("SELECT * FROM desktop_reply_requests").fetchone()
     assert row["status"] == "failed" and row["result_ciphertext"] is None
+    records = provider_logs(caplog)
+    assert len(records) == 1
+    assert all(records[0][key] is None for key in
+               ("openai_request_id", "response_id", "response_status", "incomplete_reason"))
+    if not oversized:
+        assert records[0]["usage"] == {"input_tokens": None, "output_tokens": None}
+        assert row["usage"] == {}
+    assert "PRIVATE RESPONSE" not in caplog.text and "sk-fixture-only-test" not in caplog.text
 
 
-def test_selected_event_requires_selection_evidence_not_only_visible_tail(api):
+def test_selected_event_requires_selection_evidence_not_only_visible_tail(api, monkeypatch):
     submitted = payload()
     selected = ["Creator: My order arrived with the wrong colour.", "Creator: Can I exchange it?"]
     submitted["selected_messages"] = [{"ordinal": i, "text": text} for i, text in enumerate(selected, 1)]
@@ -245,7 +315,11 @@ def test_selected_event_requires_selection_evidence_not_only_visible_tail(api):
         "usage": {"input_tokens": 30, "output_tokens": 20},
     }
     submitted["request_id"] = str(uuid4())
-    uncertain = api.client.post(PATH, json=submitted, headers=api.headers)
+    with monkeypatch.context() as broken:
+        def unavailable(*args, **kwargs):
+            raise RuntimeError("logging unavailable")
+        broken.setattr(desktop_reply_routes.logger, "warning", unavailable)
+        uncertain = api.client.post(PATH, json=submitted, headers=api.headers)
     assert uncertain.status_code == 422 and uncertain.json()["error"]["code"] == "context_unavailable"
     duplicate = api.client.post(PATH, json=submitted, headers=api.headers)
     assert uncertain.json() == duplicate.json()
@@ -262,7 +336,7 @@ def test_selected_event_requires_selection_evidence_not_only_visible_tail(api):
     assert api.client.post(PATH, json=submitted, headers=api.headers).status_code == 502
 
 
-def test_server_total_timeout_cancels_model_and_stays_terminal(api, monkeypatch):
+def test_server_total_timeout_cancels_model_and_stays_terminal(api, monkeypatch, caplog):
     monkeypatch.setattr(desktop_reply_routes, "TOTAL_TIMEOUT", 0.3)
     cancelled = []
 
@@ -283,9 +357,11 @@ def test_server_total_timeout_cancels_model_and_stays_terminal(api, monkeypatch)
     assert api.state.calls == ["started"] and cancelled == [True]
     row = api.pg.execute("SELECT status,error_code FROM desktop_reply_requests").fetchone()
     assert row == {"status": "failed", "error_code": "provider_timeout"}
+    records = provider_logs(caplog)
+    assert len(records) == 1 and records[0]["request_unknown"]
 
 
-def test_asgi_disconnect_cancels_model_and_records_cancelled_without_replay(api, monkeypatch):
+def test_asgi_disconnect_cancels_model_and_records_cancelled_without_replay(api, monkeypatch, caplog):
     submitted = payload()
     body = json.dumps(submitted).encode()
 
@@ -347,6 +423,45 @@ def test_asgi_disconnect_cancels_model_and_records_cancelled_without_replay(api,
     duplicate = api.client.post(PATH, json=submitted, headers=api.headers)
     assert duplicate.status_code == 499 and duplicate.json()["error"]["code"] == "cancelled"
     assert api.state.calls == ["started"]
+    records = provider_logs(caplog)
+    assert len(records) == 1 and records[0]["error_code"] == "cancelled" and records[0]["request_unknown"]
+    for kind in ("completed", "incomplete"):
+        simultaneous = payload()
+
+        async def completed_model(*args, _kind=kind, **kwargs):
+            api.state.calls.append(_kind)
+            if _kind == "incomplete":
+                raise openai_client.ModelOutputError("PRIVATE RESPONSE", telemetry={
+                    "http_status": 200, "openai_request_id": "req_cancel_incomplete",
+                    "response_id": "resp_cancel_incomplete", "response_status": "incomplete",
+                    "incomplete_reason": "max_output_tokens", "usage": {"input_tokens": 30, "output_tokens": 20},
+                })
+            return model_response(refs=["S1", "S2"])
+
+        async def disconnected(*args):
+            return True
+
+        async def settled(tasks, **kwargs):
+            await asyncio.gather(*tasks, return_exceptions=True)
+            return set(tasks), set()
+
+        with monkeypatch.context() as race:
+            race.setattr(openai_client, "call_openai_async", completed_model)
+            race.setattr(desktop_reply_routes, "disconnected", disconnected)
+            race.setattr(desktop_reply_routes.asyncio, "wait", settled)
+            first = api.client.post(PATH, json=simultaneous, headers=api.headers)
+        duplicate = api.client.post(PATH, json=simultaneous, headers=api.headers)
+        assert first.status_code == duplicate.status_code == 499 and first.json() == duplicate.json()
+        assert "suggestion" not in first.json() and "PRIVATE RESPONSE" not in first.text
+        row = api.pg.execute("SELECT status,result_ciphertext,usage FROM desktop_reply_requests WHERE request_id=%s",
+                             (simultaneous["request_id"],)).fetchone()
+        assert row == {"status": "cancelled", "result_ciphertext": None,
+                       "usage": {"input_tokens": 30, "output_tokens": 20}}
+        diagnostic = provider_logs(caplog)[-1]
+        assert diagnostic["response_status"] == kind and not diagnostic["request_unknown"]
+        assert diagnostic["usage"] == row["usage"]
+    assert api.state.calls == ["started", "completed", "incomplete"]
+    assert len(provider_logs(caplog)) == 3
 
 
 def test_wire_limit_rejects_declared_and_streamed_body_without_truncation(api):

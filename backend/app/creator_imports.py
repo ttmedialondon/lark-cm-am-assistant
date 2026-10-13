@@ -1326,6 +1326,10 @@ def run_claimed_import(job, settings):
             _finish(job, settings, response={"telemetry": exc.telemetry},
                     reason="request_unknown" if exc.request_unknown else "provider_error")
     except (ValueError, PermissionError, TypeError, KeyError) as exc:
+        if response is None and isinstance(exc, openai_client.ModelOutputError):
+            telemetry = exc.telemetry
+            response = {"telemetry": telemetry, "usage": telemetry.get("usage", {}),
+                        "response_id": telemetry.get("response_id")}
         _finish(job, settings, response=response, reason=str(exc) if str(exc) in REASONS else "invalid_result")
     except Exception:
         LOGGER.error("creator import AI failed row=%s", job["id"])

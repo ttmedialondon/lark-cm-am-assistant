@@ -518,11 +518,13 @@ def run(job, settings):
         )
     # Commit actual usage before admission or source/authorization queries can fail.
     ai_dispatch.observe_limits(telemetry)
+    delay = (api.retry_delay(error.retry_after_seconds, job["attempts"])
+             if isinstance(error, api.OpenAIRequestError) and error.retryable else 0)
     if isinstance(error, api.OpenAIRequestError):
         if error.is_quota:
             ai_dispatch.pause_for_quota()
         elif error.retryable:
-            ai_dispatch.throttle(api.retry_delay(error.retry_after_seconds, job["attempts"]))
+            ai_dispatch.throttle(delay)
     with connection() as conn, conn.transaction():
         current = _current(conn, job)
         if not current:
@@ -553,7 +555,7 @@ def run(job, settings):
                 (
                     "retry_wait" if retry else "failed",
                     reason,
-                    api.retry_delay(getattr(error, "retry_after_seconds", None), job["attempts"]) if retry else 0,
+                    delay if retry else 0,
                     job["id"],
                 ),
             )

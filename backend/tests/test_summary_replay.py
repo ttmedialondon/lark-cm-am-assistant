@@ -40,7 +40,9 @@ def test_v5_replay_preserves_reports_and_usage_and_bounds_the_window(pg, seeded)
             VALUES(%s,%s,'chat',%s,%s,%s,NOW()+INTERVAL '10 minutes',1,'old-result','old-checkpoint',
                 '{"input_tokens":123,"output_tokens":45}'::jsonb)''', (task, run, name, start, status))
 
-    lease = {'id': ids['recent_lease'][1], 'attempts': 1}
+    lease = {'id': ids['recent_lease'][1], 'attempts': 1,
+             'lease_until': pg.execute('SELECT lease_until FROM offhours_summary_tasks WHERE id=%s',
+                                      (ids['recent_lease'][1],)).fetchone()['lease_until']}
     summaries._current(pg, lease)
     pg.execute("UPDATE ai_feature_configs SET enabled=FALSE WHERE feature='offhours_summary'")
     configs = pg.execute('SELECT to_jsonb(c) FROM ai_feature_configs c ORDER BY feature').fetchall()

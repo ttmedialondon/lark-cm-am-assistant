@@ -606,3 +606,23 @@ def test_paid_retry_cache_and_stale_results_keep_billing_without_repeat(pg, rank
         assert importance.claim() is None and len(flow.calls) == calls
     assert pg.execute("SELECT status,reason_code FROM creator_importance_jobs WHERE id=%s",
                       (last["id"],)).fetchone() == {"status": "failed", "reason_code": "request_unknown"}
+    # An HTTP 200 with incomplete model output is still billed, but must not publish facts or retry.
+    pg.execute("UPDATE creator_importance_jobs SET status='queued',not_before=NOW() "
+               "WHERE responsible_authorization_id=%s", (flow.other,))
+    incomplete = prepared()
+    flow.error = openai_client.ModelOutputError("unfinished response", telemetry={
+        "http_status": 200, "openai_request_id": "req-incomplete", "response_id": "resp-incomplete",
+        "usage": {"input_tokens": 31, "output_tokens": 17}, "response_status": "incomplete",
+        "incomplete_reason": "max_output_tokens",
+    })
+    importance.run(incomplete, flow.settings)
+    receipt = pg.execute("SELECT request_id,response_id,error_code,input_tokens,output_tokens,finished_at "
+                         "FROM creator_importance_requests WHERE id=%s", (incomplete["reservation_id"],)).fetchone()
+    assert receipt["finished_at"] is not None
+    assert {key: value for key, value in receipt.items() if key != "finished_at"} == {
+        "request_id": "req-incomplete", "response_id": "resp-incomplete", "error_code": "invalid_output",
+        "input_tokens": 31, "output_tokens": 17,
+    }
+    assert pg.execute("SELECT status,reason_code FROM creator_importance_jobs WHERE id=%s",
+                      (incomplete["id"],)).fetchone() == {"status": "failed", "reason_code": "invalid_output"}
+    assert importance.claim() is None and len(flow.calls) == calls + 1

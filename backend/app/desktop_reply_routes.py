@@ -6,7 +6,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
+from collections.abc import Mapping
 from contextlib import suppress
 from uuid import UUID
 
@@ -94,6 +96,40 @@ def finish(actor, payload, receipt, *, result=None, failure=None, cipher=None, u
                                   usage=usage, latency_ms=latency_ms)
 
 
+def log_provider_call(request_id, failure, telemetry, usage, latency_ms):
+    def identifier(value, pattern):
+        return value if isinstance(value, str) and len(value) <= 160 and re.fullmatch(pattern, value) else None
+
+    def counter(value, maximum=2**63 - 1):
+        return value if type(value) is int and 0 <= value <= maximum else None
+
+    telemetry = telemetry if isinstance(telemetry, Mapping) else {}
+    usage = usage if isinstance(usage, Mapping) else {}
+    status = telemetry.get("response_status")
+    reason = telemetry.get("incomplete_reason")
+    http_status = counter(telemetry.get("http_status"), 599)
+    terminal_response = isinstance(status, str) and status in {"completed", "failed", "cancelled", "incomplete"}
+    diagnostic = {
+        "request_id": str(UUID(request_id)), "feature": replies.FEATURE,
+        "outcome": "failed" if failure else "succeeded", "error_code": failure.code if failure else None,
+        "request_unknown": bool(failure and not terminal_response
+                                and (failure.code in {"cancelled", "provider_timeout", "abandoned"}
+                                             or failure.code == "provider_error" and http_status is None)),
+        "http_status": http_status if http_status is not None and http_status >= 100 else None,
+        "openai_request_id": identifier(telemetry.get("openai_request_id"),
+            r"(?:req_[A-Za-z0-9_-]+|[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})"),
+        "response_id": identifier(telemetry.get("response_id"), r"resp_[A-Za-z0-9_-]+"),
+        "response_status": status if isinstance(status, str) and status in {
+            "completed", "failed", "in_progress", "cancelled", "queued", "incomplete"} else None,
+        "incomplete_reason": reason if status == "incomplete" and isinstance(reason, str)
+            and reason in {"max_output_tokens", "content_filter"} else None,
+        "usage": {key: counter(usage.get(key)) for key in ("input_tokens", "output_tokens")},
+        "latency_ms": counter(latency_ms, 2**31 - 1),
+    }
+    logger.log(logging.WARNING if failure else logging.INFO, "desktop_reply_provider %s",
+               json.dumps(diagnostic, separators=(",", ":")))
+
+
 async def disconnected(request, stopped):
     # is_disconnected uses an AnyIO cancel scope: task.cancel alone can be swallowed there.
     while not stopped.is_set():
@@ -113,6 +149,7 @@ def create_router(*, current_authorization, csrf_token):
         model_task = watcher = None
         stopped = asyncio.Event()
         usage = {}
+        telemetry = {}
         failure = None
         try:
             async with asyncio.timeout(TOTAL_TIMEOUT):
@@ -144,7 +181,7 @@ def create_router(*, current_authorization, csrf_token):
                 done, _ = await asyncio.wait((model_task, watcher), return_when=asyncio.FIRST_COMPLETED)
                 if watcher in done:
                     raise replies.ReplyError("cancelled", "请求已取消。", 499)
-                result, usage = await model_task
+                result, usage, telemetry = await model_task
                 await run_in_threadpool(authenticate, request, current_authorization, csrf_token)
                 saved = await run_in_threadpool(
                     finish, actor, payload, receipt, result=result, cipher=cipher, usage=usage,
@@ -156,10 +193,12 @@ def create_router(*, current_authorization, csrf_token):
                 return response(result)
         except (AuthError, ReplyInputError, replies.ReplyError) as exc:
             failure = exc
-            usage = getattr(exc, "usage", usage)
+            usage = getattr(exc, "usage", None) or usage
+            telemetry = getattr(exc, "telemetry", None) or telemetry
         except store.ActorInactiveError:
             failure = AuthError("actor_inactive", "账号授权已失效，请重新登录。", 401)
         except openai_client.OpenAIRequestError as exc:
+            telemetry = exc.telemetry
             usage = exc.telemetry.get("usage", {})
             if isinstance(exc.__cause__, TimeoutError | httpx.TimeoutException):
                 failure = replies.ReplyError("provider_timeout", "AI 请求超时，请重新发起生成。", 504)
@@ -170,6 +209,7 @@ def create_router(*, current_authorization, csrf_token):
             else:
                 failure = replies.ReplyError("provider_error", "AI 服务暂时无法完成请求。", 502)
         except openai_client.ModelOutputError as exc:
+            telemetry = exc.telemetry
             usage = exc.telemetry.get("usage", {})
             failure = replies.ReplyError("invalid_ai_response", "AI 未返回有效建议，请重新生成。", 502)
         except TimeoutError:
@@ -189,19 +229,35 @@ def create_router(*, current_authorization, csrf_token):
                     task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            if model_task is not None and model_task.done() and not model_task.cancelled():
+                model_error = model_task.exception()
+                if isinstance(model_error, replies.ReplyError | openai_client.OpenAIRequestError
+                              | openai_client.ModelOutputError):
+                    telemetry = getattr(model_error, "telemetry", None) or telemetry
+                    usage = getattr(model_error, "usage", None) or telemetry.get("usage") or usage
+                elif model_error is None:
+                    completed = model_task.result()
+                    usage, telemetry = completed[1] or usage, completed[2] or telemetry
             if failure is not None and receipt is not None and receipt["claim_status"] == "new":
                 failure.code, failure.message = store.safe_error(failure.code, failure.message)
                 context_reason = next((key for key, message in store.CONTEXT_MESSAGES.items()
                                        if failure.code == "context_unavailable" and failure.message == message), None)
                 if context_reason:
-                    logger.warning("desktop_reply_needs_review request_id=%s scope=%s reason=%s selected=%s context=%s",
-                                   payload["request_id"], payload["reply_scope"], context_reason,
-                                   len(payload["selected_messages"]), len(payload["conversation_context"]["messages"]))
+                    with suppress(Exception):
+                        logger.warning("desktop_reply_needs_review request_id=%s scope=%s reason=%s "
+                                       "selected=%s context=%s",
+                                       payload["request_id"], payload["reply_scope"], context_reason,
+                                       len(payload["selected_messages"]),
+                                       len(payload["conversation_context"]["messages"]))
                 with suppress(Exception):
                     await run_in_threadpool(
                         finish, actor, payload, receipt, failure=failure, usage=usage,
                         latency_ms=round((time.monotonic() - started) * 1000),
                     )
+            if receipt is not None and receipt["claim_status"] == "new" and model_task is not None:
+                with suppress(Exception):
+                    log_provider_call(payload["request_id"], failure, telemetry, usage,
+                                      round((time.monotonic() - started) * 1000))
         return error(failure.code, failure.message, failure.status)
 
     return router

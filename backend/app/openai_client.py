@@ -38,7 +38,7 @@ class OpenAIRequestError(AIInputError):
         self.telemetry = dict(telemetry or {})
         # A timeout can occur after the provider has accepted a billable request.
         self.request_unknown = not is_quota and not isinstance(self.telemetry.get("http_status"), int)
-        self.retryable = retryable and not self.request_unknown
+        self.retryable = retryable and not self.request_unknown and not is_quota
 
 
 class ModelOutputError(ValueError):
@@ -289,10 +289,13 @@ def _is_quota_response(response: httpx.Response) -> bool:
 def _response_text(data: Mapping[str, Any]) -> str:
     if isinstance(data.get("output_text"), str):
         return data["output_text"]
+    parts = []
     for output in _json_list(data.get("output")):
         for item in _json_list(output.get("content") if isinstance(output, Mapping) else None):
             if isinstance(item, Mapping) and item.get("type") == "output_text" and isinstance(item.get("text"), str):
-                return item["text"]
+                parts.append(item["text"])
+    if parts:
+        return "".join(parts)
     raise KeyError("output_text")
 
 

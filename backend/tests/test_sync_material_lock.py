@@ -4,6 +4,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from threading import Event
 from types import SimpleNamespace
 from uuid import uuid4
@@ -84,9 +85,20 @@ def test_summary_and_sync_lock_before_any_source_row(reader_first):
 def test_summary_provider_request_runs_after_material_lock_released(monkeypatch):
     dsn = _dsn()
     settings = SimpleNamespace(token_encryption_key=b"x" * 32)
-    cfg = {"api_key_ciphertext": api_key_cipher(settings.token_encryption_key).encrypt("fixture-only")}
-    job = {"chat_id": "fixture-chat", "responsible_authorization_id": uuid4()}
-    monkeypatch.setattr(summary_dialogues.core, "connection", lambda: psycopg.connect(dsn))
+    cfg = {"model": "fixture", "api_key_ciphertext":
+        api_key_cipher(settings.token_encryption_key).encrypt("fixture-only")}
+    job = {"id": uuid4(), "attempts": 1, "chat_id": "fixture-chat", "lease_until": datetime.now(UTC),
+           "responsible_authorization_id": uuid4()}
+
+    @contextmanager
+    def material_connection():
+        with psycopg.connect(dsn) as conn:
+            yield SimpleNamespace(transaction=conn.transaction, execute=lambda query, params=None:
+                None if query.startswith("UPDATE offhours_summary_tasks") else conn.execute(query, params))
+
+    monkeypatch.setattr(summary_dialogues.core, "connection", material_connection)
+    monkeypatch.setattr(summary_dialogues, "_receipt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(summary_dialogues, "_current_checkpoint", lambda *args, **kwargs: {})
     monkeypatch.setattr(summary_dialogues, "checked_chat",
                         lambda conn, *_: lock_sync_material(conn, read=True))
 
@@ -97,7 +109,8 @@ def test_summary_provider_request_runs_after_material_lock_released(monkeypatch)
         return {"text": "fixture response"}
 
     monkeypatch.setattr(summary_dialogues.openai_client, "call_openai", provider_probe)
-    assert summary_dialogues.request(job, settings, cfg, {}, {}, "fixture") == {"text": "fixture response"}
+    assert summary_dialogues.request(job, settings, cfg, {}, {}, "fixture", checkpoint={}) == {
+        "text": "fixture response"}
 
 
 @pytest.mark.parametrize("oauth_first", [True, False])

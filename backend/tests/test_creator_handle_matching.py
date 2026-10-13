@@ -346,17 +346,22 @@ def test_stale_version_and_revoked_evidence_never_publish_suggestions(pg, matchi
     flow.before_response = None
 
 
-def test_provider_delay_quota_pause_and_uncertain_usage_survive_retries(pg, matching_flow):
+def test_provider_delay_quota_pause_and_uncertain_usage_survive_retries(pg, matching_flow, monkeypatch):
     flow = matching_flow
     flow.enable()
     job = _prepared_job(pg, flow)
     flow.error = openai_client.OpenAIRequestError("synthetic overload", retry_after_seconds=7200, retryable=True,
                                                 telemetry={"http_status": 429})
+    delays = []
+    monkeypatch.setattr(matching.api, "retry_delay", lambda wait, attempts: delays.append((wait, attempts)) or 7200.5)
     matching.run(job, flow.settings)
     row = pg.execute(
         "SELECT status,EXTRACT(EPOCH FROM not_before-NOW()) seconds FROM creator_handle_jobs WHERE id=%s", (job["id"],)
     ).fetchone()
     assert row["status"] == "retry_wait" and row["seconds"] >= 7200
+    assert delays == [(7200, job["attempts"])]
+    assert pg.execute("SELECT j.not_before=s.not_before AS same_deadline FROM creator_handle_jobs j "
+                      "CROSS JOIN ai_admission_state s WHERE j.id=%s", (job["id"],)).fetchone()["same_deadline"]
     assert ai_dispatch.status(pg)["state"] == "throttled" and matching.claim() is None
     assert pg.execute("SELECT billed_tokens FROM creator_handle_requests").fetchone()["billed_tokens"] is None
     ai_dispatch.resume(pg)

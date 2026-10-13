@@ -731,7 +731,7 @@ def run(job, settings):
         result = facts.validate(raw, pack, material["state"]["facts"])
     except Exception as exc:
         error = api.ModelOutputError(str(exc), telemetry=telemetry) if isinstance(exc, ValueError) \
-            and not isinstance(exc, api.OpenAIRequestError) else exc
+            and not isinstance(exc, api.OpenAIRequestError | api.ModelOutputError) else exc
         telemetry = getattr(error, "telemetry", {}) or telemetry
     status = telemetry.get("http_status")
     unknown = isinstance(error, api.OpenAIRequestError) and error.request_unknown

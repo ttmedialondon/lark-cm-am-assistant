@@ -1685,6 +1685,21 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
     pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
         VALUES(%s,'second','colleague')""", (s.ids['cm'],))
     calls, failed = [], False
+    saved_receipt = summary_dialogues._receipt
+    crashed = local_failed = False
+
+    def receipt(*args, **kwargs):
+        nonlocal crashed, local_failed
+        saved_receipt(*args, **kwargs)
+        if kwargs.get('received'):
+            if not crashed:
+                crashed = True
+                raise SystemExit('fixture interrupted after durable response')
+            if not local_failed:
+                local_failed = True
+                raise psycopg.errors.SerializationFailure('fixture local save retry')
+
+    monkeypatch.setattr(summary_dialogues, '_receipt', receipt)
 
     def model(_cfg, _key, pack, _cm, **kwargs):
         nonlocal failed
@@ -1707,26 +1722,54 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
         assert 'future CM reply' not in json.dumps(pack) and 'too old secret' not in json.dumps(pack)
         if len(calls) == 2 and not failed:
             failed = True
-            raise openai_client.AIInputError('synthetic transient failure')
+            raise openai_client.OpenAIRequestError('synthetic transient failure', retryable=True,
+                                                   telemetry={'http_status': 429})
         targets = [m for m in pack['messages'] if m['ref'] in pack['core_refs'] and m['speaker'] == user
                    and m['message_id'] in ('m1', 'person')]
         return {'text': json.dumps({'processed_refs': pack['core_refs'], 'events': [sample_event(
             user=user, evidence_refs=[m['ref']], handle=None,
             reply_evidence_refs=[r['ref'] for r in pack['messages'] if r['message_id'] == 'colleague'])
-            for m in targets]})}
+            for m in targets]}), 'response_id': f'resp-summary-{len(calls)}',
+            'usage': {'input_tokens': 7, 'output_tokens': 2}}
 
     monkeypatch.setattr(openai_client, 'call_openai', model)
     s.save()
+    with pg.transaction(force_rollback=True):
+        old_job = ai.claim_next_summary()
+        newer_lease = old_job['lease_until'] + timedelta(seconds=1)
+        pg.execute("UPDATE offhours_summary_tasks SET lease_until=%s WHERE id=%s", (newer_lease, old_job['id']))
+        ai.run_claimed_summary(old_job, s.settings)
+        ai._finish(old_job, 'failed', 'late worker must not terminate the new phase')
+        assert pg.execute("SELECT status,lease_until FROM offhours_summary_tasks WHERE id=%s",
+                          (old_job['id'],)).fetchone() == {'status': 'running', 'lease_until': newer_lease}
+    with pg.transaction(force_rollback=True):
+        damaged = ai.claim_next_summary()
+        pg.execute("UPDATE offhours_summary_tasks SET checkpoint_ciphertext='broken',"
+                   "lease_until=NOW()-INTERVAL '1 second' WHERE id=%s", (damaged['id'],))
+        ai.claim_next_summary()
+        assert pg.execute("SELECT status FROM offhours_summary_tasks WHERE id=%s",
+                          (damaged['id'],)).fetchone()['status'] == 'failed'
     for _ in range(100):
         job = ai.claim_next_summary()
         if not job:
             break
-        ai.run_claimed_summary(job, s.settings)
+        try:
+            ai.run_claimed_summary(job, s.settings)
+        except SystemExit:
+            pg.execute("UPDATE offhours_summary_tasks SET lease_until=NOW()-INTERVAL '1 second' WHERE id=%s",
+                       (job['id'],))
         pg.execute("UPDATE offhours_summary_tasks SET scheduled_at=NOW() WHERE status='queued'")
+        ai.ai_dispatch.resume(pg)  # Advance the synthetic 429 without waiting on the fixture clock.
     else:
         pytest.fail('conversation queue did not finish')
     rows = pg.execute("SELECT * FROM offhours_summary_tasks WHERE is_current").fetchall()
-    assert all(t['status'] == 'succeeded' for t in rows)
+    assert all(t['status'] == 'succeeded' for t in rows) and crashed and local_failed
+    for task in rows:
+        state = summary_dialogues.decode(task['checkpoint_ciphertext'], s.settings)
+        assert not state.get('response_received') and not state.get('provider_call')
+        assert task['usage'] == state['usage']
+        assert task['usage'].get('input_tokens', 0) == sum(
+            receipt['usage'].get('input_tokens', 0) for receipt in state['receipts'])
     assert sum(t['processed_messages'] for t in rows) > 215
     first_pack = calls[0]
     assert sum(p == first_pack for p in calls) == 1  # Successful chunks were not repeated after the failure.
@@ -1783,20 +1826,36 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
     with pytest.raises(PermissionError):
         replies.enqueue(pg, s.ids["reviewer"], event_id, s.settings)
     calls = []
+    saved_receipt = summary_dialogues._receipt
+    crashed = local_failed = False
+
+    def receipt(*args, **kwargs):
+        nonlocal crashed, local_failed
+        saved_receipt(*args, **kwargs)
+        if kwargs.get("reply") and kwargs.get("received"):
+            if not crashed:
+                crashed = True
+                raise SystemExit("fixture reply interrupted after durable response")
+            if not local_failed and '"outcome"' in args[3]["text"]:
+                local_failed = True
+                raise psycopg.errors.SerializationFailure("fixture draft local save retry")
+
+    monkeypatch.setattr(summary_dialogues, "_receipt", receipt)
 
     def model(cfg, key, pack, actor, **kwargs):
         calls.append(pack)
+        receipt = {"response_id": f"resp-reply-{len(calls)}", "usage": {"input_tokens": 5, "output_tokens": 3}}
         assert "unrelated outsider secret" not in json.dumps(pack)
         assert "OUTSIDER_GROUP_SECRET" not in json.dumps(pack)
         assert "future CM reply" not in json.dumps(pack)
         if "edited_draft" in pack:
-            return {"text": json.dumps({"chinese_translation": "我可以帮你核对这笔 £200 的付款。"})}
+            return {**receipt, "text": json.dumps({"chinese_translation": "我可以帮你核对这笔 £200 的付款。"})}
         if "core_refs" in pack:
-            return {"text": json.dumps({"processed_refs": pack["core_refs"],
+            return {**receipt, "text": json.dumps({"processed_refs": pack["core_refs"],
                 "relevant_refs": pack["core_refs"],
                 "style_refs": [m["ref"] for m in pack["messages"] if m["speaker"] == "CM"]})}
         resolved = any("now resolved" in m["text"] for m in pack["messages"])
-        return {"text": json.dumps({"outcome": "resolved" if resolved else "ready", "language": "en",
+        return {**receipt, "text": json.dumps({"outcome": "resolved" if resolved else "ready", "language": "en",
             "draft": "" if resolved else "Happy to check that £200 payment with you.",
             "chinese_translation": "" if resolved else "我可以帮你核对这笔 £200 的付款。",
             "explanation": "后续已确认解决。" if resolved else "尚未看到处理完成结果。",
@@ -1812,7 +1871,12 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
             job = replies.claim()
             if not job:
                 break
-            replies.run(job, s.settings)
+            try:
+                replies.run(job, s.settings)
+            except SystemExit:
+                pg.execute("UPDATE summary_reply_tasks SET lease_until=NOW()-INTERVAL '1 second' WHERE id=%s",
+                           (job["id"],))
+            pg.execute("UPDATE summary_reply_tasks SET scheduled_at=NOW() WHERE status='queued'")
         else:
             pytest.fail("reply queue did not finish")
         assert not pg.execute("SELECT 1 FROM summary_reply_tasks WHERE status<>'succeeded'").fetchone()
@@ -1820,13 +1884,20 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
     finish()
     result = replies.read(pg, s.ids["cm"], job_id, s.settings, fresh=True)
     assert result["result"]["outcome"] == "ready" and result["result"]["chinese_translation"]
+    assert crashed and local_failed and sum(p == calls[0] for p in calls) == 1
+    assert sum("checked_at" in p for p in calls) == 1
+    assert result["result"]["checked_at"] == calls[-1]["checked_at"]
     processed = {m["ref"]: m for pack in calls if "core_refs" in pack for m in pack["messages"]
                  if m["ref"] in pack["core_refs"] and m["message_id"] == "long-current"}
     assert "".join(m["text"] for m in sorted(processed.values(), key=lambda m: m["part"])) == long_text
     colleagues = [m for pack in calls for m in pack.get("messages", []) if m.get("message_id") == "colleague-current"]
     assert colleagues and all(m["is_staff"] and m["speaker"] != "CM" for m in colleagues)
-    stored = pg.execute("SELECT result_ciphertext FROM summary_reply_tasks WHERE id=%s", (job_id,)).fetchone()
+    stored = pg.execute("SELECT result_ciphertext,checkpoint_ciphertext FROM summary_reply_tasks WHERE id=%s",
+                        (job_id,)).fetchone()
     assert "Happy" not in stored["result_ciphertext"]
+    state = summary_dialogues.decode(stored["checkpoint_ciphertext"], s.settings)
+    assert state["usage"] == {"input_tokens": len(calls) * 5, "output_tokens": len(calls) * 3}
+    assert len(state["receipts"]) == len(calls) and not state.get("response_received")
     with pytest.raises(PermissionError):
         replies.read(pg, s.ids["owner"], job_id, s.settings)
     translated = replies.enqueue(pg, s.ids["cm"], event_id, s.settings, parent_id=job_id,
@@ -1851,6 +1922,51 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
     latest_result = replies.read(pg, s.ids["cm"], latest, s.settings, fresh=True)["result"]
     assert latest_result["outcome"] == "resolved" and latest_result["draft"] == ""
     assert ai.get_summary_view(pg, s.ids["cm"])["events"][0]["handling_status"] == "unresolved"
+    # A late response cannot replace a newer phase even when the attempt number repeats.
+    late_id = replies.enqueue(pg, s.ids["cm"], event_id, s.settings)
+    late = replies.claim()
+    old = {"provider_call": {"id": str(uuid4()), "signature": "old", "model": "fixture"}}
+    newer = {"provider_call": {"id": str(uuid4()), "signature": "new", "model": "fixture"}}
+    new_job = {**late, "lease_until": late["lease_until"] + timedelta(seconds=1)}
+    pg.execute("UPDATE summary_reply_tasks SET checkpoint_ciphertext=%s,lease_until=%s WHERE id=%s",
+               (summary_dialogues.encode(newer, s.settings), new_job["lease_until"], late_id))
+    with pytest.raises(ai.SummaryInputError):
+        summary_dialogues._store_receipt(late, s.settings, old,
+            {"text": "must-not-replace", "usage": {"input_tokens": 2}}, reply=True, received=True)
+    saved = summary_dialogues.decode(pg.execute("SELECT checkpoint_ciphertext FROM summary_reply_tasks WHERE id=%s",
+                                              (late_id,)).fetchone()["checkpoint_ciphertext"], s.settings)
+    assert saved["provider_call"] == newer["provider_call"] and not saved.get("response_received")
+    assert saved["usage"] == {"input_tokens": 2} and saved["receipts"][0]["call_id"] == old["provider_call"]["id"]
+    replies.run(late, s.settings)
+    row = pg.execute("SELECT status,lease_until FROM summary_reply_tasks WHERE id=%s", (late_id,)).fetchone()
+    assert row == {"status": "running", "lease_until": new_job["lease_until"]}
+    summary_dialogues._store_receipt(new_job, s.settings, newer,
+        {"text": "new-phase", "usage": {"input_tokens": 3}}, reply=True, received=True)
+    with pytest.raises(ai.SummaryInputError):
+        summary_dialogues._store_receipt(late, s.settings, old,
+            {"text": "must-not-replace", "usage": {"input_tokens": 2}}, reply=True, received=True)
+    saved = summary_dialogues.decode(pg.execute("SELECT checkpoint_ciphertext FROM summary_reply_tasks WHERE id=%s",
+                                              (late_id,)).fetchone()["checkpoint_ciphertext"], s.settings)
+    assert saved["usage"] == {"input_tokens": 5}
+    assert {item["call_id"] for item in saved["receipts"]} == {
+        old["provider_call"]["id"], newer["provider_call"]["id"]}
+    assert saved["response_received"]["response"]["text"] == "new-phase"
+    pg.execute("UPDATE summary_reply_tasks SET checkpoint_ciphertext='broken',lease_until=NOW()-INTERVAL '1 second' "
+               "WHERE id=%s", (late_id,))
+    assert replies.claim() is None
+    assert pg.execute("SELECT status FROM summary_reply_tasks WHERE id=%s", (late_id,)).fetchone()["status"] == "failed"
+    # Known malformed output is failed with its receipt, never an unknown automatic retry.
+    def malformed(*_args, **_kwargs):
+        calls.append("malformed")
+        return {"text": "{", "response_id": "resp-malformed", "usage": {"input_tokens": 9}}
+    monkeypatch.setattr(openai_client, "call_openai", malformed)
+    invalid_id = replies.enqueue(pg, s.ids["cm"], event_id, s.settings)
+    replies.run(replies.claim(), s.settings)
+    assert replies.claim() is None
+    invalid = pg.execute("SELECT status,checkpoint_ciphertext FROM summary_reply_tasks WHERE id=%s",
+                         (invalid_id,)).fetchone()
+    assert invalid["status"] == "failed"
+    assert summary_dialogues.decode(invalid["checkpoint_ciphertext"], s.settings)["usage"] == {"input_tokens": 9}
     # An uncertain provider timeout or expired paid lease must never silently dispatch twice.
     count = len(calls)
     def timeout(*_args, **_kwargs):

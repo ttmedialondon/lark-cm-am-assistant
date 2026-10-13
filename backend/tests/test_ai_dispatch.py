@@ -83,6 +83,15 @@ def test_single_request_transport_preserves_retry_hints_and_safe_failure_metadat
     assert calls[-1][1]["json"]["reasoning"] == {"effort": "none"}
     assert calls[-1][1]["json"]["store"] is False
 
+    result = httpx.Response(200, json={"status": "completed", "output": [
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "PRIVATE REASONING"}]},
+        {"type": "message", "content": [{"type": "output_text", "text": '{"ready":'},
+            {"type": "refusal", "refusal": "PRIVATE REFUSAL"}]},
+        {"type": "message", "content": [{"type": "output_text", "text": "true}"}]},
+    ]})
+    assert request()["text"] == '{"ready":true}'
+    result = httpx.Response(200, json={"status": "completed", "output_text": "{}", "output": []})
+
     async def tool_post(headers, payload, total_timeout):
         return post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=total_timeout)
 
@@ -136,6 +145,7 @@ def test_single_request_transport_preserves_retry_hints_and_safe_failure_metadat
     with pytest.raises(openai_client.OpenAIRequestError) as stopped:
         request()
     assert stopped.value.is_quota and not stopped.value.retryable
+    assert not openai_client.OpenAIRequestError("quota", is_quota=True, retryable=True).retryable
 
     result = httpx.Response(401, json={"error": {"message": "PRIVATE KEY"}})
     with pytest.raises(openai_client.OpenAIRequestError) as stopped:

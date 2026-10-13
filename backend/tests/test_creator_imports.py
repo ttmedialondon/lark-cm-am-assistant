@@ -754,6 +754,34 @@ def test_two_person_stages_for_one_creator_do_not_drop_paid_results_after_classi
     imports._finish(people[0], pilot.settings, response=results["person"]["response"], result=results["person"])
     imports.run_claimed_import(people[0], pilot.settings)
     assert _snapshot(pg, settled) == settled and len(calls) == 4
+    group(pg, pilot, "paid_incomplete_group", "paid.incomplete", "creator")
+    failed_batch = imports.preview_import(cm, cm, "incomplete.xlsx", workbook("paid.incomplete"))
+    imports.start_import(cm, failed_batch["id"])
+    assert imports.prepare_next_import(pilot.settings)
+    failed_job = imports.claim_next_import()
+    assert failed_job is not None
+    incomplete_calls = []
+
+    def incomplete(*args, **kwargs):
+        incomplete_calls.append(True)
+        raise openai_client.ModelOutputError("unfinished response", telemetry={
+            "http_status": 200, "openai_request_id": "req-incomplete", "response_id": "resp-incomplete",
+            "usage": {"input_tokens": 31, "output_tokens": 17}, "response_status": "incomplete",
+            "incomplete_reason": "max_output_tokens",
+        })
+
+    monkeypatch.setattr(openai_client, "call_openai", incomplete)
+    imports.run_claimed_import(failed_job, pilot.settings)
+    failed = row_for(pg, failed_batch, "paid.incomplete")
+    assert (failed["status"], failed["reason_code"]) == ("invalid", "invalid_result")
+    assert (failed["api_requests"], failed["input_tokens"], failed["output_tokens"]) == (1, 31, 17)
+    assert (failed["request_id"], failed["response_id"]) == ("req-incomplete", "resp-incomplete")
+    receipt = imports._decode(failed, pilot.settings, "result_ciphertext")["group"]["response"]
+    assert receipt["usage"] == {"input_tokens": 31, "output_tokens": 17}
+    assert receipt["telemetry"]["http_status"] == 200
+    imports.run_claimed_import(failed_job, pilot.settings)
+    assert incomplete_calls == [True] and row_for(pg, failed_batch, "paid.incomplete")["input_tokens"] == 31
+    assert imports.claim_next_import() is None
 
 
 @pytest.mark.parametrize("change", ["body", "scope", "manual", "threshold"])
