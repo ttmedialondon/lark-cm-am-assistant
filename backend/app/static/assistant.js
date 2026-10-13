@@ -230,7 +230,7 @@
       for (const key of ["start", "end"]) if (value[key]) activeContext[key] = value[key];
       for (const key of ["reply_status", "sort"]) if (Object.hasOwn(value, key)) activeContext[key] = value[key];
     }
-    const current = [...new Set([canManageCM ? activeContext.cm_name : null, activeContext.creator_name, ...(activeContext.creator_names || []),
+    const current = [...new Set([canManageCM && ($("oa-person").hidden || $("oa-cm").value !== activeContext.cm_id) ? activeContext.cm_name : null, activeContext.creator_name, ...(activeContext.creator_names || []),
       ...(activeContext.chat_names || []), activeContext.event_title || (activeContext.event_ref ? "当前事项" : null),
       activeContext.audience === "creators" ? "我的达人" : null,
       activeContext.page_label].filter(Boolean))];
@@ -382,7 +382,7 @@
     if (!value.messages?.length) content.append(node("p", "oa-coverage", "当前没有可读取的原文。"));
     if (reading) { const gaps = gapList(value.gaps, value.gap_summary); if (gaps) content.append(gaps); }
   }
-  function evidenceCard(reference, title = "消息原文", count = null, multiCM = false, replyable = false) {
+  function evidenceCard(reference, title = "消息原文", count = null, multiCM = false) {
     const button = node("button", "oa-evidence", Number.isFinite(count) ? `查看原文 · ${count} 条` : "查看原文");
     button.type = "button"; button.setAttribute("aria-controls", "oa-sources");
     button.addEventListener("click", async () => {
@@ -396,7 +396,7 @@
         const value = await request(`/evidence/${encodeURIComponent(reference)}`);
         if (denied || version !== sourceVersion) return;
         content.replaceChildren();
-        rawMessages(content, value, replyable, true, multiCM);
+        rawMessages(content, value, false, true, multiCM);
         content.scrollTop = 0;
       } catch (error) { if (!denied && version === sourceVersion) content.replaceChildren(node("p", "oa-gaps", error.message)); }
     });
@@ -435,6 +435,7 @@
       copy.disabled = !editor.value.trim();
       translationLabel.textContent = editor.value !== draft.draft && draft.chinese_translation ? "中文参考 · 待更新" : "中文参考";
       feedback.textContent = "";
+      actions.querySelector('[data-reply-action="english"]').hidden = draft.language === "en" && editor.value === card.dataset.original;
     });
     copy.addEventListener("click", async () => {
       if (denied || !editor.value.trim()) return;
@@ -461,6 +462,8 @@
     const actions = node("div", "oa-draft-tools");
     for (const [text, action] of [["更短", "shorter"], ["更自然", "natural"], ["礼貌催办", "follow_up"], ["换成英文", "english"], ["更新中文", "translate"]]) {
       const button = node("button", "", text); button.type = "button"; button.dataset.ask = "true";
+      button.dataset.replyAction = action;
+      button.hidden = action === "english" && draft.language === "en";
       button.addEventListener("click", () => {
         if (!draft.draft_ref || !editor.value.trim()) { feedback.textContent = "请先重新生成这条草稿。"; return; }
         void ask(`${text}当前草稿，保留已确认事实。`, {event_ref: draft.event_ref || null, message_ref: draft.message_ref || null,
@@ -469,7 +472,8 @@
       actions.append(button);
     }
     card.append(actions);
-    if (draft.checks?.length || draft.explanation) card.append(node("p", "oa-draft-checks", [draft.explanation, ...(draft.checks || [])].filter(Boolean).join(" · ")));
+    const checks = [...new Set([draft.explanation, ...(draft.checks || [])].filter(Boolean).map(text => text.trim()).filter(Boolean))];
+    if (checks.length) card.append(node("p", "oa-draft-checks", checks.join(" · ")));
     card.append(copy, feedback);
     return card;
   }
@@ -639,7 +643,7 @@
       card.append(node("p", "", text.length > 420 ? `${text.slice(0, 420)}…` : text));
       const ref = data.message_ref || data.evidence_ref || message.message_ref;
       if (ref) {
-        card.append(evidenceCard(ref, message.conversation_name || message.chat_name || "原文与问答", null, multiCM, replyable));
+        card.append(evidenceCard(ref, message.conversation_name || message.chat_name || "原文与问答", null, multiCM));
         if (replyable && message.text && !message.unreadable) card.append(replyButton(ref, message.conversation_name || message.chat_name || "当前消息", true));
       }
     } else if (data.kind === "messages") {
@@ -651,7 +655,7 @@
         hit.append(node("p", "", text.length > 420 ? `${text.slice(0, 420)}…` : text));
         const ref = message.evidence_ref || message.message_ref;
         if (ref) {
-          hit.append(evidenceCard(ref, message.conversation_name || message.chat_name || "消息原文", null, multiCM, replyable));
+          hit.append(evidenceCard(ref, message.conversation_name || message.chat_name || "消息原文", null, multiCM));
           if (replyable && message.text && !message.unreadable) hit.append(replyButton(ref, message.conversation_name || message.chat_name || "当前消息", true));
         }
         card.append(hit);
@@ -684,7 +688,9 @@
     return card;
   }
   function renderResult(container, result) {
-    container.replaceChildren(answer(result.answer));
+    const duplicateAnswer = [...(result.sections || []), ...(result.events || [])]
+      .some(item => item.summary?.trim() && item.summary.trim() === result.answer?.trim());
+    container.replaceChildren(...(duplicateAnswer ? [] : [answer(result.answer)]));
     const multiCM = canQueryOtherCM && result.scope?.cm_ids?.length > 1;
     const mode = ["hidden", "compact", "detailed"].includes(result.source_mode) ? result.source_mode : "compact";
     const replyable = mode === "detailed" && result.reply_enabled === true;
@@ -701,7 +707,7 @@
         const ref = source.message_ref || source.evidence_ref || message.message_ref || message.evidence_ref;
         if (represented.has(key)) {
           if (mode === "detailed" && ref) parent.append(evidenceCard(ref,
-            source.conversation_name || source.chat_name || "消息原文", null, multiCM, replyable));
+            source.conversation_name || source.chat_name || "消息原文", null, multiCM));
           continue;
         }
         represented.add(key);
@@ -709,7 +715,7 @@
         rawMessages(item, {messages: [message]}, false, false, multiCM);
         if (ref) {
           const actions = node("div", "oa-card-actions");
-          actions.append(evidenceCard(ref, message.conversation_name || message.chat_name || "消息原文", null, multiCM, replyable));
+          actions.append(evidenceCard(ref, message.conversation_name || message.chat_name || "消息原文", null, multiCM));
           if (replyable && message.text && !message.unreadable) actions.append(replyButton(ref, message.conversation_name || message.chat_name || "当前消息", true));
           item.append(actions);
         }
@@ -735,10 +741,11 @@
       ["followup", {label: "需要内部跟进", element: node("details", "oa-event-group")}],
       ["waiting", {label: "等待对方", element: node("details", "oa-event-group")}],
       ["closed", {label: "已解决／无需处理", element: node("details", "oa-event-group")}]]);
-    let expanded = 0;
+    let expanded = 0, openEvents = 0, closedEvents = 0;
     (result.events || []).forEach((event, index) => {
       const action = event.action_group || (["resolved", "not_required", "no_action"].includes(event.handling_status) ? "closed" : event.reply_status === "replied" ? "followup" : "reply");
       const group = groups.get(action) || groups.get("followup");
+      if (action === "closed") closedEvents++; else openEvents++;
       const card = node("details", "oa-event"), header = node("summary", "oa-event-title"), meta = node("div", "oa-event-meta");
       card.open = action !== "closed" && expanded++ < 8;
       const importance = event.importance?.tier_label || {focus: "重点", priority: "优先", normal: "常规",
@@ -758,13 +765,13 @@
         card.append(conversations);
       }
       if (event.summary) card.append(node("p", "", event.summary));
-      if (event.latest_progress) card.append(node("p", "", event.latest_progress));
+      if (event.latest_progress && event.latest_progress.trim() !== event.summary?.trim()) card.append(node("p", "", event.latest_progress));
       if (event.deadline_day) card.append(node("div", "oa-deadline", event.due_today ? "今天截止" : `截止 ${event.deadline_day}`));
       if (action === "reply" && Number.isFinite(event.waiting_seconds) && event.waiting_seconds > 0) card.append(node("div", "oa-card-meta", `原文中已等待 ${event.waiting_seconds >= 86400 ? `${Math.floor(event.waiting_seconds / 86400)} 天` : event.waiting_seconds >= 3600 ? `${Math.floor(event.waiting_seconds / 3600)} 小时` : `${Math.max(1, Math.floor(event.waiting_seconds / 60))} 分钟`}`));
       card.append(states);
       const actions = node("div", "oa-card-actions");
       const canReply = replyable && action === "reply" && !["resolved", "not_required", "no_action"].includes(event.handling_status);
-      if (mode === "detailed" && (event.evidence_ref || event.event_ref)) actions.append(evidenceCard(event.evidence_ref || event.event_ref, event.title || "聊天事项原文", event.evidence_count, multiCM, canReply));
+      if (mode === "detailed" && (event.evidence_ref || event.event_ref)) actions.append(evidenceCard(event.evidence_ref || event.event_ref, event.title || "聊天事项原文", event.evidence_count, multiCM));
       const evidenceRef = event.evidence_ref || event.event_ref;
       if (mode === "compact" && evidenceRef && !eventReferences.has(evidenceRef)) {
         eventReferences.add(evidenceRef);
@@ -774,7 +781,7 @@
         item.append(evidenceCard(event.evidence_ref || event.event_ref, event.title || "聊天事项原文", event.evidence_count, multiCM));
         references.append(item);
       }
-      if (event.event_ref) actions.append(askButton("最新进展", "查看这个事项的最新进展", {event_ref: event.event_ref, event_title: event.title || "聊天事项"}));
+      if (action !== "closed" && event.event_ref) actions.append(askButton("最新进展", "查看这个事项的最新进展", {event_ref: event.event_ref, event_title: event.title || "聊天事项"}));
       if (canReply && event.event_ref) actions.append(replyButton(event.event_ref, event.title || "聊天事项"));
       if (actions.children.length) card.append(actions);
       group.element.append(card);
@@ -867,10 +874,9 @@
     }
     if (result.events?.length) {
       const followup = node("div", "oa-followup");
-      for (const [label, prompt] of [["只看未解决", "只看刚才结果中还没解决的事项"], ["查看最新进展", "刚才这些事项后来有什么进展？"]]) {
-        followup.append(askButton(label, prompt));
-      }
-      container.append(followup);
+      if (openEvents && closedEvents) followup.append(askButton("只看未解决", "只看刚才结果中还没解决的事项"));
+      if (openEvents > 1) followup.append(askButton("查看最新进展", "刚才这些事项后来有什么进展？"));
+      if (followup.children.length) container.append(followup);
     }
   }
   function turn(view) {

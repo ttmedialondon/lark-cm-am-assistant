@@ -331,6 +331,8 @@ const {chromium} = require('playwright');
     assert.equal(await page.locator('#oa-sources-body img').count(),0);
     assert.equal(await page.locator('#oa-sources-body strong').count(),0);
     assert.match(await page.locator('#oa-sources-body blockquote').textContent(),/\*\*本人原文\*\*/);
+    assert.equal(await page.locator('#oa-sources-body .oa-reply-action').count(),0);
+    assert.equal(await page.locator('.oa-event .oa-reply-action').count(),1);
     await page.locator('#oa-sources-close').click();
     await page.locator('#oa-sources').waitFor({state:'hidden'});
     await page.getByRole('button',{name:'查看回复草稿',exact:true}).click();
@@ -371,7 +373,8 @@ const {chromium} = require('playwright');
     await page.waitForFunction(()=>document.getElementById('oa-stop').hidden);
     assert.equal(await page.locator('.oa-event, .oa-draft, .oa-data, .oa-summary-section').count(),0);
     assert.equal(await page.locator('#oa-sources').isHidden(),true);
-    assert.match(await page.locator('#oa-scope').textContent(),/Remi/);
+    assert.equal(await page.locator('#oa-cm').inputValue(),remiId);
+    assert.doesNotMatch(await page.locator('#oa-scope').textContent(),/Remi/);
     assert.doesNotMatch(await page.locator('#oa-scope').textContent(),/旧事项/);
     assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('ttmedia.assistant.'+
       document.getElementById('operations-assistant').dataset.userId)).session_id),posts[4].body.session_id);
@@ -725,6 +728,7 @@ const {chromium} = require('playwright');
       events:Array.from({length:12},(_,i)=>({event_ref:`event-${i}`,title:`事项 ${i+1}`,creator_name:`达人 ${i+1}`,
         action_group:i===9?'followup':i===10?'waiting':i===11?'closed':'reply',reply_status:i===10?'replied':'unreplied',
         handling_status:i===11?'resolved':'unresolved',summary:'请核对当前情况。',
+        latest_progress:i===0?'  请核对当前情况。  ':i===1?'物流已更新，需要确认签收。':null,
         importance:{tier:i<3?'focus':'normal'},deadline_day:i===0?'2026-10-12':null,due_today:i===0,
         waiting_seconds:3600,conversations:[{name:'客服群',type:'group'}]})),
       data:[{kind:'window_messages',query_ref:'q.fixture',source_url:'/assistant/sources/q.fixture?page=1',
@@ -758,6 +762,11 @@ const {chromium} = require('playwright');
     assert.equal(await page.locator('.oa-event-group').nth(1).locator('.oa-reply-action').count(),0);
     assert.equal(await page.locator('.oa-event-group').nth(2).locator('.oa-reply-action').count(),0);
     assert.equal(await page.locator('.oa-event-group').nth(3).locator('.oa-reply-action').count(),0);
+    assert.equal(await page.locator('.oa-event').first().locator('p').count(),1);
+    assert.equal(await page.locator('.oa-event').nth(1).locator('p').count(),2);
+    assert.equal(await page.locator('.oa-event-group').last()
+      .getByRole('button',{name:'最新进展',exact:true}).count(),0);
+    assert.equal(await page.locator('.oa-followup button').count(),2);
     assert.equal(await page.locator('.oa-deadline').textContent(),'今天截止');
     assert.match(await page.locator('#oa-scope').textContent(),/未回复.*重要度优先/);
     assert.equal(await page.locator('.oa-event-group').last().getAttribute('open'),null);
@@ -781,6 +790,23 @@ const {chromium} = require('playwright');
       /同步水位|历史回填|未启用消息同步|同步尚未成功|错误码|999999/);
     assert.match(await page.locator('#oa-scope').textContent(),/10\/12 00:00.*10\/12 12:00/);
     assert.doesNotMatch(await page.locator('.oa-history .oa-gaps').textContent(),/2 个会话|部分授权/);
+    view={...view,result:{...fullResult,answer:'  请核对当前情况。  ',events:[fullResult.events[0]],data:[]}};
+    await page.reload(); await page.locator('#oa-launcher').click(); await page.locator('.oa-event').waitFor();
+    assert.equal(await page.locator('.oa-message--assistant > .oa-answer').count(),0);
+    assert.equal(await page.locator('.oa-event .oa-reply-action').count(),1);
+    assert.equal(await page.locator('.oa-event').getByRole('button',{name:'最新进展',exact:true}).count(),1);
+    assert.equal(await page.locator('.oa-followup').count(),0);
+    view={...view,result:{...fullResult,events:fullResult.events.slice(0,2),data:[]}};
+    await page.reload(); await page.locator('#oa-launcher').click(); await page.locator('.oa-event').first().waitFor();
+    assert.equal(await page.locator('.oa-followup button').count(),1);
+    assert.equal(await page.locator('.oa-followup').getByRole('button',{name:'只看未解决',exact:true}).count(),0);
+    view={...view,result:{...fullResult,events:[fullResult.events[11]],data:[]}};
+    await page.reload(); await page.locator('#oa-launcher').click();
+    await page.locator('.oa-event').waitFor({state:'attached'});
+    assert.equal(await page.locator('.oa-event .oa-reply-action, .oa-followup').count(),0);
+    assert.equal(await page.locator('.oa-event').getByRole('button',{name:'最新进展',exact:true}).count(),0);
+    assert.equal(await page.locator('.oa-event .oa-evidence').count(),1);
+    view={...view,result:fullResult};
     await page.reload(); await page.locator('#oa-launcher').click();
     await page.locator('.oa-event').first().waitFor();
     assert.match(await page.locator('#oa-scope').textContent(),/未回复.*重要度优先/);
@@ -814,7 +840,7 @@ const {chromium} = require('playwright');
           text:'Please check the dispatch status.'},
         {chat_id:'oc_fixture',message_id:'context-1',ref:'R2',chat_name:'商家客服群',sender_name:'CM',
           text:'Please check the dispatch status.'}],
-      checks:['请确认能完成这项跟进。']};
+      explanation:' 请确认能完成这项跟进。 ',checks:['请确认能完成这项跟进。','请核对最新物流状态。']};
     const draftResult={source_mode:'detailed',reply_enabled:true,answer:'草稿已准备好。',scope:fullResult.scope,draft};
     await deliver(draftResult);
     assert.equal(await page.locator('.oa-reply-context > figure').count(),2);
@@ -822,12 +848,18 @@ const {chromium} = require('playwright');
     assert.equal(await page.locator('.oa-reply-more > summary').textContent(),'更多上下文（6）');
     assert.equal(await page.locator('.oa-reply-more figure').count(),6);
     assert.equal(await page.locator('#oa-reply textarea').isVisible(),true);
+    assert.equal(await page.getByRole('button',{name:'换成英文',exact:true}).count(),0);
+    assert.equal(await page.locator('.oa-draft-checks').textContent(),'请确认能完成这项跟进。 · 请核对最新物流状态。');
     assert.equal(await page.evaluate(()=>document.querySelector('#oa-reply textarea').getBoundingClientRect().bottom <=
       document.getElementById('oa-reply-body').getBoundingClientRect().bottom),true);
     await page.locator('.oa-reply-more > summary').click();
     assert.equal(await page.locator('.oa-reply-more blockquote').first().textContent(),
       `Other context 2. ${'Full original body. '.repeat(30)}`);
     await page.locator('.oa-reply-more > summary').click();
+    await page.locator('#oa-reply textarea').fill('I will check the status today.');
+    assert.equal(await page.getByRole('button',{name:'换成英文',exact:true}).isVisible(),true);
+    await page.locator('#oa-reply textarea').fill(draft.draft);
+    assert.equal(await page.getByRole('button',{name:'换成英文',exact:true}).count(),0);
     await page.locator('#oa-reply textarea').fill('I will check the status today.');
     olderTurns.push(view);
     await nextStream(()=>page.getByRole('button',{name:'更新中文',exact:true}).click());
@@ -837,6 +869,7 @@ const {chromium} = require('playwright');
       chinese_translation:'我今天会核对状态。'}});
     assert.equal(await page.locator('#oa-reply textarea').inputValue(),'I will check the status today.');
     assert.equal(await page.locator('#oa-reply .oa-translation').textContent(),'我今天会核对状态。');
+    assert.equal(await page.getByRole('button',{name:'换成英文',exact:true}).isVisible(),true);
     await page.locator('#oa-reply textarea').fill('My hand-edited reply.');
     olderTurns.push(view);
     await nextStream(()=>page.getByRole('button',{name:'更新中文',exact:true}).click());
@@ -934,7 +967,7 @@ const {chromium} = require('playwright');
     assert.notEqual(posts.at(-1).body.session_id,ordinarySession);
     assert.deepEqual(posts.at(-1).body.context,{cm_id:ownId()});
     const categorized={source_mode:'detailed',reply_enabled:true,
-      answer:'今天有两类事项需要关注。',scope:{cm_id:ownId(),audience:'all'},
+      answer:'  Amy 询问是否还能报名。需要确认活动名额后回复。  ',scope:{cm_id:ownId(),audience:'all'},
       window:{start:'2026-10-12T23:00:00Z',end:'2026-10-13T11:00:00Z'},events:[],
       sections:[{title:'活动报名',summary:'Amy 询问是否还能报名。需要确认活动名额后回复。',
         message_refs:['m.section.group'],sources:[{message_ref:'m.section.group',
@@ -955,6 +988,7 @@ const {chromium} = require('playwright');
         {kind:'activity',scope:{audience:'all'},metrics:{messages:12,own_messages:3}}]};
     await deliver(categorized);
     const categories=page.locator('.oa-summary-section');
+    assert.equal(await page.locator('.oa-message--assistant').last().locator(':scope > .oa-answer').count(),0);
     assert.deepEqual(await categories.locator('h4').allTextContents(),['活动报名','样品寄送']);
     assert.equal(await page.locator('.oa-section-sources[open]').count(),0);
     assert.equal(await page.locator('.oa-source-entry').count(),1);
@@ -995,6 +1029,7 @@ const {chromium} = require('playwright');
     await page.waitForFunction(()=>document.getElementById('oa-sources-body').textContent
       .includes('Full private message and question context.'));
     assert.equal(evidenceReads.at(-1),'m.section.private');
+    assert.equal(await page.locator('#oa-sources-body .oa-reply-action').count(),0);
     assert.equal(posts.length,categoryPostCount);
     await page.locator('#oa-sources-close').click();
     await nextStream(()=>categories.nth(1).getByRole('button',{name:'帮我回复',exact:true}).click());
