@@ -278,7 +278,8 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
     context = assistant._context(pg, next_row, next_checkpoint, chat.settings)
     history, retained = assistant._history(pg, next_row, chat.settings, context)
     previous = json.loads(history[-1]['content'])
-    assert previous['answer'] == '已整理本时段重点。' and previous['summaries'] and retained
+    assert previous['answer'] == '已整理本时段重点。' and previous['section_index'] and retained
+    assert previous['summaries'] == []
     assert not previous['requires_refresh'] and previous['window'] == source['window']
     assert context['now'].startswith(midnight.date().isoformat())
 

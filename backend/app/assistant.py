@@ -700,7 +700,8 @@ def _history(conn, row, settings, context):
                 'checked_at': checked.get('checked_at') or next((item.get('checked_at')
                     for item in reversed(checked.get('data', [])) if item.get('checked_at')), None),
                 'coverage_refreshed': coverage_changed, 'requires_refresh': checked.get('requires_refresh', False),
-                'summaries': checked.get('summaries', material.get('summaries', []) if material else []),
+                'summaries': checked.get('summaries', [] if checked.get('sections')
+                                        else material.get('summaries', []) if material else []),
                 'section_index': [{'index': index + 1, 'title': section['title'],
                     'summary': section['summary'], 'message_refs': section['message_refs'],
                     'sources': [{key: source.get(key) for key in (
