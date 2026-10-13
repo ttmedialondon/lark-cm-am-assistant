@@ -72,11 +72,11 @@ curl --fail --silent --show-error https://larkbot.ttapp.help/healthz
 
 采用按功能增量授权，参考 [Google](https://developers.google.com/identity/protocols/oauth2/resources/granular-permissions)、[Microsoft](https://learn.microsoft.com/en-us/entra/identity-platform/consent-types-developer) 和 [Slack](https://docs.slack.dev/authentication/installing-with-oauth/) 的官方流程。不把应用已开通的全部权限都要求用户授权。
 
-- 每次进入、恢复页面及切换收件范围时，通过带会话和 CSRF 校验的 `POST /creators/broadcast/permissions` 核对当前登录者本人；选择其他 CM 只改变预览范围，不检查其凭据，也不能以其身份发送。
+- 首次进入、主动重查及返回页面时，通过带会话和 CSRF 校验的 `POST /creators/broadcast/permissions` 核对当前登录者本人；返回页面的检查在后台进行，不反复锁住编辑区。切换 CM／载入名单只重查目标范围，复用本标签页已取得的本人发送状态，不再重复外部令牌探测。实际准备和发送仍重新检查当前权限；选择其他 CM 不能以其身份发送。
 - 结合最新 OAuth/刷新响应记录的 scope 与只读 `user_info` 核对基线、两项发送权限、凭证和本人身份。只有令牌临近到期才沿用现有行锁刷新；刷新明确返回 scope 时同步保存，未返回则保留历史记录。
 - 编辑、保存、匹配和预览要求本人 active、正文同意和读取基线完整；通常由 Owner 或 `authorizations.broadcast_enabled` 单独开通。不再因缺发送 scope 自动跳 OAuth、锁住整个编辑区；实际发送前由本人点击补授权。草稿仅在当前标签页临时保留，返回后重新准备，不自动发送。普通用户只使用自己的达人、可见群和个人名单／模板，伪造其他 CM 拒绝；“自选群”允许选择未分类的本人可见群，但不改变正式分类。
 - 演示可配置 `BROADCAST_PREVIEW_UNTIL=2026-10-11T00:00:00+01:00`，仅在期限内绕过功能开通标志以预览；仍要求登录、正文授权和读取权限。到期自动恢复，不新增后台角色或发送授权。正式发送、重试及 Worker 始终要求 Owner 有效或本人功能标志为 true，并核对两项发送 scope。
-- `POST /creators/broadcast/prepare` 核验本人凭据、固定当前数据库范围和 @ 身份，并加密保存 15 分钟有效快照；`POST /creators/broadcast/send` 经再次确认、CSRF 与最新授权检查后入队。队列只有本人可创建/查看/停止/重试，Owner 不可冒充其他人。准备和确认不重复逐群请求 Lark；Worker 临发送逐群核验实际成员、发言、@ 对象及 @all 权限。
+- 本人发送就绪时，点击“预览群发”直接调用 `POST /creators/broadcast/prepare`，核验本人凭据并加密保存 15 分钟有效快照；弹窗内确认一次后调用 `/send`，经 CSRF 与最新授权检查入队，不再先 `/preview` 后重复准备。未发送就绪或跨 CM 仍只读预览。队列只有本人可创建/查看/停止/重试，Owner 不可冒充其他人。准备和确认不重复逐群请求 Lark；Worker 临发送逐群核验实际成员、发言、@ 对象及 @all 权限。
 - `/creators/broadcast/batches` 与 `/{id}` 展示本人结果；`/{id}/cancel` 停止尚未开始 POST 的项，已发出不撤回；`/{id}/retry` 只重排明确失败项。成功及结果未知不重发，未知项需到 Lark 核实。重复请求/预览复用同一任务；10 分钟内相同本人、正文、目标去重，每群持久化固定 UUID。
 - 独立发送 Worker 最多 2 个账号并行，同一账号串行，不占 AI 并发。限流尊重 Retry-After，最多 3 次自动尝试；不确定的网络/服务端结果及已开始发送的失效租约标记 unknown，未开始的失效租约恢复 pending。错误与审计不写正文或令牌，正文只加密保存并由本人在回执页查看。
 - [Lark CLI 的 auth check](https://github.com/larksuite/cli/blob/main/cmd/auth/check.go) 检查本地 scope；`user_info` 不返回 scope。因此授权就绪不等于外部群、发言或 @all 已经可用。正式验收需经网站确认并核对 Lark 回执与实际消息，不以一次直接 API 测试替代；外部群需另获指定群测试授权。

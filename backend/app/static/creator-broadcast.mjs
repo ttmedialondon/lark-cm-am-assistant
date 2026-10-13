@@ -50,8 +50,8 @@ export function listState(cmId, purpose, mention, targets) {
   return JSON.stringify([cmId, purpose, mention,
     targets.map(target => [target.contact_id || '', target.chat_id]).sort((a,b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))]);
 }
-export function permissionReady(result, pending, cm, checkedCm, redirecting = false) {
-  return !pending && !redirecting && cm === checkedCm && result?.status === 'ready';
+export function permissionReady(result, pending, actor, checkedActor, redirecting = false) {
+  return !pending && !redirecting && actor === checkedActor && result?.status === 'ready';
 }
 export function authorizationUrl(value, actor, origin) {
   if (typeof value !== 'string' || value.length > 512) throw new Error('授权地址无效，请重新检查。');
@@ -102,12 +102,12 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   let lists = config.lists || [], currentList = null, editingList = null, fixedIds = null, fixedTargets = null;
   let savedState = '', editMode = 'create', pendingAction = null, initialMetadata = '';
   let selectedGroups = new Set(), templates = config.templates || [], currentTemplateId = '', editingTemplate = null, initialTemplate = '';
-  let permissionCheck = 0, permissionPending = false, permissionCm = null, permissionResult = null;
+  let permissionCheck = 0, permissionPending = false, permissionActor = null, permissionResult = null;
   let redirecting = false, pendingRestore = false, loadingGroups = false;
   let frozenPreview = null, sendRequestId = null, sending = false, batches = [], activeBatch = null, batchTimer = null, batchBusy = false, batchRequest = 0;
   const draftKey = 'ttmedia.broadcast.authorization-draft';
   const allowed = () => !redirecting;
-  const sendReady = () => permissionReady(permissionResult,permissionPending,$('cm').value,permissionCm,redirecting)
+  const sendReady = () => permissionReady(permissionResult,permissionPending,actor,permissionActor,redirecting)
     && permissionResult.feature_enabled === true && $('cm').value === actor;
   const groupMode = () => purpose !== 'support';
   function syncAssistantScope() {
@@ -287,9 +287,9 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     $('cm').disabled = redirecting || !canSelectCm;
     $('permission-retry').disabled = permissionPending || redirecting;
     $('permission-authorize').disabled = permissionPending || redirecting;
-    $('send').disabled = busy || sending || !sendReady();
-    $('send').textContent = frozenPreview ? `确认发送 ${frozenPreview.groups.length} 个群` : '准备发送';
-    if (!sending) $('confirm-state').textContent = sendReady() ? frozenPreview ? `以 ${frozenPreview.account_name || permissionResult.account_name} 本人身份发送 · 发送前逐群检查权限` : '尚未发送'
+    $('send').disabled = busy || sending || !sendReady() || !frozenPreview;
+    $('send').textContent = frozenPreview ? `确认发送 ${frozenPreview.groups.length} 个群` : '确认发送';
+    if (!sending) $('confirm-state').textContent = sendReady() ? frozenPreview ? `以 ${frozenPreview.account_name || permissionResult.account_name} 本人身份发送` : '请返回重新预览'
       : permissionPending ? '正在核对发送授权，仍可预览' : $('cm').value !== actor ? '其他人员范围仅可预览' : permissionResult?.feature_enabled === false ? '演示模式 · 发送权限未开通' : '预览可用，发送前需补充本人授权';
   }
   function lock(value) { busy = value; render(); }
@@ -316,7 +316,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     const business = action !== 'permissions', request = permissionCheck, cm = $('cm').value;
     if (business && !allowed()) throw new Error('请先完成当前账号的授权核对。');
     const control = {'permissions':'permission-retry','match':'match','resolve':'match','groups':'group-refresh',
-      'preview':'preview','prepare':'send','send':'send','lists/save':'list-save','templates/save':'template-save',
+      'preview':'preview','prepare':'preview','send':'send','lists/save':'list-save','templates/save':'template-save',
       'lists/delete':'list-action-proceed','templates/delete':'list-action-proceed'}[action];
     const indicator = action === 'lists/load' ? $('list-action-dialog').open ? $('list-action-proceed')
       : [...$('library-items').querySelectorAll('[data-list-id]')].find(button => button.dataset.listId === data.id)
@@ -354,19 +354,18 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     }
   }
   async function checkPermissions(force = false) {
-    const cm = $('cm').value;
-    if (!force && permissionCm === cm && !permissionPending) return allowed();
-    if (permissionPending && permissionCm === cm) return false;
+    if (!force && permissionResult) return allowed();
+    if (permissionPending) return allowed();
     if (redirecting) return false;
-    const request = ++permissionCheck; permissionCm = cm; permissionPending = true; permissionResult = null;
+    const request = ++permissionCheck; permissionActor = actor; permissionPending = true;
     $('permission-bar').setAttribute('aria-busy','true'); $('permission-retry').disabled = true;
     $('permission-account').textContent = `发送账号：${config.cms.find(item => item.id === actor)?.name || '本人'}`;
     $('permission-status').replaceChildren(loading('正在核对授权')); $('permission-status').className = 'badge bg-secondary-lt ms-2';
     $('permission-status').setAttribute('aria-busy','true');
     $('permission-message').textContent = ''; $('permission-authorize').hidden = true; syncGate();
     try {
-      const result = await api('permissions',{cm_id:cm});
-      if (request !== permissionCheck || cm !== $('cm').value) return false;
+      const result = await api('permissions',{cm_id:actor});
+      if (request !== permissionCheck) return false;
       permissionResult = result;
       $('permission-account').textContent = `发送账号：${result.account_name || '本人'}`;
       $('permission-status').textContent = result.status === 'ready' && result.feature_enabled ? '本人发送已就绪' : result.feature_enabled === false ? '演示模式' : result.status === 'needs_authorization' ? '待补发送授权' : '暂时无法核对';
@@ -377,6 +376,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       }
     } catch (error) {
       if (request !== permissionCheck) return false;
+      permissionResult = null;
       $('permission-status').textContent = '暂时无法核对'; $('permission-status').className = 'badge bg-yellow-lt ms-2';
       $('permission-message').textContent = error.message;
     } finally {
@@ -503,11 +503,13 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   $('preview').addEventListener('click', async () => {
     const current = plan();
     if (busy || !allowed() || dirty || current.issues.length || !current.groups.length || !$('message').value.trim()) return;
-    lock(true); notice('核对路由',true);
+    const prepare = sendReady();
+    lock(true); notice('正在准备预览',true);
     try {
-      const result = await api('preview',{cm_id:$('cm').value,purpose,mention:$('mention').checked,message:$('message').value,selections:selections()});
+      const result = await api(prepare ? 'prepare' : 'preview',{cm_id:$('cm').value,purpose,mention:$('mention').checked,message:$('message').value,selections:selections()});
       if (result.issues.length) { dirty = true; throw new Error(groupMode() ? '群聊已变化，请点击“刷新”重新核验。' : `${result.issues.length} 项路由已变化，请重新匹配。`); }
-      frozenPreview = null; sendRequestId = null; $('confirm-error').textContent = '';
+      if (prepare && (!result.preview_id || !result.groups.length)) throw new Error('没有可发送的群，请返回修改。');
+      frozenPreview = prepare ? result : null; sendRequestId = prepare ? crypto.randomUUID() : null; $('confirm-error').textContent = '';
       renderPreview(result);
       notice(''); $('confirm').showModal();
     } catch (error) { notice(error.message || '预览失败，请稍后重试。'); }
@@ -527,19 +529,13 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     syncGate();
   }
   $('send').addEventListener('click',async () => {
-    if (sending || busy || !sendReady()) return;
+    if (sending || busy || !sendReady() || !frozenPreview) return;
     sending = true; $('confirm-error').textContent = ''; syncGate();
     try {
-      if (!frozenPreview) {
-        const result = await api('prepare',{cm_id:$('cm').value,purpose,mention:$('mention').checked,message:$('message').value,selections:selections()});
-        if (!result.preview_id || !result.groups.length) throw new Error('没有可发送的群，请返回修改。');
-        frozenPreview = result; sendRequestId = crypto.randomUUID(); renderPreview(result);
-      } else {
-        const result = await api('send',{preview_id:frozenPreview.preview_id,request_id:sendRequestId});
-        $('confirm').close(); frozenPreview = null; sendRequestId = null;
-        notice(result.deduplicated ? '已显示已有发送任务，未重复创建。' : '已加入发送队列。');
-        upsertBatch(result.batch); await openBatch(result.batch.id);
-      }
+      const result = await api('send',{preview_id:frozenPreview.preview_id,request_id:sendRequestId});
+      $('confirm').close(); frozenPreview = null; sendRequestId = null;
+      notice(result.deduplicated ? '已显示已有发送任务，未重复创建。' : '已加入发送队列。');
+      upsertBatch(result.batch); await openBatch(result.batch.id);
     } catch (error) {
       $('confirm-error').textContent = error.message;
       if (!sendReady()) $('confirm-state').textContent = '发送已暂停，预览和消息会保留';
@@ -665,7 +661,6 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       $('input').value = (result.entries || []).map(entry => entry.inputs[0]).join('\n'); $('group-search').value = ''; applyTargets(result);
       savedState = selectionState(); pendingAction = null; $('library-dialog').close(); $('list-action-dialog').close();
       notice([result.issues.length ? `已跳过 ${result.issues.length} 项：${result.issues[0].reason}` : '',result.notice || '名单已载入。'].filter(Boolean).join(' '));
-      await checkPermissions(true);
     } catch (error) {
       $('library-error').textContent = error.message; $('list-action-error').textContent = error.message; notice(error.message);
     }

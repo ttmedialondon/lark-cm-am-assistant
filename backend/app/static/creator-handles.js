@@ -590,7 +590,9 @@
     });
   }
   render();
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) void refresh(true); });
+  window.addEventListener("pageshow", event => { if (event.persisted) void refresh(true); });
   setInterval(() => {
     if (data.importance_running || data.import_batches?.some(batch => batch.status === "running")) void refresh(true);
-  }, 5000);
+  }, 30000);
 })();

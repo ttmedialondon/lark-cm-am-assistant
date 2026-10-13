@@ -2,6 +2,7 @@ import json
 from contextlib import nullcontext
 from copy import deepcopy
 from datetime import UTC, timedelta
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -35,6 +36,27 @@ def finish(chat):
 
 
 def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(pg, chat, monkeypatch):
+    roster_reads, source_checks, total_reads = [], [], []
+    original_roster = summaries._roster
+    original_validation = assistant.tools.validate_tool_results
+    original_totals = assistant_search._totals
+
+    def roster(*args, **kwargs):
+        roster_reads.append(True)
+        return original_roster(*args, **kwargs)
+
+    def validate(*args, **kwargs):
+        if kwargs.get('message_refs') is not None:
+            source_checks.append(kwargs['message_refs'])
+        return original_validation(*args, **kwargs)
+
+    def totals(*args, **kwargs):
+        total_reads.append(True)
+        return original_totals(*args, **kwargs)
+
+    monkeypatch.setattr(summaries, '_roster', roster)
+    monkeypatch.setattr(assistant.tools, 'validate_tool_results', validate)
+    monkeypatch.setattr(assistant_search, '_totals', totals)
     ids = []
     for index in range(13):
         message_id = f'window-{index}'
@@ -66,6 +88,7 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
                 ref for note in segment['summaries'] for ref in note['evidence_refs']}
             enum = kwargs['output_format']['schema']['properties']['evidence_refs']['items']['enum']
             assert refs_in_input == set(enum) and all(ref.startswith('R') and ref[1:].isdigit() for ref in enum)
+            assert len(source_checks[-1]) == len(enum)
             item_spec = kwargs['output_format']['schema']['properties']['items']['items']['properties']
             assert item_spec['evidence_refs']['items']['enum'] == enum and item_spec['evidence_refs']['minItems'] == 1
             raw_ids.update(message['message_id'] for message in messages)
@@ -166,6 +189,7 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
         if value['status'] not in assistant.ACTIVE:
             break
     assert value['status'] == 'completed' and len(calls) > 2 and reduced
+    assert len(total_reads) == 2 and roster_reads == []
     assert raw_ids == {*ids, 'm1', 'outside'}
     parts.sort()
     assert parts[0][0][0] == 0 and parts[-1][0][1] == parts[-1][0][2]
@@ -216,7 +240,15 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
         (chat.cipher.encrypt(json.dumps({'text': 'New conversation progress'})), chat.start + timedelta(hours=3)))
     pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
         VALUES(%s,'new-chat','new-chat-message')""", (chat.ids['cm'],))
-    unchanged = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
+    directory_reads = []
+
+    def execute(sql, params=None):
+        if sql == assistant_search._CHAT_SQL + ' ORDER BY c.chat_id':
+            directory_reads.append(True)
+        return pg.execute(sql, params)
+
+    unchanged = assistant.turn_view(SimpleNamespace(execute=execute), chat.ids['cm'], turn['id'], chat.settings)
+    assert len(directory_reads) == 1 and roster_reads == []
     assert unchanged['result']['answer'] == value['result']['answer']
     stable = assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings, page=15)
     assert stable['total_messages'] == 15 and stable['coverage']['scan_complete']
@@ -248,6 +280,11 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
     assert {message['message_id'] for page in fresh_checkpoint['tool_results'] for message in page['messages']} == {
         *raw_ids, 'late-window-sync', 'new-chat-message'}
     pg.execute("UPDATE chat_messages SET is_deleted=TRUE WHERE message_id='window-1'")
+    pages = stored_checkpoint['tool_results']
+    selected_refs = {message['message_ref'] for message in pages[0]['messages']}
+    assert all(message['message_id'] != 'window-1' for message in pages[0]['messages'])
+    assistant.tools.validate_tool_results(pg, chat.ids['cm'], stored_row, pages, chat.settings,
+        original_context, message_refs=selected_refs)
     with pytest.raises(PermissionError, match='已删除'):
         assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings)
     pg.execute("UPDATE chat_messages SET is_deleted=FALSE WHERE message_id='window-1'")
@@ -386,10 +423,10 @@ def test_window_collection_corrects_initial_inputs_and_rejects_incomplete_pages(
         return
     first = summary_dialogues.decode(original['checkpoint_ciphertext'], chat.settings)['tool_results'][0]
     if interruption == 'repeated_page':
-        monkeypatch.setattr(assistant.tools, 'execute', lambda *args: first)
+        monkeypatch.setattr(assistant.tools, 'execute', lambda *args, **kwargs: first)
     elif interruption == 'premature_end':
         execute = assistant.tools.execute
-        monkeypatch.setattr(assistant.tools, 'execute', lambda *args:
+        monkeypatch.setattr(assistant.tools, 'execute', lambda *args, **kwargs:
                             {**execute(*args), 'messages': [], 'next_cursor': None})
     elif interruption == 'permission':
         pg.execute("UPDATE authorizations SET scopes='{}' WHERE id=%s", (chat.ids['cm'],))
@@ -831,7 +868,7 @@ def test_waiting_releases_slot_and_resume_returns_original_call_id(pg, chat, mon
                 'name': 'summarize_messages', 'arguments': '{}'}], 'usage': {}}
 
     monkeypatch.setattr(openai_client, 'call_openai_tools', model)
-    monkeypatch.setattr(assistant.tools, 'execute', lambda *args: {
+    monkeypatch.setattr(assistant.tools, 'execute', lambda *args, **kwargs: {
         'waiting': {'kind': 'summary', 'ids': []},
     })
     monkeypatch.setattr(assistant.tools, 'resume_wait', lambda *args: {'events': []} if complete else None)
@@ -867,9 +904,9 @@ def test_repeated_tool_call_uses_current_turn_cache(pg, chat, monkeypatch):
     executions = []
     original = assistant.tools.execute
 
-    def execute(*args):
+    def execute(*args, **kwargs):
         executions.append(True)
-        return original(*args)
+        return original(*args, **kwargs)
 
     monkeypatch.setattr(assistant.tools, 'execute', execute)
 

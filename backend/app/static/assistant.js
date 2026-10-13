@@ -423,19 +423,17 @@
       if (denied || !editor.value.trim()) return;
       copy.disabled = true;
       try {
-        const session = await request(`/sessions/${encodeURIComponent(saved.session_id)}`);
+        const value = await request(`/drafts/${encodeURIComponent(draft.draft_ref)}/status`);
         if (denied) return;
-        if (!session.turns?.find(item => item.id === turnId)?.result?.draft) {
-          card.replaceChildren(node("p", "oa-gaps", "草稿已过时或不可读取，请重新生成。")); return;
-        }
-        await navigator.clipboard.writeText(editor.value); feedback.textContent = "已复制，未发送";
+        const copied = `已复制，未发送${value.new_messages ? " · 有新消息，请核对" : ""}`;
+        await navigator.clipboard.writeText(editor.value); feedback.textContent = copied;
         if (draft.context?.chat_url) {
           let url;
           try { url = new URL(draft.context.chat_url); } catch { /* Invalid conversation links are not opened. */ }
           if (url?.protocol === "https:" && ["applink.larksuite.com", "applink.feishu.cn"].includes(url.hostname)) {
             if (!window.open(url.href, "_blank", "noopener,noreferrer")) {
               const open = node("a", "", "打开 Lark"); open.href = url.href; open.target = "_blank"; open.rel = "noopener noreferrer";
-              feedback.replaceChildren(document.createTextNode("已复制，未发送 · "), open);
+              feedback.replaceChildren(document.createTextNode(`${copied} · `), open);
             }
           }
         }

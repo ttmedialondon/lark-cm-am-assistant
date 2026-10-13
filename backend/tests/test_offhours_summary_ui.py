@@ -20,7 +20,8 @@ APP = Path(__file__).resolve().parents[1] / "app"
 
 
 def render(data):
-    data = {"selection": {"cms": [], "dates": [], "date": "2026-09-15", "period": "work"}, **data}
+    data = {"responsible": {"id": "fixture-cm", "name": "Tester"},
+            "selection": {"cms": [], "dates": [], "date": "2026-09-15", "period": "work"}, **data}
     env = Environment(loader=FileSystemLoader(APP / "templates"), autoescape=select_autoescape())
     return env.get_template("offhours_summary.html").render(
         authorization={"display_name": "Tester"}, summary_data=data,

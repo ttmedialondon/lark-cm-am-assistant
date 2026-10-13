@@ -496,10 +496,15 @@ def read(conn, actor, job_id, settings, *, fresh=False):
     source(conn, actor, event_id(job), settings, require_unresolved=False, feature=feature)
     result = None
     if job["status"] == "succeeded":
+        result = dialogues.decode(job["result_ciphertext"], settings)
         if fresh:
             current = collect(conn, actor, event_id(job), settings, require_unresolved=False, feature=feature)
             checkpoint = dialogues.decode(job["checkpoint_ciphertext"], settings)
             if current["fingerprint"] != checkpoint["fingerprint"]:
+                previous = collect(conn, actor, event_id(job), settings, require_unresolved=False,
+                                   feature=feature, cutoff=result["checked_at"])
+                if previous["fingerprint"] == checkpoint["fingerprint"]:
+                    return {"id": str(job["id"]), "status": "stale", "reason_code": "new_messages",
+                            "error": "有新消息，请核对后使用。", "result": result}
                 return {"id": str(job["id"]), "status": "stale", "error": "收到新消息或资料变化，请重新生成建议。"}
-        result = dialogues.decode(job["result_ciphertext"], settings)
     return {"id": str(job["id"]), "status": job["status"], "error": job["error_message"], "result": result}

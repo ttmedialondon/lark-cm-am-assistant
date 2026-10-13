@@ -1834,8 +1834,18 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
     finish()
     assert replies.read(pg, s.ids["cm"], translated, s.settings, fresh=True)["result"]["draft"].startswith("Happy")
     s.add("resolved-later", text="This specific issue is now resolved, thank you.", at=datetime.now(UTC))
-    assert replies.read(pg, s.ids["cm"], job_id, s.settings, fresh=True)["status"] == "stale"
-    assert replies.read(pg, s.ids["cm"], translated, s.settings, fresh=True)["status"] == "stale"
+    paid_count = len(calls)
+    for previous_id in (job_id, translated):
+        changed = replies.read(pg, s.ids["cm"], previous_id, s.settings, fresh=True)
+        assert changed["status"] == "stale" and changed["reason_code"] == "new_messages"
+        assert changed["result"]["draft"].startswith("Happy")
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='long-current'",
+                   (s.cipher.encrypt(json.dumps({"text": "Changed payment terms."})),))
+        changed = replies.read(pg, s.ids["cm"], job_id, s.settings, fresh=True)
+        assert changed["status"] == "stale" and changed.get("reason_code") != "new_messages"
+        assert not changed.get("result")
+    assert len(calls) == paid_count
     latest = replies.enqueue(pg, s.ids["cm"], event_id, s.settings)
     finish()
     latest_result = replies.read(pg, s.ids["cm"], latest, s.settings, fresh=True)["result"]

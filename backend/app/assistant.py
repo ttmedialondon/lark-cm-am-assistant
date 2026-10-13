@@ -215,20 +215,21 @@ def submit(conn, actor, payload, settings):
     return turn_view(conn, actor, turn_id, settings)
 
 
-def _context(conn, row, checkpoint, settings):
+def _context(conn, row, checkpoint, settings, *, read_cache=None):
     selected = checkpoint.get('context', {}).get('scope', {})
     if 'audience' not in selected:
         selected = {**selected, 'audience': 'creators'}  # Old answers used the creator-only material protocol.
-    return tools.current_context(conn, row['actor_id'], selected, settings, now=row['created_at'])
+    return tools.current_context(conn, row['actor_id'], selected, settings, now=row['created_at'],
+                                 read_cache=read_cache)
 
 
-def _result(conn, row, checkpoint, settings):
+def _result(conn, row, checkpoint, settings, *, context=None, read_cache=None):
     stored = codec.decode(row['result_ciphertext'], settings)
     if not stored:
         return None
-    context = _context(conn, row, checkpoint, settings)
+    context = context or _context(conn, row, checkpoint, settings, read_cache=read_cache)
     result = tools.build_result(conn, row['actor_id'], row, stored['final'], settings,
-                                context, checkpoint.get('tool_results', []))
+                                context, checkpoint.get('tool_results', []), read_cache=read_cache)
     return _source_cards(result, checkpoint.get('tool_results', []))
 
 
@@ -277,17 +278,18 @@ def _source_url(reference, page, cursor=None):
 
 def source_page(conn, actor, reference, settings, *, page=1, cursor=None):
     """Read a saved source page without changing assistant jobs or invoking a model."""
+    read_cache = {}
     actor = _actor(conn, actor)
     first = tools._saved_query(conn, actor, reference, settings)
     if first.get('kind') not in {'window_messages', 'messages'} or not isinstance(page, int) or page < 1:
         raise ValueError('来源页无效。')
     row = _turn(conn, actor, reference.split('.')[1])
     checkpoint = codec.decode(row['checkpoint_ciphertext'], settings) or {}
-    context = _context(conn, row, checkpoint, settings)
+    context = _context(conn, row, checkpoint, settings, read_cache=read_cache)
     if first['kind'] == 'messages' and cursor is not None:
-        tools._validate_query(conn, actor, context, first, settings)
+        tools._validate_query(conn, actor, context, first, settings, read_cache=read_cache)
         args = {**first['_request']['args'], 'cursor': cursor}
-        value = tools.assistant_search.query(conn, actor, context, args, settings)
+        value = tools.assistant_search.query(conn, actor, context, args, settings, read_cache=read_cache)
         if value['query_id'] != first['query_id']:
             raise ValueError('检索范围已变化。')
         _, turn_id, digest = reference.split('.')
@@ -309,7 +311,7 @@ def source_page(conn, actor, reference, settings, *, page=1, cursor=None):
     if page > len(found):
         raise ValueError('来源页超出范围。')
     selected = found[page - 1]
-    tools.validate_tool_results(conn, actor, row, found, settings, context)
+    tools.validate_tool_results(conn, actor, row, found, settings, context, read_cache=read_cache)
     if first['kind'] == 'window_messages':
         value = windows.source({'tool_results': found}, {'page_refs': [item['query_ref'] for item in found]})
     else:
@@ -325,14 +327,15 @@ def source_page(conn, actor, reference, settings, *, page=1, cursor=None):
     return value
 
 
-def turn_view(conn, actor, turn_id, settings):
+def turn_view(conn, actor, turn_id, settings, *, read_cache=None):
+    read_cache = {} if read_cache is None else read_cache
     row = _turn(conn, actor, turn_id)
     checkpoint = codec.decode(row['checkpoint_ciphertext'], settings) or {}
     result, error = None, ERRORS.get(row['error_code'])
     error_code = row['error_code']
     try:
-        context = _context(conn, row, checkpoint, settings)
-        result = _result(conn, row, checkpoint, settings)
+        context = _context(conn, row, checkpoint, settings, read_cache=read_cache)
+        result = _result(conn, row, checkpoint, settings, context=context, read_cache=read_cache)
         scope = context.get('scope', {})
     except tools.SourceChangedError:
         scope, error = {}, ERRORS['source_changed']
@@ -358,7 +361,9 @@ def session_view(conn, actor, session_id, settings):
     ids = conn.execute("SELECT id FROM assistant_turns WHERE session_id=%s "
                        "AND error_code IS DISTINCT FROM 'cleared' ORDER BY created_at,id",
                        (session_id,)).fetchall()
-    return {'id': str(session_id), 'turns': [turn_view(conn, actor, row['id'], settings) for row in ids]}
+    read_cache = {}
+    return {'id': str(session_id), 'turns': [turn_view(conn, actor, row['id'], settings, read_cache=read_cache)
+                                          for row in ids]}
 
 
 def clear_conversations(conn, actor, settings):
@@ -521,6 +526,7 @@ def claim():
 
 def prepare(settings):
     with connection() as conn, conn.transaction():
+        read_cache = {}
         row = conn.execute('''SELECT t.*,s.actor_id FROM assistant_turns t
             JOIN assistant_sessions s ON s.id=t.session_id
             WHERE t.status='waiting' AND t.scheduled_at<=NOW() ORDER BY t.created_at
@@ -530,7 +536,7 @@ def prepare(settings):
         row = dict(row)
         checkpoint = codec.decode(row['checkpoint_ciphertext'], settings)
         try:
-            context = _context(conn, row, checkpoint, settings)
+            context = _context(conn, row, checkpoint, settings, read_cache=read_cache)
             result = tools.resume_wait(conn, row['actor_id'], row, checkpoint['waiting'], settings, context)
         except (PermissionError, LookupError, ValueError) as exc:
             code = 'permission' if isinstance(exc, PermissionError | LookupError) else 'source_changed'
@@ -589,13 +595,23 @@ def _complete_window(checkpoint, model_result):
     checkpoint['window_final_pending'] = True
 
 
-def _collect_window(conn, row, checkpoint, settings, context):
+def _collect_window(conn, row, checkpoint, settings, context, *, read_cache=None):
     window = checkpoint['window_job']
     current_turn = {**row, 'checkpoint_ciphertext': codec.encode(checkpoint, settings)}
+    previous = windows.pages(checkpoint, window)
+    counts = {key: previous[0][key] for key in ('total_messages', 'total_conversations')} if previous else None
     result = tools.execute(conn, row['actor_id'], current_turn, 'summarize_messages',
-                           window['args'], settings, context)
+                           window['args'], settings, context, read_cache=read_cache, window_counts=counts)
     try:
         if windows.add_page(checkpoint, window, result):
+            cm, _roster, chats, speakers, _selected = tools.assistant_search._scope(
+                conn, row['actor_id'], context, None, window['args'].get('chat_ids'), settings, 'all',
+                read_cache=read_cache)
+            fresh = tools.assistant_search._totals(conn, cm['id'], [chat['chat_id'] for chat in chats],
+                tools.assistant_search._time(result['window']['start']),
+                tools.assistant_search._time(result['window']['end']), speakers)
+            if any(result[key] != fresh[key] for key in ('total_messages', 'total_conversations')):
+                raise ValueError('时段消息数量已变化，请重新读取。')
             supplied = windows.prepare(checkpoint, window)
             if supplied is not None:
                 _complete_window(checkpoint, supplied)
@@ -643,7 +659,7 @@ def _saved_window_material(checkpoint, references, *, turn_id=None):
     return None
 
 
-def _historical_window_result(conn, previous, checkpoint, settings, context):
+def _historical_window_result(conn, previous, checkpoint, settings, context, *, read_cache=None):
     stored = codec.decode(previous['result_ciphertext'], settings) or {}
     final = stored.get('final', {})
     material = _saved_window_material(checkpoint, final.get('data_refs', []), turn_id=previous['id'])
@@ -660,12 +676,14 @@ def _historical_window_result(conn, previous, checkpoint, settings, context):
                 and item.get('query_ref', '').split('.')[1:2] == [str(previous['id'])]
                 and item.get('query_id') == first.get('query_id')]
         else:
-            _context(conn, previous, checkpoint, settings)
+            _context(conn, previous, checkpoint, settings, read_cache=read_cache)
         for item in original:
             if item.get('kind') == 'window_messages':
-                tools._validate_query(conn, previous['actor_id'], context, item, settings, history_only=True)
+                tools._validate_query(conn, previous['actor_id'], context, item, settings, history_only=True,
+                                      read_cache=read_cache)
         tools.validate_tool_results(conn, previous['actor_id'], previous,
-            [item for item in original if item.get('kind') != 'window_messages'], settings, context)
+            [item for item in original if item.get('kind') != 'window_messages'], settings, context,
+            read_cache=read_cache)
     except (PermissionError, LookupError, ValueError):
         return None
     # Revalidated old facts remain useful, but their stale query references cannot execute new actions.
@@ -676,7 +694,8 @@ def _historical_window_result(conn, previous, checkpoint, settings, context):
                 for note in material.get('summaries', [])]}
 
 
-def _history(conn, row, settings, context):
+def _history(conn, row, settings, context, *, read_cache=None):
+    read_cache = {} if read_cache is None else read_cache
     history, results, seen = [], [], set()
     rows = conn.execute('''SELECT t.*,s.actor_id FROM assistant_turns t JOIN assistant_sessions s ON s.id=t.session_id
         WHERE t.session_id=%s AND t.id<>%s AND t.status='completed' ORDER BY t.created_at DESC LIMIT 6''',
@@ -686,12 +705,9 @@ def _history(conn, row, settings, context):
         if checkpoint.get('context', {}).get('scope', {}).get('cm_id') != context['scope']['cm_id']:
             continue
         try:
-            checked = _result(conn, previous, checkpoint, settings)
-            if checked:
-                tools.validate_tool_results(conn, row['actor_id'], row,
-                                            checkpoint.get('tool_results', []), settings, context)
+            checked = _result(conn, previous, checkpoint, settings, read_cache=read_cache)
         except (PermissionError, LookupError, ValueError):
-            checked = _historical_window_result(conn, previous, checkpoint, settings, context)
+            checked = _historical_window_result(conn, previous, checkpoint, settings, context, read_cache=read_cache)
         if checked:
             coverage_changed = any(result.get('_coverage_refreshed') for result in checkpoint.get('tool_results', []))
             material = _saved_window_material(checkpoint, checked.get('data_refs', []))
@@ -745,7 +761,7 @@ def _history(conn, row, settings, context):
     return history, results
 
 
-def _apply_response(conn, row, job, checkpoint, settings, context):
+def _apply_response(conn, row, job, checkpoint, settings, context, *, read_cache=None):
     response = checkpoint.pop('response_received')
     if checkpoint.pop('summary_request', None):
         window = checkpoint['window_job']
@@ -783,7 +799,7 @@ def _apply_response(conn, row, job, checkpoint, settings, context):
             final['data_refs'] = list(dict.fromkeys([*final.get('data_refs', []), *checkpoint['window_refs']]))
         try:
             result = tools.build_result(conn, row['actor_id'], row, final, settings, context,
-                                        checkpoint['tool_results'])
+                                        checkpoint['tool_results'], read_cache=read_cache)
         except tools.SourceChangedError:
             raise
         except ValueError as exc:
@@ -797,17 +813,18 @@ def _apply_response(conn, row, job, checkpoint, settings, context):
 
 def step(job, settings):
     with connection() as conn, conn.transaction():
+        read_cache = {}
         row = _fence(conn, job)
         checkpoint = codec.decode(row['checkpoint_ciphertext'], settings)
-        context = _context(conn, row, checkpoint, settings)
+        context = _context(conn, row, checkpoint, settings, read_cache=read_cache)
         if not configured(conn):
             raise PermissionError('助手已停止。')
         if checkpoint.get('response_received'):
-            _apply_response(conn, row, job, checkpoint, settings, context)
+            _apply_response(conn, row, job, checkpoint, settings, context, read_cache=read_cache)
             return
         window = checkpoint.get('window_job')
         if window and window['phase'] == 'collect':
-            _collect_window(conn, row, checkpoint, settings, context)
+            _collect_window(conn, row, checkpoint, settings, context, read_cache=read_cache)
             _save(conn, job, checkpoint, settings)
             return
         if checkpoint['pending_calls'] and not window:
@@ -827,24 +844,26 @@ def step(job, settings):
                             pages = [value for value in checkpoint['tool_results']
                                      if value.get('query_id') == cached_window['query_id']
                                      and value.get('query_ref', '').split('.')[1:2] == [str(row['id'])]]
-                            tools.validate_tool_results(conn, row['actor_id'], row, pages, settings, context)
+                            tools.validate_tool_results(conn, row['actor_id'], row, pages, settings, context,
+                                                        read_cache=read_cache)
                             _accept_tool(checkpoint, call, cached_window,
                                          model_result=cached_window['_window_model_result'], record_result=False)
                             checkpoint.setdefault('raw_window_calls', []).append(call['call_id'])
                             continue
                         checkpoint['window_job'] = windows.begin(call, args)
-                        _collect_window(conn, row, checkpoint, settings, context)
+                        _collect_window(conn, row, checkpoint, settings, context, read_cache=read_cache)
                         _save(conn, job, checkpoint, settings)
                         return
                     cache_key = json.dumps([call['name'], args], sort_keys=True, ensure_ascii=False)
                     cached = checkpoint.setdefault('tool_cache', {}).get(cache_key)
                     if cached is not None:
-                        tools.validate_tool_results(conn, row['actor_id'], row, [cached], settings, context)
+                        tools.validate_tool_results(conn, row['actor_id'], row, [cached], settings, context,
+                                                    read_cache=read_cache)
                         result = cached
                     else:
                         current_turn = {**row, 'checkpoint_ciphertext': codec.encode(checkpoint, settings)}
                         result = tools.execute(conn, row['actor_id'], current_turn,
-                                               call['name'], args, settings, context)
+                                               call['name'], args, settings, context, read_cache=read_cache)
                         if not result.get('waiting'):
                             checkpoint['tool_cache'][cache_key] = result
                 except (PermissionError, LookupError, ValueError) as exc:
@@ -878,21 +897,23 @@ def step(job, settings):
                          for result in checkpoint['tool_results'] if result.get('query_ref'))),
                      'draft_ref': next((result['draft_ref'] for result in reversed(checkpoint['tool_results'])
                                         if result.get('draft_ref')), None)}
-            tools.build_result(conn, row['actor_id'], row, final, settings, context, checkpoint['tool_results'])
+            tools.build_result(conn, row['actor_id'], row, final, settings, context, checkpoint['tool_results'],
+                               read_cache=read_cache)
             checkpoint['progress'] = ''
             _save(conn, job, checkpoint, settings, status='completed', final=final)
             return
         if not checkpoint['items']:
-            history, results = _history(conn, row, settings, context)
+            history, results = _history(conn, row, settings, context, read_cache=read_cache)
             checkpoint['tool_results'] = results
             checkpoint['followup_scope'] = json.loads(history[-1]['content']).get('scope', {}) if history else {}
             checkpoint['items'] = history + [{'role': 'user', 'content': json.dumps({
                 'context': context, 'question': codec.decode(row['input_ciphertext'], settings)['message'],
             }, ensure_ascii=False, default=str)}]
-        tools.validate_tool_results(conn, row['actor_id'], row, checkpoint['tool_results'], settings, context)
         cfg = _config(conn)
         if window:
             segment, allowed_refs = windows.summary_input(checkpoint, window)
+            tools.validate_tool_results(conn, row['actor_id'], row, windows.pages(checkpoint, window),
+                settings, context, read_cache=read_cache, message_refs=set(allowed_refs.values()))
             model_items = [{'role': 'user', 'content': windows.encoded(segment)}]
             model_instructions, model_tools = windows.SUMMARY_INSTRUCTIONS, []
             model_format = windows.summary_format(allowed_refs,
@@ -900,6 +921,8 @@ def step(job, settings):
             checkpoint['summary_request'] = True
             checkpoint['summary_steps'] = checkpoint.get('summary_steps', 0) + 1
         else:
+            tools.validate_tool_results(conn, row['actor_id'], row, checkpoint['tool_results'], settings, context,
+                                        read_cache=read_cache)
             model_items = checkpoint['items']
             model_instructions, model_tools, model_format = INSTRUCTIONS, tools.TOOLS, OUTPUT_FORMAT
             checkpoint['model_steps'] += 1
@@ -951,8 +974,9 @@ def step(job, settings):
             (codec.encode(checkpoint, settings), json.dumps(total), response.get('response_id'), row['id']))
     with connection() as conn, conn.transaction():
         row = _fence(conn, job)
-        context = _context(conn, row, checkpoint, settings)
-        _apply_response(conn, row, job, checkpoint, settings, context)
+        read_cache = {}
+        context = _context(conn, row, checkpoint, settings, read_cache=read_cache)
+        _apply_response(conn, row, job, checkpoint, settings, context, read_cache=read_cache)
 
 
 def run(job, settings):

@@ -2,7 +2,7 @@
 
 import re
 from contextlib import nullcontext
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
@@ -148,7 +148,8 @@ def test_text_export_zip_and_source_permissions(console, monkeypatch):
 
     calls = []
 
-    def stream(source_id, viewer_id, check_access):
+    def stream(source_id, viewer_id, check_access, *, consent_at):
+        assert consent_at == console.source['body_consent_at']
         calls.append((source_id, viewer_id))
         with message_export.ZipBuffer() as output:
             with ZipFile(output, 'w') as archive:
@@ -194,7 +195,7 @@ def test_text_export_zip_and_source_permissions(console, monkeypatch):
 
     # Whitespace-only stored text can pass EXISTS, but fails before any ZIP response starts.
     console.state['messages'] = ['stored whitespace']
-    def empty_stream(*_args):
+    def empty_stream(*_args, **_kwargs):
         raise ValueError('该人员暂无已同步且可导出的文字消息。')
         yield
     monkeypatch.setattr(message_export, 'stream_export', empty_stream)
@@ -323,6 +324,10 @@ def test_export_reads_all_consented_text_and_excludes_inaccessible_rows(pg, monk
     with pytest.raises(PermissionError):
         b''.join(message_export.stream_export(source, source, revoked))
     assert not pg.execute("SELECT name FROM pg_cursors WHERE name='message_export'").fetchall()
+    consent = pg.execute("SELECT body_consent_at FROM authorizations WHERE id=%s", (source,)).fetchone()
+    with pytest.raises(PermissionError):
+        b''.join(message_export.stream_export(source, source, lambda: None,
+            consent_at=consent['body_consent_at'] - timedelta(seconds=1)))
 
     from openpyxl.worksheet._writer import ALL_TEMP_FILES
     opened = list(ALL_TEMP_FILES)
@@ -494,6 +499,7 @@ def test_message_page_grantee_can_read_and_is_recorded_as_the_actual_viewer(cons
     assert "Safe &lt;script&gt;message&lt;/script&gt;" in response.text
     assert "&lt;Creator&gt;" in response.text
     assert console.contexts[-1]["selected_chat_in_page"] is True
+    assert console.calls["chat"] == []  # Directory already supplied the current, readable conversation.
     assert console.calls["messages"] == [(console.source["id"], console.chat["chat_id"], 1)]
     assert console.calls["audit"] == [(console.actor["id"], console.source["id"], console.chat["chat_id"])]
     assert response.headers["cache-control"] == "no-store, max-age=0"
@@ -554,6 +560,8 @@ def test_source_and_filter_forms_reset_dependent_selection_state(console):
     controls = _Controls(response.text)
     source_form = controls.forms["message-source-form"]["controls"]
     assert "user_id" in source_form
+    assert "data-ui-auto-submit" in source_form["user_id"]
+    assert '<button class="btn btn-primary text-nowrap" type="submit">切换人员</button>' in response.text
     assert not {"chat_id", "page", "conversation_page", "conversation_query", "conversation_type"} & source_form.keys()
     filter_form = controls.forms["conversation-filter-form"]["controls"]
     assert filter_form["user_id"]["value"] == str(console.source["id"])
@@ -590,6 +598,7 @@ def test_current_chat_outside_directory_page_remains_visible_and_is_explained(co
     response = _open(console, chat_id=console.chat["chat_id"], conversation_page=2)
     assert response.status_code == 200
     assert console.contexts[-1]["selected_chat_in_page"] is False
+    assert console.calls["chat"] == [(console.source["id"], console.chat["chat_id"])]
     assert "当前会话不在左侧本页" in response.text
     assert "Creator collaboration" in response.text and "Safe &lt;script&gt;message&lt;/script&gt;" in response.text
 
@@ -617,7 +626,8 @@ def test_chronological_content_is_grouped_by_date_and_names_the_selected_cm(cons
     ]
     assert re.search(r'message-console__message-meta">\s*<strong>Remi</strong>', response.text)
     assert not re.search(r'message-console__message-meta">\s*<strong>本人</strong>', response.text)
-    assert "本页按时间从早到晚" in response.text
+    assert "本页按时间从早到晚" not in response.text
+    assert 'id="message-latest">已到最新</div>' in response.text
 
 
 def test_time_navigation_labels_and_latest_anchor_match_the_page_direction(console):

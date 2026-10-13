@@ -116,20 +116,22 @@ class ZipBuffer(RawIOBase):
         super().close()
 
 
-def stream_export(source_id, viewer_id, check_access):
+def stream_export(source_id, viewer_id, check_access, *, consent_at=None):
     cipher = message_body_cipher(get_settings().token_encryption_key)
     with connection() as conn, conn.transaction(), ZipBuffer() as output:
         # XLSX is already compressed. Recompressing it adds CPU cost without useful savings.
         with ZipFile(output, "w", ZIP_STORED) as archive:
-            validate = yield from _write_export(conn, archive, output, source_id, viewer_id, cipher, check_access)
+            validate = yield from _write_export(conn, archive, output, source_id, viewer_id, cipher,
+                                              check_access, consent_at)
         for chunk in output.drain():
             validate()
             yield chunk
 
 
-def _write_export(conn, archive, output, source_id, viewer_id, cipher, check_access):
+def _write_export(conn, archive, output, source_id, viewer_id, cipher, check_access, consent_at):
     message_count = conversation_count = 0
-    source_consent = None
+    source_consent = consent_at
+    analyzed_count = 0
     conn.execute("""CREATE TEMP TABLE IF NOT EXISTS message_export_versions(
         chat_id text NOT NULL,message_id text NOT NULL,row_version text NOT NULL,version text NOT NULL,
         PRIMARY KEY(chat_id,message_id)) ON COMMIT DROP""")
@@ -233,7 +235,9 @@ def _write_export(conn, archive, output, source_id, viewer_id, cipher, check_acc
             written = write_conversation(archive, filename, text_rows(source_rows))
             message_count += written
             conversation_count += bool(written)
-            conn.execute("ANALYZE message_export_versions")
+            if message_count >= max(1, analyzed_count * 2):
+                conn.execute("ANALYZE message_export_versions")
+                analyzed_count = message_count
             for chunk in output.drain():
                 validate()
                 yield chunk

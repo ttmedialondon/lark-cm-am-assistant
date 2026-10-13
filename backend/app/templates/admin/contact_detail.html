@@ -6,7 +6,7 @@
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
     <div class="d-flex align-items-center mb-3"><div><div class="d-flex flex-wrap align-items-center gap-2"><h2 class="page-title mb-0">{% if contact.private_chat_url %}<a href="{{ contact.private_chat_url }}" target="_blank" rel="noopener noreferrer" title="在 Lark 中打开你与此人的私聊">{{ contact.display_name }}</a>{% else %}{{ contact.display_name }}{% endif %}</h2><span class="badge bg-{{ contact.category_badge }}-lt">{{ contact.category_label }}</span>{% for label in contact.confirmed_role_labels[1:] %}<span class="badge bg-secondary-lt">辅助：{{ label }}</span>{% endfor %}</div></div><a class="btn btn-outline-secondary ms-auto" href="/admin/contacts?{{ source_query }}">返回人员目录</a></div>
     <div class="card mb-4">
-      <div class="card-header"><div><h3 class="card-title mb-1">所属组织</h3><div class="text-secondary small">“Lark 租户关联”仅说明稳定身份与该组织租户相关，不自动等同于员工、机构负责人或达人归属。</div></div></div>
+      <div class="card-header"><h3 class="card-title">所属组织</h3></div>
       {% if organizations %}
       <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>组织</th><th>状态</th><th>关联关系</th><th>来源</th><th>最近同步</th></tr></thead><tbody>
         {% for organization in organizations %}<tr><td>{{ organization.canonical_name }}<div class="text-secondary small">{{ organization.organization_kind_label }}</div></td><td><span class="badge bg-{{ organization.status_badge }}-lt">{{ organization.status_label }}</span></td><td>{{ organization.relationship_label }}</td><td>{{ organization.source_label }}</td><td class="text-secondary">{{ organization.last_seen_at_label }}</td></tr>{% endfor %}
@@ -23,7 +23,7 @@
       </table></div>
     </div>
     {% if can_view_conversations %}<div class="card mb-4">
-      <div class="card-header"><div><h3 class="card-title mb-1">相关会话</h3><div class="text-secondary small">仅展示会话元数据和统计，不在此页读取消息正文。</div></div></div>
+      <div class="card-header"><h3 class="card-title">相关会话</h3></div>
       {% if conversations %}
       <div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>会话</th><th>类型</th><th>群成员</th><th>会话消息</th><th>该联系人发送</th><th>最近消息</th></tr></thead>
         <tbody>{% for conversation in conversations %}<tr><td><div class="d-flex flex-wrap align-items-center gap-2"><span>{{ conversation.name }}</span>{% if conversation.chat_mode != 'p2p' %}<span class="badge bg-{{ conversation.group_purpose_badge }}-lt">{{ conversation.group_purpose_label }}</span>{% endif %}</div></td><td>{{ conversation.chat_mode_label }}</td><td>{{ conversation.member_count_label }}</td><td>{{ conversation.message_count }}</td><td>{{ conversation.contact_message_count }}</td><td class="text-secondary">{{ conversation.last_message_at_label }}</td></tr>{% endfor %}</tbody>

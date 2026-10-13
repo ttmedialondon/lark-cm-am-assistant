@@ -15,7 +15,7 @@
           <input type="hidden" name="user_page" value="{{ user_page.page }}">
           <label class="form-label" for="message-user">聊天授权来源</label>
           <div class="message-console__source-actions">
-            <select class="form-select" id="message-user" name="user_id" required>
+            <select class="form-select" id="message-user" name="user_id" required data-ui-auto-submit>
               <option value="" disabled {% if not selected_user %}selected{% endif %}>选择一位人员</option>
               {% if selected_user and not selected_user_in_page %}<option value="{{ selected_user.id }}" selected>{{ selected_user.display_name }} · {{ source_label(selected_user) }}</option>{% endif %}
               {% for user in users %}<option value="{{ user.id }}" {% if selected_user and user.id == selected_user.id %}selected{% endif %}>{{ user.display_name }} · {{ source_label(user) }}</option>{% endfor %}
@@ -33,7 +33,7 @@
       <aside class="card message-console__directory" id="conversation-directory" aria-label="会话目录">
         <div class="message-console__directory-header">
           <h2 title="{{ selected_user.display_name }}">{{ selected_user.display_name }}</h2>
-          <p>按名称排序{% if conversation_page and conversation_page.total_count is not none %} · 共 {{ conversation_page.total_count }} 个结果{% endif %}</p>
+          {% if conversation_page and conversation_page.total_count is not none %}<p>{{ conversation_page.total_count }} 个会话</p>{% endif %}
         </div>
         {% if not source_unavailable_reason %}
         <form action="/admin/messages" method="get" class="message-console__filter-panel" id="conversation-filter-form" role="search">
@@ -48,7 +48,7 @@
           </div>
         </form>
         {% endif %}
-        {% if selected_chat and not selected_chat_in_page %}<div class="message-console__current-chat"><span>当前会话不在左侧本页</span><a href="#message-panel">{{ selected_chat.name }}</a><p>右侧仍保留正在阅读的记录。</p></div>{% endif %}
+        {% if selected_chat and not selected_chat_in_page %}<div class="message-console__current-chat"><span>当前会话不在左侧本页</span><a href="#message-panel">{{ selected_chat.name }}</a></div>{% endif %}
         {% if source_unavailable_reason %}
           <div class="message-console__directory-empty"><h3>来源暂不可用</h3><p>请在上方选择其他已完成正文授权的人员。</p></div>
         {% elif conversations %}
@@ -78,7 +78,7 @@
           </header>
           {% if content_page and content_page['items'] %}
           <div class="message-console__history">
-            <div class="message-console__history-info"><span>第 {{ message_page.page }}{% if message_page.total_pages %} / {{ message_page.total_pages }}{% endif %} 页</span><p>第 1 页是最近记录，本页按时间从早到晚。</p></div>
+            <div class="message-console__history-info"><span>第 {{ message_page.page }}{% if message_page.total_pages %} / {{ message_page.total_pages }}{% endif %} 页</span></div>
             <nav class="message-console__history-actions" aria-label="消息时间翻页">
               {% if message_page.previous_url %}<a class="btn btn-sm btn-outline-secondary" href="{{ message_page.previous_url }}">更新记录</a>{% else %}<span class="btn btn-sm btn-outline-secondary disabled" aria-disabled="true">更新记录</span>{% endif %}
               {% if message_page.next_url %}<a class="btn btn-sm btn-outline-secondary" href="{{ message_page.next_url }}">更早记录</a>{% else %}<span class="btn btn-sm btn-outline-secondary disabled" aria-disabled="true">更早记录</span>{% endif %}
@@ -93,7 +93,7 @@
                 <div class="message-console__message-body">{{ message.content }}</div>
               </article>
             {% endfor %}
-            <div class="message-console__latest-marker" id="message-latest">本页记录结束{% if message_page.page == 1 %} · 已到最近记录{% endif %}</div>
+            <div class="message-console__latest-marker" id="message-latest">{% if message_page.page == 1 %}已到最新{% else %}本页结束{% endif %}</div>
           </div>
           {% else %}<div class="message-console__detail-empty"><span class="message-console__empty-step">—</span><h2>暂无已存正文</h2><p>该会话在当前已同步、已授权的范围内没有已保存的正文，不代表原会话没有聊天记录。</p></div>{% endif %}
         {% else %}

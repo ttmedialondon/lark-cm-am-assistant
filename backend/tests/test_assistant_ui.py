@@ -141,13 +141,17 @@ const {chromium} = require('playwright');
   const browser = await chromium.launch({headless:true, channel:'chrome'});
   try {
     const page = await browser.newPage({viewport:{width:1280,height:900}});
-    const errors = [], posts = [], sourceReads = [], evidenceReads = [];
+    const errors = [], posts = [], sourceReads = [], evidenceReads = [], sessionReads = [], draftReads = [];
     const remiId='22222222-2222-4222-8222-222222222222';
     let view, html = input.html, failFirstPost = true, scopeReads=0, sessionGone=false, turnsEmpty=false;
     let holdEvidence=false, denyEvidence=false, evidenceStarted, olderTurns=[], newDraftMessages=false, selfReady=true;
     const pendingEvidence=[];
     const ownId=()=>html.match(/data-user-id="([^"]+)"/)[1];
     page.on('pageerror', error => errors.push(error.message));
+    page.on('request', request => {
+      if (request.url().includes('/assistant/sessions/')) sessionReads.push(request.url());
+      if (request.url().includes('/assistant/drafts/')) draftReads.push(request.url());
+    });
     await page.addInitScript(() => {
       window.sources = [];
       window.EventSource = class extends EventTarget {
@@ -321,8 +325,11 @@ const {chromium} = require('playwright');
     await page.locator('#oa-sources').waitFor({state:'hidden'});
     await page.getByRole('button',{name:'查看回复草稿',exact:true}).click();
     await page.locator('.oa-draft textarea').fill('Edited reply');
+    const sessionsBeforeCopy = sessionReads.length, draftsBeforeCopy = draftReads.length;
     await page.getByRole('button',{name:'复制回复',exact:true}).click();
     await page.waitForFunction(() => window.copied==='Edited reply');
+    assert.equal(sessionReads.length,sessionsBeforeCopy);
+    assert.equal(draftReads.length,draftsBeforeCopy+1);
     assert.equal(posts.length,2);
     await page.locator('#oa-reply-close').click();
     await page.reload(); await page.locator('#oa-launcher').click(); await page.locator('.oa-event').waitFor();

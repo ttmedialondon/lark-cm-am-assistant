@@ -130,6 +130,26 @@ def test_people_directory_all_contacts_current_policy_priority_and_unfiltered_pr
     pg.execute("INSERT INTO lark_identities(open_id,contact_id,display_name,avatar_url,last_seen_at) "
                "VALUES('ou_AI_old',%s,'Same Lark name',%s,NOW()-INTERVAL '1 day')",
                (people["AI"], avatar_host + "old.png"))
+    pg.execute("INSERT INTO lark_identities(open_id,contact_id,last_seen_at) "
+               "VALUES('ou_manual_old',%s,NOW()-INTERVAL '1 day')", (people["manual"],))
+    owner = uuid4()
+    pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,'directory_owner','fixture')",
+               (owner,))
+    for index in range(13):
+        chat = f"directory_{index:02}"
+        pg.execute("INSERT INTO chats(chat_id,name,chat_status,chat_mode) VALUES(%s,%s,%s,%s)",
+                   (chat, chat, 'dissolved' if index == 12 else 'normal', 'p2p' if index == 1 else 'group'))
+        if index == 0:
+            pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES(%s,'ou_manual')", (chat,))
+        elif index == 1:
+            pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id,p2p_counterpart_open_id) "
+                       "VALUES(%s,%s,'ou_manual_old')", (owner, chat))
+        else:
+            pg.execute("INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_create_time) "
+                       "VALUES(%s,'live',%s,NOW()-%s*INTERVAL '1 minute')",
+                       (chat, 'ou_manual_old' if index % 2 == 0 else 'ou_manual', index))
+            pg.execute("INSERT INTO chat_messages(chat_id,message_id,sender_open_id,is_deleted,message_create_time) "
+                       "VALUES(%s,'deleted','ou_manual',TRUE,NOW()+INTERVAL '1 day')", (chat,))
     directory = admin_reporting.contacts()
     by_name = {row["display_name"]: row for row in directory["items"]}
     assert directory["total_count"] == 8 and by_name["orphan"]["open_id"] is None
@@ -138,6 +158,16 @@ def test_people_directory_all_contacts_current_policy_priority_and_unfiltered_pr
     assert by_name["AI"]["open_id"] == "ou_AI" and by_name["AI"]["avatar_url"] == avatar_host + "AI.png"
     assert by_name["AI"]["lark_identity_count"] == 2
     assert by_name["manual"]["category"] == "merchant_contact"
+    assert by_name["manual"]["conversation_count"] == 13 and by_name["manual"]["message_count"] == 11
+    details = admin_reporting.contact_detail("ou_manual")
+    assert details["conversations"]["total_count"] == 12
+    assert [row["chat_id"] for row in details["conversations"]["items"]] == [
+        f"directory_{index:02}" for index in range(2, 12)]
+    assert all(row["message_count"] == row["contact_message_count"] == 1
+               for row in details["conversations"]["items"])
+    last = admin_reporting.contact_detail("ou_manual", conversation_page=99)["conversations"]
+    assert last["page"] == 2 and [row["chat_id"] for row in last["items"]] == ["directory_00", "directory_01"]
+    assert all(row["message_count"] == row["contact_message_count"] == 0 for row in last["items"])
     assert by_name["internal"]["classification_source_label"] == "已核实同事"
     assert by_name["old"]["category"] == by_name["low"]["category"] == "unclassified"
     summary = directory["identity_summary"]
@@ -331,6 +361,16 @@ def test_personnel_counts_preserve_deleted_hidden_and_paginated_scope(pg, monkey
         assert user["message_count"] == user["own_message_count"] == 10
     assert detail["conversations"]["total_count"] == 10
     assert all(chat["message_count"] == 1 for chat in detail["conversations"]["items"])
+    groups = admin_reporting.chats()
+    assert groups["total_count"] == 11
+    by_chat = {row["chat_id"]: row for row in groups["items"]}
+    assert all(row["message_count"] == 1 for row in groups["items"])
+    assert by_chat["reporting_00"]["visible_authorization_count"] == 1
+    assert by_chat["reporting_10"]["visible_authorization_count"] == 0
+    monkeypatch.setattr(admin_reporting, "runtime_settings", lambda: ())
+    metrics = {metric["label"]: metric["value"] for metric in admin_reporting.overview()["metrics"]}
+    assert metrics["去重后的群聊"] == 11 and metrics["人员—会话关系"] == 10
+    assert metrics["去重后消息索引"] == 12 and metrics["已加密保存正文"] == 0
     assert admin_reporting.users(query="missing")["items"] == []
     other = uuid4()
     pg.execute("INSERT INTO authorizations(id,open_id,display_name,access_token_ciphertext) "

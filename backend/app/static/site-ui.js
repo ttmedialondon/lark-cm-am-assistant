@@ -2,6 +2,13 @@
 
 (() => {
   const navigating = () => { document.documentElement.dataset.uiNavigating = "true"; };
+  for (const control of document.querySelectorAll("[data-ui-auto-submit]")) {
+    const form = control.form;
+    if (!form || typeof form.requestSubmit !== "function") continue;
+    const button = form.querySelector('button[type="submit"]');
+    if (button) button.hidden = true;
+    control.addEventListener("change", () => form.requestSubmit(button));
+  }
   document.addEventListener("click", event => {
     const link = event.target.closest?.("a[href]");
     if (!link || event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey

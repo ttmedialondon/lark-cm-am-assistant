@@ -50,7 +50,8 @@ def page_data(actor_id, cm_id=None, tab="", query="", page=1, sort="importance",
                 AND NOT EXISTS(SELECT 1 FROM creator_account_assignments a
                     WHERE a.contact_id=c.id AND a.ended_at IS NULL)"""
             args = []
-        confirmed = conn.execute("SELECT count(*) n " + formal_base, args).fetchone()["n"]
+        confirmed = (conn.execute("SELECT count(*) n " + formal_base, args).fetchone()["n"]
+                     if not query and (not tier or not can_view_importance) else None)
         can_view_profiles = "contacts" in admin_permissions.permission_keys_for(actor_id)
         order = "c.display_name,c.id"
         if can_view_importance:

@@ -536,7 +536,11 @@ test("grades are sorted and filters/search/evidence work without writes", async 
   assert(await page.locator("#oh-analysis-spinner").isVisible());
   assert.equal(await page.locator("#oh-analysis-spinner").evaluate(element => getComputedStyle(element).animationName), "ui-spin");
   assert.equal(await page.locator('a[href^="/admin/"]').count(), 0);
-  assert((await page.locator("#oh-status-title").textContent()).includes("部分结果"));
+  assert.equal(await page.locator("#oh-status-title").textContent(), "正在整理");
+  assert.equal(await page.locator('#oh-selection select[name="cm_id"]').count(), 0);
+  assert.equal(await page.locator('#oh-selection input[name="cm_id"]').inputValue(), "remi-id");
+  assert(!(await page.locator("#oh-issues").evaluate(element => element.open)));
+  assert(!(await page.locator("#oh-status-description").textContent()).includes("分析任务"));
   assert.equal(await page.locator("#oh-gaps").count(), 0);
   await page.locator('.oh-filter[data-priority="P0"]').click();
   assert.equal(await page.locator(".oh-event").count(), 1);
@@ -607,10 +611,10 @@ test("an ended window with sync gaps is incomplete, not described as still in th
   data.run.status = "completed";
   data.run.counts = {queued: 0, running: 0, completed: 5, failed: 0};
   const {page, errors} = await fixture(t, data);
-  assert.equal(await page.locator("#oh-status-title").textContent(), "当前为部分结果 · 尚有资料缺口");
+  assert.equal(await page.locator("#oh-status-title").textContent(), "部分结果待更新");
   assert(!(await page.locator("#oh-analysis-spinner").isVisible()));
   const description = await page.locator("#oh-status-description").textContent();
-  assert(description.includes("已完成 5 / 5"));
+  assert(description.includes("部分消息暂未纳入"));
   assert(!description.includes("尚未到时段结束时间"));
   assert.deepEqual(errors, []);
 });
@@ -801,12 +805,12 @@ test("each summary selector navigates immediately without a submit button", asyn
 });
 
 
-test("reply drafts preserve edits, translate before copying, and block stale or revoked suggestions", async t => {
+test("reply drafts copy edits without auto translation, warn on new messages and block changed or revoked sources", async t => {
   const {page, errors} = await fixture(t, report({events: [event("P1", {
     replied_by: ["Shang Ma"], reply_evidence_refs: ["M2"],
   })]}));
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
-  let edited = "", stale = false, revoked = false, releaseGenerate;
+  let edited = "", stale = false, revoked = false, translationFailed = false, releaseGenerate;
   const generateGate = new Promise(resolve => { releaseGenerate = resolve; });
   const posted = [];
   await page.route("**/dashboard/offhours-summary/replies**", async route => {
@@ -815,11 +819,13 @@ test("reply drafts preserve edits, translate before copying, and block stale or 
     if (req.method() === "POST") {
       const body = req.postDataJSON(); posted.push(body);
       assert.equal(req.headers()["x-csrf-token"], "fixture-csrf");
+      if (body.parent_id && translationFailed) return route.fulfill({status: 503, json: {error: "翻译暂时不可用。"}});
       if (body.parent_id) edited = body.text;
       else await generateGate;
       return route.fulfill({status: 202, json: {id: body.parent_id ? "translation" : "draft", status: "queued"}});
     }
-    if (stale) return route.fulfill({json: {status: "stale", error: "收到新消息，请重新生成建议。"}});
+    if (stale) return route.fulfill({json: {status: "stale", error: "资料已变化，请重新生成建议。",
+      ...(stale === "new_messages" ? {reason_code: "new_messages"} : {})}});
     const translation = req.url().includes("/translation?");
     return route.fulfill({json: {status: "succeeded", result: translation
       ? {draft: edited, chinese_translation: "修改后的中文翻译，金额仍为 £200。"}
@@ -834,8 +840,11 @@ test("reply drafts preserve edits, translate before copying, and block stale or 
   await editor.waitFor({state: "visible"});
   const newText = "Hi lovely, I can check that £200 payment with you. I have the order number already, so you do not need to resend it.";
   await editor.fill(newText);
-  assert(await page.getByRole("button", {name: "复制回复", exact: true}).isDisabled());
+  assert(await page.getByRole("button", {name: "复制回复", exact: true}).isEnabled());
   assert(!(await page.locator(".oh-reply-translation").textContent()).includes("请确认对应哪笔订单"));
+  await page.waitForTimeout(1700);
+  assert.equal(posted.length, 1);
+  await page.getByRole("button", {name: "更新中文翻译", exact: true}).click();
   await page.getByText("修改后的中文翻译，金额仍为 £200。", {exact: true}).waitFor();
   await page.getByRole("button", {name: "刷新", exact: true}).click();
   assert.equal(await editor.inputValue(), newText);
@@ -856,22 +865,35 @@ test("reply drafts preserve edits, translate before copying, and block stale or 
   assert.equal(await page.evaluate(() => navigator.clipboard.readText()), newText);
   assert.equal(await page.locator(".oh-handling").textContent(), "未解决");
   assert.equal(await page.locator(".oh-replied").textContent(), "Shang Ma 已回复");
-  stale = true;
+  translationFailed = true;
+  await page.getByRole("button", {name: "更新中文翻译", exact: true}).click();
+  await page.getByText("翻译暂时不可用。", {exact: true}).waitFor();
+  assert(await page.getByRole("button", {name: "复制回复", exact: true}).isEnabled());
+  assert.equal(await page.getByRole("button", {name: "更新中文翻译", exact: true}).getAttribute("aria-busy"), null);
+  assert.equal(await editor.inputValue(), newText);
+  stale = "new_messages";
   await page.getByRole("button", {name: "复制回复", exact: true}).click();
-  await page.getByText("收到新消息，请重新生成建议。", {exact: true}).waitFor();
+  await page.getByText("已复制。聊天有新消息，请核对后发送。", {exact: true}).waitFor();
+  assert(await page.getByRole("button", {name: "复制回复", exact: true}).isEnabled());
+  assert.equal(await page.evaluate(() => navigator.clipboard.readText()), newText);
+  stale = "changed";
+  await page.getByRole("button", {name: "复制回复", exact: true}).click();
+  await page.getByText("资料已变化，请重新生成建议。", {exact: true}).waitFor();
   assert(await page.getByRole("button", {name: "复制回复", exact: true}).isDisabled());
   revoked = true;
   await page.getByRole("button", {name: "重新生成", exact: true}).click();
   await page.waitForFunction(() => document.querySelectorAll(".oh-event").length === 0);
-  assert.equal(posted.length, 2);
+  assert.equal(posted.length, 3);
   assert.deepEqual(errors, []);
 });
 
 test("broadcast waiting states preserve selections and drafts after request failures", async t => {
   const actor = "11111111-1111-4111-8111-111111111111";
   const other = "22222222-2222-4222-8222-222222222222";
+  const personalList = {id: "list-existing", name: "Fixture saved groups", purpose: "category", cm_id: actor,
+    mention: true, revision: 1, target_count: 1};
   const data = {can_select_cm: true, selected_cm_id: actor, cms: [{id: actor, name: "CM"}, {id: other, name: "Other CM"}],
-    purposes: {support: "客服群", category: "类目群"}, lists: [], templates: []};
+    purposes: {support: "客服群", category: "类目群"}, lists: [personalList], templates: []};
   const rendered = spawnSync(path.join(backend, ".venv/bin/python"), ["-c",
     "import json,sys; from jinja2 import Environment,FileSystemLoader,select_autoescape; data=json.load(sys.stdin); print(Environment(loader=FileSystemLoader('app/templates'),autoescape=select_autoescape()).get_template('creator_broadcast.html').render(authorization={'id':data['selected_cm_id'],'display_name':'CM'},broadcast_data=data,csrf_token='fixture-csrf'))"],
     {cwd: backend, input: JSON.stringify(data), encoding: "utf8"});
@@ -891,7 +913,10 @@ test("broadcast waiting states preserve selections and drafts after request fail
   const permissions = hold("permissions");
   await page.route("**/*", async route => {
     const req = route.request(), url = new URL(req.url());
-    if (url.origin !== "http://localhost") return route.abort();
+    if (url.origin !== "http://localhost") {
+      if (process.env.OH_SCREENSHOT_DIR && url.href.endsWith("/tabler.min.css")) return route.continue();
+      return route.abort();
+    }
     if (url.pathname === "/creators/broadcast") return route.fulfill({contentType: "text/html", body: rendered.stdout});
     if (url.pathname.startsWith("/static/")) return route.fulfill({
       contentType: /\.(m?js)$/.test(url.pathname) ? "text/javascript" : "text/css",
@@ -999,16 +1024,21 @@ test("broadcast waiting states preserve selections and drafts after request fail
   await page.locator("#broadcast-permission-retry").click(); await ready.arrived;
   ready.release({json: {status: "ready", feature_enabled: true, account_name: "CM", is_self: true, is_sender: true}});
   await page.waitForFunction(() => document.getElementById("broadcast-permission-status").textContent === "本人发送已就绪");
-  const preview = hold("preview");
-  await page.locator("#broadcast-preview").click(); await preview.arrived; preview.release({json: previewResult});
-  await page.locator("#broadcast-send").waitFor({state: "visible"});
   const preparing = hold("prepare");
-  await page.locator("#broadcast-send").click(); await preparing.arrived;
+  await page.locator("#broadcast-preview").click(); await preparing.arrived;
+  assert.equal(await page.locator("#broadcast-preview").getAttribute("aria-busy"), "true");
   assert.equal(calls.filter(call => call.action === "send").length, 0);
   preparing.release({json: {...previewResult, preview_id: "preview-1", account_name: "CM", expires_at: "2030-01-01T00:00:00Z"}});
   await page.waitForFunction(() => document.getElementById("broadcast-send").textContent === "确认发送 1 个群");
-  assert((await page.locator("#broadcast-confirm-state").textContent()).includes("发送前逐群检查权限"));
+  assert.equal(await page.locator("#broadcast-confirm-state").textContent(), "以 CM 本人身份发送");
   assert.equal(calls.filter(call => call.action === "send").length, 0);
+  if (process.env.OH_SCREENSHOT_DIR) {
+    await page.screenshot({path: path.join(process.env.OH_SCREENSHOT_DIR, "broadcast-single-confirm.png")});
+    await page.setViewportSize({width: 390, height: 844});
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    await page.screenshot({path: path.join(process.env.OH_SCREENSHOT_DIR, "broadcast-single-confirm-mobile.png")});
+    await page.setViewportSize({width: 1360, height: 1000});
+  }
 
   const failedSend = hold("send");
   await page.locator("#broadcast-send").click(); await failedSend.arrived;
@@ -1058,13 +1088,99 @@ test("broadcast waiting states preserve selections and drafts after request fail
   assert.equal(calls.filter(call => call.action.endsWith("/retry")).length, 1);
   assert.equal(calls.filter(call => call.action.endsWith("/cancel")).length, 1);
   await page.locator("#broadcast-batch-close").click();
-  const ownPermission = hold("permissions"), otherGroups = hold("groups");
-  await page.locator("#broadcast-cm").selectOption(other); await ownPermission.arrived;
+  const permissionCalls = calls.filter(call => call.action === "permissions").length;
+  await page.locator("#broadcast-list-library").click();
+  await page.locator("#broadcast-library-items").getByRole("button", {name: "使用名单 Fixture saved groups", exact: true}).click();
+  const loadingList = hold("lists/load");
+  await page.locator("#broadcast-list-action-proceed").click(); await loadingList.arrived;
+  loadingList.release({json: {...groupResult, entries: [], mode: "groups", purpose: "category", selected_cm_id: actor,
+    selected_chat_ids: ["oc_category"], list: {...personalList, targets: [{chat_id: "oc_category"}], snapshot: {mode: "groups"}}}});
+  await page.waitForFunction(() => !document.getElementById("broadcast-list-action-dialog").open);
+  assert.equal(calls.filter(call => call.action === "permissions").length, permissionCalls);
+  assert(await selected.isChecked());
+  assert.equal(await page.locator("#broadcast-message").inputValue(), message);
+  const otherGroups = hold("groups");
+  await page.locator("#broadcast-cm").selectOption(other);
   assert.equal(await page.locator("#broadcast-permission-account").textContent(), "发送账号：CM");
-  ownPermission.release({json: {status: "ready", feature_enabled: true, account_name: "CM", is_self: true, is_sender: true}});
   await otherGroups.arrived; otherGroups.release({json: groupResult});
   await page.waitForFunction(() => document.getElementById("broadcast-group-items").getAttribute("aria-busy") === "false");
   assert.equal(await page.locator("#broadcast-permission-account").textContent(), "发送账号：CM");
   assert(await page.locator("#broadcast-send").isDisabled());
+  assert.equal(calls.filter(call => call.action === "permissions").length, permissionCalls);
+  await selected.check();
+  const otherPreview = hold("preview");
+  await page.locator("#broadcast-preview").click(); await otherPreview.arrived;
+  otherPreview.release({json: previewResult});
+  await page.locator("#broadcast-confirm").waitFor({state: "visible"});
+  assert(await page.locator("#broadcast-send").isDisabled());
+  assert.equal(calls.filter(call => call.action === "prepare").length, 1);
+  assert.deepEqual(errors, []);
+});
+
+test("admin source selection resets filters and contact names open the profile with a separate Lark link", async t => {
+  const rendered = spawnSync(path.join(backend, ".venv/bin/python"), ["-c", `
+import json
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+from app import admin_permissions, admin_reporting
+env = Environment(loader=FileSystemLoader('app/templates'), autoescape=select_autoescape())
+common = dict(authorization={'display_name':'Fixture owner'}, admin_role='owner',
+              admin_permissions=['messages','contacts'], permission_pages=admin_permissions.PAGES,
+              admin_landing_path='/admin', csrf_token='fixture-csrf')
+sources = [dict(id='cm-one',display_name='CM One',content_access_label='可读取'),
+           dict(id='cm-two',display_name='CM Two',content_access_label='可读取')]
+messages = env.get_template('admin/messages.html').render(**common,active_page='messages',
+    users=sources,selected_user=sources[0],selected_user_in_page=True,selected_chat=None,
+    user_page={'page':1},conversation_page={'total_count':0},conversations=[],
+    conversation_query='previous filter',conversation_type='group',content_page=None,
+    clear_conversation_filters_url='/admin/messages?user_id=cm-one')
+person = admin_reporting._decorate_contact(dict(open_id='ou_fixture',display_name='Fixture <Creator>',
+    category='creator',handles=['fixture.creator'],conversation_count=2,message_count=5,lark_identity_count=1))
+contacts = env.get_template('admin/contacts.html').render(**common,active_page='contacts',
+    contacts=[person],contact_page={'page':2},category='creator',q='Fixture',
+    name_query_param='q=Fixture',category_filters=[],refresh_url='/admin/contacts')
+print(json.dumps(dict(messages=messages,contacts=contacts)))
+`], {cwd: backend, encoding: "utf8"});
+  assert.equal(rendered.status, 0, rendered.stderr);
+  const html = JSON.parse(rendered.stdout);
+  const browser = await chromium.launch({headless: true, channel: "chrome"});
+  t.after(() => browser.close());
+  const errors = [], calls = [];
+  const route = async route => {
+    const url = new URL(route.request().url());
+    if (url.origin !== "http://localhost") {
+      if (process.env.OH_SCREENSHOT_DIR && url.href.endsWith("/tabler.min.css")) return route.continue();
+      return route.abort();
+    }
+    if (url.pathname.startsWith("/static/")) return route.fulfill({contentType: url.pathname.endsWith(".js") ? "text/javascript" : url.pathname.endsWith(".svg") ? "image/svg+xml" : "text/css",
+      body: fs.readFileSync(path.join(backend, "app", url.pathname))});
+    calls.push({method: route.request().method(), url});
+    return route.fulfill({contentType: "text/html", body: url.pathname === "/admin/contacts" ? html.contacts : html.messages});
+  };
+  const context = await browser.newContext({viewport: {width: 1360, height: 1000}});
+  await context.route("**/*", route);
+  const page = await context.newPage(); page.on("pageerror", error => errors.push(error.message));
+  await page.goto("http://localhost/admin/messages?chat_id=old&page=3&conversation_query=old");
+  assert(await page.getByRole("button", {name: "切换人员", exact: true}).isHidden());
+  await page.locator("#message-user").selectOption("cm-two");
+  await page.waitForURL(url => url.searchParams.get("user_id") === "cm-two");
+  assert.deepEqual([...new URL(page.url()).searchParams.entries()], [["user_page", "1"], ["user_id", "cm-two"]]);
+  assert.equal(calls.at(-1).method, "GET");
+  if (process.env.OH_SCREENSHOT_DIR) await page.screenshot({path: path.join(process.env.OH_SCREENSHOT_DIR, "admin-messages.png"), fullPage: true});
+  await page.goto("http://localhost/admin/contacts");
+  const person = page.locator("tbody tr").first();
+  assert.equal(await person.getByRole("link", {name: "Fixture <Creator>", exact: true}).getAttribute("href"),
+    "/admin/contacts/ou_fixture?page=2&category=creator&q=Fixture");
+  const external = person.getByRole("link", {name: "在 Lark 中打开与 Fixture <Creator> 的私聊", exact: true});
+  assert.equal(await external.getAttribute("target"), "_blank");
+  assert.equal(await external.getAttribute("rel"), "noopener noreferrer");
+  assert((await external.getAttribute("href")).startsWith("https://applink.larksuite.com/"));
+  assert.equal(await person.locator("script").count(), 0);
+  if (process.env.OH_SCREENSHOT_DIR) await page.screenshot({path: path.join(process.env.OH_SCREENSHOT_DIR, "admin-contacts.png"), fullPage: true});
+  const noJs = await browser.newContext({javaScriptEnabled: false}); await noJs.route("**/*", route);
+  const fallback = await noJs.newPage(); await fallback.goto("http://localhost/admin/messages");
+  assert(await fallback.getByRole("button", {name: "切换人员", exact: true}).isVisible());
+  await fallback.locator("#message-user").selectOption("cm-two");
+  await fallback.getByRole("button", {name: "切换人员", exact: true}).click();
+  await fallback.waitForURL(url => url.searchParams.get("user_id") === "cm-two");
   assert.deepEqual(errors, []);
 });

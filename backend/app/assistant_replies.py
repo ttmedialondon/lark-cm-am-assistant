@@ -24,13 +24,13 @@ outcome=ready 有可人工核对发送的草稿；outcome=verify 仅用于确实
 生成、复制和打开 Lark 都不是发送，不修改事件状态。""" + REPLY_STYLE_INSTRUCTIONS
 
 
-def material(conn, actor_id, context, source, settings, *, cutoff=None):
+def material(conn, actor_id, context, source, settings, *, cutoff=None, read_cache=None):
     cutoff = cutoff or datetime.now(UTC)
     if isinstance(cutoff, str):
         cutoff = datetime.fromisoformat(cutoff)
     if source["kind"] == "message":
         data = assistant_search.read(conn, actor_id, context, {"message_ref": source["source"]},
-                                     settings, cutoff=cutoff)
+                                     settings, cutoff=cutoff, read_cache=read_cache)
         target = data["message"]
         text = target.get("text", "").replace("[未解析的@用户]", "").strip()
         if not text or text in {"[附件或正文不可读取，需人工查看原消息]", "[正文不可读取，需人工查看原消息]"}:
@@ -71,8 +71,8 @@ def material(conn, actor_id, context, source, settings, *, cutoff=None):
             gaps.append({"reason": "仅提供当前事项原证据和有界近期上下文，不是全量会话"})
         title = event["title"]
         scope = context["scope"]
-    cm, _ = summaries._authorize(conn, actor_id, cm_id=UUID(context["scope"]["cm_id"]))
-    staff = summaries._staff(conn, cm)
+    cm = assistant_search.authorize_all(conn, actor_id, context["scope"]["cm_id"], read_cache=read_cache)
+    staff = summaries._staff(conn, cm, read_cache=read_cache)
     ids = list({item.get("message_id") for item in messages if item.get("message_id")})
     speakers = {row["message_id"]: row["sender_open_id"] for row in conn.execute(
         "SELECT message_id,sender_open_id FROM chat_messages WHERE message_id=ANY(%s::text[])",

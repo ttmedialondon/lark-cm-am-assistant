@@ -63,22 +63,37 @@ def _audience(value):
     return value
 
 
-def authorize_all(conn, actor_id, cm_id):
-    cm, owner = core._authorize(conn, actor_id, cm_id=cm_id)
+def authorize_all(conn, actor_id, cm_id, *, read_cache=None):
+    cm, owner = core._authorize(conn, actor_id, cm_id=cm_id, read_cache=read_cache)
     if not owner and UUID(str(actor_id)) != cm["id"]:
         raise PermissionError("运营助手只允许本人或 Owner 查看该 CM 的聊天。")
     return cm
 
 
-def _scope(conn, actor_id, context, creator_ids, chat_ids, settings, audience="creators"):
+def creator_roster(conn, cm_id, *, read_cache=None):
+    key = ("assistant-roster", str(cm_id))
+    if read_cache is None:
+        return core._roster(conn, cm_id)
+    if key not in read_cache:
+        read_cache[key] = core._roster(conn, cm_id)
+    return read_cache[key]
+
+
+def _scope(conn, actor_id, context, creator_ids, chat_ids, settings, audience="creators", *, read_cache=None):
     actor_id = UUID(str(actor_id))
     cm_id = UUID(context["scope"]["cm_id"])
-    cm = authorize_all(conn, actor_id, cm_id)
+    cm = authorize_all(conn, actor_id, cm_id, read_cache=read_cache)
     if audience == "all":
-        chats = conn.execute(_CHAT_SQL + " ORDER BY c.chat_id", (cm_id,)).fetchall()
+        key = ("assistant-chats", str(cm_id))
+        if read_cache is None or key not in read_cache:
+            chats = conn.execute(_CHAT_SQL + " ORDER BY c.chat_id", (cm_id,)).fetchall()
+            if read_cache is not None:
+                read_cache[key] = chats
+        else:
+            chats = read_cache[key]
         roster, speakers, selected = [], None, None
     else:
-        roster = core._roster(conn, cm_id)
+        roster = creator_roster(conn, cm_id, read_cache=read_cache)
         current = context["scope"].get("creator_ids")
         selected = creator_ids if creator_ids is not None else current
         visible = {str(row["contact_id"]) for row in roster}
@@ -213,21 +228,22 @@ def _scope_version(cm, roster, chats, selected, audience="creators"):
                       sorted(chat["chat_id"] for chat in chats)])
 
 
-def query(conn, actor_id, context, args, settings):
+def query(conn, actor_id, context, args, settings, *, read_cache=None):
     terms = args.get("query")
     if (not isinstance(terms, list) or not 1 <= len(terms) <= 8
             or not all(isinstance(term, str) and term.strip() and len(term) <= 256 for term in terms)):
         raise ValueError("请提供一至八个有效检索词。")
     terms = list(dict.fromkeys(term.strip() for term in terms))
-    return _collect(conn, actor_id, context, args, settings, terms=terms)
+    return _collect(conn, actor_id, context, args, settings, terms=terms, read_cache=read_cache)
 
 
-def window_messages(conn, actor_id, context, args, settings):
+def window_messages(conn, actor_id, context, args, settings, *, read_cache=None, window_counts=None):
     """Read every permitted sender; page and body limits are explicit, not sampling."""
-    return _collect(conn, actor_id, context, args, settings, terms=None)
+    return _collect(conn, actor_id, context, args, settings, terms=None, read_cache=read_cache,
+                    window_counts=window_counts)
 
 
-def _collect(conn, actor_id, context, args, settings, *, terms):
+def _collect(conn, actor_id, context, args, settings, *, terms, read_cache=None, window_counts=None):
     audience = _audience(args.get("audience", "all"))
     kind = "window_messages" if terms is None else "messages"
     page_size = WINDOW_PAGE_SIZE if terms is None else PAGE_SIZE
@@ -236,7 +252,8 @@ def _collect(conn, actor_id, context, args, settings, *, terms):
     if start >= end:
         raise ValueError("检索结束时间必须晚于开始时间。")
     cm, roster, chats, speakers, selected = _scope(
-        conn, actor_id, context, args.get("creator_ids"), args.get("chat_ids"), settings, audience)
+        conn, actor_id, context, args.get("creator_ids"), args.get("chat_ids"), settings, audience,
+        read_cache=read_cache)
     by_chat = {chat["chat_id"]: chat for chat in chats}
     scope_version = _scope_version(cm, roster, chats, selected, audience)
     signature = core._hash([str(actor_id), scope_version, start, end,
@@ -314,17 +331,19 @@ def _collect(conn, actor_id, context, args, settings, *, terms):
                               "s.", settings),
             "next_cursor": _seal({"signature": signature, "after": after}, "c.", settings) if more else None}
     if terms is None:
-        result.update(_totals(conn, cm["id"], sorted(by_chat), start, end, speakers),
+        result.update(window_counts if window_counts is not None else
+                      _totals(conn, cm["id"], sorted(by_chat), start, end, speakers),
                       returned=len(messages), counts_scope="window_total")
     return result
 
 
-def validate_result(conn, actor_id, context, result, settings, *, history_only=False):
+def validate_result(conn, actor_id, context, result, settings, *, history_only=False, read_cache=None):
     """Recheck at most one page of hits, never rerun a negative full-text scan."""
     if result.get("kind") == "message_context":
         fresh = read(conn, actor_id, context, {"message_ref": result.get("message_ref"), "mode": result.get("mode")},
                      settings,
-                     cutoff=_time(result["checked_at"]) if result.get("checked_at") else None)
+                     cutoff=_time(result["checked_at"]) if result.get("checked_at") else None,
+                     read_cache=read_cache)
         if "audience" not in result.get("scope", {}):
             fresh["scope"].pop("audience", None)
         fields = ("message", "messages", "window", "scope")
@@ -348,7 +367,8 @@ def validate_result(conn, actor_id, context, result, settings, *, history_only=F
         raise PermissionError("检索结果不属于当前账号或范围。")
     audience = _audience(value.get("audience", "creators"))
     cm, roster, chats, speakers, selected = _scope(
-        conn, actor_id, context, value.get("creator_ids"), value.get("chat_ids"), settings, audience)
+        conn, actor_id, context, value.get("creator_ids"), value.get("chat_ids"), settings, audience,
+        read_cache=read_cache)
     frozen = (result.get("kind") == "window_messages" and audience == "all"
               and result.get("_collection_complete") is True)
     if frozen:
@@ -367,14 +387,13 @@ def validate_result(conn, actor_id, context, result, settings, *, history_only=F
         totals = _totals(conn, cm["id"], sorted(by_chat), start, end, speakers)
         if any(result.get(key) != count for key, count in totals.items()):
             raise ValueError("时段消息数量已变化，请重新读取。")
-    for message in messages:
-        ref = _open(message.get("message_ref"), "m.", settings)
+    references = [_open(message.get("message_ref"), "m.", settings) for message in messages]
+    for ref in references:
         if (ref.get("actor_id") != str(actor_id) or ref.get("cm_id") != str(cm["id"])
                 or ref.get("audience", "creators") != audience
                 or ref.get("chat_id") not in by_chat or ref.get("consent_at") != cm["body_consent_at"].isoformat()
                 or _time(ref.get("start")) != start or _time(ref.get("end")) != end):
             raise PermissionError("消息引用不属于当前检索范围。")
-    references = [_open(message.get("message_ref"), "m.", settings) for message in messages]
     rows = _rows(conn, cm["id"], sorted({ref["chat_id"] for ref in references}), start, end, speakers,
                  limit=len(references), extra=" AND m.message_id=ANY(%s::text[])",
                  extra_args=([ref["message_id"] for ref in references],)) if references else []
@@ -392,7 +411,7 @@ def validate_result(conn, actor_id, context, result, settings, *, history_only=F
                          "source_complete": (bool(chats) or audience == "all") and not gaps}}
 
 
-def read(conn, actor_id, context, args, settings, *, cutoff=None):
+def read(conn, actor_id, context, args, settings, *, cutoff=None, read_cache=None):
     mode = args.get("mode") or "period"
     if mode not in {"period", "latest"}:
         raise ValueError("请选择原时段或最新进展。")
@@ -413,7 +432,8 @@ def read(conn, actor_id, context, args, settings, *, cutoff=None):
         cutoff = cutoff.astimezone(UTC)
     read_end = max(end, cutoff) if cutoff else end
     cm, _roster, chats, speakers, _selected = _scope(
-        conn, actor_id, context, value.get("creator_ids"), [value.get("chat_id")], settings, audience)
+        conn, actor_id, context, value.get("creator_ids"), [value.get("chat_id")], settings, audience,
+        read_cache=read_cache)
     if start >= end or not chats:
         raise ValueError("消息引用无效。")
     if value.get("consent_at") != cm["body_consent_at"].isoformat():

@@ -7,13 +7,13 @@
   <main class="container-xl oh-main" id="offhours-summary">
     <header class="oh-heading business-heading"><div><h1>消息总结</h1></div><div class="oh-actions">{% if summary_data.can_manage %}<a class="btn btn-outline-secondary" href="/admin/ai#offhours-summary">分析设置</a>{% endif %}<button class="btn btn-outline-primary" id="oh-refresh" type="button">刷新</button></div></header>
     <form id="oh-selection" method="get" class="oh-context" aria-label="选择总结时段">
-      <label>负责人<select name="cm_id" class="form-select">{% for cm in summary_data.selection.cms %}<option value="{{ cm.id }}"{% if cm.id == summary_data.responsible.id %} selected{% endif %}>{{ cm.name }}</option>{% endfor %}</select></label>
+      {% if summary_data.selection.cms|length > 1 %}<label>负责人<select name="cm_id" class="form-select">{% for cm in summary_data.selection.cms %}<option value="{{ cm.id }}"{% if cm.id == summary_data.responsible.id %} selected{% endif %}>{{ cm.name }}</option>{% endfor %}</select></label>{% else %}<div><span class="form-label">负责人</span><strong>{{ summary_data.responsible.name }}</strong><input type="hidden" name="cm_id" value="{{ summary_data.responsible.id }}"></div>{% endif %}
       <label>日期（最近 7 天）<select name="date" class="form-select">{% for day in summary_data.selection.dates %}<option value="{{ day }}"{% if day == summary_data.selection.date %} selected{% endif %}>{{ day }}</option>{% endfor %}</select></label>
       <label>时段<select name="period" class="form-select"><option value="work"{% if summary_data.selection.period == 'work' %} selected{% endif %}>上班 10:00–18:00</option><option value="off"{% if summary_data.selection.period == 'off' %} selected{% endif %}>下班 18:00–次日10:00</option></select></label>
     </form>
     <details class="oh-small"><summary>总结范围</summary><p>英国时间，下班时段归入开始日期。仅整理已入库达人的可读群聊和私聊。AI 总结请结合原文核实；回复建议需核对后手动发送，不改变事件状态。</p></details>
     <div id="oh-feedback" class="oh-banner oh-warning" role="alert" hidden></div>
-    <section id="oh-status" class="oh-banner" aria-live="polite"><div><div class="ui-loading"><span id="oh-analysis-spinner" class="ui-spinner" aria-hidden="true" hidden></span><strong id="oh-status-title">正在读取总结</strong></div><p id="oh-status-description">请稍候。</p></div><span id="oh-updated" class="oh-small"></span></section>
+    <section id="oh-status" class="oh-banner" aria-live="polite"><div><div class="ui-loading"><span id="oh-analysis-spinner" class="ui-spinner" aria-hidden="true" hidden></span><strong id="oh-status-title">正在读取总结</strong></div><p id="oh-status-description">请稍候。</p><details id="oh-issues" class="oh-small" hidden><summary>查看读取情况</summary><ul id="oh-issue-list" class="mt-2 mb-0"></ul></details></div><span id="oh-updated" class="oh-small"></span></section>
     <section class="oh-stats" aria-label="事件等级统计">
       <button type="button" class="oh-stat oh-p0" data-priority="P0" aria-pressed="false"><span>P0 · 重大风险</span><strong id="oh-count-P0">0</strong><small>合作关系 / 资金危机</small></button>
       <button type="button" class="oh-stat oh-p1" data-priority="P1" aria-pressed="false"><span>P1 · 优先处理</span><strong id="oh-count-P1">0</strong><small>异常、投诉、反复催促</small></button>
@@ -30,5 +30,5 @@
   </main>
 </div>
 <script id="offhours-summary-data" type="application/json">{{ summary_data|tojson }}</script>
-<script src="/static/offhours-summary.js?v=20261009-progress-filter" defer></script>
+<script src="/static/offhours-summary.js?v=20261013-streamlined" defer></script>
 {% endblock %}

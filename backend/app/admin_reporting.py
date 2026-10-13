@@ -184,28 +184,27 @@ def overview() -> dict[str, Any]:
             """
             SELECT
                 (SELECT COUNT(*) FROM authorizations WHERE status = 'active') AS active_authorization_count,
-                (SELECT COUNT(*) FROM chats
-                  WHERE COALESCE(chat_status, 'normal') = 'normal'
-                    AND COALESCE(chat_mode, 'group') <> 'p2p') AS group_chat_count,
-                (SELECT COUNT(*) FROM chats
-                  WHERE COALESCE(chat_status, 'normal') = 'normal'
-                    AND chat_mode = 'p2p') AS p2p_chat_count,
-                (SELECT COUNT(*)
-                   FROM authorization_chats ac
-                   JOIN chats c ON c.chat_id = ac.chat_id
-                  WHERE ac.is_visible AND COALESCE(c.chat_status, 'normal') = 'normal') AS membership_count,
-                (SELECT COUNT(*) FROM chat_messages WHERE NOT is_deleted) AS message_count,
-                (SELECT COUNT(*) FROM chat_messages
-                  WHERE NOT is_deleted AND body_ciphertext IS NOT NULL) AS content_message_count,
-                (SELECT COUNT(*)
-                   FROM authorization_chats ac
-                   JOIN chats c ON c.chat_id = ac.chat_id
-                  WHERE ac.is_visible
-                    AND COALESCE(c.chat_status, 'normal') = 'normal'
-                    AND ac.sync_status IN ('pending', 'syncing', 'failed_retryable')) AS pending_membership_count,
+                groups.group_chat_count, groups.p2p_chat_count,
+                memberships.membership_count, memberships.pending_membership_count,
+                messages.message_count, messages.content_message_count,
                 (SELECT COUNT(*) FROM sync_jobs
                   WHERE status = 'running'
                      OR (status = 'queued' AND scheduled_at <= NOW())) AS active_job_count
+            FROM (
+                SELECT COUNT(*) FILTER (WHERE COALESCE(chat_mode,'group')<>'p2p') AS group_chat_count,
+                    COUNT(*) FILTER (WHERE chat_mode='p2p') AS p2p_chat_count
+                FROM chats WHERE COALESCE(chat_status,'normal')='normal'
+            ) groups CROSS JOIN (
+                SELECT COUNT(*) AS membership_count,
+                    COUNT(*) FILTER (WHERE ac.sync_status IN ('pending','syncing','failed_retryable'))
+                        AS pending_membership_count
+                FROM authorization_chats ac JOIN chats c ON c.chat_id=ac.chat_id
+                WHERE ac.is_visible AND COALESCE(c.chat_status,'normal')='normal'
+            ) memberships CROSS JOIN (
+                SELECT COUNT(*) AS message_count,
+                    COUNT(*) FILTER (WHERE body_ciphertext IS NOT NULL) AS content_message_count
+                FROM chat_messages WHERE NOT is_deleted
+            ) messages
             """
         ).fetchone()
         attention = conn.execute(
@@ -420,33 +419,35 @@ def users(page: int = 1, query: str = "", permission_filter: str = "all") -> dic
         page, limit, offset = _page_window(page, total_count=total_count)
         rows = conn.execute(
             f"""
-            WITH deleted_messages AS MATERIALIZED (
-                SELECT chat_id,message_id FROM chat_messages WHERE is_deleted
-            ), page_users AS MATERIALIZED (
+            WITH page_users AS MATERIALIZED (
                 SELECT a.id FROM authorizations a LEFT JOIN admin_roles r ON r.authorization_id=a.id
                 WHERE {filters} ORDER BY a.authorized_at DESC, a.id LIMIT %s OFFSET %s
             ), conversation_counts AS (
-                {CONVERSATION_COUNTS_SQL}
+                SELECT counts.* FROM page_users p CROSS JOIN LATERAL (
+                    SELECT * FROM ({CONVERSATION_COUNTS_SQL}) totals
+                    WHERE totals.authorization_id=p.id
+                ) counts
             ), message_counts AS (
-                SELECT
-                    o.authorization_id,
-                    COUNT(*) AS message_count,
-                    COUNT(*) FILTER (WHERE o.sent_by_author) AS own_message_count
-                FROM authorization_message_observations o
-                JOIN page_users p ON p.id=o.authorization_id
-                JOIN authorization_chats ac
-                  ON ac.authorization_id = o.authorization_id AND ac.chat_id = o.chat_id
-                JOIN chats c ON c.chat_id = ac.chat_id
-                WHERE ac.is_visible AND COALESCE(c.chat_status, 'normal') = 'normal'
-                  AND NOT EXISTS (SELECT 1 FROM deleted_messages m
-                      WHERE m.chat_id=o.chat_id AND m.message_id=o.message_id)
-                GROUP BY o.authorization_id
+                SELECT p.id AS authorization_id, counts.*
+                FROM page_users p CROSS JOIN LATERAL (
+                    SELECT COUNT(*) AS message_count,
+                        COUNT(*) FILTER (WHERE o.sent_by_author) AS own_message_count
+                    FROM authorization_message_observations o
+                    JOIN authorization_chats ac
+                      ON ac.authorization_id=o.authorization_id AND ac.chat_id=o.chat_id
+                    JOIN chats c ON c.chat_id=ac.chat_id
+                    WHERE o.authorization_id=p.id AND ac.is_visible
+                      AND COALESCE(c.chat_status, 'normal')='normal'
+                      AND NOT EXISTS (SELECT 1 FROM chat_messages m WHERE m.is_deleted
+                          AND m.chat_id=o.chat_id AND m.message_id=o.message_id)
+                ) counts
             ), latest_jobs AS (
-                SELECT DISTINCT ON (authorization_id)
-                    authorization_id, mode, status, scheduled_at, updated_at, pages_processed,
-                    chats_discovered, discovery_status, last_progress_at, last_http_status, last_error_code
-                FROM sync_jobs
-                ORDER BY authorization_id, created_at DESC
+                SELECT p.id AS authorization_id, job.*
+                FROM page_users p LEFT JOIN LATERAL (
+                    SELECT mode,status,scheduled_at,updated_at,pages_processed,chats_discovered,
+                        discovery_status,last_progress_at,last_http_status,last_error_code
+                    FROM sync_jobs WHERE authorization_id=p.id ORDER BY created_at DESC LIMIT 1
+                ) job ON TRUE
             )
             SELECT
                 a.id,
@@ -697,7 +698,11 @@ def chats(page: int = 1) -> dict[str, Any]:
         page, limit, offset = _page_window(page, total_count=total_count)
         rows = conn.execute(
             """
-            WITH memberships AS (
+            WITH page_chats AS MATERIALIZED (
+                SELECT * FROM chats WHERE COALESCE(chat_status,'normal')='normal'
+                    AND COALESCE(chat_mode,'group')<>'p2p'
+                ORDER BY LOWER(COALESCE(name,'')),chat_id LIMIT %s OFFSET %s
+            ), memberships AS (
                 SELECT
                     ac.chat_id,
                     COUNT(*) AS visible_authorization_count,
@@ -706,7 +711,7 @@ def chats(page: int = 1) -> dict[str, Any]:
                     ) AS pending_authorization_count,
                     MAX(COALESCE(ac.last_incremental_at, ac.last_backfill_at)) AS last_synced_at
                 FROM authorization_chats ac
-                JOIN chats c ON c.chat_id = ac.chat_id
+                JOIN page_chats c ON c.chat_id = ac.chat_id
                 WHERE ac.is_visible
                   AND COALESCE(c.chat_status, 'normal') = 'normal'
                   AND COALESCE(c.chat_mode, 'group') <> 'p2p'
@@ -718,7 +723,7 @@ def chats(page: int = 1) -> dict[str, Any]:
                     ac.member_count_status,
                     ac.member_count_checked_at
                 FROM authorization_chats ac
-                JOIN chats c ON c.chat_id = ac.chat_id
+                JOIN page_chats c ON c.chat_id = ac.chat_id
                 WHERE ac.is_visible
                   AND ac.sync_enabled
                   AND COALESCE(c.chat_status, 'normal') = 'normal'
@@ -729,9 +734,11 @@ def chats(page: int = 1) -> dict[str, Any]:
                     ac.member_count_checked_at DESC NULLS LAST,
                     ac.last_seen_at DESC
             ), messages AS (
-                SELECT chat_id, COUNT(*) FILTER (WHERE NOT is_deleted) AS message_count
-                FROM chat_messages
-                GROUP BY chat_id
+                SELECT c.chat_id, counts.message_count FROM page_chats c
+                CROSS JOIN LATERAL (
+                    SELECT COUNT(*) AS message_count FROM chat_messages m
+                    WHERE m.chat_id=c.chat_id AND NOT m.is_deleted
+                ) counts
             )
             SELECT
                 c.chat_id,
@@ -748,7 +755,7 @@ def chats(page: int = 1) -> dict[str, Any]:
                 COALESCE(m.pending_authorization_count, 0) AS pending_authorization_count,
                 m.last_synced_at,
                 COALESCE(msg.message_count, 0) AS message_count
-            FROM chats c
+            FROM page_chats c
             LEFT JOIN chat_group_classifications classification ON classification.chat_id=c.chat_id
             LEFT JOIN memberships m ON m.chat_id = c.chat_id
             LEFT JOIN member_counts mc ON mc.chat_id = c.chat_id
@@ -756,7 +763,6 @@ def chats(page: int = 1) -> dict[str, Any]:
             WHERE COALESCE(c.chat_status, 'normal') = 'normal'
               AND COALESCE(c.chat_mode, 'group') <> 'p2p'
             ORDER BY LOWER(COALESCE(c.name, '')), c.chat_id
-            LIMIT %s OFFSET %s
             """,
             (limit, offset),
         ).fetchall()
@@ -800,10 +806,39 @@ def jobs(page: int = 1) -> dict[str, Any]:
     return _page_result([_decorate_job(row) for row in rows], page, total_count=total_count)
 
 
-CONTACT_DIRECTORY_SQL = f"""
-    WITH directory AS (
+CONTACT_CATEGORY_SQL = f"""
+    SELECT contact.id AS contact_id, contact.display_name, contact.created_at, contact.updated_at,
+        primary_role.role AS primary_role, primary_role.source AS classification_source,
+        COALESCE(primary_role.role,'unclassified') AS category,
+        CASE WHEN primary_role.role IS NULL THEN ARRAY[]::text[] ELSE ARRAY[primary_role.role] END
+            AS confirmed_roles
+    FROM contacts contact
+    LEFT JOIN LATERAL (
+        SELECT job.status, job.result
+        FROM contact_assessments job
+        WHERE job.contact_id=contact.id AND job.policy_version='{CONTACT_IDENTITY_POLICY}'
+        ORDER BY job.created_at DESC,job.id DESC LIMIT 1
+    ) AS assessment ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT role.role,role.source
+        FROM contact_roles role
+        WHERE role.contact_id=contact.id AND role.status='confirmed'
+          AND (role.source NOT IN ('ai_auto_confirmed','lark_internal_tenant')
+            OR role.source='lark_internal_tenant' AND role.role='internal_colleague' AND EXISTS (
+                SELECT 1 FROM lark_identities trusted WHERE trusted.contact_id=contact.id
+                  AND trusted.identity_type='user' AND trusted.tenant_classification='internal')
+            OR role.source='ai_auto_confirmed' AND role.is_primary AND assessment.status='succeeded'
+              AND assessment.result->>'reason_code'='classified'
+              AND assessment.result->'roles'->0->>'role'=role.role)
+        ORDER BY CASE WHEN role.source NOT IN ('ai_auto_confirmed','lark_internal_tenant') THEN 0
+                      WHEN role.source='lark_internal_tenant' THEN 1 ELSE 2 END,
+            role.is_primary DESC,role.reviewed_at DESC NULLS LAST,role.updated_at DESC,role.role
+        LIMIT 1
+    ) AS primary_role ON TRUE
+"""
+CONTACT_DISPLAY_SQL = """
         SELECT
-            contact.id AS contact_id,
+            contact.contact_id,
             contact.created_at, contact.updated_at,
             COALESCE(contact.display_name, primary_identity.display_name) AS display_name,
             primary_identity.open_id,
@@ -813,50 +848,25 @@ CONTACT_DIRECTORY_SQL = f"""
             primary_identity.tenant_classification,
             identity_counts.lark_identity_count,
             identity_counts.last_seen_at,
-            primary_role.role AS primary_role,
-            primary_role.source AS classification_source,
-            COALESCE(primary_role.role, 'unclassified') AS category,
+            contact.primary_role, contact.classification_source, contact.category,
             COALESCE(organization.status, 'unresolved') AS organization_status,
             organization.canonical_name AS organization_name,
             organization.organization_kind,
-            CASE WHEN primary_role.role IS NULL THEN ARRAY[]::text[] ELSE ARRAY[primary_role.role] END
-                AS confirmed_roles
-        FROM contacts contact
+            contact.confirmed_roles
+        FROM page_contacts contact
         LEFT JOIN LATERAL (
             SELECT identity.open_id, identity.display_name, identity.avatar_url, identity.avatar_status,
                 identity.tenant_key, identity.tenant_classification
             FROM lark_identities identity
-            WHERE identity.contact_id = contact.id AND identity.identity_type = 'user'
+            WHERE identity.contact_id = contact.contact_id AND identity.identity_type = 'user'
             ORDER BY identity.last_seen_at DESC, identity.open_id
             LIMIT 1
         ) AS primary_identity ON TRUE
         LEFT JOIN LATERAL (
-            SELECT job.status, job.result, job.finished_at
-            FROM contact_assessments job
-            WHERE job.contact_id=contact.id AND job.policy_version='{CONTACT_IDENTITY_POLICY}'
-            ORDER BY job.created_at DESC,job.id DESC LIMIT 1
-        ) AS assessment ON TRUE
-        LEFT JOIN LATERAL (
-            SELECT role.role,role.source
-            FROM contact_roles role
-            WHERE role.contact_id=contact.id AND role.status='confirmed'
-              AND (role.source NOT IN ('ai_auto_confirmed','lark_internal_tenant')
-                OR role.source='lark_internal_tenant' AND role.role='internal_colleague' AND EXISTS (
-                    SELECT 1 FROM lark_identities trusted WHERE trusted.contact_id=contact.id
-                      AND trusted.identity_type='user' AND trusted.tenant_classification='internal')
-                OR role.source='ai_auto_confirmed' AND role.is_primary AND assessment.status='succeeded'
-                  AND assessment.result->>'reason_code'='classified'
-                  AND assessment.result->'roles'->0->>'role'=role.role)
-            ORDER BY CASE WHEN role.source NOT IN ('ai_auto_confirmed','lark_internal_tenant') THEN 0
-                          WHEN role.source='lark_internal_tenant' THEN 1 ELSE 2 END,
-                role.is_primary DESC,role.reviewed_at DESC NULLS LAST,role.updated_at DESC,role.role
-            LIMIT 1
-        ) AS primary_role ON TRUE
-        LEFT JOIN LATERAL (
             SELECT link.status, organization.canonical_name, organization.organization_kind
             FROM contact_organization_links link
             JOIN organizations organization ON organization.id = link.organization_id
-            WHERE link.contact_id = contact.id AND link.status <> 'rejected'
+            WHERE link.contact_id = contact.contact_id AND link.status <> 'rejected'
             ORDER BY CASE link.status WHEN 'verified' THEN 0 WHEN 'candidate' THEN 1 ELSE 2 END,
                 link.last_seen_at DESC, organization.canonical_name
             LIMIT 1
@@ -864,9 +874,11 @@ CONTACT_DIRECTORY_SQL = f"""
         LEFT JOIN LATERAL (
             SELECT COUNT(*) AS lark_identity_count, MAX(identity.last_seen_at) AS last_seen_at
             FROM lark_identities identity
-            WHERE identity.contact_id = contact.id AND identity.identity_type = 'user'
+            WHERE identity.contact_id = contact.contact_id AND identity.identity_type = 'user'
         ) AS identity_counts ON TRUE
-    )
+"""
+CONTACT_DIRECTORY_SQL = f"""
+    WITH page_contacts AS ({CONTACT_CATEGORY_SQL}), directory AS ({CONTACT_DISPLAY_SQL})
 """
 
 
@@ -886,45 +898,62 @@ def contacts(
     filters = (category, category, organization_status, organization_status, organization_query, organization_query,
                query, query, query)
     with connection() as conn:
-        # Materialize once: global category totals and the filtered page share
-        # the same identity/classification snapshot without a cross-request cache.
         page, _, _ = _page_window(page)
         rows = conn.execute(
             f"""
-            {CONTACT_DIRECTORY_SQL}
-            , counts AS (
+            WITH categories AS MATERIALIZED ({CONTACT_CATEGORY_SQL}), counts AS (
                 SELECT category,COUNT(*) AS count
-                FROM directory GROUP BY category
+                FROM categories GROUP BY category
             ), filtered AS MATERIALIZED (
-            SELECT * FROM directory
+            SELECT person.contact_id,COALESCE(person.display_name,fallback.display_name) AS display_name,
+                activity.last_seen_at
+            FROM categories person
+            LEFT JOIN LATERAL (
+                SELECT MAX(last_seen_at) AS last_seen_at FROM lark_identities identity
+                WHERE identity.contact_id=person.contact_id AND identity.identity_type='user'
+            ) activity ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT display_name FROM lark_identities identity
+                WHERE person.display_name IS NULL AND identity.contact_id=person.contact_id
+                    AND identity.identity_type='user'
+                ORDER BY last_seen_at DESC,open_id LIMIT 1
+            ) fallback ON TRUE
             WHERE (%s = 'all' OR category = %s)
-              AND (%s = 'all' OR organization_status = %s)
+              AND (%s = 'all' OR COALESCE((
+                  SELECT link.status FROM contact_organization_links link
+                  JOIN organizations organization ON organization.id=link.organization_id
+                  WHERE link.contact_id=person.contact_id AND link.status<>'rejected'
+                  ORDER BY CASE link.status WHEN 'verified' THEN 0 WHEN 'candidate' THEN 1 ELSE 2 END,
+                      link.last_seen_at DESC,organization.canonical_name LIMIT 1
+              ),'unresolved') = %s)
               AND (
                   %s = '' OR EXISTS (
                       SELECT 1
                       FROM contact_organization_links organization_link
                       JOIN organizations organization_filter
                         ON organization_filter.id = organization_link.organization_id
-                      WHERE organization_link.contact_id = directory.contact_id
+                      WHERE organization_link.contact_id = person.contact_id
                         AND organization_link.status <> 'rejected'
                         AND POSITION(LOWER(%s) IN LOWER(organization_filter.canonical_name)) > 0
                   )
               )
-              AND (%s='' OR POSITION(LOWER(%s) IN LOWER(COALESCE(display_name,'')))>0
+              AND (%s='' OR POSITION(LOWER(%s) IN LOWER(COALESCE(person.display_name,fallback.display_name,'')))>0
                 OR EXISTS(SELECT 1 FROM contact_social_accounts l JOIN social_accounts s ON s.id=l.social_account_id
-                  WHERE l.contact_id=directory.contact_id AND l.status='confirmed' AND l.relationship='owner'
+                  WHERE l.contact_id=person.contact_id AND l.status='confirmed' AND l.relationship='owner'
                   AND s.platform='tiktok' AND POSITION(LOWER(%s) IN LOWER(s.normalized_handle))>0))
             ), totals AS (
                 SELECT COUNT(*) AS total_count FROM filtered
-            ), page_rows AS (
+            ), page_ids AS (
                 SELECT * FROM filtered
                 ORDER BY last_seen_at DESC NULLS LAST, LOWER(display_name), contact_id
                 LIMIT %s OFFSET (LEAST(%s, GREATEST(1,
                     (SELECT CEIL(total_count::numeric / %s) FROM totals))) - 1)::int * %s
-            )
-            SELECT page_rows.*, totals.total_count,
+            ), page_contacts AS MATERIALIZED (
+                SELECT categories.* FROM page_ids JOIN categories USING(contact_id)
+            ), directory AS ({CONTACT_DISPLAY_SQL})
+            SELECT directory.*, totals.total_count,
                 (SELECT COALESCE(jsonb_agg(to_jsonb(counts)), '[]'::jsonb) FROM counts) AS category_counts
-            FROM totals LEFT JOIN page_rows ON TRUE
+            FROM totals LEFT JOIN directory ON TRUE
             ORDER BY last_seen_at DESC NULLS LAST, LOWER(display_name), contact_id
             """,
             (*filters, LIST_PAGE_SIZE, page, LIST_PAGE_SIZE, LIST_PAGE_SIZE),
@@ -939,8 +968,11 @@ def contacts(
         activity = conn.execute("""
             WITH identities AS (SELECT contact_id,open_id FROM lark_identities WHERE contact_id=ANY(%s::uuid[])),
             messages AS MATERIALIZED (
-                SELECT identity.contact_id,message.chat_id,message.is_deleted
-                FROM identities identity JOIN chat_messages message ON message.sender_open_id=identity.open_id
+                SELECT identity.contact_id,activity.chat_id,activity.message_count
+                FROM identities identity CROSS JOIN LATERAL (
+                    SELECT chat_id,COUNT(*) FILTER (WHERE NOT is_deleted) AS message_count
+                    FROM chat_messages WHERE sender_open_id=identity.open_id GROUP BY chat_id
+                ) activity
             ),
             conversations AS (
                 SELECT identity.contact_id,member.chat_id FROM chat_members member
@@ -949,12 +981,17 @@ def contacts(
                 UNION SELECT identity.contact_id,association.chat_id FROM authorization_chats association
                 JOIN identities identity ON identity.open_id=association.p2p_counterpart_open_id
                 WHERE association.is_visible
+            ), conversation_counts AS (
+                SELECT contact_id,COUNT(*) AS conversation_count FROM conversations GROUP BY contact_id
+            ), message_counts AS (
+                SELECT contact_id,SUM(message_count) AS message_count FROM messages GROUP BY contact_id
             )
             SELECT person.contact_id,
-                (SELECT COUNT(*) FROM conversations c WHERE c.contact_id=person.contact_id) AS conversation_count,
-                (SELECT COUNT(*) FROM messages m WHERE m.contact_id=person.contact_id AND NOT m.is_deleted)
-                    AS message_count
+                COALESCE(c.conversation_count,0) AS conversation_count,
+                COALESCE(m.message_count,0) AS message_count
             FROM (SELECT DISTINCT contact_id FROM identities) person
+            LEFT JOIN conversation_counts c USING(contact_id)
+            LEFT JOIN message_counts m USING(contact_id)
             """, (ids,)).fetchall() if ids else []
     activity_by_id = {row["contact_id"]: row for row in activity}
     result = _page_result([_decorate_contact({**row, **activity_by_id.get(row["contact_id"], {}),
@@ -1042,33 +1079,8 @@ def contact_detail(open_id: str, conversation_page: int = 1, *,
             (contact_id,),
         ).fetchall()
 
-        conversation_total_count = int(
-            conn.execute(
-                """
-                WITH contact_identities AS (
-                    SELECT open_id FROM lark_identities WHERE contact_id = %s
-                ), conversation_ids AS (
-                    SELECT member.chat_id FROM chat_members member
-                    JOIN contact_identities identity USING (open_id)
-                    UNION
-                    SELECT message.chat_id FROM chat_messages message
-                    JOIN contact_identities identity ON identity.open_id = message.sender_open_id
-                    UNION
-                    SELECT association.chat_id FROM authorization_chats association
-                    JOIN contact_identities identity ON identity.open_id = association.p2p_counterpart_open_id
-                    WHERE association.is_visible
-                )
-                SELECT COUNT(*) AS total_count
-                FROM conversation_ids ids
-                JOIN chats chat ON chat.chat_id = ids.chat_id
-                WHERE COALESCE(chat.chat_status, 'normal') = 'normal'
-                """,
-                (contact_id,),
-            ).fetchone()["total_count"]
-            or 0
-        ) if include_conversations else 0
-        conversation_page, conversation_limit, conversation_offset = _page_window(
-            conversation_page, DETAIL_PAGE_SIZE, total_count=conversation_total_count
+        conversation_page, _, _ = _page_window(
+            conversation_page, DETAIL_PAGE_SIZE
         )
         conversations = conn.execute(
             """
@@ -1084,6 +1096,20 @@ def contact_detail(open_id: str, conversation_page: int = 1, *,
                 SELECT association.chat_id FROM authorization_chats association
                 JOIN contact_identities identity ON identity.open_id = association.p2p_counterpart_open_id
                 WHERE association.is_visible
+            ), available_chats AS MATERIALIZED (
+                SELECT chat.* FROM conversation_ids ids JOIN chats chat ON chat.chat_id=ids.chat_id
+                WHERE COALESCE(chat.chat_status,'normal')='normal'
+            ), totals AS (
+                SELECT COUNT(*) AS total_count FROM available_chats
+            ), page_chats AS MATERIALIZED (
+                SELECT chat.*,latest.last_message_at FROM available_chats chat
+                CROSS JOIN LATERAL (
+                    SELECT MAX(message_create_time) AS last_message_at FROM chat_messages message
+                    WHERE message.chat_id=chat.chat_id AND NOT message.is_deleted
+                ) latest
+                ORDER BY latest.last_message_at DESC NULLS LAST,LOWER(COALESCE(chat.name,'')),chat.chat_id
+                LIMIT %s OFFSET (LEAST(%s,GREATEST(1,
+                    (SELECT CEIL(total_count::numeric / %s) FROM totals)))-1)::int * %s
             )
             SELECT
                 chat.chat_id,
@@ -1095,9 +1121,9 @@ def contact_detail(open_id: str, conversation_page: int = 1, *,
                 member_counts.member_count_status,
                 message_counts.message_count,
                 message_counts.contact_message_count,
-                message_counts.last_message_at
-            FROM conversation_ids ids
-            JOIN chats chat ON chat.chat_id = ids.chat_id
+                chat.last_message_at,
+                totals.total_count
+            FROM totals LEFT JOIN page_chats chat ON TRUE
             LEFT JOIN chat_group_classifications classification ON classification.chat_id=chat.chat_id
             LEFT JOIN LATERAL (
                 SELECT access.member_count, access.member_count_status
@@ -1117,17 +1143,18 @@ def contact_detail(open_id: str, conversation_page: int = 1, *,
                     COUNT(*) FILTER (
                         WHERE NOT message.is_deleted
                           AND message.sender_open_id IN (SELECT open_id FROM contact_identities)
-                    ) AS contact_message_count,
-                    MAX(message.message_create_time) FILTER (WHERE NOT message.is_deleted) AS last_message_at
+                    ) AS contact_message_count
                 FROM chat_messages message
                 WHERE message.chat_id = chat.chat_id
             ) AS message_counts ON TRUE
-            WHERE COALESCE(chat.chat_status, 'normal') = 'normal'
-            ORDER BY message_counts.last_message_at DESC NULLS LAST, LOWER(COALESCE(chat.name, '')), chat.chat_id
-            LIMIT %s OFFSET %s
+            ORDER BY chat.last_message_at DESC NULLS LAST, LOWER(COALESCE(chat.name, '')), chat.chat_id
             """,
-            (contact_id, conversation_limit, conversation_offset),
+            (contact_id, DETAIL_PAGE_SIZE, conversation_page, DETAIL_PAGE_SIZE, DETAIL_PAGE_SIZE),
         ).fetchall() if include_conversations else []
+        conversation_total_count = int(conversations[0]["total_count"] or 0) if conversations else 0
+        conversation_page, _, _ = _page_window(conversation_page, DETAIL_PAGE_SIZE,
+                                               total_count=conversation_total_count)
+        conversations = [row for row in conversations if row["chat_id"] is not None]
 
     return {
         "contact": _decorate_contact(contact),

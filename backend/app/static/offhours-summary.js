@@ -31,7 +31,7 @@
   const replyStates = new Map();
   function clearReplies() {
     for (const state of replyStates.values()) {
-      state.version++; clearTimeout(state.timer); clearTimeout(state.editTimer);
+      state.version++; clearTimeout(state.timer);
       state.text = ""; state.panel.replaceChildren();
     }
     replyStates.clear();
@@ -68,12 +68,16 @@
     const actions = node("div", "oh-actions"); actions.append(copy, translate);
     content.append(label, editor, translationLabel, translation, checks, actions);
     panel.append(generate, feedback, content);
-    const state = {panel, version: 0, text: "", jobId: null, copyId: null, readyText: null, timer: null, editTimer: null};
+    const state = {panel, version: 0, text: "", jobId: null, copyId: null, timer: null};
     replyStates.set(event.id, state);
     function stale(message) {
       copy.disabled = true; translate.disabled = true; generate.disabled = false;
       for (const button of [copy, translate, generate]) button.removeAttribute("aria-busy");
-      state.readyText = null; feedback.textContent = message;
+      feedback.textContent = message;
+    }
+    function translationFailed(message) {
+      copy.disabled = !state.text.trim(); translate.disabled = false; translate.removeAttribute("aria-busy");
+      translation.textContent = "翻译未完成，可重试。"; feedback.textContent = message;
     }
     async function poll(jobId, version, isTranslation = false) {
       if (denied || version !== state.version) return;
@@ -85,14 +89,19 @@
         }
         generate.disabled = false;
         (isTranslation ? translate : generate).removeAttribute("aria-busy");
-        if (value.status !== "succeeded") { stale(value.error || "资料已变化，请重新生成。"); return; }
+        if (value.status !== "succeeded" && value.reason_code !== "new_messages") {
+          if (isTranslation && value.status === "failed") {
+            translationFailed(value.error || "翻译未完成，可重试。");
+          } else stale(value.error || "资料已变化，请重新生成。");
+          return;
+        }
         const result = value.result;
         if (isTranslation) {
           if (result.draft !== state.text) return;
           translation.textContent = result.chinese_translation;
-          state.readyText = state.text; state.copyId = jobId;
+          state.copyId = jobId;
           copy.disabled = false; translate.disabled = false;
-          feedback.textContent = "中文翻译已更新。请核对后复制，由 CM 自行发送。";
+          feedback.textContent = "翻译已更新。";
         } else {
           feedback.textContent = result.explanation;
           checks.textContent = result.checks?.length ? `发送前需确认：${result.checks.join("；")}` : "";
@@ -102,15 +111,20 @@
             generate.textContent = "重新核对"; return;
           }
           state.jobId = jobId; state.copyId = jobId;
-          editor.value = state.text = state.readyText = result.draft;
+          editor.value = state.text = result.draft;
           translation.textContent = result.chinese_translation;
           translationLabel.hidden = translation.hidden = result.language === "zh";
           copy.disabled = false; translate.disabled = false; generate.textContent = "重新生成";
-          feedback.textContent += `（核对于 ${date(result.checked_at)}；消息同步至 ${date(result.synced_through)}）`;
         }
+        if (value.reason_code === "new_messages") feedback.textContent = "聊天有新消息，请核对后发送。";
         // Check for new messages without overwriting an edited draft or its translation.
         state.timer = setTimeout(() => checkFresh(version), 30000);
-      } catch (error) { if (!denied && version === state.version) stale(error.message); }
+      } catch (error) {
+        if (!denied && version === state.version) {
+          if (isTranslation) translationFailed(error.message);
+          else stale(error.message);
+        }
+      }
     }
     async function checkFresh(version) {
       if (denied || version !== state.version || !state.copyId) return;
@@ -118,12 +132,16 @@
       try {
         const value = await replyRequest(`/${encodeURIComponent(state.copyId)}?fresh=true`);
         if (denied || version !== state.version) return;
-        if (value.status !== "succeeded") { stale(value.error || "收到新消息，请重新生成。"); return; }
+        if (value.status !== "succeeded") {
+          if (value.reason_code === "new_messages") feedback.textContent = "聊天有新消息，请核对后发送。";
+          else stale(value.error || "资料已变化，请重新生成。");
+          return;
+        }
         state.timer = setTimeout(() => checkFresh(version), 30000);
       } catch (error) { if (!denied && version === state.version) stale(error.message); }
     }
     generate.addEventListener("click", async () => {
-      const version = ++state.version; clearTimeout(state.timer); clearTimeout(state.editTimer);
+      const version = ++state.version; clearTimeout(state.timer);
       generate.disabled = true; copy.disabled = true; content.hidden = true;
       for (const button of [copy, translate]) button.removeAttribute("aria-busy");
       generate.setAttribute("aria-busy", "true");
@@ -134,26 +152,29 @@
       } catch (error) { if (!denied && version === state.version) stale(error.message); }
     });
     async function updateTranslation() {
-      clearTimeout(state.editTimer); clearTimeout(state.timer);
+      clearTimeout(state.timer);
       if (!state.text.trim() || !state.jobId || denied) return;
       const version = ++state.version;
-      copy.disabled = true; translate.disabled = true;
+      translate.disabled = true;
       translate.setAttribute("aria-busy", "true");
       translationLabel.hidden = translation.hidden = false;
       translation.textContent = "正在更新中文翻译…";
       try {
         const value = await replyRequest("", {event_id: event.id, parent_id: state.jobId, text: state.text});
         if (!denied && version === state.version) poll(value.id, version, true);
-      } catch (error) { if (!denied && version === state.version) stale(error.message); }
+      } catch (error) {
+        if (!denied && version === state.version) {
+          translationFailed(error.message);
+        }
+      }
     }
     editor.addEventListener("input", () => {
-      state.text = editor.value; state.readyText = null; state.version++;
-      clearTimeout(state.timer); clearTimeout(state.editTimer);
+      state.text = editor.value; state.version++;
+      clearTimeout(state.timer);
       for (const button of [copy, translate]) button.removeAttribute("aria-busy");
-      copy.disabled = true; translate.disabled = false;
+      copy.disabled = !state.text.trim(); translate.disabled = !state.text.trim();
       translation.textContent = "正文已修改，中文翻译待更新。";
       translationLabel.hidden = translation.hidden = false;
-      state.editTimer = setTimeout(updateTranslation, 1500);
     });
     translate.addEventListener("click", updateTranslation);
     copy.addEventListener("click", async () => {
@@ -164,13 +185,13 @@
       try {
         const value = await replyRequest(`/${encodeURIComponent(state.copyId)}?fresh=true`);
         if (denied || version !== state.version || text !== state.text) return;
-        if (value.status !== "succeeded" || state.readyText !== text) {
-          stale(value.error || "建议或翻译已过时，请更新后再复制。"); return;
+        if (value.status !== "succeeded" && value.reason_code !== "new_messages") {
+          stale(value.error || "资料已变化，请重新生成。"); return;
         }
         fresh = true;
         await navigator.clipboard.writeText(text);
         if (denied || version !== state.version || text !== state.text) return;
-        feedback.textContent = "已复制，未发送。";
+        feedback.textContent = value.reason_code === "new_messages" ? "已复制。聊天有新消息，请核对后发送。" : "已复制，未发送。";
         copy.disabled = false;
       } catch (error) {
         if (!denied && version === state.version) {
@@ -311,35 +332,32 @@
     const run = data.run, counts = run?.counts || {};
     const settingsLink = document.querySelector('.oh-actions a[href^="/admin/"]');
     if (settingsLink) settingsLink.hidden = !data.can_manage;
-    const complete = Number(counts.completed || 0), failed = Number(counts.failed || 0);
+    const failed = Number(counts.failed || 0);
     const pending = Number(counts.queued || 0) + Number(counts.running || 0);
-    const total = complete + failed + pending;
-    let title = "尚未开启分析", description = "保存并开启后，系统会自动开始归纳这段时间的真实消息。";
+    let title = "尚未开启分析", description = "开启后将自动整理达人消息。";
     if (run) {
       const status = {
-        queued: "已排队，准备分析", running: "正在并行分析", succeeded: "本轮分析已结束",
-        completed: "本轮分析已结束", partial: "已有部分分析结果", failed: "本轮分析遇到问题",
+        queued: "正在整理", running: "正在整理", succeeded: "整理完成",
+        completed: "整理完成", partial: "部分结果待更新", failed: "暂时无法更新",
         cancelled: "本轮分析已停止", disabled: "分析已关闭", paused: "分析已暂停",
-      }[run.status] || "正在整理分析结果";
-      title = !data.enabled ? "分析已关闭" : data.window?.is_open ? "时段更新中 · 当前为部分结果"
-        : data.window?.is_partial ? "当前为部分结果 · 尚有资料缺口" : status;
-      description = `已完成 ${complete} / ${total} 个分析任务`;
-      if (pending) description += `，${pending} 个等待或处理中`;
-      if (failed) description += `，${failed} 个未能完成`;
-      description += "。";
-      if (data.coverage) description += ` 已检查 ${data.coverage.related_groups || 0} 个相关群聊、${data.coverage.related_private_chats || 0} 个私聊；本时段纳入 ${data.coverage.group_conversations || 0} 个群聊、${data.coverage.private_conversations || 0} 个私聊，共 ${data.coverage.messages || 0} 条消息。`;
-      if (run.cutoff) description += ` 本轮读取到 ${date(run.cutoff)}（英国时间）。`;
-      if (data.window?.is_open) description += " 尚未到时段结束时间，请稍后查看更新。";
+      }[run.status] || "正在整理";
+      title = !data.enabled ? "分析已关闭" : pending ? "正在整理" : data.window?.is_open ? "持续更新中"
+        : data.window?.is_partial ? "部分结果待更新" : status;
+      description = failed || data.window?.is_partial && !data.window?.is_open
+        ? "已显示可用结果；部分消息暂未纳入。" : "";
     } else if (data.window?.is_future) {
       title = "时段尚未开始";
-      description = "到达开始时间后，系统会自动收集并总结该时段的消息。";
+      description = "开始后自动整理消息。";
     } else if (data.enabled) {
-      title = "已开启 · 等待分析任务";
-      description = "后台正在准备当前时段的数据。尚未有结果不代表没有消息或没有风险。";
+      title = "正在整理";
+      description = "有结果后将自动更新。";
     }
     $("oh-status-title").textContent = title;
     $("oh-analysis-spinner").hidden = denied || !data.enabled || !(pending || ["queued", "running"].includes(run?.status));
     $("oh-status-description").textContent = description;
+    const gaps = [...new Set(run?.gaps || [])];
+    $("oh-issues").hidden = !gaps.length;
+    $("oh-issue-list").replaceChildren(...gaps.map(gap => node("li", "oh-small", gap)));
     $("oh-updated").textContent = run?.updated_at ? `结果更新 ${date(run.updated_at)}` : "";
     const all = events();
     for (const level of priorities) {
@@ -356,7 +374,7 @@
     clearTimeout(timer);
     const active = data.enabled && (!data.run || data.window?.is_open
       || ["queued", "running"].includes(data.run.status));
-    if (!denied && !navigating && !document.hidden) timer = setTimeout(refresh, active ? 10000 : 60000);
+    if (!denied && !navigating && !document.hidden) timer = setTimeout(refresh, active ? 30000 : 120000);
   }
 
   async function refresh(interactive = false) {

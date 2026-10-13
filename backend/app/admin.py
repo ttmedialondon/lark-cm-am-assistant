@@ -480,17 +480,11 @@ def create_admin_router(
             if denied is not None:
                 raise PermissionError("导出访问权限已变化")
             limits = refreshed["message_source_ids"]
-            with connection() as conn:
-                latest = conn.execute("SELECT status,body_consent_at,scopes FROM authorizations WHERE id=%s",
-                                      (user_id,)).fetchone()
-            if (limits is not None and user_id not in limits) or not latest or (
-                latest["status"] != "active"
-                or latest["body_consent_at"] != user["body_consent_at"]
-                or not BODY_READ_SCOPES.issubset(latest["scopes"])
-            ):
+            if limits is not None and user_id not in limits:
                 raise PermissionError("消息来源授权已变化")
 
-        iterator = message_export.stream_export(user_id, context["authorization"]["id"], check_access)
+        iterator = message_export.stream_export(user_id, context["authorization"]["id"], check_access,
+                                               consent_at=user["body_consent_at"])
         try:
             first_chunk = next(iterator)
         except (ValueError, PermissionError) as exc:
@@ -570,7 +564,9 @@ def create_admin_router(
                 selected_user["id"], conversation_page, conversation_query, conversation_type
             )
             conversations = conversation_page_data["items"]
-            selected_chat = admin_reporting.message_conversation(selected_user["id"], chat_id) if chat_id else None
+            selected_chat = next((item for item in conversations if item["chat_id"] == chat_id), None)
+            if chat_id and selected_chat is None:
+                selected_chat = admin_reporting.message_conversation(selected_user["id"], chat_id)
             if selected_chat:
                 content_page = admin_reporting.message_page(selected_user["id"], selected_chat["chat_id"], page)
                 admin_reporting.record_message_view(

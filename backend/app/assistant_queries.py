@@ -6,7 +6,7 @@ from uuid import UUID
 
 from . import admin_reporting, contact_handles, creator_importance, creator_responsibility_matching
 from . import offhours_summary as summaries
-from .assistant_search import authorize_all, unreadable_reason
+from .assistant_search import authorize_all, creator_roster, unreadable_reason
 from .creator_group_evidence import PURPOSES
 from .evidence_access import BODY_READ_SCOPE_SQL
 
@@ -17,9 +17,9 @@ def _iso(value):
     return value.isoformat() if value is not None else None
 
 
-def _scope(conn, actor_id, context):
-    cm = authorize_all(conn, actor_id, context["scope"]["cm_id"])
-    roster = summaries._roster(conn, cm["id"])
+def _scope(conn, actor_id, context, *, read_cache=None):
+    cm = authorize_all(conn, actor_id, context["scope"]["cm_id"], read_cache=read_cache)
+    roster = creator_roster(conn, cm["id"], read_cache=read_cache)
     visible = {row["contact_id"] for row in roster}
     selected = context["scope"].get("creator_ids")
     if selected is not None and not {UUID(str(value)) for value in selected} <= visible:
@@ -97,9 +97,9 @@ def _validate_creator_snapshot(conn, cm, roster, visible, snapshot):
         raise ValueError("达人重要度的消息依据已变化，请重新查询。")
 
 
-def creators(conn, actor_id, context, args, settings, *, now=None, snapshot=None):
+def creators(conn, actor_id, context, args, settings, *, now=None, snapshot=None, read_cache=None):
     now = now or datetime.now(UTC)
-    cm, roster, visible = _scope(conn, actor_id, context)
+    cm, roster, visible = _scope(conn, actor_id, context, read_cache=read_cache)
     # A named lookup can change the selected person, never the allowed CM roster.
     lookup_context = context if not args.get("query") else {
         **context, "scope": {**context["scope"], "creator_ids": None},
@@ -166,9 +166,9 @@ def creators(conn, actor_id, context, args, settings, *, now=None, snapshot=None
     return result
 
 
-def groups(conn, actor_id, context, args, settings, *, now=None):
+def groups(conn, actor_id, context, args, settings, *, now=None, read_cache=None):
     now = now or datetime.now(UTC)
-    cm, _roster, visible = _scope(conn, actor_id, context)
+    cm, _roster, visible = _scope(conn, actor_id, context, read_cache=read_cache)
     ids = _ids(args, context, visible)
     selected = args.get("creator_ids") is not None or context["scope"].get("creator_ids") is not None
     purpose = args.get("purpose")
@@ -205,9 +205,9 @@ def groups(conn, actor_id, context, args, settings, *, now=None):
     return result
 
 
-def conversations(conn, actor_id, context, args, settings, *, now=None):
+def conversations(conn, actor_id, context, args, settings, *, now=None, read_cache=None):
     now = now or datetime.now(UTC)
-    cm = authorize_all(conn, actor_id, context["scope"]["cm_id"])
+    cm = authorize_all(conn, actor_id, context["scope"]["cm_id"], read_cache=read_cache)
     kind = args.get("kind") or "all"
     if kind not in {"all", "group", "p2p"}:
         raise ValueError("会话类型无效。")
@@ -316,9 +316,9 @@ def _coverage(chats, start=None, end=None):
     return {"latest": _iso(max(watermarks, default=None)), "oldest": _iso(min(watermarks, default=None))}, gaps
 
 
-def sync_status(conn, actor_id, context, args, settings, *, now=None):
+def sync_status(conn, actor_id, context, args, settings, *, now=None, read_cache=None):
     now = now or datetime.now(UTC)
-    cm, _roster, _visible = _scope(conn, actor_id, context)
+    cm = authorize_all(conn, actor_id, context["scope"]["cm_id"], read_cache=read_cache)
     chats = _chat_states(conn, cm["id"])
     job = conn.execute("""SELECT status,mode,scheduled_at,discovery_status,last_http_status,last_error_code
         FROM sync_jobs WHERE authorization_id=%s ORDER BY created_at DESC LIMIT 1""", (cm["id"],)).fetchone()
@@ -507,17 +507,17 @@ def _activity_all(conn, cm, start, end, group_by, chat_ids):
             "metrics": metrics, "rows": values, "source_chat_ids": source_chats}
 
 
-def activity(conn, actor_id, context, args, settings, *, now=None):
+def activity(conn, actor_id, context, args, settings, *, now=None, read_cache=None):
     now = now or datetime.now(UTC)
     audience = args.get("audience", "all")
     if audience not in {"all", "creators"}:
         raise ValueError("统计对象无效。")
     if audience == "creators":
-        cm, roster, visible = _scope(conn, actor_id, context)
+        cm, roster, visible = _scope(conn, actor_id, context, read_cache=read_cache)
         ids = _ids(args, context, visible)
     else:
         from .assistant_search import authorize_all
-        cm = authorize_all(conn, actor_id, context["scope"]["cm_id"])
+        cm = authorize_all(conn, actor_id, context["scope"]["cm_id"], read_cache=read_cache)
         ids = []
     selected_chats = args.get("chat_ids")
     if selected_chats is None and audience == "creators":
@@ -625,12 +625,13 @@ def activity(conn, actor_id, context, args, settings, *, now=None):
                 if comparison else None}}}
 
 
-def validate_result(conn, actor_id, context, result, settings):
+def validate_result(conn, actor_id, context, result, settings, *, read_cache=None):
     """Invalidate changed business sources, not routine synchronization progress."""
-    if result.get("kind") == "conversations" or result.get("kind") == "activity" and result.get("audience") == "all":
-        cm = authorize_all(conn, actor_id, context["scope"]["cm_id"])
+    if (result.get("kind") in {"conversations", "sync"}
+            or result.get("kind") == "activity" and result.get("audience") == "all"):
+        cm = authorize_all(conn, actor_id, context["scope"]["cm_id"], read_cache=read_cache)
     else:
-        cm, _roster, _visible = _scope(conn, actor_id, context)
+        cm, _roster, _visible = _scope(conn, actor_id, context, read_cache=read_cache)
     if result.get("authorization") != _authorization(cm):
         raise ValueError("消息授权已变化，请重新查询。")
     request = result["_request"]
@@ -671,7 +672,7 @@ def validate_result(conn, actor_id, context, result, settings):
         return
     legacy_activity = kind == "activity" and "audience" not in result
     args = {**request["args"], "audience": "creators"} if legacy_activity else request["args"]
-    fresh = function(conn, actor_id, context, args, settings, now=now)
+    fresh = function(conn, actor_id, context, args, settings, now=now, read_cache=read_cache)
     if fresh["kind"] != kind:
         raise ValueError("查询引用无效。")
     if kind == "sync":

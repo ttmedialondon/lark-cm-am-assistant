@@ -163,13 +163,14 @@ def scopes_for(conn, actor_id):
             "can_switch_cm": owner}
 
 
-def current_context(conn, actor_id, selected_context, settings, *, now=None):
+def current_context(conn, actor_id, selected_context, settings, *, now=None, read_cache=None):
     selected_context = selected_context or {}
     if not isinstance(selected_context, dict):
         raise ValueError("页面范围无效。")
     actor_id = UUID(str(actor_id))
     now = now or datetime.now(UTC)
-    selection = scopes_for(conn, actor_id)
+    selection = scopes_for(conn, actor_id) if not selected_context.get("cm_id") else {
+        "selected_cm_id": str(actor_id), "scopes": []}
     requested_cm = selected_context.get("cm_id") or selection["selected_cm_id"]
     if not requested_cm:
         raise ValueError("当前账号的消息连接尚未就绪，请检查账号连接。")
@@ -178,9 +179,9 @@ def current_context(conn, actor_id, selected_context, settings, *, now=None):
         "creators" if selected_context.get("creator_ids") is not None or selected_context.get("event_ref") else "all")
     if audience not in {"all", "creators"}:
         raise ValueError("消息范围无效。")
-    cm = assistant_search.authorize_all(conn, actor_id, cm_id)
+    cm = assistant_search.authorize_all(conn, actor_id, cm_id, read_cache=read_cache)
     actor = conn.execute("SELECT display_name,body_consent_at FROM authorizations WHERE id=%s", (actor_id,)).fetchone()
-    roster = summaries._roster(conn, cm_id)
+    roster = assistant_search.creator_roster(conn, cm_id, read_cache=read_cache) if audience == "creators" else []
     visible = {str(row["contact_id"]) for row in roster}
     selected = _creator_ids(selected_context.get("creator_ids") if audience == "creators" else None, visible)
     scope = {"cm_id": str(cm_id), "cm_name": cm["display_name"] or "CM", "creator_ids": selected,
@@ -222,8 +223,9 @@ def current_context(conn, actor_id, selected_context, settings, *, now=None):
                     if str(row["contact_id"]) in scope["creator_ids"]))
     message_ref = selected_context.get("message_ref")
     if message_ref:
-        source = _saved_message(conn, actor_id, message_ref, settings)
-        data = assistant_search.read(conn, actor_id, {"scope": scope}, {"message_ref": source}, settings)
+        source = _saved_message(conn, actor_id, message_ref, settings, read_cache=read_cache)
+        data = assistant_search.read(conn, actor_id, {"scope": scope}, {"message_ref": source}, settings,
+                                     read_cache=read_cache)
         scope["message_ref"] = message_ref
         if chat_ids is not None and not set(data["scope"]["chat_ids"]) <= set(chat_ids):
             raise PermissionError("消息不属于已选会话范围。")
@@ -246,14 +248,14 @@ def current_context(conn, actor_id, selected_context, settings, *, now=None):
         if action != "generate":
             draft_ref, text = selected_context.get("draft_ref"), selected_context.get("edited_draft")
             previous = _saved_reply(conn, actor_id, None, draft_ref, settings)
-            _validate_reply_material(conn, actor_id, previous, settings, {"scope": scope})
+            _validate_reply_material(conn, actor_id, previous, settings, {"scope": scope}, read_cache=read_cache)
             if not isinstance(text, str) or not text.strip() or len(text.encode()) > 100_000:
                 raise ValueError("请填写有效的回复正文。")
             scope.update(draft_ref=draft_ref, edited_draft=text)
     query_ref = selected_context.get("query_ref")
     if query_ref:
         result = _saved_query(conn, actor_id, query_ref, settings)
-        _validate_query(conn, actor_id, {"scope": scope}, result, settings)
+        _validate_query(conn, actor_id, {"scope": scope}, result, settings, read_cache=read_cache)
         scope["query_ref"] = query_ref
         scope["query_request"] = result["_request"]
         cursor = selected_context.get("cursor")
@@ -291,10 +293,11 @@ def _creator_ids(values, visible):
     return ids
 
 
-def _scope(conn, actor_id, context):
+def _scope(conn, actor_id, context, *, creators=True, read_cache=None):
     cm_id = UUID(context["scope"]["cm_id"])
-    cm = assistant_search.authorize_all(conn, actor_id, cm_id)
-    roster = summaries._roster(conn, cm_id)
+    cm = assistant_search.authorize_all(conn, actor_id, cm_id, read_cache=read_cache)
+    roster = assistant_search.creator_roster(conn, cm_id, read_cache=read_cache) \
+        if creators or context["scope"].get("creator_ids") is not None else []
     visible = {str(row["contact_id"]) for row in roster}
     _creator_ids(context["scope"].get("creator_ids"), visible)
     return cm, roster, visible
@@ -320,7 +323,7 @@ def _saved_query(conn, actor_id, ref, settings):
     raise LookupError("查询不存在或无权查看。")
 
 
-def _validate_query(conn, actor_id, context, result, settings, *, history_only=False):
+def _validate_query(conn, actor_id, context, result, settings, *, history_only=False, read_cache=None):
     if result.get("scope", {}).get("cm_id") != context["scope"]["cm_id"]:
         raise PermissionError("查询不属于当前范围。")
     context = {**context, "scope": result["scope"]}
@@ -338,16 +341,16 @@ def _validate_query(conn, actor_id, context, result, settings, *, history_only=F
                     else refs.get(message.get(key), message.get(key)) for key in ("message_ref", "evidence_ref")}}
                     for message in result["messages"]])
         metadata = assistant_search.validate_result(conn, actor_id, context, restored, settings,
-                                                    history_only=history_only)
+                                                    history_only=history_only, read_cache=read_cache)
     else:
-        metadata = assistant_queries.validate_result(conn, actor_id, context, result, settings)
+        metadata = assistant_queries.validate_result(conn, actor_id, context, result, settings, read_cache=read_cache)
     if metadata:
         if result.get("gaps", []) != metadata["gaps"]:
             result["_coverage_refreshed"] = True
         result.update(metadata)
 
 
-def _query(conn, actor_id, turn, name, args, settings, context, visible):
+def _query(conn, actor_id, turn, name, args, settings, context, visible, *, read_cache=None, window_counts=None):
     args = dict(args)
     pinned_chats = (context["scope"].get("chat_ids") if context["scope"].get("window")
                     and args.get("audience", context["scope"].get("audience")) == context["scope"].get("audience")
@@ -366,7 +369,7 @@ def _query(conn, actor_id, turn, name, args, settings, context, visible):
         ids = _creator_ids(args["creator_ids"], visible)
         args["creator_ids"] = context["scope"].get("creator_ids") if ids is None else ids
         if args["creator_ids"] is not None:
-            roster = summaries._roster(conn, UUID(context["scope"]["cm_id"]))
+            roster = assistant_search.creator_roster(conn, UUID(context["scope"]["cm_id"]), read_cache=read_cache)
             context = {**context, "scope": {**context["scope"], "creator_ids": args["creator_ids"],
                 "creator_names": list(dict.fromkeys(row["name"] or "未命名达人" for row in roster
                     if str(row["contact_id"]) in args["creator_ids"]))}}
@@ -382,10 +385,10 @@ def _query(conn, actor_id, turn, name, args, settings, context, visible):
     if name in {"search_chat_history", "activity_stats", "summarize_messages"} and args["chat_ids"] is not None:
         context = {**context, "scope": {**context["scope"], "chat_ids": args["chat_ids"]}}
     if name == "read_message_context":
-        source = _saved_message(conn, actor_id, args["message_ref"], settings)
+        source = _saved_message(conn, actor_id, args["message_ref"], settings, read_cache=read_cache)
         mode = args.get("mode") or "period"
         result = assistant_search.read(conn, actor_id, context, {"message_ref": source, "mode": mode}, settings,
-                                       cutoff=turn["created_at"] if mode == "latest" else None)
+                                       cutoff=turn["created_at"] if mode == "latest" else None, read_cache=read_cache)
         result["_source_ref"] = source
         result["message_ref"] = args["message_ref"]
         result["evidence_ref"] = args["message_ref"]
@@ -406,8 +409,12 @@ def _query(conn, actor_id, turn, name, args, settings, context, visible):
                     snapshot = page.get("_snapshot")
                     if snapshot is not None:
                         break
-        result = (_QUERIES[name](conn, actor_id, context, args, settings, snapshot=snapshot)
-                  if name == "query_creators" else _QUERIES[name](conn, actor_id, context, args, settings))
+        query_options = {"read_cache": read_cache}
+        if name == "summarize_messages":
+            query_options["window_counts"] = window_counts
+        result = (_QUERIES[name](conn, actor_id, context, args, settings, snapshot=snapshot, **query_options)
+                  if name == "query_creators" else _QUERIES[name](conn, actor_id, context, args, settings,
+                                                                **query_options))
     if name == "query_creators" and args["query"] and result["total"] == 1:
         ids = [person["id"] for person in result["creators"]]
         selected = context["scope"].get("creator_ids")
@@ -444,7 +451,7 @@ def _query(conn, actor_id, turn, name, args, settings, context, visible):
     return {"scope": context["scope"], **result, "query_ref": ref, "_request": request}
 
 
-def _saved_message(conn, actor_id, ref, settings, *, turn=None):
+def _saved_message(conn, actor_id, ref, settings, *, turn=None, read_cache=None):
     try:
         if isinstance(ref, str) and ref.startswith("u.") and len(ref) <= 2048:
             _prefix, source_turn, digest, source = ref.split(".", 3)
@@ -456,10 +463,11 @@ def _saved_message(conn, actor_id, ref, settings, *, turn=None):
                         or value.get("query_ref") != query_ref):
                     raise ValueError
                 context = {"scope": owned["scope"]}
-                _validate_query(conn, actor_id, context, owned, settings)
+                _validate_query(conn, actor_id, context, owned, settings, read_cache=read_cache)
                 audience = owned["scope"].get("audience", "creators")
                 cm, _, chats, speakers, selected = assistant_search._scope(conn, actor_id, context,
-                    owned["scope"].get("creator_ids"), [value.get("chat_id")], settings, audience)
+                    owned["scope"].get("creator_ids"), [value.get("chat_id")], settings, audience,
+                    read_cache=read_cache)
                 start, end = (assistant_search._time(owned["window"][key]) for key in ("start", "end"))
                 rows = assistant_search._rows(conn, cm["id"], [value["chat_id"]], start, end, speakers,
                     limit=1, extra=" AND m.message_id=%s", extra_args=(value.get("message_id"),))
@@ -520,27 +528,27 @@ def _saved_reply(conn, actor_id, turn, ref, settings):
     raise ValueError("草稿材料尚未准备。")
 
 
-def _validate_reply_material(conn, actor_id, result, settings, context, *, turn=None):
+def _validate_reply_material(conn, actor_id, result, settings, context, *, turn=None, read_cache=None):
     saved = result["_reply_material"]
     source = saved["source"]
     if saved["scope"]["cm_id"] != context["scope"]["cm_id"]:
         raise PermissionError("草稿不属于当前人员范围。")
-    assistant_search.authorize_all(conn, actor_id, saved["scope"]["cm_id"])
+    assistant_search.authorize_all(conn, actor_id, saved["scope"]["cm_id"], read_cache=read_cache)
     if source["kind"] == "message":
-        current = _saved_message(conn, actor_id, source["ref"], settings, turn=turn)
+        current = _saved_message(conn, actor_id, source["ref"], settings, turn=turn, read_cache=read_cache)
         # Re-sealing a compact reference changes its nonce, not its authenticated scope.
         if assistant_search._open(current, "m.", settings) != assistant_search._open(source["source"], "m.", settings):
             raise SourceChangedError("消息引用已变化。")
     else:
         _event_id(conn, actor_id, source["ref"], settings, context)
     fresh = assistant_replies.material(conn, actor_id, context, source, settings,
-                                      cutoff=saved["context"]["checked_at"])
+                                      cutoff=saved["context"]["checked_at"], read_cache=read_cache)
     if fresh["fingerprint"] != saved["context"]["fingerprint"]:
         raise SourceChangedError("回复依据已变化，请重新生成。")
     return fresh
 
 
-def _prepare_reply(conn, actor_id, turn, args, settings, context):
+def _prepare_reply(conn, actor_id, turn, args, settings, context, *, read_cache=None):
     args = {**args}
     requested = context["scope"]
     if requested.get("reply_action"):
@@ -558,7 +566,8 @@ def _prepare_reply(conn, actor_id, turn, args, settings, context):
             raise ValueError("请选择一个实际事件或文字消息。")
         if args["message_ref"]:
             source = {"kind": "message", "ref": args["message_ref"],
-                      "source": _saved_message(conn, actor_id, args["message_ref"], settings, turn=turn)}
+                      "source": _saved_message(conn, actor_id, args["message_ref"], settings, turn=turn,
+                                               read_cache=read_cache)}
         else:
             source = {"kind": "event", "ref": args["event_ref"],
                       "source": _event_id(conn, actor_id, args["event_ref"], settings, context)}
@@ -566,7 +575,7 @@ def _prepare_reply(conn, actor_id, turn, args, settings, context):
         if args["event_ref"] or args["message_ref"] or not args["draft_ref"]:
             raise ValueError("改写时请使用已有草稿引用。")
         previous = _saved_reply(conn, actor_id, turn, args["draft_ref"], settings)
-        _validate_reply_material(conn, actor_id, previous, settings, context, turn=turn)
+        _validate_reply_material(conn, actor_id, previous, settings, context, turn=turn, read_cache=read_cache)
         if not previous.get("draft", {}).get("draft"):
             raise ValueError("原草稿不可用，请重新生成。")
         if not isinstance(args["edited_draft"], str) or not args["edited_draft"].strip() \
@@ -574,7 +583,7 @@ def _prepare_reply(conn, actor_id, turn, args, settings, context):
             raise ValueError("请填写有效的回复正文。")
         source = previous["_reply_material"]["source"]
         args["language"] = args["language"] or previous["draft"]["language"]
-    data = assistant_replies.material(conn, actor_id, context, source, settings)
+    data = assistant_replies.material(conn, actor_id, context, source, settings, read_cache=read_cache)
     digest = summaries._hash([source, data["fingerprint"], args])[0:20]
     ref = f"d.{turn['id']}.{digest}"
     saved = {"source": source, "context": data, "scope": data["scope"], "request": args}
@@ -586,11 +595,11 @@ def _prepare_reply(conn, actor_id, turn, args, settings, context):
             "_reply_material": saved}
 
 
-def _save_reply(conn, actor_id, turn, args, settings, context):
+def _save_reply(conn, actor_id, turn, args, settings, context, *, read_cache=None):
     if args["draft_ref"].split(".")[1:2] != [str(turn["id"])]:
         raise ValueError("请先准备本轮的回复材料。")
     prepared = _saved_reply(conn, actor_id, turn, args["draft_ref"], settings)
-    material = _validate_reply_material(conn, actor_id, prepared, settings, context, turn=turn)
+    material = _validate_reply_material(conn, actor_id, prepared, settings, context, turn=turn, read_cache=read_cache)
     saved = prepared["_reply_material"]
     known = {item["ref"]: item for item in material["messages"]}
     target = material["message"]
@@ -628,13 +637,13 @@ def _save_reply(conn, actor_id, turn, args, settings, context):
 
 
 def reply_status(conn, actor_id, draft_ref, settings):
-    scopes_for(conn, actor_id)
+    read_cache = {}
     draft = _saved_reply(conn, actor_id, None, draft_ref, settings)
     if not draft.get("draft"):
         raise ValueError("草稿尚未完成。")
     scope = draft["_reply_material"]["scope"]
-    context = current_context(conn, actor_id, scope, settings)
-    material = _validate_reply_material(conn, actor_id, draft, settings, context)
+    context = current_context(conn, actor_id, scope, settings, read_cache=read_cache)
+    material = _validate_reply_material(conn, actor_id, draft, settings, context, read_cache=read_cache)
     return {"new_messages": assistant_replies.has_new_messages(conn, material),
             "checked_at": material["checked_at"]}
 
@@ -857,7 +866,7 @@ def _named_selection(conn, turn, settings, context, ids):
     return set(ids) <= selected
 
 
-def execute(conn, actor_id, turn, name, args, settings, context):
+def execute(conn, actor_id, turn, name, args, settings, context, *, read_cache=None, window_counts=None):
     if name == "filter_events":
         args = {"importance": None, **args}
     if name == "draft_reply":
@@ -865,21 +874,25 @@ def execute(conn, actor_id, turn, name, args, settings, context):
     if name == "read_message_context":
         args = {"mode": None, **args}
     _validate(name, args)
-    cm, roster, visible = _scope(conn, actor_id, context)
+    creator_query = name not in {"find_conversations", "get_sync_status", "read_message_context",
+                                "draft_reply", "save_reply_draft"} and args.get("audience") != "all"
+    cm, roster, visible = _scope(conn, actor_id, context, creators=creator_query, read_cache=read_cache)
     if (context["scope"].get("window") and context["scope"].get("audience") == "creators"
             and context["scope"].get("creator_ids") is not None
             and args.get("audience", "creators") == "creators" and args.get("creator_ids") is not None
             and not set(_creator_ids(args["creator_ids"], visible)) <= set(context["scope"]["creator_ids"])):
         raise ValueError("请在页面已选达人范围内查询，或先修改范围。")
     if name == "draft_reply":
-        return _prepare_reply(conn, actor_id, turn, args, settings, context)
+        return _prepare_reply(conn, actor_id, turn, args, settings, context, read_cache=read_cache)
     if name == "save_reply_draft":
-        return _save_reply(conn, actor_id, turn, args, settings, context)
+        return _save_reply(conn, actor_id, turn, args, settings, context, read_cache=read_cache)
     if name in _QUERIES and not (name == "summarize_messages" and args["audience"] == "creators"):
-        return _query(conn, actor_id, turn, name, args, settings, context, visible)
+        return _query(conn, actor_id, turn, name, args, settings, context, visible,
+                      read_cache=read_cache, window_counts=window_counts)
     if name == "find_creators":
         return _query(conn, actor_id, turn, "query_creators",
-                      {"query": args["query"], "importance": None, "cursor": None}, settings, context, visible)
+                      {"query": args["query"], "importance": None, "cursor": None}, settings, context, visible,
+                      read_cache=read_cache)
     if name in {"summarize_messages", "query_unreplied_creator_events"}:
         context = {**context, "scope": {**context["scope"], "audience": "creators"}}
         unreplied = name == "query_unreplied_creator_events"
@@ -1038,9 +1051,10 @@ def resume_wait(conn, actor_id, turn, waiting, settings, context):
 
 
 def evidence(conn, actor_id, ref, settings):
+    read_cache = {}
     if isinstance(ref, str) and ref.startswith(("m.", "u.")):
-        source = _saved_message(conn, actor_id, ref, settings)
-        result = assistant_search.read(conn, actor_id, None, {"message_ref": source}, settings)
+        source = _saved_message(conn, actor_id, ref, settings, read_cache=read_cache)
+        result = assistant_search.read(conn, actor_id, None, {"message_ref": source}, settings, read_cache=read_cache)
         result.update(message_ref=ref, evidence_ref=ref)
         result["messages"] = [{**message, "message_ref": ref if message.get("message_ref") else None,
                                "evidence_ref": ref if message.get("evidence_ref") else None}
@@ -1063,16 +1077,19 @@ def _audit_context(conn, actor_id, event_id, mode, count):
                   json.dumps({"event_id": event_id, "mode": mode, "messages": count})))
 
 
-def validate_tool_results(conn, actor_id, turn, results, settings, context):
+def validate_tool_results(conn, actor_id, turn, results, settings, context, *, read_cache=None, message_refs=None):
     try:
-        return _validate_tool_results(conn, actor_id, turn, results, settings, context)
+        return _validate_tool_results(conn, actor_id, turn, results, settings, context,
+                                      read_cache=read_cache, message_refs=message_refs)
     except ValueError as exc:
         raise SourceChangedError(str(exc)) from exc
 
 
-def _validate_tool_results(conn, actor_id, turn, results, settings, context):
+def _validate_tool_results(conn, actor_id, turn, results, settings, context, *, read_cache=None, message_refs=None):
     """Recheck all reused source text before it goes into another paid request."""
-    cm, roster, _visible = _scope(conn, actor_id, context)
+    creator_data = any(result.get("result_id") or result.get("event_ref") or result.get("creators")
+                       or result.get("_creator_snapshot") for result in results if isinstance(result, dict))
+    cm, roster, _visible = _scope(conn, actor_id, context, creators=creator_data, read_cache=read_cache)
     collections = {}
     for result in results:
         if not isinstance(result, dict):
@@ -1120,10 +1137,17 @@ def _validate_tool_results(conn, actor_id, turn, results, settings, context):
             read_report(result["result_id"])
     for result in results:
         if result.get("query_ref"):
-            _validate_query(conn, actor_id, context, result, settings)
+            selected = result
+            if message_refs is not None and result.get("kind") == "window_messages":
+                messages = [message for message in result.get("messages", [])
+                            if message.get("message_ref") in message_refs]
+                if not messages:
+                    continue
+                selected = {**result, "messages": messages}
+            _validate_query(conn, actor_id, context, selected, settings, read_cache=read_cache)
             continue
         if result.get("_reply_material"):
-            material = _validate_reply_material(conn, actor_id, result, settings, context)
+            material = _validate_reply_material(conn, actor_id, result, settings, context, read_cache=read_cache)
             previous = drafts.get(result["draft_ref"])
             if result.get("draft") or previous is None:
                 drafts[result["draft_ref"]] = {"status": "succeeded" if result.get("draft") else "prepared",
@@ -1137,7 +1161,7 @@ def _validate_tool_results(conn, actor_id, turn, results, settings, context):
             saved_scope = {**saved_scope, "creator_ids": result["_creator_snapshot"]["query"]["creator_ids"]}
             assistant_queries.creators(conn, actor_id, {**context, "scope": saved_scope},
                 {"query": None, "importance": None, "cursor": None}, settings,
-                snapshot=result["_creator_snapshot"])
+                snapshot=result["_creator_snapshot"], read_cache=read_cache)
         for person in result.get("creators", []):
             current = people.get(person["id"])
             if (not current or current["name"] != person["name"]
@@ -1196,9 +1220,9 @@ def _sections(final, tool_results):
     return values
 
 
-def build_result(conn, actor_id, turn, final, settings, context, tool_results):
+def build_result(conn, actor_id, turn, final, settings, context, tool_results, *, read_cache=None):
     """Render only references actually returned by tools and still readable now."""
-    validated = validate_tool_results(conn, actor_id, turn, tool_results, settings, context)
+    validated = validate_tool_results(conn, actor_id, turn, tool_results, settings, context, read_cache=read_cache)
     sections = _sections(final, tool_results)
     known_results, known_events, known_drafts, data = set(), set(), set(), {}
     for result in tool_results:
