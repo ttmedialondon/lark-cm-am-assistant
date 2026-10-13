@@ -9,7 +9,7 @@ from cryptography.exceptions import InvalidTag
 from cryptography.fernet import InvalidToken
 from psycopg.types.json import Jsonb
 
-from . import creator_access, creator_broadcast
+from . import broadcast_content, broadcast_images, creator_access, creator_broadcast
 from .config import get_settings
 from .crypto import TokenCipher, message_body_cipher, message_body_fingerprint
 from .db import connection
@@ -17,6 +17,16 @@ from .lark_api import LarkApiError, LarkClient, build_chat_post_payload
 
 STATUSES = ("pending", "sending", "succeeded", "failed", "unknown", "cancelled")
 UNKNOWN_MESSAGE = "发送结果未知，请到 Lark 核实；不会自动重发"
+
+
+def _body(ciphertext, snapshot, settings):
+    value = message_body_cipher(settings.token_encryption_key).decrypt(ciphertext)
+    return broadcast_content.normalize(json.loads(value)) if snapshot.get("content_version") == 2 else value
+
+
+def _images(conn, actor, body, settings):
+    ids = broadcast_content.image_ids(body) if isinstance(body, dict) else []
+    return {key: image["image_key"] for key, image in broadcast_images.resolve(conn, actor, ids, settings).items()}
 
 
 def _audit(conn, actor, action, metadata):
@@ -140,6 +150,7 @@ def prepare(actor_id, fields):
     groups, issues = [], list(data.get("issues", []))
     with connection() as conn:
         _authorization(conn, actor)
+        image_keys = _images(conn, actor, data["message"], settings)
         for original in data["groups"]:
             group = {**original, "mentions": [], "mention_all": bool(original.get("mention_all"))}
             invalid = False
@@ -168,6 +179,7 @@ def prepare(actor_id, fields):
                         mentions=group["mentions"],
                         mention_all=group["mention_all"],
                         message_uuid=str(uuid4()),
+                        image_keys=image_keys,
                     )
                 except ValueError:
                     issues.append(
@@ -187,10 +199,18 @@ def prepare(actor_id, fields):
             authorization, _token = _client_token(actor, client, settings)
     except (LarkApiError, httpx.HTTPError, InvalidToken, InvalidTag, ValueError):
         raise ValueError("暂时无法核验本人连接，请稍后重试") from None
-    snapshot = {"groups": groups, "mention": fields["mention"]}
+    rich = isinstance(data["message"], dict)
+    content_version = 2 if rich else 1
+    image_ids = broadcast_content.image_ids(data["message"]) if rich else []
+    groups = [{**group, "content_version": content_version, "image_ids": image_ids} for group in groups]
+    snapshot = {"groups": groups, "mention": fields["mention"], "content_version": content_version,
+                "image_ids": image_ids}
+    fingerprint_body = data["message"]
+    if rich and all(isinstance(op["insert"], str) and not op.get("attributes") for op in data["message"]["ops"]):
+        fingerprint_body = broadcast_content.plain_text(data["message"])
     canonical = {
         "purpose": data["purpose"],
-        "message": data["message"],
+        "message": fingerprint_body,
         "groups": sorted(
             [
                 {
@@ -207,8 +227,16 @@ def prepare(actor_id, fields):
     fingerprint = message_body_fingerprint(
         settings.token_encryption_key, json.dumps(canonical, sort_keys=True, ensure_ascii=False)
     )
+    # Quill's mandatory final newline must not resend the same pre-upgrade plain message.
+    fingerprints = [fingerprint]
+    if isinstance(fingerprint_body, str):
+        for text in {fingerprint_body.removesuffix("\n"), fingerprint_body.removesuffix("\n") + "\n"}:
+            fingerprints.append(message_body_fingerprint(settings.token_encryption_key, json.dumps(
+                {**canonical, "message": text}, sort_keys=True, ensure_ascii=False)))
+    snapshot["content_fingerprints"] = list(dict.fromkeys(fingerprints))
     with connection() as conn, conn.transaction():
         _unchanged(conn, actor, authorization)
+        _images(conn, actor, data["message"], settings)
         for group in groups:
             _route_current(conn, actor, data["purpose"], group)
         row = conn.execute(
@@ -220,7 +248,9 @@ def prepare(actor_id, fields):
                 authorization["open_id"],
                 authorization["display_name"] or "本人",
                 data["purpose"],
-                message_body_cipher(settings.token_encryption_key).encrypt(data["message"]),
+                message_body_cipher(settings.token_encryption_key).encrypt(
+                    json.dumps(data["message"], ensure_ascii=False, separators=(",", ":"))
+                    if rich else data["message"]),
                 Jsonb(snapshot),
                 fingerprint,
             ),
@@ -317,6 +347,7 @@ def submit(actor_id, preview_id, request_id):
         if preview["expires_at"] <= datetime.now(UTC):
             raise ValueError("预览已过期，请重新准备发送。")
         _authorization(conn, actor)
+        _images(conn, actor, _body(preview["body_ciphertext"], preview["snapshot"], get_settings()), get_settings())
         for group in preview["snapshot"]["groups"]:
             _route_current(conn, actor, preview["purpose"], group)
     with connection() as conn, conn.transaction():
@@ -330,18 +361,21 @@ def submit(actor_id, preview_id, request_id):
             existing = conn.execute(
                 """SELECT b.* FROM creator_broadcast_batches b
                 JOIN creator_broadcast_previews p ON p.id=b.preview_id
-                WHERE b.sender_authorization_id=%s AND p.fingerprint=%s
+                WHERE b.sender_authorization_id=%s AND
+                  (p.fingerprint=ANY(%s::text[]) OR p.snapshot->'content_fingerprints' ?| %s::text[])
                   AND b.created_at>NOW()-INTERVAL '10 minutes'
                   AND EXISTS(SELECT 1 FROM creator_broadcast_targets t WHERE t.batch_id=b.id
                     AND t.status IN ('pending','sending','succeeded','unknown'))
                 ORDER BY b.created_at DESC LIMIT 1""",
-                (actor, preview["fingerprint"]),
+                (actor, preview["snapshot"].get("content_fingerprints", [preview["fingerprint"]]),
+                 preview["snapshot"].get("content_fingerprints", [preview["fingerprint"]])),
             ).fetchone()
         if existing:
             return {"batch": _summary(conn, _owned_batch(conn, actor, existing["id"])), "deduplicated": True}
         preview = _owned_preview(conn, actor, preview_id)
         if preview["expires_at"] <= datetime.now(UTC):
             raise ValueError("预览已过期，请重新准备发送。")
+        _images(conn, actor, _body(preview["body_ciphertext"], preview["snapshot"], get_settings()), get_settings())
         for group in preview["snapshot"]["groups"]:
             _route_current(conn, actor, preview["purpose"], group)
         row = conn.execute(
@@ -381,13 +415,13 @@ def batch(actor_id, batch_id):
             FROM creator_broadcast_targets WHERE batch_id=%s ORDER BY created_at,id""",
             (batch_id,),
         ).fetchall()
-        body = conn.execute(
-            "SELECT body_ciphertext FROM creator_broadcast_previews WHERE id=%s", (row["preview_id"],)
-        ).fetchone()["body_ciphertext"]
+        preview = conn.execute(
+            "SELECT body_ciphertext,snapshot FROM creator_broadcast_previews WHERE id=%s", (row["preview_id"],)
+        ).fetchone()
         return {
             "batch": _summary(conn, row),
             "targets": [{**target, "id": str(target["id"])} for target in targets],
-            "message": message_body_cipher(get_settings().token_encryption_key).decrypt(body),
+            "message": _body(preview["body_ciphertext"], preview["snapshot"], get_settings()),
         }
 
 
@@ -484,6 +518,7 @@ def _mark_started(job, checked):
         conn.execute("SELECT id FROM authorizations WHERE id=%s FOR UPDATE", (actor,))
         _unchanged(conn, actor, checked)
         _route_current(conn, actor, job["purpose"], job["snapshot"])
+        _images(conn, actor, _body(job["body_ciphertext"], job["snapshot"], get_settings()), get_settings())
         return bool(
             conn.execute(
                 """UPDATE creator_broadcast_targets t SET send_started_at=NOW(),
@@ -538,13 +573,16 @@ def run_claimed(job, settings=None):
             if authorization["open_id"] != job["sender_open_id"]:
                 raise PermissionError("发送账号已变化，请重新准备。")
             _live_group(client, access_token, authorization, job["snapshot"])
-            body = message_body_cipher(settings.token_encryption_key).decrypt(job["body_ciphertext"])
+            body = _body(job["body_ciphertext"], job["snapshot"], settings)
+            with connection() as conn:
+                image_keys = _images(conn, actor, body, settings)
             build_chat_post_payload(
                 job["chat_id"],
                 body,
                 mentions=job["snapshot"].get("mentions", []),
                 mention_all=bool(job["snapshot"].get("mention_all")),
                 message_uuid=str(job["message_uuid"]),
+                image_keys=image_keys,
             )
             if not _mark_started(job, authorization):
                 return
@@ -557,6 +595,7 @@ def run_claimed(job, settings=None):
                     mentions=job["snapshot"].get("mentions", []),
                     mention_all=bool(job["snapshot"].get("mention_all")),
                     message_uuid=str(job["message_uuid"]),
+                    **({"image_keys": image_keys} if image_keys else {}),
                 )
             except LarkApiError as exc:
                 if getattr(exc, "delivery_unknown", False):

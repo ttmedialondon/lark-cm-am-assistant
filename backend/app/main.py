@@ -119,6 +119,7 @@ def index(request: Request):
 
 def _oauth_database_unavailable(
     request, error, request_id, *, stage, authorization_id=None, send_authorization_id=None,
+    media=False,
 ):
     # Never log SQL, provider error text, OAuth codes, cookies or token values.
     LOGGER.error(
@@ -128,6 +129,8 @@ def _oauth_database_unavailable(
     return_url = "/auth/lark/start"
     if send_authorization_id:
         return_url += f"?send=1&account_id={send_authorization_id}"
+        if media:
+            return_url += "&media=1"
     response = _template(
         request, "error.html",
         {"title": "授权暂未完成", "detail": f"请重新发起授权。问题编号：{request_id}",
@@ -140,9 +143,11 @@ def _oauth_database_unavailable(
 
 
 @app.get("/auth/lark/start")
-def start_lark_authorization(request: Request, send: bool = False, account_id: str | None = None):
+def start_lark_authorization(request: Request, send: bool = False, account_id: str | None = None, media: bool = False):
     request_id = uuid.uuid4().hex
     settings = get_settings()
+    if media and not send:
+        return _template(request, "error.html", {"title": "无法增加图片权限", "detail": "请从群发图片入口授权。"}, 400)
     if not settings.app_secret_configured:
         return _template(
             request,
@@ -168,6 +173,7 @@ def start_lark_authorization(request: Request, send: bool = False, account_id: s
             )
         settings = replace(settings, oauth_scopes=tuple(dict.fromkeys((
             *settings.oauth_scopes, *(authorization.get("scopes") or ()), *SEND_OAUTH_SCOPES,
+            *(("im:resource",) if media else ()),
         ))))
 
     state = secrets.token_urlsafe(32)
@@ -192,6 +198,7 @@ def start_lark_authorization(request: Request, send: bool = False, account_id: s
             request, error, request_id, stage="start_state",
             authorization_id=authorization["id"] if send else None,
             send_authorization_id=authorization["id"] if send else None,
+            media=media,
         )
 
     destination = LarkClient(settings).authorization_url(state, challenge)
@@ -248,6 +255,7 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 request, error, request_id, stage="callback_session",
                 authorization_id=state_row["authorization_id"],
                 send_authorization_id=state_row["authorization_id"],
+                media="im:resource" in requested_scopes,
             )
         if (not authorization or authorization["id"] != state_row["authorization_id"]
                 or authorization["status"] not in {"active", "attention_required"}
@@ -449,6 +457,7 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 request, error, request_id, stage=stage,
                 authorization_id=diagnostic_authorization_id,
                 send_authorization_id=state_row["authorization_id"],
+                media="im:resource" in requested_scopes,
             )
         break
     response = RedirectResponse(url=destination, status_code=303)

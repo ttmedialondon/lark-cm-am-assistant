@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {recipients, buildPlan, groupPlan, parseSelection, listState, permissionReady,
   authorizationUrl, parseDraft} from '../app/static/creator-broadcast.mjs';
+import {messageDocument, messageKey, hasMessage, imageCount, imageUrl, moveImage} from '../app/static/broadcast-editor.mjs';
 
 test('broadcast routing, draft isolation and explicit authorization; no API calls', () => {
   const people = [{id:'p1', name:'Example One', handles:['one','backup'], groups:['shared','training']},
@@ -70,4 +71,29 @@ test('broadcast routing, draft isolation and explicit authorization; no API call
   assert.ok(!permissionReady({status:'ready'},false,actor,'all'));
   assert.ok(!permissionReady({status:'ready'},false,'all','all',true));
   assert.ok(!permissionReady({status:'needs_authorization'},false,'all','all'));
+  const image = '33333333-3333-4333-8333-333333333333';
+  const rich = {version:2,ops:[{insert:'Hello 🎉',attributes:{bold:true}}, {insert:'\n'},
+    {insert:{image}}, {insert:'\n'}, {insert:'Offer',attributes:{link:'https://example.com/offer'}}, {insert:'\n',attributes:{list:'bullet'}}]};
+  assert.equal(imageCount(rich),1); assert(hasMessage(rich)); assert(!hasMessage(' \n'));
+  assert.equal(imageUrl(image),`/creators/broadcast/images/${image}`);
+  assert.deepEqual(messageDocument('Hello'),{version:2,ops:[{insert:'Hello\n'}]});
+  assert.equal(messageKey({version:2,ops:[{insert:'He'},{insert:'llo\n'}]}),messageKey('Hello'));
+  assert.deepEqual(messageDocument({version:2,ops:[{insert:'\n\n',attributes:{list:'ordered'}}]}).ops,
+    [{insert:'\n',attributes:{list:'ordered'}},{insert:'\n',attributes:{list:'ordered'}}]);
+  for (const ops of [[{retain:1}],[{insert:{image:'https://evil.test/image.png'}}],
+    [{insert:'Unsafe',attributes:{link:'javascript:alert(1)'}}],[{insert:'Unexpected',attributes:{color:'red'}}],
+    [{insert:'text',attributes:{list:'bullet'}}],Array.from({length:6},() => ({insert:{image}}))]) {
+    assert.throws(() => messageDocument({version:2,ops}));
+  }
+  const richDraft = {...draft,version:2,cm_id:actor,message:rich,template:{name:'Offer',body:rich}};
+  assert.deepEqual(parseDraft(JSON.stringify(richDraft),actor,1001,false).message,messageDocument(rich));
+  assert.deepEqual(parseDraft(JSON.stringify(richDraft),actor,1001,false).template.body,messageDocument(rich));
+  assert.throws(() => parseDraft(JSON.stringify({...richDraft,actor_id:other}),actor,1001,false));
+  assert.equal(authorizationUrl(`/auth/lark/start?send=1&media=1&account_id=${actor}`,actor,'https://testserver'),
+    `/auth/lark/start?send=1&media=1&account_id=${actor}`);
+  for (const suffix of ['&media=0','&media=1&media=1','&send=1']) assert.throws(() =>
+    authorizationUrl(`/auth/lark/start?send=1&account_id=${actor}${suffix}`,actor,'https://testserver'));
+  const moved = moveImage(rich,'Hello 🎉\n'.length,-1);
+  assert.equal(moved.ops[0].insert.image,image); assert.equal(imageCount(moved),1);
+  assert.notEqual(messageKey(rich),messageKey(moved));
 });

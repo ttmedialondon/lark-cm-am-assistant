@@ -13,6 +13,7 @@ from urllib.parse import quote, urlencode
 
 import httpx
 
+from . import broadcast_content
 from .config import Settings
 from .identity_names import format_display_name
 from .lark_sync_admission import LarkSyncAdmission
@@ -346,13 +347,13 @@ class LarkClient:
                 return members
 
     def send_chat_post(
-        self, access_token: str, chat_id: str, body: str, *,
+        self, access_token: str, chat_id: str, body: str | dict, *,
         mentions: list[dict[str, str]] | tuple[dict[str, str], ...] = (),
-        mention_all: bool = False, message_uuid: str,
+        mention_all: bool = False, message_uuid: str, image_keys: dict | None = None,
     ) -> str:
         """Send one explicit post with durable UUID; never retry a send here."""
         payload = build_chat_post_payload(
-            chat_id, body, mentions=mentions, mention_all=mention_all, message_uuid=message_uuid,
+            chat_id, body, mentions=mentions, mention_all=mention_all, message_uuid=message_uuid, image_keys=image_keys,
         )
         data = self._request(
             "POST", f"{self.settings.lark_api_base_url}/open-apis/im/v1/messages",
@@ -364,6 +365,16 @@ class LarkClient:
         if data.get("chat_id") is not None and data["chat_id"] != chat_id:
             raise LarkApiError(502, None, "Lark send response had an unexpected chat", delivery_unknown=True)
         return message_id
+
+    def upload_message_image(self, access_token: str, content: bytes, filename: str, mime_type: str) -> str:
+        data = self._request(
+            "POST", f"{self.settings.lark_api_base_url}/open-apis/im/v1/images", access_token=access_token,
+            data={"image_type": "message"}, files={"image": (filename, content, mime_type)},
+        )
+        key = _string(data.get("image_key"))
+        if not key or not re.fullmatch(r"img_[A-Za-z0-9_-]{1,256}", key):
+            raise LarkApiError(502, None, "Lark did not confirm a valid image key")
+        return key
 
     def tenant_access_token(self) -> str:
         """Get a short-lived app tenant token; never persist it."""
@@ -416,6 +427,8 @@ class LarkClient:
         params: dict[str, str | int] | None = None,
         json: dict[str, str] | None = None,
         sending: bool = False,
+        data: dict[str, str] | None = None,
+        files: dict | None = None,
     ) -> dict[str, Any]:
         headers = {"Accept": "application/json"}
         if json is not None:
@@ -423,14 +436,18 @@ class LarkClient:
         if access_token:
             headers["Authorization"] = f"Bearer {access_token}"
 
+        kwargs = {"headers": headers, "params": params, "json": json}
+        if files is not None:
+            kwargs.update(data=data, files=files)
+
         gate = self._admission.request() if self._admission else nullcontext()
         with gate:
             try:
                 if self._http_client:
-                    response = self._http_client.request(method, url, headers=headers, params=params, json=json)
+                    response = self._http_client.request(method, url, **kwargs)
                 else:
                     with httpx.Client(timeout=httpx.Timeout(20.0, connect=8.0)) as client:
-                        response = client.request(method, url, headers=headers, params=params, json=json)
+                        response = client.request(method, url, **kwargs)
             except httpx.HTTPError as exc:
                 if sending:
                     unknown = not isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout | httpx.PoolTimeout)
@@ -489,12 +506,12 @@ def _require_im_id(value: str, prefix: str) -> None:
 
 
 def build_chat_post_payload(
-    chat_id: str, body: str, *, mentions: list[dict[str, str]] | tuple[dict[str, str], ...] = (),
-    mention_all: bool = False, message_uuid: str,
+    chat_id: str, body: str | dict, *, mentions: list[dict[str, str]] | tuple[dict[str, str], ...] = (),
+    mention_all: bool = False, message_uuid: str, image_keys: dict | None = None,
 ) -> dict[str, str]:
     """The same literal-content and wire-size check is used at preview and send."""
     _require_im_id(chat_id, "oc_")
-    if not isinstance(body, str) or not body.strip():
+    if not isinstance(body, str | dict) or isinstance(body, str) and not body.strip():
         raise ValueError("Message body cannot be empty")
     message_uuid = str(uuid.UUID(str(message_uuid)))
     if mention_all and mentions:
@@ -510,7 +527,8 @@ def build_chat_post_payload(
             if open_id not in seen:
                 seen.add(open_id)
                 nodes.append({"tag": "at", "user_id": open_id, "user_name": mention.get("name") or open_id})
-    rows = [[{"tag": "text", "text": line}] for line in body.split("\n")]
+    rows = (broadcast_content.post_rows(broadcast_content.normalize(body), image_keys or {}) if isinstance(body, dict)
+            else [[{"tag": "text", "text": line}] for line in body.split("\n")])
     if nodes:
         rows.insert(0, nodes)
     content = json.dumps({"zh_cn": {"title": "", "content": rows}}, ensure_ascii=False, separators=(",", ":"))

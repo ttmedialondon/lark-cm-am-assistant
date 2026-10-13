@@ -348,6 +348,42 @@ def test_broadcast_send_uses_explicit_real_mentions_and_fixed_uuid_without_parsi
         with pytest.raises(ValueError, match="size limit"):
             client.send_chat_post("user-token", "oc_group", "test\n" * 1000, message_uuid=message_uuid)
         assert len(requests) == 2
+        from app import broadcast_content
+        asset = str(UUID(int=99))
+        document = {"version": 2, "ops": [
+            {"insert": "Styled", "attributes": {"bold": True, "italic": True, "underline": True, "strike": True}},
+            {"insert": "\n", "attributes": {"list": "ordered"}},
+            {"insert": "link", "attributes": {"link": "https://example.com"}}, {"insert": "\n"},
+            {"insert": {"image": asset}}, {"insert": "\n😊\n"}]}
+        client.send_chat_post("user-token", "oc_group", document, message_uuid=message_uuid,
+                             mention_all=True, image_keys={asset: "img_private"})
+        rich = json.loads(json.loads(requests[-1].content)["content"])["zh_cn"]["content"]
+        assert rich[1] == [{"tag": "text", "text": "1. "}, {"tag": "text", "text": "Styled",
+                           "style": ["bold", "italic", "underline", "lineThrough"]}]
+        assert rich[2] == [{"tag": "a", "text": "link", "href": "https://example.com"}]
+        assert rich[3] == [{"tag": "img", "image_key": "img_private"}]
+        before = len(requests)
+        for bad in (
+            {"version": 2, "ops": [{"insert": {"image": "https://evil.test/a.png"}}]},
+            {"version": 2, "ops": [{"insert": "bad", "attributes": {"link": "javascript:alert(1)"}}]},
+            {"version": 2, "ops": [{"retain": 1}]},
+            {"version": 2, "ops": [{"insert": {"image": asset}}] * 6},
+            {"version": 2, "ops": [{"insert": "a" * 4001 + "\n"}]},
+        ):
+            with pytest.raises(ValueError):
+                client.send_chat_post("user-token", "oc_group", bad, message_uuid=message_uuid)
+        assert len(requests) == before
+        assert len(broadcast_content.plain_text(broadcast_content.normalize("a" * 4000))) == 4000
+
+    def image_upload(request):
+        assert request.headers["Authorization"] == "Bearer user-token"
+        assert request.headers["Content-Type"].startswith("multipart/form-data; boundary=")
+        assert b'name="image_type"' in request.content and b"message" in request.content
+        assert b'name="image"; filename="example.png"' in request.content
+        return httpx.Response(200, json={"code": 0, "data": {"image_key": "img_private"}})
+    with httpx.Client(transport=httpx.MockTransport(image_upload)) as http_client:
+        assert LarkClient(settings(), http_client=http_client).upload_message_image(
+            "user-token", b"tested-by-image-service", "example.png", "image/png") == "img_private"
 
 
 def test_broadcast_send_distinguishes_known_rejection_from_unknown_delivery_and_hides_raw_errors():

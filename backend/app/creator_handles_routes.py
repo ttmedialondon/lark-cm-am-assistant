@@ -1,15 +1,18 @@
 """Session-scoped creator rosters and imports; CM access is not an admin grant."""
 
+import asyncio
 import json
 from urllib.parse import unquote
 from uuid import UUID
 
+import httpx
 from fastapi import APIRouter, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 from . import (
+    broadcast_images,
     contact_handles,
     creator_broadcast,
     creator_broadcast_delivery,
@@ -33,10 +36,12 @@ from .http_helpers import (
 from .http_helpers import (
     secure_response as secure,
 )
+from .lark_api import LarkApiError
 
 
 def create_router(*, current_authorization, render_template, csrf_token):
     router = APIRouter(prefix="/creators", include_in_schema=False)
+    image_uploads = asyncio.Semaphore(2)
 
     def actor(auth):
         if not auth or auth["status"] != "active":
@@ -49,6 +54,43 @@ def create_router(*, current_authorization, render_template, csrf_token):
         if not _csrf_matches(form, csrf_token(auth)):
             raise ValueError("请求校验失败，请刷新页面后重试。")
         return auth, form
+
+    @router.post("/broadcast/images")
+    async def image_upload(request: Request):
+        try:
+            auth = actor(await run_in_threadpool(current_authorization, request))
+            if not _csrf_matches({"csrf_token": request.headers.get("X-CSRF-Token", "")}, csrf_token(auth)):
+                raise ValueError("请求校验失败，请刷新页面后重试。")
+            mime = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if mime not in broadcast_images.MIME_TYPES.values():
+                raise ValueError("请选择 JPEG、PNG、WebP 或 GIF 图片。")
+            async with image_uploads:
+                content = bytearray()
+                async for chunk in request.stream():
+                    content.extend(chunk[:broadcast_images.MAX_BYTES + 1 - len(content)])
+                    if len(content) > broadcast_images.MAX_BYTES:
+                        raise ValueError("图片不能超过 10 MB。")
+                result = await run_in_threadpool(broadcast_images.upload, auth["id"], bytes(content),
+                                                unquote(request.headers.get("X-Filename", "image")))
+            return payload({"image": result})
+        except creator_broadcast.BroadcastAuthorizationRequired as exc:
+            return payload({"error": str(exc), "authorization_url": exc.authorization_url}, 403)
+        except (LarkApiError, httpx.HTTPError):
+            return payload({"error": "图片未上传到 Lark，请稍后重试。"}, 502)
+        except (ValueError, LookupError, PermissionError) as exc:
+            return error(exc)
+        except OSError:
+            return payload({"error": "图片暂时无法保存，请稍后重试。"}, 503)
+
+    @router.get("/broadcast/images/{asset_id}")
+    async def image_read(request: Request, asset_id: UUID):
+        try:
+            auth = actor(await run_in_threadpool(current_authorization, request))
+            content, mime = await run_in_threadpool(broadcast_images.read, auth["id"], asset_id)
+            return secure(Response(content, media_type=mime, headers={"Cache-Control": "no-store",
+                                                                     "X-Content-Type-Options": "nosniff"}))
+        except (ValueError, LookupError, PermissionError) as exc:
+            return error(exc)
 
     @router.get("/broadcast")
     def broadcast_page(request: Request):
@@ -112,6 +154,8 @@ def create_router(*, current_authorization, render_template, csrf_token):
                 raise ValueError("请求格式无效。") from None
             if not isinstance(fields, dict):
                 raise ValueError("请求格式无效。")
+            if not isinstance(fields.get("media", False), bool):
+                raise ValueError("图片授权参数无效。")
             args = (auth["id"], fields.get("cm_id", "all"), fields.get("purpose", "support"))
             action = request.url.path.rsplit("/", 1)[-1]
             if reconnect_self:
@@ -119,12 +163,15 @@ def create_router(*, current_authorization, render_template, csrf_token):
                 if action != "permissions":
                     return payload({
                         "error": "请先更新本人群发授权。",
-                        "authorization_url": f"/auth/lark/start?send=1&account_id={auth['id']}",
+                        "authorization_url": creator_broadcast.BroadcastAuthorizationRequired(
+                            auth["id"], media=fields.get("media", False)).authorization_url,
                     }, 403)
                 return payload({
                     "status": "needs_authorization", "account_id": str(auth["id"]),
                     "account_name": auth.get("display_name") or "当前账号", "is_self": True, "is_sender": False,
-                    "missing_scopes": [], "authorization_url": f"/auth/lark/start?send=1&account_id={auth['id']}",
+                    "missing_scopes": [], "resource_authorized": False,
+                    "authorization_url": creator_broadcast.BroadcastAuthorizationRequired(
+                        auth["id"], media=fields.get("media", False)).authorization_url,
                     "message": "当前账号连接需要更新，请本人补充授权。",
                 })
             if batch_id is not None:
@@ -148,7 +195,10 @@ def create_router(*, current_authorization, render_template, csrf_token):
                         creator_broadcast.template_delete, auth["id"], fields.get("id"), fields.get("revision"),
                     )
             elif action == "permissions":
-                result = await run_in_threadpool(creator_broadcast.permission_check, args[0], args[1])
+                if not isinstance(fields.get("media", False), bool):
+                    raise ValueError("图片授权参数无效。")
+                result = await run_in_threadpool(creator_broadcast.permission_check, args[0], args[1],
+                                                media=fields.get("media", False))
             elif action == "groups":
                 result = await run_in_threadpool(creator_broadcast.groups, *args)
             elif action == "match":
@@ -174,7 +224,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
             return payload(result)
         except creator_broadcast.BroadcastAuthorizationRequired as exc:
             return payload({
-                "error": str(exc), "authorization_url": f"/auth/lark/start?send=1&account_id={exc.account_id}",
+                "error": str(exc), "authorization_url": exc.authorization_url,
             }, 403)
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)
@@ -213,8 +263,32 @@ def create_router(*, current_authorization, render_template, csrf_token):
                     return contact_handles.set_manual(
                         conn, auth["id"], contact_id, form.get("cm_id"),
                         form.get("old_handle", ""), form.get("handle", ""),
+                        operation=form.get("operation", "replace"),
                     )
 
+            return payload(await run_in_threadpool(save))
+        except (ValueError, LookupError, PermissionError) as exc:
+            return error(exc)
+
+    @router.get("/people/search")
+    async def people_search(request: Request, q: str = "", cm_id: UUID | None = None):
+        try:
+            auth = actor(await run_in_threadpool(current_authorization, request))
+            def search():
+                with connection() as conn:
+                    return contact_handles.search_people(conn, auth["id"], cm_id, q)
+            return payload(await run_in_threadpool(search))
+        except (ValueError, LookupError, PermissionError) as exc:
+            return error(exc)
+
+    @router.post("/people/link")
+    async def people_link(request: Request):
+        try:
+            auth, form = await form_for(request)
+            def save():
+                with connection() as conn, conn.transaction():
+                    return contact_handles.link_manual(conn, auth["id"], form.get("cm_id"),
+                        form.get("handle"), form.get("contact_id"), old_contact_id=form.get("old_contact_id") or None)
             return payload(await run_in_threadpool(save))
         except (ValueError, LookupError, PermissionError) as exc:
             return error(exc)

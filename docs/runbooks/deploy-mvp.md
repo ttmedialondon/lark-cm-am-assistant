@@ -1,6 +1,6 @@
 # Lark CM/AM Assistant 部署手册
 
-本手册用于应用代码或数据库变更的发布。当前系统同步授权范围内的群聊/私聊、加密正文和最新成员快照，后台按页面权限开放；不保存附件二进制。业务与权限边界见 [文档总入口](../README.md)。
+本手册用于应用代码或数据库变更的发布。当前系统同步授权范围内的群聊/私聊、加密正文和最新成员快照，后台按页面权限开放；不下载聊天附件。群发用户主动上传的原图单独加密保存在私有目录。业务与权限边界见 [文档总入口](../README.md)。
 
 纯文档更新只提交并推送 Git，不执行下方安装、迁移、停机或重启步骤，也不重新开启任何 AI 功能。正文采集权限已有效的用户，不因普通发布重复 OAuth。
 
@@ -38,6 +38,13 @@ sudo bash -euo pipefail -c '
   sha256sum "$backup_path" > "$backup_path.sha256"
   sha256sum --check "$backup_path.sha256"
   chmod 0600 "$backup_path" "$backup_path.sha256"
+  if test -d /var/lib/lark-message-stats/broadcast-images; then
+    tar -czf "$backup_path.images.tar.gz" -C /var/lib/lark-message-stats broadcast-images
+    tar -tzf "$backup_path.images.tar.gz" >/dev/null
+    sha256sum "$backup_path.images.tar.gz" > "$backup_path.images.tar.gz.sha256"
+    sha256sum --check "$backup_path.images.tar.gz.sha256"
+    chmod 0600 "$backup_path.images.tar.gz" "$backup_path.images.tar.gz.sha256"
+  fi
   echo "Verified backup: $backup_path"
 '
 sudo systemd-run --quiet --wait --pipe --collect \
@@ -71,6 +78,11 @@ curl --fail --silent --show-error https://larkbot.ttapp.help/healthz
 #### 群发页面与正式发送
 
 采用按功能增量授权，参考 [Google](https://developers.google.com/identity/protocols/oauth2/resources/granular-permissions)、[Microsoft](https://learn.microsoft.com/en-us/entra/identity-platform/consent-types-developer) 和 [Slack](https://docs.slack.dev/authentication/installing-with-oauth/) 的官方流程。不把应用已开通的全部权限都要求用户授权。
+
+- 富文本采用本地 Quill 2.0.3，只启用文字样式、简单列表、链接、Emoji 和图片；正文为受限 insert-only Delta v2，服务端拒绝任意 HTML、远端图片 URL、客户端 image_key 和非 http(s) 链接。旧纯文字模板、草稿和历史继续可读。富文本、图片顺序与 @ 都参与冻结及防重，模板后续编辑不改变发送任务。
+- 图片首次上传或载入带图消息时检查本人 `im:resource`，缺失时保存标签页草稿并进入 `/auth/lark/start?send=1&media=1&account_id=<本人UUID>`，返回后不自动发送；不加入全局读取 scope。应用须先开通并发布该**用户身份**权限，CM 仍需本人同意。图片和消息使用同一用户令牌，不混用机器人图片。
+- `POST /creators/broadcast/images` 接收带 CSRF 的原图，验证实际格式（JPEG/PNG/WebP/GIF）、非空、10 MiB、尺寸和解码工作量；GIF 保留原始动画。每条最多 5 张；上传中、失败、越权、缺素材或权限变化均阻止发送，不省略图片。图片素材 UUID 对应私有 AES-GCM 原图和服务器 image_key，本人范围读取 `GET /creators/broadcast/images/{id}` 且 `no-store`，Owner 也不能读取其他员工素材。
+- `BROADCAST_IMAGE_DIR` 默认 `/var/lib/lark-message-stats/broadcast-images`，0700 目录／0600 文件，应纳入与数据库相同时间点的加密素材备份和 SHA 校验；若改变目录，同步修改备份路径与 systemd 可写范围。回退数据库时恢复对应素材，不能仅恢复 pg_dump。每日清理超过 7 天且无任何模板／发送预览引用的素材及孤立密文；历史发送和已删除模板引用仍保留，不删除聊天或业务关系。
 
 - 首次进入、主动重查及返回页面时，通过带会话和 CSRF 校验的 `POST /creators/broadcast/permissions` 核对当前登录者本人；返回页面的检查在后台进行，不反复锁住编辑区。切换 CM／载入名单只重查目标范围，复用本标签页已取得的本人发送状态，不再重复外部令牌探测。实际准备和发送仍重新检查当前权限；选择其他 CM 不能以其身份发送。
 - 结合最新 OAuth/刷新响应记录的 scope 与只读 `user_info` 核对基线、两项发送权限、凭证和本人身份。只有令牌临近到期才沿用现有行锁刷新；刷新明确返回 scope 时同步保存，未返回则保留历史记录。

@@ -122,7 +122,8 @@ def page_data(actor_id, cm_id=None, tab="", query="", page=1, sort="importance",
             "can_view_unassigned": can_view_unassigned,
             "can_view_importance": can_view_importance,
             "can_adjust_importance": can_view_unassigned and can_view_importance, "sort": sort, "tier": tier,
-            "can_edit_handles": can_view_unassigned and can_view_importance,
+            "can_edit_handles": tab == "mine" and (can_view_unassigned or creator_access.parse_id(actor_id) == cm_id),
+            "can_link_people": tab == "mine" and (can_view_unassigned or creator_access.parse_id(actor_id) == cm_id),
             "importance_running": bool(can_view_importance and conn.execute(
                 """SELECT 1 FROM creator_importance_jobs j JOIN ai_feature_configs f
                     ON f.feature='creator_importance' AND f.enabled

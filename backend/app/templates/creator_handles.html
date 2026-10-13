@@ -5,7 +5,7 @@
 <div class="page business-page" id="creators-app" data-csrf="{{ csrf_token }}" data-tab="{{ creator_tab }}" data-actor="{{ authorization.id }}">
   {% with business_section='creators' %}{% include "partials/business_nav.html" %}{% endwith %}
   <main class="page-wrapper"><div class="page-body"><div class="container-xl">
-    <div class="business-heading"><h2 class="page-title">我的达人</h2><div class="btn-list">{% if creator_data.can_broadcast %}<a class="btn btn-outline-primary" href="/creators/broadcast">群发消息</a>{% endif %}<button type="button" id="creators-import-open" class="btn btn-primary">导入 Excel</button><button type="button" id="creators-refresh" class="btn btn-outline-secondary">刷新</button></div></div>
+    <div class="business-heading"><h2 class="page-title">我的达人</h2><div class="btn-list">{% if creator_data.can_broadcast %}<a class="btn btn-outline-primary" href="/creators/broadcast">群发消息</a>{% endif %}<button type="button" id="creators-link-open" class="btn btn-primary" {% if not creator_data.can_link_people %}hidden{% endif %}>手动关联</button><button type="button" id="creators-import-open" class="btn btn-outline-secondary">导入 Excel</button><button type="button" id="creators-refresh" class="btn btn-outline-secondary">刷新</button></div></div>
     <div id="creators-notice" class="alert d-none" role="status"></div>
     <details class="card mb-3 creator-import-history" id="creators-import-batches" hidden><summary class="fw-semibold">导入记录</summary><div id="creators-import-batch-list" class="card-body"></div></details>
     <section class="card creator-roster-card"><div class="card-header d-flex align-items-center flex-wrap gap-3"><div class="btn-list me-auto" role="group" aria-label="达人列表"><button type="button" id="creators-mine" class="btn">我的达人</button><button type="button" id="creators-unassigned" class="btn" hidden>未分配达人</button></div>{% if creator_data.can_select_cm %}<div class="creator-cm-filter" id="creators-cm-filter"><label for="creators-cm" class="visually-hidden">负责人</label><select id="creators-cm" class="form-select"><option value="">暂无可用负责人</option></select></div>{% endif %}<form id="creators-search" class="d-flex gap-2" role="search"><label class="visually-hidden" for="creators-query">姓名或 handle</label><input class="form-control" id="creators-query" type="search" value="{{ creator_query }}" maxlength="120" placeholder="搜索姓名或 handle"><button class="btn btn-outline-secondary" type="submit">搜索</button></form></div>
@@ -21,6 +21,19 @@
     </section>
     <noscript><div class="alert alert-warning mt-3">请开启浏览器 JavaScript 后核对达人。</div></noscript>
   </div></div></main>
+  <dialog id="creators-link-dialog" class="creator-evidence" aria-labelledby="creators-link-title">
+    <div class="d-flex align-items-center gap-3 mb-3"><h3 id="creators-link-title" class="mb-0 me-auto">手动关联达人</h3><button type="button" id="creators-link-close" class="btn btn-sm btn-outline-secondary">关闭</button></div>
+    <p id="creators-link-effect" class="text-secondary small">确认达人身份和账号，并加入当前负责人的名单。</p>
+    <form id="creators-link-form">
+      <div class="mb-3"><label class="form-label" for="creators-link-handle">TikTok handle</label><input id="creators-link-handle" class="form-control" maxlength="160" required placeholder="handle 或 TikTok 主页链接"></div>
+      <div class="mb-3" id="creators-link-cm-field" hidden><label class="form-label" for="creators-link-cm">查找范围</label><select id="creators-link-cm" class="form-select"></select></div>
+      <div id="creators-link-original" class="small text-secondary mb-3" hidden></div>
+      <label class="form-label" for="creators-link-query">对应 Lark 用户</label><div class="d-flex gap-2"><input id="creators-link-query" class="form-control" type="search" maxlength="120" placeholder="搜索姓名"><button id="creators-link-search" class="btn btn-outline-secondary" type="button">搜索</button></div>
+      <div id="creators-link-results" class="list-group mt-3" role="group" aria-label="选择对应 Lark 用户"></div>
+      <div id="creators-link-message" class="small mt-3" role="status" aria-live="polite"></div>
+      <div class="d-flex justify-content-end mt-4"><button id="creators-link-save" class="btn btn-primary" type="submit" disabled>关联并加入我的达人</button></div>
+    </form>
+  </dialog>
   <dialog id="creators-import-dialog" class="creator-evidence" aria-labelledby="creators-import-title"><div class="d-flex align-items-center gap-3 mb-3"><h3 id="creators-import-title" class="mb-0 me-auto">导入达人账号名单</h3><button type="button" id="creators-import-close" class="btn btn-sm btn-outline-secondary">关闭</button></div>
     <p>负责人：<strong id="creators-import-cm"></strong></p>
     <p class="text-secondary">一列 handle，每行一个，可带表头。导入后自动匹配。</p>
@@ -38,5 +51,5 @@
   </dialog>
 </div>
 <script id="creators-initial" type="application/json">{{ creator_data|tojson }}</script>
-<script src="/static/creator-handles.js?v=20261013-streamlined" defer></script>
+<script src="/static/creator-handles.js?v=20261013-manual-link" defer></script>
 {% endblock %}

@@ -9,7 +9,7 @@ import httpx
 from cryptography.fernet import InvalidToken
 from psycopg.types.json import Jsonb
 
-from . import contact_handles, creator_access
+from . import broadcast_content, contact_handles, creator_access
 from .config import get_settings
 from .creator_group_evidence import PURPOSES as GROUP_PURPOSES
 from .crypto import TokenCipher
@@ -24,9 +24,14 @@ SEND_SCOPES = ("im:message", "im:message.send_as_user")
 
 
 class BroadcastAuthorizationRequired(PermissionError):
-    def __init__(self, account_id):
-        super().__init__("请先完成本人群发授权。")
+    def __init__(self, account_id, *, media=False):
+        super().__init__("请先完成本人图片授权。" if media else "请先完成本人群发授权。")
         self.account_id = str(account_id)
+        self.media = media
+
+    @property
+    def authorization_url(self):
+        return f"/auth/lark/start?send=1&account_id={self.account_id}" + ("&media=1" if self.media else "")
 
 
 def preview_open():
@@ -277,7 +282,7 @@ def page_data(actor_id):
                 "templates": _templates(conn, actor_id)}
 
 
-def permission_check(actor_id, cm_id):
+def permission_check(actor_id, cm_id, *, media=False):
     """Check token acceptance and recorded grants, not external-group or @all sendability."""
     from .worker import ReauthorizationRequired, _authorization, _usable_access_token
 
@@ -293,14 +298,14 @@ def permission_check(actor_id, cm_id):
     result = {"status": "unavailable", "account_id": str(target) if target else None,
               "account_name": row["display_name"] or "未命名用户" if row else "",
               "is_self": True, "is_sender": True,
-              "missing_scopes": [], "authorization_url": None,
+              "missing_scopes": [], "authorization_url": None, "resource_authorized": False,
               "feature_enabled": owner or bool(actor_row and actor_row["broadcast_enabled"]),
               "message": "暂时无法核验本人授权。", "checked_at": datetime.now(UTC).isoformat()}
     if not row or row["status"] == "revoked" or not row["body_consent_at"]:
         result.update(status="needs_authorization", message="该账号尚未完成有效的聊天授权，请本人先完成接入。")
         return result
     settings = get_settings()
-    required = set(settings.oauth_scopes) | set(SEND_SCOPES)
+    required = set(settings.oauth_scopes) | set(SEND_SCOPES) | ({"im:resource"} if media else set())
     cipher = TokenCipher(settings.token_encryption_key)
     checked = row
     result["message"] = "暂时无法核验授权，请稍后重试。"
@@ -326,7 +331,8 @@ def permission_check(actor_id, cm_id):
                     result["message"] = "返回账号与选定账号不一致，已停止核验。"
                 else:
                     result["missing_scopes"] = sorted(required - set(checked["scopes"] or ()))
-                    missing = [{"im:message": "发送消息", "im:message.send_as_user": "以本人身份发送"}.get(scope, scope)
+                    missing = [{"im:message": "发送消息", "im:message.send_as_user": "以本人身份发送",
+                                "im:resource": "上传图片"}.get(scope, scope)
                                for scope in result["missing_scopes"]]
                     result.update(status="needs_authorization"
                                   if missing or checked["status"] != "active" else "ready",
@@ -358,7 +364,9 @@ def permission_check(actor_id, cm_id):
     )):
         result.update(status="unavailable", missing_scopes=[], message="授权已更新，请重新检查。")
     elif result["status"] == "needs_authorization":
-        result["authorization_url"] = f"/auth/lark/start?send=1&account_id={target}"
+        result["authorization_url"] = BroadcastAuthorizationRequired(target, media=media).authorization_url
+    result["resource_authorized"] = bool(result["status"] == "ready" and current
+                                        and "im:resource" in (current["scopes"] or ()))
     result["checked_at"] = datetime.now(UTC).isoformat()
     return result
 
@@ -592,6 +600,8 @@ def list_delete(actor_id, list_id, revision):
 
 
 def _message(value):
+    if isinstance(value, dict):
+        return broadcast_content.normalize(value)
     if not isinstance(value, str) or not value.strip() or len(value) > 4000 or "\x00" in value:
         raise ValueError("请填写 1–4,000 字符的消息。")
     try:
@@ -602,11 +612,12 @@ def _message(value):
 
 
 def _template_metadata(row):
-    return {"id": str(row["id"]), "name": row["name"], "body": row["body"], "revision": row["revision"]}
+    return {"id": str(row["id"]), "name": row["name"], "body": row.get("body_document") or row["body"],
+            "revision": row["revision"]}
 
 
 def _templates(conn, actor_id):
-    return [_template_metadata(row) for row in conn.execute("""SELECT id,name,body,revision
+    return [_template_metadata(row) for row in conn.execute("""SELECT id,name,body,body_document,revision
         FROM creator_broadcast_templates WHERE owner_authorization_id=%s AND deleted_at IS NULL
         ORDER BY updated_at DESC,id""", (creator_access.parse_id(actor_id),)).fetchall()]
 
@@ -623,6 +634,11 @@ def template_save(actor_id, fields):
             raise ValueError("模板名称包含无效字符。") from None
         body = _message(fields.get("body"))
         owner = creator_access.parse_id(actor_id)
+        document = body if isinstance(body, dict) else None
+        if document:
+            from . import broadcast_images
+            broadcast_images.resolve(conn, owner, broadcast_content.image_ids(document), get_settings())
+            body = broadcast_content.plain_text(document)
         if fields.get("id"):
             template_id = creator_access.parse_id(fields["id"])
             if not conn.execute("""SELECT 1 FROM creator_broadcast_templates
@@ -630,12 +646,14 @@ def template_save(actor_id, fields):
                 (template_id, owner)).fetchone():
                 raise LookupError("找不到该模板。")
             row = conn.execute("""UPDATE creator_broadcast_templates
-                SET name=%s,body=%s,revision=revision+1,updated_at=NOW()
+                SET name=%s,body=%s,body_document=%s,revision=revision+1,updated_at=NOW()
                 WHERE id=%s AND owner_authorization_id=%s AND revision=%s AND deleted_at IS NULL RETURNING *""",
-                (name.strip(), body, template_id, owner, _revision(fields.get("revision")))).fetchone()
+                (name.strip(), body, Jsonb(document) if document else None, template_id, owner,
+                 _revision(fields.get("revision")))).fetchone()
         else:
-            row = conn.execute("""INSERT INTO creator_broadcast_templates(name,body,owner_authorization_id)
-                VALUES(%s,%s,%s) RETURNING *""", (name.strip(), body, owner)).fetchone()
+            row = conn.execute("""INSERT INTO creator_broadcast_templates
+                (name,body,body_document,owner_authorization_id) VALUES(%s,%s,%s,%s) RETURNING *""",
+                (name.strip(), body, Jsonb(document) if document else None, owner)).fetchone()
         if not row:
             raise ValueError("模板已被修改或删除，请刷新后重试。")
         return {"template": _template_metadata(row), "templates": _templates(conn, actor_id)}
@@ -662,7 +680,7 @@ def preview(actor_id, cm_id, purpose, selections, message, mention):
         conn.execute("SET TRANSACTION READ ONLY")
         cm = _scope(conn, actor_id, cm_id)
         _purpose(purpose)
-        _message(message)
+        message = _message(message)
         if not isinstance(mention, bool):
             raise ValueError("@ 选项无效。")
         if purpose != "support":

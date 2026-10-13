@@ -31,6 +31,21 @@
 #broadcast-app #broadcast-notice:empty { display: none; }
 #broadcast-app #broadcast-notice { font-size: 13px; color: var(--tblr-secondary); }
 #broadcast-app .broadcast-message { background: var(--tblr-bg-surface-secondary); border-radius: 8px; padding: 16px; white-space: pre-wrap; overflow-wrap: anywhere; }
+#broadcast-app .broadcast-message p { margin: 0 0 .5rem; }
+#broadcast-app .broadcast-message p:last-child { margin-bottom: 0; }
+#broadcast-app .broadcast-message img { display: block; max-width: 100%; max-height: 320px; border-radius: 8px; margin: 12px 0; object-fit: contain; }
+#broadcast-app .broadcast-editor { border: 1px solid var(--tblr-border-color); border-radius: 10px; background: var(--tblr-bg-surface); overflow: hidden; }
+#broadcast-app .broadcast-editor .ql-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; border: 0; border-bottom: 1px solid var(--tblr-border-color); background: var(--tblr-bg-surface-secondary); padding: 7px 8px; }
+#broadcast-app .broadcast-editor .ql-container { border: 0; font: inherit; }
+#broadcast-app .broadcast-editor .ql-editor { min-height: 190px; max-height: 420px; padding: 14px; line-height: 1.6; color: var(--tblr-body-color); }
+#broadcast-app .broadcast-editor .ql-editor.ql-blank::before { color: var(--tblr-secondary); font-style: normal; left: 14px; }
+#broadcast-app .broadcast-editor .ql-editor img { display: block; max-width: 100%; max-height: 260px; margin: 10px 0; border-radius: 8px; }
+#broadcast-app .broadcast-editor .ql-editor img.is-selected { outline: 2px solid var(--tblr-primary); outline-offset: 3px; }
+#broadcast-app .broadcast-editor button:disabled, #broadcast-app .broadcast-editor select:disabled { opacity: .45; }
+#broadcast-app .broadcast-emoji { border: 0; background: transparent; width: 43px; height: 28px; font-size: 17px; cursor: pointer; }
+#broadcast-app .broadcast-editor-feedback, #broadcast-app .broadcast-image-actions { padding: 8px 12px; border-top: 1px solid var(--tblr-border-color); font-size: 13px; }
+#broadcast-app .broadcast-editor-feedback { color: var(--tblr-secondary); }
+#broadcast-app .broadcast-editor .ql-tooltip { z-index: 5; max-width: calc(100vw - 48px); }
 #broadcast-app .broadcast-dialog { width: min(760px, calc(100vw - 24px)); max-height: 85dvh; padding: 24px; border: 1px solid var(--tblr-border-color); border-radius: 12px; color: var(--tblr-body-color); background: var(--tblr-bg-surface); }
 #broadcast-app .broadcast-list-dialog { width: min(520px, calc(100vw - 24px)); }
 #broadcast-app .broadcast-dialog::backdrop { background: rgb(15 23 42 / 35%); }

@@ -82,7 +82,7 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
   const attack = '<img src=x onerror="window.compromised=true">';
   const contactId = "11111111-1111-4111-8111-111111111111";
   const data = {tab: "mine", cms: [{id: "cm-1", name: "CM"}], selected_cm_id: "cm-1", can_select_cm: true,
-    can_view_unassigned: true, can_view_importance: true, can_adjust_importance: true, can_edit_handles: true,
+    can_view_unassigned: true, can_view_importance: true, can_adjust_importance: true, can_edit_handles: true, can_link_people: true,
     read_only: false, import_batches: [{id: "batch-1", filename: "fixture.xlsx", status: "completed",
       status_label: "识别完成", counts: {confirmed: 2, review: 1}, can_recheck: true}],
     sort: "importance", tier: "", importance_running: true, page: 1, total_count: 3, total_pages: 1,
@@ -99,7 +99,7 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
     manual_tier: "", manual_reason: "",
   };
   const rendered = spawnSync(path.join(backend, ".venv/bin/python"), ["-c",
-    "import json,sys; from app.lark_api import private_chat_url; from jinja2 import Environment,FileSystemLoader,select_autoescape; data=json.load(sys.stdin); [item.update(private_chat_url=private_chat_url(item['open_id'])) for item in data['items']]; html=Environment(loader=FileSystemLoader('app/templates'),autoescape=select_autoescape()).get_template('creator_handles.html').render(authorization={'display_name':'CM'},creator_data=data,creator_tab='mine',creator_query='',csrf_token='fixture-csrf'); print(json.dumps({'data':data,'html':html}))"],
+    "import json,sys; from app.lark_api import private_chat_url; from jinja2 import Environment,FileSystemLoader,select_autoescape; data=json.load(sys.stdin); [item.update(private_chat_url=private_chat_url(item['open_id'])) for item in data['items']]; html=Environment(loader=FileSystemLoader('app/templates'),autoescape=select_autoescape()).get_template('creator_handles.html').render(authorization={'id':'cm-1','display_name':'CM'},creator_data=data,creator_tab='mine',creator_query='',csrf_token='fixture-csrf'); print(json.dumps({'data':data,'html':html}))"],
     {cwd: backend, input: JSON.stringify(data), encoding: "utf8"});
   assert.equal(rendered.status, 0, rendered.stderr);
   const fixture = JSON.parse(rendered.stdout), state = {data: fixture.data, calls: [], larkRequests: [], status: 200};
@@ -178,9 +178,25 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
     }
     if (request.method() === "POST" && target.pathname === `/creators/people/${contactId}/handle`) {
       const fields = new URLSearchParams(request.postData());
-      state.data.items[0].handles = state.data.items[0].handles.map(handle => handle === fields.get("old_handle") ? fields.get("handle") : handle);
+      const handles = state.data.items[0].handles;
+      state.data.items[0].handles = fields.get("operation") === "add" ? [...handles, fields.get("handle")]
+        : fields.get("operation") === "remove" ? handles.filter(handle => handle !== fields.get("old_handle"))
+        : handles.map(handle => handle === fields.get("old_handle") ? fields.get("handle") : handle);
       if (state.handleSaveGate) await state.handleSaveGate;
       return route.fulfill({json: {saved: true, handles: state.data.items[0].handles}});
+    }
+    if (target.pathname === "/creators/people/search") {
+      if (state.linkGate) await state.linkGate;
+      if (state.linkStatus) return route.fulfill({status: state.linkStatus, json: {error: "Fixture access revoked"}});
+      return route.fulfill({json: {cm_id: "cm-1", items: [
+        {contact_id: contactId, display_name: "Same Name", avatar_url: null, context_label: "Creator customer group", handles: []},
+        {contact_id: "22222222-2222-4222-8222-222222222222", display_name: "Same Name", avatar_url: null, context_label: "Private with Same Name", handles: []},
+      ]}});
+    }
+    if (request.method() === "POST" && target.pathname === "/creators/people/link") {
+      const fields = new URLSearchParams(request.postData());
+      if (!fields.get("old_contact_id")) state.data.items[0].handles.push(fields.get("handle"));
+      return route.fulfill({json: {saved: true, correction: Boolean(fields.get("old_contact_id"))}});
     }
     if (target.pathname === "/creators/data") {
       if (state.dataGate) await state.dataGate;
@@ -223,7 +239,7 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
   assert(!(await manual.evaluate(element => element.open)));
   const handleEditor = rows.first().locator(".creator-handle-editor");
   await handleEditor.locator("summary").press("Enter");
-  assert.deepEqual(await handleEditor.locator("option").allTextContents(), ["@one", "@one.alt"]);
+  assert.deepEqual(await handleEditor.getByRole("combobox", {name: "选择要修改的 handle", exact: true}).locator("option").allTextContents(), ["@one", "@one.alt"]);
   await handleEditor.getByRole("textbox", {name: "新 handle", exact: true}).fill("cancelled.edit");
   await handleEditor.getByRole("button", {name: "取消", exact: true}).click();
   assert(!(await handleEditor.evaluate(element => element.open)));
@@ -405,9 +421,10 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
   assert.equal(ranked.get("q"), "Creator"); assert.equal(ranked.get("sort"), "importance"); assert.equal(ranked.get("tier"), "focus");
   const mineView = {read_only: state.data.read_only, can_view_importance: state.data.can_view_importance,
     can_adjust_importance: state.data.can_adjust_importance, can_edit_handles: state.data.can_edit_handles,
+    can_link_people: state.data.can_link_people,
     import_batches: state.data.import_batches};
   Object.assign(state.data, {read_only: true, can_view_importance: false,
-    can_adjust_importance: false, can_edit_handles: false, import_batches: []});
+    can_adjust_importance: false, can_edit_handles: false, can_link_people: false, import_batches: []});
   await Promise.all([
     page.waitForResponse(response => response.url().includes("/creators/data?")
       && new URL(response.url()).searchParams.get("tab") === "unassigned"),
@@ -419,6 +436,7 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
   assert(!(await page.getByRole("combobox", {name: "负责人", exact: true}).isVisible()));
   assert(!(await page.locator('#creators-importance-toolbar').isVisible()));
   assert.equal(await page.locator('.creator-inline-editor:visible').count(), 0);
+  assert(!(await page.getByRole("button", {name: "手动关联", exact: true}).isVisible()));
   Object.assign(state.data, mineView);
   await page.getByRole("button", {name: "我的达人", exact: true}).click();
   await page.waitForFunction(() => document.querySelector('#creators-mine').getAttribute('aria-pressed') === 'true'
@@ -520,6 +538,75 @@ test("creator roster edits preserve sibling handles and permission-scoped profil
     assert.equal(await page.locator("#creators-cm option").count(), 0);
     assert(await page.locator("#creators-app").evaluate(app => [...app.querySelectorAll("button, input, select")].every(control => control.disabled)));
   }
+  state.status = 200; state.handleSaveGate = null;
+  Object.assign(state.data, {can_view_unassigned: false, can_select_cm: false, can_adjust_importance: false,
+    can_edit_handles: true, can_link_people: true, read_only: false, import_batches: []});
+  await page.reload(); await rows.first().waitFor();
+  await page.locator("#creators-refresh").click();
+  await page.waitForFunction(() => document.querySelector('#creators-unassigned').hidden);
+  assert.equal(await page.getByRole("button", {name: "更正 Lark 用户", exact: true}).count(), 0);
+  await page.getByRole("button", {name: "手动关联", exact: true}).click();
+  const manualLink = page.locator("#creators-link-dialog");
+  assert(!(await manualLink.getByRole("combobox", {name: "查找范围", exact: true}).isVisible()));
+  await manualLink.getByRole("textbox", {name: "TikTok handle", exact: true}).fill("manual.linked");
+  await manualLink.getByRole("searchbox", {name: "对应 Lark 用户", exact: true}).fill("Same");
+  await manualLink.getByRole("button", {name: "搜索", exact: true}).click();
+  const personChoice = manualLink.getByRole("button", {name: "Same Name · Creator customer group", exact: true});
+  await personChoice.click();
+  await manualLink.getByRole("searchbox", {name: "对应 Lark 用户", exact: true}).fill("Same Name");
+  assert(await manualLink.getByRole("button", {name: "关联并加入我的达人", exact: true}).isDisabled());
+  await manualLink.getByRole("button", {name: "搜索", exact: true}).click(); await personChoice.click();
+  if (process.env.OH_SCREENSHOT_DIR) {
+    await page.screenshot({path: path.join(process.env.OH_SCREENSHOT_DIR, "creator-manual-link.png")});
+    await page.setViewportSize({width: 390, height: 844});
+    assert(await manualLink.evaluate(element => {
+      const bounds = element.getBoundingClientRect(); return bounds.left >= 0 && bounds.right <= innerWidth;
+    }));
+    await page.screenshot({path: path.join(process.env.OH_SCREENSHOT_DIR, "creator-manual-link-mobile.png")});
+    await page.setViewportSize({width: 1280, height: 720});
+  }
+  await manualLink.getByRole("button", {name: "关联并加入我的达人", exact: true}).click();
+  await page.getByText("已关联并加入达人名单。", {exact: true}).waitFor();
+  const linked = new URLSearchParams(state.calls.findLast(call => call.url === "/creators/people/link").body);
+  assert.equal(linked.get("csrf_token"), "fixture-csrf"); assert.equal(linked.get("cm_id"), "cm-1");
+  assert.equal(linked.get("contact_id"), contactId); assert.equal(linked.get("handle"), "manual.linked");
+  assert.equal(linked.get("old_contact_id"), null);
+  await page.waitForFunction(() => document.querySelector('#creators-rows td').textContent.includes("@manual.linked"));
+  await handleEditor.locator("summary").click();
+  await handleEditor.getByRole("combobox", {name: "账号操作", exact: true}).selectOption("add");
+  await handleEditor.getByRole("textbox", {name: "新 handle", exact: true}).fill("manual.extra");
+  await handleEditor.getByRole("button", {name: "保存", exact: true}).click();
+  await page.waitForFunction(() => document.querySelector('#creators-rows td').textContent.includes("@manual.extra"));
+  await handleEditor.locator("summary").click();
+  await handleEditor.getByRole("combobox", {name: "账号操作", exact: true}).selectOption("remove");
+  await handleEditor.getByRole("combobox", {name: "选择要修改的 handle", exact: true}).selectOption("manual.extra");
+  assert(!(await handleEditor.getByRole("textbox", {name: "新 handle", exact: true}).isVisible()));
+  await handleEditor.getByRole("button", {name: "解除关联", exact: true}).click();
+  await page.waitForFunction(() => !document.querySelector('#creators-rows td').textContent.includes("@manual.extra"));
+  assert(state.data.items[0].handles.includes("one.alt") && state.data.items[0].handles.includes("worker.added"));
+  Object.assign(state.data, {can_view_unassigned: true, can_select_cm: true});
+  await page.reload(); await rows.first().waitFor();
+  await page.locator("#creators-refresh").click();
+  await page.waitForFunction(() => document.querySelector('#creators-rows td').textContent.includes("@manual.linked"));
+  await handleEditor.locator("summary").click();
+  await handleEditor.getByRole("button", {name: "更正 Lark 用户", exact: true}).click();
+  assert(await manualLink.getByRole("textbox", {name: "TikTok handle", exact: true}).evaluate(element => element.readOnly));
+  await manualLink.getByRole("searchbox", {name: "对应 Lark 用户", exact: true}).fill("Same");
+  await manualLink.getByRole("button", {name: "搜索", exact: true}).click();
+  await manualLink.getByRole("button", {name: "Same Name · Private with Same Name", exact: true}).click();
+  await manualLink.getByRole("button", {name: "保存更正", exact: true}).click();
+  await page.getByText("账号关联已更正。", {exact: true}).waitFor();
+  const corrected = new URLSearchParams(state.calls.findLast(call => call.url === "/creators/people/link").body);
+  assert.equal(corrected.get("old_contact_id"), contactId);
+  assert.equal(corrected.get("contact_id"), "22222222-2222-4222-8222-222222222222");
+  await page.getByRole("button", {name: "手动关联", exact: true}).click();
+  await manualLink.getByRole("searchbox", {name: "对应 Lark 用户", exact: true}).fill("Same");
+  state.linkStatus = 403;
+  await manualLink.getByRole("button", {name: "搜索", exact: true}).click();
+  await page.waitForFunction(() => !document.querySelectorAll('#creators-rows tr').length);
+  assert(!(await manualLink.evaluate(element => element.open)));
+  assert.equal(await manualLink.locator('#creators-link-results').textContent(), "");
+  assert.equal(await manualLink.locator('#creators-link-handle').inputValue(), "");
   assert.deepEqual(errors, []);
 });
 
@@ -903,6 +990,11 @@ test("broadcast waiting states preserve selections and drafts after request fail
   const page = await browser.newPage({viewport: {width: 1360, height: 1000}});
   const errors = [], calls = [], holds = new Map();
   let currentBatch = null, batchTargets = [];
+  const secondImageId = '55555555-5555-4555-8555-555555555555';
+  const imageId = '33333333-3333-4333-8333-333333333333';
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jC1sAAAAASUVORK5CYII=', 'base64');
+  const gifId = '66666666-6666-4666-8666-666666666666';
+  const gif = Buffer.from('R0lGODlhAQABAIAAAP///////yH5BAEAAAEALAAAAAABAAEAAAICRAEAOw==','base64');
   page.on("pageerror", error => errors.push(error.message));
   function hold(action) {
     let started, release;
@@ -918,14 +1010,16 @@ test("broadcast waiting states preserve selections and drafts after request fail
       return route.abort();
     }
     if (url.pathname === "/creators/broadcast") return route.fulfill({contentType: "text/html", body: rendered.stdout});
+    if (url.pathname === '/auth/lark/start') return route.fulfill({contentType:'text/html',body:'<p>Fixture authorization only</p>'});
     if (url.pathname.startsWith("/static/")) return route.fulfill({
       contentType: /\.(m?js)$/.test(url.pathname) ? "text/javascript" : "text/css",
       body: fs.readFileSync(path.join(backend, "app", url.pathname))});
     const action = url.pathname.replace("/creators/broadcast/", "");
+    if (req.method() === 'GET' && action.startsWith('images/')) return route.fulfill({contentType:action.endsWith(gifId) ? 'image/gif' : 'image/png',body:action.endsWith(gifId) ? gif : png});
     if (req.method() === "GET" && action === "batches") return route.fulfill({json: {batches: currentBatch ? [currentBatch] : []}});
     if (req.method() === "GET" && action.startsWith("batches/")) return route.fulfill({json: {batch: currentBatch, targets: batchTargets, message: currentBatch.message_body}});
     assert.equal(req.method(), "POST"); assert.equal(req.headers()["x-csrf-token"], "fixture-csrf");
-    calls.push({action, body: req.postDataJSON()});
+    calls.push({action, body: action === 'images' ? {size:req.postDataBuffer().length,type:req.headers()['content-type']} : req.postDataJSON()});
     const held = holds.get(action);
     assert(held, `Unexpected fixture request: ${url.pathname}`);
     held.started(); const response = await held.response; holds.delete(action);
@@ -934,7 +1028,7 @@ test("broadcast waiting states preserve selections and drafts after request fail
   await page.goto("http://localhost/creators/broadcast");
   await permissions.arrived;
   assert(!(await page.locator("#broadcast-workspace").evaluate(el => el.disabled)));
-  assert(!(await page.locator("#broadcast-message").isDisabled()));
+  assert.equal(await page.locator('#broadcast-message .ql-editor').getAttribute('contenteditable'),'true');
   assert.equal(await page.locator("#broadcast-permission-status").getAttribute("aria-busy"), "true");
   assert.equal(await page.locator("#broadcast-permission-status .ui-spinner").count(), 1);
   assert.equal(await page.locator("#broadcast-permission-status .ui-spinner").evaluate(el => getComputedStyle(el).animationName), "ui-spin");
@@ -985,7 +1079,7 @@ test("broadcast waiting states preserve selections and drafts after request fail
   assert(!(await page.locator("#broadcast-workspace").evaluate(el => el.disabled)));
 
   const message = "Hello, please check this week's offer.";
-  await page.locator("#broadcast-message").fill(message);
+  await page.locator('#broadcast-message .ql-editor').fill(message);
   await page.locator("#broadcast-template-new").click();
   await page.locator("#broadcast-template-name").fill("本周活动");
   const saving = hold("templates/save");
@@ -1000,8 +1094,8 @@ test("broadcast waiting states preserve selections and drafts after request fail
   assert(!(await page.locator("#broadcast-template-save").isDisabled()));
   assert(await page.locator("#broadcast-template-dialog").isVisible());
   assert.equal(await page.locator("#broadcast-template-name").inputValue(), "本周活动");
-  assert.equal(await page.locator("#broadcast-template-body").inputValue(), message);
-  assert.equal(await page.locator("#broadcast-message").inputValue(), message);
+  assert.equal((await page.locator('#broadcast-template-body .ql-editor').innerText()).trim(), message);
+  assert.equal((await page.locator('#broadcast-message .ql-editor').innerText()).trim(), message);
   assert.equal(await page.locator("[aria-busy='true']").count(), 0);
   assert.equal(await page.locator("html").getAttribute("data-ui-navigating"), null);
   assert.deepEqual(calls.map(call => call.action), ["permissions", "groups", "groups", "match", "templates/save"]);
@@ -1045,7 +1139,7 @@ test("broadcast waiting states preserve selections and drafts after request fail
   assert(await page.locator("#broadcast-send").isDisabled());
   failedSend.release({status: 503, json: {error: "发送任务响应中断，请重试确认。"}});
   await page.getByText("发送任务响应中断，请重试确认。", {exact: true}).waitFor();
-  assert.equal(await page.locator("#broadcast-message").inputValue(), message);
+  assert.equal((await page.locator('#broadcast-message .ql-editor').innerText()).trim(), message);
   const send = hold("send");
   await page.locator("#broadcast-send").click(); await send.arrived;
   const submissions = calls.filter(call => call.action === "send");
@@ -1070,7 +1164,7 @@ test("broadcast waiting states preserve selections and drafts after request fail
   const bodyPanel = page.locator("#broadcast-batch-message-panel");
   assert(!(await bodyPanel.evaluate(element => element.open)));
   await bodyPanel.locator("summary").click();
-  assert.equal(await page.locator("#broadcast-batch-message").textContent(), message);
+  assert.equal((await page.locator('#broadcast-batch-message').textContent()).trim(), message);
   currentBatch.can_retry = true;
   await page.locator("#broadcast-batch-refresh").click();
   await page.locator("#broadcast-batch-retry").waitFor({state: "visible"});
@@ -1098,7 +1192,7 @@ test("broadcast waiting states preserve selections and drafts after request fail
   await page.waitForFunction(() => !document.getElementById("broadcast-list-action-dialog").open);
   assert.equal(calls.filter(call => call.action === "permissions").length, permissionCalls);
   assert(await selected.isChecked());
-  assert.equal(await page.locator("#broadcast-message").inputValue(), message);
+  assert.equal((await page.locator('#broadcast-message .ql-editor').innerText()).trim(), message);
   const otherGroups = hold("groups");
   await page.locator("#broadcast-cm").selectOption(other);
   assert.equal(await page.locator("#broadcast-permission-account").textContent(), "发送账号：CM");
@@ -1114,6 +1208,131 @@ test("broadcast waiting states preserve selections and drafts after request fail
   await page.locator("#broadcast-confirm").waitFor({state: "visible"});
   assert(await page.locator("#broadcast-send").isDisabled());
   assert.equal(calls.filter(call => call.action === "prepare").length, 1);
+  await page.locator('#broadcast-back').click();
+  const ownGroups = hold('groups'); await page.locator('#broadcast-cm').selectOption(actor);
+  await ownGroups.arrived; ownGroups.release({json:groupResult}); await selected.check();
+  await page.locator('#broadcast-message .ql-editor').fill('New offer\nPlease check');
+  await page.evaluate(() => window.Quill.find(document.querySelector('#broadcast-message .ql-container')).setSelection(0,9));
+  await page.locator('#broadcast-message').getByRole('button',{name:'加粗',exact:true}).click();
+  await page.locator('#broadcast-message .broadcast-emoji').selectOption('🎉');
+  const failedUploadPermission = hold('permissions');
+  await page.locator('#broadcast-message input[type=file]').setInputFiles({name:'fixture.png',mimeType:'image/png',buffer:png});
+  await failedUploadPermission.arrived;
+  assert.equal(calls.at(-1).body.media,true);
+  const failedImage = hold('images');
+  failedUploadPermission.release({json:{status:'ready',resource_authorized:true,is_self:true}});
+  await failedImage.arrived;
+  assert(await page.locator('#broadcast-preview').isDisabled());
+  failedImage.release({status:503,json:{error:'图片未上传，请重试。'}});
+  await page.getByText('图片未上传，请重试。',{exact:false}).waitFor();
+  assert(await page.locator('#broadcast-preview').isDisabled());
+  const retryUploadPermission = hold('permissions');
+  await page.locator('#broadcast-message').getByRole('button',{name:'重试',exact:true}).click();
+  await retryUploadPermission.arrived;
+  const uploadedImage = hold('images');
+  retryUploadPermission.release({json:{status:'ready',resource_authorized:true,is_self:true}});
+  await uploadedImage.arrived;
+  uploadedImage.release({json:{image:{id:imageId,url:`/creators/broadcast/images/${imageId}`,mime_type:'image/png'}}});
+  await page.locator(`#broadcast-message img[data-asset-id="${imageId}"]`).waitFor();
+  assert.equal(calls.filter(call => call.action === 'images').length,2);
+  assert(calls.filter(call => call.action === 'images').every(call => call.body.size === png.length && call.body.type === 'image/png'));
+  const readDocument = () => page.evaluate(() => ({version:2,ops:window.Quill.find(document.querySelector('#broadcast-message .ql-container')).getContents().ops}));
+  const beforeMove = await readDocument();
+  await page.locator(`#broadcast-message img[data-asset-id="${imageId}"]`).click();
+  await page.locator('#broadcast-message').getByRole('button',{name:'下移',exact:true}).click();
+  assert.notDeepEqual((await readDocument()).ops,beforeMove.ops);
+  const pastedPermission = hold('permissions');
+  await page.evaluate(bytes => {
+    const editor = window.Quill.find(document.querySelector('#broadcast-message .ql-container'));
+    editor.setSelection(editor.getLength()-1,0);
+    const data = new DataTransfer(); data.items.add(new File([new Uint8Array(bytes)],'pasted.png',{type:'image/png'}));
+    editor.root.dispatchEvent(new ClipboardEvent('paste',{bubbles:true,clipboardData:data}));
+  },[...png]);
+  await pastedPermission.arrived;
+  const pastedImage = hold('images'); pastedPermission.release({json:{status:'ready',resource_authorized:true,is_self:true}});
+  await pastedImage.arrived; pastedImage.release({json:{image:{id:secondImageId,mime_type:'image/png'}}});
+  await page.locator(`#broadcast-message img[data-asset-id="${secondImageId}"]`).click();
+  await page.locator('#broadcast-message').getByRole('button',{name:'移除',exact:true}).click();
+  assert.equal(await page.locator('#broadcast-message img').count(),1);
+  await page.locator('#broadcast-template-new').click();
+  const templateImagePermission = hold('permissions');
+  await page.locator('#broadcast-template-body input[type=file]').setInputFiles({name:'failed-template.png',mimeType:'image/png',buffer:png});
+  await templateImagePermission.arrived;
+  const templateImage = hold('images'); templateImagePermission.release({json:{status:'ready',resource_authorized:true,is_self:true}});
+  await templateImage.arrived; templateImage.release({status:503,json:{error:'Template image upload failed'}});
+  await page.getByText('Template image upload failed',{exact:false}).waitFor();
+  assert(await page.locator('#broadcast-preview').isDisabled());
+  await page.locator('#broadcast-template-cancel').click(); await page.locator('#broadcast-list-action-proceed').click();
+  assert(!(await page.locator('#broadcast-preview').isDisabled()));
+  await page.locator('#broadcast-template-new').click();
+  await page.locator('#broadcast-template-name').fill('Rich fixture');
+  const savingRich = hold('templates/save'); await page.locator('#broadcast-template-save').click(); await savingRich.arrived;
+  const richTemplate = {id:'44444444-4444-4444-8444-444444444444',name:'Rich fixture',body:calls.at(-1).body.body,revision:1};
+  assert.equal(richTemplate.body.version,2); assert(richTemplate.body.ops.some(op => op.insert?.image === imageId));
+  assert(richTemplate.body.ops.some(op => op.attributes?.bold)); assert(richTemplate.body.ops.some(op => typeof op.insert === 'string' && op.insert.includes('🎉')));
+  savingRich.release({json:{template:richTemplate,templates:[richTemplate]}});
+  await page.waitForFunction(() => !document.getElementById('broadcast-template-dialog').open);
+  const richPermission = hold('permissions'), richPrepare = hold('prepare');
+  await page.locator('#broadcast-preview').click(); await richPermission.arrived;
+  richPermission.release({json:{status:'ready',resource_authorized:true,is_self:true}});
+  await richPrepare.arrived;
+  const richMessage = calls.at(-1).body.message;
+  assert.deepEqual(richMessage,richTemplate.body);
+  const richPreview = {...previewResult,message:richMessage,preview_id:'rich-preview',account_name:'CM',expires_at:'2030-01-01T00:00:00Z'};
+  richPrepare.release({json:richPreview}); await page.locator('#broadcast-confirm').waitFor({state:'visible'});
+  assert.equal(await page.locator('#broadcast-confirm-message img').getAttribute('src'),`/creators/broadcast/images/${imageId}`);
+  assert(await page.locator('#broadcast-confirm-message strong').count());
+  const richSend = hold('send'); await page.locator('#broadcast-send').click(); await richSend.arrived;
+  currentBatch = {...currentBatch,id:'rich-batch',status:'succeeded',total:1,succeeded:1,failed:0,unknown:0,pending:0,sending:0,cancelled:0,can_retry:false,message_body:richMessage};
+  batchTargets = [{chat_id:'oc_category',chat_name:'女装类目',status:'succeeded'}];
+  richSend.release({json:{batch:currentBatch}}); await page.locator('#broadcast-batch-message-panel').waitFor({state:'visible'});
+  await page.locator('#broadcast-batch-message-panel summary').click();
+  assert.equal(await page.locator('#broadcast-batch-message img').getAttribute('src'),`/creators/broadcast/images/${imageId}`);
+  assert(await page.locator('#broadcast-batch-message strong').count());
+  const pasted = await page.evaluate(() => window.Quill.find(document.querySelector('#broadcast-message .ql-container')).clipboard.convert({
+    html:'<p>Safe <img src="https://untrusted.invalid/picture.png"><a href="javascript:alert(1)">label</a><script>alert(1)</script></p>',text:''}).ops);
+  assert(pasted.every(op => typeof op.insert === 'string' && (!op.attributes?.link || /^https?:/.test(op.attributes.link))));
+  if (process.env.OH_SCREENSHOT_DIR) await page.screenshot({path:path.join(process.env.OH_SCREENSHOT_DIR,'broadcast-rich-history.png')});
+  await page.locator('#broadcast-batch-close').click();
+  const missingMedia = hold('permissions'); await page.locator('#broadcast-message').getByRole('button',{name:'添加图片',exact:true}).click();
+  await missingMedia.arrived;
+  missingMedia.release({json:{status:'needs_authorization',resource_authorized:false,is_self:true,
+    authorization_url:`/auth/lark/start?send=1&media=1&account_id=${actor}`}});
+  await page.waitForURL('**/auth/lark/start?**');
+  const savedDraft = await page.evaluate(() => JSON.parse(sessionStorage.getItem('ttmedia.broadcast.authorization-draft')));
+  assert.equal(savedDraft.version,2); assert.equal(savedDraft.actor_id,actor); assert.deepEqual(savedDraft.message,richMessage);
+  const sendCount = calls.filter(call => call.action === 'send').length;
+  const restoredPermission = hold('permissions'), restoredGroups = hold('groups');
+  await page.goto('http://localhost/creators/broadcast'); await restoredPermission.arrived;
+  restoredPermission.release({json:{status:'ready',feature_enabled:true,resource_authorized:true,account_name:'CM',is_self:true,is_sender:true}});
+  await restoredGroups.arrived; restoredGroups.release({json:groupResult});
+  await page.waitForFunction(() => document.getElementById('broadcast-group-items').getAttribute('aria-busy') === 'false');
+  assert.deepEqual(await readDocument(),richMessage); assert(await selected.isChecked());
+  assert.equal(calls.filter(call => call.action === 'send').length,sendCount);
+  const gifPermission = hold('permissions');
+  await page.evaluate(bytes => {
+    const editor = document.querySelector('#broadcast-message .ql-editor'), bounds = editor.getBoundingClientRect();
+    const data = new DataTransfer(); data.items.add(new File([new Uint8Array(bytes)],'fixture.gif',{type:'image/gif'}));
+    editor.dispatchEvent(new DragEvent('drop',{bubbles:true,dataTransfer:data,clientX:bounds.left+20,clientY:bounds.top+20}));
+  },[...gif]);
+  await gifPermission.arrived;
+  const gifUpload = hold('images'); gifPermission.release({json:{status:'ready',resource_authorized:true,is_self:true}});
+  await gifUpload.arrived; assert.equal(calls.at(-1).body.type,'image/gif');
+  gifUpload.release({json:{image:{id:gifId,mime_type:'image/gif'}}});
+  await page.locator(`#broadcast-message img[data-asset-id="${gifId}"]`).waitFor();
+  await page.evaluate(id => window.Quill.find(document.querySelector('#broadcast-message .ql-container')).setContents([{insert:{image:id}},{insert:'\n'}]),gifId);
+  assert(!(await page.locator('#broadcast-preview').isDisabled()));
+  const imageOnlyPermission = hold('permissions'), imageOnlyPrepare = hold('prepare');
+  await page.locator('#broadcast-preview').click(); await imageOnlyPermission.arrived;
+  imageOnlyPermission.release({json:{status:'ready',resource_authorized:true,is_self:true}}); await imageOnlyPrepare.arrived;
+  const imageOnly = calls.at(-1).body.message;
+  assert.equal(imageOnly.ops.filter(op => typeof op.insert !== 'string').length,1);
+  assert(!imageOnly.ops.some(op => typeof op.insert === 'string' && op.insert.trim()));
+  imageOnlyPrepare.release({json:{...richPreview,message:imageOnly,preview_id:'image-only-preview'}});
+  await page.locator('#broadcast-confirm').waitFor({state:'visible'});
+  assert.equal(await page.locator('#broadcast-confirm-message img').getAttribute('src'),`/creators/broadcast/images/${gifId}`);
+  assert.equal(calls.filter(call => call.action === 'send').length,sendCount);
+  await page.locator('#broadcast-back').click();
   assert.deepEqual(errors, []);
 });
 

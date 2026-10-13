@@ -1,10 +1,12 @@
 """One durable send workflow: no impersonation, repeat sends or blind timeout retries."""
 
+import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 from threading import Barrier
 from types import SimpleNamespace
 from uuid import uuid4
@@ -12,12 +14,13 @@ from uuid import uuid4
 import httpx
 import psycopg
 import pytest
+from PIL import Image
 from psycopg.rows import dict_row
 
-from app import creator_broadcast, worker
+from app import broadcast_content, broadcast_images, creator_broadcast, worker
 from app import creator_broadcast_delivery as delivery
 from app.crypto import TokenCipher, message_body_cipher
-from app.lark_api import LarkApiError, LarkProfile
+from app.lark_api import LarkApiError, LarkProfile, build_chat_post_payload
 
 
 def test_confirmed_delivery_is_scoped_idempotent_and_recoverable(pg, monkeypatch):
@@ -305,6 +308,130 @@ def test_confirmed_delivery_is_scoped_idempotent_and_recoverable(pg, monkeypatch
     assert not any(
         fields["message"] in str(row["metadata"]) for row in pg.execute("SELECT metadata FROM audit_events").fetchall()
     )
+
+
+def test_rich_content_upload_template_frozen_delivery_and_legacy_dedup(pg, tmp_path, monkeypatch):
+    settings = SimpleNamespace(oauth_scopes=("offline_access", "im:chat:read", "im:message:readonly"),
+        token_encryption_key=b"r" * 32, broadcast_image_dir=str(tmp_path / "images"))
+    cipher, actor, other = TokenCipher(settings.token_encryption_key), uuid4(), uuid4()
+    scopes = [*settings.oauth_scopes, *creator_broadcast.SEND_SCOPES, "im:resource"]
+    for who in (actor, other):
+        pg.execute("""INSERT INTO authorizations(id,open_id,display_name,access_token_ciphertext,
+            scopes,access_token_expires_at,body_consent_at,broadcast_enabled)
+            VALUES(%s,%s,'CM',%s,%s,NOW()+INTERVAL '1 hour',NOW(),TRUE)""",
+            (who, "ou_" + who.hex, cipher.encrypt(who.hex), scopes))
+    pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (other,))
+    pg.execute("INSERT INTO chats(chat_id,name) VALUES('oc_rich','Rich message group')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'oc_rich')", (actor,))
+    pg.execute("""INSERT INTO chat_group_classifications(chat_id,purpose,confirmed_by_authorization_id)
+        VALUES('oc_rich','category',%s)""", (actor,))
+    depth, uploaded, sent = 0, [], []
+
+    @contextmanager
+    def connect():
+        nonlocal depth
+        depth += 1
+        try:
+            yield pg
+        finally:
+            depth -= 1
+
+    class Client:
+        def __init__(self, received, *, http_client):
+            assert received is settings
+
+        def user_info(self, token):
+            assert depth == 0
+            return LarkProfile("ou_" + token, None, None, None)
+
+        def upload_message_image(self, token, content, filename, mime_type):
+            assert depth == 0 and token == actor.hex
+            uploaded.append(content)
+            return "img_fixture_rich"
+
+        def check_chat_send_access(self, token, chat_id, **kwargs):
+            assert depth == 0 and token == actor.hex and chat_id == "oc_rich"
+            return {"chat_name": "Rich message group", "member_count": 3}
+
+        def send_chat_post(self, token, chat_id, body, **kwargs):
+            assert depth == 0 and token == actor.hex
+            sent.append(build_chat_post_payload(chat_id, body, **kwargs))
+            return "om_fixture_" + str(len(sent))
+
+    def preview(who, cm, purpose, selections, message, mention):
+        assert cm == str(who)
+        return {"message": creator_broadcast._message(message), "purpose": purpose, "issues": [],
+            "groups": [{"id": item["chat_id"], "name": "Rich message group", "people": [],
+                        "mentions": [], "mention_all": mention} for item in selections]}
+
+    for module in (delivery, creator_broadcast, broadcast_images):
+        monkeypatch.setattr(module, "connection", connect)
+        monkeypatch.setattr(module, "get_settings", lambda: settings)
+    for module in (delivery, broadcast_images):
+        monkeypatch.setattr(module, "LarkClient", Client)
+    monkeypatch.setattr(creator_broadcast, "preview", preview)
+    original = BytesIO()
+    Image.new("RGB", (3, 4), "red").save(original, "GIF", save_all=True,
+        append_images=[Image.new("RGB", (3, 4), "blue")], duration=100, loop=0)
+    image = broadcast_images.upload(actor, original.getvalue(), "animation.gif")
+    document = {"version": 2, "ops": [
+        {"insert": "Announcement", "attributes": {"bold": True, "italic": True}},
+        {"insert": " Details", "attributes": {"link": "https://example.test/product", "underline": True}},
+        {"insert": "\nFirst item"}, {"insert": "\n", "attributes": {"list": "ordered"}},
+        {"insert": {"image": image["id"]}}, {"insert": "\n"}]}
+    document = broadcast_content.normalize(document)
+    with pytest.raises(PermissionError):
+        creator_broadcast.template_save(other, {"name": "Not my image", "body": document})
+    template = creator_broadcast.template_save(actor, {"name": "Campaign", "body": document})["template"]
+    assert template["body"] == document
+    fields = {"cm_id": str(actor), "purpose": "category", "selections": [{"chat_id": "oc_rich"}],
+              "message": template["body"], "mention": True}
+    prepared = delivery.prepare(actor, fields)
+    frozen = pg.execute("SELECT * FROM creator_broadcast_previews WHERE id=%s", (prepared["preview_id"],)).fetchone()
+    assert document != frozen["body_ciphertext"] and frozen["snapshot"]["image_ids"] == [image["id"]]
+    assert json.loads(message_body_cipher(settings.token_encryption_key).decrypt(frozen["body_ciphertext"])) == document
+    changed_style = json.loads(json.dumps(document))
+    changed_style["ops"][0]["attributes"].pop("bold")
+    styled = delivery.prepare(actor, {**fields, "message": changed_style})
+    assert pg.execute("SELECT fingerprint FROM creator_broadcast_previews WHERE id=%s",
+                      (styled["preview_id"],)).fetchone()["fingerprint"] != frozen["fingerprint"]
+    creator_broadcast.template_save(actor, {"id": template["id"], "revision": template["revision"],
+        "name": "Changed after preview", "body": "Not the frozen message"})
+    request_id = uuid4()
+    batch_id = delivery.submit(actor, prepared["preview_id"], request_id)["batch"]["id"]
+    assert delivery.submit(actor, prepared["preview_id"], request_id)["deduplicated"]
+    duplicate = delivery.prepare(actor, fields)
+    assert delivery.submit(actor, duplicate["preview_id"], uuid4())["batch"]["id"] == batch_id
+    delivery.run_claimed(delivery.claim_next(), settings)
+    assert delivery.claim_next() is None and len(sent) == 1 and uploaded == [original.getvalue()]
+    nodes = [node for row in json.loads(sent[0]["content"])["zh_cn"]["content"] for node in row]
+    assert {"tag": "at", "user_id": "all", "user_name": "all"} in nodes
+    assert any(node.get("style") == ["bold", "italic"] and node["text"] == "Announcement" for node in nodes)
+    assert any(node.get("href") == "https://example.test/product" for node in nodes)
+    assert {"tag": "text", "text": "1. "} in nodes
+    assert {"tag": "img", "image_key": "img_fixture_rich"} in nodes
+    receipt = delivery.batch(actor, batch_id)
+    assert receipt["message"] == document and receipt["batch"]["succeeded"] == 1
+    assert delivery.history(actor)["batches"][0]["id"] == batch_id
+    # A later resource revocation stops a queued rich send, without retrying or dropping its image.
+    another = delivery.prepare(actor, {**fields, "message": changed_style})
+    blocked_id = delivery.submit(actor, another["preview_id"], uuid4())["batch"]["id"]
+    pg.execute("UPDATE authorizations SET scopes=%s WHERE id=%s", (scopes[:-1], actor))
+    delivery.run_claimed(delivery.claim_next(), settings)
+    assert delivery.batch(actor, blocked_id)["batch"]["failed"] == 1 and len(sent) == 1
+    assert delivery.batch(actor, blocked_id)["message"] == changed_style
+    # Text-only messages keep working without im:resource and deduplicate against the legacy representation.
+    plain = "Legacy plain announcement"
+    legacy = delivery.prepare(actor, {**fields, "message": plain})
+    legacy_id = delivery.submit(actor, legacy["preview_id"], uuid4())["batch"]["id"]
+    delivery.run_claimed(delivery.claim_next(), settings)
+    rich_plain = delivery.prepare(actor, {**fields, "message": broadcast_content.normalize(plain)})
+    same = delivery.submit(actor, rich_plain["preview_id"], uuid4())
+    assert same["batch"]["id"] == legacy_id and same["deduplicated"] and len(sent) == 2
+    assert delivery.batch(actor, legacy_id)["message"] == plain and delivery.claim_next() is None
+    pg.execute("UPDATE creator_broadcast_images SET created_at=NOW()-INTERVAL '8 days'")
+    assert broadcast_images.cleanup(settings) == 0
+    assert broadcast_images.read(actor, image["id"])[0] == original.getvalue() and len(uploaded) == 1
 
 
 def test_literal_post_and_safe_send_errors_do_not_require_database(monkeypatch):

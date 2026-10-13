@@ -230,6 +230,7 @@ def test_reauthorization_restarts_an_active_job_with_a_new_generation() -> None:
     ("send", False, "active", False),
     ("send", False, "attention_required", False),
     ("send", False, "active", True),
+    ("media", False, "active", True),
 ))
 def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapping_grants(
     pg, monkeypatch, caplog, upgrade, owner, initial_status, broadcast_enabled,  # noqa: F811
@@ -238,9 +239,11 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
         "offline_access", "im:chat:read", "im:message:readonly", "im:chat.members:read",
         "contact:contact.base:readonly", "contact:user.base:readonly",
     )
-    send = upgrade == "send"
+    send = upgrade in {"send", "media"}
     initial_scopes = scopes + ("contact:user.email:readonly",) if send else scopes[:4]
     upgrade_scopes = tuple(dict.fromkeys((*scopes, *initial_scopes, *main.SEND_OAUTH_SCOPES))) if send else scopes
+    if upgrade == "media":
+        upgrade_scopes += ("im:resource",)
     settings = Settings(
         database_url="fixture", lark_app_id="fixture-app", lark_app_secret="fixture-secret",
         lark_redirect_uri="https://testserver/auth/lark/callback", token_encryption_key=b"o" * 32,
@@ -392,8 +395,11 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
                                   follow_redirects=False).status_code == 403
                 assert not pg.execute("SELECT 1 FROM oauth_states").fetchone()
             for params, requested, target in (
-                ({"send": "1"}, upgrade_scopes, actor),
-                ({"send": "1", "account_id": str(actor)}, upgrade_scopes, actor),
+                ({"send": "1", **({"media": "1"} if upgrade == "media" else {})}, upgrade_scopes, actor),
+                ({"send": "1", "account_id": str(actor), **({"media": "1"} if upgrade == "media" else {})},
+                 upgrade_scopes, actor),
+                ({"send": "1", "media": "1", "account_id": str(actor)},
+                 tuple(dict.fromkeys((*upgrade_scopes, "im:resource"))), actor),
                 ({}, scopes, None),
             ):
                 response = client.get("/auth/lark/start", params=params, follow_redirects=False)
@@ -403,6 +409,7 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
                 assert row["requested_scopes"] == list(requested) and row["authorization_id"] == target
                 pg.execute("DELETE FROM oauth_states")
                 assert settings.oauth_scopes == scopes and snapshot() == before_start
+            assert client.get("/auth/lark/start?media=1", follow_redirects=False).status_code == 400
         pg.execute("UPDATE authorizations SET status=%s WHERE id=%s", (initial_status, actor))
         assert snapshot() == original
         current = pg.execute("SELECT * FROM authorizations WHERE id=%s", (actor,)).fetchone()

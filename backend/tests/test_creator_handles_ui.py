@@ -17,6 +17,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from app import (
     admin_permissions,
+    broadcast_images,
     contact_handles,
     creator_broadcast,
     creator_broadcast_delivery,
@@ -50,7 +51,49 @@ def browser(monkeypatch, *, owner=False, active=True):
     return TestClient(app), actor
 
 
-def test_owner_handle_correction_preserves_siblings_history_and_all_cm_responsibilities(pg, monkeypatch):
+def test_image_endpoints_require_session_csrf_bounds_and_private_reads(monkeypatch):
+    client, actor = browser(monkeypatch)
+    asset, other = uuid4(), uuid4()
+    calls = []
+    def upload(who, content, filename):
+        calls.append((who, content, filename))
+        return {"id": str(asset), "url": f"/creators/broadcast/images/{asset}"}
+    monkeypatch.setattr(broadcast_images, "upload", upload)
+    monkeypatch.setattr(broadcast_images, "MAX_BYTES", 10)
+    path = "/creators/broadcast/images"
+    headers = {"Content-Type": "image/png", "X-CSRF-Token": "csrf", "X-Filename": "a%20b.png"}
+    assert client.post(path, content=b"png", headers={"Content-Type": "image/png"}).status_code == 400
+    assert client.post(path, content=b"svg", headers={**headers, "Content-Type": "image/svg+xml"}).status_code == 400
+    assert client.post(path, content=b"x" * 11, headers=headers).status_code == 400
+    assert not calls
+    assert client.post(path, content=b"png", headers=headers).json()["image"]["id"] == str(asset)
+    assert calls == [(actor["id"], b"png", "a b.png")]
+    def missing(*args):
+        raise creator_broadcast.BroadcastAuthorizationRequired(actor["id"], media=True)
+    monkeypatch.setattr(broadcast_images, "upload", missing)
+    blocked = client.post(path, content=b"png", headers=headers)
+    assert blocked.status_code == 403 and "media=1" in blocked.json()["authorization_url"]
+    def failed(*args):
+        raise LarkApiError(503, None, "provider-private-error")
+    monkeypatch.setattr(broadcast_images, "upload", failed)
+    failure = client.post(path, content=b"png", headers=headers)
+    assert failure.status_code == 502 and "provider-private-error" not in failure.text
+    def read(who, image_id):
+        assert who == actor["id"]
+        if image_id != asset:
+            raise PermissionError("图片不属于本人。")
+        return b"private-original", "image/png"
+    monkeypatch.setattr(broadcast_images, "read", read)
+    result = client.get(f"{path}/{asset}")
+    assert result.content == b"private-original" and "no-store" in result.headers["cache-control"]
+    assert result.headers["x-content-type-options"] == "nosniff"
+    assert client.get(f"{path}/{other}").status_code == 403
+    actor["status"] = "revoked"
+    assert client.get(f"{path}/{asset}").status_code == 403
+    assert client.post(path, content=b"png", headers=headers).status_code == 403
+
+
+def test_manual_handle_workflow_preserves_siblings_history_and_all_cm_responsibilities(pg, monkeypatch):
     client, actor = browser(monkeypatch, owner=True)
     owner = actor["id"]
     cm, second_cm, manager = uuid4(), uuid4(), uuid4()
@@ -60,8 +103,8 @@ def test_owner_handle_correction_preserves_siblings_history_and_all_cm_responsib
     pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (owner,))
     pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission) VALUES(%s,'creator-manage')",
                (manager,))
-    person, empty_person, legacy_person, foreign_person = (uuid4() for _ in range(4))
-    for contact in (person, empty_person, legacy_person, foreign_person):
+    person, empty_person, legacy_person, foreign_person, unassigned_person = (uuid4() for _ in range(5))
+    for contact in (person, empty_person, legacy_person, foreign_person, unassigned_person):
         pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,'Creator')", (contact,))
         pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) "
                    "VALUES(%s,'creator','confirmed','manual')", (contact,))
@@ -116,7 +159,7 @@ def test_owner_handle_correction_preserves_siblings_history_and_all_cm_responsib
     assert client.post(url, data={**fields, "csrf_token": "bad"}).status_code == 400
     for current_actor in (cm, manager):
         actor["id"] = current_actor
-        assert client.post(url, data={**fields, "actor_id": str(owner)}).status_code == 403
+        assert client.post(url, data={**fields, "cm_id": str(second_cm)}).status_code == 403
     actor.update(id=owner, status="revoked")
     assert client.post(url, data=fields).status_code == 403
     actor["status"] = "active"
@@ -183,6 +226,80 @@ def test_owner_handle_correction_preserves_siblings_history_and_all_cm_responsib
     assert pg.execute("SELECT reviewed_by_authorization_id FROM contact_social_accounts "
                       "WHERE contact_id=%s AND social_account_id=%s", (legacy_person, accounts["legacy_old"])
                       ).fetchone()["reviewed_by_authorization_id"] == owner
+
+    # A CM can maintain their own person without receiving global creator management.
+    actor["id"] = cm
+    responsibilities = pg.execute("SELECT * FROM contact_assignments ORDER BY id").fetchall()
+    added = {**fields, "operation": "add", "old_handle": "", "handle": "cm_extra"}
+    assert client.post(url, data=added).status_code == 200
+    assert client.post(url, data=added).status_code == 200
+    replaced = {**fields, "operation": "replace", "old_handle": "sibling", "handle": "cm_current"}
+    assert client.post(url, data=replaced).status_code == 200
+    assert client.post(url, data={**added, "operation": "remove", "old_handle": "cm_extra", "handle": ""}
+                       ).status_code == 200
+    assert pg.execute("SELECT * FROM contact_assignments ORDER BY id").fetchall() == responsibilities
+    for responsible in (cm, second_cm):
+        assert "cm_current" in contact_handles.for_contacts(pg, [person], responsible)[person]
+        assert "cm_extra" not in contact_handles.for_contacts(pg, [person], responsible)[person]
+    assert creator_imports._conflicts(pg, [(None, person, "cm_extra")]) == [True]
+    assert client.post(url, data={**added, "handle": "old_handle"}).status_code == 403
+    assert client.post(f"/creators/people/{unassigned_person}/handle", data=added).status_code == 403
+
+    # Direct association uses visible Lark people and never silently steals an occupied account.
+    new_person = uuid4()
+    pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,'Same Name')", (new_person,))
+    for contact in (person, empty_person, legacy_person, foreign_person, new_person):
+        pg.execute("INSERT INTO lark_identities(open_id,contact_id,display_name,identity_type,"
+                   "tenant_classification,avatar_url) "
+                   "VALUES(%s,%s,'Same Name','user','known_external','https://img.feishucdn.com/fixture-avatar')",
+                   ("ou_person_" + contact.hex, contact))
+    pg.execute("""INSERT INTO lark_identities(open_id,contact_id,display_name,identity_type,tenant_classification,
+        avatar_url,last_seen_at) VALUES('ou_private_alias',%s,'Same Name','user','known_external',
+        'https://img.feishucdn.com/private-avatar',NOW()+INTERVAL '1 hour')""", (person,))
+    pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('manual-visible','Visible Creator Group','group')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'manual-visible')", (cm,))
+    for contact in (person, empty_person, legacy_person, new_person):
+        pg.execute("INSERT INTO chat_members(chat_id,open_id,member_type) VALUES('manual-visible',%s,'user')",
+                   ("ou_person_" + contact.hex,))
+    found = client.get(f"/creators/people/search?cm_id={cm}&q=Same").json()
+    assert {row["contact_id"] for row in found["items"]} == {
+        str(person), str(empty_person), str(legacy_person), str(new_person)}
+    assert all(row["avatar_url"] and row["context_label"] == "Visible Creator Group" for row in found["items"])
+    assert next(row for row in found["items"] if row["contact_id"] == str(person)
+                )["open_id"] == "ou_person_" + person.hex
+    assert client.get(f"/creators/people/search?cm_id={second_cm}&q=Same").status_code == 403
+    link = {"csrf_token": "csrf", "cm_id": str(cm), "handle": "newly_linked", "contact_id": str(new_person)}
+    assert client.post("/creators/people/link", data={**link, "csrf_token": "bad"}).status_code == 400
+    assert client.post("/creators/people/link", data={**link, "contact_id": str(foreign_person)}).status_code == 403
+    assert client.post("/creators/people/link", data={**link, "cm_id": str(second_cm)}).status_code == 403
+    assert client.post("/creators/people/link", data=link).status_code == 200
+    assert client.post("/creators/people/link", data=link).status_code == 200
+    assert pg.execute("SELECT count(*) n FROM contact_assignments WHERE contact_id=%s "
+                      "AND responsible_authorization_id=%s "
+                      "AND ended_at IS NULL", (new_person, cm)).fetchone()["n"] == 1
+    assert pg.execute("SELECT status,reviewed_by_authorization_id FROM contact_roles WHERE contact_id=%s "
+                      "AND role='creator'", (new_person,)).fetchone() == {
+        "status": "confirmed", "reviewed_by_authorization_id": cm}
+    assert next(row for row in contact_handles.confirmed_pairs(pg, [new_person])
+                if row["handle"] == "newly_linked")["human_confirmed"]
+    correction = {**link, "handle": "cm_current", "contact_id": str(empty_person), "old_contact_id": str(person)}
+    assert client.post("/creators/people/link", data=correction).status_code == 403
+    assert client.post("/creators/people/link", data={**correction, "old_contact_id": ""}).status_code == 400
+    actor["id"] = owner
+    before_correction = pg.execute("SELECT * FROM contact_assignments ORDER BY id").fetchall()
+    assert client.post("/creators/people/link", data=correction).status_code == 200
+    assert pg.execute("SELECT * FROM contact_assignments ORDER BY id").fetchall() == before_correction
+    assert "cm_current" not in contact_handles.for_contacts(pg, [person])[person]
+    assert "cm_current" in contact_handles.for_contacts(pg, [empty_person])[empty_person]
+    assert creator_imports._conflicts(pg, [(None, person, "cm_current")]) == [True]
+    corrected = facts()
+    assert client.post("/creators/people/link", data=correction).status_code == 400
+    assert facts() == corrected
+    actor["id"] = cm
+    pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s "
+               "AND chat_id='manual-visible'", (cm,))
+    assert not client.get(f"/creators/people/search?cm_id={cm}&q=Same").json()["items"]
+    assert client.post("/creators/people/link", data={**link, "handle": "hidden_link"}).status_code == 403
 
 
 def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypatch):
@@ -322,7 +439,7 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
             "A non-Owner roster decrypted the manual reason"))
         personal = client.get("/creators/data").json()
     assert personal["tab"] == "mine" and personal["total_count"] == 1
-    assert not personal["can_adjust_importance"] and not personal["can_edit_handles"]
+    assert not personal["can_adjust_importance"] and personal["can_edit_handles"] and personal["can_link_people"]
     assert personal["items"][0]["importance"]["manual_reason"] == ""
     assert client.get("/creators/data?tab=candidates").json()["tab"] == "mine"
     assert client.get("/creators/data?tab=unassigned").status_code == 403
@@ -642,8 +759,9 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
             reads.append(sql)
             if "creator_broadcast_templates" in sql:
                 if sql.startswith("INSERT"):
-                    name, body, owner = params
-                    item = {"id": uuid4(), "name": name, "body": body, "owner_authorization_id": owner,
+                    name, body, document, owner = params
+                    item = {"id": uuid4(), "name": name, "body": body,
+                            "body_document": document.obj if document else None, "owner_authorization_id": owner,
                             "revision": 1, "deleted_at": None}
                     saved_templates[str(item["id"])] = item
                     return Rows([dict(item)])
@@ -655,7 +773,8 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
                     if "SET deleted_at" in sql:
                         item["deleted_at"] = True
                     else:
-                        item.update(name=params[0], body=params[1])
+                        item.update(name=params[0], body=params[1],
+                                    body_document=params[2].obj if params[2] else None)
                     item["revision"] += 1
                     return Rows([dict(item)])
                 if "WHERE id=%s" in sql:

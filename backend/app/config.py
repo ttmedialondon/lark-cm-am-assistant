@@ -73,6 +73,7 @@ class Settings:
     lark_sync_per_authorization_max_inflight: int = 2
     lark_member_snapshot_max_inflight: int = 1
     broadcast_preview_until: datetime | None = None
+    broadcast_image_dir: str = "/var/lib/lark-message-stats/broadcast-images"
 
     @property
     def app_secret_configured(self) -> bool:
@@ -127,4 +128,7 @@ def get_settings() -> Settings:
         ),
         lark_member_snapshot_max_inflight=_positive_int("LARK_MEMBER_SNAPSHOT_MAX_INFLIGHT", 1, 1),
         broadcast_preview_until=preview_until,
+        broadcast_image_dir=os.environ.get(
+            "BROADCAST_IMAGE_DIR", "/var/lib/lark-message-stats/broadcast-images"
+        ).strip(),
     )

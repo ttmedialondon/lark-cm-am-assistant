@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}群发消息 · TT Media{% endblock %}
-{% block extra_head %}<link rel="stylesheet" href="/static/creator-broadcast.css?v=20261009-send">{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="/static/vendor/quill-2.0.3/quill.snow.css"><link rel="stylesheet" href="/static/creator-broadcast.css?v=20261013-rich"><script src="/static/vendor/quill-2.0.3/quill.js" defer></script>{% endblock %}
 {% block body %}
 <div class="page business-page" id="broadcast-app" data-csrf="{{ csrf_token }}" data-actor="{{ authorization.id }}">
   {% with business_section='broadcast' %}{% include "partials/business_nav.html" %}{% endwith %}
@@ -44,10 +44,9 @@
         <div class="card broadcast-composer"><div class="card-body">
           <h3 class="card-title broadcast-section-title" id="message-title">消息</h3>
           <div class="broadcast-template-toolbar mb-3"><label class="visually-hidden" for="broadcast-template-select">消息模板</label><select class="form-select" id="broadcast-template-select"><option value="">选择消息模板</option></select><button class="btn btn-outline-secondary" id="broadcast-template-edit" type="button" disabled>编辑</button><button class="btn btn-outline-primary" id="broadcast-template-new" type="button">新建</button></div>
-          <label class="form-label" for="broadcast-message">消息正文</label>
-          <textarea class="form-control" id="broadcast-message" rows="7" maxlength="4000" placeholder="输入通知，支持换行和链接"></textarea>
+          <label class="form-label" id="broadcast-message-label">消息正文</label>
+          <div class="broadcast-editor" id="broadcast-message" data-label="消息正文" aria-labelledby="broadcast-message-label"></div>
           <label class="form-check mt-3"><input class="form-check-input" id="broadcast-mention" type="checkbox" checked><span class="form-check-label" id="broadcast-mention-label">@ 所选达人</span></label>
-          <div class="broadcast-message mt-3" aria-label="消息预览"><div id="broadcast-mention-preview" class="text-primary mb-1"></div><div id="broadcast-message-preview">输入消息后预览</div></div>
           <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mt-4"><span id="broadcast-summary" class="text-secondary" aria-live="polite">尚未选择对象</span><button class="btn btn-primary" id="broadcast-preview" type="button" disabled>预览群发</button></div>
         </div></div>
       </section>
@@ -69,7 +68,7 @@
     <form id="broadcast-template-form">
       <div class="broadcast-heading mb-3"><h3 class="mb-0" id="broadcast-template-title">新建消息模板</h3><button class="btn btn-sm btn-outline-secondary" id="broadcast-template-cancel" type="button">关闭</button></div>
       <label class="form-label" for="broadcast-template-name">模板名称</label><input class="form-control mb-3" id="broadcast-template-name" required maxlength="80" placeholder="例如：女装活动通知">
-      <label class="form-label" for="broadcast-template-body">消息正文</label><textarea class="form-control" id="broadcast-template-body" required rows="8" maxlength="4000" placeholder="输入可重复使用的消息"></textarea>
+      <label class="form-label" id="broadcast-template-body-label">消息正文</label><div class="broadcast-editor" id="broadcast-template-body" data-label="模板正文" aria-labelledby="broadcast-template-body-label"></div>
       <div class="small text-danger mt-2" id="broadcast-template-error" role="alert"></div>
       <div class="d-flex justify-content-between gap-2 mt-4"><button class="btn btn-ghost-danger" id="broadcast-template-delete" type="button" hidden>删除模板</button><button class="btn btn-primary ms-auto" id="broadcast-template-save" type="submit">保存并使用</button></div>
     </form>
@@ -106,5 +105,5 @@
   </dialog>
 </div>
 <script id="broadcast-config" type="application/json">{{ broadcast_data | tojson }}</script>
-<script type="module" src="/static/creator-broadcast.mjs?v=20261013-streamlined"></script>
+<script type="module" src="/static/creator-broadcast.mjs?v=20261013-rich"></script>
 {% endblock %}

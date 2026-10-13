@@ -24,6 +24,10 @@
 
 群可见性来自 Lark 群发现快照，不是实时发送资格。实际 @ 全体仍受群设置约束，外部群本人发送需单独验收：[获取已加入群](https://open.larksuite.com/document/server-docs/group/chat/list)、[群信息与 @ 权限](https://open.larksuite.com/document/server-docs/group/chat/get)、[消息与 @ FAQ](https://open.larksuite.com/document/server-docs/im-v1/faq)。
 
+2026-10-13 群发正文与模板支持加粗、斜体、下划线、删除线、简单列表、链接、Emoji 与最多 5 张图片（JPEG、PNG、WebP、GIF；每张不超过 10 MB）。图片仅在使用时补充本人 `im:resource` 授权，私有原图加密保存，上传一次后可在本人模板和多群消息中复用；不提供任意字体字号或个人贴纸收藏。文字、格式、图片顺序和 @ 一起冻结并参与防重，每群仍为一条消息，旧纯文字记录兼容。
+
+CM 在“我的达人”可以维护本人负责达人的多个账号，也可搜索本人可见的 Lark 用户“关联并加入我的达人”。手动操作不依赖 AI 或 Curva，不改变其他负责人。一个 handle 正式归属一个联系人；跨人纠错仅由 Owner 显式执行，旧错误关系保留拒绝记录，不能仅凭同名自动合并人员。
+
 2026-09-14 的达人清空、CAP 名单和关闭 AI 记录是历史操作，不代表当前功能状态；恢复与清理边界见对应历史文档。
 
 ## 开发与运行

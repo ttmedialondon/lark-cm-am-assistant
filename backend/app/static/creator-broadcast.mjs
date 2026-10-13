@@ -1,4 +1,5 @@
 // Sending uses a frozen, server-rechecked preview and an idempotent request ID.
+import {createEditor, messageDocument, messageKey, hasMessage, imageCount, renderMessage} from './broadcast-editor.mjs';
 export function recipients(entries, routes, groups, purpose) {
   const rows = new Map();
   for (const entry of entries) {
@@ -58,10 +59,12 @@ export function authorizationUrl(value, actor, origin) {
   const url = new URL(value, origin);
   if (url.origin !== origin || url.pathname !== '/auth/lark/start' || url.hash || url.username || url.password
       || url.searchParams.get('send') !== '1' || url.searchParams.get('account_id') !== actor
-      || [...url.searchParams.keys()].some(key => !['send','account_id'].includes(key))) {
+      || (url.searchParams.has('media') && url.searchParams.get('media') !== '1')
+      || [...url.searchParams.keys()].some(key => !['send','account_id','media'].includes(key))
+      || ['send','account_id','media'].some(key => url.searchParams.getAll(key).length > 1)) {
     throw new Error('授权账号不一致，请重新检查。');
   }
-  return `/auth/lark/start?${new URLSearchParams({send:'1',account_id:actor})}`;
+  return `/auth/lark/start?${new URLSearchParams({send:'1',...(url.searchParams.has('media') ? {media:'1'} : {}),account_id:actor})}`;
 }
 export function parseDraft(raw, actor, now = Date.now(), canSelectCm = true) {
   if (typeof raw !== 'string' || raw.length > 300000) throw new Error('授权草稿无效。');
@@ -70,11 +73,12 @@ export function parseDraft(raw, actor, now = Date.now(), canSelectCm = true) {
   const id = value => typeof value === 'string' && uuid.test(value);
   const chat = value => text(value,256) && Boolean(value.trim());
   const age = now - draft?.created_at;
-  if (!draft || draft.version !== 1 || draft.actor_id !== actor || typeof draft.created_at !== 'number'
+  if (!draft || ![1,2].includes(draft.version) || draft.actor_id !== actor || typeof draft.created_at !== 'number'
       || !Number.isFinite(age) || age < 0 || age > 1800000
       || (!['all',''].includes(draft.cm_id) && !id(draft.cm_id)) || (!canSelectCm && draft.cm_id !== actor)
       || !['support','community','training','category','campaign','custom'].includes(draft.purpose)
-      || typeof draft.mention !== 'boolean' || !text(draft.raw,65536) || !text(draft.message,4000)
+      || typeof draft.mention !== 'boolean' || !text(draft.raw,65536)
+      || (draft.version === 1 && !text(draft.message,4000))
       || (draft.fixed_ids !== null && (!Array.isArray(draft.fixed_ids) || draft.fixed_ids.length > 500
         || !draft.fixed_ids.every(id)))
       || !Array.isArray(draft.selected_groups) || draft.selected_groups.length > 500 || !draft.selected_groups.every(chat)) throw new Error('授权草稿已失效。');
@@ -84,8 +88,16 @@ export function parseDraft(raw, actor, now = Date.now(), canSelectCm = true) {
       || !draft.fixed_targets.every(target => target && ids.includes(target.contact_id) && text(target.chat_id,256)))) {
     throw new Error('草稿接收对象无效，请重新选择。');
   }
-  return {version:1,actor_id:actor,created_at:draft.created_at,cm_id:draft.cm_id,purpose:draft.purpose,
-    mention:draft.mention,raw:draft.raw,message:draft.message,fixed_ids:ids,
+  const message = draft.version === 1 ? draft.message : messageDocument(draft.message);
+  let template = null;
+  if (draft.template) {
+    const value = draft.template;
+    if (!text(value.name,80) || (value.id != null && !id(value.id))
+        || (value.id != null && (!Number.isInteger(value.revision) || value.revision < 1))) throw new Error('模板草稿无效。');
+    template = {id:value.id || null,revision:value.revision || null,name:value.name,body:messageDocument(value.body)};
+  }
+  return {version:draft.version,actor_id:actor,created_at:draft.created_at,cm_id:draft.cm_id,purpose:draft.purpose,
+    mention:draft.mention,raw:draft.raw,message,template,fixed_ids:ids,
     fixed_targets:draft.fixed_targets?.map(target => ({contact_id:target.contact_id,chat_id:target.chat_id})) || null,
     selected_groups:[...new Set(draft.selected_groups)]};
 }
@@ -110,6 +122,12 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   const sendReady = () => permissionReady(permissionResult,permissionPending,actor,permissionActor,redirecting)
     && permissionResult.feature_enabled === true && $('cm').value === actor;
   const groupMode = () => purpose !== 'support';
+  let messageEditor, templateEditor;
+  const mediaBlocked = () => Boolean(messageEditor?.blocked() || templateEditor?.blocked());
+  function contentChanged() { frozenPreview = null; sendRequestId = null; render(); }
+  const editorOptions = {authorizeMedia: ensureMedia, uploadImage, onState: () => { if (messageEditor && templateEditor) syncGate(); }};
+  messageEditor = createEditor($('message'), {...editorOptions,onChange: contentChanged});
+  templateEditor = createEditor($('template-body'), {...editorOptions,onChange: () => syncGate()});
   function syncAssistantScope() {
     const cmId = $('cm').value === 'all' || !$('cm').value ? actor : $('cm').value;
     const cm = config.cms.find(person => person.id === cmId);
@@ -266,13 +284,10 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     }
     $('exclude').hidden = !current.issues.length;
     $('summary').textContent = groupMode() ? `已选 ${current.groups.length} 个群` : entries.length ? `已选 ${current.people.length} 人 · ${current.groups.length} 个群` : '尚未选择对象';
-    $('preview').disabled = busy || dirty || !current.groups.length || Boolean(current.issues.length) || !$('message').value.trim();
     $('download').disabled = busy || dirty || !current.people.length;
-    $('message-preview').textContent = $('message').value || '输入消息后预览';
     $('input').readOnly = Boolean(fixedIds);
     $('match').textContent = fixedIds ? '重新核验' : '匹配名单';
     $('match').disabled = busy || Boolean(fixedIds && !fixedIds.length);
-    $('mention-preview').textContent = groupMode() ? $('mention').checked ? '@全体成员' : '' : current.groups[0]?.mentions.map(person => `@${person.name}`).join(' ') || '';
     for (const button of buttons) {
       const active = button.dataset.purpose === purpose;
       button.className = `btn ${active ? 'btn-primary' : 'btn-outline-secondary'}`; button.setAttribute('aria-pressed', String(active));
@@ -287,7 +302,13 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     $('cm').disabled = redirecting || !canSelectCm;
     $('permission-retry').disabled = permissionPending || redirecting;
     $('permission-authorize').disabled = permissionPending || redirecting;
-    $('send').disabled = busy || sending || !sendReady() || !frozenPreview;
+    messageEditor.enable(!busy && !redirecting); templateEditor.enable(!busy && !redirecting);
+    $('template-save').disabled = busy || redirecting || mediaBlocked();
+    $('template-cancel').disabled = busy || templateEditor.uploading();
+    $('template-new').disabled = busy || redirecting || messageEditor.blocked();
+    const current = plan();
+    $('preview').disabled = busy || redirecting || dirty || mediaBlocked() || !current.groups.length || Boolean(current.issues.length) || !hasMessage(messageEditor.get());
+    $('send').disabled = busy || sending || mediaBlocked() || !sendReady() || !frozenPreview;
     $('send').textContent = frozenPreview ? `确认发送 ${frozenPreview.groups.length} 个群` : '确认发送';
     if (!sending) $('confirm-state').textContent = sendReady() ? frozenPreview ? `以 ${frozenPreview.account_name || permissionResult.account_name} 本人身份发送` : '请返回重新预览'
       : permissionPending ? '正在核对发送授权，仍可预览' : $('cm').value !== actor ? '其他人员范围仅可预览' : permissionResult?.feature_enabled === false ? '演示模式 · 发送权限未开通' : '预览可用，发送前需补充本人授权';
@@ -298,8 +319,9 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     try {
       const url = authorizationUrl(value,$('app').dataset.actor,location.origin);
       const selected = !groupMode() && !dirty && entries.length ? rows().filter(row => row.selected && row.person) : null;
-      const raw = JSON.stringify({version:1,actor_id:$('app').dataset.actor,created_at:Date.now(),
-        cm_id:$('cm').value,purpose,mention:$('mention').checked,raw:$('input').value,message:$('message').value,
+      const raw = JSON.stringify({version:2,actor_id:$('app').dataset.actor,created_at:Date.now(),
+        cm_id:$('cm').value,purpose,mention:$('mention').checked,raw:$('input').value,message:messageEditor.get(),
+        template:$('template-dialog').open ? {id:editingTemplate?.id || null,revision:editingTemplate?.revision || null,name:$('template-name').value,body:templateEditor.get()} : null,
         fixed_ids:selected ? selected.map(row => row.person.id) : fixedIds,
         fixed_targets:selected ? selected.map(row => ({contact_id:row.person.id,chat_id:row.chatId})) : fixedTargets,
         selected_groups:[...selectedGroups]});
@@ -311,6 +333,23 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
       redirecting = false; syncGate();
       $('permission-message').textContent = `${error.message}。已暂停跳转，请保留当前页面并重新检查。`;
     }
+  }
+  async function ensureMedia() {
+    if (!allowed()) return false;
+    const result = await api('permissions',{cm_id:actor,media:true});
+    if (result.resource_authorized === true && result.status === 'ready') return true;
+    if (result.status === 'needs_authorization' && result.is_self && result.authorization_url) {
+      beginAuthorization(result.authorization_url); return false;
+    }
+    throw new Error(result.message || '暂时无法核对图片授权，请重试。');
+  }
+  async function uploadImage(file) {
+    const response = await fetch('/creators/broadcast/images', {method:'POST',credentials:'same-origin',signal:AbortSignal.timeout(60000),
+      headers:{'Content-Type':file.type,'X-CSRF-Token':$('app').dataset.csrf,'X-Filename':encodeURIComponent(file.name)},body:file});
+    const result = await response.json().catch(() => { throw new Error('图片上传暂未完成，请重试。'); });
+    if (!response.ok) throw new Error(result.error || '图片未上传，请重试。');
+    if (!result.image?.id) throw new Error('图片返回格式异常。');
+    return result.image;
   }
   async function api(action, data) {
     const business = action !== 'permissions', request = permissionCheck, cm = $('cm').value;
@@ -455,7 +494,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   }
   $('match').addEventListener('click', () => void match());
   $('input').addEventListener('input', () => { dirty = true; notice(entries.length ? '名单已修改，请重新匹配。' : ''); render(); });
-  for (const id of ['message','mention']) $(id).addEventListener('input', render);
+  $('mention').addEventListener('input', contentChanged);
   $('cm').addEventListener('change', async () => {
     syncAssistantScope();
     pendingRestore = false;
@@ -502,11 +541,12 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   });
   $('preview').addEventListener('click', async () => {
     const current = plan();
-    if (busy || !allowed() || dirty || current.issues.length || !current.groups.length || !$('message').value.trim()) return;
+    if (busy || !allowed() || mediaBlocked() || dirty || current.issues.length || !current.groups.length || !hasMessage(messageEditor.get())) return;
     const prepare = sendReady();
     lock(true); notice('正在准备预览',true);
     try {
-      const result = await api(prepare ? 'prepare' : 'preview',{cm_id:$('cm').value,purpose,mention:$('mention').checked,message:$('message').value,selections:selections()});
+      if (imageCount(messageEditor.get()) && !await ensureMedia()) return;
+      const result = await api(prepare ? 'prepare' : 'preview',{cm_id:$('cm').value,purpose,mention:$('mention').checked,message:messageEditor.get(),selections:selections()});
       if (result.issues.length) { dirty = true; throw new Error(groupMode() ? '群聊已变化，请点击“刷新”重新核验。' : `${result.issues.length} 项路由已变化，请重新匹配。`); }
       if (prepare && (!result.preview_id || !result.groups.length)) throw new Error('没有可发送的群，请返回修改。');
       frozenPreview = prepare ? result : null; sendRequestId = prepare ? crypto.randomUUID() : null; $('confirm-error').textContent = '';
@@ -518,7 +558,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   function renderPreview(result) {
     $('confirm-count').textContent = `${result.groups.length} 个群 · ${result.groups.length} 条消息`;
     $('confirm-scope').textContent = result.account_name ? `发送账号：${result.account_name}` : $('cm').selectedOptions[0].textContent;
-    $('confirm-message').textContent = result.message; $('confirm-groups').replaceChildren();
+    renderMessage($('confirm-message'),result.message); $('confirm-groups').replaceChildren();
     for (const group of result.groups) {
       const item = node('div','','broadcast-target');
       item.append(node('strong',group.name),node('div',group.mention_all ? '@全体成员'
@@ -529,7 +569,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     syncGate();
   }
   $('send').addEventListener('click',async () => {
-    if (sending || busy || !sendReady() || !frozenPreview) return;
+    if (sending || busy || mediaBlocked() || !sendReady() || !frozenPreview) return;
     sending = true; $('confirm-error').textContent = ''; syncGate();
     try {
       const result = await api('send',{preview_id:frozenPreview.preview_id,request_id:sendRequestId});
@@ -582,7 +622,8 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
   function renderBatch(result) {
     const batch = result.batch; activeBatch = batch; upsertBatch(batch);
     $('batch-summary').textContent = `${statusLabels[batch.status] || batch.status} · ${progress(batch)}`;
-    $('batch-message-panel').hidden = !result.message; $('batch-message').textContent = result.message || '';
+    $('batch-message-panel').hidden = !result.message;
+    renderMessage($('batch-message'),result.message || '');
     $('batch-targets').replaceChildren();
     for (const target of result.targets || []) {
       const item = node('div','','broadcast-target broadcast-result'), info = node('div');
@@ -737,22 +778,23 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     }
   });
   function useTemplate(template) {
-    currentTemplateId = template.id; $('message').value = template.body;
+    currentTemplateId = template.id; messageEditor.set(template.body);
+    frozenPreview = null; sendRequestId = null;
     pendingAction = null; $('list-action-dialog').close(); render();
   }
   function editTemplate(template = null) {
     if (busy || !allowed()) return;
     editingTemplate = template;
     $('template-title').textContent = template ? '编辑消息模板' : '新建消息模板';
-    $('template-name').value = template?.name || ''; $('template-body').value = template?.body ?? $('message').value;
-    initialTemplate = JSON.stringify([$('template-name').value,$('template-body').value]);
+    $('template-name').value = template?.name || ''; templateEditor.set(template?.body ?? messageEditor.get());
+    initialTemplate = JSON.stringify([$('template-name').value,templateEditor.get()]);
     $('template-error').textContent = ''; $('template-delete').hidden = !template;
     $('template-dialog').showModal(); $('template-name').focus();
   }
   function closeTemplate() {
-    if (busy || !allowed()) return;
-    if (JSON.stringify([$('template-name').value,$('template-body').value]) !== initialTemplate) confirmListAction('template-discard');
-    else $('template-dialog').close();
+    if (busy || !allowed() || templateEditor.uploading()) return;
+    if (templateEditor.blocked() || JSON.stringify([$('template-name').value,templateEditor.get()]) !== initialTemplate) confirmListAction('template-discard');
+    else { $('template-dialog').close(); templateEditor.set(''); }
   }
   $('template-new').addEventListener('click',() => editTemplate());
   $('template-edit').addEventListener('click',() => editTemplate(templates.find(template => template.id === currentTemplateId)));
@@ -760,15 +802,16 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     const template = templates.find(template => template.id === $('template-select').value);
     if (!template) { currentTemplateId = ''; renderTemplates(); return; }
     $('template-select').value = currentTemplateId;
-    if ($('message').value.trim() && $('message').value !== template.body) confirmListAction('template-use',template);
+    if (hasMessage(messageEditor.get()) && messageKey(messageEditor.get()) !== messageKey(template.body)) confirmListAction('template-use',template);
     else useTemplate(template);
   });
   $('template-cancel').addEventListener('click',closeTemplate);
   $('template-dialog').addEventListener('cancel',event => { event.preventDefault(); closeTemplate(); });
   $('template-delete').addEventListener('click',() => { if (editingTemplate) confirmListAction('template-delete',editingTemplate); });
   $('template-form').addEventListener('submit',async event => {
-    event.preventDefault(); if (busy) return;
-    const fields = {name:$('template-name').value,body:$('template-body').value,
+    event.preventDefault(); if (busy || mediaBlocked()) return;
+    if (!hasMessage(templateEditor.get())) { $('template-error').textContent = '请输入消息或添加图片。'; return; }
+    const fields = {name:$('template-name').value,body:templateEditor.get(),
       ...(editingTemplate ? {id:editingTemplate.id,revision:editingTemplate.revision} : {})};
     lock(true); $('template-error').textContent = '';
     try {
@@ -783,7 +826,7 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     if (busy || !pendingAction) return;
     const {kind,list} = pendingAction;
     if (kind === 'discard') { pendingAction = null; $('list-action-dialog').close(); $('list-dialog').close(); return; }
-    if (kind === 'template-discard') { pendingAction = null; $('list-action-dialog').close(); $('template-dialog').close(); return; }
+    if (kind === 'template-discard') { pendingAction = null; $('list-action-dialog').close(); $('template-dialog').close(); templateEditor.set(''); return; }
     if (kind === 'template-use') { useTemplate(list); return; }
     if (kind === 'load') { await loadList(list); return; }
     lock(true); $('list-action-error').textContent = '';
@@ -809,9 +852,15 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     if (raw) {
       const draft = parseDraft(raw,actor,Date.now(),canSelectCm);
       purpose = draft.purpose; fixedIds = draft.fixed_ids; fixedTargets = draft.fixed_targets;
-      selectedGroups = new Set(draft.selected_groups); $('input').value = draft.raw; $('message').value = draft.message;
+      selectedGroups = new Set(draft.selected_groups); $('input').value = draft.raw; messageEditor.set(draft.message);
       $('mention').checked = draft.mention; configureScope(draft.cm_id); pendingRestore = true;
       notice('草稿已恢复，正在重新核验接收对象。');
+      if (draft.template) {
+        editingTemplate = draft.template.id ? {id:draft.template.id,revision:draft.template.revision} : null;
+        $('template-title').textContent = editingTemplate ? '编辑消息模板' : '新建消息模板';
+        $('template-name').value = draft.template.name; templateEditor.set(draft.template.body); initialTemplate = '';
+        $('template-delete').hidden = !editingTemplate; $('template-dialog').showModal();
+      }
     }
   } catch (error) { notice(error.message || '无法读取授权草稿。'); }
   try {

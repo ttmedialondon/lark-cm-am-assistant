@@ -18,6 +18,7 @@ import psycopg
 from . import (
     ai_dispatch,
     assistant,
+    broadcast_images,
     creator_broadcast_delivery,
     creator_group_matching,
     creator_handle_matching,
@@ -119,6 +120,7 @@ def run_forever() -> None:
     broadcast_futures: set[Future[Any]] = set()
     next_broadcast_check = 0.0
     next_broadcast_recovery = 0.0
+    next_image_cleanup = 0.0
     preview_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="creator-preview")
     preview_future: Future[tuple[bool, int]] | None = None
     next_preview_check = 0.0
@@ -168,6 +170,13 @@ def run_forever() -> None:
                         getattr(settings, "organization_sync_interval_seconds", 21_600), 300
                     )
                 if settings.app_secret_configured:
+                    if time.monotonic() >= next_image_cleanup:
+                        try:
+                            broadcast_images.cleanup(settings)
+                        except (OSError, RuntimeError, psycopg.Error) as exc:
+                            # Image retention must not stop message sync or unrelated queues.
+                            LOGGER.warning("broadcast_image_cleanup_failed type=%s", type(exc).__name__)
+                        next_image_cleanup = time.monotonic() + 86_400
                     if time.monotonic() >= next_broadcast_recovery:
                         creator_broadcast_delivery.recover()
                         next_broadcast_recovery = time.monotonic() + 60
