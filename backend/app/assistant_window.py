@@ -64,7 +64,8 @@ def pages(checkpoint, job):
 
 def begin(call, args):
     return {'call': call, 'args': {**args, 'cursor': None}, 'page_refs': [],
-            'seen_cursors': [], 'phase': 'collect', 'compact_refs': True, 'structured_items': True}
+            'seen_cursors': [], 'phase': 'collect', 'compact_refs': True, 'structured_items': True,
+            'freeze_collection': True}
 
 
 def add_page(checkpoint, job, result):
@@ -131,8 +132,15 @@ def source(checkpoint, job):
 
 def prepare(checkpoint, job):
     found = pages(checkpoint, job)
-    if sum(len(page['messages']) for page in found) != found[0]['total_messages']:
+    identities = [(message['chat_id'], message['message_id']) for page in found for message in page['messages']]
+    if (not found or found[-1].get('next_cursor') or len(identities) != len(set(identities))
+            or len(identities) != found[0]['total_messages']
+            or any(page.get(key) != found[0].get(key) for page in found
+                   for key in ('query_id', 'total_messages', 'total_conversations'))):
         raise ValueError('分页未覆盖时段全部消息，已停止归纳。')
+    if job.get('freeze_collection'):
+        for page in found:
+            page['_collection_complete'] = True
     combined = {**source(checkpoint, job), 'messages': []}
     size = len(encoded(combined))
     for page in found:

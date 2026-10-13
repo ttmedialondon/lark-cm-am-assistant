@@ -1073,6 +1073,26 @@ def validate_tool_results(conn, actor_id, turn, results, settings, context):
 def _validate_tool_results(conn, actor_id, turn, results, settings, context):
     """Recheck all reused source text before it goes into another paid request."""
     cm, roster, _visible = _scope(conn, actor_id, context)
+    collections = {}
+    for result in results:
+        if not isinstance(result, dict):
+            raise ValueError("工具结果无效。")
+        if result.get("kind") == "window_messages" and result.get("query_ref"):
+            identity = (result["query_ref"].split(".")[1], result.get("query_id"))
+            collections.setdefault(identity, {})[result["query_ref"]] = result
+    for group in collections.values():
+        pages = list(group.values())
+        if not any(page.get("_collection_complete") for page in pages):
+            continue
+        identities = [(message["chat_id"], message["message_id"])
+                      for page in pages for message in page.get("messages", [])]
+        if (not all(page.get("_collection_complete") is True and page.get("scope", {}).get("audience") == "all"
+                    for page in pages)
+                or pages[-1].get("next_cursor") or len(identities) != len(set(identities))
+                or len(identities) != pages[0].get("total_messages")
+                or any(page.get(key) != pages[0].get(key) for page in pages
+                       for key in ("total_messages", "total_conversations"))):
+            raise ValueError("已读取的时段消息集合不完整，请重新查询。")
     people, views, cards, drafts = {}, {}, {}, {}
     for row in roster:
         person = people.setdefault(str(row["contact_id"]), {"name": row["name"] or "未命名达人", "handles": set()})
@@ -1096,8 +1116,6 @@ def _validate_tool_results(conn, actor_id, turn, results, settings, context):
             raise ValueError("事件材料已更新，请重新查询。")
 
     for result in results:
-        if not isinstance(result, dict):
-            raise ValueError("工具结果无效。")
         if result.get("result_id"):
             read_report(result["result_id"])
     for result in results:

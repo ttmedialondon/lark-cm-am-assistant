@@ -182,6 +182,77 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
                    if item.get('type') == 'function_call_output' and item.get('call_id') == 'window-call')
     assert compact['summaries'] and 'messages' not in compact
     assert 'LONG_PRIVATE_BODY' not in json.dumps(compact, ensure_ascii=False)
+    original_pages = stored_checkpoint['tool_results']
+    assert all(page['_collection_complete'] for page in original_pages)
+    missing_pages = original_pages[:-1]
+    mixed_pages = deepcopy(original_pages)
+    mixed_pages[-1].pop('_collection_complete')
+    original_context = assistant._context(pg, stored_row, stored_checkpoint, chat.settings)
+    for broken in (missing_pages, mixed_pages):
+        with pytest.raises(assistant.tools.SourceChangedError, match='集合不完整'):
+            assistant.tools.validate_tool_results(pg, chat.ids['cm'], stored_row, broken,
+                                                 chat.settings, original_context)
+
+    # Once collected, late messages/new chats belong to the next query rather than invalidating this answer.
+    chat.add('late-window-sync', text='Later synchronized progress', at=chat.start + timedelta(hours=3))
+    pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('new-chat','New conversation','group')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'new-chat')", (chat.ids['cm'],))
+    pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,
+        body_ciphertext,message_create_time) VALUES('new-chat','new-chat-message','ou_person','text',%s,%s)""",
+        (chat.cipher.encrypt(json.dumps({'text': 'New conversation progress'})), chat.start + timedelta(hours=3)))
+    pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+        VALUES(%s,'new-chat','new-chat-message')""", (chat.ids['cm'],))
+    unchanged = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
+    assert unchanged['result']['answer'] == value['result']['answer']
+    stable = assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings, page=15)
+    assert stable['total_messages'] == 15 and stable['coverage']['scan_complete']
+    assert 'new-chat' not in {gap.get('chat_id') for gap in stable['gaps']}
+    assert all(message['message_id'] not in {'late-window-sync', 'new-chat-message'} for message in stable['messages'])
+    legacy_pages = deepcopy(original_pages)
+    for page in legacy_pages:
+        page.pop('_collection_complete')
+    with pytest.raises(PermissionError):
+        assistant.tools.validate_tool_results(pg, chat.ids['cm'], stored_row, legacy_pages,
+                                             chat.settings, original_context)
+    legacy_checkpoint = {'tool_results': legacy_pages}
+    legacy_job = {'page_refs': [page['query_ref'] for page in legacy_pages]}
+    assistant_window.prepare(legacy_checkpoint, legacy_job)
+    assert not any('_collection_complete' in page for page in legacy_pages)
+    fresh_args = {'audience': 'all', **{key: source['window'][key] for key in ('start', 'end')},
+                  'creator_ids': None, 'chat_ids': None, 'cursor': None}
+    fresh_job = assistant_window.begin({'name': 'summarize_messages', 'call_id': 'fresh-window'}, fresh_args)
+    fresh_checkpoint = {'tool_results': []}
+    fresh_turn = {**stored_row, 'id': uuid4()}
+    while True:
+        fresh_page = assistant.tools.execute(pg, chat.ids['cm'], fresh_turn, 'summarize_messages',
+                                            fresh_job['args'], chat.settings, original_context)
+        if assistant_window.add_page(fresh_checkpoint, fresh_job, fresh_page):
+            break
+    assistant_window.prepare(fresh_checkpoint, fresh_job)
+    assert fresh_page['total_messages'] == 17 and all(page['_collection_complete']
+                                                   for page in fresh_checkpoint['tool_results'])
+    assert {message['message_id'] for page in fresh_checkpoint['tool_results'] for message in page['messages']} == {
+        *raw_ids, 'late-window-sync', 'new-chat-message'}
+    pg.execute("UPDATE chat_messages SET is_deleted=TRUE WHERE message_id='window-1'")
+    with pytest.raises(PermissionError, match='已删除'):
+        assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings)
+    pg.execute("UPDATE chat_messages SET is_deleted=FALSE WHERE message_id='window-1'")
+    pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s AND chat_id='chat'",
+               (chat.ids['cm'],))
+    with pytest.raises(PermissionError):
+        assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings)
+    pg.execute("UPDATE authorization_chats SET is_visible=TRUE,sync_status='not_readable' "
+               "WHERE authorization_id=%s AND chat_id='chat'", (chat.ids['cm'],))
+    with pytest.raises(PermissionError):
+        assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings)
+    pg.execute("UPDATE authorization_chats SET sync_status='succeeded' WHERE authorization_id=%s AND chat_id='chat'",
+               (chat.ids['cm'],))
+    pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (chat.ids['cm'],))
+    with pytest.raises(PermissionError):
+        assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings)
+    pg.execute("UPDATE authorizations SET status='active' WHERE id=%s", (chat.ids['cm'],))
+    assert assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings)['total_messages'] == 15
+    assert len(calls) == paid_count
     following = assistant.submit(pg, chat.ids['cm'], {
         **submitted, 'client_request_id': str(uuid4()), 'message': '这些事情的进度怎么样了？',
     }, chat.settings)
@@ -219,12 +290,8 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
     dependent['tool_results'][1]['_window_model_result'].pop('summaries')
     assert assistant._historical_window_result(pg, stored_row, dependent, chat.settings, context) is None
 
-    # A late historical sync changes totals/global scope, not the previously readable business facts.
-    chat.add('late-window-sync', text='Later synchronized progress', at=chat.start + timedelta(hours=3))
-    pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('new-chat','New conversation','group')")
-    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'new-chat')", (chat.ids['cm'],))
-    with pytest.raises(PermissionError):
-        assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings)
+    # The independent window remains readable even if the unrelated older dependency has changed.
+    assert assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings)['total_messages'] == 15
     history, retained = assistant._history(pg, next_row, chat.settings, context)
     previous = json.loads(history[-1]['content'])
     assert previous['answer'] == '' and previous['requires_refresh']
@@ -240,7 +307,7 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
                (chat.ids['cm'],))
     pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='window-0'",
                (chat.cipher.encrypt(json.dumps({'text': 'Updated fact'})),))
-    with pytest.raises(ValueError, match='消息数量已变化'):
+    with pytest.raises(ValueError, match='已更新'):
         assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings, page=15)
     changed_page = next(item for item in stored_checkpoint['tool_results']
                         if any(message['message_id'] == 'window-0' for message in item.get('messages', [])))

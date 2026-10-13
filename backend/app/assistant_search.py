@@ -349,6 +349,12 @@ def validate_result(conn, actor_id, context, result, settings, *, history_only=F
     audience = _audience(value.get("audience", "creators"))
     cm, roster, chats, speakers, selected = _scope(
         conn, actor_id, context, value.get("creator_ids"), value.get("chat_ids"), settings, audience)
+    frozen = (result.get("kind") == "window_messages" and audience == "all"
+              and result.get("_collection_complete") is True)
+    if frozen:
+        # The checkpoint already collected this set; new chats are for the next query, not this answer.
+        source_ids = {source["chat_id"] for source in result["sources"]}
+        chats = [chat for chat in chats if chat["chat_id"] in source_ids]
     if not history_only and _scope_version(cm, roster, chats, selected, audience) != value.get("version"):
         raise PermissionError("检索授权或正式达人范围已变化。")
     messages = result.get("messages")
@@ -357,7 +363,7 @@ def validate_result(conn, actor_id, context, result, settings, *, history_only=F
         raise ValueError("检索结果无效。")
     by_chat = {chat["chat_id"]: chat for chat in chats}
     start, end = _time(value.get("start")), _time(value.get("end"))
-    if result.get("kind") == "window_messages" and not history_only:
+    if result.get("kind") == "window_messages" and not history_only and not frozen:
         totals = _totals(conn, cm["id"], sorted(by_chat), start, end, speakers)
         if any(result.get(key) != count for key, count in totals.items()):
             raise ValueError("时段消息数量已变化，请重新读取。")
