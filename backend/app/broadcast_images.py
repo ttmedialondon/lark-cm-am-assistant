@@ -153,7 +153,8 @@ def resolve(conn, actor_id, asset_ids, settings):
             raise ValueError("图片文件已不可用，请重新上传。") from exc
         if not stat.S_ISREG(info.st_mode) or info.st_size != row["size_bytes"] + 28:
             raise ValueError("图片文件已不可用，请重新上传。")
-    return {str(row["id"]): {**_metadata(row), "image_key": row["image_key"]} for row in rows}
+    return {str(row["id"]): {**_metadata(row), "image_key": row["image_key"],
+                            "content_sha256": row["content_sha256"]} for row in rows}
 
 
 def read(actor_id, asset_id):

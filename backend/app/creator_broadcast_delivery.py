@@ -26,7 +26,7 @@ def _body(ciphertext, snapshot, settings):
 
 def _images(conn, actor, body, settings):
     ids = broadcast_content.image_ids(body) if isinstance(body, dict) else []
-    return {key: image["image_key"] for key, image in broadcast_images.resolve(conn, actor, ids, settings).items()}
+    return broadcast_images.resolve(conn, actor, ids, settings)
 
 
 def _audit(conn, actor, action, metadata):
@@ -150,7 +150,8 @@ def prepare(actor_id, fields):
     groups, issues = [], list(data.get("issues", []))
     with connection() as conn:
         _authorization(conn, actor)
-        image_keys = _images(conn, actor, data["message"], settings)
+        image_assets = _images(conn, actor, data["message"], settings)
+        image_keys = {key: image["image_key"] for key, image in image_assets.items()}
         for original in data["groups"]:
             group = {**original, "mentions": [], "mention_all": bool(original.get("mention_all"))}
             invalid = False
@@ -206,6 +207,11 @@ def prepare(actor_id, fields):
     snapshot = {"groups": groups, "mention": fields["mention"], "content_version": content_version,
                 "image_ids": image_ids}
     fingerprint_body = data["message"]
+    if rich and image_assets:
+        # Uploading identical bytes again must not bypass the same-message send guard.
+        fingerprint_body = {"version": 2, "ops": [
+            {"insert": {"image": image_assets[op["insert"]["image"]]["content_sha256"]}}
+            if isinstance(op["insert"], dict) else op for op in data["message"]["ops"]]}
     if rich and all(isinstance(op["insert"], str) and not op.get("attributes") for op in data["message"]["ops"]):
         fingerprint_body = broadcast_content.plain_text(data["message"])
     canonical = {
@@ -575,7 +581,7 @@ def run_claimed(job, settings=None):
             _live_group(client, access_token, authorization, job["snapshot"])
             body = _body(job["body_ciphertext"], job["snapshot"], settings)
             with connection() as conn:
-                image_keys = _images(conn, actor, body, settings)
+                image_keys = {key: image["image_key"] for key, image in _images(conn, actor, body, settings).items()}
             build_chat_post_payload(
                 job["chat_id"],
                 body,

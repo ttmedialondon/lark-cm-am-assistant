@@ -413,6 +413,14 @@ def test_rich_content_upload_template_frozen_delivery_and_legacy_dedup(pg, tmp_p
     receipt = delivery.batch(actor, batch_id)
     assert receipt["message"] == document and receipt["batch"]["succeeded"] == 1
     assert delivery.history(actor)["batches"][0]["id"] == batch_id
+    identical_image = broadcast_images.upload(actor, original.getvalue(), "same-bytes.gif")
+    same_content = json.loads(json.dumps(document))
+    for op in same_content["ops"]:
+        if isinstance(op["insert"], dict):
+            op["insert"]["image"] = identical_image["id"]
+    repeated_upload = delivery.prepare(actor, {**fields, "message": same_content})
+    assert delivery.submit(actor, repeated_upload["preview_id"], uuid4())["batch"]["id"] == batch_id
+    assert len(sent) == 1 and delivery.claim_next() is None
     # A later resource revocation stops a queued rich send, without retrying or dropping its image.
     another = delivery.prepare(actor, {**fields, "message": changed_style})
     blocked_id = delivery.submit(actor, another["preview_id"], uuid4())["batch"]["id"]
@@ -431,7 +439,7 @@ def test_rich_content_upload_template_frozen_delivery_and_legacy_dedup(pg, tmp_p
     assert delivery.batch(actor, legacy_id)["message"] == plain and delivery.claim_next() is None
     pg.execute("UPDATE creator_broadcast_images SET created_at=NOW()-INTERVAL '8 days'")
     assert broadcast_images.cleanup(settings) == 0
-    assert broadcast_images.read(actor, image["id"])[0] == original.getvalue() and len(uploaded) == 1
+    assert broadcast_images.read(actor, image["id"])[0] == original.getvalue() and len(uploaded) == 2
 
 
 def test_literal_post_and_safe_send_errors_do_not_require_database(monkeypatch):
