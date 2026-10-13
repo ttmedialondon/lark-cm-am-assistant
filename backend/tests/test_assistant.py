@@ -280,6 +280,7 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
     previous = json.loads(history[-1]['content'])
     assert previous['answer'] == '已整理本时段重点。' and previous['section_index'] and retained
     assert previous['summaries'] == []
+    assert {item['chat_id'] for section in previous['section_index'] for item in section['sources']} == {'chat'}
     assert not previous['requires_refresh'] and previous['window'] == source['window']
     assert context['now'].startswith(midnight.date().isoformat())
 
@@ -335,19 +336,54 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
     assert len(calls) == paid_count
 
 
-@pytest.mark.parametrize('interruption', ['repeated_page', 'premature_end', 'permission', 'cancel'])
-def test_window_collection_never_finalizes_missing_pages_or_replays_model(pg, chat, monkeypatch, interruption):
+@pytest.mark.parametrize('interruption', ['initial_scope', 'repeated_page', 'premature_end', 'permission', 'cancel'])
+def test_window_collection_corrects_initial_inputs_and_rejects_incomplete_pages(pg, chat, monkeypatch, interruption):
     monkeypatch.setattr(assistant_search, 'WINDOW_PAGE_SIZE', 1)
     calls = []
-    monkeypatch.setattr(openai_client, 'call_openai_tools', lambda *args, **kwargs:
-        calls.append(True) or {'text': '', 'output': [{'type': 'function_call', 'call_id': 'window-call',
+
+    def model(_cfg, _key, items, _actor, **_kwargs):
+        calls.append(True)
+        outputs = [item for item in items if item.get('type') == 'function_call_output']
+        if outputs:
+            source = json.loads(outputs[-1]['output'])
+            if not source.get('error_code'):
+                assert source['coverage']['scan_complete'] and source['total_messages'] == 2
+                return {'text': json.dumps({'answer': '本人的会话已整理。', 'event_refs': [], 'result_refs': [],
+                    'data_refs': [source['query_ref']], 'draft_ref': None, 'sections': []}), 'output': [], 'usage': {}}
+            assert interruption == 'initial_scope' and source['error_code'] == 'permission'
+            assert len(outputs) == 1 and 'messages' not in source
+            chat_ids = ['chat']
+        else:
+            chat_ids = ['chat', 'oc_???'] if interruption == 'initial_scope' else None
+        return {'text': '', 'output': [{'type': 'function_call', 'call_id': f'window-call-{len(calls)}',
             'name': 'summarize_messages', 'arguments': json.dumps({'audience': 'all',
                 'start': chat.start.isoformat(), 'end': chat.end.isoformat(),
-                'creator_ids': None, 'chat_ids': None, 'cursor': None})}], 'usage': {}})
+                'creator_ids': None, 'chat_ids': chat_ids, 'cursor': None})}], 'usage': {}}
+
+    monkeypatch.setattr(openai_client, 'call_openai_tools', model)
     turn = assistant.submit(pg, chat.ids['cm'], payload('总结全部聊天'), chat.settings)
     finish(chat)
     finish(chat)
     original = assistant._turn(pg, chat.ids['cm'], turn['id'])
+    if interruption == 'initial_scope':
+        checkpoint = summary_dialogues.decode(original['checkpoint_ciphertext'], chat.settings)
+        assert original['status'] == 'queued' and 'window_job' not in checkpoint
+        assert checkpoint['tool_errors'] == [{'tool': 'summarize_messages', 'code': 'permission'}]
+        assert len(checkpoint['tool_results']) == 1 and checkpoint['tool_results'][0]['error_code'] == 'permission'
+        for _ in range(8):
+            finish(chat)
+            value = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
+            if value['status'] not in assistant.ACTIVE:
+                break
+        assert value['status'] == 'completed' and len(calls) == 3
+        assert value['result']['data'][0]['scope']['chat_ids'] == ['chat']
+        assert value['result']['data'][0]['total_messages'] == 2
+        corrected = assistant._turn(pg, chat.ids['cm'], turn['id'])
+        checkpoint = summary_dialogues.decode(corrected['checkpoint_ciphertext'], chat.settings)
+        pages = [item for item in checkpoint['tool_results'] if item.get('kind') == 'window_messages']
+        assert len(pages) == 2 and all(page['scope']['chat_ids'] == ['chat'] for page in pages)
+        assert assistant.claim() is None
+        return
     first = summary_dialogues.decode(original['checkpoint_ciphertext'], chat.settings)['tool_results'][0]
     if interruption == 'repeated_page':
         monkeypatch.setattr(assistant.tools, 'execute', lambda *args: first)
@@ -412,6 +448,7 @@ def test_search_source_get_continues_without_model_and_cleared_refs_stay_unreada
     indexed = json.loads(history[-1]['content'])['section_index'][0]
     assert indexed['index'] == 1 and indexed['message_refs'] == section['message_refs'] and retained
     assert indexed['sources'][0]['message_ref'] == section['message_refs'][0]
+    assert indexed['sources'][0]['chat_id'] == section['sources'][0]['chat_id'] == 'chat'
     assert source['has_more'] and source['next_source_url'].startswith('/assistant/sources/')
     before = pg.execute('SELECT checkpoint_ciphertext,usage FROM assistant_turns WHERE id=%s',
                         (turn['id'],)).fetchone()

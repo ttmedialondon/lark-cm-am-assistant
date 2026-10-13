@@ -89,6 +89,8 @@ query的next_cursor非空表示仍有未查材料，必要时继续同参数检�
 需核对消息问答再用read_message_context，附近消息不自动属于同一事项；只用完整证据作结论。
 单条事项的最新进展可用read_message_context mode=latest；它是有界上下文，不表示读完全部后续。
 需要完整跟进时段时，用summarize_messages限定原事项实际所属chat_ids，从原起点到本轮context.now；不把最新二十条当作全量。
+chat_ids只能使用工具或history.section_index.sources实际提供的chat_id，不能从群名拼接、猜测或填占位编号。
+来源未给会话编号时，先用实际message_ref读取read_message_context，或用find_conversations定位并区分候选，再限定会话查询。
 先找到具体付款/样品事项再查实际后续；只看付款等短追问复用有效事项及来源，缺新的进度才继续调用工具。
 统计消息量、联系人数和时段比较用activity_stats，默认all，使用工具数字和口径，不把群成员数或分组相加当人数。
 消息0条、材料不可读、同步水位未覆盖是不同情况；没有命中不等于数据缺口。coverage解释的是实际读取范围。
@@ -705,7 +707,7 @@ def _history(conn, row, settings, context):
                 'section_index': [{'index': index + 1, 'title': section['title'],
                     'summary': section['summary'], 'message_refs': section['message_refs'],
                     'sources': [{key: source.get(key) for key in (
-                        'message_ref', 'conversation_name', 'sender_name', 'time')}
+                        'message_ref', 'chat_id', 'conversation_name', 'sender_name', 'time')}
                         for source in section['sources']]}
                     for index, section in enumerate(checked.get('sections', []))],
                 'event_count': len(checked.get('events', [])),
@@ -846,8 +848,10 @@ def step(job, settings):
                         if not result.get('waiting'):
                             checkpoint['tool_cache'][cache_key] = result
                 except (PermissionError, LookupError, ValueError) as exc:
-                    if checkpoint.get('window_job'):
+                    window = checkpoint.get('window_job')
+                    if window and (isinstance(exc, tools.SourceChangedError) or window.get('page_refs')):
                         raise
+                    checkpoint.pop('window_job', None)
                     code = ('permission' if isinstance(exc, PermissionError) else
                             'source_changed' if isinstance(exc, tools.SourceChangedError) else
                             'source_not_found' if isinstance(exc, LookupError) else 'invalid_tool_input')
