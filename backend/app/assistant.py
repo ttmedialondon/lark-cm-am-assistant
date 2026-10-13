@@ -36,16 +36,19 @@ OUTPUT_FORMAT = {
         'type': 'object', 'additionalProperties': False,
         'properties': {
             'answer': {'type': 'string'},
-            'sections': {'type': 'array', 'maxItems': 40, 'items': {
+            'sections': {'type': 'array', 'maxItems': 40,
+                'description': '有原消息来源的业务分类；纯统计、资料或草稿结果使用空数组。', 'items': {
                 'type': 'object', 'additionalProperties': False,
                 'properties': {'title': {'type': 'string', 'minLength': 1, 'maxLength': 120},
                     'summary': {'type': 'string', 'minLength': 1, 'maxLength': 2500},
                     'message_refs': {'type': 'array', 'minItems': 1, 'maxItems': 30,
-                        'items': {'type': 'string'}}},
+                        'items': {'type': 'string', 'pattern': '^m\\.',
+                                  'description': '工具返回的实际 message_ref，不是 query_ref。'}}},
                 'required': ['title', 'summary', 'message_refs']}},
             'event_refs': {'type': 'array', 'items': {'type': 'string'}},
             'result_refs': {'type': 'array', 'items': {'type': 'string'}},
-            'data_refs': {'type': 'array', 'items': {'type': 'string'}},
+            'data_refs': {'type': 'array', 'description': '资料、统计、检索结果的实际 query_ref。',
+                          'items': {'type': 'string', 'pattern': '^q\\.'}},
             'draft_ref': {'type': ['string', 'null']},
         },
         'required': ['answer', 'sections', 'event_refs', 'result_refs', 'data_refs', 'draft_ref'],
@@ -867,6 +870,11 @@ def step(job, settings):
             model_items = checkpoint['items']
             model_instructions = rules.main_instructions(checkpoint['rules']) + '\n' + REPLY_INSTRUCTIONS
             model_tools, model_format = tools.tools_for(context), OUTPUT_FORMAT
+            if not any(message.get('message_ref') for result in checkpoint['tool_results']
+                       for message in result.get('messages', [])):
+                model_format = {**OUTPUT_FORMAT, 'schema': {**OUTPUT_FORMAT['schema'], 'properties': {
+                    **OUTPUT_FORMAT['schema']['properties'], 'sections': {
+                        **OUTPUT_FORMAT['schema']['properties']['sections'], 'maxItems': 0}}}}
             if checkpoint.get('no_progress_calls', 0) >= 3:
                 checkpoint['final_only'] = True
                 model_tools = []

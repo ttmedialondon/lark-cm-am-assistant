@@ -813,15 +813,29 @@ def test_owner_multi_person_loop_preserves_sources_and_revocation_boundary(pg, c
         tool_map = {tool['name']: tool for tool in kwargs['tools']}
         assert 'resolve_staff' in tool_map and 'cm_id' in tool_map['summarize_messages']['parameters']['properties']
         output = [json.loads(item['output']) for item in items if item.get('type') == 'function_call_output']
+        sections = kwargs['output_format']['schema']['properties']['sections']
+        assert sections['items']['properties']['message_refs']['items']['pattern'] == r'^m\.'
+        assert kwargs['output_format']['schema']['properties']['data_refs']['items']['pattern'] == r'^q\.'
         if not output:
+            assert sections['maxItems'] == 0
+            return {'text': '', 'output': [{'type': 'function_call', 'name': 'activity_stats',
+                'call_id': f'stats-{cm_id}', 'arguments': json.dumps({'cm_id': str(cm_id), 'audience': 'all',
+                    'start': chat.start.isoformat(), 'end': chat.end.isoformat(),
+                    'creator_ids': None, 'chat_ids': None, 'cursor': None,
+                    'group_by': 'conversation', 'comparison': None})}
+                for cm_id in (chat.ids['cm'], other_id)], 'usage': {}}
+        if all(item.get('kind') == 'activity' for item in output):
+            assert len(output) == 2 and sections['maxItems'] == 0
             return {'text': '', 'output': [{'type': 'function_call', 'name': 'summarize_messages',
                 'call_id': str(cm_id), 'arguments': json.dumps({'cm_id': str(cm_id), 'audience': 'all',
                     'start': chat.start.isoformat(), 'end': chat.end.isoformat(),
                     'creator_ids': None, 'chat_ids': None, 'cursor': None})}
                 for cm_id in (chat.ids['cm'], other_id)], 'usage': {}}
-        assert len(output) == 2 and {item['scope']['cm_id'] for item in output} == {
+        messages = [item for item in output if item.get('kind') == 'window_messages']
+        assert len(messages) == 2 and sections['maxItems'] == 40
+        assert {item['scope']['cm_id'] for item in messages} == {
             str(chat.ids['cm']), str(other_id)}
-        refs = [message['message_ref'] for item in output for message in item['messages']
+        refs = [message['message_ref'] for item in messages for message in item['messages']
                 if message['message_id'] == 'm1']
         final = {'answer': '样品询问已整理。', 'sections': [{'title': '样品', 'summary': '达人询问样品。',
             'message_refs': refs}], 'event_refs': [], 'result_refs': [],
@@ -830,17 +844,18 @@ def test_owner_multi_person_loop_preserves_sources_and_revocation_boundary(pg, c
 
     monkeypatch.setattr(openai_client, 'call_openai_tools', model)
     turn = assistant.submit(pg, chat.ids['owner'], payload(question), chat.settings)
-    for _ in range(8):
+    for _ in range(12):
         finish(chat)
         if assistant.turn_view(pg, chat.ids['owner'], turn['id'], chat.settings)['status'] == 'completed':
             break
     view = assistant.turn_view(pg, chat.ids['owner'], turn['id'], chat.settings)
-    assert view['status'] == 'completed' and len(calls) == 2
+    assert view['status'] == 'completed' and len(calls) == 3
     assert view['result']['scope']['cm_id'] == str(chat.ids['owner'])
     assert set(view['result']['scope']['cm_ids']) == {str(chat.ids['cm']), str(other_id)}
     assert len(view['result']['sections'][0]['sources']) == 1
-    assert len(view['result']['data']) == 2
-    source = view['result']['data'][1]
+    assert len(view['result']['data']) == 4
+    source = next(item for item in view['result']['data']
+                  if item['kind'] == 'window_messages' and item['scope']['cm_id'] == str(other_id))
     assert assistant.source_page(pg, chat.ids['owner'], source['query_ref'], chat.settings)[
         'scope']['cm_id'] == str(other_id)
     with pg.transaction(force_rollback=True):
