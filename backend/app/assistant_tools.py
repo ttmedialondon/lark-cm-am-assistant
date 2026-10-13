@@ -1408,6 +1408,11 @@ def _sections(final, tool_results):
 def build_result(conn, actor_id, turn, final, settings, context, tool_results, *, read_cache=None):
     """Render only references actually returned by tools and still readable now."""
     validated = validate_tool_results(conn, actor_id, turn, tool_results, settings, context, read_cache=read_cache)
+    source_mode = final.get("source_mode", "compact")
+    reply_enabled = final.get("reply_enabled", False)
+    if (not isinstance(source_mode, str) or source_mode not in {"hidden", "compact", "detailed"}
+            or type(reply_enabled) is not bool):
+        raise ValueError("来源展示格式无效。")
     sections = _sections(final, tool_results)
     documents = {document["document_ref"]: document for result in tool_results if result.get("kind") == "documents"
                  for document in result["documents"]}
@@ -1496,6 +1501,7 @@ def build_result(conn, actor_id, turn, final, settings, context, tool_results, *
     if queried_scopes and (len(queried_scopes) > 1 or set(queried_scopes) != {context["scope"]["cm_id"]}):
         result_scope = {**context["scope"], "cm_ids": list(queried_scopes), "cm_names": list(queried_scopes.values())}
     return {"turn_id": str(turn["id"]), "status": "completed", "answer": answer, "sections": sections,
+            "source_mode": source_mode, "reply_enabled": reply_enabled and source_mode == "detailed",
             "documents": [{key: documents[ref][key] for key in ("document_ref", "key", "title", "kind", "revision")}
                           | {"text": documents[ref]["text"][:1200],
                              "truncated": len(documents[ref]["text"]) > 1200}

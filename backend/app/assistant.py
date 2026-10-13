@@ -36,6 +36,11 @@ OUTPUT_FORMAT = {
         'type': 'object', 'additionalProperties': False,
         'properties': {
             'answer': {'type': 'string'},
+            'source_mode': {'type': 'string', 'enum': ['hidden', 'compact', 'detailed'],
+                'description': '仅控制来源展示，不删除引用。纯文案/翻译/一般建议用 hidden；'
+                               '总结/分析/统计用 compact；原话/核对/待回复/起草回复用 detailed。'},
+            'reply_enabled': {'type': 'boolean',
+                'description': '仅用户要求回复、起草或列待回复清单时为 true；总结、分析、原话查询和进度核对为 false。'},
             'sections': {'type': 'array', 'maxItems': 40,
                 'description': '有原消息来源的业务分类；纯统计、资料或草稿结果使用空数组。', 'items': {
                 'type': 'object', 'additionalProperties': False,
@@ -54,7 +59,8 @@ OUTPUT_FORMAT = {
                 'items': {'type': 'string', 'pattern': '^doc\\.'}},
             'draft_ref': {'type': ['string', 'null']},
         },
-        'required': ['answer', 'sections', 'event_refs', 'result_refs', 'data_refs', 'document_refs', 'draft_ref'],
+        'required': ['answer', 'source_mode', 'reply_enabled', 'sections', 'event_refs', 'result_refs',
+                     'data_refs', 'document_refs', 'draft_ref'],
     },
 }
 

@@ -462,6 +462,7 @@ def test_search_source_get_continues_without_model_and_cleared_refs_stay_unreada
                     'creator_ids': None, 'chat_ids': None, 'cursor': None})}], 'usage': {}}
         source = json.loads(outputs[-1]['output'])
         final = {'answer': '找到相关原文。', 'event_refs': [], 'result_refs': [],
+                 'source_mode': 'hidden', 'reply_enabled': False,
                  'data_refs': [source['query_ref']], 'draft_ref': None,
                  'sections': [{'title': '相关沟通', 'summary': '找到真实文字记录。',
                                'message_refs': [source['messages'][0]['message_ref']]}]}
@@ -474,6 +475,7 @@ def test_search_source_get_continues_without_model_and_cleared_refs_stay_unreada
     view = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
     source = view['result']['data'][0]
     section = view['result']['sections'][0]
+    assert view['result']['source_mode'] == 'hidden' and view['result']['reply_enabled'] is False
     assert section['message_refs'] == [source['messages'][0]['message_ref']]
     assert section['sources'][0]['text'] == 'Find fixture facts'
     row = assistant._turn(pg, chat.ids['cm'], turn['id'])
@@ -484,6 +486,17 @@ def test_search_source_get_continues_without_model_and_cleared_refs_stay_unreada
     with pytest.raises(ValueError, match='引用未取得'):
         assistant.tools.build_result(pg, chat.ids['cm'], row, invalid, chat.settings,
                                      context, checkpoint['tool_results'])
+    for mode, can_reply in [('compact', False), ('detailed', True)]:
+        rendered = assistant.tools.build_result(pg, chat.ids['cm'], row,
+            {**stored_final, 'source_mode': mode, 'reply_enabled': True}, chat.settings,
+            context, checkpoint['tool_results'])
+        assert rendered['source_mode'] == mode and rendered['reply_enabled'] is can_reply
+        assert rendered['sections'] == view['result']['sections']
+        assert rendered['data_refs'] == view['result']['data_refs']
+    for fields in ({'source_mode': 'other'}, {'reply_enabled': 'true'}):
+        with pytest.raises(ValueError, match='来源展示格式'):
+            assistant.tools.build_result(pg, chat.ids['cm'], row, {**stored_final, **fields},
+                chat.settings, context, checkpoint['tool_results'])
     history, retained = assistant._history(pg, {**row, 'id': uuid4()}, chat.settings, context)
     indexed = json.loads(history[-1]['content'])['section_index'][0]
     assert indexed['index'] == 1 and indexed['message_refs'] == section['message_refs'] and retained
@@ -638,6 +651,7 @@ def test_model_prepares_saves_and_returns_message_draft_without_child_job(pg, ch
         assert 'save_reply_draft' in kwargs['instructions']
         if latest and latest.get('kind') == 'reply_draft':
             final = {'answer': '英文草稿已准备。', 'event_refs': [], 'result_refs': [],
+                     'source_mode': 'detailed', 'reply_enabled': True,
                      'data_refs': [], 'draft_ref': latest['draft_ref']}
             return {'text': json.dumps(final), 'output': [], 'usage': {}}
         if latest.get('kind') == 'documents':
@@ -675,6 +689,7 @@ def test_model_prepares_saves_and_returns_message_draft_without_child_job(pg, ch
     assert summary_dialogues.decode(stored['checkpoint_ciphertext'], chat.settings)['tool_errors'] == [
         {'tool': 'save_reply_draft', 'code': 'invalid_tool_input'}]
     assert view['result']['scope']['audience'] == 'all'
+    assert view['result']['source_mode'] == 'detailed' and view['result']['reply_enabled'] is True
     assert view['result']['draft']['outcome'] == 'ready' and view['result']['draft']['checks']
     assert view['result']['draft']['context']['message']['message_id'] == 'outside'
     assert pg.execute('SELECT count(*) n FROM summary_reply_tasks').fetchone()['n'] == 0
@@ -833,6 +848,9 @@ def test_owner_multi_person_loop_preserves_sources_and_revocation_boundary(pg, c
         sections = kwargs['output_format']['schema']['properties']['sections']
         assert sections['items']['properties']['message_refs']['items']['pattern'] == r'^m\.'
         assert kwargs['output_format']['schema']['properties']['data_refs']['items']['pattern'] == r'^q\.'
+        presentation = kwargs['output_format']['schema']['properties']
+        assert presentation['source_mode']['enum'] == ['hidden', 'compact', 'detailed']
+        assert presentation['reply_enabled']['type'] == 'boolean'
         if not output:
             assert set(tool_map) == {'resolve_staff', 'read_documents'}
             assert 'statistics' in kwargs['instructions'] and 'message-summary' in kwargs['instructions']

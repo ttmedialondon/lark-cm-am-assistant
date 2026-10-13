@@ -352,13 +352,26 @@
     });
     return button;
   }
-  function rawMessages(content, value, replyable = true, reading = true, multiCM = false) {
+  function messageKey(message) {
+    return message.chat_id && message.message_id ? `${message.chat_id}:${message.message_id}` :
+      message.message_ref || message.evidence_ref || JSON.stringify(message);
+  }
+  function uniqueMessages(messages) {
+    const unique = new Map();
+    for (const message of messages) {
+      const key = messageKey(message), previous = unique.get(key);
+      const cmNames = [...new Set([...(previous?.cm_names || []), ...(message.cm_names || []), message.cm_name].filter(Boolean))];
+      unique.set(key, {...(previous || message), cm_names: cmNames});
+    }
+    return [...unique.values()];
+  }
+  function rawMessages(content, value, replyable = false, reading = true, multiCM = false) {
     for (const message of value.messages || []) {
       const item = node("figure");
       const caption = node("figcaption", "", [message.conversation_name || message.chat_name, message.sender_name || (message.is_staff ? "内部同事" : message.speaker === "other" ? "对方" : null),
         date(message.time || message.sent_at || message.created_at),
         {matched: "引用消息", parent: "回复对象", root: "话题起点", nearby_context: "相邻消息"}[message.relation]].filter(Boolean).join(" · "));
-      const cmName = multiCM && (message.cm_name || value.scope?.cm_name);
+      const cmName = multiCM && (message.cm_names?.join("、") || message.cm_name || value.scope?.cm_name);
       if (cmName) caption.prepend(node("span", "oa-chip oa-cm-source", cmName), document.createTextNode(" · "));
       item.append(caption,
         node("blockquote", "", message.text || "这条消息没有可显示的文字。"));
@@ -369,7 +382,7 @@
     if (!value.messages?.length) content.append(node("p", "oa-coverage", "当前没有可读取的原文。"));
     if (reading) { const gaps = gapList(value.gaps, value.gap_summary); if (gaps) content.append(gaps); }
   }
-  function evidenceCard(reference, title = "消息原文", count = null, multiCM = false) {
+  function evidenceCard(reference, title = "消息原文", count = null, multiCM = false, replyable = false) {
     const button = node("button", "oa-evidence", Number.isFinite(count) ? `查看原文 · ${count} 条` : "查看原文");
     button.type = "button"; button.setAttribute("aria-controls", "oa-sources");
     button.addEventListener("click", async () => {
@@ -383,7 +396,7 @@
         const value = await request(`/evidence/${encodeURIComponent(reference)}`);
         if (denied || version !== sourceVersion) return;
         content.replaceChildren();
-        rawMessages(content, value, true, true, multiCM);
+        rawMessages(content, value, replyable, true, multiCM);
         content.scrollTop = 0;
       } catch (error) { if (!denied && version === sourceVersion) content.replaceChildren(node("p", "oa-gaps", error.message)); }
     });
@@ -396,7 +409,7 @@
     card.dataset.original = draft.draft;
     const copy = node("button", "", draft.context?.chat_url ? "复制并打开 Lark" : "复制回复"), feedback = node("span", "oa-copy-feedback");
     copy.type = "button"; feedback.setAttribute("role", "status");
-    if (draft.context?.message) {
+    if (draft.context?.message && draft.source_mode === "detailed") {
       const context = node("details", "oa-reply-context"); context.open = true; context.tabIndex = 0;
       context.append(node("summary", "", draft.context.chat_name || "原文与最新进展"));
       const messageKey = message => message.chat_id && message.message_id ? `${message.chat_id}:${message.message_id}` :
@@ -519,7 +532,7 @@
     }
     return list;
   }
-  function windowSources(data, multiCM = false) {
+  function windowSources(data, multiCM = false, replyable = false, excluded = new Set()) {
     const card = node("section", "oa-data oa-source-entry"), details = node("details", "oa-coverage");
     card.dataset.queryRef = data.query_ref || "";
     let pageNumber = data.page || 1, currentPage = data;
@@ -532,7 +545,8 @@
     const draw = value => {
       currentPage = value;
       body.replaceChildren();
-      rawMessages(body, value, true, false, multiCM);
+      const messages = uniqueMessages(value.messages || []).filter(message => !excluded.has(messageKey(message)));
+      if (messages.length || !value.messages?.length) rawMessages(body, {...value, messages}, replyable, false, multiCM);
       const pageCount = value.page_count || data.page_count || 1;
       pageLabel.textContent = `第 ${pageNumber} / ${pageCount} 页`;
       previous.disabled = pageNumber <= 1; next.disabled = !(value.has_more ?? pageNumber < pageCount);
@@ -556,12 +570,12 @@
     if (data.window?.start && data.window?.end) details.append(node("p", "oa-card-meta", `${date(data.window.start)} – ${date(data.window.end)} · 英国时间`));
     card.append(details); draw(data); return card;
   }
-  function dataCard(data, multiCM = false) {
+  function dataCard(data, multiCM = false, replyable = false, excluded = new Set()) {
     const titles = {creators: "达人资料", groups: "群聊目录", conversations: "会话目录", sync: "连接与消息读取", activity: "活动统计", messages: "消息命中",
       window_messages: "总结来源", message_context: "原文与问答"};
     if (!data || !titles[data.kind]) return null;
     if (data.kind === "sync" && !canManageCM) return null;
-    if (data.kind === "window_messages") return windowSources(data, multiCM);
+    if (data.kind === "window_messages") return windowSources(data, multiCM, replyable, excluded);
     const card = node("section", "oa-data"); card.dataset.queryRef = data.query_ref || "";
     card.append(node("h4", "", titles[data.kind]));
     if (multiCM && data.scope?.cm_name) card.firstChild.append(node("span", "oa-chip oa-cm-source", data.scope.cm_name));
@@ -624,9 +638,12 @@
       const text = message.text || "这条消息没有可显示的文字。";
       card.append(node("p", "", text.length > 420 ? `${text.slice(0, 420)}…` : text));
       const ref = data.message_ref || data.evidence_ref || message.message_ref;
-      if (ref) card.append(evidenceCard(ref, message.conversation_name || message.chat_name || "原文与问答", null, multiCM), replyButton(ref, message.conversation_name || message.chat_name || "当前消息", true));
+      if (ref) {
+        card.append(evidenceCard(ref, message.conversation_name || message.chat_name || "原文与问答", null, multiCM, replyable));
+        if (replyable && message.text && !message.unreadable) card.append(replyButton(ref, message.conversation_name || message.chat_name || "当前消息", true));
+      }
     } else if (data.kind === "messages") {
-      for (const message of (data.messages || []).slice(0, 25)) {
+      for (const message of uniqueMessages(data.messages || []).filter(message => !excluded.has(messageKey(message))).slice(0, 25)) {
         const hit = node("div", "oa-hit");
         hit.append(node("div", "oa-card-meta", [message.conversation_name || message.chat_name, message.sender_name,
           date(message.time || message.sent_at)].filter(Boolean).join(" · ")));
@@ -634,8 +651,8 @@
         hit.append(node("p", "", text.length > 420 ? `${text.slice(0, 420)}…` : text));
         const ref = message.evidence_ref || message.message_ref;
         if (ref) {
-          hit.append(evidenceCard(ref, message.conversation_name || message.chat_name || "消息原文", null, multiCM));
-          if (message.text && !message.unreadable) hit.append(replyButton(ref, message.conversation_name || message.chat_name || "当前消息", true));
+          hit.append(evidenceCard(ref, message.conversation_name || message.chat_name || "消息原文", null, multiCM, replyable));
+          if (replyable && message.text && !message.unreadable) hit.append(replyButton(ref, message.conversation_name || message.chat_name || "当前消息", true));
         }
         card.append(hit);
       }
@@ -656,7 +673,7 @@
           if (url.origin !== location.origin || !url.pathname.startsWith("/assistant/sources/")) throw new Error("来源地址无效。");
           const value = await request(url.pathname.slice("/assistant".length) + url.search);
           if (denied || version !== revision || !card.isConnected) return;
-          const page = dataCard(value, multiCM); if (page) card.replaceWith(page); controls();
+          const page = dataCard(value, multiCM, replyable, excluded); if (page) card.replaceWith(page); controls();
         } catch (error) { if (!denied && version === revision) { next.disabled = false; actions.append(node("span", "oa-gaps", error.message)); } }
       });
       actions.append(next); card.append(actions);
@@ -669,6 +686,36 @@
   function renderResult(container, result) {
     container.replaceChildren(answer(result.answer));
     const multiCM = canQueryOtherCM && result.scope?.cm_ids?.length > 1;
+    const mode = ["hidden", "compact", "detailed"].includes(result.source_mode) ? result.source_mode : "compact";
+    const replyable = mode === "detailed" && result.reply_enabled === true;
+    const represented = new Set(), eventReferences = new Set(), references = node("details", "oa-section-sources oa-answer-sources");
+    const mergedMessages = new Map(uniqueMessages([...(result.sections || []).flatMap(section => section.sources || []),
+      ...(result.data || []).flatMap(data => (data.kind === "message_context" ? [data.message || {}] : data.messages || [])
+        .map(message => ({...message, cm_name: message.cm_name || data.scope?.cm_name})))])
+      .map(message => [messageKey(message), message]));
+    references.append(node("summary", "", "查看依据"));
+    const sourceMessages = (parent, messages) => {
+      for (const source of uniqueMessages(messages)) {
+        const message = mergedMessages.get(messageKey(source)) || source;
+        const key = messageKey(message);
+        const ref = source.message_ref || source.evidence_ref || message.message_ref || message.evidence_ref;
+        if (represented.has(key)) {
+          if (mode === "detailed" && ref) parent.append(evidenceCard(ref,
+            source.conversation_name || source.chat_name || "消息原文", null, multiCM, replyable));
+          continue;
+        }
+        represented.add(key);
+        const item = node("div", "oa-section-source");
+        rawMessages(item, {messages: [message]}, false, false, multiCM);
+        if (ref) {
+          const actions = node("div", "oa-card-actions");
+          actions.append(evidenceCard(ref, message.conversation_name || message.chat_name || "消息原文", null, multiCM, replyable));
+          if (replyable && message.text && !message.unreadable) actions.append(replyButton(ref, message.conversation_name || message.chat_name || "当前消息", true));
+          item.append(actions);
+        }
+        parent.append(item);
+      }
+    };
     if (multiCM || (canQueryOtherCM && result.scope?.cm_ids?.length === 1 && result.scope.cm_ids[0] !== result.scope.cm_id)) {
       container.append(node("p", "oa-coverage oa-queried-cms", `查询人员：${(result.scope.cm_names || []).join("、")}`));
     }
@@ -679,21 +726,11 @@
       card.append(node("h4", "", section.title));
       const summary = answer(section.summary); summary.className = "oa-section-summary"; card.append(summary);
       sources.append(node("summary", "", "查看相关消息"));
-      for (const message of section.sources || []) {
-        const item = node("div", "oa-section-source");
-        rawMessages(item, {messages: [message]}, false, false, multiCM);
-        const ref = message.message_ref || message.evidence_ref;
-        if (ref) {
-          const actions = node("div", "oa-card-actions");
-          actions.append(evidenceCard(ref, message.conversation_name || message.chat_name || section.title, null, multiCM));
-          if (message.text && !message.unreadable) actions.append(replyButton(ref, message.conversation_name || message.chat_name || section.title, true));
-          item.append(actions);
-        }
-        sources.append(item);
-      }
+      if (mode === "detailed") sourceMessages(sources, section.sources || []);
       if (sources.children.length > 1) card.append(sources);
       container.append(card);
     }
+    if (mode === "compact") sourceMessages(references, (result.sections || []).flatMap(section => section.sources || []));
     const groups = new Map([["reply", {label: "需要我回复", element: node("details", "oa-event-group")}],
       ["followup", {label: "需要内部跟进", element: node("details", "oa-event-group")}],
       ["waiting", {label: "等待对方", element: node("details", "oa-event-group")}],
@@ -726,9 +763,19 @@
       if (action === "reply" && Number.isFinite(event.waiting_seconds) && event.waiting_seconds > 0) card.append(node("div", "oa-card-meta", `原文中已等待 ${event.waiting_seconds >= 86400 ? `${Math.floor(event.waiting_seconds / 86400)} 天` : event.waiting_seconds >= 3600 ? `${Math.floor(event.waiting_seconds / 3600)} 小时` : `${Math.max(1, Math.floor(event.waiting_seconds / 60))} 分钟`}`));
       card.append(states);
       const actions = node("div", "oa-card-actions");
-      if (event.evidence_ref || event.event_ref) actions.append(evidenceCard(event.evidence_ref || event.event_ref, event.title || "聊天事项原文", event.evidence_count, multiCM));
-      if (event.event_ref) actions.append(askButton("最新进展", "查看这个事项的最新进展", {event_ref: event.event_ref, event_title: event.title || "聊天事项"}),
-        replyButton(event.event_ref, event.title || "聊天事项"));
+      const canReply = replyable && action === "reply" && !["resolved", "not_required", "no_action"].includes(event.handling_status);
+      if (mode === "detailed" && (event.evidence_ref || event.event_ref)) actions.append(evidenceCard(event.evidence_ref || event.event_ref, event.title || "聊天事项原文", event.evidence_count, multiCM, canReply));
+      const evidenceRef = event.evidence_ref || event.event_ref;
+      if (mode === "compact" && evidenceRef && !eventReferences.has(evidenceRef)) {
+        eventReferences.add(evidenceRef);
+        const item = node("div", "oa-section-source");
+        item.append(node("h4", "", event.title || "聊天事项"));
+        if (multiCM && event.cm_name) item.append(node("span", "oa-chip oa-cm-source", event.cm_name));
+        item.append(evidenceCard(event.evidence_ref || event.event_ref, event.title || "聊天事项原文", event.evidence_count, multiCM));
+        references.append(item);
+      }
+      if (event.event_ref) actions.append(askButton("最新进展", "查看这个事项的最新进展", {event_ref: event.event_ref, event_title: event.title || "聊天事项"}));
+      if (canReply && event.event_ref) actions.append(replyButton(event.event_ref, event.title || "聊天事项"));
       if (actions.children.length) card.append(actions);
       group.element.append(card);
     });
@@ -736,31 +783,67 @@
       group.element.open = key !== "closed";
       group.element.prepend(node("summary", "", `${group.label} · ${group.element.children.length} 项`)); container.append(group.element);
     }
-    const sourcePages = (result.data || []).filter(data => data.kind === "window_messages");
-    let sourcesAdded = false;
+    const sourcePages = new Map();
     for (const data of result.data || []) {
-      if (data.kind === "window_messages" && result.sections?.length && !canManageCM && !multiCM) continue;
-      if (data.kind === "window_messages" && sourcesAdded && !multiCM) continue;
-      const value = data.kind === "window_messages" && sourcePages.length > 1 && !multiCM ? {...data,
-        messages: [...new Map(sourcePages.flatMap(page => page.messages || []).map(message => [message.message_ref || message.evidence_ref || JSON.stringify(message), message])).values()]} : data;
-      const card = dataCard(value, multiCM); if (card) container.append(card);
-      if (data.kind === "window_messages") sourcesAdded = true;
+      if (["window_messages", "messages", "message_context"].includes(data.kind)) {
+        if (mode === "hidden") continue;
+        if (mode === "compact" && data.kind === "message_context") {
+          sourceMessages(references, [{...data.message, message_ref: data.message_ref || data.evidence_ref || data.message?.message_ref}]);
+          continue;
+        }
+        if (data.kind === "messages") {
+          const allMessages = uniqueMessages(data.messages || []).map(message => mergedMessages.get(messageKey(message)) || message);
+          const messages = allMessages.filter(message => !represented.has(messageKey(message)));
+          if (!messages.length && !data.next_source_url) continue;
+          const card = dataCard({...data, messages: allMessages}, multiCM, replyable, new Set(represented));
+          messages.forEach(message => represented.add(messageKey(message)));
+          if (card) (mode === "compact" ? references : container).append(card);
+          continue;
+        }
+        if (data.kind === "window_messages") {
+          const key = data.query_ref || `${data.scope?.cm_id || ""}:${data.query_id || "window"}`;
+          const previous = sourcePages.get(key);
+          sourcePages.set(key, {...(previous || data), messages: uniqueMessages([...(previous?.messages || []),
+            ...(data.messages || []).map(message => ({...message, cm_name: message.cm_name || data.scope?.cm_name}))])});
+          continue;
+        }
+      }
+      if (data.kind === "message_context") {
+        const message = {...data.message, message_ref: data.message_ref || data.evidence_ref || data.message?.message_ref};
+        if (represented.has(messageKey(message))) continue;
+        const card = dataCard({...data, message}, multiCM, replyable); if (card) container.append(card);
+        represented.add(messageKey(message));
+      } else {
+        const card = dataCard(data, multiCM, replyable, represented); if (card) container.append(card);
+      }
     }
-    if (result.documents?.length) {
-      const references = node("details", "oa-coverage oa-document-sources");
-      references.append(node("summary", "", `参考文档 · ${result.documents.length}`));
-      for (const document of result.documents) {
+    for (const data of sourcePages.values()) {
+      // Summary citations are enough; the full scanned window remains available to backend follow-ups.
+      if (mode === "compact" && (result.sections?.length || result.events?.length)) continue;
+      const allMessages = (data.messages || []).map(message => mergedMessages.get(messageKey(message)) || message);
+      const messages = allMessages.filter(message => !represented.has(messageKey(message)));
+      if (!messages.length && !(data.source_url && (data.has_more || (data.page || 1) < (data.page_count || 1)))) continue;
+      const card = dataCard({...data, messages: allMessages}, multiCM, replyable, new Set(represented));
+      messages.forEach(message => represented.add(messageKey(message)));
+      if (mode === "compact") { card.firstChild.open = true; references.append(card); }
+      else container.append(card);
+    }
+    const knowledge = (result.documents || []).filter(document => document.kind === "knowledge");
+    if (mode !== "hidden" && knowledge.length) {
+      const documents = node("div", "oa-document-sources");
+      for (const document of new Map(knowledge.map(document => [document.document_ref || document.key, document])).values()) {
         const source = node("section", "oa-section-source oa-document-source");
         source.append(node("h4", "", document.title), node("small", "oa-coverage", `版本 ${document.revision}`));
         const content = node("p", "", document.text); content.style.whiteSpace = "pre-wrap";
         source.append(content);
         if (document.truncated) source.append(node("small", "oa-coverage", "仅展示相关文档片段"));
-        references.append(source);
+        documents.append(source);
       }
-      container.append(references);
+      references.append(documents);
     }
+    if (mode !== "hidden" && references.children.length > 1) container.append(references);
     if (result.draft?.draft?.trim()) {
-      const draft = {...result.draft, draft_ref: result.draft.draft_ref || result.draft_ref};
+      const draft = {...result.draft, source_mode: mode, draft_ref: result.draft.draft_ref || result.draft_ref};
       showDraft(draft, container.dataset.turnId, Boolean(activeReplyAction));
       const openDraft = node("button", "oa-evidence", "查看回复草稿"); openDraft.type = "button";
       openDraft.addEventListener("click", () => { showDraft(draft, container.dataset.turnId); openReply(); }); container.append(openDraft);
