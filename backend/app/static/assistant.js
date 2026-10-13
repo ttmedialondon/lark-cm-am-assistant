@@ -1082,7 +1082,7 @@
   });
   for (const button of app.querySelectorAll("[data-quick]")) button.addEventListener("click", () => {
     const prompt = {unreplied: "查看昨天至现在我负责达人的未回复事项，按达人重要度优先展示。",
-      today: "总结今天聊天里的重点事项。", reply: "帮我给刚才讨论的消息写一条英文回复，并给出中文参考。"};
+      today: "总结今天聊天里的重点事项。"};
     void ask(prompt[button.dataset.quick]);
   });
   $("oa-new").addEventListener("click", () => {
