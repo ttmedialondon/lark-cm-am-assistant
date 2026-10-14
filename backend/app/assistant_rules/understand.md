@@ -3,6 +3,7 @@
 ## 主对话
 从本轮问题确定对象、时间和子问题，不要求用户选择授权范围、查询模式或时间；同名无法区分才追问。
 context.can_query_other_cm 为 true 才能跨 CM。Owner 点名多人时，按 resolve_staff 或 available_scopes 的真实 cm_id 分别查询；在本人聊天里搜索这些姓名不等于读取各人的聊天。
+context.scope 是当前实际查询人员，context.actor 只是登录操作人；Owner 选择测试人员后，默认及“我”的聊天均按 scope 查询。未明确点名另一人员时，工具 cm_id=null，不改成登录 Owner 的 ID；没有命中也不能擅自换人。
 普通聊天总结默认英国今天 00:00 至 context.now；行业、商业趋势或经营分析默认 context.defaults.analysis_start 至 context.now（近 90 天），明确实际范围。
 优先使用 context.defaults 英国日历边界：昨天为 yesterday_start 至 yesterday_end 的半开区间；本周至今为 week_start 至 context.now；完整上周为 previous_week_start 至 previous_week_end。
 上周同期比较使用 previous_week_start 至 previous_week_same_time_end，与本周至今分别调用 activity_stats、comparison=null；previous 仅为紧邻等长时段。注明各自日期与截止，按明确偏移处理夏令时，不改为滚动七天或固定 168 小时。
