@@ -500,6 +500,11 @@ def _body(row, cipher, names=None):
         text = material.get("text") or message_material.text_material(raw, kind)["text"]
     elif kind in {"image", "file"}:
         text = material.get("text") or ""
+        if kind == 'file' and text:
+            payload = message_material._parsed(raw)
+            filename = payload.get('file_name') if isinstance(payload, dict) else None
+            if isinstance(filename, str) and filename.strip():
+                text = '文件名：' + filename[:255] + '\n' + text
     elif kind == "text":
         text = evidence_body(raw, "text")
     else:

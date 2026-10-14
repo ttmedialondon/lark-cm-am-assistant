@@ -929,11 +929,17 @@ def step(job, settings):
                                           for document in checkpoint['rules'].get('catalog', [])))
             model_tools, model_format = tools.tools_for(context,
                 document_mode=checkpoint['rules'].get('protocol') == 2, documents_ready=documents_ready), OUTPUT_FORMAT
+            query_refs = list(dict.fromkeys(result['query_ref'] for result in checkpoint['tool_results']
+                                           if result.get('query_ref')))
+            fields = OUTPUT_FORMAT['schema']['properties']
+            model_format = {**OUTPUT_FORMAT, 'schema': {**OUTPUT_FORMAT['schema'], 'properties': {
+                **fields, 'data_refs': {**fields['data_refs'], **(
+                    {'items': {**fields['data_refs']['items'], 'enum': query_refs}} if query_refs else
+                    {'maxItems': 0})}}}}
             if not any(message.get('message_ref') for result in checkpoint['tool_results']
                        for message in result.get('messages', [])):
-                model_format = {**OUTPUT_FORMAT, 'schema': {**OUTPUT_FORMAT['schema'], 'properties': {
-                    **OUTPUT_FORMAT['schema']['properties'], 'sections': {
-                        **OUTPUT_FORMAT['schema']['properties']['sections'], 'maxItems': 0}}}}
+                model_format = {**model_format, 'schema': {**model_format['schema'], 'properties': {
+                    **model_format['schema']['properties'], 'sections': {**fields['sections'], 'maxItems': 0}}}}
             if checkpoint.get('no_progress_calls', 0) >= 3:
                 checkpoint['final_only'] = True
                 model_tools = []

@@ -501,16 +501,22 @@ def test_search_source_get_continues_without_model_and_cleared_refs_stay_unreada
                (chat.cipher.encrypt(json.dumps({'text': 'Find fixture facts'})),))
     monkeypatch.setattr(assistant_search, 'PAGE_SIZE', 1)
     calls = []
+    original_format = deepcopy(assistant.OUTPUT_FORMAT)
 
-    def model(_cfg, _key, items, _actor, **_kwargs):
+    def model(_cfg, _key, items, _actor, **kwargs):
         calls.append(True)
         outputs = [item for item in items if item.get('type') == 'function_call_output']
+        data_schema = kwargs['output_format']['schema']['properties']['data_refs']
         if not outputs:
+            assert data_schema['maxItems'] == 0 and 'enum' not in data_schema['items']
             return {'text': '', 'output': [{'type': 'function_call', 'call_id': 'search-call',
                 'name': 'search_chat_history', 'arguments': json.dumps({'audience': 'all',
                     'query': ['fixture'], 'start': chat.start.isoformat(), 'end': chat.end.isoformat(),
                     'creator_ids': None, 'chat_ids': None, 'cursor': None})}], 'usage': {}}
         source = json.loads(outputs[-1]['output'])
+        assert data_schema['items']['enum'] == [source['query_ref']]
+        mistyped = source['query_ref'][:-1] + ('0' if source['query_ref'][-1] != '0' else '1')
+        assert mistyped not in data_schema['items']['enum']
         final = {'answer': '找到相关原文。', 'event_refs': [], 'result_refs': [],
                  'source_mode': 'hidden', 'reply_enabled': False,
                  'data_refs': [source['query_ref']], 'draft_ref': None,
@@ -522,6 +528,7 @@ def test_search_source_get_continues_without_model_and_cleared_refs_stay_unreada
     turn = assistant.submit(pg, chat.ids['cm'], payload('查找fixture原话'), chat.settings)
     for _ in range(3):
         finish(chat)
+    assert assistant.OUTPUT_FORMAT == original_format
     view = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
     source = view['result']['data'][0]
     section = view['result']['sections'][0]
@@ -536,6 +543,10 @@ def test_search_source_get_continues_without_model_and_cleared_refs_stay_unreada
     with pytest.raises(ValueError, match='引用未取得'):
         assistant.tools.build_result(pg, chat.ids['cm'], row, invalid, chat.settings,
                                      context, checkpoint['tool_results'])
+    mistyped = source['query_ref'][:-1] + ('0' if source['query_ref'][-1] != '0' else '1')
+    with pytest.raises(ValueError, match='引用未取得的资料'):
+        assistant.tools.build_result(pg, chat.ids['cm'], row, {**stored_final, 'data_refs': [mistyped]},
+                                     chat.settings, context, checkpoint['tool_results'])
     for mode, can_reply in [('compact', False), ('detailed', True)]:
         rendered = assistant.tools.build_result(pg, chat.ids['cm'], row,
             {**stored_final, 'source_mode': mode, 'reply_enabled': True}, chat.settings,

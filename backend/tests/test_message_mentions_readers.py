@@ -147,6 +147,8 @@ def test_assistant_attachments_use_memory_only_and_keep_partial_reading_explicit
     from openpyxl import Workbook
     from PIL import Image
 
+    from app import offhours_summary
+
     image = io.BytesIO()
     Image.new("RGB", (2, 2), "white").save(image, format="PNG")
     result = message_material.file_inputs(image.getvalue(), "../../sample.png", "image/png")
@@ -154,6 +156,12 @@ def test_assistant_attachments_use_memory_only_and_keep_partial_reading_explicit
     assert base64.b64decode(result["inputs"][0]["image_url"].split(",", 1)[1]) == image.getvalue()
     pdf = message_material.file_inputs(b"%PDF-1.7\nexample", "../sample.pdf", "application/pdf")
     assert pdf["inputs"][0]["filename"] == "sample.pdf" and pdf["inputs"][0]["type"] == "input_file"
+    cipher = message_body_cipher(b'r' * 32)
+    raw_file = json.dumps({'file_name': 'distinct-file-name.pdf', 'file_key': 'file_test'})
+    body, unreadable = offhours_summary._body(
+        {'message_type': 'file', 'body_ciphertext': cipher.encrypt(raw_file),
+         '_material': {'text': '[文件解析，非发言人原话]\nBusiness facts', 'complete': True}}, cipher)
+    assert not unreadable and 'distinct-file-name.pdf' in body and 'Business facts' in body
     doc = io.BytesIO()
     with ZipFile(doc, "w") as archive:
         archive.writestr("word/document.xml", '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
