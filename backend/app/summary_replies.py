@@ -133,7 +133,9 @@ def _collect(conn, actor_id, event_id, settings, selected, *, cutoff=None, featu
         watermark = max((t for t in (chat["last_incremental_at"], chat["last_backfill_at"]) if t), default=None)
         if watermark:
             watermarks.append(watermark.isoformat())
-        if not chat["backfill_complete"] or chat["sync_status"] != "succeeded" or not watermark:
+        # Keep old paid drafts independent of a ticking sync watermark.
+        if (chat["backfill_complete"] and (chat["sync_status"] != "succeeded" or not watermark)
+                or not core._covers_window(chat, start, min(now, watermark) if watermark else now)):
             gaps.append(chat["chat_id"])
         rows = list(
             reversed(

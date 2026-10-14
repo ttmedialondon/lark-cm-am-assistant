@@ -4,7 +4,7 @@ from concurrent.futures import Future as TaskFuture
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from types import SimpleNamespace
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
@@ -21,6 +21,9 @@ from app.worker import (
 
 def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg, monkeypatch):
     monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
+    signals = []
+    monkeypatch.setattr(worker.creator_responsibility_matching, "touch_chats",
+                        lambda _conn, _chats, **signal: signals.append(signal))
     actor, job_id = UUID(int=1), UUID(int=2)
     pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,'ou_cm','fixture')", (actor,))
     pg.execute("""INSERT INTO sync_jobs(id,authorization_id,mode,status,discovery_status,discovery_generation)
@@ -30,12 +33,14 @@ def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg
         pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,backfill_page_token)
                    VALUES(%s,%s,'page-2')""", (actor, chat))
     job = worker.SyncJob(job_id, actor, "backfill", 0, "succeeded", 3)
-    config = SimpleNamespace(sync_lookback_days=0, sync_overlap_seconds=600,
+    config = SimpleNamespace(sync_lookback_days=0, sync_overlap_seconds=600, sync_interval_seconds=300,
                              lark_sync_per_authorization_max_inflight=2)
     authorization = {"open_id": "ou_cm", "body_consent_at": None}
     claim = worker._claim_next_page(job, authorization, config)
     other = worker._claim_next_page(job, authorization, config)
-    assert claim.chat_id != other.chat_id and claim.expected_page_token == "page-2"
+    assert claim.mode == "incremental" and claim.end_at - claim.start_at == worker.timedelta(days=7)
+    assert other.mode == "backfill" and other.expected_page_token == "page-2" and other.start_at is None
+    assert claim.chat_id != other.chat_id
     assert worker._claim_next_page(job, authorization, config) is None
     body = '{"text":"hello"}'
     mention = {"key": "@_user_1", "id": "ou_mentioned", "id_type": "open_id", "name": "Mentioned"}
@@ -50,7 +55,7 @@ def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg
         {"message_id": "om_untyped", "sender": {"id": "ou_cm", "sender_type": "user"}},
     ]
     cipher = TokenCipher(b"i" * 32)
-    result = worker._record_claimed_page(claim, messages, "page-3", cipher)
+    result = worker._record_claimed_page(claim, messages, "page-3", cipher, fingerprint_key=b"i" * 32)
     assert result.committed and (result.messages, result.own_messages) == (4, 1)
     rows = {row["message_id"]: row for row in pg.execute("SELECT * FROM chat_messages")}
     saved = rows["om_cm"]
@@ -66,21 +71,113 @@ def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg
     assert identities["ou_mentioned"]["tenant_classification"] == "unresolved"
     replay = worker._claim_next_page(job, authorization, config)
     assert replay.chat_id == claim.chat_id and replay.expected_page_token == "page-3"
-    duplicate = worker._record_claimed_page(replay, messages, None, cipher)
+    duplicate = worker._record_claimed_page(replay, messages, None, cipher, fingerprint_key=b"i" * 32)
     assert duplicate.committed and duplicate.messages == duplicate.own_messages == 0
+    synced = pg.execute("SELECT * FROM authorization_chats WHERE chat_id=%s", (claim.chat_id,)).fetchone()
+    assert synced["last_incremental_at"] == replay.end_at and not synced["backfill_complete"]
+    assert synced["backfill_page_token"] == "page-2" and synced["sync_status"] != "succeeded"
+    assert len(signals) == 1 and set(signals[0]["message_ids"]) == {m["message_id"] for m in messages}
+    assert signals[0]["authorization_id"] == actor and signals[0]["new_scope"]
+    assert set(signals[0]["observed_message_ids"]) == {m["message_id"] for m in messages}
     assert pg.execute("SELECT count(*) n FROM authorization_message_observations").fetchone()["n"] == 4
     assert not worker._record_claimed_page(claim, [{"message_id": "om_stale"}], None, cipher).committed
     assert not pg.execute("SELECT 1 FROM chat_messages WHERE message_id='om_stale'").fetchone()
+    pg.execute("UPDATE authorization_message_observations SET observed_at=NOW()-INTERVAL '1 day'")
+    pg.execute("UPDATE authorizations SET body_consent_at=NOW() WHERE id=%s", (actor,))
+    authorization["body_consent_at"] = pg.execute("SELECT NOW() consent").fetchone()["consent"]
+    granted = worker._claim_next_page(job, authorization, config)
+    assert granted.chat_id == claim.chat_id and granted.mode == "backfill"
+    restored = worker._record_claimed_page(granted, messages, "history-3", cipher, fingerprint_key=b"i" * 32)
+    assert restored.committed and restored.messages == 0
+    assert len(signals) == 2 and not signals[-1]["message_ids"] and signals[-1]["new_scope"]
+    assert set(signals[-1]["observed_message_ids"]) == {m["message_id"] for m in messages}
+    pg.execute("UPDATE authorization_chats SET sync_enabled=FALSE WHERE chat_id='oc_ingest_3'")
+    edited = {**messages[0], "body": {"content": '{"text":"updated"}'}}
+    history = worker._claim_next_page(job, authorization, config)
+    assert history.chat_id == claim.chat_id and history.mode == "backfill"
+    assert worker._record_claimed_page(history, [edited], None, cipher, fingerprint_key=b"i" * 32).committed
+    assert len(signals) == 3 and signals[-1]["message_ids"] == ["om_cm"] and not signals[-1]["new_scope"]
+    assert signals[-1]["observed_message_ids"] == []
+    pg.execute("UPDATE authorization_chats SET sync_enabled=TRUE WHERE chat_id='oc_ingest_3'")
     current = worker._claim_next_page(job, authorization, config)
     pg.execute("UPDATE authorization_chats SET sync_generation=sync_generation+1 WHERE chat_id=%s", (current.chat_id,))
     assert not worker._record_claimed_page(current, [{"message_id": "om_revoked"}], None, cipher).committed
     assert not pg.execute("SELECT 1 FROM chat_messages WHERE message_id='om_revoked'").fetchone()
     monkeypatch.setattr(worker, "get_settings", lambda: SimpleNamespace(sync_interval_seconds=300))
     pg.execute("UPDATE authorization_chats SET backfill_complete=TRUE,page_claim_id=NULL,"
-               "page_claim_job_id=NULL,page_lease_until=NULL")
+               "page_claim_job_id=NULL,page_lease_until=NULL,incremental_job_id=%s,"
+               "incremental_window_start_at=NULL,incremental_window_end_at=NULL", (job_id,))
+    pg.execute("UPDATE sync_jobs SET mode='backfill' WHERE id=%s", (job_id,))
     worker._finish_and_schedule_incremental(job)
     following = pg.execute("SELECT * FROM sync_jobs WHERE status='queued'").fetchone()
     assert following["id"] != job_id and following["mode"] == "incremental"
+    assert following["scheduled_at"] == pg.execute("SELECT NOW() due").fetchone()["due"]
+
+
+def test_new_cm_interleaves_recent_and_history_without_losing_either_window(pg, monkeypatch):
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
+    settings = SimpleNamespace(sync_lookback_days=0, sync_overlap_seconds=600, sync_interval_seconds=300,
+                               lark_sync_per_authorization_max_inflight=2)
+    monkeypatch.setattr(worker, "get_settings", lambda: settings)
+    actor, job_id = uuid4(), uuid4()
+    pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,'ou_new','fixture')", (actor,))
+    pg.execute("INSERT INTO chats(chat_id) VALUES('oc_long_history')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'oc_long_history')", (actor,))
+    pg.execute("""INSERT INTO sync_jobs(id,authorization_id,mode,status,discovery_status)
+        VALUES(%s,%s,'backfill','running','succeeded')""", (job_id, actor))
+    job, auth = worker.SyncJob(job_id, actor, "backfill", 0, "succeeded", 0), {"open_id": "ou_new"}
+    recent = worker._claim_next_page(job, auth, settings)
+    assert recent.mode == "incremental" and recent.end_at - recent.start_at == worker.timedelta(days=7)
+    assert worker._record_claimed_page(recent, [], "recent-2", None).committed
+    assert pg.execute("SELECT recent_coverage_start_at FROM authorization_chats").fetchone()[
+        "recent_coverage_start_at"] is None
+    history = worker._claim_next_page(job, auth, settings)
+    assert history.mode == "backfill" and history.start_at is None
+    assert worker._record_claimed_page(history, [], "history-2", None).committed
+    resumed = worker._claim_next_page(job, auth, settings)
+    assert (resumed.mode, resumed.expected_page_token, resumed.start_at, resumed.end_at) == (
+        "incremental", "recent-2", recent.start_at, recent.end_at)
+    assert worker._record_claimed_page(resumed, [], None, None).committed
+    row = pg.execute("SELECT * FROM authorization_chats WHERE chat_id='oc_long_history'").fetchone()
+    assert row["last_incremental_at"] == recent.end_at and not row["backfill_complete"]
+    assert row["recent_coverage_start_at"] == recent.start_at
+    assert row["backfill_page_token"] == "history-2"
+    pg.execute("UPDATE authorization_chats SET last_incremental_at=NOW()-INTERVAL '6 minutes'")
+    waterline = pg.execute("SELECT last_incremental_at FROM authorization_chats").fetchone()["last_incremental_at"]
+    resumed_history = worker._claim_next_page(job, auth, settings)
+    assert (resumed_history.mode, resumed_history.expected_page_token, resumed_history.end_at) == (
+        "backfill", "history-2", history.end_at)
+    assert worker._record_claimed_page(resumed_history, [], "history-3", None).committed
+    updated = worker._claim_next_page(job, auth, settings)
+    assert updated.mode == "incremental" and updated.start_at == waterline - worker.timedelta(seconds=600)
+    assert worker._record_claimed_page(updated, [], None, None).committed
+    last_history = worker._claim_next_page(job, auth, settings)
+    assert last_history.mode == "backfill" and last_history.expected_page_token == "history-3"
+    assert worker._record_claimed_page(last_history, [], None, None).committed
+    row = pg.execute("SELECT * FROM authorization_chats").fetchone()
+    assert row["backfill_complete"] and row["last_backfill_at"] == history.end_at
+    assert row["last_incremental_at"] == updated.end_at
+    pg.execute("""UPDATE authorization_chats SET last_incremental_at=NOW()-INTERVAL '10 days',
+        incremental_window_start_at=NOW()-INTERVAL '3 days',incremental_window_end_at=NOW(),
+        incremental_page_token='gap-1'""")
+    gap = worker._claim_next_page(job, auth, settings)
+    assert worker._record_claimed_page(gap, [], "gap-2", None).committed
+    assert pg.execute("SELECT recent_coverage_start_at FROM authorization_chats").fetchone()[
+        "recent_coverage_start_at"] == recent.start_at
+    late = worker._claim_next_page(job, auth, settings)
+    pg.execute("UPDATE authorization_chats SET sync_generation=sync_generation+1")
+    assert not worker._record_claimed_page(late, [], None, None).committed
+    assert pg.execute("SELECT recent_coverage_start_at FROM authorization_chats").fetchone()[
+        "recent_coverage_start_at"] == recent.start_at
+    pg.execute("UPDATE authorization_chats SET page_claim_id=NULL,page_claim_job_id=NULL,page_lease_until=NULL")
+    renewed = worker._claim_next_page(job, auth, settings)
+    assert renewed.expected_page_token == "gap-2" and worker._record_claimed_page(renewed, [], None, None).committed
+    assert pg.execute("SELECT recent_coverage_start_at FROM authorization_chats").fetchone()[
+        "recent_coverage_start_at"] == gap.start_at
+    worker._finish_and_schedule_incremental(job)
+    following = pg.execute("SELECT * FROM sync_jobs WHERE status='queued'").fetchone()
+    assert following["mode"] == "incremental" and following["scheduled_at"] == pg.execute(
+        "SELECT NOW()+INTERVAL '300 seconds' due").fetchone()["due"]
 
 
 def test_p2p_contact_discovery_skips_bots(pg, monkeypatch) -> None:
@@ -734,7 +831,7 @@ def test_all_due_accounts_rotate_through_three_page_slots_and_resume_cursors(pg,
     monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(worker, "_usable_access_token", lambda *_args: "test-token")
     settings = SimpleNamespace(lark_sync_max_inflight=3, lark_sync_per_authorization_max_inflight=2,
-                               sync_overlap_seconds=600, sync_lookback_days=0)
+                               sync_overlap_seconds=600, sync_lookback_days=0, sync_interval_seconds=300)
     jobs = []
     for index in range(1, 8):
         job_id, actor_id = UUID(int=index), UUID(int=100 + index)
@@ -930,11 +1027,41 @@ def test_new_coordinator_keeps_revocation_and_discovery_retry_fences(pg, monkeyp
                                               "discovery_generation": 1}
     assert pg.execute("SELECT backfill_page_token FROM authorization_chats WHERE authorization_id=%s",
                       (actor,)).fetchone()["backfill_page_token"] == "keep-page-3"
+    pg.execute("UPDATE authorizations SET body_consent_at=NOW(),p2p_discovery_status='unavailable',"
+               "p2p_last_checked_at=NOW()-INTERVAL '2 hours' WHERE id=%s", (actor,))
+    p2p_calls = []
+    available = False
+
+    def conversations(_token, _page=None, *, types=None):
+        if types == "p2p":
+            p2p_calls.append(types)
+            if not available:
+                raise worker.LarkApiError(503, None, "temporary P2P outage")
+            return {"items": []}
+        return {"items": [{"chat_id": "oc_discovery_resume"}]}
+
+    client.list_chats = conversations
+    for state, checked, count in (("unavailable", "NOW()-INTERVAL '2 hours'", 1),
+                                   ("unavailable", "NOW()", 1),
+                                   ("unavailable", "NOW()-INTERVAL '2 hours'", 2),
+                                   ("attention_required", "NOW()-INTERVAL '2 hours'", 2)):
+        pg.execute("UPDATE sync_jobs SET status='running',discovery_status='pending',"
+                   "lease_until=NOW()+INTERVAL '10 minutes' WHERE id=%s", (job_id,))
+        pg.execute(f"UPDATE authorizations SET p2p_discovery_status=%s,p2p_last_checked_at={checked} WHERE id=%s",
+                   (state, actor))
+        assert worker._start_pending_jobs(settings, client)
+        assert len(p2p_calls) == count
+        assert pg.execute("SELECT discovery_status FROM sync_jobs WHERE id=%s", (job_id,)).fetchone()[
+            "discovery_status"] == "succeeded"
+        available = True
+    assert pg.execute("SELECT backfill_page_token FROM authorization_chats WHERE authorization_id=%s", (actor,)
+                      ).fetchone()["backfill_page_token"] == "keep-page-3"
 
 
 
 
-def test_delayed_only_job_yields_its_coordinator_slot() -> None:
+def test_delayed_only_job_yields_its_coordinator_slot(monkeypatch) -> None:
+    monkeypatch.setattr(worker, "get_settings", lambda: SimpleNamespace(sync_interval_seconds=300))
     calls = []
     job = worker.SyncJob(UUID(int=1), UUID(int=2), "backfill", 0, "succeeded", 3)
 

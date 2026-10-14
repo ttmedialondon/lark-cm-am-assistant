@@ -198,9 +198,8 @@ def _coverage(chats, start, end):
         watermark = max((value for value in (chat["last_incremental_at"], chat["last_backfill_at"])
                          if value), default=None)
         reasons = []
-        # A completed backfill with a NULL start is the worker's full-history scan.
-        if not chat["backfill_complete"] or (chat["backfill_window_start_at"] is not None
-                                            and chat["backfill_window_start_at"] > start):
+        if (chat["sync_status"] != "not_readable" and (not core._covers_window(chat, start)
+                or watermark and watermark >= end and not core._covers_window(chat, start, end))):
             reasons.append(("历史同步未覆盖检索起点", "history"))
         if chat["sync_status"] == "not_readable":
             reasons.append((unreadable_reason(chat), "restricted"))

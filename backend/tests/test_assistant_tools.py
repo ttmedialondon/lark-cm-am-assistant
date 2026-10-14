@@ -219,6 +219,9 @@ def test_creator_snapshot_keeps_all_pages_stable_and_live_sources_protected(pg, 
 
 def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeypatch):  # noqa: F811
     s = seeded
+    assert not summaries._covers_window({"sync_status": "succeeded", "backfill_complete": True,
+        "backfill_window_start_at": None, "last_backfill_at": s.end, "last_incremental_at": s.end},
+        s.end, s.start)
     pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
                "VALUES(%s,%s,%s,'manual')", (uuid4(), s.ids["person"], s.ids["owner"]))
     account = uuid4()
@@ -518,17 +521,19 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
     pg.execute("UPDATE authorization_chats SET sync_status='succeeded' WHERE authorization_id=%s AND chat_id='chat'",
                (s.ids["cm"],))
     # A completed unbounded backfill has no start; a new sync round does not erase that coverage.
-    for complete, history_start, status, watermark, expected_gap in [
-        (True, None, "syncing", s.end, None),
-        (False, None, "pending", s.end, "历史"),
-        (True, s.start + timedelta(minutes=1), "succeeded", s.end, "历史"),
-        (True, None, "not_readable", s.end, "Lark未允许读取"),
-        (True, None, "syncing", s.start + timedelta(hours=1), "截止"),
+    for complete, history_start, status, watermark, recent_start, expected_gap in [
+        (True, None, "syncing", s.end, None, None),
+        (False, None, "pending", s.end, None, "历史"),
+        (True, s.start + timedelta(minutes=1), "succeeded", s.end, None, "历史"),
+        (True, None, "not_readable", s.end, None, "Lark未允许读取"),
+        (True, None, "syncing", s.start + timedelta(hours=1), None, "截止"),
+        (False, None, "syncing", s.end, s.start - timedelta(days=7), None),
+        (False, None, "syncing", s.end, s.start + timedelta(minutes=1), "历史"),
     ]:
         pg.execute("""UPDATE authorization_chats SET backfill_complete=%s,backfill_window_start_at=%s,
-            sync_status=%s,last_incremental_at=%s,last_backfill_at=NULL
+            sync_status=%s,last_incremental_at=%s,last_backfill_at=NULL,recent_coverage_start_at=%s
             WHERE authorization_id=%s AND chat_id='business'""",
-            (complete, history_start, status, watermark, s.ids["cm"]))
+            (complete, history_start, status, watermark, recent_start, s.ids["cm"]))
         scoped = {**all_args, "chat_ids": ["business"]}
         material = assistant_search.window_messages(pg, s.ids["cm"], context, scoped, s.settings)
         activity = assistant_queries.activity(pg, s.ids["cm"], context, {
@@ -544,6 +549,24 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
                 0 if status == "not_readable" else 3)
         assert material["sources"][0]["source_complete"] == (expected_gap is None)
         assert material["coverage"]["source_complete"] == (expected_gap is None)
+        if recent_start is not None and expected_gap is None:
+            old = assistant_search.window_messages(pg, s.ids["cm"], context, {**scoped,
+                "start": (s.start - timedelta(days=30)).isoformat(),
+                "end": (s.start - timedelta(days=29)).isoformat()}, s.settings)
+            assert old["messages"] == [] and not old["coverage"]["source_complete"]
+            assert any(gap["category"] == "history" for gap in old["gaps"])
+    pg.execute("""UPDATE authorization_chats SET backfill_complete=TRUE,backfill_window_start_at=NULL,
+        last_backfill_at=%s,last_incremental_at=%s,recent_coverage_start_at=%s,sync_status='succeeded'
+        WHERE authorization_id=%s AND chat_id='business'""",
+        (s.start + timedelta(hours=1), s.end, s.start + timedelta(hours=2), s.ids["cm"]))
+    for start, end, complete in ((s.start, s.start + timedelta(minutes=30), True),
+                                 (s.start + timedelta(hours=3), s.end, True), (s.start, s.end, False)):
+        scoped = {**all_args, "chat_ids": ["business"], "start": start.isoformat(), "end": end.isoformat()}
+        material = assistant_search.window_messages(pg, s.ids["cm"], context, scoped, s.settings)
+        activity = assistant_queries.activity(pg, s.ids["cm"], context, {
+            **scoped, "group_by": "day", "comparison": None}, s.settings)
+        assert material["coverage"]["source_complete"] == complete
+        assert bool(activity["gaps"]) != complete
     gaps = [{"chat_id": f"gap-{index}", "reason": "历史回填尚未完成"} for index in range(30)]
     gaps += [{"chat_id": "gap-0", "reason": "历史回填尚未完成"},
              {"chat_id": "gap-0", "reason": "同步水位未覆盖请求截止"},
@@ -570,6 +593,7 @@ def test_business_queries_pagination_context_and_live_grants(pg, seeded, monkeyp
     assert assistant_search.unreadable_reason({"last_error": "private provider response"}) == "Lark未允许读取"
     results.remove(blocked)
     pg.execute("""UPDATE authorization_chats SET backfill_complete=TRUE,backfill_window_start_at=%s,
+        recent_coverage_start_at=NULL,
         sync_status='succeeded',last_incremental_at=%s,last_error=NULL
         WHERE authorization_id=%s AND chat_id='business'""",
         (s.start - timedelta(days=9), s.end, s.ids["cm"]))

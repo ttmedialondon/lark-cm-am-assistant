@@ -560,10 +560,10 @@ def _prepare_job(job: SyncJob, settings: Settings, client: LarkClient) -> None:
         access_token = _usable_access_token(current.authorization_id, authorization, client, settings)
         _refresh_profile_name(current, authorization, access_token, client, settings)
         discovered = _discover_chats(current, authorization, access_token, client, settings, chat_type="group")
-        if authorization.get("body_consent_at") and authorization.get("p2p_discovery_status") not in {
-            "unavailable",
-            "attention_required",
-        }:
+        p2p_checked = authorization.get("p2p_last_checked_at")
+        if (authorization.get("body_consent_at") and authorization.get("p2p_discovery_status") != "attention_required"
+                and (authorization.get("p2p_discovery_status") != "unavailable" or not p2p_checked
+                     or p2p_checked <= datetime.now(UTC) - timedelta(hours=1))):
             discovered += _discover_p2p(current, authorization, access_token, client, settings)
         _complete_discovery(current, discovered)
     except StaleSyncJob:
@@ -913,7 +913,7 @@ def _store_claimed_member_snapshot(claim: MemberSnapshotClaim, measurement: Memb
         lock_sync_material(conn)
         row = conn.execute(
             """
-            SELECT 1
+            SELECT member_snapshot_checked_at
             FROM authorization_chats
             WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
               AND member_snapshot_claim_id = %s
@@ -952,6 +952,9 @@ def _store_claimed_member_snapshot(claim: MemberSnapshotClaim, measurement: Memb
             seen_at,
             _internal_tenant_keys(conn),
         )
+        if row["member_snapshot_checked_at"] is None:
+            creator_responsibility_matching.touch_chats(conn, [claim.chat_id],
+                authorization_id=claim.authorization_id, new_scope=True)
         conn.execute(
             """
             UPDATE authorization_chats
@@ -1051,7 +1054,7 @@ def _authorization(authorization_id: uuid.UUID) -> dict[str, Any] | None:
             """
             SELECT id, open_id, status, access_token_ciphertext, refresh_token_ciphertext,
                    access_token_expires_at, refresh_token_expires_at,
-                   body_consent_at, p2p_discovery_status
+                   body_consent_at, p2p_discovery_status, p2p_last_checked_at
             FROM authorizations WHERE id = %s
             """,
             (authorization_id,),
@@ -1225,6 +1228,11 @@ def _discover_chats(
             lock_sync_material(conn)
             _assert_discovery_current(conn, job)
             internal_tenant_keys = _internal_tenant_keys(conn)
+            previous = {row["chat_id"]: row["is_visible"] for row in conn.execute(
+                "SELECT chat_id,is_visible FROM authorization_chats WHERE authorization_id=%s AND chat_id=ANY(%s)",
+                (job.authorization_id, [row[0] for row in rows]),
+            ).fetchall()}
+            new_scopes = []
             for (
                 chat_id,
                 name,
@@ -1356,7 +1364,12 @@ def _discover_chats(
                         internal_tenant_keys,
                     )
                 discovered += 1
+                if not previous.get(chat_id):
+                    new_scopes.append(chat_id)
             _ensure_internal_contact_roles(conn)
+            if new_scopes:
+                creator_responsibility_matching.touch_chats(conn, new_scopes,
+                    authorization_id=job.authorization_id, new_scope=True)
         if not _has_more(data):
             break
         page_token = _text(data.get("page_token"))
@@ -1411,8 +1424,6 @@ def _discover_p2p(
     try:
         discovered = _discover_chats(job, authorization, access_token, client, settings, chat_type="p2p")
     except LarkApiError as exc:
-        if exc.retryable:
-            raise
         status = "attention_required" if exc.likely_auth_problem else "unavailable"
         detail = (
             "Lark authorization or P2P permission must be renewed."
@@ -1824,19 +1835,21 @@ def _claim_next_page(
         ).fetchone()
         if int(active_claims["count"]) >= claim_limit:
             return None
-        mode = "backfill" if current["mode"] == "backfill" or _has_pending_backfill_in_connection(
-            conn, job.authorization_id
-        ) else "incremental"
-        if mode != current["mode"]:
-            conn.execute("UPDATE sync_jobs SET mode = %s, updated_at = NOW() WHERE id = %s", (mode, job.id))
-
-        if mode == "backfill":
-            _reset_one_requested_backfill(conn, job.authorization_id)
-            chat = _select_backfill_chat_for_claim(conn, job.authorization_id)
-        else:
-            chat = _select_incremental_chat_for_claim(conn, job.authorization_id, job.id)
+        # Keep recent messages moving even while the same account has years of history left.
+        modes = ("incremental", "backfill") if current["mode"] == "backfill" else ("backfill", "incremental")
+        for mode in modes:
+            if mode == "backfill":
+                _reset_one_requested_backfill(conn, job.authorization_id)
+                chat = _select_backfill_chat_for_claim(conn, job.authorization_id)
+            else:
+                chat = _select_incremental_chat_for_claim(conn, job.authorization_id, job.id,
+                                                           settings.sync_interval_seconds)
+            if chat:
+                break
         if not chat:
             return None
+        if mode != current["mode"]:
+            conn.execute("UPDATE sync_jobs SET mode = %s, updated_at = NOW() WHERE id = %s", (mode, job.id))
 
         now = datetime.now(UTC)
         generation = int(chat["sync_generation"])
@@ -1860,10 +1873,12 @@ def _claim_next_page(
             if not end_at:
                 end_at = now
                 last_sync = chat["last_incremental_at"] or chat["last_backfill_at"]
+                if not chat["backfill_complete"] and not chat["recent_coverage_start_at"]:
+                    last_sync = None
                 start_at = (
                     last_sync - timedelta(seconds=settings.sync_overlap_seconds)
                     if last_sync
-                    else end_at - timedelta(days=settings.sync_lookback_days or 1)
+                    else end_at - timedelta(days=7)
                 )
             expected_page_token = chat["incremental_page_token"] if same_job else None
 
@@ -1982,7 +1997,7 @@ def _select_backfill_chat_for_claim(conn: psycopg.Connection, authorization_id: 
 
 
 def _select_incremental_chat_for_claim(
-    conn: psycopg.Connection, authorization_id: uuid.UUID, job_id: uuid.UUID
+    conn: psycopg.Connection, authorization_id: uuid.UUID, job_id: uuid.UUID, interval_seconds: int
 ) -> dict[str, Any] | None:
     return conn.execute(
         """
@@ -1991,20 +2006,20 @@ def _select_incremental_chat_for_claim(
         JOIN chats c ON c.chat_id = access.chat_id
         WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
           AND COALESCE(c.chat_status, 'normal') = 'normal'
-          AND access.backfill_complete
           AND (access.page_claim_id IS NULL OR access.page_lease_until < NOW())
           AND (access.page_retry_at IS NULL OR access.page_retry_at <= NOW())
           AND (
-            (access.incremental_job_id = %s AND access.incremental_page_token IS NOT NULL)
+            (access.incremental_job_id = %s AND access.incremental_window_end_at IS NOT NULL)
             OR access.incremental_job_id IS DISTINCT FROM %s
+            OR access.last_incremental_at <= NOW() - (%s * INTERVAL '1 second')
           )
         ORDER BY
-            CASE WHEN access.incremental_job_id = %s AND access.incremental_page_token IS NOT NULL THEN 0 ELSE 1 END,
-            COALESCE(access.last_incremental_at, access.last_backfill_at), access.chat_id
+            CASE WHEN access.incremental_job_id = %s AND access.incremental_window_end_at IS NOT NULL THEN 0 ELSE 1 END,
+            COALESCE(access.last_incremental_at, access.last_backfill_at) NULLS FIRST, access.chat_id
         FOR UPDATE SKIP LOCKED
         LIMIT 1
         """,
-        (authorization_id, job_id, job_id, job_id),
+        (authorization_id, job_id, job_id, interval_seconds, job_id),
     ).fetchone()
 
 
@@ -2125,6 +2140,15 @@ def _record_claimed_page(
         ).fetchone()
         if not current_claim:
             return PageCommit(False)
+        previous = {row["message_id"]: row for row in conn.execute("""SELECT m.message_id,m.body_fingerprint,
+            m.parent_id,m.root_id,m.thread_id,m.mentions_json,m.is_deleted,m.sender_open_id,m.sender_type,
+            m.message_type,m.message_create_time,o.observed_at AS scope_observed_at
+            FROM chat_messages m LEFT JOIN authorization_message_observations o ON o.authorization_id=%s
+              AND o.chat_id=m.chat_id AND o.message_id=m.message_id
+            WHERE m.chat_id=%s AND m.message_id=ANY(%s::text[])""",
+            (claim.job.authorization_id, claim.chat_id, [_text(message.get("message_id")) for message in messages]),
+        ).fetchall()} if messages else {}
+        changed, observed = [], []
         internal_tenant_keys = _internal_tenant_keys(conn)
         for message in messages:
             message_id = _text(message.get("message_id"))
@@ -2149,7 +2173,23 @@ def _record_claimed_page(
             body_ciphertext = (
                 content_cipher.encrypt(body_content) if content_cipher and body_content and not is_deleted else None
             )
+            body_fingerprint = (message_body_fingerprint(fingerprint_key, body_content)
+                                if body_ciphertext and fingerprint_key else None)
             relations = _message_relation_metadata(message)
+            old = previous.get(message_id, {})
+            material = {
+                "body_fingerprint": None if is_deleted else body_fingerprint or old.get("body_fingerprint"),
+                "is_deleted": is_deleted or old.get("is_deleted", False),
+                "message_create_time": old.get("message_create_time") or _lark_time(message.get("create_time")),
+                "message_type": _text(message.get("msg_type")) or old.get("message_type"),
+                "sender_open_id": sender_open_id or old.get("sender_open_id"),
+                "sender_type": sender_type or old.get("sender_type"),
+                "mentions_json": (relations["mentions"] if relations["mentions"] is not None
+                                  else old.get("mentions_json")),
+                **{key: relations[key] or old.get(key) for key in ("parent_id", "root_id", "thread_id")},
+            }
+            if not old or any(old.get(key) != value for key, value in material.items()):
+                changed.append(message_id)
             for mention in relations["mentions"] or []:
                 if mention.get("id_type") != "open_id" or not mention.get("id"):
                     continue
@@ -2222,8 +2262,7 @@ def _record_claimed_page(
                     _lark_time(message.get("update_time")),
                     _text(message.get("msg_type")),
                     body_ciphertext,
-                    message_body_fingerprint(fingerprint_key, body_content)
-                    if body_ciphertext and fingerprint_key else None,
+                    body_fingerprint,
                     relations["root_id"],
                     relations["parent_id"],
                     relations["thread_id"],
@@ -2251,6 +2290,9 @@ def _record_claimed_page(
                 """,
                 (claim.job.authorization_id, claim.chat_id, message_id, is_own),
             ).fetchone()
+            if observation["is_new"] or (claim.body_consent_at and (
+                    not old.get("scope_observed_at") or old["scope_observed_at"] < claim.body_consent_at)):
+                observed.append(message_id)
             if observation["is_new"]:
                 inserted += 1
                 own_inserted += int(bool(observation["sent_by_author"]))
@@ -2263,7 +2305,7 @@ def _record_claimed_page(
                 UPDATE authorization_chats
                 SET backfill_page_token = %s,
                     backfill_complete = %s,
-                    last_backfill_at = CASE WHEN %s THEN NOW() ELSE last_backfill_at END,
+                    last_backfill_at = CASE WHEN %s THEN %s ELSE last_backfill_at END,
                     sync_status = CASE WHEN %s THEN 'succeeded' ELSE 'syncing' END,
                     manual_backfill_requested_at = CASE
                         WHEN %s THEN NULL ELSE manual_backfill_requested_at
@@ -2281,6 +2323,7 @@ def _record_claimed_page(
                     next_page_token,
                     next_page_token is None,
                     next_page_token is None,
+                    claim.end_at,
                     next_page_token is None,
                     next_page_token is None,
                     next_page_token is None,
@@ -2299,8 +2342,12 @@ def _record_claimed_page(
                 SET incremental_page_token = %s,
                     incremental_window_start_at = CASE WHEN %s THEN NULL ELSE incremental_window_start_at END,
                     incremental_window_end_at = CASE WHEN %s THEN NULL ELSE incremental_window_end_at END,
-                    last_incremental_at = CASE WHEN %s THEN NOW() ELSE last_incremental_at END,
-                    sync_status = CASE WHEN %s THEN 'succeeded' ELSE 'syncing' END,
+                    recent_coverage_start_at = CASE WHEN %s THEN
+                        CASE WHEN recent_coverage_start_at IS NULL OR last_incremental_at IS NULL
+                            OR %s > last_incremental_at THEN %s ELSE LEAST(recent_coverage_start_at,%s) END
+                        ELSE recent_coverage_start_at END,
+                    last_incremental_at = CASE WHEN %s THEN %s ELSE last_incremental_at END,
+                    sync_status = CASE WHEN %s AND backfill_complete THEN 'succeeded' ELSE 'syncing' END,
                     last_error = NULL,
                     page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
                     page_claimed_at = NULL, page_lease_until = NULL, page_retry_at = NULL
@@ -2314,6 +2361,11 @@ def _record_claimed_page(
                     next_page_token is None,
                     next_page_token is None,
                     next_page_token is None,
+                    claim.start_at,
+                    claim.start_at,
+                    claim.start_at,
+                    next_page_token is None,
+                    claim.end_at,
                     next_page_token is None,
                     claim.job.authorization_id,
                     claim.chat_id,
@@ -2329,6 +2381,10 @@ def _record_claimed_page(
             creator_handle_matching.touch_chats(conn, [claim.chat_id],
                 recognition_message_ids=[m['message_id'] for m in messages if m.get('message_id')])
             creator_group_matching.touch_chats(conn, [claim.chat_id])
+        if changed or observed:
+            creator_responsibility_matching.touch_chats(conn, [claim.chat_id],
+                authorization_id=claim.job.authorization_id, message_ids=changed,
+                observed_message_ids=observed, new_scope=bool(observed))
     return PageCommit(True, inserted, own_inserted)
 
 
@@ -2475,22 +2531,8 @@ def _yield_job_to_retry_if_idle(conn: psycopg.Connection, job: SyncJob) -> bool:
 def _has_claimable_page_in_connection(conn: psycopg.Connection, job: SyncJob) -> bool:
     """Whether this coordinator has a page it can run now, not after backoff."""
 
-    if _has_pending_backfill_in_connection(conn, job.authorization_id):
-        pending = """
-            (access.manual_backfill_requested_at IS NOT NULL OR NOT access.backfill_complete)
-        """
-        params: tuple[object, ...] = (job.authorization_id,)
-    else:
-        pending = """
-            access.backfill_complete
-            AND (
-                (access.incremental_job_id = %s AND access.incremental_page_token IS NOT NULL)
-                OR access.incremental_job_id IS DISTINCT FROM %s
-            )
-        """
-        params = (job.authorization_id, job.id, job.id)
     row = conn.execute(
-        f"""
+        """
         SELECT EXISTS (
             SELECT 1
             FROM authorization_chats access
@@ -2499,10 +2541,12 @@ def _has_claimable_page_in_connection(conn: psycopg.Connection, job: SyncJob) ->
               AND COALESCE(c.chat_status, 'normal') = 'normal'
               AND (access.page_claim_id IS NULL OR access.page_lease_until < NOW())
               AND (access.page_retry_at IS NULL OR access.page_retry_at <= NOW())
-              AND {pending}
+              AND (access.manual_backfill_requested_at IS NOT NULL OR NOT access.backfill_complete
+                OR access.incremental_job_id IS DISTINCT FROM %s OR access.incremental_window_end_at IS NOT NULL
+                OR access.last_incremental_at <= NOW() - (%s * INTERVAL '1 second'))
         ) AS ready
         """,
-        params,
+        (job.authorization_id, job.id, get_settings().sync_interval_seconds),
     ).fetchone()
     return bool(row["ready"])
 
@@ -2588,32 +2632,28 @@ def _finish_and_schedule_incremental(job: SyncJob) -> None:
         if claimed["claimed"] or _has_pending_backfill_in_connection(conn, job.authorization_id):
             return
 
-        # A backfill job owns only backfill cursors.  Once those are complete,
-        # finish it and let the new incremental job establish its own windows.
-        # Otherwise every uninitialised incremental cursor would keep this
-        # backfill coordinator alive forever.
-        if current["mode"] == "incremental":
-            incremental_pending = conn.execute(
-                """
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM authorization_chats access
-                    JOIN chats c ON c.chat_id = access.chat_id
-                    WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
-                      AND COALESCE(c.chat_status, 'normal') = 'normal'
-                      AND access.backfill_complete
-                      AND (access.sync_status <> 'not_readable'
-                           OR access.page_retry_at IS NULL OR access.page_retry_at <= NOW())
-                      AND (
-                        (access.incremental_job_id = %s AND access.incremental_page_token IS NOT NULL)
-                        OR access.incremental_job_id IS DISTINCT FROM %s
-                      )
-                ) AS pending
-                """,
-                (job.authorization_id, job.id, job.id),
-            ).fetchone()
-            if incremental_pending["pending"]:
-                return
+        # Drain a started recent window before replacing its coordinator and page token.
+        incremental_pending = conn.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM authorization_chats access
+                JOIN chats c ON c.chat_id = access.chat_id
+                WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
+                  AND COALESCE(c.chat_status, 'normal') = 'normal'
+                  AND access.backfill_complete
+                  AND (access.sync_status <> 'not_readable'
+                       OR access.page_retry_at IS NULL OR access.page_retry_at <= NOW())
+                  AND (
+                    (access.incremental_job_id = %s AND access.incremental_window_end_at IS NOT NULL)
+                    OR (%s='incremental' AND access.incremental_job_id IS DISTINCT FROM %s)
+                  )
+            ) AS pending
+            """,
+            (job.authorization_id, job.id, current["mode"], job.id),
+        ).fetchone()
+        if incremental_pending["pending"]:
+            return
 
         finished = conn.execute(
             """
@@ -2651,7 +2691,7 @@ def _finish_and_schedule_incremental(job: SyncJob) -> None:
             )
             ON CONFLICT (authorization_id) WHERE status IN ('queued', 'running') DO NOTHING
             """,
-            (uuid.uuid4(), job.authorization_id, mode, mode, settings.sync_interval_seconds),
+            (uuid.uuid4(), job.authorization_id, mode, current["mode"], settings.sync_interval_seconds),
         )
 
 

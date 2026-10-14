@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-from app import main
+from app import creator_broadcast, main
 from app.config import Settings
 from app.crypto import TokenCipher
 from app.lark_api import LarkApiError, LarkProfile
@@ -70,15 +70,13 @@ def test_session_touch_is_throttled_without_caching_revocation(pg, monkeypatch):
                "VALUES(%s,%s,NOW()+INTERVAL '1 day',NOW()-INTERVAL '10 minutes')", (session_hash, actor))
     request = _request_with_session("fixture-session")
     authorization = main._current_authorization(request)
-    assert authorization["status"] == "active" and authorization["broadcast_enabled"] is False
+    assert authorization["status"] == "active" and authorization["broadcast_enabled"] is True
     touched = pg.execute("SELECT last_seen_at FROM web_sessions WHERE session_hash=%s", (session_hash,)).fetchone()
     pg.execute("UPDATE web_sessions SET last_seen_at=NOW()-INTERVAL '1 minute' WHERE session_hash=%s", (session_hash,))
     for _ in range(3):
         assert main._current_authorization(request)["id"] == actor
     unchanged = pg.execute("SELECT last_seen_at FROM web_sessions WHERE session_hash=%s", (session_hash,)).fetchone()
     assert touched["last_seen_at"] - unchanged["last_seen_at"] == timedelta(minutes=1)
-    pg.execute("UPDATE authorizations SET broadcast_enabled=TRUE WHERE id=%s", (actor,))
-    assert main._current_authorization(request)["broadcast_enabled"] is True
     pg.execute("UPDATE authorizations SET broadcast_enabled=FALSE WHERE id=%s", (actor,))
     assert main._current_authorization(request)["broadcast_enabled"] is False
     pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (actor,))
@@ -87,12 +85,22 @@ def test_session_touch_is_throttled_without_caching_revocation(pg, monkeypatch):
     assert main._current_authorization(request) is None
 
 
-def test_dashboard_navigation_preserves_access_and_connection_controls(monkeypatch) -> None:
-    monkeypatch.setattr(main, "connection", lambda: nullcontext(None))
+def test_dashboard_navigation_preserves_access_and_connection_controls(pg, monkeypatch) -> None:
+    monkeypatch.setattr(main, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(main.assistant, "configured", lambda _: True)
     monkeypatch.setattr(main, "_admin_csrf_token", lambda _: "fixture-csrf")
-    authorization = {"id": uuid4(), "status": "active", "display_name": "CM", "body_consent_at": True,
-                     "p2p_discovery_status": "succeeded"}
+    actor = uuid4()
+    authorization = pg.execute("""INSERT INTO authorizations(id,open_id,display_name,access_token_ciphertext,
+        body_consent_at,p2p_discovery_status) VALUES(%s,'new_cm','CM','fixture',NOW(),'succeeded')
+        RETURNING *""", (actor,)).fetchone()
+    monkeypatch.setattr(creator_broadcast, "get_settings",
+                        lambda: SimpleNamespace(oauth_scopes=authorization["scopes"]))
+    assert authorization["broadcast_enabled"] and not pg.execute(
+        "SELECT 1 FROM admin_roles WHERE authorization_id=%s", (actor,)).fetchone()
+    assert not set(creator_broadcast.SEND_SCOPES) & set(authorization["scopes"])
+    assert creator_broadcast._scope(pg, actor, str(actor)) == actor
+    with pytest.raises(PermissionError):
+        creator_broadcast._scope(pg, actor, str(uuid4()))
     context = {
         "authorization": authorization, "admin_role": None, "body_consent": True,
         "stats": {
@@ -105,15 +113,19 @@ def test_dashboard_navigation_preserves_access_and_connection_controls(monkeypat
     assert "工作台" in rendered and "权限与数据使用" in rendered
     assert 'id="operations-assistant"' in rendered and 'id="oa-launcher"' in rendered
     assert 'href="/creators"' in rendered and 'href="/dashboard/offhours-summary"' in rendered
-    assert "/creators/broadcast" not in rendered and 'href="/admin"' not in rendered
+    assert 'href="/creators/broadcast"' in rendered and 'href="/admin"' not in rendered
     assert 'hx-trigger="every 10s [!document.hidden]"' in rendered
     assert 'hx-trigger="load' not in rendered and 'class="ui-spinner"' not in rendered
-    enabled = main._template(request, "dashboard.html", {
-        **context, "authorization": {**authorization, "broadcast_enabled": True},
+    pg.execute("UPDATE authorizations SET broadcast_enabled=FALSE WHERE id=%s", (actor,))
+    disabled_authorization = pg.execute("SELECT * FROM authorizations WHERE id=%s", (actor,)).fetchone()
+    disabled = main._template(request, "dashboard.html", {
+        **context, "authorization": disabled_authorization,
     }).body.decode()
-    assert 'href="/creators/broadcast"' in enabled and 'href="/admin"' not in enabled
+    assert "/creators/broadcast" not in disabled and 'href="/admin"' not in disabled
+    with pytest.raises(PermissionError):
+        creator_broadcast._scope(pg, actor, str(actor))
     owner = main._template(request, "dashboard.html", {
-        **context, "admin_role": "owner", "admin_landing_path": "/admin",
+        **context, "authorization": disabled_authorization, "admin_role": "owner", "admin_landing_path": "/admin",
     }).body.decode()
     assert 'href="/creators/broadcast"' in owner and 'href="/admin"' in owner
     admin_context = {**context, 'admin_role': 'owner', 'admin_role_label': 'Owner',
@@ -126,7 +138,7 @@ def test_dashboard_navigation_preserves_access_and_connection_controls(monkeypat
     }).body.decode()
     assert 'id="operations-assistant"' not in member_page
     restricted = main._template(request, "dashboard.html", {
-        **context, "authorization": {**authorization, "body_consent_at": None},
+        **context, "authorization": {**disabled_authorization, "body_consent_at": None},
         "body_consent": False, "offhours_summary_visible": False,
     }).body.decode()
     assert "/creators/broadcast" not in restricted and "/dashboard/offhours-summary" not in restricted
@@ -223,6 +235,8 @@ def test_oauth_reauthorization_defers_creator_scans_for_a_large_existing_roster(
                member_snapshot_status,member_snapshot_checked_at)
                SELECT %s,chat_id,17,'succeeded',TRUE,'backfill-cursor','incremental-cursor',%s,
                  'succeeded',NOW() FROM chats""", (actor, job))
+    pg.execute("UPDATE authorization_chats SET recent_coverage_start_at=NOW()-INTERVAL '7 days' "
+               "WHERE authorization_id=%s", (actor,))
     pg.execute("""INSERT INTO creator_importance_profiles(contact_id,responsible_authorization_id,sources)
                VALUES(%s,%s,'[{"chat_id":"oc_bulk_0001"}]')""", (person, actor))
     pg.execute("""INSERT INTO creator_authorization_rescans(authorization_id,generation,stage,
@@ -283,6 +297,7 @@ def test_oauth_reauthorization_defers_creator_scans_for_a_large_existing_roster(
     for chat in chats:
         assert chat["sync_generation"] == 18 and not chat["backfill_complete"]
         assert chat["sync_status"] == chat["member_snapshot_status"] == "pending"
+        assert chat["recent_coverage_start_at"] is None
         assert all(chat[field] is None for field in ("backfill_page_token", "incremental_page_token",
                                                     "incremental_job_id", "member_snapshot_checked_at"))
     queued = pg.execute("SELECT * FROM sync_jobs WHERE id=%s", (job,)).fetchone()
@@ -334,8 +349,7 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
     )
     if owner:
         pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (actor,))
-    if broadcast_enabled:
-        pg.execute("UPDATE authorizations SET broadcast_enabled=TRUE WHERE id=%s", (actor,))
+    pg.execute("UPDATE authorizations SET broadcast_enabled=%s WHERE id=%s", (broadcast_enabled, actor))
     pg.execute(
         "INSERT INTO sync_jobs(id,authorization_id,mode,status,discovery_generation) "
         "VALUES(%s,%s,'backfill','running',9)",
@@ -355,6 +369,8 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
             (actor, chat, job, uuid4(), job, "ou_counterpart" if mode == "p2p" else None,
              "user" if mode == "p2p" else None),
         )
+    pg.execute("UPDATE authorization_chats SET recent_coverage_start_at=NOW()-INTERVAL '7 days' "
+               "WHERE authorization_id=%s", (actor,))
     pg.execute(
         "INSERT INTO chat_members(chat_id,open_id,display_name) VALUES('oauth_group','ou_upgrade','Old Profile')"
     )
@@ -552,6 +568,7 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
     upgraded = snapshot()
     auth = upgraded["authorizations"][0]
     assert auth["id"] == actor and auth["open_id"] == "ou_upgrade" and auth["status"] == "active"
+    assert auth["broadcast_enabled"] == broadcast_enabled
     assert auth["last_error"] is None and auth["scopes"] == list(upgrade_scopes)
     assert cipher.decrypt(auth["access_token_ciphertext"]) == "new-access-full"
     for field in ("body_consent_at", "p2p_discovery_status", "p2p_last_checked_at", "p2p_last_error"):

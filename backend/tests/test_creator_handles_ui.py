@@ -590,6 +590,7 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
         access_token_expires_at=NOW()+INTERVAL '1 hour' WHERE id=%s""",
         (list(required), cipher.encrypt("fixture-owner"), actor["id"]))
     state["change"] = "owner"
+    pg.execute("UPDATE authorizations SET broadcast_enabled=FALSE WHERE id=%s", (actor["id"],))
     assert client.post(url, json={"cm_id": "all"}, headers=headers).status_code == 403
     state["change"] = None
     before = len(state["calls"])
@@ -696,6 +697,7 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
     state["change"] = None
     assert client.get("/creators/broadcast").status_code == 403
     assert client.post("/creators/broadcast/templates/save", json=draft, headers=headers).status_code == 403
+    pg.execute("UPDATE authorizations SET broadcast_enabled=FALSE WHERE id=%s", (other,))
     ordinary, ordinary_actor = browser(monkeypatch)
     ordinary_actor["id"] = other
     assert ordinary.get("/creators/broadcast").status_code == 403

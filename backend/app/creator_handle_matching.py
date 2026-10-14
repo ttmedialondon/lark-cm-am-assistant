@@ -149,7 +149,6 @@ def confirm_identity(conn, contact_id, creator, pack, refs, settings, *, thresho
         (contact_id, source)).fetchone()
     if not inserted:
         return False
-    conn.execute("SELECT enqueue_creator_responsibility(%s,'history')", (contact_id,))
     _audit(conn, None, 'creator_identity_auto_confirmed', {'contact_id': str(contact_id),
         'task_id': str(job_id) if job_id else None, 'source': source,
         'rules_digest': pack.get('_rules', {}).get('digest'), 'refs': creator['refs']})

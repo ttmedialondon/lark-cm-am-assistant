@@ -478,6 +478,7 @@ def _reset_chat_backfill(conn, authorization_id):
             backfill_window_start_at = NULL, backfill_window_end_at = NULL,
             incremental_page_token = NULL, incremental_job_id = NULL,
             incremental_window_start_at = NULL, incremental_window_end_at = NULL,
+            recent_coverage_start_at = NULL,
             page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
             page_claimed_at = NULL, page_lease_until = NULL,
             page_retry_at = NULL,

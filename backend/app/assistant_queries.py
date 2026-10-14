@@ -281,7 +281,8 @@ def conversations(conn, actor_id, context, args, settings, *, now=None, read_cac
 def _chat_states(conn, cm_id):
     return conn.execute("""SELECT c.chat_id,c.name,COALESCE(c.chat_status,'normal') chat_status,
         COALESCE(c.chat_mode,'group') chat_mode,ac.sync_enabled,ac.sync_status,ac.backfill_complete,
-        ac.backfill_window_start_at,ac.last_backfill_at,ac.last_incremental_at,ac.p2p_counterpart_open_id,ac.last_error
+        ac.backfill_window_start_at,ac.last_backfill_at,ac.last_incremental_at,ac.recent_coverage_start_at,
+        ac.p2p_counterpart_open_id,ac.last_error
         FROM authorization_chats ac JOIN chats c USING(chat_id)
         WHERE ac.authorization_id=%s AND ac.is_visible ORDER BY c.chat_id""", (cm_id,)).fetchall()
 
@@ -299,14 +300,14 @@ def _coverage(chats, start=None, end=None):
         else:
             if watermark:
                 watermarks.append(watermark)
-            if not chat["backfill_complete"]:
-                reasons.append("历史回填尚未完成")
+            history_gap = not chat["backfill_complete"] if start is None else not summaries._covers_window(chat, start)
+            if start is not None and end is not None and watermark and watermark >= end \
+                    and not summaries._covers_window(chat, start, end):
+                history_gap = True
+            if chat["sync_status"] != "not_readable" and history_gap:
+                reasons.append("请求早于已确认历史同步范围" if chat["backfill_complete"] else "历史回填尚未完成")
             if chat["sync_status"] not in {"succeeded", "syncing"}:
                 reasons.append(unreadable_reason(chat) if chat["sync_status"] == "not_readable" else "同步尚未成功")
-            # NULL is an unbounded history start, not a missing sync boundary.
-            if start is not None and chat["backfill_window_start_at"] is not None \
-                    and chat["backfill_window_start_at"] > start:
-                reasons.append("请求早于已确认历史同步范围")
             if watermark is None or (end is not None and watermark < end):
                 reasons.append("尚无同步水位" if watermark is None else "同步水位未覆盖请求截止")
         if reasons:
@@ -341,7 +342,7 @@ def sync_status(conn, actor_id, context, args, settings, *, now=None, read_cache
         "job": {"status": job["status"], "mode": job["mode"], "scheduled_at": _iso(job["scheduled_at"])}
         if job else None, "checked_at": _iso(now), "authorization": _authorization(cm),
         "source_chat_ids": [chat["chat_id"] for chat in chats],
-        "definition": "同步水位是检查完成时间，不是最后一条消息时间，也不保证全历史已同步。"}
+        "definition": "同步水位是已完成读取的查询截止时间，不是最后一条消息时间，也不代表全历史已同步。"}
 
 
 # Only actual sender, private counterpart and explicit @/reply links count; group membership alone never does.

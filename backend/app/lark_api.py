@@ -52,7 +52,9 @@ class LarkApiError(RuntimeError):
 
     @property
     def likely_auth_problem(self) -> bool:
-        return self.status_code in {401, 403} or self.lark_code in {
+        # A chat/resource denial may also use HTTP 403; only token/scope errors affect the account.
+        return self.status_code == 401 or self.lark_code in {
+            20026,
             20037,
             20064,
             20073,
@@ -60,6 +62,10 @@ class LarkApiError(RuntimeError):
             99991661,
             99991663,
             99991668,
+            99991669,
+            99991671,
+            99991676,
+            99991677,
             99991679,
         }
 

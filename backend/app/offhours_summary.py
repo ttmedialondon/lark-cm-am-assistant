@@ -305,6 +305,7 @@ def _roster(conn, cm_id=REMI_ID):
 
 _CHAT_SQL = f"""SELECT c.chat_id,c.name,c.chat_mode,ac.p2p_counterpart_open_id,ac.backfill_complete,
                       ac.backfill_window_start_at,ac.last_backfill_at,ac.last_incremental_at,ac.sync_status,
+                      ac.recent_coverage_start_at,
                       ac.member_snapshot_status,ac.member_count
     FROM authorization_chats ac JOIN chats c USING(chat_id)
     JOIN authorizations a ON a.id=ac.authorization_id
@@ -312,6 +313,20 @@ _CHAT_SQL = f"""SELECT c.chat_id,c.name,c.chat_mode,ac.p2p_counterpart_open_id,a
       AND a.status='active' AND a.body_consent_at IS NOT NULL
       AND {BODY_READ_SCOPE_SQL}
       AND COALESCE(c.chat_status,'normal')='normal'"""
+
+
+def _covers_window(chat, start, end=None):
+    end = end or start
+    if chat["sync_status"] == "not_readable" or end < start:
+        return False
+    history_start = chat["backfill_window_start_at"]
+    recent_start, recent_end = chat.get("recent_coverage_start_at"), chat["last_incremental_at"]
+    history_end = chat["last_backfill_at"]
+    if recent_start is None or history_end and recent_start <= history_end:
+        history_end = max((at for at in (history_end, recent_end) if at), default=None)
+    return bool(history_end and history_end >= end and chat["backfill_complete"]
+                and (history_start is None or history_start <= start)
+                or recent_start and recent_start <= start and recent_end and recent_end >= end)
 
 
 def _related_chats(conn, roster, *, settings=None, cm_id=REMI_ID):
@@ -704,7 +719,7 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
         "fingerprint": fingerprint,
         "selected_contact_ids": selected,
         "incomplete": incomplete,
-        "synced": watermark >= cutoff,
+        "synced": _covers_window(chat, run["window_start"], cutoff),
         "history_complete": complete,
         "material_pending_ids": materials["pending_ids"],
     }
@@ -813,11 +828,7 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
         evidence = _load_chat(conn, _task_run(run, previous), chat["chat_id"], chat_cutoff,
                               roster=roster, related_chats=chats, prepare_materials=True)
         if not evidence:
-            watermark = max(
-                [t for t in (chat["last_incremental_at"], chat["last_backfill_at"]) if t]
-                or [datetime.min.replace(tzinfo=UTC)]
-            )
-            synced = synced and watermark >= cutoff
+            synced = synced and _covers_window(chat, state["window_start"], cutoff)
             continue
         count += 1
         private_count += evidence["pack"]["is_private"]
@@ -915,8 +926,7 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
         previous_coverage = state.get('coverage') or {}
         gaps = [gap for gap in previous_coverage.get('gaps', []) if '正文' in gap or '附件' in gap] + gaps
         task_cutoffs = {row['chat_id']: row['cutoff'] for row in totals}
-        synced = all(max([t for t in (chat['last_incremental_at'],chat['last_backfill_at']) if t]
-                        or [datetime.min.replace(tzinfo=UTC)]) >= task_cutoffs.get(chat['chat_id'], cutoff)
+        synced = all(_covers_window(chat, state['window_start'], task_cutoffs.get(chat['chat_id'], cutoff))
                      for chat in chats)
     if not synced:
         gaps.append("部分会话同步进度尚未覆盖所选时段，当前仅总结已同步内容。")

@@ -1206,8 +1206,9 @@ def test_creator_enrollment_backfills_closed_periods_without_repaying_or_replaci
     add_private('empty-old-private', s.ids['cm'], 'empty-placeholder')
     pg.execute("DELETE FROM authorization_message_observations WHERE message_id='empty-placeholder'")
     pg.execute("DELETE FROM chat_messages WHERE message_id='empty-placeholder'")
-    pg.execute("UPDATE authorization_chats SET p2p_counterpart_open_id='ou_person',last_incremental_at=%s "
-               "WHERE chat_id='empty-old-private'", (start - timedelta(hours=1),))
+    pg.execute("""UPDATE authorization_chats SET p2p_counterpart_open_id='ou_person',backfill_complete=FALSE,
+               last_incremental_at=%s,last_backfill_at=NULL,recent_coverage_start_at=%s
+               WHERE chat_id='empty-old-private'""", (end, start + timedelta(minutes=1)))
     pg.execute('''INSERT INTO offhours_summary_tasks(id,run_id,chat_id,input_fingerprint,cutoff,status)
         VALUES(%s,%s,'empty-old-private','old-zero',%s,'succeeded')''', (uuid4(), run['id'], end))
     ai._schedule_run(pg, {**after, 'run_id': run['id']}, now, contact_ids={s.ids['other']})

@@ -22,7 +22,7 @@ from app import creator_handle_evidence as handle_evidence
 from app import creator_matching_routes as routes
 from app import creator_responsibility_evidence as evidence
 from app import creator_responsibility_matching as matching
-from app.crypto import message_body_cipher
+from app.crypto import message_body_cipher, message_body_fingerprint
 
 pilot = parent_pilot
 
@@ -516,7 +516,8 @@ def test_one_creator_one_call_formal_multi_cm_idempotency_and_cache_gates(pg, pi
     )
     identifier = _enqueue(pg, flow.contact)
     assert _enqueue(pg, flow.contact) == identifier
-    assert pg.execute("SELECT count(*) n FROM creator_responsibility_jobs").fetchone()["n"] == 1
+    assert pg.execute("SELECT count(*) n FROM creator_responsibility_jobs WHERE contact_id=%s",
+                      (flow.contact,)).fetchone()["n"] == 1
     assert matching.prepare_next(flow.settings)
     job = matching.claim()
     assert job["attempts"] == 1 and job["snapshot_version"] == job["desired_version"]
@@ -578,6 +579,126 @@ def test_one_creator_one_call_formal_multi_cm_idempotency_and_cache_gates(pg, pi
     refreshed = json.loads(creator_data.cipher(flow.settings).decrypt(cached["result_ciphertext"]))
     assert UUID(refreshed["candidate_ids"]["CM2"]) == flow.helper
     assert refreshed["result"]["suggestions"][1]["association_status"] == "review_required"
+
+
+def test_new_cm_material_wakes_existing_creator_and_signals_downstream(pg, pilot, monkeypatch):
+    """New scope/real messages wake once; formal links continue into importance and seven-day backfill."""
+    settings, creator = pilot.settings, pilot.ids["creator"]
+    monkeypatch.setattr(matching, "connection", lambda: nullcontext(pg))
+    monkeypatch.setattr(config, "get_settings", lambda: settings)
+    for feature in (matching.FEATURE, "creator_importance"):
+        ai_feature_config.save_feature_config(
+            pg, ai_feature_config.api_key_cipher(settings.token_encryption_key), feature,
+            provider="openai", project_id="test-project", model="test-model", enabled=True,
+            auto_confirm_threshold=0.95, api_key="sk-synthetic-only",
+            updated_by_authorization_id=pilot.ids["owner"],
+        )
+    calls = []
+
+    def respond(_config, _key, pack, _contact, **_kwargs):
+        calls.append(pack)
+        return {
+            "text": json.dumps({"suggestions": [
+                _suggestion(c["id"], [m["id"] for m in pack["messages"] if m["speaker"] == c["id"]][:8],
+                            decision="responsible") for c in pack["candidates"]]}),
+            "usage": {"input_tokens": 100, "output_tokens": 50}, "telemetry": {},
+            "response_id": "resp_new_cm_synthetic",
+        }
+
+    monkeypatch.setattr(matching.api, "call_openai", respond)
+    initial = _enqueue(pg, creator)
+    assert matching.prepare_next(settings)
+    matching.run(matching.claim(), settings)
+    assert pg.execute("SELECT status FROM creator_responsibility_jobs WHERE id=%s",
+                      (initial,)).fetchone()["status"] == "completed"
+    pg.execute("UPDATE creator_responsibility_jobs SET created_at=NOW()-INTERVAL '1 minute' WHERE id=%s", (initial,))
+    assert len(calls) == 1
+    before = _snapshot(pg, ("contact_roles", "contact_social_accounts"))
+    newcomer = _internal(pg, "new_cm", connected=True)
+    auth = pg.execute("SELECT id FROM authorizations WHERE open_id='ou_new_cm'").fetchone()["id"]
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id,p2p_counterpart_open_id) "
+               "VALUES(%s,'chat_creator','ou_creator')", (auth,))
+    pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+               "SELECT %s,chat_id,message_id FROM chat_messages WHERE chat_id='chat_creator'", (auth,))
+    body = json.dumps({"text": "I will handle your campaign and arrange your sample."})
+    pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,
+        body_ciphertext,body_fingerprint,message_create_time,parent_id)
+        VALUES('chat_creator','new_cm_reply','ou_new_cm','user','text',%s,%s,NOW(),'creator_7_question')""",
+        (message_body_cipher(settings.token_encryption_key).encrypt(body),
+         message_body_fingerprint(settings.token_encryption_key, body)))
+    pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+               "VALUES(%s,'chat_creator','new_cm_reply')", (auth,))
+    # Old globally stored messages newly observed by the CM must be usable onboarding anchors.
+    signal = {"authorization_id": auth, "observed_message_ids": ["creator_7_question"], "new_scope": True}
+    assert matching.touch_chats(pg, ["chat_creator"], **signal) == 1
+    assert matching.touch_chats(pg, ["chat_creator"], **signal) == 0
+    current = pg.execute("SELECT * FROM creator_responsibility_jobs WHERE contact_id=%s "
+                         "ORDER BY created_at DESC,id DESC LIMIT 1", (creator,)).fetchone()
+    marker = current["stats"]["auto_signals"]
+    assert marker and current["id"] != initial
+    pg.execute("UPDATE creator_responsibility_jobs SET not_before=NOW() WHERE id=%s", (current["id"],))
+    assert matching.prepare_next(settings)
+    prepared = pg.execute("SELECT * FROM creator_responsibility_jobs WHERE id=%s", (current["id"],)).fetchone()
+    assert prepared["status"] == "ready" and prepared["stats"]["auto_signals"] == marker
+    # Restored consent wakes even a known CM; identical scope observations cannot keep re-enqueueing.
+    pg.execute("SAVEPOINT renewed_consent")
+    pg.execute("UPDATE creator_responsibility_jobs SET status='completed',created_at=NOW()-INTERVAL '30 seconds' "
+               "WHERE id=%s", (current["id"],))
+    pg.execute("UPDATE authorizations SET body_consent_at=NOW()-INTERVAL '1 hour' WHERE id=%s", (auth,))
+    assert matching.touch_chats(pg, ["chat_creator"], **signal) == 1
+    assert matching.touch_chats(pg, ["chat_creator"], **signal) == 0
+    pg.execute("ROLLBACK TO SAVEPOINT renewed_consent")
+    matching.run(matching.claim(), settings)
+    assert len(calls) == 2
+    assignments = pg.execute("SELECT responsible_authorization_id FROM contact_assignments "
+                             "WHERE contact_id=%s AND ended_at IS NULL", (creator,)).fetchall()
+    assert {row["responsible_authorization_id"] for row in assignments} == {pilot.ids["cm"], auth}
+    for table in ("creator_importance_jobs", "offhours_summary_backfills"):
+        assert pg.execute(f"SELECT 1 FROM {table} WHERE contact_id=%s AND responsible_authorization_id=%s",
+                          (creator, auth)).fetchone()
+    assert _snapshot(pg, before.keys()) == before
+    assert newcomer != auth
+    assert matching.touch_chats(pg, ["chat_creator"], authorization_id=auth,
+                                message_ids=["new_cm_reply"]) == 0  # Already formal, not the whole creator skipped.
+    pg.execute("UPDATE contact_assignments SET ended_at=NOW(),ended_by_authorization_id=%s "
+               "WHERE contact_id=%s AND responsible_authorization_id=%s", (pilot.ids["owner"], creator, auth))
+    assert matching.touch_chats(pg, ["chat_creator"], authorization_id=auth, message_ids=["new_cm_reply"]) == 0
+    # Waiting jobs wake from explicit handover, without requiring the new CM to have spoken already.
+    target = pilot.ids["silent"]
+    waiting = _enqueue(pg, target)
+    assert matching.prepare_next(settings)
+    assert pg.execute("SELECT status FROM creator_responsibility_jobs WHERE id=%s",
+                      (waiting,)).fetchone()["status"] == "waiting_evidence"
+    pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('new_handover','Creator handover','group')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'new_handover')", (auth,))
+    body = json.dumps({"text": "@_user_1 Please arrange the campaign sample for me."})
+    pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,
+        body_ciphertext,body_fingerprint,message_create_time,mentions_json)
+        VALUES('new_handover','handover','ou_silent','user','text',%s,%s,NOW(),%s::jsonb)""",
+        (message_body_cipher(settings.token_encryption_key).encrypt(body),
+         message_body_fingerprint(settings.token_encryption_key, body),
+         json.dumps([{"key": "@_user_1", "id_type": "open_id", "id": "ou_new_cm"}])))
+    pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+               "VALUES(%s,'new_handover','handover')", (auth,))
+    assert matching.touch_chats(pg, ["new_handover"], authorization_id=auth, new_scope=True) == 1
+    assert matching.touch_chats(pg, ["new_handover"], authorization_id=auth, new_scope=True) == 0
+    assert pg.execute("SELECT status FROM creator_responsibility_jobs WHERE id=%s",
+                      (waiting,)).fetchone()["status"] == "queued"
+    # Another CM stored this globally first; this known CM's first readable observation is still new evidence.
+    pg.execute("UPDATE creator_responsibility_jobs SET status='waiting_evidence' WHERE id=%s", (waiting,))
+    body = json.dumps({"text": "I will arrange your sample and follow up on the campaign."})
+    pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,
+        body_ciphertext,body_fingerprint,message_create_time,parent_id)
+        VALUES('new_handover','globally_stored_reply','ou_new_cm','user','text',%s,%s,NOW(),'handover')""",
+        (message_body_cipher(settings.token_encryption_key).encrypt(body),
+         message_body_fingerprint(settings.token_encryption_key, body)))
+    pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+               "VALUES(%s,'new_handover','globally_stored_reply')", (auth,))
+    assert matching.touch_chats(pg, ["new_handover"], authorization_id=auth,
+                                observed_message_ids=["globally_stored_reply"]) == 1
+    assert matching.touch_chats(pg, ["new_handover"], authorization_id=auth,
+                                observed_message_ids=["globally_stored_reply"]) == 0
+    assert len(calls) == 2
 
 
 def test_stale_queue_version_prompt_and_revocation_fence_publication(pg, pilot, responsibility_flow, monkeypatch):

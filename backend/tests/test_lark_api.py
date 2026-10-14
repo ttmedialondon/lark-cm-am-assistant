@@ -168,6 +168,10 @@ def test_message_list_requests_sender_names(monkeypatch) -> None:
         client.get_message("user-token", "om_saved")
     assert (raised.value.status_code, raised.value.lark_code, raised.value.retry_after) == (403, 99991672, 7)
     assert raised.value.likely_auth_problem and "secret" not in str(raised.value)
+    assert not LarkApiError(403, 230002, "chat denied").likely_auth_problem
+    assert not LarkApiError(403, 231203, "restricted mode").likely_auth_problem
+    assert LarkApiError(401, None, "token expired").likely_auth_problem
+    assert LarkApiError(400, 99991677, "token expired").likely_auth_problem
 
 
 def test_message_resources_are_bounded_in_memory_and_never_follow_redirects_or_expose_errors():

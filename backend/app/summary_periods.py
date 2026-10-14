@@ -150,9 +150,7 @@ def backfill_due(conn, now):
             # Closed periods wait briefly for known conversations to finish syncing.
             # The one-day grace is bounded; missing data remains a report gap, not a fact.
             if end <= now and now < signal['requested_at'] + timedelta(days=1):
-                waiting_sync |= any(max([t for t in (chat['last_incremental_at'],chat['last_backfill_at']) if t]
-                    or [datetime.min.replace(tzinfo=UTC)]) < end or chat['sync_status'] != 'succeeded'
-                    for chat in affected)
+                waiting_sync |= any(not summaries._covers_window(chat, start, end) for chat in affected)
     from . import summary_dialogues
 
     summary_dialogues.schedule_merges(conn, summaries.get_settings())

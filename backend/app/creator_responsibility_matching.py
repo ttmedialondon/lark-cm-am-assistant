@@ -113,6 +113,120 @@ def configuration_changed(conn):
         not_before=NOW(),updated_at=NOW() WHERE status NOT IN ('completed','failed','cancelled')""")
 
 
+def touch_chats(conn, chat_ids, *, authorization_id, message_ids=(), observed_message_ids=(), new_scope=False):
+    """Wake affected pairs from new material, not from overlapping sync observations."""
+    if not chat_ids or not (message_ids or observed_message_ids or new_scope) or not _enabled(_config(conn)):
+        return 0
+    from .evidence_access import BODY_READ_SCOPE_SQL
+
+    actor = conn.execute("""SELECT a.id AS authorization_id,a.open_id AS authorization_open_id,
+        a.body_consent_at,i.contact_id,ARRAY(SELECT open_id FROM lark_identities alias
+          WHERE alias.contact_id=i.contact_id AND alias.identity_type='user') AS aliases
+        FROM authorizations a JOIN lark_identities i ON i.open_id=a.open_id AND i.identity_type='user'
+        WHERE a.id=%s AND a.status='active' AND a.body_consent_at IS NOT NULL AND """ + BODY_READ_SCOPE_SQL,
+        (authorization_id,)).fetchone()
+    if not actor or not actor["contact_id"]:
+        return 0
+    columns = """m.chat_id,m.message_id,m.sender_open_id,m.message_type,m.message_create_time,m.parent_id,
+        m.root_id,m.thread_id,m.mentions_json,m.body_fingerprint,c.chat_mode,ac.p2p_counterpart_open_id,
+        (SELECT sender_open_id FROM chat_messages parent
+          WHERE parent.chat_id=m.chat_id AND parent.message_id=m.parent_id) AS parent_sender"""
+    readable = evidence.access._READABLE + " AND m.sender_type='user' AND m.message_type IN ('text','post') "
+    ids = sorted(set(message_ids) | set(observed_message_ids))
+    if ids:
+        anchors = ("SELECT " + columns + " " + readable
+                   + " AND m.chat_id=ANY(%s::text[]) AND m.message_id=ANY(%s::text[])")
+        params = [authorization_id, sorted(set(chat_ids)), ids]
+    else:
+        # shortcut: discovery checks 256 recent headers/chat and 256 anchors total; message pages cover older history.
+        anchors = """SELECT material.* FROM unnest(%s::text[]) chats(chat_id) CROSS JOIN LATERAL (
+            SELECT * FROM (SELECT """ + columns + " " + readable + """ AND m.chat_id=chats.chat_id
+              ORDER BY m.message_create_time DESC NULLS LAST,m.message_id LIMIT 256) recent
+            WHERE chat_mode='p2p' OR sender_open_id=ANY(%s::text[]) OR parent_sender=ANY(%s::text[])
+              OR EXISTS(SELECT 1 FROM unnest(%s::text[]) own(open_id) WHERE
+                mentions_json @> jsonb_build_array(jsonb_build_object('id_type','open_id','id',own.open_id)))
+            LIMIT 32) material LIMIT 256"""
+        params = [sorted(set(chat_ids)), authorization_id, actor["aliases"], actor["aliases"], actor["aliases"]]
+    rows = conn.execute("WITH anchors AS (" + anchors + """ )
+        SELECT anchors.*,COALESCE((SELECT jsonb_agg(to_jsonb(neighbor)) FROM (
+          SELECT """ + columns + " " + readable + """ AND m.chat_id=anchors.chat_id
+            AND m.message_create_time BETWEEN anchors.message_create_time-INTERVAL '5 minutes'
+              AND anchors.message_create_time+INTERVAL '5 minutes'
+            AND m.message_id<>anchors.message_id
+          ORDER BY abs(extract(epoch FROM m.message_create_time-anchors.message_create_time)),m.message_id LIMIT 32
+        ) neighbor),'[]'::jsonb) AS neighbors FROM anchors""",
+        [*params, authorization_id]).fetchall()
+    if not rows:
+        return 0
+    opens = set(actor["aliases"])
+    for row in rows:
+        for message in [row, *row["neighbors"]]:
+            opens.update([message["sender_open_id"], message["parent_sender"]])
+            opens.update(t["open_id"] for t in evidence.mention_targets(message["mentions_json"])
+                         if not t["ambiguous"])
+    creators = {r["open_id"]: r["contact_id"] for r in conn.execute("""SELECT i.open_id,i.contact_id
+        FROM lark_identities i JOIN contact_roles r ON r.contact_id=i.contact_id AND r.role='creator'
+          AND r.status='confirmed' WHERE i.open_id=ANY(%s::text[]) AND i.identity_type='user'
+          AND i.contact_id<>%s AND i.contact_id<>ALL(%s::uuid[])""",
+        ([oid for oid in opens if oid], actor["contact_id"], sorted(evidence.source.RESTRICTED_CONTACTS))).fetchall()}
+    grouped = {}
+    for row in rows:
+        mentions = {t["open_id"] for t in evidence.mention_targets(row["mentions_json"]) if not t["ambiguous"]}
+        own = row["sender_open_id"] in actor["aliases"]
+        addressed = bool(mentions.intersection(actor["aliases"]))
+        targets = set()
+        if own or addressed:
+            targets.update(creators[oid] for oid in mentions | {row["parent_sender"]} if oid in creators)
+            targets.update(creators[m["sender_open_id"]] for m in row["neighbors"] if m["sender_open_id"] in creators)
+        if row["sender_open_id"] in creators and (row["chat_mode"] == "p2p" or addressed
+                or row["parent_sender"] in actor["aliases"]
+                or any(m["sender_open_id"] in actor["aliases"] for m in row["neighbors"])):
+            targets.add(creators[row["sender_open_id"]])
+        key = str(actor["contact_id"]) + ":" + row["chat_id"]
+        for target in targets:
+            grouped.setdefault(target, {}).setdefault(key, []).append(row)
+    blocked = {r["contact_id"] for r in conn.execute("""SELECT x.contact_id FROM (
+        SELECT contact_id,responsible_authorization_id,ended_at,source,ended_by_authorization_id
+          FROM contact_assignments
+        UNION ALL SELECT contact_id,responsible_authorization_id,ended_at,source,NULL::uuid
+          FROM creator_account_assignments WHERE ended_at IS NOT NULL) x
+        JOIN authorizations a ON a.id=x.responsible_authorization_id
+        JOIN lark_identities i ON i.open_id=a.open_id AND i.identity_type='user'
+        WHERE x.contact_id=ANY(%s::uuid[]) AND i.contact_id=%s AND (x.ended_at IS NULL
+          OR x.ended_by_authorization_id IS NOT NULL OR x.source IN ('manual','cm_confirmation','excel_verified'))
+        UNION SELECT contact_id FROM creator_responsibility_jobs WHERE contact_id=ANY(%s::uuid[])
+          AND source='sample' AND status NOT IN ('completed','failed','cancelled')""",
+        (list(grouped), actor["contact_id"], list(grouped))).fetchall()} if grouped else set()
+    grant = evidence.source._scope_hash(actor)
+    changed = 0
+    for contact_id, materials in grouped.items():
+        if contact_id in blocked:
+            continue
+        latest = conn.execute("""SELECT * FROM creator_responsibility_jobs WHERE contact_id=%s AND source<>'sample'
+            ORDER BY created_at DESC,id DESC LIMIT 1 FOR UPDATE""", (contact_id,)).fetchone()
+        previous = (latest or {}).get("stats", {}).get("auto_signals", {})
+        known = {ref["contact_id"] for ref in (latest or {}).get("refs", [])
+                 if ref.get("kind") == "person" and ref.get("label", "").startswith("CM")}
+        known.update(key.split(":", 1)[0] for key in previous)
+        scopes = {ref["scope_hash"] for ref in (latest or {}).get("refs", [])
+                  if ref.get("kind") == "message" and ref.get("authorization_id") == str(authorization_id)}
+        scope_changed = (grant not in scopes if scopes else bool(latest and latest["prepared_at"]
+                         and actor["body_consent_at"] > latest["prepared_at"]))
+        signals = {key: {"material": _hash(material), "grant": grant} for key, material in materials.items()}
+        if not any(previous.get(key) != signature and (
+                ids or key.split(":", 1)[0] not in known or scope_changed
+                or previous.get(key, {}).get("grant", grant) != grant) for key, signature in signals.items()):
+            continue
+        job_id = conn.execute("SELECT enqueue_creator_responsibility(%s,'history') id", (contact_id,)).fetchone()["id"]
+        if job_id:
+            not_before = latest["not_before"] if latest and latest["status"] == "queued" else None
+            conn.execute("""UPDATE creator_responsibility_jobs SET stats=stats||%s::jsonb,
+                not_before=COALESCE(%s,NOW()+INTERVAL '30 seconds') WHERE id=%s""",
+                (creator_data.encode({"auto_signals": {**previous, **signals}}), not_before, job_id))
+            changed += 1
+    return changed
+
+
 def enqueue(conn, actor):
     require_owner(conn, actor)
     if not _enabled(_config(conn)):
@@ -172,7 +286,8 @@ def _store_prepared(conn, job, material, config, settings):
         [material["fingerprint"], config["provider"], config["project_id"], config["model"], evidence.PROMPT_VERSION]
     )
     pack = material["pack"]
-    stats = {**material["stats"], "prompt_version": evidence.PROMPT_VERSION}
+    stats = {**material["stats"], "prompt_version": evidence.PROMPT_VERSION,
+             **({"auto_signals": job["stats"]["auto_signals"]} if job["stats"].get("auto_signals") else {})}
     cache = (
         conn.execute(
             """SELECT result_ciphertext FROM creator_responsibility_jobs

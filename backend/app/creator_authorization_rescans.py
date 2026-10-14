@@ -6,6 +6,7 @@ import logging
 
 import psycopg
 
+from . import creator_responsibility_matching
 from .db import connection
 
 LOGGER = logging.getLogger(__name__)
@@ -58,6 +59,8 @@ def prepare_next(_settings):
                 for chat in chats:
                     conn.execute("SELECT creator_handle_chat_signal(%s)", (chat["chat_id"],))
                     conn.execute("SELECT enqueue_creator_group(%s)", (chat["chat_id"],))
+                creator_responsibility_matching.touch_chats(
+                    conn, [chat["chat_id"] for chat in chats], authorization_id=actor, new_scope=True)
                 if len(chats) < BATCH_SIZE:
                     completed = conn.execute(
                         "DELETE FROM creator_authorization_rescans "
