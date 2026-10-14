@@ -117,28 +117,12 @@
           copy.disabled = false; translate.disabled = false; generate.textContent = "重新生成";
         }
         if (value.reason_code === "new_messages") feedback.textContent = "聊天有新消息，请核对后发送。";
-        // Check for new messages without overwriting an edited draft or its translation.
-        state.timer = setTimeout(() => checkFresh(version), 30000);
       } catch (error) {
         if (!denied && version === state.version) {
           if (isTranslation) translationFailed(error.message);
           else stale(error.message);
         }
       }
-    }
-    async function checkFresh(version) {
-      if (denied || version !== state.version || !state.copyId) return;
-      if (document.hidden) { state.timer = setTimeout(() => checkFresh(version), 30000); return; }
-      try {
-        const value = await replyRequest(`/${encodeURIComponent(state.copyId)}?fresh=true`);
-        if (denied || version !== state.version) return;
-        if (value.status !== "succeeded") {
-          if (value.reason_code === "new_messages") feedback.textContent = "聊天有新消息，请核对后发送。";
-          else stale(value.error || "资料已变化，请重新生成。");
-          return;
-        }
-        state.timer = setTimeout(() => checkFresh(version), 30000);
-      } catch (error) { if (!denied && version === state.version) stale(error.message); }
     }
     generate.addEventListener("click", async () => {
       const version = ++state.version; clearTimeout(state.timer);

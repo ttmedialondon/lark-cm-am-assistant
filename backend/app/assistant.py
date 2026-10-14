@@ -464,7 +464,7 @@ def claim():
                 ('unknown' if sent else 'queued', 'unknown' if sent else None, sent, row['id']))
         if not configured(conn):
             return None
-        if not ai_dispatch.can_claim(conn):
+        if not ai_dispatch.can_claim(conn, interactive=True):
             return None
         row = conn.execute('''SELECT t.*,s.actor_id FROM assistant_turns t
             JOIN assistant_sessions s ON s.id=t.session_id WHERE t.status='queued' AND t.scheduled_at<=NOW()

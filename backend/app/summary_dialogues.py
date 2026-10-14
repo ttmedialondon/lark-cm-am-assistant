@@ -7,6 +7,8 @@ checkpoints retain completed work and provider receipts for local response repla
 from __future__ import annotations
 
 import json
+import re
+from collections import Counter
 from copy import deepcopy
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
@@ -21,6 +23,7 @@ from .ai_feature_config import api_key_cipher
 PART_CHARS = 8000
 CHUNK_CHARS = 32000
 CHUNK_MESSAGES = 32
+MERGE_CANDIDATES = 8
 
 
 def encode(value, settings):
@@ -71,7 +74,8 @@ def parts(evidence, user):
             ref = f"{m['ref']}.{offset // PART_CHARS}"
             part = text[offset : offset + PART_CHARS]
             messages.append({**m, "ref": ref, "text": part})
-            refs[ref] = {**evidence["refs"][m["ref"]], "text": part}
+            refs[ref] = {**evidence["refs"][m["ref"]], "text": part,
+                         **{key: m[key] for key in ("parent_message_id", "root_message_id") if m.get(key)}}
     return messages, refs
 
 
@@ -424,7 +428,7 @@ def merge_format(refs=("E1",), left=None, right=None):
     }
 
 
-def combine(raw, left, right):
+def combine(raw, left, right, *, messages=None):
     value = json.loads(raw)
     required = set(merge_format()["schema"]["properties"])
     if (set(value) - required or required - set(value) - {"action_group", "waiting_since_ref"}
@@ -434,7 +438,7 @@ def combine(raw, left, right):
         return None
     a = "\n".join(e["text"] for e in left["evidence"])
     b = "\n".join(e["text"] for e in right["evidence"])
-    messages = merged_evidence(left, right)
+    messages = merged_evidence(left, right) if messages is None else messages
     quote_a = messages.get(value["quote_a_ref"])
     quote_b = messages.get(value["quote_b_ref"])
     if quote_a not in left["evidence"] or quote_b not in right["evidence"]:
@@ -449,6 +453,11 @@ def combine(raw, left, right):
     for key in ("title", "summary", "latest_progress"):
         if not isinstance(value[key], str) or not value[key].strip():
             raise core.InvalidModelOutput("empty merge text")
+    used = [*value["handling_evidence_refs"], *value["reply_evidence_refs"]]
+    if value.get("waiting_since_ref"):
+        used.append(value["waiting_since_ref"])
+    if any(messages.get(ref) not in left["evidence"] + right["evidence"] for ref in used):
+        raise core.InvalidModelOutput("merge evidence outside selected events")
     core.validate_handling(value, messages)
     if value["waiting_since_ref"]:
         origins = [message for side in (left, right) for message in side["evidence"]
@@ -478,6 +487,68 @@ def combine(raw, left, right):
         "merge_basis": {"basis_kind": value["basis_kind"], "basis_value": value["basis_value"],
                         "quote_a": quote_a["text"], "quote_b": quote_b["text"]},
     }
+
+
+def merge_batch(ledger, candidate):
+    """Rank actual evidence anchors; a recent-event fallback keeps semantic matches eligible."""
+    def anchors(event):
+        evidence = event["evidence"]
+        words = set(re.findall(r"[\w£€$@][\w./:@£€$-]{2,}",
+                               " ".join(e["text"] for e in evidence).casefold()))
+        ids = {(e["chat_id"], e["message_id"]) for e in evidence}
+        links = {(e["chat_id"], e[key]) for e in evidence
+                 for key in ("parent_message_id", "root_message_id") if e.get(key)}
+        return words, ids, links
+
+    target_words, target_ids, target_links = anchors(candidate)
+    values = [anchors(event) for event in ledger]
+    counts = Counter(word for words, _, _ in values for word in words)
+
+    def rank(index):
+        words, ids, links = values[index]
+        direct = bool(ids & (target_ids | target_links) or links & target_ids)
+        shared = words & target_words
+        score = sum((4 if any(c.isdigit() for c in word) else 1) / counts[word] for word in shared)
+        return direct, score, index
+
+    # shortcut: at most eight candidates; add retrieval if older paraphrased
+    # matches are repeatedly missed. Unselected events remain independent.
+    selected, size = [], len(json.dumps(candidate["evidence"], ensure_ascii=False))
+    for index in sorted(range(len(ledger)), key=rank, reverse=True)[:MERGE_CANDIDATES]:
+        added = len(json.dumps(ledger[index]["evidence"], ensure_ascii=False))
+        if selected and size + added > CHUNK_CHARS * 2:
+            break
+        selected.append(index)
+        size += added
+    selected.sort()
+    matches = {str(index): ledger[index] for index in selected}
+    left = {"evidence": [e for event in matches.values() for e in event["evidence"]],
+            "waiting_evidence": [e for event in matches.values() for e in event["evidence"]
+                if (event.get("user") and e.get("speaker") == event["user"])
+                or e in event.get("waiting_evidence", [])]}
+    messages = merged_evidence(left, candidate)
+
+    def compact(event):
+        return {**{key: event.get(key) for key in ("title", "summary", "latest_progress", "priority",
+                                                  "handling_status", "action_group")},
+                "evidence_refs": [ref for ref, message in messages.items() if message in event["evidence"]]}
+
+    schema = merge_format(messages, left, candidate)
+    schema["name"] = "same_shift_merge_batch"
+    schema["schema"]["properties"]["match_id"] = {"type": ["string", "null"], "enum": [*matches, None]}
+    schema["schema"]["required"].append("match_id")
+    pack = {"candidate": compact(candidate), "candidates": [
+        {"id": key, **compact(event)} for key, event in matches.items()], "evidence_messages": messages}
+    return pack, schema, matches
+
+
+BATCH_MERGE_INSTRUCTIONS = """
+本次为批量候选核对，不是逐对调用。candidate 是待核对事项，candidates 是系统提供的最多八条候选。
+一次比较这些候选，只选与 candidate 有最明确真实依据的一条，match_id 返回它的 id，same=true；
+quote_a_ref 来自所选候选，quote_b_ref 来自 candidate，状态和其他引用只能来自这两条事项。
+没有可靠对应关系则 match_id=null、same=false。候选未被选中不代表无关，由系统原样保留。
+只合并所选的一条，系统会按合并后的证据重新选择候选，继续处理明确承接的其他事项。
+"""
 
 
 def step(job, settings):
@@ -553,16 +624,17 @@ def step(job, settings):
     else:
         ledger = checkpoint.setdefault("events", [])
         index = checkpoint.setdefault("index", 0)
-        against = checkpoint.setdefault("against", 0)
         if index < len(source_events):
             candidate = checkpoint.get("candidate", source_events[index])
-            if against >= len(ledger):
+            legacy = not checkpoint.get("merge_mode") and (
+                checkpoint.get("response_received") or checkpoint.get("provider_call"))
+            if not ledger:
                 ledger.append(candidate)
                 checkpoint.pop("candidate", None)
-                checkpoint.update(index=index + 1, against=0)
-            else:
-                # Pairwise comparison keeps unrelated items independent and avoids
-                # an ever-growing full-ledger model prompt. Originals stay attached.
+                checkpoint["index"] = index + 1
+            elif legacy:
+                # Replay an already paid old pair once, never restart its pairwise traversal.
+                against = checkpoint.get("against", 0)
                 evidence_messages = merged_evidence(ledger[against], candidate)
                 response = request(
                     job,
@@ -574,13 +646,36 @@ def step(job, settings):
                     merge_format(evidence_messages, ledger[against], candidate),
                     instructions,
                     checkpoint=checkpoint,
+                    prepared_merge=True,
                 )
                 merged = combine(response["text"], ledger[against], candidate)
                 if merged:
                     ledger.pop(against)
                     checkpoint["candidate"] = merged
                 else:
-                    checkpoint["against"] = against + 1
+                    checkpoint["candidate"] = candidate
+            else:
+                pack, schema, matches = merge_batch(ledger, candidate)
+                response = request(job, settings, cfg, pack, schema, instructions + BATCH_MERGE_INSTRUCTIONS,
+                                   checkpoint=checkpoint, prepared_merge=True)
+                value = json.loads(response["text"])
+                match_id = value.pop("match_id")
+                if match_id is None:
+                    if value.get("same") is not False:
+                        raise core.InvalidModelOutput("merge selection missing")
+                    combine(json.dumps(value), next(iter(matches.values())), candidate)
+                    ledger.append(candidate)
+                    checkpoint.pop("candidate", None)
+                    checkpoint["index"] = index + 1
+                else:
+                    if match_id not in matches or value.get("same") is not True:
+                        raise core.InvalidModelOutput("invalid merge selection")
+                    merged = combine(json.dumps(value), matches[match_id], candidate,
+                                     messages=pack["evidence_messages"])
+                    ledger.pop(int(match_id))
+                    checkpoint["candidate"] = merged
+            checkpoint["merge_mode"] = "batch"
+            checkpoint.pop("against", None)
         finished = checkpoint["index"] >= len(source_events)
         result = {"users": {"creator": person}, "events": ledger}
         processed, total = checkpoint["index"], len(source_events)
@@ -681,14 +776,44 @@ def _store_receipt(job, settings, checkpoint, response, *, reply=False, received
         raise core.SummaryInputError("任务已失效；已保留调用用量。")
 
 
-def request(job, settings, cfg, pack, schema, instructions, *, checkpoint, reply=False, max_output_tokens=12000):
+def _check_merge_access(conn, run, job, messages):
+    """Recheck live grants and cited rows, not decrypt all conversations a third time."""
+    core._authorize_run(conn, run, executing=True)
+    if not any(row["contact_id"] == job["contact_id"]
+               for row in core._roster(conn, run["responsible_authorization_id"])):
+        raise core.SummaryInputError("达人归属已变化。")
+    required = {}
+    for row in messages.values():
+        key = (row["chat_id"], row["message_id"])
+        required[key] = required.get(key, False) or not row.get("unreadable")
+    ids = sorted(required)
+    readable = conn.execute(f"""SELECT m.chat_id,m.message_id
+        FROM unnest(%s::text[],%s::text[],%s::boolean[]) wanted(chat_id,message_id,body_required)
+        JOIN chat_messages m USING(chat_id,message_id) JOIN chats c USING(chat_id)
+        JOIN authorization_chats ac ON ac.chat_id=m.chat_id AND ac.authorization_id=%s
+        JOIN authorizations a ON a.id=ac.authorization_id
+        JOIN authorization_message_observations o ON o.authorization_id=a.id
+          AND o.chat_id=m.chat_id AND o.message_id=m.message_id
+        WHERE a.status='active' AND a.body_consent_at IS NOT NULL AND {core.BODY_READ_SCOPE_SQL}
+          AND ac.is_visible AND ac.sync_enabled AND ac.sync_status IS DISTINCT FROM 'not_readable'
+          AND COALESCE(c.chat_status,'normal')='normal' AND NOT m.is_deleted
+          AND (NOT wanted.body_required OR m.body_ciphertext IS NOT NULL)
+          AND o.observed_at>=a.body_consent_at""",
+        ([chat for chat, _ in ids], [message for _, message in ids], [required[key] for key in ids],
+         run["responsible_authorization_id"])).fetchall()
+    if {(row["chat_id"], row["message_id"]) for row in readable} != set(ids):
+        raise core.SummaryInputError("合并原文读取权限已变化。")
+
+
+def request(job, settings, cfg, pack, schema, instructions, *, checkpoint, reply=False, max_output_tokens=12000,
+            prepared_merge=False):
     # The clock and sync watermark do not change the prepared business evidence.
     material = {key: value for key, value in pack.items() if key not in {"checked_at", "synced_through"}}
     signature = core._hash([material, schema, instructions])
     pending = checkpoint.get("response_received")
     if pending:
         signatures = {signature}
-        if not reply and pending["signature"] != signature:
+        if not reply and pending["signature"] != signature and schema["name"] != "same_shift_merge_batch":
             # Replay paid legacy returns through the unchanged semantic validator, not another request.
             legacy = deepcopy(schema)
             fields = legacy["schema"]["properties"]
@@ -712,7 +837,10 @@ def request(job, settings, cfg, pack, schema, instructions, *, checkpoint, reply
         elif not reply:
             core._current(conn, job)
             run = conn.execute("SELECT * FROM offhours_summary_runs WHERE id=%s", (job["run_id"],)).fetchone()
-            merge_input(conn, run, job, settings)
+            if prepared_merge:
+                _check_merge_access(conn, run, job, pack["evidence_messages"])
+            else:
+                merge_input(conn, run, job, settings)
         _retain_receipts(checkpoint, _current_checkpoint(conn, job, settings, reply=reply))
         checkpoint["provider_call"] = {"id": str(uuid4()), "signature": signature, "model": cfg["model"],
                                        "checked_at": pack.get("checked_at")}

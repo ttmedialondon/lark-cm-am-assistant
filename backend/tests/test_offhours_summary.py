@@ -273,6 +273,9 @@ def test_reply_and_resolution_remain_independent_through_context_and_merge(monke
             assert schema == before
     with pytest.raises(ai.InvalidModelOutput, match="reply evidence is not staff"):
         summary_dialogues.combine(json.dumps({**value, "reply_evidence_refs": [request_ref]}), pending, done)
+    with pytest.raises(ai.InvalidModelOutput, match="outside selected events"):
+        summary_dialogues.combine(json.dumps({**value, "handling_evidence_refs": ["other-candidate"]}), pending, done,
+            messages={**refs, "other-candidate": {**done_message, "message_id": "unselected"}})
     merged = summary_dialogues.combine(json.dumps(value), pending, done)
     assert merged["handling_status"] == "resolved" and merged["replied_by"] == ["Remi", "Shang"]
     assert merged["action_group"] == "closed"
@@ -761,8 +764,9 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
     pg.execute("UPDATE contact_social_accounts SET import_row_id=%s WHERE social_account_id=%s", (row_id, s.account))
 
     def model(_cfg, _key, input_pack, _cm, **_kwargs):
-        if 'a' in input_pack:
-            return {'text': json.dumps({'same': False, 'basis_kind': 'none', 'handling_status': 'uncertain',
+        if 'candidates' in input_pack:
+            return {'text': json.dumps({'match_id': None, 'same': False, 'basis_kind': 'none',
+                'handling_status': 'uncertain',
                 'handling_reason': '不合并', 'handling_evidence_refs': ['E1'], 'reply_evidence_refs': [],
                 'quote_a_ref': 'E1', 'quote_b_ref': 'E1',
                 **{k: '' for k in ('basis_value', 'title', 'summary', 'latest_progress')}})}
@@ -1721,11 +1725,89 @@ def test_creator_enrollment_backfills_closed_periods_without_repaying_or_replaci
 def finish_merges(pg, s):
     summary_dialogues.schedule_merges(pg, s.settings)
     for _ in range(50):
-        job = ai.claim_next_summary()
+        job = ai.claim_next_summary() or ai.claim_next_summary(interactive=True)
         if job is None:
             return
         ai.run_claimed_summary(job, s.settings)
     raise AssertionError('queue did not finish')
+
+
+def test_merge_batches_bound_calls_preserve_events_and_replay_paid_pair(pg, seeded, monkeypatch):
+    s = seeded
+    for index in range(1, 20):
+        s.add(f"case-{index}", text=f"Distinct enquiry TRACK-{index:03d}")
+    calls = []
+
+    def no_match(ref):
+        return {"same": False, "basis_kind": "none", "basis_value": "", "quote_a_ref": ref,
+                "quote_b_ref": ref, "title": "", "summary": "", "latest_progress": "",
+                "handling_status": "uncertain", "handling_reason": "没有具体关联。",
+                "handling_evidence_refs": [ref], "reply_evidence_refs": []}
+
+    def model(_cfg, _key, pack, _cm, **_kwargs):
+        calls.append(pack)
+        if "candidates" in pack:
+            assert 1 <= len(pack["candidates"]) <= 8
+            return {"text": json.dumps({"match_id": None, **no_match(next(iter(pack["evidence_messages"])))})}
+        return {"text": json.dumps({"processed_refs": pack["core_refs"], "events": [
+            sample_event(evidence_refs=[ref]) for ref in pack["core_refs"]]})}
+
+    monkeypatch.setattr(openai_client, "call_openai", model)
+    s.save()
+    ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
+    summary_dialogues.schedule_merges(pg, s.settings)
+    task = ai.claim_next_summary()
+    ai.run_claimed_summary(task, s.settings)  # The first event needs no model comparison.
+    with pg.transaction(force_rollback=True):
+        legacy_job = ai.claim_next_summary()
+        checkpoint = summary_dialogues.decode(legacy_job["checkpoint_ciphertext"], s.settings)
+        checkpoint.pop("merge_mode")
+        checkpoint["against"] = 0
+        run = pg.execute("SELECT * FROM offhours_summary_runs WHERE id=%s", (task["run_id"],)).fetchone()
+        source, _ = summary_dialogues.merge_input(pg, run, legacy_job, s.settings)
+        left, right = checkpoint["events"][0], source[1]
+        refs = summary_dialogues.merged_evidence(left, right)
+        query = {"a": {k: v for k, v in left.items() if k != "reason"},
+                 "b": {k: v for k, v in right.items() if k != "reason"}, "evidence_messages": refs}
+        rules = summary_dialogues._event_instructions(legacy_job, s.settings, "merge")
+        checkpoint["response_received"] = {"signature": ai._hash([
+            query, summary_dialogues.merge_format(refs, left, right), rules]),
+            "response": {"text": json.dumps(no_match(next(iter(refs))))}}
+        legacy_job["checkpoint_ciphertext"] = summary_dialogues.encode(checkpoint, s.settings)
+        pg.execute("UPDATE offhours_summary_tasks SET checkpoint_ciphertext=%s WHERE id=%s",
+                   (legacy_job["checkpoint_ciphertext"], legacy_job["id"]))
+        before = len(calls)
+        ai.run_claimed_summary(legacy_job, s.settings)
+        saved = pg.execute("SELECT * FROM offhours_summary_tasks WHERE id=%s", (legacy_job["id"],)).fetchone()
+        restored = summary_dialogues.decode(saved["checkpoint_ciphertext"], s.settings)
+        assert saved["status"] == "queued" and restored["merge_mode"] == "batch" and "against" not in restored
+        assert len(calls) == before  # An already-paid legacy pair is consumed locally exactly once.
+    with pg.transaction(force_rollback=True), monkeypatch.context() as patch:
+        build = summary_dialogues.merge_batch
+
+        def revoked_after_preparation(*args):
+            pack = build(*args)
+            pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='chat'")
+            return pack
+
+        patch.setattr(summary_dialogues, "merge_batch", revoked_after_preparation)
+        blocked = ai.claim_next_summary()
+        before = len(calls)
+        ai.run_claimed_summary(blocked, s.settings)
+        assert pg.execute("SELECT status FROM offhours_summary_tasks WHERE id=%s",
+                          (blocked["id"],)).fetchone()["status"] == "cancelled"
+        assert len(calls) == before  # Live per-chat revocation still blocks paid dispatch.
+    finish_merges(pg, s)
+    view = ai.get_summary_view(pg, s.ids["owner"])
+    assert len(view["events"]) == 20
+    assert {e["message_id"] for event in view["events"] for e in event["evidence"]} == {
+        "m1", *(f"case-{index}" for index in range(1, 20))}
+    assert sum("candidates" in call for call in calls) == 19  # Not the previous 190 pair requests.
+    ledger = view["events"]
+    candidate = {**ledger[0], "evidence": [{**ledger[0]["evidence"][0], "message_id": "later",
+        "parent_message_id": ledger[0]["evidence"][0]["message_id"], "text": "That is now done"}]}
+    _, _, matches = summary_dialogues.merge_batch(ledger, candidate)
+    assert "0" in matches  # A reply anchor remains eligible beyond the eight most recent events.
 
 
 def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, seeded, monkeypatch):
@@ -1789,7 +1871,7 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
     def model(_cfg, _key, pack, _cm, **kwargs):
         nonlocal failed
         calls.append(pack)
-        stage = "merge" if "a" in pack else "extract"
+        stage = "merge" if "candidates" in pack else "extract"
         assert assistant_rules.event_instructions(expected_rules, stage) in kwargs["instructions"]
         assert ("new-event-rules-marker" in kwargs["instructions"]) == (expected_rules != pinned_rules)
         if len(calls) == 1:
@@ -1797,11 +1879,11 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
                 assistant_rules.save_document(pg, s.settings, s.ids["owner"], key,
                     document["title"], document["description"], "manual", "published", "owner",
                     document["text"] + "\nnew-event-rules-marker", document["revision"])
-        if 'a' in pack:
-            a, b = pack['a'], pack['b']
-            return {'text': json.dumps({'same': True, 'basis_kind': 'identifier', 'basis_value': 'ABC-123',
-                'quote_a_ref': next(r for r,e in pack['evidence_messages'].items() if e in a['evidence']),
-                'quote_b_ref': next(r for r,e in pack['evidence_messages'].items() if e in b['evidence']),
+        if 'candidates' in pack:
+            a, b = pack['candidates'][0], pack['candidate']
+            return {'text': json.dumps({'match_id': a['id'], 'same': True,
+                'basis_kind': 'identifier', 'basis_value': 'ABC-123',
+                'quote_a_ref': a['evidence_refs'][0], 'quote_b_ref': b['evidence_refs'][0],
                 'title': '样品订单', 'summary': '样品订单已送达。', 'latest_progress': '达人确认收到。',
                 'handling_status': 'resolved', 'handling_reason': '达人已确认对应订单收到。',
                 'handling_evidence_refs': [r for r, e in pack['evidence_messages'].items() if 'arrived' in e['text']],
@@ -1880,6 +1962,8 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
     assert view['run']['counts']['failed'] == 0 and view['run']['status'] == 'completed'
     assert len(view['events']) == 1
     assert {e['chat_id'] for e in view['events'][0]['evidence']} == {'chat', 'second'}
+    assert next(e for e in view['events'][0]['evidence'] if e['message_id'] == 'm1')[
+        'parent_message_id'] == 'history'
     assert view['events'][0]['latest_progress'] == '达人确认收到。'
     assert view['events'][0]['handling_status'] == 'resolved'
     assert view['events'][0]['handling_evidence'][0]['chat_id'] == 'second'
@@ -2276,7 +2360,7 @@ def test_assistant_window_uses_cm_identity_separate_switch_and_frozen_cutoff(pg,
     ai._stop_tasks(pg, "old function stopped")
     assert pg.execute("SELECT status FROM offhours_summary_tasks WHERE run_id=%s AND is_current",
                       (run_id,)).fetchone()["status"] == "queued"
-    job = ai.claim_next_summary()
+    job = ai.claim_next_summary(interactive=True)
     assert job["origin"] == "assistant" and job["cutoff"] == turn["created_at"]
     ai.run_claimed_summary(job, s.settings)
     document = pinned_rules["documents"]["event-priority"]
@@ -2286,7 +2370,7 @@ def test_assistant_window_uses_cm_identity_separate_switch_and_frozen_cutoff(pg,
     assert ai.ensure_assistant_run(pg, s.ids["cm"], turn, s.ids["cm"], s.start, s.end,
                                    [s.ids["person"]], s.settings)["run"]["id"] == run_id
     assert ai.prepare_next_summary(s.settings)
-    ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
+    ai.run_claimed_summary(ai.claim_next_summary(interactive=True), s.settings)
     result = ai.read_assistant_run(pg, s.ids["cm"], run_id, s.settings)
     assert result["run"]["status"] == "completed" and len(result["events"]) == 1
     assert len(summary_instructions) == 1
@@ -2311,7 +2395,7 @@ def test_assistant_window_uses_cm_identity_separate_switch_and_frozen_cutoff(pg,
                                        [s.ids["person"]], s.settings)
     assert next_view["run"]["id"] != run_id
     assert ai.prepare_next_summary(s.settings)
-    next_job = ai.claim_next_summary()
+    next_job = ai.claim_next_summary(interactive=True)
     assert str(next_job["run_id"]) == next_view["run"]["id"]
     assert next_job["input_fingerprint"] != job["input_fingerprint"]
     ai.run_claimed_summary(next_job, s.settings)
@@ -2392,7 +2476,7 @@ def test_assistant_window_uses_cm_identity_separate_switch_and_frozen_cutoff(pg,
     owner_run = ai.ensure_assistant_run(pg, s.ids["owner"], owner_turn, s.ids["cm"], s.start, s.end,
                                         [s.ids["person"]], s.settings)["run"]["id"]
     assert ai.prepare_next_summary(s.settings)
-    summary_job = ai.claim_next_summary()
+    summary_job = ai.claim_next_summary(interactive=True)
     assert str(summary_job["run_id"]) == owner_run
     count = len(observed)
     pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (s.ids["owner"],))
@@ -2446,7 +2530,7 @@ def test_assistant_unknown_material_cannot_be_replayed_by_a_new_turn(pg, seeded,
     monkeypatch.setattr(openai_client, "call_openai", timeout)
     first = request()
     assert ai.prepare_next_summary(s.settings)
-    ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
+    ai.run_claimed_summary(ai.claim_next_summary(interactive=True), s.settings)
     assert ai.read_assistant_run(pg, s.ids["cm"], first["run"]["id"], s.settings)["run"]["status"] == "unknown"
     document = assistant_rules.event_snapshot(pg, s.settings)["documents"]["event-extraction"]
     assistant_rules.save_document(pg, s.settings, s.ids["owner"], "event-extraction",
@@ -2455,7 +2539,7 @@ def test_assistant_unknown_material_cannot_be_replayed_by_a_new_turn(pg, seeded,
     repeated = request()
     if repeated["run"]["id"] != first["run"]["id"]:
         ai.prepare_next_summary(s.settings)
-    assert ai.claim_next_summary() is None and len(calls) == 1
+    assert ai.claim_next_summary(interactive=True) is None and len(calls) == 1
     assert ai.read_assistant_run(pg, s.ids["cm"], repeated["run"]["id"], s.settings)["run"]["status"] == "unknown"
     # A real message change is new material, so the frozen request cannot hide it.
     s.add("new-material", text="Please check sample SKU-200", at=s.start + timedelta(hours=2))
@@ -2463,11 +2547,11 @@ def test_assistant_unknown_material_cannot_be_replayed_by_a_new_turn(pg, seeded,
     changed = request()
     assert changed["run"]["id"] != first["run"]["id"]
     assert ai.prepare_next_summary(s.settings)
-    fresh = ai.claim_next_summary()
+    fresh = ai.claim_next_summary(interactive=True)
     assert fresh is not None
     ai.run_claimed_summary(fresh, s.settings)
     ai.prepare_next_summary(s.settings)
-    ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
+    ai.run_claimed_summary(ai.claim_next_summary(interactive=True), s.settings)
     assert ai.read_assistant_run(pg, s.ids["cm"], changed["run"]["id"], s.settings)["run"]["status"] == "completed"
 
 

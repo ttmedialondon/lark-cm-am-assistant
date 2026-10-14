@@ -1,4 +1,4 @@
-"""Two independent AI decisions per imported handle, with scoped, replayable evidence."""
+"""Locate imported handles once per batch, then verify people with scoped evidence."""
 
 from __future__ import annotations
 
@@ -64,12 +64,15 @@ def _candidate_groups(chats, handle):
     return ranked[:MAX_GROUPS], len(ranked) > MAX_GROUPS
 
 
-def _history_groups(conn, settings, cm, chats, handle):
+def _history_groups(conn, settings, cm, chats, imported_handles):
     """Only a recall fallback: mentions rank candidates but never establish group ownership."""
-    counts, samples = defaultdict(int), defaultdict(list)
+    counts, samples = defaultdict(lambda: defaultdict(int)), defaultdict(lambda: defaultdict(list))
     scanned, truncated = 0, False
     cipher = message_body_cipher(settings.token_encryption_key)
-    if chats:
+    pattern = re.compile(r'(?<![A-Za-z0-9_.])(' + '|'.join(
+        re.escape(handle) for handle in sorted(imported_handles, key=lambda h: (-len(h), h)))
+        + r')(?=\.*(?:[^A-Za-z0-9_.]|$))', re.I) if imported_handles else None
+    if chats and pattern:
         with conn.cursor(name='import_history_' + uuid4().hex) as cursor:
             cursor.itersize = 1000
             cursor.execute(
@@ -83,21 +86,23 @@ def _history_groups(conn, settings, cm, chats, handle):
                     break
                 scanned += 1
                 raw = people._decrypt_body(cipher, row['body_ciphertext'])
-                if raw is None or not _mentions_handle(raw, handle):
+                if raw is None or not pattern.search(raw):
                     continue
-                if not _mentions_handle(handles._body(raw, row, {}, {}), handle):
-                    continue
-                counts[row['chat_id']] += 1
-                if len(samples[row['chat_id']]) < 4:
-                    samples[row['chat_id']].append(row)
-    ranked = sorted((chat for chat in chats if chat['chat_id'] in counts),
-                    key=lambda chat: (-counts[chat['chat_id']], chat['chat_id']))
-    selected = [{**chat, 'match_kind': 'history', 'similarity': None,
-                 'history_mentions': counts[chat['chat_id']]} for chat in ranked[:MAX_GROUPS]]
-    return selected, truncated or len(ranked) > MAX_GROUPS, {
-        'history_search_messages': scanned, 'history_matching_groups': len(ranked),
-        'history_search_truncated': truncated,
-    }, [row for chat in selected for row in samples[chat['chat_id']]]
+                for handle in {m[1].casefold() for m in pattern.finditer(handles._body(raw, row, {}, {}))}:
+                    counts[handle][row['chat_id']] += 1
+                    if len(samples[handle][row['chat_id']]) < 4:
+                        samples[handle][row['chat_id']].append({**row, '_decrypted_body': raw})
+    found = {}
+    for handle in imported_handles:
+        ranked = sorted((chat for chat in chats if chat['chat_id'] in counts[handle]),
+                        key=lambda chat: (-counts[handle][chat['chat_id']], chat['chat_id']))
+        selected = [{**chat, 'match_kind': 'history', 'similarity': None,
+                     'history_mentions': counts[handle][chat['chat_id']]} for chat in ranked[:MAX_GROUPS]]
+        found[handle] = (selected, truncated or len(ranked) > MAX_GROUPS, {
+            'history_search_messages': scanned, 'history_matching_groups': len(ranked),
+            'history_search_truncated': truncated,
+        }, [row for chat in selected for row in samples[handle][chat['chat_id']]])
+    return found
 
 
 def _population(conn, cm, chats, handle, stage, selected_rows=None):
@@ -213,7 +218,8 @@ def _messages(conn, settings, cm, chats, population, handle, stage, selected_row
     by_group, by_user, addressed = defaultdict(list), defaultdict(list), defaultdict(list)
     items = []
     for row in rows[:LOCAL_SEARCH_MESSAGES]:
-        raw = people._decrypt_body(cipher, row['body_ciphertext'])
+        raw = (row['_decrypted_body'] if '_decrypted_body' in row
+               else people._decrypt_body(cipher, row['body_ciphertext']))
         if raw is None or row['message_type'] not in {'text', 'post'}:
             continue
         text = handles._body(raw, row, aliases, population['names']).strip()
@@ -353,16 +359,20 @@ def _messages(conn, settings, cm, chats, population, handle, stage, selected_row
     return messages, refs, stats, source
 
 
-def _build(conn, settings, cm_id, handle, stage, selected_chat_ids=None):
+def _build(conn, settings, cm_id, handle, stage, selected_chat_ids=None, *, group_context=None):
     handle = handles.normalize_handle(handle)
-    cm, inventory = _scope(conn, cm_id)
+    cm, inventory = group_context[:2] if group_context else _scope(conn, cm_id)
     if cm:
         cm = {**cm, 'id': str(cm_id)}
     search_stats, selected_rows = {}, None
     if stage == 'group':
-        chats, truncated = _candidate_groups(inventory, handle)
-        if cm and not chats:
-            chats, truncated, search_stats, selected_rows = _history_groups(conn, settings, cm, inventory, handle)
+        if group_context:
+            chats, truncated, search_stats, selected_rows = group_context[2]
+        else:
+            chats, truncated = _candidate_groups(inventory, handle)
+            if cm and not chats:
+                chats, truncated, search_stats, selected_rows = _history_groups(
+                    conn, settings, cm, inventory, [handle])[handle]
     else:
         chats = [{**c, 'match_kind': 'ai_selected', 'similarity': None}
                  for c in inventory if c['chat_id'] in (selected_chat_ids or [])]
@@ -376,11 +386,15 @@ def _build(conn, settings, cm_id, handle, stage, selected_chat_ids=None):
                       for c in inventory if c['chat_mode'] == 'p2p'
                       and c['p2p_counterpart_open_id'] in candidates
                       and c['chat_id'] not in (selected_chat_ids or [])]
-    population = _population(conn, cm, chats, handle, stage, selected_rows) if cm else {
+    local_group = bool(group_context and chats and not truncated and all(
+        chat['match_kind'] == 'exact' and handles._name_handles(chat['name'] or '') == [handle]
+        for chat in chats))
+    population = _population(conn, cm, chats, handle, stage, selected_rows) if cm and not local_group else {
         'users': [], 'refs': [], 'members': [], 'observed': [], 'identities': [], 'directory': [],
         'aliases': {}, 'names': {}, 'staff': set(), 'target_names': {}}
     messages, message_refs, stats, history = _messages(
-        conn, settings, cm, chats, population, handle, stage, selected_rows) if cm else ([], [], {}, [])
+        conn, settings, cm, chats, population, handle, stage, selected_rows
+    ) if cm and not local_group else ([], [], {}, [])
     stats.update(search_stats)
     groups, refs = [], list(population['refs'])
     all_members = [*population['members'], *population['observed']]
@@ -429,6 +443,10 @@ def _build(conn, settings, cm_id, handle, stage, selected_chat_ids=None):
     directory = [{**d, 'category': 'possible_creator', 'classification_source': None, 'creator_known': None}
                  if d['category'] in {'creator', 'unclassified'} and not d['protected_noncreator'] else d
                  for d in population['directory']] if stage == 'person' else []
+    if stage == 'person':
+        stats['candidate_fingerprint'] = _candidate_fingerprint(population, directory)
+    if local_group:
+        stats['group_localized_locally'] = True
     source = {'cm': cm, 'inventory': [{'chat_id': c['chat_id'], 'name': c['name']} for c in chats],
               'members': population['members'], 'observed': population['observed'],
               'identities': population['identities'], 'directory': directory, 'history': history}
@@ -443,43 +461,63 @@ def _build(conn, settings, cm_id, handle, stage, selected_chat_ids=None):
 
 def _stable_pack(pack):
     return {**{k: v for k, v in pack.items() if k != '_rules'}, 'meta': {k: v for k, v in pack['meta'].items()
-                           if k not in {'accessible_groups', 'history_search_messages', 'rules_digest'}}, 'users': [
+                           if k not in {'accessible_groups', 'history_search_messages', 'rules_digest'}},
+            'users': _stable_users(pack['users'])}
+
+
+def _stable_users(users):
+    return [
         {**u, 'known_category': 'possible_creator', 'category_source': None, 'creator_known': None}
         if u.get('eligible') and u.get('known_category') in {'creator', 'unclassified'} else u
-        for u in pack['users']]}
+        for u in users]
 
 
-def build_group_evidence(conn, settings, cm_id, handle):
-    return _build(conn, settings, cm_id, handle, 'group')
+def _candidate_fingerprint(population, directory):
+    membership = [sorted(population[key], key=lambda row: (row['chat_id'], row['open_id']))
+                  for key in ('members', 'observed')]
+    return ownership._hash([*membership, population['identities'], directory])
+
+
+def build_group_evidence(conn, settings, cm_id, handle, *, group_context=None):
+    return _build(conn, settings, cm_id, handle, 'group', group_context=group_context)
+
+
+def group_batch_context(conn, settings, cm_id, imported_handles):
+    """One permission inventory and streaming history scan; raw samples live only in this call."""
+    cm, inventory = _scope(conn, cm_id)
+    cm = {**cm, 'id': str(cm_id)} if cm else None
+    candidates = {handle: (*_candidate_groups(inventory, handle), {}, None) for handle in imported_handles}
+    fallback = [handle for handle, (chats, *_) in candidates.items() if not chats]
+    if cm and fallback:
+        candidates.update(_history_groups(conn, settings, cm, inventory, fallback))
+    return {handle: (cm, inventory, candidate) for handle, candidate in candidates.items()}
+
+
+def local_group_result(material):
+    if not material['stats'].get('group_localized_locally'):
+        return None
+    refs = [group['ref'] for group in material['pack']['groups']]
+    return {'outcome': 'matched', 'group_refs': refs, 'confidence': 1,
+            'reason': '规范群名精确对应导入账号，仅完成会话定位，人员和账号归属继续核验。',
+            'evidence_refs': refs, 'reason_code': 'group_matched', 'blocking_reasons': [],
+            'localized_locally': True}
 
 
 def build_person_evidence(conn, settings, cm_id, handle, selected_chat_ids):
     return _build(conn, settings, cm_id, handle, 'person', selected_chat_ids)
 
 
-def validate_evidence(conn, settings, cm_id, handle, pack, refs, fingerprint, *, stage=None, selected_chat_ids=None):
-    stage = stage or pack.get('stage')
-    if stage not in {'group', 'person'}:
-        return False
-    if stage == 'person' and selected_chat_ids is None:
-        selected_refs = {g['ref'] for g in pack.get('groups', []) if g.get('match_kind') != 'person_context'}
-        selected_chat_ids = [r['chat_id'] for r in refs if r.get('kind') == 'group' and r['label'] in selected_refs]
-        if not selected_chat_ids:
-            return False
-    current = _build(conn, settings, cm_id, handle, stage, selected_chat_ids)
-    return (_stable_pack(current['pack']) == _stable_pack(pack) and current['refs'] == refs
-            and current['fingerprint'] == fingerprint)
+def validate_references(conn, settings, cm_id, material, *, check_candidates=False):
+    return validate_reference_batch(conn, settings, cm_id, [material], check_candidates=check_candidates)[0]
 
 
-def validate_references(conn, settings, cm_id, material):
-    return validate_reference_batch(conn, settings, cm_id, [material])[0]
-
-
-def validate_reference_batch(conn, settings, cm_id, materials):
+def validate_reference_batch(conn, settings, cm_id, materials, *, check_candidates=False):
     """Permission and exact displayed-reference checks, without decrypting or rescanning history."""
     if not materials:
         return []
-    cm = conn.execute("SELECT a.open_id,a.body_consent_at FROM authorizations a WHERE a.id=%s AND a.status='active' "
+    cm = conn.execute("SELECT a.open_id,a.body_consent_at,i.contact_id FROM authorizations a "
+                      "LEFT JOIN lark_identities i ON i.open_id=a.open_id AND i.identity_type='user' "
+                      "WHERE a.id=%s AND a.status='active' "
                       "AND a.body_consent_at IS NOT NULL AND " + ownership.BODY_READ_SCOPE_SQL,
                       (cm_id,)).fetchone()
     if not cm:
@@ -528,9 +566,34 @@ def validate_reference_batch(conn, settings, cm_id, materials):
     members += [{'chat_id': g['chat_id'], 'open_id': g['p2p_counterpart_open_id']}
                 for g in current_groups if g['chat_id'] in group_ids and g['chat_mode'] == 'p2p'
                 and g['p2p_counterpart_open_id']]
-    results = [False] * len(materials)
+    results, candidate_checks = [False] * len(materials), {}
     for index, material, groups in candidates:
         results[index] = _references_match(material, groups, rows, identities, members)
+        if check_candidates and results[index] and material['pack'].get('stage') == 'person':
+            pack = material['pack']
+            key = (pack['imported_handle'], tuple(sorted(groups)))
+            if key not in candidate_checks:
+                chats = [g for g in current_groups if g['chat_id'] in groups]
+                population = _population(conn, {**cm, 'id': str(cm_id)}, chats, pack['imported_handle'], 'person')
+                directory = [{**d, 'category': 'possible_creator', 'classification_source': None, 'creator_known': None}
+                             if d['category'] in {'creator', 'unclassified'} and not d['protected_noncreator'] else d
+                             for d in population['directory']]
+                candidate_checks[key] = (_candidate_fingerprint(population, directory), population)
+            fingerprint, population = candidate_checks[key]
+            expected = material.get('stats', {}).get('candidate_fingerprint')
+            if expected:
+                results[index] = expected == fingerprint
+            else:
+                # Old paid packs keep their snapshot; compare only current candidates, never rebuild history.
+                current_members = defaultdict(set)
+                for member in [*population['members'], *population['observed']]:
+                    alias = population['aliases'].get(member['open_id'])
+                    if alias and alias != 'CM1':
+                        current_members[member['chat_id']].add(alias)
+                group_ids_by_ref = {ref['label']: ref['chat_id'] for ref in material['refs'] if ref['kind'] == 'group'}
+                results[index] = (_stable_users(pack['users']) == _stable_users(population['users']) and all(
+                    set(group['member_refs']) == current_members[group_ids_by_ref[group['ref']]]
+                    for group in pack['groups']))
     return results
 
 

@@ -812,9 +812,22 @@ def test_five_tools_keep_reports_private_resume_and_recheck_sources(pg, seeded, 
     assert tools.execute(pg, s.ids["cm"], turn, "summarize_messages", args, s.settings, context) == waiting
     assert pg.execute("SELECT * FROM offhours_summary_settings").fetchone() == before_global
     summaries.prepare_next_summary(s.settings)
-    job = summaries.claim_next_summary()
+    background_run = uuid4()
+    pg.execute("""INSERT INTO offhours_summary_runs
+        (id,requested_by_authorization_id,responsible_authorization_id,window_start,window_end)
+        VALUES(%s,%s,%s,%s,%s)""", (background_run, s.ids["owner"], s.ids["cm"], s.start, s.end))
+    for index in range(5):
+        pg.execute("INSERT INTO chats(chat_id) VALUES(%s)", (f"busy-background-{index}",))
+        pg.execute("""INSERT INTO offhours_summary_tasks
+            (id,run_id,chat_id,input_fingerprint,cutoff,status,lease_until)
+            VALUES(%s,%s,%s,%s,NOW(),'running',NOW()+INTERVAL '10 minutes')""",
+            (uuid4(), background_run, f"busy-background-{index}", str(index)))
+    assert summaries.claim_next_summary() is None
+    job = summaries.claim_next_summary(interactive=True)
     assert job and job["origin"] == "assistant"
     summaries.run_claimed_summary(job, s.settings)
+    pg.execute("UPDATE offhours_summary_tasks SET status='cancelled',lease_until=NULL WHERE run_id=%s",
+               (background_run,))
     finish_merges(pg, s)
     result = tools.resume_wait(pg, s.ids["cm"], turn, waiting["waiting"], s.settings, context)
     assert result and len(result["events"]) == 1 and result["events"][0]["handling_status"] == "unresolved"

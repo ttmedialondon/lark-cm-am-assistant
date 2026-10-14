@@ -351,40 +351,71 @@ def test_export_reads_all_consented_text_and_excludes_inaccessible_rows(pg, monk
         pg.execute("UPDATE authorization_chats SET is_visible=TRUE,sync_enabled=TRUE,sync_status='succeeded' "
                    "WHERE chat_id='private'")
 
-    # A workbook spanning several chunks must stop if an included message is deleted or edited.
-    from random import Random
-    large = json.dumps({'text': ''.join(Random(4).choices('abcdefghijklmnopqrstuvwxyz', k=200000))})
-    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE chat_id='group' AND message_id='0000'", (large,))
+    # Changes before a workbook freezes still invalidate its content, without leaking temp files or audit.
+    audit_sql = "SELECT count(*) n FROM audit_events WHERE action='admin_messages_exported'"
+    audits = pg.execute(audit_sql).fetchone()['n']
     for change, parameters in (("is_deleted=TRUE", ()), ("body_ciphertext=%s", ('{"text":"edited"}',))):
-        iterator = message_export.stream_export(source, source, lambda: None)
-        assert len(next(iterator)) == 65536
-        pg.execute("UPDATE chat_messages SET " + change + " WHERE chat_id='group' AND message_id='0000'", parameters)
-        with pytest.raises(PermissionError):
-            next(iterator)
-        pg.execute("UPDATE chat_messages SET is_deleted=FALSE,body_ciphertext=%s "
-                   "WHERE chat_id='group' AND message_id='0000'", (large,))
+        def changed_during_generation(conn, rows, *, lock=False, change=change, parameters=parameters):
+            names = unlocked_lookup(conn, rows, lock=lock)
+            conn.execute("UPDATE chat_messages SET " + change + " WHERE chat_id='group' AND message_id='0000'",
+                         parameters)
+            return names
 
-    # Previously emitted conversations remain protected until the ZIP is complete.
+        with monkeypatch.context() as patch:
+            patch.setattr(message_export, 'mention_names', changed_during_generation)
+            with pytest.raises(PermissionError):
+                b''.join(message_export.stream_export(source, source, lambda: None))
+        assert ALL_TEMP_FILES == opened
+        assert pg.execute(audit_sql).fetchone()['n'] == audits
+
+    # Once frozen, one workbook stays a valid snapshot despite edits during its many download chunks.
+    from random import Random
+    text = ''.join(Random(4).choices('abcdefghijklmnopqrstuvwxyz', k=600000))
+    large = json.dumps({'text': text})
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE chat_id='group' AND message_id='0000'", (large,))
+    content_checks = []
+
+    def execute(sql, args=None):
+        if 'LEFT JOIN chat_messages m ON m.chat_id=v.chat_id' in sql:
+            content_checks.append(True)
+        return pg.execute(sql, args)
+
+    traced = SimpleNamespace(execute=execute, cursor=pg.cursor, transaction=pg.transaction)
+    before_batches = len(lookup_calls)
+    with monkeypatch.context() as patch:
+        patch.setattr(message_export, 'connection', lambda: nullcontext(traced))
+        iterator = message_export.stream_export(source, source, lambda: None)
+        chunks = [next(iterator)]
+        assert len(chunks[0]) == 65536
+        pg.execute("UPDATE chat_messages SET body_ciphertext='updated later' "
+                   "WHERE chat_id='group' AND message_id='0000'")
+        chunks.extend(iterator)
+    assert len(content_checks) == len(lookup_calls) - before_batches + 2 < len(chunks)
+    with ZipFile(BytesIO(b''.join(chunks))) as archive:
+        assert archive.testzip() is None and len(archive.namelist()) == 2
+        book = load_workbook(BytesIO(archive.read(archive.namelist()[0])), read_only=True)
+        rows = list(book.active.values)[1:]
+        assert ''.join(row[2] for row in rows).startswith(text)
+        book.close()
+
+    # Permission changes, unlike edits to a frozen snapshot, still stop the entire download.
     original = '{"text":"message-0"}'
     pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE chat_id='group' AND message_id='0000'", (original,))
-    for table, change, parameters in (
-        ("authorization_chats", "is_visible=FALSE", ()),
-        ("authorization_chats", "sync_status='not_readable'", ()),
-        ("authorization_chats", "sync_generation=sync_generation+1", ()),
-        ("chat_messages", "is_deleted=TRUE", ()),
-        ("chat_messages", "body_ciphertext=%s", ('{"text":"changed later"}',)),
+    for sql in (
+        "UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='group'",
+        "UPDATE authorization_chats SET sync_status='not_readable' WHERE chat_id='group'",
+        "UPDATE authorization_chats SET sync_generation=sync_generation+1 WHERE chat_id='group'",
+        "UPDATE authorizations SET status='revoked' WHERE id=%s",
+        "UPDATE authorizations SET scopes=ARRAY['im:message.send_as_user'] WHERE id=%s",
     ):
+        audits = pg.execute(audit_sql).fetchone()['n']
         iterator = message_export.stream_export(source, source, lambda: None)
         assert next(iterator).startswith(b'PK')
         assert next(iterator).startswith(b'PK')  # The second conversation is already being sent.
-        target = "chat_id='group'" + (" AND message_id='0000'" if table == "chat_messages" else "")
-        pg.execute(f"UPDATE {table} SET {change} WHERE {target}", parameters)
+        pg.execute(sql, (source,) if '%s' in sql else ())
         with pytest.raises(PermissionError):
             b''.join(iterator)
-        pg.execute("UPDATE authorization_chats SET is_visible=TRUE,sync_status='succeeded' WHERE chat_id='group'")
-        pg.execute("UPDATE chat_messages SET is_deleted=FALSE WHERE chat_id='group' AND message_id='0000'")
-        pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE chat_id='group' AND message_id='0000'",
-                   (original,))
+        assert pg.execute(audit_sql).fetchone()['n'] == audits
 
     # Restricted content is retained, but every current reader excludes it until Lark restores access.
     from app import evidence_access, offhours_summary

@@ -1,4 +1,4 @@
-"""Scoped CAP group/person evidence, automatic admission and manual correction."""
+"""Scoped roster evidence, automatic admission and manual correction."""
 
 import json
 import os
@@ -221,6 +221,92 @@ def row_for(pg, batch, handle):
     ).fetchone()
 
 
+def test_import_batch_shares_history_scan_and_validates_only_relevant_material(pg, pilot, monkeypatch):
+    from collections import Counter
+
+    from app import creator_import_evidence as evidence
+
+    calls, callbacks = prepare(pg, pilot, monkeypatch)
+    cm = pilot.ids['cm']
+    group(pg, pilot, 'fallback', 'campaign', 'creator')
+    group(pg, pilot, 'canonical', 'canonical_one', 'creator')
+    add_message(pg, pilot, 'fallback', 'creator', 'My accounts are alpha.creator and .dot_creator.')
+    own = add_message(pg, pilot, 'canonical', 'creator', 'My account is canonical_one. I film my own TikTok videos.')
+    pg.execute("UPDATE chat_messages SET message_create_time=NOW()-INTERVAL '1 minute' WHERE message_id=%s", (own,))
+    uncited = add_message(pg, pilot, 'canonical', 'cm', 'Please arrange campaign samples')
+    batch = imports.preview_import(cm, cm, 'batch.xlsx',
+                                   workbook('alpha.creator', '.dot_creator', 'canonical_one', 'alpha',
+                                            *(f'fallback_{i}' for i in range(96)), 'next_cohort'))
+    imports.start_import(cm, batch['id'])
+    decrypt = evidence.people._decrypt_body
+    seen = Counter()
+
+    def counted(cipher, encrypted):
+        seen[encrypted] += 1
+        return decrypt(cipher, encrypted)
+
+    monkeypatch.setattr(evidence.people, '_decrypt_body', counted)
+    assert imports.prepare_next_import(pilot.settings)
+    assert seen and max(seen.values()) == 1
+    assert not calls
+    assert not row_for(pg, batch, 'next_cohort')['pack_ciphertext']
+    for handle in ('alpha.creator', '.dot_creator'):
+        prepared = imports._decode(row_for(pg, batch, handle), pilot.settings)['group']
+        assert prepared['stats']['history_matching_groups'] == 1
+        assert prepared['pack']['groups'][0]['match_kind'] == 'history'
+        assert '_decrypted_body' not in json.dumps(prepared)
+    assert not imports._decode(row_for(pg, batch, 'alpha'), pilot.settings)['group']['pack']['groups']
+    local = row_for(pg, batch, 'canonical_one')
+    assert local['stats']['analysis_stage'] == 'person' and local['api_requests'] == 0
+    assert local['review_status'] == 'pending' and not local['contact_id']
+    # The next worker turn handles the bounded overflow before the ready person stage.
+    assert imports.prepare_next_import(pilot.settings)
+    assert row_for(pg, batch, 'next_cohort')['pack_ciphertext']
+    assert imports.prepare_next_import(pilot.settings)
+    local = row_for(pg, batch, 'canonical_one')
+    material = imports._decode(local, pilot.settings)['person']
+    assert evidence.validate_references(pg, pilot.settings, cm, material, check_candidates=True)
+    legacy = {**material, 'stats': {k: v for k, v in material['stats'].items() if k != 'candidate_fingerprint'}}
+    assert evidence.validate_references(pg, pilot.settings, cm, legacy, check_candidates=True)
+    with pg.transaction(force_rollback=True):
+        other = pilot.person('new_candidate')
+        pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('canonical','ou_new_candidate')")
+        assert other and not evidence.validate_references(
+            pg, pilot.settings, cm, material, check_candidates=True)
+        assert not evidence.validate_references(pg, pilot.settings, cm, legacy, check_candidates=True)
+    # An unrelated new message and an unrelated account do not invalidate paid evidence.
+    def unrelated_change(stage, pack, result):
+        if stage == 'person' and pack['imported_handle'] == 'canonical_one':
+            add_message(pg, pilot, 'canonical', 'cm', 'Unrelated campaign update')
+            pg.execute('UPDATE chat_messages SET body_ciphertext=NULL WHERE message_id=%s', (uncited,))
+            pg.execute("UPDATE authorizations SET display_name='Updated colleague' WHERE id=%s",
+                       (pilot.ids['owner'],))
+
+    callbacks.append(unrelated_change)
+    monkeypatch.setattr(imports, '_build_material', lambda *_a, **_kw: pytest.fail('paid material was rebuilt'))
+    while job := imports.claim_next_import():
+        imports.run_claimed_import(job, pilot.settings)
+    admitted = row_for(pg, batch, 'canonical_one')
+    assert admitted['review_status'] == 'confirmed' and admitted['api_requests'] == 1, (
+        admitted['reason_code'], imports._decode(admitted, pilot.settings, 'result_ciphertext'))
+    assert [p['stage'] for p in calls if p['imported_handle'] == 'canonical_one'] == ['person']
+    failed = imports.preview_import(cm, cm, 'failed.xlsx', workbook('unread_first', 'unread_second'))
+    imports.start_import(cm, failed['id'])
+
+    def fail_context(*_args):
+        raise RuntimeError('history search unavailable')
+
+    monkeypatch.setattr(evidence, 'group_batch_context', fail_context)
+    assert imports.prepare_next_import(pilot.settings)
+    assert all(row_for(pg, failed, handle)['reason_code'] == 'preparation_failed'
+               for handle in ('unread_first', 'unread_second'))
+    stale = {**row_for(pg, failed, 'unread_first'), 'uploaded_by': cm}
+    pg.execute("UPDATE creator_import_rows SET status='preparing',lease_until=NOW()+INTERVAL '10 minutes' WHERE id=%s",
+               (stale['id'],))
+    imports._prepare_import_row(pilot.settings, stale, preparation_error='preparation_failed')
+    assert row_for(pg, failed, 'unread_first')['status'] == 'preparing'
+
+
 def test_cap_excel_two_stage_matching_manual_confirmation_and_replays_preserve_people(pg, pilot, monkeypatch):
     calls, _ = prepare(pg, pilot, monkeypatch)
     cm, owner, creator = pilot.ids["cm"], pilot.ids["owner"], pilot.ids["creator"]
@@ -255,8 +341,8 @@ def test_cap_excel_two_stage_matching_manual_confirmation_and_replays_preserve_p
     assert matched["contact_id"] == creator and matched["review_status"] == "confirmed"
     assert matched["reason_code"] == "ai_confirmed"
     assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 1
-    assert matched["api_requests"] == 2 and imports.source_labels(matched) == ["Excel", "AI"]
-    assert [p["stage"] for p in calls if p["imported_handle"] == "beauty.one_12"] == ["group", "person"]
+    assert matched["api_requests"] == 1 and imports.source_labels(matched) == ["Excel", "AI"]
+    assert [p["stage"] for p in calls if p["imported_handle"] == "beauty.one_12"] == ["person"]
     assert all(p['roster'] == {'responsibility_confirmed': False, 'purpose': 'candidate_handles'} for p in calls)
     imports.confirm_row(cm, first["id"], "beauty.one_12", creator)
     imports.confirm_row(cm, first["id"], "@Beauty.One_12", creator)
@@ -679,7 +765,7 @@ def test_import_admission_respects_configured_threshold_without_curva_and_scopes
     evidence = imports.row_evidence(cm, admitted["id"])
     assert evidence["group_decision"]["status_label"] == evidence["person"]["status_label"] == "对应关系通过"
     chain = imports._decode(admitted, pilot.settings, "result_ciphertext")
-    assert chain["group"]["auto_confirm_threshold"] == chain["person"]["auto_confirm_threshold"] == .92
+    assert chain["group"]["localized_locally"] and chain["person"]["auto_confirm_threshold"] == .92
     other = imports.preview_import(cm, cm, "other.xlsx", workbook("another_manual"))
     imports.start_import(cm, other["id"])
     scoped = imports.page_data(cm, cm, batch_id=batch["id"])
@@ -695,20 +781,18 @@ def test_import_admission_respects_configured_threshold_without_curva_and_scopes
     drain(pilot)
     reviewed = row_for(pg, high, "high_handle")
     assert reviewed["review_status"] == "pending" and reviewed["contact_id"] is None
-    assert [pack["stage"] for pack in calls if pack["imported_handle"] == "high_handle"] == ["group"]
+    assert [pack["stage"] for pack in calls if pack["imported_handle"] == "high_handle"] == ["person"]
     assert not pg.execute("SELECT 1 FROM social_accounts WHERE normalized_handle='high_handle'").fetchone()
 
 
-def test_silent_unique_person_still_needs_both_ai_thresholds_and_recheck_keeps_usage(pg, pilot, monkeypatch):
+def test_silent_unique_person_needs_person_evidence_and_recheck_keeps_usage(pg, pilot, monkeypatch):
     calls, callbacks = prepare(pg, pilot, monkeypatch)
     pg.execute("UPDATE ai_feature_configs SET auto_confirm_threshold=0.950 WHERE feature='creator_import'")
     cm = pilot.ids["cm"]
     group(pg, pilot, "chat_creator", "silent_handle", "creator")
     pg.execute("UPDATE chat_messages SET body_ciphertext=NULL")
-    lower = ["person"]
-
     def low_confidence(stage, _pack, result):
-        if stage == lower[0]:
+        if stage == "person":
             result["confidence"] = .9
 
     callbacks.append(low_confidence)
@@ -722,14 +806,14 @@ def test_silent_unique_person_still_needs_both_ai_thresholds_and_recheck_keeps_u
     imports.resume_import(cm, batch["id"])
     drain(pilot)
     first = row_for(pg, batch, "silent_handle")
-    assert first["review_status"] == "pending" and first["contact_id"] is None and first["api_requests"] == 2
-    assert [p["stage"] for p in calls] == ["group", "person"]
+    assert first["review_status"] == "pending" and first["contact_id"] is None and first["api_requests"] == 1
+    assert [p["stage"] for p in calls] == ["person"]
     assert not calls[-1]["messages"] and any(u["eligible"] for u in calls[-1]["users"])
-    lower[0] = "group"
+    callbacks.clear()
     imports.recheck_batch(cm, batch["id"])
     drain(pilot)
     second = row_for(pg, batch, "silent_handle")
-    assert second["id"] == first["id"] and second["api_requests"] == 3
+    assert second["id"] == first["id"] and second["api_requests"] == 2
     assert second["review_status"] == "pending" and second["contact_id"] is None
     callbacks.clear()
     imports.recheck_batch(cm, batch["id"])
@@ -737,7 +821,7 @@ def test_silent_unique_person_still_needs_both_ai_thresholds_and_recheck_keeps_u
     final = row_for(pg, batch, "silent_handle")
     assert final["review_status"] == "pending" and final["contact_id"] is None
     assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
-    assert (final["api_requests"], final["input_tokens"], final["output_tokens"]) == (5, 60, 40)
+    assert (final["api_requests"], final["input_tokens"], final["output_tokens"]) == (3, 36, 24)
     assert pg.execute("SELECT count(*) n FROM creator_import_rows WHERE batch_id=%s",
                       (batch["id"],)).fetchone()["n"] == 1
     archived = pg.execute("SELECT metadata FROM audit_events WHERE action='creator_import_evidence_invalidated' "
@@ -813,8 +897,8 @@ def test_multiple_groups_merge_the_same_person_without_hiding_other_people_or_pa
         row = row_for(pg, batch, handle)
         assert row["review_status"] == "pending" and row["contact_id"] is None
         assert row["reason_code"] == "person_uncertain"
-        assert row["stats"]["person_candidate_count"] == count and row["api_requests"] == 2
-    assert len(calls) == 6 and pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 0
+        assert row["stats"]["person_candidate_count"] == count and row["api_requests"] == 1
+    assert len(calls) == 4 and pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 0
 
 
 def test_two_person_stages_for_one_creator_do_not_drop_paid_results_after_classification(pg, pilot, monkeypatch):
@@ -864,6 +948,7 @@ def test_two_person_stages_for_one_creator_do_not_drop_paid_results_after_classi
     failed_batch = imports.preview_import(cm, cm, "incomplete.xlsx", workbook("paid.incomplete"))
     imports.start_import(cm, failed_batch["id"])
     assert imports.prepare_next_import(pilot.settings)
+    assert imports.prepare_next_import(pilot.settings)
     failed_job = imports.claim_next_import()
     assert failed_job is not None
     incomplete_calls = []
@@ -882,7 +967,7 @@ def test_two_person_stages_for_one_creator_do_not_drop_paid_results_after_classi
     assert (failed["status"], failed["reason_code"]) == ("invalid", "invalid_result")
     assert (failed["api_requests"], failed["input_tokens"], failed["output_tokens"]) == (1, 31, 17)
     assert (failed["request_id"], failed["response_id"]) == ("req-incomplete", "resp-incomplete")
-    receipt = imports._decode(failed, pilot.settings, "result_ciphertext")["group"]["response"]
+    receipt = imports._decode(failed, pilot.settings, "result_ciphertext")["person"]["response"]
     assert receipt["usage"] == {"input_tokens": 31, "output_tokens": 17}
     assert receipt["telemetry"]["http_status"] == 200
     imports.run_claimed_import(failed_job, pilot.settings)
@@ -915,8 +1000,8 @@ def test_inflight_person_result_cannot_overwrite_changed_evidence_or_manual_sele
     callbacks.append(change_during_person)
     drain(pilot)
     row = pg.execute("SELECT * FROM creator_import_rows WHERE id=%s", (row_id,)).fetchone()
-    assert (row["api_requests"], row["input_tokens"], row["output_tokens"]) == (2, 24, 16)
-    assert len(calls) == 2
+    assert (row["api_requests"], row["input_tokens"], row["output_tokens"]) == (1, 12, 8)
+    assert len(calls) == 1
     if change == "manual":
         assert row["review_status"] == "confirmed" and row["handle"] == "corrected_handle"
         assert imports.source_labels(row) == ["Excel"]
@@ -1313,11 +1398,9 @@ def test_group_person_refs_do_not_cross_people_groups_or_current_access(pg, pilo
                    "VALUES(%s,'creator','confirmed','manual')", (pilot.ids["creator"],))
         classified = evidence.build_person_evidence(pg, pilot.settings, cm, "target_account", ["first_group"])
         assert unknown["fingerprint"] == classified["fingerprint"]
-        assert evidence.validate_evidence(pg, pilot.settings, cm, "target_account", unknown["pack"],
-                                          unknown["refs"], unknown["fingerprint"])
+        assert evidence.validate_references(pg, pilot.settings, cm, unknown, check_candidates=True)
         pg.execute("UPDATE contact_roles SET role='merchant_contact' WHERE contact_id=%s", (pilot.ids["creator"],))
-        assert not evidence.validate_evidence(pg, pilot.settings, cm, "target_account", unknown["pack"],
-                                              unknown["refs"], unknown["fingerprint"])
+        assert not evidence.validate_references(pg, pilot.settings, cm, unknown, check_candidates=True)
     with pg.transaction(force_rollback=True):
         referenced = next(r["message_id"] for r in material["refs"] if r["label"] == own)
         sole = evidence.build_person_evidence(pg, pilot.settings, cm, "target_account", ["second_group"])
@@ -1383,8 +1466,7 @@ def test_group_person_refs_do_not_cross_people_groups_or_current_access(pg, pilo
         assert not revoked["eligible"] and not revoked["pack"]["groups"]
     with pg.transaction(force_rollback=True):
         pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (cm,))
-        assert not evidence.validate_evidence(pg, pilot.settings, cm, "target_account", material["pack"],
-                                              material["refs"], material["fingerprint"])
+        assert not evidence.validate_references(pg, pilot.settings, cm, material, check_candidates=True)
         hidden = evidence.build_group_evidence(pg, pilot.settings, cm, "target_account")["pack"]
         assert not hidden["groups"] and not hidden["users"] and not hidden["messages"]
         pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (cm,))
@@ -1468,11 +1550,11 @@ def test_person_analysis_waits_for_members_and_resumes_without_repeating_group_a
     drain(pilot)
     row = row_for(pg, batch, "waiting_creator")
     assert row['reason_code'] == 'members_pending' and row['status'] == 'pending'
-    assert [p['stage'] for p in calls] == ['group']
+    assert not calls
     assert not imports.prepare_next_import(pilot.settings)
     pg.execute("UPDATE authorization_chats SET member_snapshot_status='succeeded' WHERE chat_id='chat_creator'")
     pg.execute("UPDATE creator_import_rows SET scheduled_at=NOW() WHERE id=%s", (row['id'],))
     drain(pilot)
     row = row_for(pg, batch, "waiting_creator")
     assert row['review_status'] == 'confirmed' and row['reason_code'] == 'ai_confirmed'
-    assert [p['stage'] for p in calls] == ['group', 'person']
+    assert [p['stage'] for p in calls] == ['person']

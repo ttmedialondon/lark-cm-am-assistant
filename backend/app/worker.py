@@ -115,9 +115,15 @@ def run_forever() -> None:
 
     next_ai_queue = 0
     next_ai_check = 0.0
+    next_interactive_queue = 0
+    next_interactive_check = 0.0
+    next_sync_recovery = 0.0
     next_organization_check = 0.0
     ai_executor = ThreadPoolExecutor(max_workers=ai_dispatch.MAX_CONCURRENT_REQUESTS, thread_name_prefix="openai")
     ai_futures: set[Future[Any]] = set()
+    interactive_executor = ThreadPoolExecutor(max_workers=ai_dispatch.INTERACTIVE_REQUESTS,
+                                             thread_name_prefix="openai-interactive")
+    interactive_futures: set[Future[Any]] = set()
     broadcast_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="lark-broadcast")
     broadcast_futures: set[Future[Any]] = set()
     next_broadcast_check = 0.0
@@ -157,7 +163,11 @@ def run_forever() -> None:
             try:
                 _reap_page_futures(page_futures, settings)
                 _reap_member_futures(member_futures)
-                _recover_expired_leases()
+                next_sync_recovery = _schedule_sync_recovery(next_sync_recovery)
+                next_interactive_queue, next_interactive_check = _schedule_ai(
+                    settings, interactive_executor, interactive_futures,
+                    next_interactive_queue, next_interactive_check, interactive=True,
+                )
                 next_ai_queue, next_ai_check = _schedule_ai(
                     settings, ai_executor, ai_futures, next_ai_queue, next_ai_check,
                 )
@@ -207,6 +217,7 @@ def run_forever() -> None:
     finally:
         # Leases preserve in-flight work if systemd terminates us during a call.
         ai_executor.shutdown(wait=False, cancel_futures=False)
+        interactive_executor.shutdown(wait=False, cancel_futures=False)
         broadcast_executor.shutdown(wait=False, cancel_futures=False)
         preview_executor.shutdown(wait=False, cancel_futures=False)
         discovery_executor.shutdown(wait=False, cancel_futures=False)
@@ -253,19 +264,20 @@ def _dispatch_ai_turn(
     executor: ThreadPoolExecutor,
     futures: set[Future[Any]],
     next_queue: int,
+    *, interactive: bool = False,
 ) -> tuple[bool, int]:
     """Claim one fair AI task and submit it without blocking Lark sync."""
 
-    if len(futures) >= ai_dispatch.MAX_CONCURRENT_REQUESTS:
+    if len(futures) >= (ai_dispatch.INTERACTIVE_REQUESTS if interactive else ai_dispatch.MAX_CONCURRENT_REQUESTS):
         return False, next_queue
-    queues = (
-        (assistant.claim, assistant.run),
+    queues = ((assistant.claim, assistant.run), (summary_replies.claim, summary_replies.run),
+              (lambda: offhours_summary.claim_next_summary(interactive=True),
+               offhours_summary.run_claimed_summary)) if interactive else (
         (
             offhours_summary.claim_next_summary,
             offhours_summary.run_claimed_summary,
         ),
         (creator_imports.claim_next_import, creator_imports.run_claimed_import),
-        (summary_replies.claim, summary_replies.run),
         (creator_handle_matching.claim, creator_handle_matching.run),
         (creator_responsibility_matching.claim, creator_responsibility_matching.run),
         (creator_group_matching.claim, creator_group_matching.run),
@@ -292,17 +304,18 @@ def _fill_ai_slots(
     executor: ThreadPoolExecutor,
     futures: set[Future[Any]],
     next_queue: int,
+    *, interactive: bool = False,
 ) -> int:
     """Fill available AI slots before returning immediately to Lark sync."""
 
-    while len(futures) < ai_dispatch.MAX_CONCURRENT_REQUESTS:
-        submitted, next_queue = _dispatch_ai_turn(settings, executor, futures, next_queue)
+    while len(futures) < (ai_dispatch.INTERACTIVE_REQUESTS if interactive else ai_dispatch.MAX_CONCURRENT_REQUESTS):
+        submitted, next_queue = _dispatch_ai_turn(settings, executor, futures, next_queue, interactive=interactive)
         if not submitted:
             break
     return next_queue
 
 
-def _schedule_ai(settings, executor, futures, next_queue, next_check):
+def _schedule_ai(settings, executor, futures, next_queue, next_check, *, interactive=False):
     """Empty AI queues follow the idle cadence, not the busy Lark 50ms loop."""
     previous = len(futures)
     _reap_ai_futures(futures)
@@ -311,9 +324,10 @@ def _schedule_ai(settings, executor, futures, next_queue, next_check):
     if time.monotonic() < next_check:
         return next_queue, next_check
     previous = len(futures)
-    next_queue = _fill_ai_slots(settings, executor, futures, next_queue)
+    next_queue = _fill_ai_slots(settings, executor, futures, next_queue, interactive=interactive)
+    limit = ai_dispatch.INTERACTIVE_REQUESTS if interactive else ai_dispatch.MAX_CONCURRENT_REQUESTS
     next_check = (time.monotonic() + max(settings.worker_idle_seconds, 0.05)
-                  if len(futures) == previous and len(futures) < ai_dispatch.MAX_CONCURRENT_REQUESTS else 0.0)
+                  if len(futures) == previous and len(futures) < limit else 0.0)
     return next_queue, next_check
 
 
@@ -374,6 +388,13 @@ def _reap_ai_futures(futures: set[Future[Any]]) -> None:
             future.result()
         except Exception:
             LOGGER.exception("AI task runner failed without exposing user data")
+
+
+def _schedule_sync_recovery(next_check):
+    if time.monotonic() >= next_check:
+        _recover_expired_leases()
+        return time.monotonic() + 60
+    return next_check
 
 
 def _recover_expired_leases() -> None:

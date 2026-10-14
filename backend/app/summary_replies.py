@@ -312,7 +312,7 @@ def claim():
             conn.execute("UPDATE summary_reply_tasks SET status=%s,lease_until=NULL,error_message=%s WHERE id=%s",
                 ("queued" if pending else "failed", None if pending else
                  "请求结果未知，未自动重复调用；请核实后重新生成。", row["id"]))
-        if not core.ai_dispatch.can_claim(conn):
+        if not core.ai_dispatch.can_claim(conn, interactive=True):
             return None
         row = conn.execute(
             """SELECT t.* FROM summary_reply_tasks t JOIN ai_feature_configs cfg ON cfg.feature=t.feature

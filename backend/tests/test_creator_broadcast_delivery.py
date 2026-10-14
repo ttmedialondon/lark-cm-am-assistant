@@ -204,7 +204,17 @@ def test_confirmed_delivery_is_scoped_idempotent_and_recoverable(pg, monkeypatch
     with pytest.raises(ValueError, match="预览已过期"):
         delivery.submit(actor, expired["preview_id"], uuid4())
     request = uuid4()
-    first = delivery.submit(actor, ready["preview_id"], request)
+    lookups = []
+    joined_groups = creator_broadcast._joined_groups
+
+    def target_groups(conn, cm, purpose, chat_ids=None):
+        lookups.append(chat_ids)
+        return joined_groups(conn, cm, purpose, chat_ids)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(creator_broadcast, "_joined_groups", target_groups)
+        first = delivery.submit(actor, ready["preview_id"], request)
+    assert lookups == [["oc_a", "oc_b", "oc_c"]]  # One targeted lookup for the whole submission.
     batch_id = first["batch"]["id"]
     assert first["batch"]["pending"] == 3 and not state["sent"]
     assert delivery.submit(actor, ready["preview_id"], request)["batch"]["id"] == batch_id
@@ -469,7 +479,7 @@ def test_literal_post_and_safe_send_errors_do_not_require_database(monkeypatch):
 
     monkeypatch.setattr(delivery, "connection", lambda: nullcontext(None))
     monkeypatch.setattr(delivery, "_authorization", lambda *_args: authorization)
-    monkeypatch.setattr(delivery, "_route_current", lambda *_args: None)
+    monkeypatch.setattr(delivery, "_routes_current", lambda *_args: None)
     monkeypatch.setattr(delivery, "_client_token", lambda *_args: (authorization, "token"))
     monkeypatch.setattr(delivery, "_live_group", lambda *_args: {})
     monkeypatch.setattr(delivery, "_mark_started", lambda *_args: True)

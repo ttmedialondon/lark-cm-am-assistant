@@ -1579,7 +1579,7 @@ def test_unreplied_creator_query_covers_whole_roster_and_attaches_all_events(pg,
     assert set(report['selected_contact_ids']) == {chat.ids['person'], *people}
     summaries.prepare_next_summary(chat.settings)
     for _ in range(40):
-        job = summaries.claim_next_summary()
+        job = summaries.claim_next_summary(interactive=True)
         if job is None:
             break
         summaries.run_claimed_summary(job, chat.settings)

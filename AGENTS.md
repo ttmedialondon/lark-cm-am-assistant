@@ -12,3 +12,4 @@
 - Prefer extending an existing critical workflow check over adding per-function, text, CSS or duplicate browser/helper suites. Remove dedicated tests when retiring their feature.
 - Keep runnable coverage of authorization, sensitive data access, synchronization, ingestion, confirmation, idempotency and data-loss risks. Add one minimal regression for a real risk, not a combinatorial matrix of equivalent inputs.
 - Reduce duplicate test code, not test discovery; never hide failures with skips or weaken security/data-integrity checks to reduce counts.
+- Do not require a coverage percentage or per-helper tests. For routine changes, run the affected critical workflows; use one combined regression for a broad release rather than adding parallel suites for the same behavior.

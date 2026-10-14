@@ -131,7 +131,6 @@ def stream_export(source_id, viewer_id, check_access, *, consent_at=None):
 def _write_export(conn, archive, output, source_id, viewer_id, cipher, check_access, consent_at):
     message_count = conversation_count = 0
     source_consent = consent_at
-    analyzed_count = 0
     conn.execute("""CREATE TEMP TABLE IF NOT EXISTS message_export_versions(
         chat_id text NOT NULL,message_id text NOT NULL,row_version text NOT NULL,version text NOT NULL,
         PRIMARY KEY(chat_id,message_id)) ON COMMIT DROP""")
@@ -140,12 +139,24 @@ def _write_export(conn, archive, output, source_id, viewer_id, cipher, check_acc
     conn.execute("TRUNCATE message_export_versions")
     conn.execute("TRUNCATE message_export_chats")
 
-    def validate(message_ids=None, chat_id=None):
+    def validate(message_ids=None, chat_id=None, *, contents=False):
         check_access()
-        version_filter = "v.chat_id=%s AND v.message_id=ANY(%s::text[]) AND " if message_ids is not None else ""
-        args = [source_id, source_consent, source_id]
-        if message_ids is not None:
-            args.extend((chat_id, message_ids))
+        args = [source_id, source_consent]
+        content_check = ""
+        if contents or message_ids is not None:
+            args.append(source_id)
+            version_filter = "v.chat_id=%s AND v.message_id=ANY(%s::text[]) AND " if message_ids is not None else ""
+            if message_ids is not None:
+                args.extend((chat_id, message_ids))
+            content_check = f"""AND NOT EXISTS(
+                    SELECT 1 FROM message_export_versions v
+                    LEFT JOIN chat_messages m ON m.chat_id=v.chat_id AND m.message_id=v.message_id
+                    LEFT JOIN authorization_message_observations o
+                      ON o.authorization_id=%s AND o.chat_id=v.chat_id AND o.message_id=v.message_id
+                    WHERE {version_filter}(m.message_id IS NULL OR m.is_deleted OR m.body_ciphertext IS NULL
+                      OR o.observed_at IS NULL OR o.observed_at<a.body_consent_at
+                      OR ({_ROW_VERSION_SQL} IS DISTINCT FROM v.row_version
+                          AND {_MESSAGE_VERSION_SQL} IS DISTINCT FROM v.version)))"""
         current = conn.execute(
             f"""SELECT 1 FROM authorizations a WHERE a.id=%s AND a.status='active'
                 AND a.body_consent_at=%s AND {reporting.BODY_READ_SCOPE_SQL}
@@ -156,15 +167,7 @@ def _write_export(conn, archive, output, source_id, viewer_id, cipher, check_acc
                     WHERE ac.chat_id IS NULL OR NOT ac.is_visible OR NOT ac.sync_enabled
                       OR ac.sync_status='not_readable' OR COALESCE(c.chat_status,'normal')<>'normal'
                       OR ac.sync_generation IS DISTINCT FROM saved.sync_generation)
-                AND NOT EXISTS(
-                    SELECT 1 FROM message_export_versions v
-                    LEFT JOIN chat_messages m ON m.chat_id=v.chat_id AND m.message_id=v.message_id
-                    LEFT JOIN authorization_message_observations o
-                      ON o.authorization_id=%s AND o.chat_id=v.chat_id AND o.message_id=v.message_id
-                    WHERE {version_filter}(m.message_id IS NULL OR m.is_deleted OR m.body_ciphertext IS NULL
-                      OR o.observed_at IS NULL OR o.observed_at<a.body_consent_at
-                      OR ({_ROW_VERSION_SQL} IS DISTINCT FROM v.row_version
-                          AND {_MESSAGE_VERSION_SQL} IS DISTINCT FROM v.version)))""", args,
+                {content_check}""", args,
         ).fetchone()
         if not current:
             raise PermissionError("会话授权或消息内容已变化，请重新导出。")
@@ -235,9 +238,11 @@ def _write_export(conn, archive, output, source_id, viewer_id, cipher, check_acc
             written = write_conversation(archive, filename, text_rows(source_rows))
             message_count += written
             conversation_count += bool(written)
-            if message_count >= max(1, analyzed_count * 2):
+            if written > 500:
                 conn.execute("ANALYZE message_export_versions")
-                analyzed_count = message_count
+            # Freeze each completed workbook; later chat edits do not invalidate bytes already sent.
+            validate(contents=True)
+            conn.execute("TRUNCATE message_export_versions")
             for chunk in output.drain():
                 validate()
                 yield chunk

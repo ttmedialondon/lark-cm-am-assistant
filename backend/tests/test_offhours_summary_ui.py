@@ -1,7 +1,9 @@
 """Read-only HTTP and template boundaries; backend scope checks have their own SQL tests."""
 
 import json
+import os
 import re
+import subprocess
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -299,6 +301,78 @@ def test_client_does_not_persist_or_interpolate_messages_as_html():
     assert 'cache: "no-store"' in script
     assert 'credentials: "same-origin"' in script
     assert 'redirect: "error"' in script
+
+
+def test_reply_browser_polls_only_generation_and_rechecks_before_copy():
+    html = render({"enabled": True, "window": {}, "run": {"status": "completed"}, "events": [{
+        "id": "event:0", "title": "样品尚未收到", "priority": "P1", "handling_status": "unresolved",
+        "summary": "请跟进样品。", "latest_progress": "等待回复。", "evidence": [],
+    }]})
+    script = r"""
+const assert = require('node:assert/strict'), fs = require('node:fs'), path = require('node:path');
+const {chromium} = require('playwright');
+(async () => {
+  const input=JSON.parse(fs.readFileSync(0,'utf8'));
+  const browser=await chromium.launch({headless:true,channel:'chrome'});
+  try {
+    const page=await browser.newPage(), errors=[], reads=[];
+    let deny=false;
+    page.on('pageerror',error=>errors.push(error.message));
+    await page.addInitScript(()=>Object.defineProperty(navigator,'clipboard',{
+      value:{writeText:async text=>{window.copied=text;}}
+    }));
+    await page.clock.install();
+    await page.route('**/*',async route=>{
+      const request=route.request(), url=new URL(request.url());
+      if(url.origin!=='http://localhost') return route.abort();
+      if(url.pathname==='/') return route.fulfill({contentType:'text/html',body:input.html});
+      if(url.pathname.startsWith('/static/')) return route.fulfill({
+        contentType:url.pathname.endsWith('.js')?'text/javascript':'text/css',
+        body:url.pathname.endsWith('.js')?fs.readFileSync(path.join(input.app,url.pathname.slice(1)),'utf8'):''
+      });
+      if(url.pathname==='/dashboard/offhours-summary/data') return route.fulfill({status:304});
+      if(url.pathname==='/dashboard/offhours-summary/replies') {
+        assert.equal(request.method(),'POST');
+        return route.fulfill({status:202,json:{id:'job-1'}});
+      }
+      if(url.pathname==='/dashboard/offhours-summary/replies/job-1') {
+        assert.equal(url.searchParams.get('fresh'),'true'); reads.push(url.href);
+        if(deny) return route.fulfill({status:403,json:{error:'revoked'}});
+        return route.fulfill({json:reads.length===1?{status:'running'}:{
+          status:'succeeded',result:{outcome:'ready',draft:'I will check your sample.',
+            chinese_translation:'我会核查样品。',language:'en',explanation:'请核对后发送。',checks:[]}
+        }});
+      }
+      throw new Error('Unexpected request: '+url.href);
+    });
+    await page.goto('http://localhost/');
+    await page.getByRole('button',{name:'生成回复建议',exact:true}).click();
+    await page.waitForFunction(()=>document.querySelector('.oh-reply button').getAttribute('aria-busy')==='true');
+    await page.clock.runFor(2600);
+    const copy=page.getByRole('button',{name:'复制回复',exact:true});
+    await copy.waitFor({state:'visible'});
+    assert.equal(reads.length,2); // Pending work continues polling until completion.
+    assert.equal(await copy.isEnabled(),true);
+    await page.getByRole('button',{name:'P2',exact:true}).click();
+    assert.equal(await page.locator('#oh-events .oh-reply').count(),0);
+    await page.clock.runFor(65000);
+    assert.equal(reads.length,2); // Neither completed nor detached drafts perform idle reads.
+    await page.getByRole('button',{name:'全部事件',exact:true}).click();
+    await copy.click();
+    await page.waitForFunction(()=>window.copied==='I will check your sample.');
+    assert.equal(reads.length,3);
+    deny=true;
+    await copy.click();
+    await page.waitForFunction(()=>document.querySelectorAll('.oh-reply').length===0);
+    assert.equal(reads.length,4);
+    assert.equal(await page.locator('body').textContent().then(text=>text.includes('I will check your sample.')),false);
+    assert.deepEqual(errors,[]);
+  } finally {await browser.close();}
+})().catch(error=>{console.error(error);process.exit(1);});
+"""
+    result = subprocess.run(["node", "-e", script], input=json.dumps({"html": html, "app": str(APP)}),
+                            text=True, capture_output=True, timeout=30, env=os.environ.copy())
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.fixture

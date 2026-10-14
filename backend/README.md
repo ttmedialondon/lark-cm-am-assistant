@@ -15,7 +15,9 @@ python3 -m venv .venv
 
 数据库测试需要独立 PostgreSQL；CI 已配置隔离服务。完整本地验证将 `TEST_DATABASE_URL`、`IDENTITY_NAMES_TEST_DATABASE_URL`、`OFFHOURS_SUMMARY_TEST_DATABASE_URL`、`CREATOR_WORKFLOW_AI_TEST_DATABASE_URL` 指向测试库，并注入示例应用配置。未设置时相关用例会跳过，不能当作完整验证。不要使用生产数据库跑测试。
 
-测试优先覆盖登录与权限、消息读取范围/加密、同步续跑、名单找群找人取证、并发/原子入库、旧机制退役与数据保全、头像、总结和数据保护。旧归属/导入工程的专属测试随功能删除，活跃功能的共享夹具保留。页面以少量真实浏览器流程验证；不为每个文案、CSS 类、重复按钮状态单独建测试，不能靠 skip 或缩小收集范围掩盖失败。
+浏览器工作流使用 Node、Chrome 和 Playwright 1.62.1；CI 统一安装。本地可在本目录运行 `npm install --no-save --package-lock=false --ignore-scripts playwright@1.62.1`，或通过 `NODE_PATH` 使用已安装的同版依赖。
+
+测试不设覆盖率门槛，不要求逐函数补测；日常运行受影响的关键链，跨业务发布合并回归一次。保留权限、正文隔离、同步恢复、入库、幂等与数据完整性验证；旧功能专属测试随功能删除。不重复测试 helper、文案和 CSS，不靠 skip 或缩小收集范围掩盖失败。
 
 ## 运行服务
 

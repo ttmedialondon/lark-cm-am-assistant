@@ -18,7 +18,6 @@ from .handle_evidence import normalize_handle
 from .lark_api import LarkApiError, LarkClient
 
 PURPOSES = {**{key: value for key, value in GROUP_PURPOSES.items() if key != "unknown"}, "custom": "自选群"}
-MEMBERSHIP_NOTE = "发送前逐群检查权限"
 BLOCKED_REASON = "请准备并确认后发送"
 SEND_SCOPES = ("im:message", "im:message.send_as_user")
 
@@ -108,36 +107,28 @@ def _people(conn, cm_id, contact_ids=None):
              "aliases": person["aliases"], "handles": handles[person["id"]]} for person in people]
 
 
-def _groups(conn, contact_ids, cm_id, purpose):
+def _groups(conn, contact_ids, cm_id, purpose, chat_ids=None):
     if not contact_ids:
         return []
-    rows = conn.execute("""SELECT DISTINCT ch.chat_id,ch.name,g.purpose,i.contact_id,
-        snapshot.member_count,snapshot.member_count_status,snapshot.member_snapshot_checked_at,
-        snapshot.member_snapshot_status
+    rows = conn.execute("""SELECT DISTINCT ch.chat_id,ch.name,g.purpose,i.contact_id
         FROM lark_identities i JOIN chat_members m ON m.open_id=i.open_id
         JOIN chats ch ON ch.chat_id=m.chat_id
         JOIN chat_group_classifications g ON g.chat_id=ch.chat_id AND g.purpose=%s
-        JOIN LATERAL (
-          SELECT ac.member_count,ac.member_count_status,ac.member_snapshot_checked_at,
-                 ac.member_snapshot_status
-          FROM authorization_chats ac JOIN authorizations a ON a.id=ac.authorization_id
-          WHERE ac.chat_id=ch.chat_id AND ac.is_visible AND ac.sync_enabled
-            AND a.status='active' AND a.body_consent_at IS NOT NULL
-            AND (%s::uuid IS NULL OR a.id=%s::uuid)
-          ORDER BY ac.member_snapshot_checked_at DESC NULLS LAST,a.id LIMIT 1
-        ) snapshot ON TRUE
         WHERE i.contact_id=ANY(%s::uuid[]) AND i.identity_type='user' AND m.member_type='user'
           AND COALESCE(ch.chat_status,'normal')='normal'
           AND COALESCE(ch.chat_mode,'group')<>'p2p'
-        ORDER BY ch.name,ch.chat_id,i.contact_id""", (purpose, cm_id, cm_id, contact_ids)).fetchall()
+          AND (%s::text[] IS NULL OR ch.chat_id=ANY(%s::text[]))
+          AND EXISTS(SELECT 1 FROM authorization_chats ac JOIN authorizations a ON a.id=ac.authorization_id
+            WHERE ac.chat_id=ch.chat_id AND ac.is_visible AND ac.sync_enabled
+              AND a.status='active' AND a.body_consent_at IS NOT NULL
+              AND (%s::uuid IS NULL OR a.id=%s::uuid))
+        ORDER BY ch.name,ch.chat_id,i.contact_id""",
+        (purpose, contact_ids, chat_ids, chat_ids, cm_id, cm_id)).fetchall()
     groups = {}
     for row in rows:
         group = groups.setdefault(row["chat_id"], {
             "id": row["chat_id"], "name": row["name"] or "未命名群", "purpose": row["purpose"],
-            "members": [], "member_count": row["member_count"] if row["member_count_status"] == "succeeded" else None,
-            "membership_checked_at": row["member_snapshot_checked_at"].isoformat()
-                if row["member_snapshot_checked_at"] else None,
-            "membership_status": row["member_snapshot_status"], "membership_note": MEMBERSHIP_NOTE,
+            "members": [],
         })
         contact_id = str(row["contact_id"])
         if contact_id not in group["members"]:
@@ -145,26 +136,20 @@ def _groups(conn, contact_ids, cm_id, purpose):
     return list(groups.values())
 
 
-def _joined_groups(conn, cm_id, purpose):
+def _joined_groups(conn, cm_id, purpose, chat_ids=None):
     """CM visibility comes from Lark discovery, not historical member rows or sync settings."""
-    rows = conn.execute("""SELECT ch.chat_id,ch.name,g.purpose,ac.member_count,ac.member_count_status,
-        ac.member_snapshot_checked_at,ac.member_snapshot_status,ac.last_seen_at
+    rows = conn.execute("""SELECT ch.chat_id,ch.name
         FROM authorization_chats ac JOIN authorizations a ON a.id=ac.authorization_id
         JOIN chats ch ON ch.chat_id=ac.chat_id
         LEFT JOIN chat_group_classifications g ON g.chat_id=ch.chat_id
         WHERE ac.authorization_id=%s AND ac.is_visible
           AND (%s='custom' OR g.purpose=%s)
+          AND (%s::text[] IS NULL OR ch.chat_id=ANY(%s::text[]))
           AND a.status='active' AND a.body_consent_at IS NOT NULL
           AND COALESCE(ch.chat_status,'normal')='normal' AND COALESCE(ch.chat_mode,'group')<>'p2p'
-        ORDER BY ch.name,ch.chat_id""", (cm_id, purpose, purpose)).fetchall()
+        ORDER BY ch.name,ch.chat_id""", (cm_id, purpose, purpose, chat_ids, chat_ids)).fetchall()
     return [{"id": row["chat_id"], "name": row["name"] or "未命名群", "purpose": purpose,
-             "members": [],
-             "member_count": row["member_count"] if row["member_count_status"] == "succeeded" else None,
-             "membership_status": row["member_snapshot_status"],
-             "membership_checked_at": row["member_snapshot_checked_at"].isoformat()
-                 if row["member_snapshot_checked_at"] else None,
-             "visibility_checked_at": row["last_seen_at"].isoformat() if row["last_seen_at"] else None,
-             "membership_note": MEMBERSHIP_NOTE} for row in rows]
+             "members": []} for row in rows]
 
 
 def _group_targets(values):

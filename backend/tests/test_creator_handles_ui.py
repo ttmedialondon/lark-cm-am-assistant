@@ -651,6 +651,28 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
     assert [group["id"] for group in joined["groups"]] == ["oc_own"]
     checked = client.post("/creators/broadcast/preview", json=own_fields, headers=headers).json()
     assert checked["groups"][0]["mention_all"] and not checked["can_send"]
+    # Batched routes must keep membership, classification and visibility checks.
+    own_person = pg.execute("SELECT contact_id FROM lark_identities WHERE open_id='ou_oc_own'").fetchone()["contact_id"]
+    pg.execute("SAVEPOINT support_route")
+    pg.execute("UPDATE chat_group_classifications SET purpose='support' WHERE chat_id='oc_own'")
+    pg.execute("INSERT INTO chat_members(chat_id,open_id,member_type) VALUES('oc_own','ou_oc_own','user')")
+    support = {"id": "oc_own", "people": [{"id": str(own_person)}],
+               "mentions": [{"id": "ou_oc_own", "contact_id": str(own_person)}]}
+    creator_broadcast_delivery._routes_current(pg, actor["id"], "support", [support])
+    with pytest.raises(PermissionError, match="身份关联"):
+        creator_broadcast_delivery._routes_current(pg, actor["id"], "support", [
+            {**support, "mentions": [{"id": "ou_oc_foreign", "contact_id": str(own_person)}]}])
+    pg.execute("DELETE FROM chat_members WHERE chat_id='oc_own'")
+    with pytest.raises(PermissionError):
+        creator_broadcast_delivery._routes_current(pg, actor["id"], "support", [support])
+    pg.execute("ROLLBACK TO SAVEPOINT support_route")
+    for sql in ("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='oc_own'",
+                "UPDATE chat_group_classifications SET purpose='support' WHERE chat_id='oc_own'"):
+        pg.execute("SAVEPOINT changed_route")
+        pg.execute(sql)
+        with pytest.raises(PermissionError):
+            creator_broadcast_delivery._routes_current(pg, actor["id"], "category", checked["groups"])
+        pg.execute("ROLLBACK TO SAVEPOINT changed_route")
     assert client.post("/creators/broadcast/send", json=own_fields, headers=headers).status_code == 400
     list_fields = dict(own_fields, name="Own list")
     list_item = client.post("/creators/broadcast/lists/save", json=list_fields, headers=headers).json()["list"]
@@ -737,8 +759,7 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
     p1, p2, other_cm = map(str, (uuid4(), uuid4(), uuid4()))
     people = [{"id": p1, "name": "Example One", "handles": ["example_one", "example_backup"]},
               {"id": p2, "name": "Example Two", "handles": ["example_two"]}]
-    group = {"id": "oc_example", "name": "Example group", "purpose": "support", "members": [p1, p2],
-             "member_count": None, "membership_note": creator_broadcast.MEMBERSHIP_NOTE}
+    group = {"id": "oc_example", "name": "Example group", "purpose": "support", "members": [p1, p2]}
     changed = {"routes": False, "role": True, "cm_active": True, "scopes": list(required), "consent": True}
     reads = []
     saved_lists = {}
@@ -832,11 +853,7 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
                 return Rows([{"id": params[0], "open_id": "ou_example", "display_name": "CM"}]
                             if changed["cm_active"] else [])
             if "FROM authorization_chats ac JOIN authorizations" in sql:
-                assert params == (params[0], params[1], params[1])
-                return Rows([{"chat_id": group["id"], "name": group["name"], "purpose": params[1],
-                              "member_count": None, "member_count_status": "pending",
-                              "member_snapshot_checked_at": None, "member_snapshot_status": "pending",
-                              "last_seen_at": None}] if not changed["routes"] else [])
+                return Rows([{"chat_id": group["id"], "name": group["name"]}] if not changed["routes"] else [])
             raise AssertionError(f"Unexpected query: {sql}")
 
     monkeypatch.setattr(creator_broadcast, "connection", lambda: nullcontext(Conn()))

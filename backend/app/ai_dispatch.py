@@ -15,13 +15,14 @@ import psycopg
 from .db import connection
 
 MAX_CONCURRENT_REQUESTS = 5
+INTERACTIVE_REQUESTS = 2
 _ADMISSION_LOCK = 541_195_270
 _TEMPORARY_RATE_LIMIT_MESSAGE = "OpenAI 请求暂时限速；系统将按服务端给出的时间自动重试。"
 _QUOTA_PAUSE_MESSAGE = "OpenAI 项目因配额或账单问题已暂停；请处理后由所有者恢复队列。"
 
 
-def can_claim(conn: psycopg.Connection) -> bool:
-    """Atomically decide whether any AI queue may claim one more task."""
+def can_claim(conn: psycopg.Connection, *, interactive: bool = False) -> bool:
+    """Keep user requests independent of the bounded background pool."""
 
     conn.execute("SELECT pg_advisory_xact_lock(%s)", (_ADMISSION_LOCK,))
     state = conn.execute(
@@ -34,40 +35,16 @@ def can_claim(conn: psycopg.Connection) -> bool:
     ).fetchone()
     if not state or state["paused_at"] is not None or state["throttled"]:
         return False
-    active = conn.execute(
-        """
-        SELECT COUNT(*) AS count
-        FROM (
-            SELECT id FROM assistant_turns
-            WHERE status = 'running' AND lease_until > NOW()
-            UNION ALL
-            SELECT id FROM summary_reply_tasks
-            WHERE status = 'running' AND lease_until > NOW()
-            UNION ALL
-            SELECT id FROM offhours_summary_tasks
-            WHERE status = 'running' AND lease_until > NOW()
-            UNION ALL
-            SELECT id FROM creator_import_rows
-            WHERE status = 'running' AND lease_until > NOW()
-            UNION ALL
-            SELECT id FROM creator_handle_jobs
-            WHERE status = 'running' AND lease_until > NOW()
-            UNION ALL
-            SELECT id FROM creator_responsibility_jobs
-            WHERE status = 'running' AND lease_until > NOW()
-            UNION ALL
-            SELECT id FROM creator_group_jobs
-            WHERE status = 'running' AND lease_until > NOW()
-            UNION ALL
-            SELECT id FROM creator_importance_jobs
-            WHERE status = 'running' AND lease_until > NOW()
-            UNION ALL
-            SELECT id FROM message_material_jobs
-            WHERE status = 'running' AND lease_until > NOW()
-        ) AS active
-        """
-    ).fetchone()
-    return bool(active and active["count"] < MAX_CONCURRENT_REQUESTS)
+    tables = (("assistant_turns", "summary_reply_tasks") if interactive else (
+        "creator_import_rows", "creator_handle_jobs",
+        "creator_responsibility_jobs", "creator_group_jobs", "creator_importance_jobs", "message_material_jobs",
+    ))
+    queries = [f"SELECT id FROM {table} WHERE status='running' AND lease_until > NOW()" for table in tables]
+    queries.append("SELECT t.id FROM offhours_summary_tasks t JOIN offhours_summary_runs r ON r.id=t.run_id "
+                   "WHERE t.status='running' AND t.lease_until>NOW() AND (r.origin='assistant')="
+                   + ("TRUE" if interactive else "FALSE"))
+    active = conn.execute("SELECT COUNT(*) AS count FROM (" + " UNION ALL ".join(queries) + ") AS active").fetchone()
+    return bool(active and active["count"] < (INTERACTIVE_REQUESTS if interactive else MAX_CONCURRENT_REQUESTS))
 
 
 def throttle(delay_seconds: float) -> None:

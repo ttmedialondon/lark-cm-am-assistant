@@ -20,6 +20,7 @@ from .db import connection
 from .handle_evidence import normalize_handle
 
 POLICY_VERSION = "creator-import-v2"
+PREPARATION_BATCH_SIZE = 100
 LOGGER = logging.getLogger(__name__)
 REASONS = {
     "existing": "已有相同账号和负责人，已复用正式关联",
@@ -974,12 +975,12 @@ def _rules_gate(conn, pinned, stage):
         raise ValueError("rules_unavailable") from exc
 
 
-def _build_material(conn, settings, row, stage, chain, results):
+def _build_material(conn, settings, row, stage, chain, results, *, group_context=None):
     from . import assistant_rules
 
     if stage == "group":
         material = creator_import_evidence.build_group_evidence(
-            conn, settings, row["cm_authorization_id"], row["handle"])
+            conn, settings, row["cm_authorization_id"], row["handle"], group_context=group_context)
     else:
         material = creator_import_evidence.build_person_evidence(
             conn, settings, row["cm_authorization_id"], row["handle"], _selected_chats(chain, results))
@@ -994,20 +995,32 @@ def _build_material(conn, settings, row, stage, chain, results):
     return material
 
 
-def _valid_chain(conn, settings, row, chain, results, *, full=False):
+def _decision_material(material, decision):
+    if not decision:
+        return material
+    cited = set(decision.get("evidence_refs", [])) | set(decision.get("creator", {}).get("refs", []))
+    cited.update(ref for candidate in decision.get("candidates", []) for ref in candidate.get("evidence_refs", []))
+    messages = {message["ref"]: message for message in material["pack"]["messages"]}
+    pending = list(cited)
+    while pending:
+        message = messages.get(pending.pop(), {})
+        for ref in (message.get("reply_to_ref"), message.get("previous_ref")):
+            if ref and ref not in cited:
+                cited.add(ref)
+                pending.append(ref)
+    return {**material, "refs": [ref for ref in material["refs"]
+                                if ref["kind"] != "message" or ref["label"] in cited]}
+
+
+def _valid_chain(conn, settings, row, chain, results, *, check_candidates=False):
+    materials = []
     for stage, material in chain.items():
         if material.get("pack", {}).get("_rules"):
             _rules_gate(
                 conn, material["pack"]["_rules"], "prepare" if stage == "group" else "match")
-        if not creator_import_evidence.validate_references(conn, settings, row["cm_authorization_id"], material):
-            return False
-        if (
-            full
-            and material["pack"].get("policy_version") == creator_import_evidence.POLICY_VERSION
-            and _build_material(conn, settings, row, stage, chain, results)["fingerprint"] != material["fingerprint"]
-        ):
-            return False
-    return True
+        materials.append(_decision_material(material, results.get(stage)) if check_candidates else material)
+    return all(creator_import_evidence.validate_reference_batch(
+        conn, settings, row["cm_authorization_id"], materials, check_candidates=check_candidates))
 
 
 def prepare_next_import(settings):
@@ -1027,25 +1040,51 @@ def prepare_next_import(settings):
         ).fetchone()
         if not batch:
             return False
-        row = conn.execute(
+        rows = conn.execute(
             """SELECT r.*,b.uploaded_by FROM creator_import_rows r JOIN creator_import_batches b
             ON b.id=r.batch_id WHERE r.batch_id=%s AND r.status='pending' AND r.review_status='pending'
             AND r.scheduled_at<=NOW()
-            ORDER BY r.row_number,r.id FOR UPDATE OF r SKIP LOCKED LIMIT 1""",
-            (batch["id"],),
-        ).fetchone()
-        if not row:
+            ORDER BY CASE WHEN COALESCE(r.stats->>'analysis_stage','group')='group' THEN 0 ELSE 1 END,
+            r.row_number,r.id FOR UPDATE OF r SKIP LOCKED LIMIT %s""",
+            (batch["id"], PREPARATION_BATCH_SIZE),
+        ).fetchall()
+        if not rows:
             return False
-        conn.execute(
-            "UPDATE creator_import_rows SET status='preparing',lease_until=NOW()+INTERVAL '10 minutes' WHERE id=%s",
-            (row["id"],),
-        )
+        # The history fallback is shared by group-stage rows; person-stage material stays scoped.
+        rows = [row for row in rows if _stage(row) == "group"] or rows[:1]
+        leases = conn.execute(
+            "UPDATE creator_import_rows SET status='preparing',lease_until=NOW()+INTERVAL '10 minutes' "
+            "WHERE id=ANY(%s::uuid[]) RETURNING id,lease_until", ([row["id"] for row in rows],),
+        ).fetchall()
+        leases = {lease["id"]: lease["lease_until"] for lease in leases}
+        rows = [{**row, "lease_until": leases[row["id"]]} for row in rows]
+    contexts, preparation_error = {}, ""
+    if _stage(rows[0]) == "group":
+        try:
+            with connection() as conn:
+                creator_access.access(conn, rows[0]["uploaded_by"], rows[0]["cm_authorization_id"])
+                contexts = creator_import_evidence.group_batch_context(
+                    conn, settings, rows[0]["cm_authorization_id"], [row["handle"] for row in rows])
+        except (ValueError, PermissionError) as exc:
+            preparation_error = str(exc) if str(exc) in REASONS else "authorization_changed"
+        except Exception:
+            LOGGER.error("creator import batch evidence preparation failed batch=%s", batch["id"])
+            preparation_error = "preparation_failed"
+    for row in rows:
+        _prepare_import_row(settings, row, group_context=contexts.get(row["handle"]),
+                            preparation_error=preparation_error)
+    return True
+
+
+def _prepare_import_row(settings, row, *, group_context=None, preparation_error=""):
     stage, material, config, reason = _stage(row), None, None, ""
     try:
+        if preparation_error:
+            raise ValueError(preparation_error)
         with connection() as conn:
             creator_access.access(conn, row["uploaded_by"], row["cm_authorization_id"])
             chain, results = _decode(row, settings), _decode(row, settings, "result_ciphertext")
-            if chain and not _valid_chain(conn, settings, row, chain, results, full=True):
+            if chain and not _valid_chain(conn, settings, row, chain, results, check_candidates=True):
                 raise ValueError("authorization_changed")
             waiting_members = stage == "person" and conn.execute(
                 """SELECT 1 FROM authorization_chats ac JOIN chats c ON c.chat_id=ac.chat_id
@@ -1056,7 +1095,7 @@ def prepare_next_import(settings):
             if waiting_members:
                 reason = "members_pending"
             else:
-                material = _build_material(conn, settings, row, stage, chain, results)
+                material = _build_material(conn, settings, row, stage, chain, results, group_context=group_context)
                 config = creator_data.config(conn)
                 reason = (material["reason_code"] if not material["eligible"]
                           else "" if config else "configuration_changed")
@@ -1078,6 +1117,7 @@ def prepare_next_import(settings):
             reason = "authorization_changed"
         if (
             current["status"] != "preparing"
+            or current["lease_until"] != row["lease_until"]
             or current["review_status"] != "pending"
             or (current["stats"].get("analysis_generation", 0) != row["stats"].get("analysis_generation", 0))
         ):
@@ -1092,6 +1132,9 @@ def prepare_next_import(settings):
         chain = _decode(current, settings)
         if material:
             chain[stage] = material
+            if not reason and not creator_import_evidence.validate_references(
+                    conn, settings, row["cm_authorization_id"], material):
+                reason = "authorization_changed"
         conn.execute(
             "SELECT pg_advisory_xact_lock(hashtextextended(%s,137035))",
             (str(row["cm_authorization_id"]) + ":" + row["handle"],),
@@ -1105,12 +1148,20 @@ def prepare_next_import(settings):
             ).fetchone()
         ):
             reason = "other_batch"
-        stats = {**current["stats"], **(material or {}).get("stats", {}), "analysis_stage": stage}
+        local = (creator_import_evidence.local_group_result(material)
+                 if material and not reason and stage == "group" else None)
+        if local:
+            results = _decode(current, settings, "result_ciphertext")
+            results["group"] = {**local, "auto_confirm_threshold": float(config["auto_confirm_threshold"])}
+            conn.execute("UPDATE creator_import_rows SET result_ciphertext=%s WHERE id=%s", (
+                creator_data.cipher(settings).encrypt(creator_data.encode(results)), row["id"]))
+        stats = {**current["stats"], **(material or {}).get("stats", {}),
+                 "analysis_stage": "person" if local else stage}
         conn.execute(
             """UPDATE creator_import_rows SET status=%s,reason_code=%s,pack_ciphertext=%s,refs=%s,
             fingerprint=%s,config_fingerprint=%s,stats=%s,lease_until=NULL,updated_at=NOW() WHERE id=%s""",
             (
-                "invalid" if reason else "queued",
+                "invalid" if reason else "pending" if local else "queued",
                 reason,
                 creator_data.cipher(settings).encrypt(creator_data.encode(chain)),
                 Jsonb((material or {}).get("refs", [])),
@@ -1239,7 +1290,8 @@ def _finish(job, settings, *, response=None, result=None, reason=""):
                 config = creator_data.config(conn)
                 if not config or creator_data.config_fingerprint(config) != row["config_fingerprint"]:
                     raise ValueError("configuration_changed")
-                if not _valid_chain(conn, settings, row, chain, results, full=True):
+                if not _valid_chain(
+                        conn, settings, row, chain, {**results, _stage(row): result}, check_candidates=True):
                     raise ValueError("authorization_changed")
             except (ValueError, PermissionError) as exc:
                 reason = str(exc) if str(exc) in REASONS else "authorization_changed"
@@ -1258,7 +1310,7 @@ def _finish(job, settings, *, response=None, result=None, reason=""):
                     and contact_id):
                 from .creator_handle_matching import confirm_identity
 
-                material = chain["person"]
+                material = _decision_material(chain["person"], result)
                 pinned = material["pack"].get("_rules")
                 if pinned:
                     _rules_gate(conn, pinned, "admit")
@@ -1344,7 +1396,7 @@ def run_claimed_import(job, settings):
                 return
             creator_access.access(conn, row["uploaded_by"], row["cm_authorization_id"])
             chain, results = _decode(row, settings), _decode(row, settings, "result_ciphertext")
-            if not _valid_chain(conn, settings, row, chain, results, full=True):
+            if not _valid_chain(conn, settings, row, chain, results, check_candidates=True):
                 raise ValueError("authorization_changed")
             config = creator_data.config(conn)
             if not config or creator_data.config_fingerprint(config) != row["config_fingerprint"]:

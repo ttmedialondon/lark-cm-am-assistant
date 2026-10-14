@@ -82,24 +82,32 @@ def _unchanged(conn, actor, checked):
     return current
 
 
-def _route_current(conn, actor, purpose, group):
-    contacts = [person["id"] for person in group.get("people", [])]
+def _routes_current(conn, actor, purpose, groups):
+    chat_ids = [group["id"] for group in groups]
+    contacts = list({person["id"] for group in groups for person in group.get("people", [])})
     if purpose == "support":
         people = creator_broadcast._people(conn, actor, contacts)
         if {person["id"] for person in people} != set(contacts):
             raise PermissionError("达人或负责人范围已变化，请重新选择。")
-        groups = creator_broadcast._groups(conn, contacts, actor, purpose)
-        current = next((item for item in groups if item["id"] == group["id"]), None)
-        if not current or not set(contacts).issubset(current["members"]):
-            raise PermissionError("目标群或人员关系已变化，请重新选择。")
-        for mention in group.get("mentions", []):
-            if not conn.execute(
-                """SELECT 1 FROM lark_identities i JOIN chat_members m ON m.open_id=i.open_id
-                WHERE i.open_id=%s AND i.contact_id=%s AND m.chat_id=%s AND m.member_type='user'""",
-                (mention["id"], creator_access.parse_id(mention["contact_id"]), group["id"]),
-            ).fetchone():
+        current = {item["id"]: item for item in creator_broadcast._groups(conn, contacts, actor, purpose, chat_ids)}
+        for group in groups:
+            if group["id"] not in current or not {person["id"] for person in group.get("people", [])}.issubset(
+                current.get(group["id"], {}).get("members", [])
+            ):
+                raise PermissionError("目标群或人员关系已变化，请重新选择。")
+        mentions = {(mention["id"], creator_access.parse_id(mention["contact_id"]), group["id"])
+                    for group in groups for mention in group.get("mentions", [])}
+        if mentions:
+            valid = {(row["open_id"], row["contact_id"], row["chat_id"]) for row in conn.execute(
+                """SELECT i.open_id,i.contact_id,m.chat_id FROM lark_identities i
+                JOIN chat_members m ON m.open_id=i.open_id
+                WHERE i.open_id=ANY(%s::text[]) AND i.contact_id=ANY(%s::uuid[])
+                  AND m.chat_id=ANY(%s::text[]) AND m.member_type='user'""",
+                (list({item[0] for item in mentions}), list({item[1] for item in mentions}), chat_ids),
+            ).fetchall()}
+            if not mentions.issubset(valid):
                 raise PermissionError("被 @ 人员的身份关联已变化，请重新选择。")
-    elif not any(item["id"] == group["id"] for item in creator_broadcast._joined_groups(conn, actor, purpose)):
+    elif set(chat_ids) != {item["id"] for item in creator_broadcast._joined_groups(conn, actor, purpose, chat_ids)}:
         raise PermissionError("目标群授权、分类或可见性已变化，请重新选择。")
 
 
@@ -243,8 +251,7 @@ def prepare(actor_id, fields):
     with connection() as conn, conn.transaction():
         _unchanged(conn, actor, authorization)
         _images(conn, actor, data["message"], settings)
-        for group in groups:
-            _route_current(conn, actor, data["purpose"], group)
+        _routes_current(conn, actor, data["purpose"], groups)
         row = conn.execute(
             """INSERT INTO creator_broadcast_previews
             (sender_authorization_id,sender_open_id,sender_name,purpose,body_ciphertext,snapshot,fingerprint)
@@ -344,7 +351,9 @@ def _existing(conn, actor, preview_id, request_id):
 
 def submit(actor_id, preview_id, request_id):
     actor, preview_id, request_id = map(creator_access.parse_id, (actor_id, preview_id, request_id))
-    with connection() as conn:
+    with connection() as conn, conn.transaction():
+        # One actor lock serializes submissions, cancellation and worker admission.
+        conn.execute("SELECT id FROM authorizations WHERE id=%s FOR UPDATE", (actor,))
         creator_access.require_broadcast_access(conn, actor)
         existing = _existing(conn, actor, preview_id, request_id)
         if existing:
@@ -352,38 +361,26 @@ def submit(actor_id, preview_id, request_id):
         preview = _owned_preview(conn, actor, preview_id)
         if preview["expires_at"] <= datetime.now(UTC):
             raise ValueError("预览已过期，请重新准备发送。")
-        _authorization(conn, actor)
-        _images(conn, actor, _body(preview["body_ciphertext"], preview["snapshot"], get_settings()), get_settings())
-        for group in preview["snapshot"]["groups"]:
-            _route_current(conn, actor, preview["purpose"], group)
-    with connection() as conn, conn.transaction():
-        # One actor lock serializes submissions, cancellation and worker admission.
-        conn.execute("SELECT id FROM authorizations WHERE id=%s FOR UPDATE", (actor,))
         authorization = _authorization(conn, actor)
         if authorization["open_id"] != preview["sender_open_id"]:
             raise PermissionError("发送账号已变化，请重新准备。")
-        existing = _existing(conn, actor, preview_id, request_id)
-        if not existing:
-            existing = conn.execute(
-                """SELECT b.* FROM creator_broadcast_batches b
-                JOIN creator_broadcast_previews p ON p.id=b.preview_id
-                WHERE b.sender_authorization_id=%s AND
-                  (p.fingerprint=ANY(%s::text[]) OR p.snapshot->'content_fingerprints' ?| %s::text[])
-                  AND b.created_at>NOW()-INTERVAL '10 minutes'
-                  AND EXISTS(SELECT 1 FROM creator_broadcast_targets t WHERE t.batch_id=b.id
-                    AND t.status IN ('pending','sending','succeeded','unknown'))
-                ORDER BY b.created_at DESC LIMIT 1""",
-                (actor, preview["snapshot"].get("content_fingerprints", [preview["fingerprint"]]),
-                 preview["snapshot"].get("content_fingerprints", [preview["fingerprint"]])),
-            ).fetchone()
+        existing = conn.execute(
+            """SELECT b.* FROM creator_broadcast_batches b
+            JOIN creator_broadcast_previews p ON p.id=b.preview_id
+            WHERE b.sender_authorization_id=%s AND
+              (p.fingerprint=ANY(%s::text[]) OR p.snapshot->'content_fingerprints' ?| %s::text[])
+              AND b.created_at>NOW()-INTERVAL '10 minutes'
+              AND EXISTS(SELECT 1 FROM creator_broadcast_targets t WHERE t.batch_id=b.id
+                AND t.status IN ('pending','sending','succeeded','unknown'))
+            ORDER BY b.created_at DESC LIMIT 1""",
+            (actor, preview["snapshot"].get("content_fingerprints", [preview["fingerprint"]]),
+             preview["snapshot"].get("content_fingerprints", [preview["fingerprint"]])),
+        ).fetchone()
         if existing:
             return {"batch": _summary(conn, _owned_batch(conn, actor, existing["id"])), "deduplicated": True}
-        preview = _owned_preview(conn, actor, preview_id)
-        if preview["expires_at"] <= datetime.now(UTC):
-            raise ValueError("预览已过期，请重新准备发送。")
-        _images(conn, actor, _body(preview["body_ciphertext"], preview["snapshot"], get_settings()), get_settings())
-        for group in preview["snapshot"]["groups"]:
-            _route_current(conn, actor, preview["purpose"], group)
+        settings = get_settings()
+        _images(conn, actor, _body(preview["body_ciphertext"], preview["snapshot"], settings), settings)
+        _routes_current(conn, actor, preview["purpose"], preview["snapshot"]["groups"])
         row = conn.execute(
             """INSERT INTO creator_broadcast_batches(sender_authorization_id,preview_id,request_id)
             VALUES(%s,%s,%s) RETURNING id""",
@@ -523,7 +520,7 @@ def _mark_started(job, checked):
     with connection() as conn, conn.transaction():
         conn.execute("SELECT id FROM authorizations WHERE id=%s FOR UPDATE", (actor,))
         _unchanged(conn, actor, checked)
-        _route_current(conn, actor, job["purpose"], job["snapshot"])
+        _routes_current(conn, actor, job["purpose"], [job["snapshot"]])
         _images(conn, actor, _body(job["body_ciphertext"], job["snapshot"], get_settings()), get_settings())
         return bool(
             conn.execute(
@@ -572,7 +569,7 @@ def run_claimed(job, settings=None):
     try:
         with connection() as conn:
             _authorization(conn, actor)
-            _route_current(conn, actor, job["purpose"], job["snapshot"])
+            _routes_current(conn, actor, job["purpose"], [job["snapshot"]])
         with httpx.Client(timeout=8) as http:
             client = LarkClient(settings, http_client=http)
             authorization, access_token = _client_token(actor, client, settings)

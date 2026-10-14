@@ -425,7 +425,7 @@ def _related_chats(conn, roster, *, settings=None, cm_id=REMI_ID):
         checks = []
         for row, _, chain in candidates:
             try:
-                checks.append(creator_imports._valid_chain(conn, settings, row, chain, {}, full=False))
+                checks.append(creator_imports._valid_chain(conn, settings, row, chain, {}))
             except (KeyError, TypeError, ValueError):
                 checks.append(False)
     for (row, selected, _), valid in zip(candidates, checks, strict=True):
@@ -975,7 +975,7 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
     return inserted
 
 
-def claim_next_summary():
+def claim_next_summary(*, interactive=False):
     with connection() as conn, conn.transaction():
         from . import summary_dialogues
         for row in conn.execute("SELECT id,checkpoint_ciphertext FROM offhours_summary_tasks "
@@ -989,7 +989,7 @@ def claim_next_summary():
                          "error_message=%s WHERE id=%s", ("queued" if pending else "failed",
                 None if pending else datetime.now(UTC), None if pending else
                 "请求结果未知，未自动重复调用；请核实后重新生成。", row["id"]))
-        if not ai_dispatch.can_claim(conn):
+        if not ai_dispatch.can_claim(conn, interactive=interactive):
             return None
         row = conn.execute("""SELECT t.*,r.requested_by_authorization_id,r.responsible_authorization_id,
                             r.window_start,r.window_end,r.origin,r.assistant_turn_id,r.selected_contact_ids,
@@ -1007,7 +1007,9 @@ def claim_next_summary():
                                 AND (r.period IS NULL OR r.report_date >= (NOW() AT TIME ZONE 'Europe/London')::date-6))
                               OR (r.origin='assistant' AND aturn.status IN ('queued','running','waiting')))
                               AND t.status='queued' AND t.is_current AND t.scheduled_at<=NOW()
-                            ORDER BY t.scheduled_at,t.created_at FOR UPDATE OF t SKIP LOCKED LIMIT 1""").fetchone()
+                              AND (r.origin='assistant')=%s
+                            ORDER BY t.scheduled_at,t.created_at FOR UPDATE OF t SKIP LOCKED LIMIT 1""",
+                           (interactive,)).fetchone()
         if not row:
             return None
         claimed = conn.execute(
