@@ -7,7 +7,7 @@ from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
@@ -133,11 +133,14 @@ def test_missing_media_and_multi_handle_do_not_invent_risk_or_duplicate_account(
     assert "reason" not in old_output and old_output["handling_reason"]
 
 
-def test_reply_and_resolution_remain_independent_through_context_and_merge():
+def test_reply_and_resolution_remain_independent_through_context_and_merge(monkeypatch):
     from app import assistant_worklist
 
+    no_staff = ai._format(pack())["schema"]["properties"]["events"]["items"]["properties"]["reply_evidence_refs"]
+    assert no_staff["maxItems"] == 0
     first = {"chat_id": "one", "message_id": "first", "created_at": "2026-10-12T08:00:00+00:00",
              "speaker": "U1", "is_staff": False, "text": "Please send the link by today"}
+    assert summary_dialogues.merge_format({"E1": first})["schema"]["properties"]["reply_evidence_refs"]["maxItems"] == 0
     reminder = {**first, "message_id": "reminder", "created_at": "2026-10-12T09:00:00+00:00",
                 "text": "Any update?"}
     metadata = assistant_worklist.decorate({"handling_status": "unresolved", "evidence": [first, reminder]},
@@ -165,13 +168,19 @@ def test_reply_and_resolution_remain_independent_through_context_and_merge():
         ("M2", "CM", "I'll look into sample order ABC-123 tomorrow"),
         ("M3", "CM2", "I can help check sample order ABC-123"),
         ("M4", "U1", "[附件或正文不可读取]"),
+        ("M0", "CM", "[附件或正文不可读取]"),
     ):
         data["pack"]["messages"].append({"ref": ref, "message_id": ref, "speaker": speaker,
-            "text": text, "in_window": True, "unreadable": ref == "M4",
-            "unavailable_or_truncated": ref == "M4"})
+            "text": text, "in_window": True, "unreadable": ref in {"M4", "M0"},
+            "unavailable_or_truncated": ref in {"M4", "M0"}})
     data["refs"] = {m["ref"]: {**m, "sender_name": {"CM": "Remi", "CM2": "Shang"}.get(m["speaker"], "Alice"),
         "is_staff": m["speaker"] in {"CM", "CM2"}, "chat_id": "group", "created_at": m["ref"]}
         for m in data["pack"]["messages"]}
+    reply_schema = ai._format(data)["schema"]["properties"]["events"]["items"]["properties"]["reply_evidence_refs"]
+    assert set(reply_schema["items"]["enum"]) == {"M2", "M3"}
+    with pytest.raises(ai.InvalidModelOutput, match="reply evidence is not staff"):
+        ai._validate(json.dumps({"events": [sample_event(reply_evidence_refs=[ref])
+                                            for ref in ("M2", "M3", "M1")]}), data)
     pending = ai._validate(json.dumps({"events": [sample_event(
         handling_evidence_refs=["M1", "M4"], reply_evidence_refs=["M2", "M3"])]}), data)[0]
     assert pending["handling_status"] == "unresolved" and pending["replied_by"] == ["Remi", "Shang"]
@@ -195,10 +204,58 @@ def test_reply_and_resolution_remain_independent_through_context_and_merge():
     refs = summary_dialogues.merged_evidence(pending, done)
     request_ref = next(r for r, m in refs.items() if m["message_id"] == "request")
     done_ref = next(r for r, m in refs.items() if m["message_id"] == "done")
+    merge_reply_refs = summary_dialogues.merge_format(refs, pending, done)["schema"]["properties"][
+        "reply_evidence_refs"]["items"]["enum"]
+    assert {refs[ref]["message_id"] for ref in merge_reply_refs} == {"M2", "M3", "done"}
     value = {"same": True, "basis_kind": "identifier", "basis_value": "ABC-123", "quote_a_ref": request_ref,
         "quote_b_ref": done_ref, "title": "样品订单", "summary": "样品已送达", "latest_progress": "同事已确认送达",
         "handling_status": "resolved", "handling_reason": "已确认对应样品送达", "handling_evidence_refs": [done_ref],
         "reply_evidence_refs": [r for r, m in refs.items() if m.get("is_staff")]}
+    # Paid returns can survive only this exact schema correction, not new material or instructions.
+    def unexpected_provider_call(*_args, **_kwargs):
+        pytest.fail("saved provider response must not cause another API call")
+    monkeypatch.setattr(openai_client, "call_openai", unexpected_provider_call)
+    for chat_id, query, schema, valid, forged, all_refs in (
+        ("chat", data["pack"], ai._format(data), {"events": [sample_event(reply_evidence_refs=["M2"])]},
+         {"events": [sample_event(reply_evidence_refs=["M1"])]}, list(data["refs"])),
+        (None, {"a": pending, "b": done, "evidence_messages": refs},
+         summary_dialogues.merge_format(refs, pending, done),
+         value, {**value, "reply_evidence_refs": [request_ref]}, list(refs)),
+    ):
+        before = json.loads(json.dumps(schema))
+        legacy = json.loads(json.dumps(schema))
+        fields = legacy["schema"]["properties"]
+        if chat_id:
+            fields = fields["events"]["items"]["properties"]
+        fields["reply_evidence_refs"] = {"type": "array", "items": {"type": "string", "enum": all_refs}, "maxItems": 20}
+        instructions = "fixed paid event manuals"
+        response = {"text": json.dumps(valid), "usage": {"input_tokens": 7}, "response_id": "paid-old-response"}
+        checkpoint = {"response_received": {"signature": ai._hash([query, legacy, instructions]), "response": response}}
+        job = {"chat_id": chat_id}
+        assert summary_dialogues.request(job, None, None, query, schema, instructions,
+                                         checkpoint=checkpoint) is response
+        assert schema == before
+        for changed_query, changed_rules, reply in (
+            ({**query, "changed_material": True}, instructions, False),
+            (query, instructions + " changed", False), (query, instructions, True),
+        ):
+            with pytest.raises(ai.SummaryInputError, match="调用材料或处理阶段已变化"):
+                summary_dialogues.request(job, None, None, changed_query, schema, changed_rules,
+                                          checkpoint=checkpoint, reply=reply)
+        with pytest.raises(openai_client.OpenAIRequestError, match="请求结果未知"):
+            summary_dialogues.request(job, None, None, query, schema, instructions,
+                                      checkpoint={"provider_call": {"id": "paid-without-received-return"}})
+        bad_checkpoint = {"response_received": {
+            **checkpoint["response_received"], "response": {"text": json.dumps(forged)}}}
+        restored = summary_dialogues.request(job, None, None, query, schema, instructions, checkpoint=bad_checkpoint)
+        with pytest.raises(ai.InvalidModelOutput, match="reply evidence is not staff"):
+            if chat_id:
+                ai._validate(restored["text"], data)
+            else:
+                summary_dialogues.combine(restored["text"], pending, done)
+        assert schema == before
+    with pytest.raises(ai.InvalidModelOutput, match="reply evidence is not staff"):
+        summary_dialogues.combine(json.dumps({**value, "reply_evidence_refs": [request_ref]}), pending, done)
     merged = summary_dialogues.combine(json.dumps(value), pending, done)
     assert merged["handling_status"] == "resolved" and merged["replied_by"] == ["Remi", "Shang"]
     assert merged["action_group"] == "closed"
@@ -729,7 +786,8 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
                 pg.execute("""UPDATE offhours_summary_tasks SET checkpoint_ciphertext=%s,
                     usage=%s::jsonb,response_id='resp-paid-broadcast' WHERE id=%s""",
                     (summary_dialogues.encode(checkpoint, s.settings), json.dumps(paid_usage), job["id"]))
-                job.update(pg.execute("SELECT * FROM offhours_summary_tasks WHERE id=%s", (job["id"],)).fetchone())
+                job.update(pg.execute("SELECT checkpoint_ciphertext,usage,response_id FROM offhours_summary_tasks "
+                                      "WHERE id=%s", (job["id"],)).fetchone())
                 before = len(s.calls)
             ai.run_claimed_summary(job, s.settings)
             if job["chat_id"] == "group_ai":
@@ -1650,6 +1708,7 @@ def finish_merges(pg, s):
 def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, seeded, monkeypatch):
     s = seeded
     pinned_rules = assistant_rules.event_snapshot(pg, s.settings)
+    expected_rules = pinned_rules
     long_body = 'Long message beginning ' + 'z' * 19000 + ' final-marker'
     for i in range(215):
         s.add(f'noise-{i}', text=f'Routine {i}', at=s.start + timedelta(minutes=i + 1))
@@ -1708,8 +1767,8 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
         nonlocal failed
         calls.append(pack)
         stage = "merge" if "a" in pack else "extract"
-        assert assistant_rules.event_instructions(pinned_rules, stage) in kwargs["instructions"]
-        assert "new-event-rules-marker" not in kwargs["instructions"]
+        assert assistant_rules.event_instructions(expected_rules, stage) in kwargs["instructions"]
+        assert ("new-event-rules-marker" in kwargs["instructions"]) == (expected_rules != pinned_rules)
         if len(calls) == 1:
             for key, document in pinned_rules["documents"].items():
                 assistant_rules.save_document(pg, s.settings, s.ids["owner"], key,
@@ -1811,6 +1870,89 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
     assert pg.execute("SELECT id,input_fingerprint,status FROM offhours_summary_tasks WHERE is_current "
                       "ORDER BY id").fetchall() == completed
     assert ai.claim_next_summary() is None
+    # Replace one source/its affected merges only; mixed versions must remain readable together.
+    with pg.transaction(force_rollback=True):
+        expected_rules = assistant_rules.event_snapshot(pg, s.settings)
+        override_cipher = summary_dialogues.encode(expected_rules, s.settings)
+        original_source = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s "
+                                     "AND chat_id='chat' AND is_current", (saved_run["id"],)).fetchone()
+        people = [UUID(user["contact_id"]) for user in summary_dialogues.decode(
+            original_source["result_ciphertext"], s.settings)["users"].values()]
+        original_merges = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s "
+            "AND contact_id=ANY(%s::uuid[]) AND is_current", (saved_run["id"], people)).fetchall()
+        affected_ids = [original_source["id"], *(row["id"] for row in original_merges)]
+        unchanged_ids = [row["id"] for row in pg.execute("SELECT id FROM offhours_summary_tasks "
+            "WHERE run_id=%s AND id<>ALL(%s::uuid[]) ORDER BY id",
+            (saved_run["id"], affected_ids)).fetchall()]
+        unchanged = pg.execute("SELECT * FROM offhours_summary_tasks WHERE id=ANY(%s::uuid[]) ORDER BY id",
+                               (unchanged_ids,)).fetchall()
+        override = {"event_rules_ciphertext": override_cipher, "event_rules_digest": expected_rules["digest"]}
+        material = ai._load_chat(pg, ai._task_run(saved_run, override), "chat", original_source["cutoff"],
+                                 settings=s.settings)
+        pg.execute("UPDATE offhours_summary_tasks SET is_current=FALSE WHERE id=%s", (original_source["id"],))
+        new_id = uuid4()
+        pg.execute("""INSERT INTO offhours_summary_tasks(id,run_id,chat_id,input_fingerprint,cutoff,
+            event_rules_ciphertext,event_rules_digest) VALUES(%s,%s,'chat',%s,%s,%s,%s)""",
+            (new_id, saved_run["id"], material["fingerprint"], original_source["cutoff"],
+             override_cipher, expected_rules["digest"]))
+        count_before = len(calls)
+        for _ in range(50):
+            job = ai.claim_next_summary()
+            if job is None:
+                break
+            assert job["id"] == new_id and job["event_rules_digest"] == expected_rules["digest"]
+            ai.run_claimed_summary(job, s.settings)
+        else:
+            pytest.fail("targeted source did not finish")
+        assert len(calls) > count_before
+        assert all(pack["chat_name"] == "Alice X TT" for pack in calls[count_before:])
+        assert summary_dialogues.schedule_merges(pg, s.settings) == len(original_merges)
+        new_merges = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s "
+            "AND contact_id=ANY(%s::uuid[]) AND is_current", (saved_run["id"], people)).fetchall()
+        new_merge_ids = [row["id"] for row in new_merges]
+        assert len(new_merges) == len(original_merges) and not set(new_merge_ids) & set(affected_ids)
+        assert all(row["status"] == "queued" for row in new_merges)
+        pg.execute("UPDATE offhours_summary_tasks SET event_rules_ciphertext=%s,event_rules_digest=%s "
+                   "WHERE id=ANY(%s::uuid[])", (override_cipher, expected_rules["digest"], new_merge_ids))
+        for _ in range(50):
+            job = ai.claim_next_summary()
+            if job is None:
+                break
+            assert job["id"] in new_merge_ids and job["event_rules_digest"] == expected_rules["digest"]
+            ai.run_claimed_summary(job, s.settings)
+        else:
+            pytest.fail("targeted merge did not finish")
+        refreshed = ai.read_assistant_run(pg, s.ids["cm"], saved_run["id"], s.settings)
+        assert refreshed["run"]["status"] == "completed" and len(refreshed["events"]) == 1, refreshed["run"]
+        assert {item["chat_id"] for item in refreshed["events"][0]["evidence"]} == {"chat", "second"}
+        assert pg.execute("SELECT * FROM offhours_summary_runs WHERE id=%s", (saved_run["id"],)).fetchone()[
+            "event_rules_ciphertext"] == saved_run["event_rules_ciphertext"]
+        for old in (original_source, *original_merges):
+            assert pg.execute("SELECT * FROM offhours_summary_tasks WHERE id=%s", (old["id"],)).fetchone() == {
+                **old, "is_current": False}
+        assert pg.execute("SELECT * FROM offhours_summary_tasks WHERE id=ANY(%s::uuid[]) ORDER BY id",
+                          (unchanged_ids,)).fetchall() == unchanged
+        prepared = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s ORDER BY id",
+                              (saved_run["id"],)).fetchall()
+        assert summary_dialogues.schedule_merges(pg, s.settings) == 0
+        state = pg.execute("SELECT *,id AS run_id FROM offhours_summary_runs WHERE id=%s",
+                           (saved_run["id"],)).fetchone()
+        state["refresh_until"] = pg.execute("SELECT refresh_until FROM offhours_summary_settings WHERE id").fetchone()[
+            "refresh_until"]
+        assert ai._schedule_run(pg, state, original_source["cutoff"]) == 0
+        assert pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s ORDER BY id",
+                          (saved_run["id"],)).fetchall() == prepared
+        s.add("after-targeted-rerun", text="New sample order ABC-123 follow-up",
+              at=original_source["cutoff"] - timedelta(minutes=1))
+        assert ai._schedule_run(pg, state, original_source["cutoff"]) == 1
+        successor = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s "
+                               "AND chat_id='chat' AND is_current", (saved_run["id"],)).fetchone()
+        assert successor["id"] != new_id and successor["status"] == "queued"
+        assert successor["event_rules_ciphertext"] == override_cipher
+        assert successor["event_rules_digest"] == expected_rules["digest"]
+        assert pg.execute("SELECT * FROM offhours_summary_tasks WHERE id=ANY(%s::uuid[]) ORDER BY id",
+                          (unchanged_ids,)).fetchall() == unchanged
+    expected_rules = pinned_rules
     # Changed access hides the merged narrative as well as its evidence.
     pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='second'")
     assert ai.get_summary_view(pg, s.ids['owner'])['events'] == []

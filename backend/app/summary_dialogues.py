@@ -7,6 +7,7 @@ checkpoints retain completed work and provider receipts for local response repla
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -187,7 +188,8 @@ def schedule_merges(conn, settings):
             for user in result["users"].values():
                 people.setdefault(user["contact_id"], []).append(task)
         existing_merges = {str(row['contact_id']): row for row in conn.execute(
-            "SELECT id,contact_id,input_fingerprint,status FROM offhours_summary_tasks "
+            "SELECT id,contact_id,input_fingerprint,status,event_rules_ciphertext,event_rules_digest "
+            "FROM offhours_summary_tasks "
             "WHERE run_id=%s AND is_current AND contact_id IS NOT NULL", (run['id'],),
         ).fetchall()}
         fingerprints = {person: core._hash(_source_hashes(run, sources))
@@ -211,7 +213,7 @@ def schedule_merges(conn, settings):
                 if source['chat_id'] not in related:
                     missing_sources.add(source['id'])
                     continue
-                data = core._load_chat(conn, run, source['chat_id'], source['cutoff'],
+                data = core._load_chat(conn, core._task_run(run, source), source['chat_id'], source['cutoff'],
                                        settings=settings, roster=roster, related_chats=chats)
                 if not data or data['fingerprint'] != source['input_fingerprint']:
                     stale_people.update(related[source['chat_id']]['contact_ids'])
@@ -257,8 +259,9 @@ def schedule_merges(conn, settings):
             ).fetchone() if core.run_feature(run) == core.ASSISTANT_FEATURE else None
             task = conn.execute(
                 """INSERT INTO offhours_summary_tasks(id,run_id,contact_id,input_fingerprint,cutoff,
-                status,error_message,checkpoint_ciphertext,result_ciphertext,model,response_id)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                status,error_message,checkpoint_ciphertext,result_ciphertext,model,response_id,
+                event_rules_ciphertext,event_rules_digest)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT(run_id,contact_id,input_fingerprint) WHERE contact_id IS NOT NULL
                 DO UPDATE SET is_current=TRUE,
                 status=CASE WHEN offhours_summary_tasks.status='cancelled' THEN 'queued'
@@ -267,7 +270,9 @@ def schedule_merges(conn, settings):
                 (new_id, run["id"], person, fingerprint, max(t["cutoff"] for t in sources),
                  cached["status"] if cached else "queued", cached["error_message"] if cached else None,
                  cached["checkpoint_ciphertext"] if cached else None, cached["result_ciphertext"] if cached else None,
-                 cached["model"] if cached else None, cached["response_id"] if cached else None),
+                 cached["model"] if cached else None, cached["response_id"] if cached else None,
+                 existing.get("event_rules_ciphertext") if existing else None,
+                 existing.get("event_rules_digest") if existing else None),
             ).fetchone()
             inserted += task["id"] == new_id
             selected.append(task["id"])
@@ -322,7 +327,7 @@ def merge_input(conn, run, task, settings, roster=None, chats=None, *, read_cach
         if key not in cache:
             try:
                 data = core._load_chat(
-                    conn, run, source["chat_id"], source["cutoff"], settings=settings,
+                    conn, core._task_run(run, source), source["chat_id"], source["cutoff"], settings=settings,
                     roster=roster, related_chats=chats, read_cache=read_cache,
                 )
             except (PermissionError, core.SummaryInputError, InvalidTag, ValueError, KeyError):
@@ -391,7 +396,7 @@ def merge_format(refs=("E1",), left=None, right=None):
     props = {
         "quote_a_ref": {"type": "string", "enum": [r for r in refs if left is None or refs[r] in left["evidence"]]},
         "quote_b_ref": {"type": "string", "enum": [r for r in refs if right is None or refs[r] in right["evidence"]]},
-        **core.handling_fields(refs),
+        **core.handling_fields(refs, refs if isinstance(refs, dict) else {}),
         "same": {"type": "boolean"},
         "basis_kind": {"type": "string", "enum": ["identifier", "product", "amount", "reference", "none"]},
         **{
@@ -477,7 +482,8 @@ def step(job, settings):
             chunks = segments(data)
         else:
             core._current(conn, job)
-            source_events, person = merge_input(conn, job, job, settings)
+            run = conn.execute("SELECT * FROM offhours_summary_runs WHERE id=%s", (job["run_id"],)).fetchone()
+            source_events, person = merge_input(conn, run, job, settings)
     checkpoint = decode(job.get("checkpoint_ciphertext"), settings) or {}
     response = None
     if job["chat_id"]:
@@ -576,7 +582,7 @@ def step(job, settings):
             checked_chat(conn, job, settings)
         else:
             core._current(conn, job)
-            merge_input(conn, job, job, settings)
+            merge_input(conn, run, job, settings)
         _retain_receipts(checkpoint, _current_checkpoint(conn, job, settings))
         model = checkpoint.get("provider_call", {}).get("model", cfg["model"])
         checkpoint.pop("response_received", None)
@@ -670,11 +676,21 @@ def _store_receipt(job, settings, checkpoint, response, *, reply=False, received
 
 def request(job, settings, cfg, pack, schema, instructions, *, checkpoint, reply=False, max_output_tokens=12000):
     # The clock and sync watermark do not change the prepared business evidence.
-    signature = core._hash([{key: value for key, value in pack.items()
-                            if key not in {"checked_at", "synced_through"}}, schema, instructions])
+    material = {key: value for key, value in pack.items() if key not in {"checked_at", "synced_through"}}
+    signature = core._hash([material, schema, instructions])
     pending = checkpoint.get("response_received")
     if pending:
-        if pending["signature"] != signature:
+        signatures = {signature}
+        if not reply and pending["signature"] != signature:
+            # Replay paid legacy returns through the unchanged semantic validator, not another request.
+            legacy = deepcopy(schema)
+            fields = legacy["schema"]["properties"]
+            if job["chat_id"]:
+                fields = fields["events"]["items"]["properties"]
+            fields["reply_evidence_refs"] = {"type": "array", "items": {"type": "string",
+                "enum": fields["handling_evidence_refs"]["items"]["enum"]}, "maxItems": 20}
+            signatures.add(core._hash([material, legacy, instructions]))
+        if pending["signature"] not in signatures:
             raise core.SummaryInputError("调用材料或处理阶段已变化。")
         return pending["response"]
     if checkpoint.get("provider_call"):
@@ -685,7 +701,8 @@ def request(job, settings, cfg, pack, schema, instructions, *, checkpoint, reply
             checked_chat(conn, job, settings)
         elif not reply:
             core._current(conn, job)
-            merge_input(conn, job, job, settings)
+            run = conn.execute("SELECT * FROM offhours_summary_runs WHERE id=%s", (job["run_id"],)).fetchone()
+            merge_input(conn, run, job, settings)
         _retain_receipts(checkpoint, _current_checkpoint(conn, job, settings, reply=reply))
         checkpoint["provider_call"] = {"id": str(uuid4()), "signature": signature, "model": cfg["model"],
                                        "checked_at": pack.get("checked_at")}

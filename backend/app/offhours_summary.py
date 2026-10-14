@@ -118,6 +118,13 @@ def _event_rules(conn, settings):
     return summary_dialogues.encode(pinned, settings), pinned["digest"]
 
 
+def _task_run(run, task):
+    if task and (task.get("event_rules_ciphertext") is not None or task.get("event_rules_digest") is not None):
+        return {**run, "event_rules_ciphertext": task.get("event_rules_ciphertext"),
+                "event_rules_digest": task.get("event_rules_digest")}
+    return run
+
+
 def _authorize_run(conn, run, *, actor_id=None, read_cache=None, executing=False):
     actor = UUID(str(actor_id or run["requested_by_authorization_id"]))
     cm, owner = _authorize(conn, actor, cm_id=run["responsible_authorization_id"],
@@ -761,7 +768,8 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
             ORDER BY is_current DESC,created_at DESC LIMIT 1""", (state["run_id"], chat["chat_id"])).fetchone()
         active = previous and previous['is_current'] and previous['status'] in ('queued', 'running')
         chat_cutoff = previous['cutoff'] if active else cutoff
-        evidence = _load_chat(conn, run, chat["chat_id"], chat_cutoff, roster=roster, related_chats=chats)
+        evidence = _load_chat(conn, _task_run(run, previous), chat["chat_id"], chat_cutoff,
+                              roster=roster, related_chats=chats)
         if not evidence:
             watermark = max(
                 [t for t in (chat["last_incremental_at"], chat["last_backfill_at"]) if t]
@@ -805,8 +813,8 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
         ).fetchone() if assistant else None
         selected = conn.execute(
             """INSERT INTO offhours_summary_tasks(id,run_id,chat_id,input_fingerprint,cutoff,checkpoint_ciphertext,
-                     status,error_message,result_ciphertext,model,response_id)
-                     VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(run_id,chat_id,input_fingerprint)
+                     status,error_message,result_ciphertext,model,response_id,event_rules_ciphertext,event_rules_digest)
+                     VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(run_id,chat_id,input_fingerprint)
                      DO UPDATE SET is_current=TRUE,
                      cutoff=CASE WHEN offhours_summary_tasks.status='cancelled' THEN EXCLUDED.cutoff
                             ELSE offhours_summary_tasks.cutoff END,
@@ -816,7 +824,9 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
              cached["checkpoint_ciphertext"] if cached else previous["checkpoint_ciphertext"] if previous else None,
              cached["status"] if cached else "queued", cached["error_message"] if cached else None,
              cached["result_ciphertext"] if cached else None, cached["model"] if cached else None,
-             cached["response_id"] if cached else None),
+             cached["response_id"] if cached else None,
+             previous.get("event_rules_ciphertext") if previous else None,
+             previous.get("event_rules_digest") if previous else None),
         ).fetchone()
         inserted += selected["id"] == new_id
         selected_ids.append(selected["id"])
@@ -920,7 +930,8 @@ def claim_next_summary():
             return None
         row = conn.execute("""SELECT t.*,r.requested_by_authorization_id,r.responsible_authorization_id,
                             r.window_start,r.window_end,r.origin,r.assistant_turn_id,r.selected_contact_ids,
-                            r.event_rules_ciphertext,r.event_rules_digest
+                            COALESCE(t.event_rules_ciphertext,r.event_rules_ciphertext) AS event_rules_ciphertext,
+                            COALESCE(t.event_rules_digest,r.event_rules_digest) AS event_rules_digest
                             FROM offhours_summary_tasks t
                             JOIN offhours_summary_runs r ON r.id=t.run_id
                             LEFT JOIN offhours_summary_settings s ON s.id
@@ -1008,7 +1019,14 @@ closed/waiting 分组填 null，不把员工索取资料后的等待对方时间
 _INSTRUCTIONS += HANDLING_INSTRUCTIONS
 
 
-def handling_fields(refs):
+def handling_fields(refs, messages, staff=()):
+    reply_refs = [ref for ref, message in messages.items()
+                  if (message.get("is_staff", message.get("speaker") == "CM" or message.get("speaker") in staff)
+                      or message.get("speaker") == "CM")
+                  and not message.get("unreadable") and message.get("text", "").strip()]
+    reply_items = {"type": "string"}
+    if reply_refs:
+        reply_items["enum"] = reply_refs
     return {
         "action_group": {"type": "string", "enum": ["reply", "followup", "waiting", "closed"]},
         "waiting_since_ref": {"type": ["string", "null"], "enum": [*refs, None]},
@@ -1016,8 +1034,10 @@ def handling_fields(refs):
         "handling_reason": {"type": "string", "minLength": 1, "maxLength": 500},
         "handling_evidence_refs": {"type": "array", "items": {"type": "string", "enum": list(refs)},
                                    "minItems": 1, "maxItems": 20},
-        "reply_evidence_refs": {"type": "array", "items": {"type": "string", "enum": list(refs)},
-                                "maxItems": 20},
+        "reply_evidence_refs": {"type": "array", "items": reply_items,
+                                "maxItems": 20 if reply_refs else 0,
+                                "description": "只引用员工的实质回复；没有则填 []。"
+                                               "达人自己的确认可证明解决，不能证明员工已回复。"},
     }
 
 
@@ -1070,8 +1090,9 @@ def validate_handling(item, messages):
 
 
 def _format(evidence):
+    messages = {message["ref"]: message for message in evidence["pack"]["messages"]}
     properties = {
-        **handling_fields(evidence["refs"]),
+        **handling_fields(evidence["refs"], messages, evidence["pack"].get("staff", {})),
         "user": {"type": "string", "enum": list(evidence["users"])},
         "handle": {"type": ["string", "null"]},
         "priority": {"type": ["string", "null"], "enum": ["P0", "P1", "P2", "P3", None]},
@@ -1340,19 +1361,20 @@ def read_assistant_run(conn, actor_id, run_id, settings):
         chats = _related_chats(conn, roster, settings=settings, cm_id=run["responsible_authorization_id"])
         targets = set(run["selected_contact_ids"]) if run["selected_contact_ids"] is not None else None
         cutoff = datetime.fromisoformat(view["run"]["cutoff"])
+        saved_tasks = {task["chat_id"]: task for task in conn.execute(
+            "SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND is_current AND chat_id IS NOT NULL",
+            (run["id"],)).fetchall()}
         material = {}
         for chat in chats:
             if targets is not None and not chat["contact_ids"] & targets:
                 continue
             if chat["sync_status"] == "not_readable":
                 continue
-            data = _load_chat(conn, run, chat["chat_id"], cutoff, settings=settings, roster=roster, related_chats=chats)
+            data = _load_chat(conn, _task_run(run, saved_tasks.get(chat["chat_id"])), chat["chat_id"], cutoff,
+                              settings=settings, roster=roster, related_chats=chats)
             if data:
                 material[chat["chat_id"]] = data["fingerprint"]
-        saved = {t["chat_id"]: t["input_fingerprint"] for t in conn.execute(
-            """SELECT chat_id,input_fingerprint FROM offhours_summary_tasks
-            WHERE run_id=%s AND is_current AND chat_id IS NOT NULL""",
-            (run["id"],)).fetchall()}
+        saved = {chat_id: task["input_fingerprint"] for chat_id, task in saved_tasks.items()}
         if material != saved:
             view["run"]["status"] = "partial"
             view["run"]["gaps"].append("会话或消息资料已变化，需按当前材料重新分析。")
