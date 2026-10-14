@@ -1,4 +1,4 @@
-"""Owner-managed documents, encrypted and pinned once for each assistant turn."""
+"""Delegated administrator documents, encrypted and pinned once for each assistant turn."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 from uuid import uuid4
 
+from . import admin_permissions
 from . import summary_dialogues as codec
 
 DOCUMENTS = (
@@ -312,12 +313,12 @@ def save_document(conn, settings, actor_id, key_or_none, title, description, kin
         raise ValueError("只有知识资料或自定义处理手册可以批准用于回复起草。")
     if type(revision) is not int or not 0 <= revision < 2_147_483_647:
         raise ValueError("规则版本无效，请刷新页面后重试。")
-    account = conn.execute("SELECT status FROM authorizations WHERE id=%s FOR NO KEY UPDATE", (actor_id,)).fetchone()
-    role = conn.execute("SELECT role,is_active FROM admin_roles WHERE authorization_id=%s FOR UPDATE",
-                        (actor_id,)).fetchone()
-    if (not account or account["status"] != "active"
-            or not role or role["role"] != "owner" or not role["is_active"]):
-        raise PermissionError("只有当前有效的系统主人可以修改助手文档。")
+    conn.execute("SELECT id FROM authorizations WHERE id=%s FOR NO KEY UPDATE", (actor_id,)).fetchone()
+    conn.execute("SELECT authorization_id FROM admin_roles WHERE authorization_id=%s FOR UPDATE",
+                 (actor_id,)).fetchone()
+    conn.execute("SELECT permission FROM admin_page_permissions WHERE authorization_id=%s "
+                 "AND permission='assistant-rules' FOR SHARE", (actor_id,)).fetchone()
+    admin_permissions.require_page(conn, actor_id, "assistant-rules")
     # A missing override row needs the same lock as existing rows for the first concurrent save.
     conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", ("assistant-rules:" + key,))
     current = conn.execute("SELECT revision,status FROM assistant_rule_overrides WHERE rule_key=%s FOR UPDATE",

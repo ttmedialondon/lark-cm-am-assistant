@@ -33,13 +33,14 @@ GET_ROUTES = (
     ("contacts", "/admin/contacts/ou_contact"),
     ("ai", "/admin/ai"),
     ("jobs", "/admin/jobs"),
+    ("assistant-rules", "/admin/assistant-rules"),
+    ("assistant-rules", "/admin/assistant-rules?new=1"),
+    ("assistant-rules", "/admin/assistant-rules?document=doc-00000000-0000-0000-0000-000000000001"),
 )
-PRIVATE_ROUTES = ("/admin/assistant-rules", "/admin/assistant-rules?new=1",
-                  "/admin/assistant-rules?document=doc-00000000-0000-0000-0000-000000000001")
 POST_ROUTES = (
     f"/admin/users/{TARGET}/permissions",
     "/admin/contacts/ou_contact/organization",
-    "/admin/ai", "/admin/ai/resume", "/admin/assistant-rules",
+    "/admin/ai", "/admin/ai/resume",
 )
 
 
@@ -108,7 +109,7 @@ def test_each_route_checks_its_own_permission_before_reading(monkeypatch, data_f
         assert response.headers["location"] == f"/admin/{unrelated}"
 
 
-@pytest.mark.parametrize("path", [path for _, path in GET_ROUTES] + list(PRIVATE_ROUTES))
+@pytest.mark.parametrize("path", [path for _, path in GET_ROUTES])
 def test_no_page_grants_means_no_backend_even_with_a_legacy_role(monkeypatch, data_fence, path):
     monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _: "operator")
     browser, _, _ = _client(monkeypatch)
@@ -122,13 +123,22 @@ def test_all_page_grants_still_cannot_mutate_or_grant_access(monkeypatch, data_f
     assert response.status_code == 403
 
 
-def test_contact_assessment_plaintext_remains_owner_only(monkeypatch, data_fence):
-    browser, _, _ = _client(monkeypatch, permissions=PAGES)
-    for path in PRIVATE_ROUTES:
-        assert browser.get(path).status_code == 403
+def test_document_management_is_narrowly_delegated_and_revocable(monkeypatch, data_fence):
+    browser, _, state = _client(monkeypatch, permissions={'assistant-rules'})
+    form = {'csrf_token': 'csrf', 'document': '', 'revision': '0', 'title': 'Sample guide',
+            'description': 'Sample questions', 'kind': 'manual', 'status': 'draft',
+            'visibility': 'owner', 'content': 'Check actual facts.'}
+    assert browser.post('/admin/assistant-rules', data={**form, 'csrf_token': 'wrong'}).status_code == 400
+    with pytest.raises(_DataQueryReached):
+        browser.post('/admin/assistant-rules', data=form)
+    for path in POST_ROUTES:
+        assert browser.post(path, data=form).status_code == 403
+    state['permissions'] = frozenset({'users'})
+    assert browser.get('/admin/assistant-rules').status_code == 403
+    assert browser.post('/admin/assistant-rules', data=form).status_code == 403
 
 
-@pytest.mark.parametrize("path", [path for _, path in GET_ROUTES] + list(PRIVATE_ROUTES))
+@pytest.mark.parametrize("path", [path for _, path in GET_ROUTES])
 def test_owner_has_every_read_entry_without_explicit_page_grants(monkeypatch, data_fence, path):
     browser, _, _ = _client(monkeypatch, owner=True)
     with pytest.raises(_DataQueryReached):
@@ -146,7 +156,7 @@ def test_revocation_applies_to_the_next_request_in_the_same_session(monkeypatch,
 @pytest.mark.parametrize("owner", [False, True])
 def test_inactive_authorization_has_no_backend_access(monkeypatch, data_fence, owner):
     browser, _, _ = _client(monkeypatch, permissions=PAGES, owner=owner, status="revoked")
-    for path in [path for _, path in GET_ROUTES] + list(PRIVATE_ROUTES):
+    for path in [path for _, path in GET_ROUTES]:
         assert browser.get(path, follow_redirects=False).status_code == 403
 
 
@@ -176,9 +186,8 @@ def test_owner_navigation_exposes_every_page():
     )
     backend_links = {link for link in re.findall(r'href="([^"]+)"', html) if link.startswith("/admin")}
     assert backend_links == {page["path"] for page in admin_permissions.PAGES
-                             if page["path"].startswith("/admin")} | {"/admin/assistant-rules"}
-    assert _page_menu_targets(html) == list(dict.fromkeys(page["path"] for page in admin_permissions.PAGES)) + [
-        "/admin/assistant-rules"]
+                             if page["path"].startswith("/admin")}
+    assert _page_menu_targets(html) == list(dict.fromkeys(page["path"] for page in admin_permissions.PAGES))
     assert ">助手文档</a>" in html
     _assert_no_navigation_role_labels(html)
 
@@ -186,6 +195,7 @@ def test_owner_navigation_exposes_every_page():
 @pytest.mark.parametrize("permissions", [
     ("users", "messages"),
     ("ai", "jobs"),
+    ("assistant-rules",),
 ])
 def test_navigation_keeps_exact_grants_when_switching_between_pages(permissions):
     environment = Environment(loader=FileSystemLoader(Path(admin.__file__).parent / "templates"), autoescape=True)
@@ -205,6 +215,7 @@ def test_navigation_keeps_exact_grants_when_switching_between_pages(permissions)
 @pytest.mark.parametrize(("permissions", "owner", "expected"), [
     ((), False, set()),
     (("messages",), False, {"/admin/messages"}),
+    (("assistant-rules",), False, {"/admin/assistant-rules"}),
     ((), True, {"/admin"}),
 ])
 def test_frontend_entry_uses_current_page_permissions(monkeypatch, permissions, owner, expected):
@@ -327,8 +338,8 @@ def test_every_admin_route_is_in_the_access_matrix(monkeypatch):
             path = path.replace(f"{{{parameter}}}", TARGET)
         actual.update((method, path) for method in route.methods)
     expected = {("GET", path.split("?", 1)[0]) for _, path in GET_ROUTES}
-    expected.update(("GET", path.split("?", 1)[0]) for path in PRIVATE_ROUTES)
     expected.update(("POST", path) for path in POST_ROUTES)
+    expected.add(("POST", '/admin/assistant-rules'))
     assert actual == expected
 
 

@@ -348,7 +348,7 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     assert new.status_code == 200 and 'name="document" value=""' in new.text
     assert '<option value="rule"' not in new.text
     assert '<option value="manual" selected>' in new.text and '<option value="draft" selected>' in new.text
-    assert '<option value="all" selected>' in new.text and "所有已接入 CM" in new.text
+    assert '<option value="all" selected>' in new.text and "发布范围控制助手取材" in new.text
     draft_form = {"csrf_token": "csrf", "document": "", "revision": "0", "title": "样品进度手册",
                   "description": "回答寄样安排及后续进展。", "kind": "manual", "status": "draft",
                   "visibility": "all", "content": "先读取实际样品询问，再核对员工回复及后续消息。"}
@@ -527,6 +527,31 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     assert client.post(path, data=event_form).status_code == 403
     assert client.get(path + "?document=" + creator_key).status_code == 403
     assert client.post(path, data=creator_form).status_code == 403
+    pg.execute("INSERT INTO admin_page_permissions(authorization_id,permission,granted_by) "
+               "VALUES(%s,'assistant-rules',%s)", (member, owner))
+    assert client.get(path + '?new=1').status_code == 200
+    assert client.get(path + '?document=' + creator_key).status_code == 200
+    delegated = client.post(path, data={**draft_form, 'kind': 'knowledge', 'status': 'published',
+        'visibility': 'owner', 'content': 'PRIVATE_DELEGATED_FACT'}, follow_redirects=False)
+    assert delegated.status_code == 303
+    delegated_key = delegated.headers['location'].split('document=', 1)[1].split('&', 1)[0]
+    stored = assistant_rules.library(pg, settings)[delegated_key]
+    assert stored['updated_by'] == str(member) and stored['revision'] == 1
+    assert delegated_key not in assistant_rules.snapshot(pg, settings)['documents']
+    from app import assistant_tools, reply_rules
+    assert not reply_rules._owner(pg, member)
+    assert not assistant_tools._owner(pg, member)
+    with pytest.raises(PermissionError):
+        assistant_tools.effective_context(pg, member, {}, {'cm_id': str(owner)})
+    assert client.post('/admin/ai', data={'csrf_token': 'csrf'}).status_code == 403
+    pg.execute("DELETE FROM admin_page_permissions WHERE authorization_id=%s AND permission='assistant-rules'",
+               (member,))
+    assert client.get(path + '?document=' + delegated_key).status_code == 403
+    assert client.post(path, data={**draft_form, 'document': delegated_key, 'revision': '1'}).status_code == 403
+    with pytest.raises(PermissionError):
+        assistant_rules.save_document(pg, settings, member, delegated_key, stored['title'], stored['description'],
+            stored['kind'], stored['status'], stored['visibility'], stored['text'], stored['revision'])
+    assert assistant_rules.library(pg, settings)[delegated_key] == stored
     session["auth"] = {"id": owner, "status": "active"}
     pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (owner,))
     assert client.get(path).status_code == 403 and client.post(path, data=form).status_code == 403

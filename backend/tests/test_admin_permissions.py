@@ -174,7 +174,7 @@ def test_migration_has_fixed_keys_and_no_implicit_grants():
     sql = (Path(__file__).parents[1] / "migrations/027_admin_page_permissions.sql").read_text()
     assert "PRIMARY KEY (authorization_id, permission)" in sql
     assert "INSERT" not in sql
-    current_sql = (Path(__file__).parents[1] / "migrations/056_creator_manage_permission.sql").read_text()
+    current_sql = (Path(__file__).parents[1] / "migrations/104_assistant_document_permission.sql").read_text()
     assert "INSERT" not in current_sql
     for key in admin_permissions.PAGE_KEYS:
         assert f"'{key}'" in current_sql
@@ -188,7 +188,7 @@ def test_message_source_limit_survives_page_permission_saves(pg, monkeypatch):
     pg.execute("INSERT INTO admin_message_source_limits VALUES (%s, %s)", (PERSON, OWNER))
     pg.execute("INSERT INTO admin_message_source_limits VALUES (%s, %s)", (PERSON, PERSON))
     monkeypatch.setattr(admin_permissions, "connection", lambda: nullcontext(pg))
-    for grants in (["messages"], [], ["messages", "creator-roster"]):
+    for grants in (["messages"], [], ["messages", "creator-roster", "assistant-rules"]):
         admin_permissions.set_permissions(OWNER, PERSON, grants)
         result = admin_permissions.access_for(PERSON)
         assert result["message_source_ids"] == [OWNER, PERSON]

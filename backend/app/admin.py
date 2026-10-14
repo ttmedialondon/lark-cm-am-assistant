@@ -177,14 +177,16 @@ def create_admin_router(
             "/admin/contacts/{open_id}": "contacts",
             "/admin/messages/export": "messages",
             "/admin/ai": "ai", "/admin/jobs": "jobs",
+            "/admin/assistant-rules": "assistant-rules",
         }.get(route_path)
         if not acl["is_owner"]:
             if request.method == "GET" and route_path == "/admin" and "overview" not in acl["permissions"]:
                 return None, RedirectResponse(acl["landing_path"], status_code=303,
                                               headers={"Cache-Control": "no-store, max-age=0"})
-            if request.method != "GET" or permission not in acl["permissions"]:
+            document_write = request.method == "POST" and permission == "assistant-rules"
+            if (request.method != "GET" and not document_write) or permission not in acl["permissions"]:
                 return None, render_template(request, "error.html", {
-                    "title": "当前页面或操作未获授权", "detail": "仅可查看系统主人已勾选的页面；管理操作仅限主人。",
+                    "title": "当前页面或操作未获授权", "detail": "仅可访问系统主人已授予的页面和操作。",
                 }, 403)
         return {"authorization": authorization, "admin_role": "owner" if acl["is_owner"] else "member",
                 "message_source_ids": acl.get("message_source_ids"),
@@ -742,7 +744,7 @@ def create_admin_router(
 
     @router.get("/admin/assistant-rules")
     def admin_assistant_rules(request: Request, document: str = "core", new: bool = False) -> Response:
-        access_context, denied = owner_access(request)
+        access_context, denied = access(request)
         if denied is not None:
             return denied
         assert access_context is not None
@@ -1021,7 +1023,7 @@ def create_admin_router(
     def admin_save_assistant_rules(
         request: Request, *, form: Annotated[dict[str, str], Depends(assistant_rule_fields)],
     ) -> Response:
-        access_context, denied = owner_access(request)
+        access_context, denied = access(request)
         if denied is not None:
             return denied
         assert access_context is not None
@@ -1097,4 +1099,4 @@ def create_admin_router(
 
 
 def _role_label(role: str) -> str:
-    return {"owner": "系统主人", "member": "按页面授权 · 只读"}.get(role, "管理员")
+    return {"owner": "系统主人", "member": "按页面授权"}.get(role, "管理员")
