@@ -12,9 +12,6 @@ CONTACT_ROLE_CODES = frozenset(
         "other_external_contact",
     }
 )
-AI_ROLE_CODES = CONTACT_ROLE_CODES
-MODEL_ROLE_CODES = AI_ROLE_CODES | {"insufficient"}
-
 ROLE_LABELS = {
     "creator": "达人",
     "partner_contact": "其他机构负责人",

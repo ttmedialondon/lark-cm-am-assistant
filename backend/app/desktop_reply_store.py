@@ -32,9 +32,6 @@ _ERROR_MESSAGES = {
     "csrf_invalid": "请求校验失败，请刷新页面。",
     "cancelled": "请求已取消，本请求不会自动重跑。",
     "abandoned": "处理期限已过，计费结果不确定；本请求不会自动重跑。",
-    "conversation_not_found": "没有找到当前账号可访问的会话。",
-    "conversation_ambiguous": "会话名称对应多个会话，需要明确选择。",
-    "conversation_forbidden": "当前账号无权访问此会话。",
     "context_unavailable": "AI 暂未确定要回复的事项，请选中具体诉求后重新生成。",
 }
 

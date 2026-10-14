@@ -863,48 +863,28 @@ def test_role_and_chat_events_shared_slots_and_catalog_changes(pg, matching_flow
     pg.execute("UPDATE creator_handle_jobs SET status='completed' WHERE id<>%s", (job_id,))
     job = matching.claim()
     assert job is not None
-    # Curva version changed before networking: no charge, no obsolete suggestions.
+    # Curva changes do not invalidate real chat evidence before or after the model call.
     monkeypatch.setattr(matching, "catalog", lambda: (frozenset({"first.handle", "backup_2"}), "catalog-v2"))
-    matching.run(job, flow.settings)
-    assert not flow.calls
-    assert (
-        pg.execute(
-            "SELECT billed_tokens FROM creator_handle_requests WHERE id=%s", (job["reservation_id"],)
-        ).fetchone()["billed_tokens"]
-        == 0
-    )
-    assert pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (job_id,)).fetchone()["status"] == "queued"
-    assert matching.prepare_next(flow.settings)
-    job = matching.claim()
     flow.before_response = lambda: monkeypatch.setattr(
         matching, "catalog", lambda: (frozenset({"first.handle", "backup_2"}), "catalog-v3")
     )
     matching.run(job, flow.settings)
     assert len(flow.calls) == 1
-    assert pg.execute("SELECT status,result_ciphertext FROM creator_handle_jobs WHERE id=%s", (job_id,)).fetchone() == {
-        "status": "queued",
-        "result_ciphertext": None,
-    }
-    # Curva can also change while the final account/person writer lock is being acquired.
-    flow.before_response = None
-    assert matching.prepare_next(flow.settings)
-    job = matching.claim()
-    versions = iter(("catalog-v3", "catalog-v3", "catalog-v4"))
-    monkeypatch.setattr(matching, "catalog", lambda: (frozenset({"first.handle", "backup_2"}), next(versions)))
-    matching.run(job, flow.settings)
-    assert len(flow.calls) == 2
-    assert pg.execute("SELECT status,result_ciphertext FROM creator_handle_jobs WHERE id=%s", (job_id,)).fetchone() == {
-        "status": "queued",
-        "result_ciphertext": None,
-    }
+    finished = pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (job_id,)).fetchone()
+    assert finished["status"] == "completed"
     assert (
         pg.execute(
             "SELECT billed_tokens FROM creator_handle_requests WHERE id=%s", (job["reservation_id"],)
         ).fetchone()["billed_tokens"]
         == 150
     )
-    assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
-    assert not pg.execute("SELECT 1 FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
+    assert set(contact_handles.for_contacts(pg, [flow.contact])[flow.contact]) == {"first.handle", "backup_2"}
+    displayed = matching.page_data(pg, pilot.ids["owner"], flow.settings)["jobs"]
+    assert any(item["id"] == job_id and item["suggestions"] for item in displayed)
+    pg.execute("UPDATE ai_feature_configs SET automatic_queue_checked_at=NOW()-INTERVAL '2 minutes'")
+    before_jobs = pg.execute("SELECT COUNT(*) n FROM creator_handle_jobs").fetchone()["n"]
+    assert not matching.prepare_next(flow.settings)
+    assert pg.execute("SELECT COUNT(*) n FROM creator_handle_jobs").fetchone()["n"] == before_jobs
 
     # History admission upgrades unlinked prior-version contacts, never existing formal owners.
     monkeypatch.setattr(matching, "catalog", lambda: (frozenset({"first.handle", "backup_2"}), "catalog-v4"))
@@ -938,30 +918,17 @@ def test_role_and_chat_events_shared_slots_and_catalog_changes(pg, matching_flow
     assert len({row["contact_id"] for row in latest}) == len(latest)
     assert old_id not in {row["id"] for row in latest}
     # Bulk history admission skips formal owners and preserves explicit manual review.
-    for handle in ("first.handle", "backup_2"):
-        account = uuid4()
-        pg.execute(
-            "INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) VALUES(%s,'tiktok',%s,%s)",
-            (account, handle, handle),
-        )
-        pg.execute(
-            "INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source) "
-            "VALUES(%s,%s,'owner','confirmed','excel_ai_verified')",
-            (flow.contact, account),
-        )
     pg.execute(
         "UPDATE creator_handle_jobs SET status='review_required',source='manual',"
         "stats=jsonb_build_object('prompt_version','retired-prompt') WHERE id=%s",
         (job_id,),
     )
+    query = "SELECT status,reason_code,source FROM creator_handle_jobs WHERE id=%s"
+    manual = pg.execute(query, (job_id,)).fetchone()
     assert matching.enqueue_history(pg, pilot.ids["owner"]) == 0
     assert matching.prepare_next(flow.settings)  # Only the earlier, unlinked silent history item.
-    assert pg.execute("SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s", (job_id,)).fetchone() == {
-        "status": "review_required",
-        "reason_code": "snapshot_changed",
-    }
-    assert pg.execute("SELECT source FROM creator_handle_jobs WHERE id=%s", (job_id,)).fetchone()["source"] == "manual"
-    assert len(flow.calls) == 2
+    assert pg.execute(query, (job_id,)).fetchone() == manual
+    assert len(flow.calls) == 1
 
 
 def test_failed_diagnostics_partial_results_and_queue_cleanup_preserve_data(pg, matching_flow, monkeypatch):
@@ -1016,7 +983,7 @@ def test_failed_diagnostics_partial_results_and_queue_cleanup_preserve_data(pg, 
     assert retained == {"n": 2, "tokens": 300}
 
 
-def test_disabled_probe_retains_paid_diagnostics_when_postcall_catalog_fails(pg, matching_flow, monkeypatch, capsys):
+def test_disabled_probe_retains_paid_diagnostics_when_source_changes(pg, matching_flow, monkeypatch, capsys):
     from scripts import probe_creator_handle_matching as probe
 
     flow = matching_flow
@@ -1044,15 +1011,7 @@ def test_disabled_probe_retains_paid_diagnostics_when_postcall_catalog_fails(pg,
     monkeypatch.setattr(probe, "connection", lambda: nullcontext(proxy))
     monkeypatch.setattr(probe, "get_settings", lambda: flow.settings)
     monkeypatch.setattr(sys, "argv", ["probe_creator_handle_matching", "--contact-id", str(flow.contact)])
-    catalogs = []
-
-    def catalog():
-        catalogs.append(True)
-        if len(catalogs) == 3:
-            raise OSError("synthetic postcall catalog failure")
-        return frozenset({"first.handle", "backup_2"}), "catalog-v1"
-
-    monkeypatch.setattr(matching, "catalog", catalog)
+    flow.before_response = lambda: setattr(flow, "valid", False)
     try:
         assert probe.main() == 0
     finally:
@@ -1060,7 +1019,7 @@ def test_disabled_probe_retains_paid_diagnostics_when_postcall_catalog_fails(pg,
     output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert output[0]["evidence_fresh"] is False and output[0]["evidence_eligible_candidates"] == []
     assert output[-1]["business_links_written"] == 0 and output[-1]["matching_enabled_by_probe"] is False
-    assert len(flow.calls) == 1 and len(catalogs) == 3
+    assert len(flow.calls) == 1
     logged = pg.execute("SELECT * FROM creator_handle_requests").fetchone()
     assert logged["job_id"] is None
     assert (logged["input_tokens"], logged["output_tokens"], logged["billed_tokens"]) == (100, 50, 150)

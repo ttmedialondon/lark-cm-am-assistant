@@ -370,12 +370,3 @@ def save_document(conn, settings, actor_id, key_or_none, title, description, kin
                      "revision": next_revision, "digest": _digest(text), "kind": kind,
                      "status": status, "visibility": visibility, "reply_usable": reply_usable})))
     return key
-
-
-def save_override(conn, settings, actor_id, key, text, revision):
-    if key not in KEYS:
-        raise ValueError("未知的助手规则文档。")
-    item = next(item for item in DOCUMENTS if item["key"] == key)
-    save_document(conn, settings, actor_id, key, item["title"], item["description"],
-                  "rule", "published", "all", text, revision)
-    return revision + 1

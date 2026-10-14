@@ -2088,13 +2088,18 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
     s.add("long-current", who="cm", text=long_text, at=datetime.now(UTC))
     pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('reply-group','Shared group','group')")
     pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,backfill_complete,
-        last_incremental_at,sync_status) VALUES(%s,'reply-group',TRUE,NOW(),'succeeded')""", (s.ids["cm"],))
+        last_incremental_at,sync_status) VALUES(%s,'reply-group',FALSE,NOW(),'succeeded')""", (s.ids["cm"],))
     pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('reply-group','ou_person')")
     pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,body_ciphertext,
         message_create_time) VALUES('reply-group','broadcast','ou_cm','text',%s,NOW())""",
         (s.cipher.encrypt(json.dumps({"text": "OUTSIDER_GROUP_SECRET"})),))
     pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
         VALUES(%s,'reply-group','broadcast')""", (s.ids["cm"],))
+    pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,body_ciphertext,
+        message_create_time) VALUES('reply-group','later-payment','ou_person','text',%s,NOW())""",
+        (s.cipher.encrypt(json.dumps({"text": "Please check the payment for sample A-200."})),))
+    pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+        VALUES(%s,'reply-group','later-payment')""", (s.ids["cm"],))
     with pytest.raises(PermissionError):
         replies.enqueue(pg, s.ids["reviewer"], event_id, s.settings)
     payment_knowledge = assistant_rules.save_document(pg, s.settings, s.ids["owner"], None,
@@ -2175,6 +2180,7 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
     finish()
     result = replies.read(pg, s.ids["cm"], job_id, s.settings, fresh=True)
     assert result["result"]["outcome"] == "ready" and result["result"]["chinese_translation"]
+    assert calls[-1]["sync_gaps"] == ["reply-group"]
     assert crashed and local_failed and sum(p == calls[0] for p in calls) == 1
     assert sum("checked_at" in p for p in calls) == 1
     assert result["result"]["checked_at"] == calls[-1]["checked_at"]
@@ -2196,15 +2202,33 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
     assert calls[-1]["business_documents"][0]["document_ref"] == "doc." + payment_knowledge
     with pytest.raises(PermissionError):
         replies.read(pg, s.ids["owner"], job_id, s.settings)
+    s.add("new-before-translation", text="Thanks, I will wait for the payment check.", at=datetime.now(UTC))
     translated = replies.enqueue(pg, s.ids["cm"], event_id, s.settings, parent_id=job_id,
                                  text="Happy to check the £200 payment with you.")
-    finish()
-    assert replies.read(pg, s.ids["cm"], translated, s.settings, fresh=True)["result"]["draft"].startswith("Happy")
+    with monkeypatch.context() as patch:
+        patch.setattr(replies, "collect", lambda *_args, **_kwargs: pytest.fail("translation reread chat bodies"))
+        finish()
+    translated_result = replies.read(pg, s.ids["cm"], translated, s.settings, fresh=True)
+    assert translated_result["result"]["draft"].startswith("Happy")
+    assert translated_result["reason_code"] == "new_messages"
     translated_state = summary_dialogues.decode(pg.execute(
         "SELECT checkpoint_ciphertext FROM summary_reply_tasks WHERE id=%s", (translated,)
     ).fetchone()["checkpoint_ciphertext"], s.settings)
     assert translated_state["reply_rules"] == state["reply_rules"]
     assert translated_state["document_ids"] == state["document_ids"]
+    with pg.transaction(force_rollback=True):
+        denied_id = replies.enqueue(pg, s.ids["cm"], event_id, s.settings, parent_id=job_id,
+                                    text="Please check this payment.")
+        denied_job = replies.claim()
+        paid_count = len(calls)
+        pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='reply-group'")
+        for saved_id in (job_id, translated):
+            with pytest.raises(ai.SummaryInputError, match="原文读取权限"):
+                replies.read(pg, s.ids["cm"], saved_id, s.settings)
+        replies.run(denied_job, s.settings)
+        assert len(calls) == paid_count
+        assert pg.execute("SELECT status FROM summary_reply_tasks WHERE id=%s", (denied_id,)).fetchone()[
+            "status"] == "stale"
     with pg.transaction(force_rollback=True):
         assistant_rules.save_document(pg, s.settings, s.ids["owner"], payment_knowledge,
             "付款核对资料", "仅用于付款咨询", "knowledge", "draft", "all", "PAYMENT_KNOWLEDGE_V2", 2,

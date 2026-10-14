@@ -19,9 +19,9 @@ from psycopg.errors import DivisionByZero
 
 from app import ai_dispatch, ai_feature_config, config, creator_data, openai_client
 from app import creator_handle_evidence as handle_evidence
+from app import creator_matching_routes as routes
 from app import creator_responsibility_evidence as evidence
 from app import creator_responsibility_matching as matching
-from app import creator_responsibility_routes as routes
 from app.crypto import message_body_cipher
 
 pilot = parent_pilot
@@ -912,6 +912,7 @@ def test_ai_readonly_routes_csrf_lazy_evidence_and_safe_audit(pg, pilot, respons
     app = FastAPI()
     app.include_router(
         routes.create_router(
+            "responsibility",
             current_authorization=lambda _: session["auth"],
             csrf_token=lambda _: "csrf",
             render_template=lambda request, name, context, status_code=200: HTMLResponse(

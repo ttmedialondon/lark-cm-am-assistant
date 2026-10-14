@@ -355,17 +355,25 @@ def step(job, settings):
     with connection() as conn, conn.transaction():
         fence(conn, job)
         _rules_access(conn, job["actor_id"], checkpoint)
-        current = collect(conn, job["actor_id"], event_id(job), settings, feature=job.get("feature", core.FEATURE))
         cfg = core._config(conn, job.get("feature", core.FEATURE))
         options = dialogues.decode(job["input_ciphertext"], settings) or {}
-        if job["parent_id"]:
+        if job["action"] == "translate":
+            task, run, *_ = source(conn, job["actor_id"], event_id(job), settings,
+                                  feature=job.get("feature", core.FEATURE))
             parent = conn.execute(
                 "SELECT * FROM summary_reply_tasks WHERE id=%s AND actor_id=%s", (job["parent_id"], job["actor_id"])
             ).fetchone()
-            parent_state = dialogues.decode(parent["checkpoint_ciphertext"], settings)
-            _rules_access(conn, job["actor_id"], parent_state or {})
-            if parent["status"] != "succeeded" or parent_state["fingerprint"] != current["fingerprint"]:
-                raise core.SummaryInputError("有新消息或权限变化，请重新生成建议。")
+            if not parent or parent["status"] != "succeeded":
+                raise core.SummaryInputError("原建议已不可用。")
+            parent_state = dialogues.decode(parent["checkpoint_ciphertext"], settings) or {}
+            _rules_access(conn, job["actor_id"], parent_state)
+            original = dialogues.decode(parent["result_ciphertext"], settings)
+            dialogues._check_merge_access(conn, run, task,
+                dict(enumerate(original.get("evidence", []))), actor_id=job["actor_id"])
+            # Translation changes language, not the draft's evidence snapshot or copy-time checks.
+            current = {**original, "fingerprint": parent_state["fingerprint"], "messages": []}
+        else:
+            current = collect(conn, job["actor_id"], event_id(job), settings, feature=job.get("feature", core.FEATURE))
     if checkpoint.get("fingerprint") and checkpoint["fingerprint"] != current["fingerprint"]:
         raise core.SummaryInputError("有新消息或权限变化，请重新生成建议。")
     checkpoint.setdefault("fingerprint", current["fingerprint"])
@@ -373,7 +381,7 @@ def step(job, settings):
     done = False
     pinned = checkpoint.get("reply_rules")
     if job["action"] == "translate":
-        pack = {"edited_draft": dialogues.decode(job["input_ciphertext"], settings)["text"]}
+        pack = {"edited_draft": options["text"]}
         instructions = (reply_rules.instructions(pinned, "event", stage="translate")
                         if pinned else TRANSLATE_INSTRUCTIONS)
         output = schema("reply_translation", {"chinese_translation": {"type": "string", "minLength": 1}})
@@ -480,9 +488,6 @@ def step(job, settings):
         available = {m["ref"] for m in pack["messages"] if m.get("purpose") != "style_only"}
         if not result["evidence_refs"] or any(r not in available for r in result["evidence_refs"]):
             raise core.InvalidModelOutput("missing reply proof")
-        if current["sync_gaps"]:
-            result.update(outcome="verify", draft="", chinese_translation="")
-            result["checks"].append("相关会话尚未完成同步，请先核对最新消息。")
         if result["outcome"] == "ready":
             if not result["draft"].strip() or result["language"] != "zh" and not result["chinese_translation"].strip():
                 raise core.InvalidModelOutput("missing draft or translation")
@@ -493,9 +498,16 @@ def step(job, settings):
     with connection() as conn, conn.transaction():
         fence(conn, job)
         _rules_access(conn, job["actor_id"], checkpoint)
-        fresh = collect(conn, job["actor_id"], event_id(job), settings, feature=job.get("feature", core.FEATURE))
-        if fresh["fingerprint"] != current["fingerprint"]:
-            raise core.SummaryInputError("有新消息或权限变化，请重新生成建议。")
+        if job["action"] == "translate":
+            task, run, *_ = source(conn, job["actor_id"], event_id(job), settings,
+                                  feature=job.get("feature", core.FEATURE))
+            dialogues._check_merge_access(conn, run, task,
+                dict(enumerate(original.get("evidence", []))), actor_id=job["actor_id"])
+            fresh = current
+        else:
+            fresh = collect(conn, job["actor_id"], event_id(job), settings, feature=job.get("feature", core.FEATURE))
+            if fresh["fingerprint"] != current["fingerprint"]:
+                raise core.SummaryInputError("有新消息或权限变化，请重新生成建议。")
         dialogues._retain_receipts(checkpoint, dialogues._current_checkpoint(conn, job, settings, reply=True))
         prepared_at = checkpoint.get("response_received", {}).get("checked_at") or fresh["checked_at"]
         result.update(checked_at=prepared_at, synced_through=fresh["synced_through"])
@@ -551,12 +563,22 @@ def read(conn, actor, job_id, settings, *, fresh=False):
     if not job:
         raise PermissionError("回复建议不存在或无权查看。")
     feature = job.get("feature", core.FEATURE)
-    source(conn, actor, event_id(job), settings, require_unresolved=False, feature=feature)
+    task, run, *_ = source(conn, actor, event_id(job), settings, require_unresolved=False, feature=feature)
     checkpoint = dialogues.decode(job["checkpoint_ciphertext"], settings) or {}
     _rules_access(conn, actor, checkpoint)
     result = None
     if job["status"] == "succeeded":
         result = dialogues.decode(job["result_ciphertext"], settings)
+        if not fresh:
+            original = result
+            if job["action"] == "translate":
+                parent = conn.execute("SELECT result_ciphertext FROM summary_reply_tasks "
+                    "WHERE id=%s AND actor_id=%s AND status='succeeded'", (job["parent_id"], actor)).fetchone()
+                if not parent:
+                    raise core.SummaryInputError("原建议已不可用。")
+                original = dialogues.decode(parent["result_ciphertext"], settings)
+            dialogues._check_merge_access(conn, run, task,
+                dict(enumerate(original.get("evidence", []))), actor_id=actor)
         if fresh:
             current = collect(conn, actor, event_id(job), settings, require_unresolved=False, feature=feature)
             if current["fingerprint"] != checkpoint["fingerprint"]:

@@ -755,8 +755,20 @@ def test_repeated_window_uses_validated_cache_and_history_does_not_double_source
 
 
 def test_model_prepares_saves_and_returns_message_draft_without_child_job(pg, chat, monkeypatch):
-    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='outside'",
-               (chat.cipher.encrypt(json.dumps({'text': 'When will the sample be dispatched?'})),))
+    pg.execute("UPDATE chat_messages SET message_type='image',body_ciphertext=%s WHERE message_id='outside'",
+               (chat.cipher.encrypt(json.dumps({'image_key': 'fixture-dispatch-question'})),))
+    original_attach = assistant_search.message_materials.attach
+
+    def parsed_image(conn, actor, cm_id, rows, settings, **kwargs):
+        result = original_attach(conn, actor, cm_id, [row for row in rows if row['message_id'] != 'outside'],
+                                 settings, **kwargs)
+        for row in rows:
+            if row['message_id'] == 'outside':
+                row['_material'] = {'text': 'When will the sample be dispatched?', 'complete': True, 'notes': []}
+        result['rows'] = rows
+        return result
+
+    monkeypatch.setattr(assistant_search.message_materials, 'attach', parsed_image)
     calls = []
     knowledge_key = assistant_rules.save_document(pg, chat.settings, chat.ids['owner'], None,
         '公开样品流程', '用于回复样品申请流程', 'knowledge', 'published', 'all',
@@ -914,8 +926,10 @@ def test_model_first_lookup_replay_history_and_actor_isolation(pg, chat, monkeyp
     assert turn['status'] == 'queued' and calls == []
     pinned = summary_dialogues.decode(assistant._turn(pg, chat.ids['cm'], turn['id'])[
         'checkpoint_ciphertext'], chat.settings)['rules']
-    assistant_rules.save_override(pg, chat.settings, chat.ids['owner'], 'answer',
-        assistant_rules.default_text('answer') + '\nOWNER_RULE_SNAPSHOT_MARKER\n', 0)
+    document = assistant_rules.library(pg, chat.settings)['answer']
+    assistant_rules.save_document(pg, chat.settings, chat.ids['owner'], 'answer',
+        document['title'], document['description'], 'rule', 'published', 'all',
+        document['text'] + '\nOWNER_RULE_SNAPSHOT_MARKER\n', document['revision'])
     assert assistant_rules.snapshot(pg, chat.settings)['digest'] != pinned['digest']
     assert assistant.submit(pg, chat.ids['cm'], submitted, chat.settings)['id'] == turn['id']
     with pytest.raises(LookupError):

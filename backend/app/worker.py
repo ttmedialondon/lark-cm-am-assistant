@@ -41,7 +41,6 @@ from .lark_api import LarkApiError, LarkClient, TokenBundle
 from .lark_sync_admission import LarkSyncAdmission
 
 LOGGER = logging.getLogger("lark_message_stats.worker")
-LEASE_MINUTES = 10
 
 
 class ReauthorizationRequired(RuntimeError):

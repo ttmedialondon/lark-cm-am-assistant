@@ -33,14 +33,9 @@ class BroadcastAuthorizationRequired(PermissionError):
         return f"/auth/lark/start?send=1&account_id={self.account_id}" + ("&media=1" if self.media else "")
 
 
-def preview_open():
-    until = getattr(get_settings(), "broadcast_preview_until", None)
-    return bool(until and until > datetime.now(UTC))
-
-
 def _require_broadcast_grant(conn, actor_id, *, sending=False):
     actor = creator_access.parse_id(actor_id)
-    owner = creator_access.require_broadcast_access(conn, actor, preview=not sending and preview_open())
+    owner = creator_access.require_broadcast_access(conn, actor)
     row = conn.execute("""SELECT id,status,body_consent_at,scopes FROM authorizations WHERE id=%s""",
                        (actor,)).fetchone()
     if not row or row["status"] != "active" or not row["body_consent_at"]:
@@ -53,7 +48,7 @@ def _require_broadcast_grant(conn, actor_id, *, sending=False):
 
 def require_access(actor_id):
     with connection() as conn:
-        return creator_access.require_broadcast_access(conn, actor_id, preview=preview_open())
+        return creator_access.require_broadcast_access(conn, actor_id)
 
 
 def _selected_cm(actor_id, cm_id, owner):
@@ -262,7 +257,7 @@ def page_data(actor_id):
         return {"purposes": PURPOSES, "cms": [{"id": str(cm["id"]), "name": cm["display_name"] or "未命名用户"}
                                              for cm in cms],
                 "selected_cm_id": str(actor_id), "can_select_cm": owner,
-                "demo_preview": preview_open(), "actor_id": str(actor_id),
+                "actor_id": str(actor_id),
                 "lists": _lists(conn, actor_id),
                 "templates": _templates(conn, actor_id)}
 
@@ -275,7 +270,7 @@ def permission_check(actor_id, cm_id, *, media=False):
     sql = """SELECT id,open_id,display_name,status,body_consent_at,scopes,access_token_ciphertext,broadcast_enabled
         FROM authorizations WHERE id=%s"""
     with connection() as conn:
-        owner = creator_access.require_broadcast_access(conn, actor, preview=preview_open())
+        owner = creator_access.require_broadcast_access(conn, actor)
         actor_row = conn.execute(sql, (actor,)).fetchone()
         _selected_cm(actor, cm_id, owner)
         target = actor
@@ -337,7 +332,7 @@ def permission_check(actor_id, cm_id, *, media=False):
     except (httpx.HTTPError, InvalidToken, ValueError, RuntimeError):
         pass
     with connection() as conn:
-        owner = creator_access.require_broadcast_access(conn, actor, preview=preview_open())
+        owner = creator_access.require_broadcast_access(conn, actor)
         current_actor = conn.execute(sql, (actor,)).fetchone()
         result["feature_enabled"] = owner or bool(current_actor and current_actor["broadcast_enabled"])
         _selected_cm(actor, cm_id, owner)
@@ -697,43 +692,3 @@ def preview(actor_id, cm_id, purpose, selections, message, mention):
                 "message": message, "purpose": purpose, "selected_cm_id": "all" if cm is None else str(cm),
                 "mode": "people", "mention_all": False,
                 "preview_only": True, "can_send": False, "blocked_reason": BLOCKED_REASON}
-
-
-if __name__ == "__main__":
-    sample = [{"id": "p1", "name": "Ava Collins", "handles": ["demo_ava", "demo_ava_backup"]},
-              {"id": "p2", "name": "Ben Carter", "handles": ["demo_ben"]},
-              {"id": "p3", "name": "Ben Carter", "handles": ["demo_ben_live"]},
-              {"id": "p4", "name": "Demo Ava", "handles": ["shared_demo"], "aliases": ["Ava Collins", "Demo"]},
-              {"id": "p5", "name": "Other Ava", "handles": ["shared_demo", "demo"]}]
-    entries, duplicates = _match_entries("@DEMO_AVA\nhttps://tiktok.com/@demo_ava\nBen Carter\nAva", sample)
-    assert duplicates == 1 and len(entries) == 3
-    assert entries[0]["person"]["id"] == "p1"
-    assert entries[1]["person"] is None and len(entries[1]["candidates"]) == 2
-    assert entries[2]["person"] is None and entries[2]["approximate"]
-    assert _match_entries("https://tiktok.com.evil.test/@demo_ava", sample)[0][0]["candidates"] == []
-    alias = _match_entries("Ａｖａ　Ｃｏｌｌｉｎｓ", sample)[0][0]
-    assert alias["person"] is None and {p["id"] for p in alias["candidates"]} == {"p1", "p4"}
-    shared = _match_entries("@shared_demo", sample)[0][0]
-    assert shared["person"] is None and {p["id"] for p in shared["candidates"]} == {"p4", "p5"}
-    approximate = _match_entries("dem", sample)[0][0]
-    assert approximate["person"] is None and {p["id"] for p in approximate["candidates"]} >= {"p4", "p5"}
-    try:
-        _match_entries("name\n" * 501, sample)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("oversized input accepted")
-    contact = "00000000-0000-0000-0000-000000000001"
-    target = {"contact_id": contact, "chat_id": "demo-fixed"}
-    assert _targets([target, target], one_per_contact=True) == [(contact, "demo-fixed")]
-    try:
-        _targets([target, {**target, "chat_id": "demo-other"}], one_per_contact=True)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("multiple target groups accepted in a static list")
-    revoked_scope = _resolve(None, contact, "support", [contact], [target], "CM 授权已失效")
-    assert revoked_scope["entries"][0]["person"] is None and not revoked_scope["entries"][0]["selected"]
-    assert revoked_scope["routes"] == [{"contact_id": contact, "chat_id": ""}]
-    assert len(revoked_scope["issues"]) == 1 and not revoked_scope["can_send"]
-    print("Creator broadcast matching/list check passed; no database or API accessed.")

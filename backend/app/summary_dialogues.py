@@ -776,9 +776,9 @@ def _store_receipt(job, settings, checkpoint, response, *, reply=False, received
         raise core.SummaryInputError("任务已失效；已保留调用用量。")
 
 
-def _check_merge_access(conn, run, job, messages):
+def _check_merge_access(conn, run, job, messages, *, actor_id=None):
     """Recheck live grants and cited rows, not decrypt all conversations a third time."""
-    core._authorize_run(conn, run, executing=True)
+    core._authorize_run(conn, run, actor_id=actor_id, executing=actor_id is None)
     if not any(row["contact_id"] == job["contact_id"]
                for row in core._roster(conn, run["responsible_authorization_id"])):
         raise core.SummaryInputError("达人归属已变化。")

@@ -3,7 +3,6 @@
 import asyncio
 import json
 from contextlib import contextmanager, nullcontext
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -473,7 +472,7 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
     other = uuid4()
     baseline = ("offline_access", "im:chat:read", "im:message:readonly")
     required = (*baseline, "im:message", "im:message.send_as_user")
-    settings = SimpleNamespace(oauth_scopes=baseline, token_encryption_key=b"p" * 32, broadcast_preview_until=None)
+    settings = SimpleNamespace(oauth_scopes=baseline, token_encryption_key=b"p" * 32)
     cipher = TokenCipher(settings.token_encryption_key)
     for account, open_id, token, scopes in ((actor["id"], "ou_owner", "fixture-owner", required),
                                            (other, "ou_other", "fixture-other", ())):
@@ -725,27 +724,6 @@ def test_broadcast_permission_workflow_checks_real_account_without_sending(pg, m
     assert ordinary.get("/creators/broadcast", follow_redirects=False).status_code == 403
     assert ordinary.post(url, json={"cm_id": "all"}, headers=headers).status_code == 403
 
-    # The temporary demo opens only the logged-in CM's editor; it does not enable delivery.
-    settings.broadcast_preview_until = datetime.now(UTC) + timedelta(hours=1)
-    ordinary_actor["status"] = "active"
-    pg.execute("UPDATE authorizations SET scopes=%s WHERE id=%s", (list(baseline), other))
-    assert ordinary.get("/creators/broadcast").status_code == 200
-    assert creator_broadcast.page_data(other)["demo_preview"]
-    assert creator_broadcast.page_data(other)["templates"][0]["id"] == str(foreign_template)
-    assert client.post("/creators/broadcast/templates/save", json=dict(draft, id=str(foreign_template), revision=1),
-                       headers=headers).status_code == 404
-    assert ordinary.post("/creators/broadcast/groups", json=dict(own_fields, cm_id=str(actor["id"])),
-                         headers=headers).status_code == 403
-    blocked_demo = ordinary.post("/creators/broadcast/prepare", json=dict(send_fields, cm_id=str(other)),
-                                 headers=headers)
-    assert blocked_demo.status_code == 403 and "authorization_url" not in blocked_demo.json()
-    pg.execute("UPDATE authorizations SET scopes='{}' WHERE id=%s", (other,))
-    assert ordinary.get("/creators/broadcast").status_code == 403  # Baseline consent still matters.
-    pg.execute("UPDATE authorizations SET scopes=%s,status='revoked' WHERE id=%s", (list(required), other))
-    assert ordinary.get("/creators/broadcast").status_code == 403
-    pg.execute("UPDATE authorizations SET status='active' WHERE id=%s", (other,))
-    settings.broadcast_preview_until = datetime.now(UTC) - timedelta(seconds=1)
-    assert ordinary.get("/creators/broadcast").status_code == 403
     assert pg.execute("SELECT COUNT(*) n FROM creator_broadcast_batches").fetchone()["n"] == 0
 
 
@@ -754,7 +732,7 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
     baseline = ("offline_access", "im:chat:read", "im:message:readonly", "im:chat.members:read",
                 "contact:contact.base:readonly", "contact:user.base:readonly")
     required = (*baseline, *creator_broadcast.SEND_SCOPES)
-    settings = SimpleNamespace(oauth_scopes=baseline, broadcast_preview_until=None)
+    settings = SimpleNamespace(oauth_scopes=baseline)
     monkeypatch.setattr(creator_broadcast, "get_settings", lambda: settings)
     p1, p2, other_cm = map(str, (uuid4(), uuid4(), uuid4()))
     people = [{"id": p1, "name": "Example One", "handles": ["example_one", "example_backup"]},
@@ -1229,3 +1207,34 @@ def test_excel_upload_is_bounded_scoped_and_requires_explicit_start_and_confirma
     revoked, _ = browser(monkeypatch, active=False)
     assert revoked.get(f"/creators/imports/rows/{row}/evidence").status_code == 403
     assert revoked.post(f"/creators/imports/{batch}/recheck", data={"csrf_token": "csrf"}).status_code == 403
+
+
+def test_broadcast_recipient_matching_deduplicates_without_guessing_ambiguous_or_revoked_targets():
+    sample = [{"id": "p1", "name": "Ava Collins", "handles": ["demo_ava", "demo_ava_backup"]},
+              {"id": "p2", "name": "Ben Carter", "handles": ["demo_ben"]},
+              {"id": "p3", "name": "Ben Carter", "handles": ["demo_ben_live"]},
+              {"id": "p4", "name": "Demo Ava", "handles": ["shared_demo"], "aliases": ["Ava Collins", "Demo"]},
+              {"id": "p5", "name": "Other Ava", "handles": ["shared_demo", "demo"]}]
+    entries, duplicates = creator_broadcast._match_entries(
+        "@DEMO_AVA\nhttps://tiktok.com/@demo_ava\nBen Carter\nAva", sample)
+    assert duplicates == 1 and len(entries) == 3
+    assert entries[0]["person"]["id"] == "p1"
+    assert entries[1]["person"] is None and len(entries[1]["candidates"]) == 2
+    assert entries[2]["person"] is None and entries[2]["approximate"]
+    for query, ids in (("Ａｖａ　Ｃｏｌｌｉｎｓ", {"p1", "p4"}), ("@shared_demo", {"p4", "p5"})):
+        result = creator_broadcast._match_entries(query, sample)[0][0]
+        assert result["person"] is None and {p["id"] for p in result["candidates"]} == ids
+    approximate = creator_broadcast._match_entries("dem", sample)[0][0]
+    assert approximate["person"] is None and {p["id"] for p in approximate["candidates"]} >= {"p4", "p5"}
+    assert creator_broadcast._match_entries("https://tiktok.com.evil.test/@demo_ava", sample)[0][0]["candidates"] == []
+    with pytest.raises(ValueError):
+        creator_broadcast._match_entries("name\n" * 501, sample)
+    contact = "00000000-0000-0000-0000-000000000001"
+    target = {"contact_id": contact, "chat_id": "demo-fixed"}
+    assert creator_broadcast._targets([target, target], one_per_contact=True) == [(contact, "demo-fixed")]
+    with pytest.raises(ValueError):
+        creator_broadcast._targets([target, {**target, "chat_id": "demo-other"}], one_per_contact=True)
+    revoked = creator_broadcast._resolve(None, contact, "support", [contact], [target], "CM 授权已失效")
+    assert revoked["entries"][0]["person"] is None and not revoked["entries"][0]["selected"]
+    assert revoked["routes"] == [{"contact_id": contact, "chat_id": ""}]
+    assert len(revoked["issues"]) == 1 and not revoked["can_send"]

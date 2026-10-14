@@ -58,13 +58,10 @@ def main():
             with conn.transaction():
                 # Do not reverse the worker's config-before-admission lock order.
                 current = matching._config(conn)
-                current_handles, current_version = matching.reference_catalog()
                 if (
                     not current
                     or current["enabled"]
                     or matching._config_hash(current) != matching._config_hash(config)
-                    or current_version != version
-                    or not matching._catalog_matches(pack, current_handles)
                     or not matching.evidence.still_valid(conn, refs, settings)
                     or not pack["creator_known"]
                     or not conn.execute(
@@ -100,17 +97,14 @@ def main():
                         (usage["input_tokens"] + usage["output_tokens"], reservation),
                     )
             # Commit paid-call diagnostics before fallible eligibility checks.
-            # A catalog/database failure must not erase the known usage.
+            # A source/database failure must not erase the known usage.
             with conn.transaction():
                 conn.execute("SET TRANSACTION READ ONLY")
                 current = matching._config(conn)
-                current_handles, current_version = matching.reference_catalog()
                 fresh = bool(
                     current
                     and not current["enabled"]
                     and matching._config_hash(current) == matching._config_hash(config)
-                    and current_version == version
-                    and matching._catalog_matches(pack, current_handles)
                     and matching.evidence.still_valid(conn, refs, settings)
                     and conn.execute(
                         "SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed'",

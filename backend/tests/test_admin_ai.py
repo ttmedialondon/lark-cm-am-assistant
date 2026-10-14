@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from app import admin, admin_permissions, admin_reporting, ai_feature_config, assistant_rules
-from app import creator_handle_matching_routes as matching_routes
+from app import creator_matching_routes as matching_routes
 
 
 @pytest.fixture(autouse=True)
@@ -298,9 +298,10 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     client, path = TestClient(app), "/admin/assistant-rules"
     pinned = assistant_rules.snapshot(pg, settings)
     defaults = assistant_rules.builtin_snapshot()
-    assert pinned["protocol"] == 2 and len(pinned["documents"]) == 24 and len(pinned["catalog"]) == 15
-    assert len(assistant_rules.library(pg, settings)) == 34
+    assert pinned["protocol"] == 2
     backend_keys = assistant_rules.EVENT_KEYS | assistant_rules.CREATOR_KEYS
+    assert backend_keys <= assistant_rules.library(pg, settings).keys()
+    assert {item["key"] for item in pinned["catalog"]} <= pinned["documents"].keys()
     for owner_scope in (False, True):
         navigation = assistant_rules.snapshot(pg, settings, owner=owner_scope)
         assert not backend_keys.intersection(navigation["documents"])
@@ -558,7 +559,8 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     assert client.post(path, data=event_form).status_code == 403
     assert client.post(path, data=creator_form).status_code == 403
     with pg.transaction(), pytest.raises(PermissionError):
-        assistant_rules.save_override(pg, settings, owner, "core", content, 1)
+        assistant_rules.save_document(pg, settings, owner, "core", core["title"], core["description"],
+            "rule", "published", "all", content, 1)
     with pg.transaction(), pytest.raises(PermissionError):
         assistant_rules.save_document(pg, settings, owner, creator_key, creator_document["title"],
             creator_document["description"], "manual", "published", "owner", creator_content, 4)
@@ -619,6 +621,7 @@ def test_matching_routes_recheck_live_owner_and_csrf_before_queue_writes(pg, mon
                             autoescape=select_autoescape(["html"]))
     app = FastAPI()
     app.include_router(matching_routes.create_router(
+        "handle",
         current_authorization=lambda _: session["auth"], csrf_token=lambda _: "csrf",
         render_template=lambda request, name, context, status_code=200: contexts.append(context) or HTMLResponse(
             templates.get_template(name).render(**context), status_code=status_code),

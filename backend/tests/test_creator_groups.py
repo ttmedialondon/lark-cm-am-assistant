@@ -15,7 +15,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from app import ai_dispatch, ai_feature_config, config
 from app import creator_group_evidence as evidence
 from app import creator_group_matching as matching
-from app import creator_group_routes as routes
+from app import creator_matching_routes as routes
 from app.crypto import message_body_cipher
 
 
@@ -477,6 +477,7 @@ def test_creator_group_queue_real_authorization_manual_lock_and_billing_fences(p
                             autoescape=select_autoescape(["html"]))
     app = FastAPI()
     app.include_router(routes.create_router(
+        "groups",
         current_authorization=lambda _: actor,
         render_template=lambda request, name, context, status_code=200: HTMLResponse(
             templates.get_template(name).render(**context), status_code=status_code),

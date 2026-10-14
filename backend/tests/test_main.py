@@ -9,7 +9,6 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from starlette.requests import Request
-from test_identity_names import pg  # noqa: F401
 
 from app import main
 from app.config import Settings
@@ -89,7 +88,6 @@ def test_session_touch_is_throttled_without_caching_revocation(pg, monkeypatch):
 
 
 def test_dashboard_navigation_preserves_access_and_connection_controls(monkeypatch) -> None:
-    monkeypatch.setattr(main.creator_broadcast, "preview_open", lambda: False)
     monkeypatch.setattr(main, "connection", lambda: nullcontext(None))
     monkeypatch.setattr(main.assistant, "configured", lambda _: True)
     monkeypatch.setattr(main, "_admin_csrf_token", lambda _: "fixture-csrf")
@@ -127,9 +125,6 @@ def test_dashboard_navigation_preserves_access_and_connection_controls(monkeypat
         **admin_context, 'admin_role': 'member',
     }).body.decode()
     assert 'id="operations-assistant"' not in member_page
-    monkeypatch.setattr(main.creator_broadcast, "preview_open", lambda: True)
-    demo = main._template(request, "dashboard.html", context).body.decode()
-    assert 'href="/creators/broadcast"' in demo and 'href="/admin"' not in demo
     restricted = main._template(request, "dashboard.html", {
         **context, "authorization": {**authorization, "body_consent_at": None},
         "body_consent": False, "offhours_summary_visible": False,

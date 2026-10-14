@@ -14,7 +14,6 @@ import pytest
 from psycopg import sql
 from psycopg.rows import dict_row
 from starlette.requests import Request
-from test_identity_names import pg  # noqa: F401
 
 from app import main, summary_dialogues, worker
 from app.ai_feature_config import api_key_cipher

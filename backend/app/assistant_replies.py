@@ -34,9 +34,7 @@ def material(conn, actor_id, context, source, settings, *, cutoff=None, read_cac
         target = data["message"]
         text = target.get("text", "").replace("[未解析的@用户]", "").strip()
         if not text or text in {"[附件或正文不可读取，需人工查看原消息]", "[正文不可读取，需人工查看原消息]"}:
-            raise ValueError("这条消息没有可读取的文字，请选择文字消息。")
-        if target.get("message_type") not in (None, "text", "post"):
-            raise ValueError("请先选择有可读取文字的消息。")
+            raise ValueError("这条消息没有可读取的文字，请选择已解析的消息。")
         messages, gaps = data["messages"], data["gaps"]
         title = target.get("text", "")[:240]
         scope = data["scope"]

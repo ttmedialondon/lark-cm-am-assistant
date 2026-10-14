@@ -5,7 +5,6 @@ import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
-from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from threading import Barrier
 from types import SimpleNamespace
@@ -129,27 +128,19 @@ def test_confirmed_delivery_is_scoped_idempotent_and_recoverable(pg, monkeypatch
         "selections": [{"chat_id": chat} for chat in ("oc_a", "oc_b", "oc_c")],
     }
 
-    # A temporary preview window grants only baseline-scoped reads, never sending.
+    # Feature access and send authorization are separate grants.
     pg.execute(
         "UPDATE authorizations SET broadcast_enabled=FALSE,scopes=%s WHERE id=%s", (list(settings.oauth_scopes), other)
     )
-    settings.broadcast_preview_until = datetime.now(UTC) + timedelta(minutes=1)
-    assert creator_broadcast.preview_open()
-    assert creator_broadcast._require_broadcast_grant(pg, other) is False
-    assert delivery.history(other) == {"batches": []}
-    with pytest.raises(PermissionError):
-        delivery.prepare(other, {**fields, "cm_id": str(other)})
-    pg.execute("UPDATE authorizations SET broadcast_enabled=TRUE WHERE id=%s", (other,))
-    with pytest.raises(creator_broadcast.BroadcastAuthorizationRequired):
-        delivery.prepare(other, {**fields, "cm_id": str(other)})
-    pg.execute("UPDATE authorizations SET broadcast_enabled=FALSE WHERE id=%s", (other,))
-    settings.broadcast_preview_until = datetime.now(UTC) - timedelta(seconds=1)
-    assert not creator_broadcast.preview_open()
     with pytest.raises(PermissionError):
         creator_broadcast._require_broadcast_grant(pg, other)
     with pytest.raises(PermissionError):
         delivery.history(other)
-    settings.broadcast_preview_until = None
+    pg.execute("UPDATE authorizations SET broadcast_enabled=TRUE WHERE id=%s", (other,))
+    assert creator_broadcast._require_broadcast_grant(pg, other) is False
+    assert delivery.history(other) == {"batches": []}
+    with pytest.raises(creator_broadcast.BroadcastAuthorizationRequired):
+        delivery.prepare(other, {**fields, "cm_id": str(other)})
     pg.execute(
         "UPDATE authorizations SET broadcast_enabled=TRUE,scopes=%s WHERE id=%s",
         ([*settings.oauth_scopes, *creator_broadcast.SEND_SCOPES], other),

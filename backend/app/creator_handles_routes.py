@@ -240,8 +240,7 @@ def create_router(*, current_authorization, render_template, csrf_token):
             auth = actor(auth)
             data = creator_roster.page_data(auth["id"], cm_id=cm_id, tab=tab, query=q[:120], page=max(1, page),
                                            sort=sort, tier=tier)
-            data["can_broadcast"] = bool(auth.get("broadcast_enabled") or data["can_view_unassigned"]
-                                         or creator_broadcast.preview_open())
+            data["can_broadcast"] = bool(auth.get("broadcast_enabled") or data["can_view_unassigned"])
             if request.url.path.endswith("/data"):
                 return payload(data)
             return secure(render_template(request, "creator_handles.html", {

@@ -68,10 +68,6 @@ def reference_catalog():
         return frozenset(), "unavailable"
 
 
-def _catalog_matches(pack, handles):
-    return all(h["catalog_verified"] == (h["handle"] in handles) for h in pack["handles"])
-
-
 @lru_cache(maxsize=2)
 def _load_catalog(directory, _modified):
     root = Path(directory)
@@ -96,7 +92,7 @@ def _load_catalog(directory, _modified):
 def _config(conn, *, lock=False):
     return conn.execute(
         """SELECT provider,project_id,model,enabled,api_key_ciphertext,updated_at,
-        matching_catalog_version,auto_confirm_threshold,creator_recognition_started_at,
+        auto_confirm_threshold,creator_recognition_started_at,
         automatic_queue_checked_at<NOW()-INTERVAL '1 minute' AS reconcile_due
         FROM ai_feature_configs WHERE feature=%s"""
         + (" FOR UPDATE" if lock else ""),
@@ -257,16 +253,6 @@ def prepare_next(settings):
         _recover(conn)
         # Trigger is primary. This low-frequency indexed check covers clients that predate the hook.
         if config["reconcile_due"]:
-            _, catalog_version = reference_catalog()
-            if catalog_version and catalog_version != config["matching_catalog_version"]:
-                # Reprepare only previously enrolled contacts; unchanged selected evidence is cached.
-                conn.execute("""SELECT enqueue_creator_handle(contact_id,'incremental',TRUE)
-                    FROM (SELECT DISTINCT contact_id FROM creator_handle_jobs WHERE status<>'cancelled'
-                      AND (catalog_version IS NOT NULL OR reason_code='catalog_unavailable')) enrolled""")
-                conn.execute(
-                    "UPDATE ai_feature_configs SET matching_catalog_version=%s WHERE feature=%s",
-                    (catalog_version, FEATURE),
-                )
             conn.execute(
                 """SELECT enqueue_creator_handle(r.contact_id,'incremental',TRUE)
                 FROM contact_roles r WHERE r.role='creator' AND r.status='confirmed'
@@ -414,7 +400,6 @@ def prepare_next(settings):
                 cached["stats"],
                 prepared["refs"],
                 settings,
-                catalog_version,
             )
             if cached["stats"] is None:
                 _invalidate(conn, current)
@@ -514,7 +499,7 @@ def auto_link_eligible(pack, link, stats):
     return isinstance(omitted, list) and handle not in omitted
 
 
-def _apply_links(conn, job, pack, result, stats, refs, settings, catalog_version):
+def _apply_links(conn, job, pack, result, stats, refs, settings):
     """Add only verified self-account links; preserve all existing human decisions."""
     by_handle = {h["id"]: h["handle"] for h in pack["handles"]}
     claims = [
@@ -527,9 +512,6 @@ def _apply_links(conn, job, pack, result, stats, refs, settings, catalog_version
     if claimed:
         conn.execute("SELECT id FROM contacts WHERE id=%s FOR UPDATE", (job["contact_id"],))
         # Locks may have waited: recheck reference facts, authorization and identity.
-        current_handles, version = reference_catalog()
-        if version != catalog_version or not _catalog_matches(pack, current_handles):
-            return None
         if (
             not evidence.still_valid(conn, refs, settings)
             or not conn.execute(
@@ -637,7 +619,7 @@ def _apply_links(conn, job, pack, result, stats, refs, settings, catalog_version
     }
 
 
-def _apply_result(conn, job, pack, result, stats, refs, settings, catalog_version):
+def _apply_result(conn, job, pack, result, stats, refs, settings):
     with conn.transaction() as admission:
         _manual_access(conn, pack)
         if job.get('purpose') == 'identity':
@@ -650,7 +632,7 @@ def _apply_result(conn, job, pack, result, stats, refs, settings, catalog_versio
             if not admitted:
                 return {**stats, 'claimed_handles': [], 'auto_linked_handles': []}
             pack = {**pack, 'creator_known': True}
-        applied = _apply_links(conn, job, pack, result, stats, refs, settings, catalog_version)
+        applied = _apply_links(conn, job, pack, result, stats, refs, settings)
         if applied is None:
             raise Rollback(admission)
         return applied
@@ -871,12 +853,7 @@ def run(job, settings):
             conn.execute("UPDATE creator_handle_requests SET billed_tokens=0 WHERE id=%s", (job["reservation_id"],))
             return
     result, telemetry, error, diagnostic = None, {}, None, None
-    network_started = False
     try:
-        handles, version = reference_catalog()
-        if version != job["catalog_version"] or not _catalog_matches(job["pack"], handles):
-            raise ValueError("catalog_changed")
-        network_started = True
         result, telemetry, error, diagnostic = review(job["pack"], job["config"], job["contact_id"], settings)
     except Exception as exc:
         error = exc
@@ -888,9 +865,7 @@ def run(job, settings):
         usage = telemetry.get("usage", {})
         input_tokens = int(usage.get("input_tokens", telemetry.get("input_tokens", 0)) or 0)
         output_tokens = int(usage.get("output_tokens", telemetry.get("output_tokens", 0)) or 0)
-        if not network_started:
-            conn.execute("UPDATE creator_handle_requests SET billed_tokens=0 WHERE id=%s", (job["reservation_id"],))
-        elif usage.get("input_tokens") is not None and usage.get("output_tokens") is not None:
+        if usage.get("input_tokens") is not None and usage.get("output_tokens") is not None:
             conn.execute(
                 "UPDATE creator_handle_requests SET billed_tokens=%s WHERE id=%s",
                 (input_tokens + output_tokens, job["reservation_id"]),
@@ -913,11 +888,6 @@ def run(job, settings):
         if not current:
             return
         if not evidence.still_valid(conn, current["refs"], settings):
-            _invalidate(conn, current)
-            return
-        current_handles, version = reference_catalog()
-        catalog_valid = version == job["catalog_version"] and _catalog_matches(job["pack"], current_handles)
-        if not catalog_valid or (isinstance(error, ValueError) and str(error) == "catalog_changed"):
             _invalidate(conn, current)
             return
         if error:
@@ -949,7 +919,6 @@ def run(job, settings):
                 current["stats"],
                 current["refs"],
                 settings,
-                job["catalog_version"],
             )
             if stats is None:
                 _invalidate(conn, current)
@@ -1012,7 +981,6 @@ def page_data(conn, actor, settings, page=1):
         ((page - 1) * 50,),
     ).fetchall()
     storage = creator_data.cipher(settings)
-    _, version = reference_catalog()
     associations = {}
     for row in contact_handles.confirmed_pairs(conn, [j["contact_id"] for j in jobs]):
         associations.setdefault(str(row["contact_id"]), []).append(
@@ -1027,7 +995,6 @@ def page_data(conn, actor, settings, page=1):
             job["validation_error"] = None
         if (
             not reused and job["result_ciphertext"]
-            and job["catalog_version"] == version
             and evidence.still_valid(conn, job["refs"], settings, ciphertext_only=not access["is_owner"])
         ):
             view = json.loads(storage.decrypt(job["result_ciphertext"]))

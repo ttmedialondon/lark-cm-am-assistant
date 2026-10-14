@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import os
 from dataclasses import dataclass
-from datetime import datetime
 from functools import lru_cache
 
 
@@ -72,7 +71,6 @@ class Settings:
     lark_sync_requests_per_second: int = 10
     lark_sync_per_authorization_max_inflight: int = 2
     lark_member_snapshot_max_inflight: int = 1
-    broadcast_preview_until: datetime | None = None
     broadcast_image_dir: str = "/var/lib/lark-message-stats/broadcast-images"
 
     @property
@@ -82,13 +80,6 @@ class Settings:
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    preview_until = os.environ.get("BROADCAST_PREVIEW_UNTIL", "").strip()
-    try:
-        preview_until = datetime.fromisoformat(preview_until) if preview_until else None
-    except ValueError as exc:
-        raise RuntimeError("BROADCAST_PREVIEW_UNTIL must be an ISO timestamp") from exc
-    if preview_until is not None and preview_until.utcoffset() is None:
-        raise RuntimeError("BROADCAST_PREVIEW_UNTIL must include a timezone")
     return Settings(
         database_url=_required("DATABASE_URL"),
         lark_app_id=_required("LARK_APP_ID"),
@@ -127,7 +118,6 @@ def get_settings() -> Settings:
             "LARK_SYNC_PER_AUTHORIZATION_MAX_INFLIGHT", 2, 1
         ),
         lark_member_snapshot_max_inflight=_positive_int("LARK_MEMBER_SNAPSHOT_MAX_INFLIGHT", 1, 1),
-        broadcast_preview_until=preview_until,
         broadcast_image_dir=os.environ.get(
             "BROADCAST_IMAGE_DIR", "/var/lib/lark-message-stats/broadcast-images"
         ).strip(),

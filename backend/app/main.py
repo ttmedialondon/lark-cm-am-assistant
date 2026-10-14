@@ -28,11 +28,8 @@ from . import (
     assistant,
     assistant_routes,
     creator_access,
-    creator_broadcast,
-    creator_group_routes,
-    creator_handle_matching_routes,
     creator_handles_routes,
-    creator_responsibility_routes,
+    creator_matching_routes,
     desktop_auth_routes,
     desktop_reply_routes,
     offhours_summary_routes,
@@ -72,9 +69,7 @@ def _template(request: Request, name: str, context: dict[str, Any], status_code:
                      or context.get("broadcast_data", {}).get("can_select_cm"))
         active = authorization["status"] == "active"
         context = {**context, "business_nav": {
-            "can_broadcast": active and (owner or bool(authorization.get("broadcast_enabled"))
-                                         or (bool(authorization.get("body_consent_at"))
-                                             and creator_broadcast.preview_open())),
+            "can_broadcast": active and (owner or bool(authorization.get("broadcast_enabled"))),
             "can_summary": context.get("offhours_summary_visible", active and (
                 bool(authorization.get("body_consent_at")) or owner
                 or _is_remi_tester(authorization, {"is_owner": owner})
@@ -754,15 +749,10 @@ app.include_router(assistant_routes.create_router(
 app.include_router(creator_handles_routes.create_router(
     current_authorization=_current_authorization, render_template=_template, csrf_token=_admin_csrf_token,
 ))
-app.include_router(creator_handle_matching_routes.create_router(
-    current_authorization=_current_authorization,render_template=_template,csrf_token=_admin_csrf_token,
-))
-app.include_router(creator_responsibility_routes.create_router(
-    current_authorization=_current_authorization, render_template=_template, csrf_token=_admin_csrf_token,
-))
-app.include_router(creator_group_routes.create_router(
-    current_authorization=_current_authorization, render_template=_template, csrf_token=_admin_csrf_token,
-))
+for feature in ("handle", "responsibility", "groups"):
+    app.include_router(creator_matching_routes.create_router(
+        feature, current_authorization=_current_authorization, render_template=_template, csrf_token=_admin_csrf_token,
+    ))
 app.include_router(desktop_reply_routes.create_router(
     current_authorization=_current_authorization, csrf_token=_admin_csrf_token,
 ))

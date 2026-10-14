@@ -4,7 +4,7 @@ TT Media 内部工作台：同步已授权的 Lark 消息，管理已确认达�
 
 ## 从哪里看
 
-- 产品和开发都从 [文档总入口](docs/README.md) 开始：当前只维护三份业务规则和一份技术说明。
+- 产品和开发都从 [文档总入口](docs/README.md) 开始：业务规则和技术说明集中维护。
 - [本地开发](backend/README.md) · [部署与回退](docs/runbooks/deploy-mvp.md) · [AI 协作约定](AGENTS.md)。
 - 身份、账号、负责人和群用途分别管理；不再使用 CAP/非 CAP 分类，也不恢复旧三阶段泛扫描。
 - 各 AI 功能独立配置，启用状态以线上配置为准；发布不自动开关功能或重跑历史。人工关系与原始数据保留。
@@ -19,7 +19,7 @@ TT Media 内部工作台：同步已授权的 Lark 消息，管理已确认达�
 | `infra/` | Caddy 与 systemd 配置 |
 | `docs/` | 当前规则、工程手册、明确标注日期的历史记录 |
 
-网页使用服务端模板，不是独立 React 工作台。桌面客户端在独立的 `lark-reply-assistant-desktop` 仓库，使用 Electron、React 和原生采集助手；长期知识库及无人值守自动回复不属于已交付能力。
+网页使用服务端模板，不是独立 React 工作台。桌面客户端在独立的 `lark-reply-assistant-desktop` 仓库，使用 Electron、React 和原生采集助手；无人值守自动发送尚未开放。
 
 ## 工程底线
 
