@@ -392,6 +392,9 @@ def test_selected_event_requires_selection_evidence_not_only_visible_tail(api, m
 
     api.state.output = model_response("Could you send the order number so I can check the exchange?",
                                       refs=["S2", "C1"])
+    without_commentary = json.loads(api.state.output['text'])
+    without_commentary['explanation'] = ''
+    api.state.output['text'] = json.dumps(without_commentary)
     submitted["request_id"] = str(uuid4())
     assert api.client.post(PATH, json=submitted, headers=api.headers).status_code == 200
 

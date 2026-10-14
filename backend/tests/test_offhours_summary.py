@@ -2268,7 +2268,10 @@ def test_assistant_window_uses_cm_identity_separate_switch_and_frozen_cutoff(pg,
     assert ai.ensure_assistant_run(pg, s.ids["cm"], turn, s.ids["cm"], s.start, s.end,
                                    [s.ids["person"]], s.settings)["run"]["id"] == run_id
     s.add("after-assistant", who="cm", text="This arrived after the fixed request cutoff",
-          at=turn["created_at"] + timedelta(seconds=1))
+          at=s.end - timedelta(minutes=1))
+    unfrozen = ai._load_chat(pg, stored_run, 'chat', s.end, settings=s.settings)
+    assert any(message['message_id'] == 'after-assistant' and message['in_window']
+               for message in unfrozen['pack']['messages'])
     assert ai.prepare_next_summary(s.settings)
     ai._stop_tasks(pg, "old function stopped")
     assert pg.execute("SELECT status FROM offhours_summary_tasks WHERE run_id=%s AND is_current",

@@ -17,7 +17,7 @@ style_refs 只选择负责 CM 对当前对象的自然表达，近期且相近�
 - verify：对应关系不清、关键冲突、必要附件未读，或回答依赖未确认内部结果。告知 CM 核实什么，不生成可发送稿，不把内部核查转给达人。
 - ready：有明确未回答诉求且可基于证据回应，或只缺对方尚未提供、未问过的必要信息。
 
-仅 ready 有 draft 和 chinese_translation；其他状态两者为空。sync_gaps 非空必须 verify，不假装已全面核对。引用本轮真实事件证据，不引用仅 style_only 的样例。遵守 draft_request 的语言和起草要求，但不能因此编造事实或扩大权限。
+仅 ready 有 draft 和 chinese_translation；其他状态两者为空。explanation 简短说明具体判断依据，不留空；checks 无实际待核实项时返回空数组。sync_gaps 非空必须 verify，不假装已全面核对。引用本轮真实事件证据，不引用仅 style_only 的样例。遵守 draft_request 的语言和起草要求，但不能因此编造事实或扩大权限。
 
 ## 翻译
 

@@ -173,8 +173,6 @@ async def generate(payload, actor, config, api_key, *, total_timeout, settings, 
             raise ValueError
         if any(not isinstance(ref, str) or ref not in refs for ref in result["evidence_refs"]):
             raise ValueError
-        if not result["explanation"].strip():
-            raise ValueError
         if result["outcome"] == "verify":
             if result["draft"] or result["chinese_translation"] or result["context_reason"] not in CONTEXT_MESSAGES:
                 raise ValueError
