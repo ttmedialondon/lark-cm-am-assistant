@@ -48,6 +48,7 @@ REASONS = {
     "group_unavailable": "对应群当前不可访问，请检查授权。",
     "no_readable_material": "负责人当前没有有效的可读聊天授权。",
     "account_conflict": "存在账号归属或人员身份冲突，未覆盖原资料",
+    "rules_unavailable": "识别手册暂停，恢复发布后继续处理。",
 }
 BATCH_LABELS = {"preview": "待确认导入", "running": "正在识别", "paused": "已暂停", "completed": "识别完成"}
 PHASE_LABELS = {"group": "AI 找群", "person": "AI 找人", "completed": "已完成"}
@@ -246,8 +247,10 @@ def _admit(conn, row, actor, handle, contact_id, *, automatic=False):
         reviewed_by_authorization_id,reviewed_at,import_row_id)
         VALUES(%s,%s,'owner','confirmed',%s,%s,NOW(),%s)
         ON CONFLICT(contact_id,social_account_id,relationship) DO UPDATE SET
-            import_row_id=COALESCE(contact_social_accounts.import_row_id,EXCLUDED.import_row_id),updated_at=NOW()
-        WHERE contact_social_accounts.status='confirmed'""",
+            status='confirmed',source=EXCLUDED.source,
+            reviewed_by_authorization_id=EXCLUDED.reviewed_by_authorization_id,reviewed_at=EXCLUDED.reviewed_at,
+            import_row_id=EXCLUDED.import_row_id,updated_at=NOW()
+        WHERE contact_social_accounts.status NOT IN ('confirmed','rejected')""",
         (
             contact_id,
             account["id"],
@@ -266,9 +269,9 @@ def _admit(conn, row, actor, handle, contact_id, *, automatic=False):
             uuid4(),
             contact_id,
             row["cm_authorization_id"],
-            "ai" if automatic else "manual",
-            row.get("confidence") if automatic else None,
-            None if automatic else actor,
+            "manual",
+            None,
+            actor,
             row["id"],
             contact_id,
             row["cm_authorization_id"],
@@ -301,9 +304,8 @@ def _admit(conn, row, actor, handle, contact_id, *, automatic=False):
 def _record_roster_identity(conn, actor, contact_id, *, automatic=False):
     """Called only after account/person locks and all admission conflict checks."""
     if (
-        automatic
-        and conn.execute(
-            "SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed' AND is_primary",
+        conn.execute(
+            "SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed'",
             (contact_id,),
         ).fetchone()
     ):
@@ -904,7 +906,7 @@ def _settle(conn, batch_id):
         """UPDATE creator_import_batches b SET status='completed',updated_at=NOW()
         WHERE id=%s AND status='running' AND NOT EXISTS (SELECT 1 FROM creator_import_rows r
         WHERE r.batch_id=b.id AND r.review_status='pending'
-        AND r.status IN ('pending','preparing','queued','running'))""",
+        AND (r.status IN ('pending','preparing','queued','running') OR r.reason_code='rules_unavailable'))""",
         (batch_id,),
     )
 
@@ -963,20 +965,45 @@ def _selected_chats(chain, results):
     return creator_import_evidence.resolve_groups(chain["group"]["refs"], refs)
 
 
+def _rules_gate(conn, pinned, stage):
+    from . import assistant_rules
+
+    try:
+        assistant_rules.creator_validate_access(conn, pinned, stage)
+    except PermissionError as exc:
+        raise ValueError("rules_unavailable") from exc
+
+
 def _build_material(conn, settings, row, stage, chain, results):
+    from . import assistant_rules
+
     if stage == "group":
-        return creator_import_evidence.build_group_evidence(conn, settings, row["cm_authorization_id"], row["handle"])
-    return creator_import_evidence.build_person_evidence(
-        conn, settings, row["cm_authorization_id"], row["handle"], _selected_chats(chain, results)
-    )
+        material = creator_import_evidence.build_group_evidence(
+            conn, settings, row["cm_authorization_id"], row["handle"])
+    else:
+        material = creator_import_evidence.build_person_evidence(
+            conn, settings, row["cm_authorization_id"], row["handle"], _selected_chats(chain, results))
+    try:
+        pinned = (chain.get("group", {}).get("pack", {}).get("_rules")
+                  or assistant_rules.creator_snapshot(conn, settings))
+    except PermissionError as exc:
+        raise ValueError("rules_unavailable") from exc
+    material["pack"]["_rules"] = pinned
+    material["stats"]["rules_digest"] = pinned["digest"]
+    _rules_gate(conn, pinned, "prepare" if stage == "group" else "match")
+    return material
 
 
 def _valid_chain(conn, settings, row, chain, results, *, full=False):
     for stage, material in chain.items():
+        if material.get("pack", {}).get("_rules"):
+            _rules_gate(
+                conn, material["pack"]["_rules"], "prepare" if stage == "group" else "match")
         if not creator_import_evidence.validate_references(conn, settings, row["cm_authorization_id"], material):
             return False
         if (
             full
+            and material["pack"].get("policy_version") == creator_import_evidence.POLICY_VERSION
             and _build_material(conn, settings, row, stage, chain, results)["fingerprint"] != material["fingerprint"]
         ):
             return False
@@ -1021,8 +1048,9 @@ def prepare_next_import(settings):
             if chain and not _valid_chain(conn, settings, row, chain, results, full=True):
                 raise ValueError("authorization_changed")
             waiting_members = stage == "person" and conn.execute(
-                """SELECT 1 FROM authorization_chats WHERE authorization_id=%s
-                AND chat_id=ANY(%s::text[]) AND member_snapshot_status='pending' LIMIT 1""",
+                """SELECT 1 FROM authorization_chats ac JOIN chats c ON c.chat_id=ac.chat_id
+                WHERE ac.authorization_id=%s AND ac.chat_id=ANY(%s::text[])
+                AND COALESCE(c.chat_mode,'group')<>'p2p' AND ac.member_snapshot_status='pending' LIMIT 1""",
                 (row["cm_authorization_id"], _selected_chats(chain, results)),
             ).fetchone()
             if waiting_members:
@@ -1032,8 +1060,8 @@ def prepare_next_import(settings):
                 config = creator_data.config(conn)
                 reason = (material["reason_code"] if not material["eligible"]
                           else "" if config else "configuration_changed")
-    except (ValueError, PermissionError):
-        reason = "authorization_changed"
+    except (ValueError, PermissionError) as exc:
+        reason = str(exc) if str(exc) in REASONS else "authorization_changed"
     except Exception:
         LOGGER.error("creator import evidence preparation failed row=%s", row["id"])
         reason = "preparation_failed"
@@ -1123,6 +1151,15 @@ def claim_next_import():
             (POLICY_VERSION,),
         ).fetchone()
         if not row:
+            return None
+        try:
+            material = _decode(row, get_settings()).get(_stage(row), {})
+            pinned = material.get("pack", {}).get("_rules")
+            if pinned:
+                _rules_gate(conn, pinned, "prepare" if _stage(row) == "group" else "match")
+        except (ValueError, PermissionError):
+            conn.execute("UPDATE creator_import_rows SET status='invalid',reason_code='rules_unavailable',"
+                         "lease_until=NULL,updated_at=NOW() WHERE id=%s", (row["id"],))
             return None
         conn.execute(
             """UPDATE creator_import_rows SET status='running',attempts=attempts+1,
@@ -1215,9 +1252,33 @@ def _finish(job, settings, *, response=None, result=None, reason=""):
         matched = bool(result and not reason and result["outcome"] == "matched"
                        and result["confidence"] >= threshold)
         contact_id = None
-        if matched and stage == "person":
+        if result and not reason and stage == "person" and result.get("user_ref"):
             contact_id = creator_import_evidence.resolve_contact(chain["person"]["refs"], result.get("user_ref"))
-            matched = bool(contact_id and not result.get("conflicts"))
+            if (chain["person"]["pack"].get("policy_version") == creator_import_evidence.POLICY_VERSION
+                    and contact_id):
+                from .creator_handle_matching import confirm_identity
+
+                material = chain["person"]
+                pinned = material["pack"].get("_rules")
+                if pinned:
+                    _rules_gate(conn, pinned, "admit")
+                conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,137034))",
+                             ("tiktok:" + row["handle"],))
+                identity_confirmed = confirm_identity(
+                    conn, contact_id, result["creator"],
+                    creator_import_evidence.person_pack(material["pack"], result["user_ref"]),
+                    material["refs"], settings, threshold=threshold, job_id=row["id"], source="excel_ai_verified",
+                    live_valid=lambda: creator_import_evidence.validate_references(
+                        conn, settings, row["cm_authorization_id"], material))
+                if matched and not identity_confirmed:
+                    reason = "account_conflict"
+                    results[stage]["blocking_reasons"] = [*(result.get("blocking_reasons") or []),
+                                                          "当前人员身份不满足入库条件，未覆盖原有资料。"]
+                matched = matched and identity_confirmed
+                results[stage]["identity_confirmed"] = identity_confirmed
+                if not identity_confirmed:
+                    contact_id = None
+            matched = bool(matched and contact_id and not result.get("conflicts"))
         next_stage = "person" if matched and stage == "group" else "completed"
         status = "pending" if next_stage == "person" else "invalid" if reason else "succeeded"
         reason = reason or ("" if matched else (result or {}).get("reason_code") or f"{stage}_review")
@@ -1267,6 +1328,8 @@ def _finish(job, settings, *, response=None, result=None, reason=""):
 
 
 def run_claimed_import(job, settings):
+    from . import assistant_rules
+
     response = None
     try:
         with connection() as conn, conn.transaction():
@@ -1288,22 +1351,40 @@ def run_claimed_import(job, settings):
                 raise ValueError("configuration_changed")
             key = api_key_cipher(settings.token_encryption_key).decrypt(config["api_key_ciphertext"])
             pack = chain[_stage(row)]["pack"]
+            pinned = pack.get("_rules")
+            if pinned:
+                _rules_gate(
+                    conn, pinned, "prepare" if _stage(row) == "group" else "match")
             # Historical packs may contain retired classification metadata.
+            pack = {k: v for k, v in pack.items() if k != "_rules"}
             pack = {**pack, "roster": {"responsibility_confirmed": False, "purpose": "candidate_handles"},
                     "catalog_check": {"source": "curva", "status": "not_provided"}}
             conn.execute("UPDATE creator_import_rows SET api_requests=api_requests+1 WHERE id=%s", (row["id"],))
         group = _stage(job) == "group"
+        instructions = (creator_import_evidence.GROUP_INSTRUCTIONS if group
+                        else creator_import_evidence.PERSON_INSTRUCTIONS)
+        if pinned:
+            instructions = assistant_rules.creator_instructions(pinned, "prepare" if group else "match") + (
+                "\n本阶段按 imported_handle 选择群聊或私聊，仅完成会话定位，不判断成员身份。"
+                "matched逐一引用选中的G，非精确会话名必须同时引用对应M；review/not_found留空group_refs。"
+                if group else
+                "\n本阶段从全部eligible候选定位一个真实用户，身份和账号分别判断。"
+                "creator={state,code,confidence,refs}只判断所选用户本人达人业务；已有creator_known返回known。"
+                "link_code与evidence_refs只判断该人与imported_handle关系，支持self_claim/qa_confirm/own_page/"
+                "group_context。group_context需要精确固定合作群及本人真实业务，不要求自我介绍。"
+                "creator.refs及账号消息引用最多6条实际M；完整问答同时引用问题和本人回答。"
+                "matched只在唯一用户身份和账号均成立时使用。账号待定但身份明确，可review并保留user_ref及"
+                "独立creator结论；无法唯一定位时user_ref=null、creator=review/insufficient且refs=[]。"
+                "candidates覆盖所有eligible用户。名单负责人与扫描发现者不由模型确认。")
         response = openai_client.call_openai(
             config,
             key,
             pack,
             job["id"],
-            instructions=creator_import_evidence.GROUP_INSTRUCTIONS
+            instructions=instructions,
+            output_format=creator_import_evidence.group_output_format(pack)
             if group
-            else creator_import_evidence.PERSON_INSTRUCTIONS,
-            output_format=creator_import_evidence.group_output_format()
-            if group
-            else creator_import_evidence.person_output_format(),
+            else creator_import_evidence.person_output_format(pack),
             max_output_tokens=5000,
         )
         validator = creator_import_evidence.group_validate if group else creator_import_evidence.person_validate

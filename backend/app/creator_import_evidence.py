@@ -15,8 +15,9 @@ from . import handle_evidence as handles
 from .crypto import message_body_cipher
 from .message_mentions import mention_targets
 
-POLICY_VERSION = "creator-import-group-person-v5"
-PROMPT_VERSION = "creator-handle-research-v1.2"
+POLICY_VERSION = "creator-import-group-person-v6"
+LEGACY_POLICY_VERSION = "creator-import-group-person-v5"
+PROMPT_VERSION = "creator-recognition-manual-v1"
 MAX_GROUPS, MAX_USERS, MAX_MESSAGES, MAX_CHARS = 8, 80, 48, 20_000
 LOCAL_SEARCH_MESSAGES = 20_000
 HISTORY_SEARCH_MESSAGES = 200_000
@@ -34,15 +35,18 @@ def _scope(conn, cm_id):
         """SELECT a.open_id,a.display_name,a.body_consent_at,i.name,i.en_name,i.contact_id,
                   i.display_name AS identity_display_name FROM authorizations a
            LEFT JOIN lark_identities i ON i.open_id=a.open_id AND i.identity_type='user'
-           WHERE a.id=%s AND a.status='active' AND a.body_consent_at IS NOT NULL""", (cm_id,),
+           WHERE a.id=%s AND a.status='active' AND a.body_consent_at IS NOT NULL
+             AND """ + ownership.BODY_READ_SCOPE_SQL, (cm_id,),
     ).fetchone()
     chats = conn.execute(
-        """SELECT c.chat_id,c.name,ac.member_snapshot_status,ac.member_count,ac.member_count_status
+        """SELECT c.chat_id,c.name,c.chat_mode,ac.p2p_counterpart_open_id,
+                  CASE WHEN c.chat_mode='p2p' THEN 'succeeded' ELSE ac.member_snapshot_status END
+                    AS member_snapshot_status,ac.member_count,ac.member_count_status
            FROM authorizations a JOIN authorization_chats ac ON ac.authorization_id=a.id
            JOIN chats c ON c.chat_id=ac.chat_id
            WHERE a.id=%s AND a.status='active' AND a.body_consent_at IS NOT NULL
-             AND ac.is_visible AND ac.sync_enabled AND COALESCE(c.chat_status,'normal')='normal'
-             AND COALESCE(c.chat_mode,'group')<>'p2p' ORDER BY c.chat_id""", (cm_id,),
+             AND ac.is_visible AND ac.sync_enabled AND ac.sync_status IS DISTINCT FROM 'not_readable'
+             AND COALESCE(c.chat_status,'normal')='normal' ORDER BY c.chat_id""", (cm_id,),
     ).fetchall() if cm else []
     return cm, chats
 
@@ -100,6 +104,11 @@ def _population(conn, cm, chats, handle, stage, selected_rows=None):
     chat_ids = [chat['chat_id'] for chat in chats]
     members, observed = handles._members(conn, cm_id=cm['id'], chat_ids=chat_ids,
                                         aliases={cm['open_id']: 'CM1'}) if chats else ([], [])
+    for chat in chats:
+        counterpart = chat.get('p2p_counterpart_open_id')
+        if chat.get('chat_mode') == 'p2p' and counterpart and not any(
+                m['chat_id'] == chat['chat_id'] and m['open_id'] == counterpart for m in members):
+            members.append({'chat_id': chat['chat_id'], 'open_id': counterpart, 'member_type': 'user'})
     if stage == 'group':
         members = []  # Choosing a group does not depend on its changing silent-member roster.
         if selected_rows is not None:
@@ -131,7 +140,9 @@ def _population(conn, cm, chats, handle, stage, selected_rows=None):
             AND i.identity_type='user' AND i.tenant_classification='internal') AS protected_noncreator,
           EXISTS(SELECT 1 FROM contact_social_accounts l JOIN social_accounts s ON s.id=l.social_account_id
             WHERE l.contact_id=directory.contact_id AND l.relationship='owner' AND l.status='confirmed'
-              AND s.platform='tiktok' AND lower(s.normalized_handle)=%s) AS existing_handle_owner
+              AND s.platform='tiktok' AND lower(s.normalized_handle)=%s) AS existing_handle_owner,
+          EXISTS(SELECT 1 FROM contact_roles r WHERE r.contact_id=directory.contact_id
+              AND r.role='creator' AND r.status='confirmed') AS creator_known
           FROM directory WHERE contact_id=ANY(%s::uuid[]) ORDER BY contact_id""", (handle, contact_ids),
     ).fetchall() if contact_ids else []
     facts = {str(row['contact_id']): row for row in directory}
@@ -159,7 +170,8 @@ def _population(conn, cm, chats, handle, stage, selected_rows=None):
         sources = sorted({source for i in items for source in presence[i['open_id']]})
         users.append({'ref': label, 'known_category': category, 'category_source': fact.get('classification_source'),
                       'eligible': bool(contact_id and not excluded), 'exclusion_reason': reason,
-                      'membership_sources': sources, 'existing_handle_owner': bool(fact.get('existing_handle_owner'))})
+                      'membership_sources': sources, 'existing_handle_owner': bool(fact.get('existing_handle_owner')),
+                      'creator_known': bool(fact.get('creator_known'))})
         refs.append({'kind': 'person' if contact_id else 'unresolved_person', 'label': label,
                      'contact_id': contact_id, 'open_ids': [i['open_id'] for i in items],
                      'identity_hash': ownership._hash(items),
@@ -251,11 +263,56 @@ def _messages(conn, settings, cm, chats, population, handle, stage, selected_row
                 continue
             item = bucket[offset]
             key = (item['row']['chat_id'], item['row']['message_id'])
-            if key in seen or len(chosen) >= MAX_MESSAGES or chars + len(item['text']) > MAX_CHARS:
+            if (key in seen or len(chosen) >= (MAX_MESSAGES - 12 if stage == 'person' else MAX_MESSAGES)
+                    or chars + len(item['text']) > MAX_CHARS):
                 continue
             chosen.append(item)
             seen.add(key)
             chars += len(item['text'])
+    previous_ids, context_rows = {}, []
+    if stage == 'person' and chosen:
+        from .creator_handle_evidence import _previous_ids
+
+        all_rows = {(row['chat_id'], row['message_id']): row for row in rows}
+        private = {chat['chat_id'] for chat in chats if chat.get('chat_mode') == 'p2p'}
+        for _ in range(4):
+            previous_ids.update(_previous_ids(conn, [item['row'] for item in chosen]))
+            needed = {(item['row']['chat_id'], message_id)
+                      for item in chosen for message_id in [
+                          item['row'].get('parent_id'),
+                          previous_ids.get((item['row']['chat_id'], item['row']['message_id']))
+                          if item['row']['chat_id'] in private else None]
+                      if message_id and (item['row']['chat_id'], message_id) not in seen}
+            missing = needed - all_rows.keys()
+            if missing:
+                fetched = conn.execute(
+                    'SELECT ' + ownership._COLUMNS + ' ' + ownership._READABLE
+                    + ' AND m.chat_id=ANY(%s::text[]) AND m.message_id=ANY(%s::text[])',
+                    (cm['id'], sorted({key[0] for key in missing}), sorted({key[1] for key in missing})),
+                ).fetchall()
+                all_rows.update({(row['chat_id'], row['message_id']): row for row in fetched})
+                context_rows += fetched
+            added = False
+            for key in sorted(needed):
+                row = all_rows.get(key)
+                if not row or row['message_type'] not in {'text', 'post'} or len(chosen) >= MAX_MESSAGES:
+                    continue
+                raw = people._decrypt_body(cipher, row['body_ciphertext'])
+                body = handles._body(raw, row, aliases, population['names']).strip() if raw is not None else ''
+                if not body or '消息没有可展示的文本' in body or chars + len(body) > MAX_CHARS:
+                    continue
+                chosen.append({'row': row, 'text': body, 'speaker': aliases.get(row['sender_open_id'], 'other'),
+                               'target_refs': sorted({aliases[t['open_id']]
+                                   for t in mention_targets(row.get('mentions_json'))
+                                   if not t['ambiguous'] and t['open_id'] in aliases}),
+                               'speaker_is_staff': row['sender_open_id'] in population['staff'],
+                               'excerpted': False})
+                seen.add(key)
+                chars += len(body)
+                added = True
+            if not added:
+                break
+        previous_ids.update(_previous_ids(conn, [item['row'] for item in chosen]))
     group_labels = {chat['chat_id']: f'G{i}' for i, chat in enumerate(chats, 1)}
     messages, refs = [], []
     message_labels = {(item['row']['chat_id'], item['row']['message_id']): f'M{i}'
@@ -264,6 +321,8 @@ def _messages(conn, settings, cm, chats, population, handle, stage, selected_row
         row, label = item['row'], f'M{len(messages) + 1}'
         messages.append({'ref': label, 'group_ref': group_labels[row['chat_id']], 'speaker': item['speaker'],
                          'reply_to_ref': message_labels.get((row['chat_id'], row.get('parent_id'))),
+                         'previous_ref': message_labels.get((row['chat_id'], previous_ids.get(
+                             (row['chat_id'], row['message_id'])))),
                          'reply_context_missing': bool(row.get('parent_id') and
                              (row['chat_id'], row['parent_id']) not in message_labels),
                          'text': item['text'], 'target_refs': item['target_refs'],
@@ -272,6 +331,8 @@ def _messages(conn, settings, cm, chats, population, handle, stage, selected_row
                          'sent_at': str(row['message_create_time']) if row['message_create_time'] else None})
         refs.append({'kind': 'message', 'label': label, 'chat_id': row['chat_id'],
                      'message_id': row['message_id'], 'sender_open_id': row['sender_open_id'],
+                     **({'previous_id': previous_ids.get((row['chat_id'], row['message_id']))}
+                        if stage == 'person' else {}),
                      'body_hash': ownership._hash(row['body_ciphertext']),
                      'relation_hash': ownership._relation_hash(row)})
     stats = {'messages': len(messages), 'body_chars': chars, 'history_messages': len(rows),
@@ -279,7 +340,16 @@ def _messages(conn, settings, cm, chats, population, handle, stage, selected_row
              'messages_omitted': len(items) > len(messages),
              'critical_evidence_omitted': any(item['critical'] and
                  (item['row']['chat_id'], item['row']['message_id']) not in seen for item in items)}
-    source = [[r['chat_id'], r['message_id'], r['body_ciphertext'], ownership._relation_hash(r)] for r in rows]
+    if stage == 'person':
+        from . import creator_handle_evidence
+
+        stats['identity_counterevidence_omitted_users'] = sorted({item['speaker'] for item in items
+            if (item['row']['chat_id'], item['row']['message_id']) not in seen and any(
+                pattern.search(item['text']) for pattern in (creator_handle_evidence._PROXY_ROLE,
+                    creator_handle_evidence._NOT_OWNER, creator_handle_evidence._OWNER_NEGATION))})
+    source = [[r['chat_id'], r['message_id'], r['body_ciphertext'], ownership._relation_hash(r)]
+              for r in rows + context_rows]
+    source += [['previous', *key, value] for key, value in sorted(previous_ids.items())]
     return messages, refs, stats, source
 
 
@@ -297,6 +367,15 @@ def _build(conn, settings, cm_id, handle, stage, selected_chat_ids=None):
         chats = [{**c, 'match_kind': 'ai_selected', 'similarity': None}
                  for c in inventory if c['chat_id'] in (selected_chat_ids or [])]
         truncated = False
+        if cm and chats:
+            selected_population = _population(conn, cm, chats, handle, stage)
+            candidates = {oid for ref in selected_population['refs'] if ref.get('kind') == 'person'
+                          for oid in ref['open_ids'] if any(
+                              u['ref'] == ref['label'] and u['eligible'] for u in selected_population['users'])}
+            chats += [{**c, 'match_kind': 'person_context', 'similarity': None}
+                      for c in inventory if c['chat_mode'] == 'p2p'
+                      and c['p2p_counterpart_open_id'] in candidates
+                      and c['chat_id'] not in (selected_chat_ids or [])]
     population = _population(conn, cm, chats, handle, stage, selected_rows) if cm else {
         'users': [], 'refs': [], 'members': [], 'observed': [], 'identities': [], 'directory': [],
         'aliases': {}, 'names': {}, 'staff': set(), 'target_names': {}}
@@ -313,7 +392,8 @@ def _build(conn, settings, cm_id, handle, stage, selected_chat_ids=None):
                               and population['aliases'][m['open_id']] != 'CM1'})
         name = handles._body(chat['name'] or '', {'message_type': 'text', 'mentions_json': []}, {}, {},
                              group_name=True)
-        groups.append({'ref': label, 'name': name, 'match_kind': chat['match_kind'],
+        groups.append({'ref': label, 'name': name, 'mode': chat.get('chat_mode') or 'group',
+                       'match_kind': chat['match_kind'],
                        **({'history_mentions': chat['history_mentions']} if chat['match_kind'] == 'history' else {}),
                        'member_refs': member_refs, 'unresolved_member_refs': sorted(set(member_refs) & unresolved),
                        'member_snapshot_status': chat['member_snapshot_status'], 'member_count': chat['member_count']})
@@ -337,7 +417,7 @@ def _build(conn, settings, cm_id, handle, stage, selected_chat_ids=None):
                  users_truncated=stage == 'person' and eligible_count > MAX_USERS,
                  scope_fingerprint=ownership._hash([str(cm_id), cm['open_id'], cm['body_consent_at']]) if cm else None)
     # Exact group names are recall evidence, never sufficient person evidence.
-    available = bool(chats and {c['chat_id'] for c in chats} == set(selected_chat_ids or []))
+    available = bool(selected_chat_ids and set(selected_chat_ids) <= {c['chat_id'] for c in chats})
     eligible = bool(cm and (stage == 'group' or available and eligible_count <= MAX_USERS))
     reason = ('no_readable_material' if not cm else 'group_unavailable' if stage == 'person' and not available
               else 'material_limit' if stage == 'person' and eligible_count > MAX_USERS else 'eligible')
@@ -346,7 +426,7 @@ def _build(conn, settings, cm_id, handle, stage, selected_chat_ids=None):
             'roster': {'responsibility_confirmed': False, 'purpose': 'candidate_handles'},
             'catalog_check': {'source': 'curva', 'status': 'not_provided'},
             'groups': groups, 'users': users, 'messages': messages, 'meta': stats, 'untrusted_content': True}
-    directory = [{**d, 'category': 'possible_creator', 'classification_source': None}
+    directory = [{**d, 'category': 'possible_creator', 'classification_source': None, 'creator_known': None}
                  if d['category'] in {'creator', 'unclassified'} and not d['protected_noncreator'] else d
                  for d in population['directory']] if stage == 'person' else []
     source = {'cm': cm, 'inventory': [{'chat_id': c['chat_id'], 'name': c['name']} for c in chats],
@@ -362,9 +442,9 @@ def _build(conn, settings, cm_id, handle, stage, selected_chat_ids=None):
 
 
 def _stable_pack(pack):
-    return {**pack, 'meta': {k: v for k, v in pack['meta'].items()
-                           if k not in {'accessible_groups', 'history_search_messages'}}, 'users': [
-        {**u, 'known_category': 'possible_creator', 'category_source': None}
+    return {**{k: v for k, v in pack.items() if k != '_rules'}, 'meta': {k: v for k, v in pack['meta'].items()
+                           if k not in {'accessible_groups', 'history_search_messages', 'rules_digest'}}, 'users': [
+        {**u, 'known_category': 'possible_creator', 'category_source': None, 'creator_known': None}
         if u.get('eligible') and u.get('known_category') in {'creator', 'unclassified'} else u
         for u in pack['users']]}
 
@@ -382,7 +462,8 @@ def validate_evidence(conn, settings, cm_id, handle, pack, refs, fingerprint, *,
     if stage not in {'group', 'person'}:
         return False
     if stage == 'person' and selected_chat_ids is None:
-        selected_chat_ids = [r['chat_id'] for r in refs if r.get('kind') == 'group']
+        selected_refs = {g['ref'] for g in pack.get('groups', []) if g.get('match_kind') != 'person_context'}
+        selected_chat_ids = [r['chat_id'] for r in refs if r.get('kind') == 'group' and r['label'] in selected_refs]
         if not selected_chat_ids:
             return False
     current = _build(conn, settings, cm_id, handle, stage, selected_chat_ids)
@@ -398,8 +479,9 @@ def validate_reference_batch(conn, settings, cm_id, materials):
     """Permission and exact displayed-reference checks, without decrypting or rescanning history."""
     if not materials:
         return []
-    cm = conn.execute("SELECT open_id,body_consent_at FROM authorizations WHERE id=%s AND status='active' "
-                      "AND body_consent_at IS NOT NULL", (cm_id,)).fetchone()
+    cm = conn.execute("SELECT a.open_id,a.body_consent_at FROM authorizations a WHERE a.id=%s AND a.status='active' "
+                      "AND a.body_consent_at IS NOT NULL AND " + ownership.BODY_READ_SCOPE_SQL,
+                      (cm_id,)).fetchone()
     if not cm:
         return [False] * len(materials)
     scope = ownership._hash([str(cm_id), cm['open_id'], cm['body_consent_at']])
@@ -412,9 +494,11 @@ def validate_reference_batch(conn, settings, cm_id, materials):
             candidates.append((index, material, groups))
     group_ids = sorted({chat for _, _, groups in candidates for chat in groups})
     current_groups = conn.execute(
-        """SELECT c.chat_id,c.name FROM authorization_chats ac JOIN chats c ON c.chat_id=ac.chat_id
+        """SELECT c.chat_id,c.name,c.chat_mode,ac.p2p_counterpart_open_id
+           FROM authorization_chats ac JOIN chats c ON c.chat_id=ac.chat_id
            WHERE ac.authorization_id=%s AND ac.chat_id=ANY(%s::text[]) AND ac.is_visible AND ac.sync_enabled
-             AND COALESCE(c.chat_status,'normal')='normal' AND COALESCE(c.chat_mode,'group')<>'p2p'""",
+             AND ac.sync_status IS DISTINCT FROM 'not_readable'
+             AND COALESCE(c.chat_status,'normal')='normal'""",
         (cm_id, group_ids),
     ).fetchall() if group_ids else []
     names = {g['chat_id']: ownership._hash(g['name']) for g in current_groups}
@@ -429,6 +513,11 @@ def validate_reference_batch(conn, settings, cm_id, materials):
         + ' AND m.chat_id=ANY(%s::text[]) AND m.message_id=ANY(%s::text[])',
         (cm_id, group_ids, message_ids),
     ).fetchall() if message_ids and group_ids else []
+    if any(r.get('kind') == 'message' and 'previous_id' in r for r in refs) and rows:
+        from .creator_handle_evidence import _previous_ids
+
+        previous_ids = _previous_ids(conn, rows)
+        rows = [{**r, 'previous_id': previous_ids.get((r['chat_id'], r['message_id']))} for r in rows]
     open_ids = sorted({oid for r in refs if r.get('kind') == 'person' for oid in r['open_ids']})
     identities = conn.execute(
         "SELECT open_id,contact_id,display_name,name,en_name,identity_type,tenant_classification "
@@ -436,6 +525,9 @@ def validate_reference_batch(conn, settings, cm_id, materials):
     ).fetchall() if open_ids else []
     members, observed = handles._members(conn, cm_id, group_ids, {cm['open_id']: 'CM1'}) if group_ids else ([], [])
     members.extend(observed)
+    members += [{'chat_id': g['chat_id'], 'open_id': g['p2p_counterpart_open_id']}
+                for g in current_groups if g['chat_id'] in group_ids and g['chat_mode'] == 'p2p'
+                and g['p2p_counterpart_open_id']]
     results = [False] * len(materials)
     for index, material, groups in candidates:
         results[index] = _references_match(material, groups, rows, identities, members)
@@ -450,6 +542,8 @@ def _references_match(material, groups, rows, identities, members):
     if len(rows) != len(message_refs) or any(
             message_refs[(r['chat_id'], r['message_id'])].get('body_hash') != ownership._hash(r['body_ciphertext'])
             or message_refs[(r['chat_id'], r['message_id'])].get('relation_hash') != ownership._relation_hash(r)
+            or 'previous_id' in message_refs[(r['chat_id'], r['message_id'])]
+                and message_refs[(r['chat_id'], r['message_id'])]['previous_id'] != r.get('previous_id')
             for r in rows):
         return False
     visible = {r['open_id'] for r in members if r['chat_id'] in groups}
@@ -548,7 +642,7 @@ confidence 只是兼容旧接口的自评分，不是校准概率；即使 0.99 
 """
 
 
-def _output_format(stage):
+def _output_format(stage, *, legacy=False):
     ref = 'group_refs' if stage == 'group' else 'user_ref'
     references = {'type': 'array', 'maxItems': 16,
                   'items': {'type': 'string', 'pattern': '^[GUMX][1-9][0-9]*$'}}
@@ -559,6 +653,19 @@ def _output_format(stage):
                   'confidence': {'type': 'number', 'minimum': 0, 'maximum': 1},
                   'reason': {'type': 'string', 'maxLength': 600}, 'evidence_refs': references}
     if stage == 'person':
+        if not legacy:
+            from .creator_handle_evidence import IDENTITY_CODES
+
+            properties['creator'] = {'type': 'object', 'additionalProperties': False,
+                'required': ['state', 'code', 'confidence', 'refs'], 'properties': {
+                    'state': {'type': 'string', 'enum': ['known', 'supported', 'review', 'not_supported']},
+                    'code': {'type': 'string', 'enum': sorted(IDENTITY_CODES)},
+                    'confidence': {'type': 'number', 'minimum': 0, 'maximum': 1},
+                    'refs': {'type': 'array', 'maxItems': 6, 'items': {'type': 'string'}}}}
+            properties['link_code'] = {'type': 'string', 'enum': [
+                'self_claim', 'qa_confirm', 'own_page', 'group_context', 'own_content', 'operates_for_other',
+                'third_party', 'mention_only', 'no_link_evidence', 'ambiguous_reply', 'conflict',
+                'username_changed', 'out_of_catalog']}
         properties['conflicts'] = {'type': 'array', 'maxItems': 12, 'items': {'type': 'string', 'maxLength': 300}}
         properties['candidates'] = {'type': 'array', 'maxItems': MAX_USERS, 'items': {
             'type': 'object', 'additionalProperties': False,
@@ -566,16 +673,17 @@ def _output_format(stage):
                 'user_ref': {'type': 'string'},
                 'assessment': {'type': 'string', 'enum': ['target', 'not_target', 'uncertain']},
                 'reason': {'type': 'string', 'maxLength': 600}, 'evidence_refs': references}}}
-    return {'type': 'json_schema', 'name': f'creator_import_{stage}_v5', 'strict': True, 'schema': {
+    version = 5 if legacy else 6
+    return {'type': 'json_schema', 'name': f'creator_import_{stage}_v{version}', 'strict': True, 'schema': {
         'type': 'object', 'additionalProperties': False, 'required': list(properties), 'properties': properties}}
 
 
-def group_output_format():
-    return _output_format('group')
+def group_output_format(pack=None):
+    return _output_format('group', legacy=bool(pack and pack.get('policy_version') == LEGACY_POLICY_VERSION))
 
 
-def person_output_format():
-    return _output_format('person')
+def person_output_format(pack=None):
+    return _output_format('person', legacy=bool(pack and pack.get('policy_version') == LEGACY_POLICY_VERSION))
 
 
 def _refs(value, allowed):
@@ -593,8 +701,9 @@ def _text(value, limit=600):
 
 def _parse(raw, pack, stage):
     result = json.loads(raw) if isinstance(raw, str) else raw
-    fields = set(_output_format(stage)['schema']['properties'])
-    if (pack.get('policy_version') != POLICY_VERSION or pack.get('stage') != stage
+    legacy = pack.get('policy_version') == LEGACY_POLICY_VERSION
+    fields = set(_output_format(stage, legacy=legacy)['schema']['properties'])
+    if (pack.get('policy_version') not in {POLICY_VERSION, LEGACY_POLICY_VERSION} or pack.get('stage') != stage
             or not isinstance(result, dict) or set(result) != fields
             or not isinstance(result['outcome'], str) or result['outcome'] not in _OUTCOMES):
         raise ValueError('invalid import decision')
@@ -606,9 +715,32 @@ def _parse(raw, pack, stage):
     else:
         if result['user_ref'] is not None and not isinstance(result['user_ref'], str):
             raise ValueError('invalid import selection')
-        if result['outcome'] != 'matched' and result['user_ref'] is not None:
+        if (result['outcome'] == 'not_found' or legacy and result['outcome'] != 'matched') \
+                and result['user_ref'] is not None:
             raise ValueError('unresolved import decision must leave selection empty')
     return result
+
+
+def person_pack(pack, selected):
+    """Project scoped import references into the same single-person evidence contract."""
+    user = next(u for u in pack['users'] if u['ref'] == selected)
+    return {'target': selected, 'purpose': 'identity', 'creator_known': user.get('creator_known', False),
+            **({'_rules': pack['_rules']} if pack.get('_rules') else {}),
+            'confirmed_handles': [], 'handles': [{'id': 'H1', 'handle': pack['imported_handle']}],
+            'people': [{'id': u['ref'], 'role': 'staff' if any(
+                m['speaker'] == u['ref'] and m.get('speaker_is_staff') for m in pack['messages']) else 'external'}
+                for u in pack['users']]
+                      + [{'id': 'CM1', 'role': 'staff'}],
+            'chats': [{'id': g['ref'], 'name': g['name'], 'mode': g.get('mode', 'group')}
+                      for g in pack['groups']],
+            'messages': [{'id': m['ref'], 'chat': m['group_ref'], 'speaker': m['speaker'],
+                          'text': m['text'], 'at': m['sent_at'], 'reply': m.get('reply_to_ref'),
+                          'previous': m.get('previous_ref')} for m in pack['messages']],
+            'coverage': {'missing_reply_ids': [m['ref'] for m in pack['messages']
+                                              if m.get('reply_context_missing')],
+                         'excerpted_ids': [m['ref'] for m in pack['messages'] if m.get('excerpted')],
+                         'identity_counterevidence_omitted': selected in pack['meta'].get(
+                             'identity_counterevidence_omitted_users', [])}}
 
 
 def group_validate(raw, pack, *, threshold=0.95):
@@ -671,6 +803,29 @@ def person_validate(raw, pack, *, threshold=0.95):
         _refs(candidate['evidence_refs'], allowed)
         if candidate['assessment'] == 'target':
             targets.append(candidate['user_ref'])
+    shared = None
+    if pack.get('policy_version') == POLICY_VERSION:
+        from . import creator_handle_evidence
+
+        creator = result['creator']
+        creator_handle_evidence._shape(creator, creator_handle_evidence._result_schema(True)['properties']['creator'])
+        if result['link_code'] not in _output_format('person')['schema']['properties']['link_code']['enum']:
+            raise ValueError('invalid import link code')
+        if result['user_ref'] is not None:
+            if result['user_ref'] not in eligible:
+                raise ValueError('invalid import selected person')
+            projected = person_pack(pack, result['user_ref'])
+            identity = creator_handle_evidence.identity_validate(projected, creator, threshold=threshold)
+            linked = {'creator': identity, 'links': [{'h': 'H1',
+                'decision': 'supported' if result['outcome'] == 'matched' else 'review',
+                'relation': 'self_account' if result['outcome'] == 'matched' else 'uncertain',
+                'period': 'at_message' if result['outcome'] == 'matched' else 'unknown',
+                'code': result['link_code'],
+                'refs': [ref for ref in result['evidence_refs'] if ref in messages], 'needed': []}]}
+            shared = creator_handle_evidence.validate(projected, linked)
+            result['creator'] = shared['creator']
+        elif creator['state'] in {'known', 'supported'} or creator['refs']:
+            raise ValueError('identity decision requires an actual selected person')
     reason = 'person_not_found' if result['outcome'] == 'not_found' else 'person_uncertain'
     blockers = []
     if result['outcome'] == 'matched':
@@ -679,8 +834,10 @@ def person_validate(raw, pack, *, threshold=0.95):
             raise ValueError('invalid import selected person')
         targeted = {m['ref'] for m in messages.values() if m['speaker'] == selected}
         cited = set(result['evidence_refs'])
-        direct = bool(cited & targeted) and any(
-            _mentions_handle(messages[ref]['text'], pack['imported_handle']) for ref in cited if ref in messages)
+        direct = (shared['creator']['state'] in {'known', 'supported'}
+                  and shared['links'][0]['decision'] == 'supported') if shared else (
+                      bool(cited & targeted) and any(_mentions_handle(messages[ref]['text'], pack['imported_handle'])
+                                                   for ref in cited if ref in messages))
         if result['confidence'] >= threshold and targets == [selected] and not result['conflicts'] and direct:
             reason = 'person_matched'
         else:
@@ -691,6 +848,7 @@ def person_validate(raw, pack, *, threshold=0.95):
             if result['conflicts']:
                 blockers.append('AI 仍记录了未解决的账号或人员冲突。')
             if not direct:
-                blockers.append('缺少所选用户本人消息及精确账号引用，群成员唯一或历史绑定不能替代。')
-            result.update(outcome='review', user_ref=None)
+                blockers.append('本人达人身份或账号证据未通过校验，群成员唯一或名单不能替代。')
+            result.update(outcome='review', user_ref=(selected if shared and shared['creator']['state']
+                                                     == 'supported' else None))
     return {**result, 'reason_code': reason, 'person_candidate_count': len(eligible), 'blocking_reasons': blockers}

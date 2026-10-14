@@ -19,6 +19,9 @@ from .crypto import message_body_cipher
 from .openai_client import ModelOutputError
 
 PROMPT_VERSION = "creator-handle-research-v1.11"
+IDENTITY_VERSION = "creator-identity-v1"
+IDENTITY_CODES = ("known", "own_activity", "business_reply", "group_activity", "insufficient",
+                  "proxy", "other_business", "conflict")
 MAX_MESSAGES, MAX_CHARS, MAX_HANDLES, SEARCH_LIMIT = 48, 20_000, 12, 20_000
 # A research hold is an explicit access restriction, not a negative identity finding.
 RESTRICTED_CONTACTS = frozenset({"6abf6bf9-12dc-4a22-9654-2010aa4c7785"})
@@ -107,20 +110,38 @@ def _schema():
                        / "docs/specs/creator-handle-association_v1.2.schema.json").read_text())
 
 
-def output_format(pack=None):
+def _result_schema(identity=False):
     schema = deepcopy(_schema())
+    if identity:
+        creator = schema["properties"]["creator"]
+        creator["properties"].update(
+            code={"type": "string", "enum": list(IDENTITY_CODES)},
+            confidence={"type": "number", "minimum": 0, "maximum": 1},
+        )
+        creator["required"] += ["code", "confidence"]
+    return schema
+
+
+def output_format(pack=None):
+    identity = pack is not None and pack.get("purpose") == "identity"
+    schema = _result_schema(identity)
     if pack is not None:
         creator = schema["properties"]["creator"]["properties"]
         links = schema["properties"]["links"]
         fields = links["items"]["properties"]
-        fields["h"]["enum"] = [h["id"] for h in pack["handles"]]
+        if pack["handles"]:
+            fields["h"]["enum"] = [h["id"] for h in pack["handles"]]
         links.update(minItems=len(pack["handles"]), maxItems=len(pack["handles"]))
         for refs in (creator["refs"], fields["refs"]):
-            refs["items"]["enum"] = [m["id"] for m in pack["messages"]]
+            if pack["messages"]:
+                refs["items"]["enum"] = [m["id"] for m in pack["messages"]]
+            else:
+                refs["maxItems"] = 0
         creator["state"]["enum"] = ["known"] if pack["creator_known"] else ["supported", "review", "not_supported"]
         if pack["creator_known"]:
             creator["refs"]["maxItems"] = 0
-    return {"type": "json_schema", "name": "creator_handle_v1_11", "strict": True, "schema": schema}
+    return {"type": "json_schema", "name": "creator_identity_v1" if identity else "creator_handle_v1_11",
+            "strict": True, "schema": schema}
 
 
 def _denied(value):
@@ -267,9 +288,10 @@ def _previous_ids(conn, rows):
     ).fetchall()}
 
 
-def build(conn, settings, contact_id, catalog, *, recheck=False):
+def build(conn, settings, contact_id, catalog, *, recheck=False, purpose="handles"):
     """Prepare bounded material locally. Missing evidence never means a non-creator."""
     contact_id = str(contact_id)
+    identity_mode = purpose == "identity"
     empty = {"pack": None, "refs": [], "fingerprint": None, "reason": "restricted", "stats": {}}
     if contact_id in RESTRICTED_CONTACTS:
         return empty
@@ -366,6 +388,15 @@ def build(conn, settings, contact_id, catalog, *, recheck=False):
         if row.get("parent_id"):
             return row["chat_id"], row["parent_id"]
         key = row["chat_id"], previous_answers.get(_key(row))
+        if identity_mode and row.get("chat_mode") == "p2p":
+            chain = []
+            for _ in range(3):
+                if key not in by_key:
+                    break
+                chain.append(key)
+                key = row["chat_id"], previous_answers.get(key)
+            answer_chains[_key(row)] = list(reversed(chain))
+            return chain[0] if chain else (row["chat_id"], None)
         speaker, chain = by_key.get(key, {}).get("row", {}).get("sender_open_id"), []
         for _ in range(3):
             item = by_key.get(key)
@@ -390,12 +421,14 @@ def build(conn, settings, contact_id, catalog, *, recheck=False):
     empty["stats"]["recheck_handles"] = sorted(rechecks)
     scores = Counter({h: score for h, score in scores.items() if h not in confirmed or h in rechecks})
     candidates = sorted(scores, key=lambda h: (-scores[h], h))[:MAX_HANDLES]
-    if not candidates:
+    if not candidates and not identity_mode:
         return {**empty, "reason": "already_confirmed" if recalled else "no_candidates",
                 "stats": {**empty["stats"], "readable_messages": len(own)}}
     candidate_set = set(candidates)
 
     ranked = sorted(own, key=lambda i: (
+        identity_mode and bool(_PROXY_ROLE.search(i["text"]) or _OWN_BUSINESS.search(i["text"])
+                          or _CREATOR_ACTIVITY.search(i["text"])),
         bool(i["handles"] & candidate_set or by_key.get(parent_key(i), {})
              .get("handles", set()) & candidate_set), bool(handles._CHANGE.search(i["text"])),
         bool(_SELF.search(i["text"])), bool(text._IMPORTANT.search(i["text"])),
@@ -406,11 +439,18 @@ def build(conn, settings, contact_id, catalog, *, recheck=False):
         for h in candidates)]
     group_anchors = {h: next((i for i in ranked if known and _group_handle(chats_by_id[i["row"]["chat_id"]]) == h
                              and _personal_context(i["text"], h, confirmed | candidate_set)), None) for h in candidates}
+    diverse = []
+    if identity_mode:
+        # Every readable person is assessed; different conversations get a slot before repeat messages.
+        per_chat = {}
+        for item in ranked:
+            per_chat.setdefault(item["row"]["chat_id"], item)
+        diverse = list(per_chat.values())
     anchors = list({_key(i["row"]): i for i in [*changes[:8],
-        *(i for i in group_anchors.values() if i), *ranked]}.values())[:24]
+        *(i for i in group_anchors.values() if i), *diverse, *ranked]}.values())[:24]
     # Only selected private handle answers need an extra question lookup (at most 24, not whole history).
     answer_previous, answer_context = previous_context([i["row"] for i in anchors if i["row"].get("chat_mode") == "p2p"
-        and not i["row"].get("parent_id") and i["handles"] & candidate_set])
+        and not i["row"].get("parent_id") and (identity_mode or i["handles"] & candidate_set)])
     previous_answers.update(answer_previous)
     by_key.update({_key(i["row"]): i for i in answer_context})
     if answer_context:
@@ -510,6 +550,12 @@ def build(conn, settings, contact_id, catalog, *, recheck=False):
                    and speaker_types.get(item["row"]["sender_open_id"], {}).get("tenant_classification") != "internal")
     omitted_handles = sorted({h for item in dropped for h in item["handles"] & candidate_set})
     pack["coverage"]["omitted_handle_ids"] = [h["id"] for h in pack["handles"] if h["handle"] in omitted_handles]
+    if identity_mode:
+        pack["purpose"] = "identity"
+        pack["coverage"]["identity_counterevidence_omitted"] = any(
+            i["row"]["sender_open_id"] in open_ids
+            and (_PROXY_ROLE.search(i["text"]) or _NOT_OWNER.search(i["text"]))
+            for i in own if _key(i["row"]) not in seen)
     stats = {**empty["stats"], "messages": len(messages), "body_chars": chars, "readable_messages": len(own),
              "history_truncated": truncated, "candidates_omitted": max(0, len(scores) - len(candidates)),
              "critical_evidence_omitted": bool(omitted_handles),
@@ -520,11 +566,12 @@ def build(conn, settings, contact_id, catalog, *, recheck=False):
         if support:
             pack["evidence_hints"].append({"h": candidate["id"], "groups": support[:3]})
     # Let the model assess title + conversation context even without a recognized self-introduction.
-    if not any(_mentions(m["text"], h) for m in messages for h in candidates) and not any(
+    if not identity_mode and not any(_mentions(m["text"], h) for m in messages for h in candidates) and not any(
             _tokens(c["name"], candidate_set) for c in pack["chats"]):
         return {**empty, "reason": "no_account_evidence", "stats": stats}
     # Cache semantic input only. Fresh grant/body references remain mandatory before use.
-    return {"pack": pack, "refs": refs, "fingerprint": access._hash([PROMPT_VERSION, pack]),
+    return {"pack": pack, "refs": refs,
+            "fingerprint": access._hash([IDENTITY_VERSION if identity_mode else PROMPT_VERSION, pack]),
             "reason": "ready", "stats": stats}
 
 
@@ -782,12 +829,15 @@ def validate(pack, result):
                 if not isinstance(error, str) or error not in VALIDATION_ERRORS or link.get("decision") != "review":
                     raise ModelOutputError("shape")
                 diagnostics[index] = error
-    _shape(result, output_format()["schema"])
+    identity = pack.get("purpose") == "identity"
+    _shape(result, _result_schema(identity))
     messages = {m["id"]: m for m in pack["messages"]}
     candidates = {h["id"]: h for h in pack["handles"]}
     if len(result["links"]) != len(candidates) or {link["h"] for link in result["links"]} != set(candidates):
         raise ModelOutputError("candidates")
-    if pack["creator_known"]:
+    if identity:
+        result["creator"] = identity_validate(pack, result["creator"])
+    elif pack["creator_known"]:
         result["creator"] = {"state": "known", "refs": []}
     else:
         creator = result["creator"]
@@ -831,13 +881,43 @@ def validate(pack, result):
         if link["code"] not in {"self_claim", "qa_confirm", "own_page", "group_context"}:
             _review(link, "owner_code", messages)
             continue
-        if link["code"] == "group_context" and (not pack["creator_known"] or not any(
+        identity_supported = identity and result["creator"]["state"] == "supported"
+        if link["code"] == "group_context" and (not (pack["creator_known"] or identity_supported) or not any(
                 c["id"] == m["chat"] and _group_handle(c) == candidate["handle"]
                 for m in own for c in pack.get("chats", []))):
             _review(link, "unsupported_evidence", messages)
         elif link["code"] == "qa_confirm" and not _reply_refs(pack, own, cited):
             _review(link, "reply_relation", messages)
     return result
+
+
+def identity_validate(pack, creator, threshold=0.95):
+    """Check identity references and source structure; interpretation belongs to the model."""
+    creator = deepcopy(creator)
+    _shape(creator, _result_schema(True)["properties"]["creator"])
+    if pack["creator_known"]:
+        return {"state": "known", "code": "known", "confidence": 1, "refs": []}
+    messages = {m["id"]: m for m in pack["messages"]}
+    refs = creator["refs"]
+    invalid = (creator["state"] == "known" or len(refs) > 6 or len(refs) != len(set(refs))
+               or not set(refs) <= messages.keys())
+    if creator["state"] == "supported" and not invalid:
+        cited = [messages[ref] for ref in refs]
+        own = [m for m in cited if m["speaker"] == pack["target"]]
+        coverage = pack["coverage"]
+        invalid = (creator["confidence"] < threshold or not own
+                   or creator["code"] not in {"own_activity", "business_reply", "group_activity"}
+                   or bool(set(refs) & set(coverage["excerpted_ids"]))
+                   or coverage.get("identity_counterevidence_omitted", False))
+        if creator["code"] == "business_reply":
+            invalid = invalid or not _reply_refs(pack, own, cited)
+        elif creator["code"] == "group_activity":
+            invalid = invalid or not any(c["id"] == m["chat"] and _group_handle(c)
+                                        for m in own for c in pack["chats"])
+    if invalid:
+        creator.update(state="review", code="insufficient",
+                       refs=list(dict.fromkeys(r for r in refs if r in messages))[:6])
+    return creator
 
 
 def _review(link, error, messages):

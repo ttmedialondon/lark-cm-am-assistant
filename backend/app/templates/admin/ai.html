@@ -29,7 +29,7 @@
         <div class="d-flex flex-wrap justify-content-between gap-2 mb-3"><span class="text-secondary">{{ summary_settings.status_label }}</span><a href="/dashboard/offhours-summary">查看消息总结 →</a></div>
         {% endif %}
         {% if feature.feature == 'creator_handle_matching' %}
-        <div class="d-flex justify-content-between gap-2 mb-3"><span class="text-secondary">新达人及新增证据自动入队；历史全量需手动启动。</span><a href="/admin/ai/creator-handle-matching">匹配任务 →</a></div>
+        <div class="d-flex justify-content-between gap-2 mb-3"><span class="text-secondary">新人及新增材料自动识别；已有关系不重判，历史不自动重扫。</span><a href="/admin/ai/creator-handle-matching">识别任务 →</a></div>
         {% endif %}
         {% if feature.feature == 'creator_responsibility_matching' %}
         <div class="d-flex justify-content-between gap-2 mb-3"><span class="text-secondary">独立配置密钥后启用，从匹配页面启动全部待处理达人。</span><a href="/admin/ai/creator-responsibility">负责人匹配 →</a></div>

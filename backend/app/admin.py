@@ -73,10 +73,10 @@ AI_FEATURES = {
         "processing_label": "手动启动名单匹配",
     },
     "creator_handle_matching": {
-        "title": "达人—handle 匹配",
+        "title": "达人识别与账号匹配",
         "description": (
-            "结合群名和授权消息匹配账号，Curva 仅作参考；强证据自动关联，其余待核实，"
-            "不修改身份、负责人或已有关系。"
+            "新联系人按本人聊天证据识别达人，身份至少 95% 且校验通过自动入库；"
+            "已确认达人只补新账号，保留已有关系，Curva 仅作参考。"
         ),
         "enabled_label": "开启自动匹配",
         "processing_label": "队列匹配，强证据自动关联",
@@ -354,6 +354,9 @@ def create_admin_router(
             "is_creator": creator,
             "event_usage": {"event-extraction": "事项抽取", "event-state": "处理状态",
                             "event-priority": "紧急度分级", "event-merge": "跨群合并"}.get(key),
+            "creator_usage": {"creator-recognition-flow": "入口与任务准备", "creator-identity": "身份判定",
+                              "creator-handle-link": "账号判定", "creator-evidence": "取材与补查",
+                              "creator-admission": "入库与下游", "creator-regression": "开发验收"}.get(key),
             "kind_labels": {"rule": "规则", "manual": "任务手册", "knowledge": "知识资料", "template": "输出模板"},
             "status_labels": {"draft": "草稿", "published": "已发布", "archived": "已停用"},
             "visibility_labels": {"all": "全体 CM", "owner": "仅 Owner"},

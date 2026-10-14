@@ -35,4 +35,4 @@ Curva 未收录不否决明确账号；已确认 Excel 或人工关系也不因�
 
 证据不足、回复链不完整、明确旧账号、改名或转让关系、具体归属冲突进入待核实；不能仅因消息较旧否定 `at_message` 的关联。合法候选中的错误引用只影响该候选，不能让整批有效账号失败。
 
-现行执行 prompt 在 `docs/specs/creator-handle-association-prompt_v1.2.md` 中，实际协议版本已为 v1.11；本手册尚未替代该文件。
+生产业务判断读取本手册的任务级快照；原账号匹配协议和后端引用校验继续保留。`docs/specs/creator-handle-association-prompt_v1.2.md` 是历史研究协议说明，不与本手册叠加成另一套业务判断规则。

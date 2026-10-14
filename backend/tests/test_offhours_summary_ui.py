@@ -135,7 +135,7 @@ def test_matching_template_escapes_names_and_distinguishes_associations_from_his
         },
     )
     assert "账号匹配" in html and 'action="/admin/ai/creator-handle-matching/enqueue"' in html
-    assert "强证据自动关联，其他待核实" in html
+    assert "规则通过自动入库，其他待核实" in html
     assert hostile not in html and "&lt;script&gt;" in html
     assert "代运营" in html and "历史关系" in html and "待核实" in html
     assert "operator" not in html and "review_required" not in html

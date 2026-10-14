@@ -399,6 +399,49 @@ def test_contact_matching_evidence_auth_replies_and_reencryption(pg, pilot, monk
     assert matcher.validate(outside["pack"], outside_result) == outside_result
     pg.execute("ROLLBACK TO SAVEPOINT non_catalog_claim")
 
+    # A new person without any handle still gets assessed from real personal business and QA.
+    newcomer = pilot.person("identity_newcomer", pairs=1)
+    pg.execute("DELETE FROM contact_roles WHERE contact_id=%s AND role='creator'", (newcomer,))
+    pg.execute("UPDATE chats SET name='New contact conversation' WHERE chat_id='chat_identity_newcomer'")
+    for mid, sender, body, minute in (
+        ("identity_question", "ou_cm", "Could you film a TikTok review of this sample?", 250),
+        ("identity_answer", "ou_identity_newcomer", "Yes, I'll film the review tonight and post it tomorrow.", 251),
+    ):
+        pg.execute(
+            "INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,body_ciphertext,"
+            "message_create_time) VALUES('chat_identity_newcomer',%s,%s,'user','text',%s,%s)",
+            (mid, sender, cipher.encrypt(json.dumps({"text": body})), start + timedelta(minutes=minute)),
+        )
+        pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+                   "VALUES(%s,'chat_identity_newcomer',%s)", (cm, mid))
+    assert matcher.build(pg, pilot.settings, newcomer, frozenset())["reason"] == "no_candidates"
+    identity = matcher.build(pg, pilot.settings, newcomer, frozenset(), purpose="identity")
+    pack = identity["pack"]
+    assert identity["reason"] == "ready" and pack["purpose"] == "identity"
+    assert not pack["creator_known"] and not pack["handles"]
+    labels = {r["message_id"]: r["label"] for r in identity["refs"] if r["kind"] == "message"}
+    assert {"identity_question", "identity_answer"} <= labels.keys()
+    result = {"creator": {"state": "supported", "code": "business_reply", "confidence": 0.98,
+                          "refs": [labels["identity_question"], labels["identity_answer"]]}, "links": []}
+    assert matcher.validate(pack, result) == result
+    assert matcher.still_valid(pg, identity["refs"], pilot.settings)
+    no_owner = deepcopy(result)
+    no_owner["creator"]["refs"] = [labels["identity_question"]]
+    assert matcher.validate(pack, no_owner)["creator"]["state"] == "review"
+    no_parent = deepcopy(pack)
+    next(m for m in no_parent["messages"] if m["id"] == labels["identity_answer"])["previous"] = None
+    assert matcher.validate(no_parent, result)["creator"]["state"] == "review"
+    empty = deepcopy(pack)
+    empty["messages"] = []
+    schema = matcher.output_format(empty)["schema"]["properties"]
+    assert schema["links"]["maxItems"] == 0
+    assert "enum" not in schema["links"]["items"]["properties"]["h"]
+    assert schema["creator"]["properties"]["refs"]["maxItems"] == 0
+    assert "enum" not in schema["creator"]["properties"]["refs"]["items"]
+    pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (cm,))
+    assert not matcher.still_valid(pg, identity["refs"], pilot.settings)
+    assert matcher.build(pg, pilot.settings, newcomer, frozenset(), purpose="identity")["reason"] == "no_text"
+
 
 def test_model_language_judgment_preserved_with_structural_guards():
     """Sarah's three reply chains: verify sources, not sentence meaning; no model API used."""
@@ -486,3 +529,20 @@ def test_model_language_judgment_preserved_with_structural_guards():
     assert not matcher._tokens("a" * 65, frozenset({"a" * 64, "a"}))
     assert matcher._plain(json.dumps({"content": [[{"tag": "img", "image_key": "hidden-pixels"}]]}),
                           {"message_type": "post"}) == ""
+    identity = deepcopy(group)
+    identity.update(purpose="identity", creator_known=False)
+    identity["messages"][1]["text"] = "I posted my TikTok review today."
+    identified = deepcopy(grouped)
+    identified["creator"] = {"state": "supported", "code": "group_activity", "confidence": 0.98, "refs": ["M2"]}
+    assert matcher.validate(identity, identified) == identified  # Identity and account can use one paid result.
+    missing_business = deepcopy(identified)
+    missing_business["creator"]["refs"] = []
+    refused = matcher.validate(identity, missing_business)
+    assert refused["creator"]["state"] == "review" and refused["links"][0]["decision"] == "review"
+    missing_group = deepcopy(identity)
+    missing_group["chats"][0]["name"] = "General product group"
+    assert matcher.identity_validate(missing_group, identified["creator"])["state"] == "review"
+    assert matcher.identity_validate(identity, identified["creator"], threshold=0.99)["state"] == "review"
+    omitted = deepcopy(identity)
+    omitted["coverage"]["identity_counterevidence_omitted"] = True
+    assert matcher.identity_validate(omitted, identified["creator"])["state"] == "review"

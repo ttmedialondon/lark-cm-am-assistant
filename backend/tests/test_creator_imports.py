@@ -164,7 +164,9 @@ def prepare(pg, pilot, monkeypatch):
     def respond(_config, _key, pack, _row_id, **kwargs):
         stage = pack["stage"]
         assert kwargs["output_format"]["strict"]
-        assert kwargs["output_format"]["name"] == f"creator_import_{stage}_v5"
+        version = 6 if pack["policy_version"] == imports.creator_import_evidence.POLICY_VERSION else 5
+        assert kwargs["output_format"]["name"] == f"creator_import_{stage}_v{version}"
+        assert "_rules" not in pack
         calls.append(pack)
         if stage == "group":
             groups = [g["ref"] for g in pack["groups"] if pack["imported_handle"] in g["name"].casefold()]
@@ -184,6 +186,14 @@ def prepare(pg, pilot, monkeypatch):
                           {"user_ref": u["ref"], "assessment": "target" if u == target else "uncertain",
                            "reason": "有对应账号的定位依据。" if u == target else "尚未确定与目标账号的关系。",
                            "evidence_refs": refs if u == target else []} for u in people]}
+            if version == 6:
+                known = bool(target and target.get("creator_known"))
+                identity_refs = own[target["ref"]][:6] if target else []
+                result.update(creator={"state": "known" if known else "supported" if identity_refs else "review",
+                                      "code": "known" if known else "own_activity" if identity_refs else "insufficient",
+                                      "confidence": 1 if known else .99 if identity_refs else .5,
+                                      "refs": [] if known else identity_refs},
+                              link_code="self_claim" if target and own[target["ref"]] else "group_context")
         for callback in callbacks:
             callback(stage, pack, result)
         return {"text": json.dumps(result), "response_id": f"synthetic-{stage}-{len(calls)}",
@@ -370,6 +380,8 @@ def test_shared_creator_reuses_identity_without_sharing_message_permissions(pg, 
     imports.start_import(cm, original["id"])
     imports.confirm_row(cm, row_for(pg, original, "shared_handle")["id"], "shared_handle", person)
     link_before = pg.execute("SELECT * FROM contact_social_accounts WHERE contact_id=%s", (person,)).fetchone()
+    role_before = pg.execute("SELECT * FROM contact_roles WHERE contact_id=%s AND role='creator'",
+                             (person,)).fetchone()
     denied = imports.preview_import(other, other, "denied.xlsx", workbook("shared_handle"))
     imports.start_import(other, denied["id"])
     assert row_for(pg, denied, "shared_handle")["reason_code"] == "authorization_changed"
@@ -392,7 +404,8 @@ def test_shared_creator_reuses_identity_without_sharing_message_permissions(pg, 
         == 1
     )
     link = pg.execute("SELECT * FROM contact_social_accounts WHERE contact_id=%s", (person,)).fetchone()
-    assert link["import_row_id"] == link_before["import_row_id"]  # Preserve original identity evidence.
+    assert link == link_before and pg.execute("SELECT * FROM contact_roles WHERE contact_id=%s AND role='creator'",
+                                             (person,)).fetchone() == role_before
     for target in (cm, other):
         view = creator_roster.page_data(other, cm_id=target, tab="mine")
         assert any(item["id"] == str(person) for item in view["items"])
@@ -509,6 +522,96 @@ def add_message(pg, pilot, chat, sender, text):
     pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
                "VALUES(%s,%s,%s)", (pilot.ids["cm"], chat, message_id))
     return message_id
+
+
+def test_manuals_unify_private_import_identity_account_and_existing_facts(pg, pilot, monkeypatch):
+    from app import assistant_rules
+
+    calls, callbacks = prepare(pg, pilot, monkeypatch)
+    cm = pilot.ids['cm']
+    person = pilot.person('private_new')
+    pg.execute("UPDATE contacts SET entity_type='person' WHERE id=%s", (person,))
+    pg.execute('DELETE FROM contact_roles WHERE contact_id=%s', (person,))
+    pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('private_only','New conversation','p2p')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id,p2p_counterpart_open_id) "
+               "VALUES(%s,'private_only','ou_private_new')", (cm,))
+    question = add_message(pg, pilot, 'private_only', 'cm', 'Please send your TikTok handle')
+    answer = add_message(pg, pilot, 'private_only', 'private_new', 'private_handle')
+    activity = add_message(pg, pilot, 'private_only', 'private_new', 'I filmed my TikTok videos this morning.')
+    for minute, message_id in ((2, question), (1, answer), (0, activity)):
+        pg.execute("UPDATE chat_messages SET message_create_time=NOW()-(%s*INTERVAL '1 minute') WHERE message_id=%s",
+                   (minute, message_id))
+
+    def private_response(stage, pack, result):
+        if stage == 'group':
+            assert pack['groups'][0]['mode'] == 'p2p'
+            result.update(outcome='matched', group_refs=[pack['groups'][0]['ref']], confidence=.99,
+                          evidence_refs=[pack['groups'][0]['ref'], next(m['ref'] for m in pack['messages']
+                                                                     if m['text'] == 'private_handle')])
+            return
+        target = next(u['ref'] for u in pack['users'] if u['eligible'])
+        by_text = {m['text']: m for m in pack['messages']}
+        answer_ref = by_text['private_handle']['ref']
+        question_ref = by_text['Please send your TikTok handle']['ref']
+        assert by_text['private_handle']['previous_ref'] == question_ref
+        identity_ref = by_text['I filmed my TikTok videos this morning.']['ref']
+        result.update(user_ref=target, outcome='matched', link_code='qa_confirm',
+                      evidence_refs=[question_ref, answer_ref],
+                      creator={'state': 'supported', 'code': 'own_activity', 'confidence': .99,
+                               'refs': [identity_ref]},
+                      candidates=[{'user_ref': target, 'assessment': 'target', 'reason': '本人完整私聊问答。',
+                                   'evidence_refs': [question_ref, answer_ref]}])
+
+    callbacks.append(private_response)
+    batch = imports.preview_import(cm, cm, 'private.xlsx', workbook('private_handle'))
+    imports.start_import(cm, batch['id'])
+    drain(pilot)
+    row = row_for(pg, batch, 'private_handle')
+    assert row['review_status'] == 'confirmed' and row['contact_id'] == person and row['api_requests'] == 2, (
+        row['reason_code'], imports._decode(row, pilot.settings, 'result_ciphertext'))
+    assert [p['stage'] for p in calls] == ['group', 'person']
+    chain = imports._decode(row, pilot.settings)
+    assert chain['group']['pack']['_rules']['digest'] == chain['person']['pack']['_rules']['digest']
+    assert set(chain['person']['pack']['_rules']['documents']) == assistant_rules.CREATOR_KEYS
+    assert imports.creator_import_evidence.validate_references(pg, pilot.settings, cm, chain['person'])
+    assignment = pg.execute('SELECT source,created_by_authorization_id FROM contact_assignments '
+                            'WHERE contact_id=%s', (person,)).fetchone()
+    assert assignment == {'source': 'manual', 'created_by_authorization_id': cm}
+    facts = _snapshot(pg, ('contact_roles', 'contact_social_accounts', 'contact_assignments'))
+    duplicate = imports.preview_import(cm, cm, 'private-copy.xlsx', workbook('handle', 'private_handle'))
+    imports.start_import(cm, duplicate['id'])
+    assert row_for(pg, duplicate, 'private_handle')['reason_code'] == 'existing'
+    assert _snapshot(pg, facts) == facts and len(calls) == 2
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE authorizations SET scopes=ARRAY['im:chat:read']::text[] WHERE id=%s", (cm,))
+        assert not imports.creator_import_evidence.validate_references(pg, pilot.settings, cm, chain['person'])
+    callbacks.clear()
+    identity_only = pilot.person('identity_wait')
+    pg.execute("UPDATE contacts SET entity_type='person' WHERE id=%s", (identity_only,))
+    pg.execute('DELETE FROM contact_roles WHERE contact_id=%s', (identity_only,))
+    group(pg, pilot, 'identity_wait', 'waiting_handle', 'identity_wait')
+    add_message(pg, pilot, 'identity_wait', 'identity_wait', 'I filmed my TikTok videos today.')
+
+    def identity_without_account(stage, pack, result):
+        if stage != 'person':
+            return
+        target = next(u['ref'] for u in pack['users'] if u['eligible'])
+        proof = next(m['ref'] for m in pack['messages'] if m['speaker'] == target)
+        result.update(outcome='review', user_ref=target, link_code='no_link_evidence', evidence_refs=[],
+                      creator={'state': 'supported', 'code': 'own_activity', 'confidence': .99, 'refs': [proof]},
+                      candidates=[{'user_ref': target, 'assessment': 'uncertain',
+                                   'reason': '本人在创作，但当前账号归属待核实。', 'evidence_refs': []}])
+
+    callbacks.append(identity_without_account)
+    pending = imports.preview_import(cm, cm, 'identity.xlsx', workbook('waiting_handle'))
+    imports.start_import(cm, pending['id'])
+    drain(pilot)
+    row = row_for(pg, pending, 'waiting_handle')
+    assert row['review_status'] == 'pending' and row['contact_id'] == identity_only
+    assert pg.execute("SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed'",
+                      (identity_only,)).fetchone()
+    assert not pg.execute('SELECT 1 FROM contact_social_accounts WHERE contact_id=%s', (identity_only,)).fetchone()
+    assert not pg.execute('SELECT 1 FROM contact_assignments WHERE contact_id=%s', (identity_only,)).fetchone()
 
 
 def test_shared_group_identifies_each_handle_person_and_preserves_the_evidence_chain(pg, pilot, monkeypatch):
@@ -694,14 +797,17 @@ def test_multiple_groups_merge_the_same_person_without_hiding_other_people_or_pa
     matched = row_for(pg, batch, "jodine_xx")
     assert matched["review_status"] == "pending" and matched["contact_id"] is None
     material = imports._decode(matched, pilot.settings)["person"]
-    assert len(material["pack"]["groups"]) == 2 and not material["pack"]["messages"]
+    primary = [g for g in material["pack"]["groups"] if g['match_kind'] != 'person_context']
+    private = [g for g in material["pack"]["groups"] if g['match_kind'] == 'person_context']
+    assert len(primary) == 2 and len(private) == 1 and private[0]['mode'] == 'p2p'
+    assert all(m['group_ref'] == private[0]['ref'] for m in material["pack"]["messages"])
     users = [u for u in material["pack"]["users"] if u["eligible"]]
     assert len(users) == 1
     assert all(g["member_refs"] == [users[0]["ref"]] for g in material["pack"]["groups"])
     assert set(next(r["open_ids"] for r in material["refs"] if r["label"] == users[0]["ref"])) == {
         "ou_creator", "ou_creator_alias"}
     displayed = imports.row_evidence(cm, matched["id"])
-    assert len(displayed["groups"]) == 2 and all(g["selected"] for g in displayed["groups"])
+    assert len(displayed["groups"]) == 3 and sum(g["selected"] for g in displayed["groups"]) == 2
     assert all(len(g["members"]) == 2 for g in displayed["groups"])
     for handle, count in (("different_people", 2), ("partial_roster", 1)):
         row = row_for(pg, batch, handle)
@@ -1159,7 +1265,8 @@ def test_group_person_refs_do_not_cross_people_groups_or_current_access(pg, pilo
                 "reason": "本人明确提供目标账号。", "evidence_refs": [own], "conflicts": [], "candidates": [
                     {"user_ref": target, "assessment": "target", "reason": "本人提供账号。", "evidence_refs": [own]},
                     {"user_ref": peer, "assessment": "uncertain", "reason": "不能仅凭同群判断。", "evidence_refs": []},
-                ]}
+                ], "creator": {"state": "known", "code": "known", "confidence": 1, "refs": []},
+                "link_code": "self_claim"}
     assert evidence.person_validate(json.dumps(response), pack)["outcome"] == "matched"
     wrong_person = deepcopy(response)
     wrong_person["evidence_refs"] = [unrelated]
@@ -1171,6 +1278,8 @@ def test_group_person_refs_do_not_cross_people_groups_or_current_access(pg, pilo
         # Preserve short answers and their explicit reply link; staff addressing alone cannot bind an account.
         question = add_message(pg, pilot, 'first_group', 'cm', 'Is target_account your TikTok account?')
         answer = add_message(pg, pilot, 'first_group', 'creator', 'Yes')
+        pg.execute("UPDATE chat_messages SET message_create_time=NOW()-INTERVAL '1 minute' WHERE message_id=%s",
+                   (question,))
         pg.execute('UPDATE chat_messages SET parent_id=%s WHERE message_id=%s', (question, answer))
         qa = evidence.build_person_evidence(pg, pilot.settings, cm, 'target_account', ['first_group'])
         labels = {r['message_id']: r['label'] for r in qa['refs'] if r['kind'] == 'message'}
@@ -1180,7 +1289,7 @@ def test_group_person_refs_do_not_cross_people_groups_or_current_access(pg, pilo
             {**response, 'evidence_refs': [labels[question]]}, qa['pack'],
         )['outcome'] == 'review'
         assert evidence.person_validate(
-            {**response, 'evidence_refs': [labels[question], labels[answer]]}, qa['pack'],
+            {**response, 'evidence_refs': [labels[question], labels[answer]], 'link_code': 'qa_confirm'}, qa['pack'],
         )['outcome'] == 'matched'
     with pg.transaction(force_rollback=True):
         sole = evidence.build_person_evidence(pg, pilot.settings, cm, "target_account", ["second_group"])
@@ -1189,7 +1298,9 @@ def test_group_person_refs_do_not_cross_people_groups_or_current_access(pg, pilo
         inferred = {"outcome": "matched", "user_ref": user, "confidence": .99,
                     "reason": "已选 CAP 群的完整成员资料仅一位可用用户。", "evidence_refs": [group_ref, user],
                     "conflicts": [], "candidates": [{"user_ref": user, "assessment": "target",
-                        "reason": "基于 CAP 名单和完整群成员。", "evidence_refs": [group_ref, user]}]}
+                        "reason": "基于 CAP 名单和完整群成员。", "evidence_refs": [group_ref, user]}],
+                    "creator": {"state": "known", "code": "known", "confidence": 1, "refs": []},
+                    "link_code": "group_context"}
         assert evidence.person_validate(json.dumps(inferred), sole["pack"])["outcome"] == "review"
         pg.execute("UPDATE authorization_chats SET member_snapshot_status='partial' WHERE chat_id='second_group'")
         partial = evidence.build_person_evidence(pg, pilot.settings, cm, "target_account", ["second_group"])
@@ -1227,7 +1338,7 @@ def test_group_person_refs_do_not_cross_people_groups_or_current_access(pg, pilo
         assert evidence.validate_reference_batch(
             meter, pilot.settings, cm, [material] * 50 + [sole, mixed_scope]
         ) == [True] * 51 + [False]
-        assert meter.calls == 6
+        assert meter.calls == 7
         pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id=%s",
                    (message_body_cipher(pilot.settings.token_encryption_key).encrypt("Changed account evidence"),
                     referenced))

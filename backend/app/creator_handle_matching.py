@@ -10,7 +10,17 @@ from functools import lru_cache
 from pathlib import Path
 from uuid import uuid4
 
-from . import admin_permissions, ai_dispatch, ai_feature_config, contact_handles, creator_data, creator_imports
+from psycopg import Rollback
+
+from . import (
+    admin_permissions,
+    ai_dispatch,
+    ai_feature_config,
+    assistant_rules,
+    contact_handles,
+    creator_data,
+    creator_imports,
+)
 from . import creator_handle_evidence as evidence
 from . import openai_client as api
 from .creator_access import require_owner
@@ -86,7 +96,7 @@ def _load_catalog(directory, _modified):
 def _config(conn, *, lock=False):
     return conn.execute(
         """SELECT provider,project_id,model,enabled,api_key_ciphertext,updated_at,
-        matching_catalog_version,
+        matching_catalog_version,auto_confirm_threshold,creator_recognition_started_at,
         automatic_queue_checked_at<NOW()-INTERVAL '1 minute' AS reconcile_due
         FROM ai_feature_configs WHERE feature=%s"""
         + (" FOR UPDATE" if lock else ""),
@@ -102,6 +112,52 @@ def _config_hash(config):
     # Credentials or rules invalidate frozen requests, without exposing the credential.
     return evidence_hash({**{k: config[k] for k in ("provider", "project_id", "model", "api_key_ciphertext")},
                           "prompt_version": evidence.PROMPT_VERSION})
+
+
+def _job_config_hash(config, purpose):
+    return (evidence_hash([_config_hash(config), str(config['auto_confirm_threshold'])])
+            if purpose == 'identity' else _config_hash(config))
+
+
+def _manual_stage(pack):
+    return 'match' if pack.get('purpose') == 'identity' else 'handle'
+
+
+def _manual_access(conn, pack):
+    if pack and pack.get('_rules'):
+        assistant_rules.creator_validate_access(conn, pack['_rules'], _manual_stage(pack))
+
+
+def confirm_identity(conn, contact_id, creator, pack, refs, settings, *, threshold=0.95,
+                     job_id=None, source='creator_identity_auto_verified', live_valid=None):
+    """Add a new creator fact only; existing roles, accounts and responsibilities are immutable here."""
+    creator = evidence.identity_validate(pack, creator, threshold=max(0.95, float(threshold)))
+    if creator['state'] not in {'known', 'supported'}:
+        return False
+    for handle in sorted({h['handle'] for h in pack['handles']}):
+        conn.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,137034))', ('tiktok:' + handle,))
+    conn.execute('SELECT id FROM contacts WHERE id=%s FOR UPDATE', (contact_id,))
+    valid = live_valid() if live_valid else evidence.still_valid(conn, refs, settings)
+    if not valid:
+        return False
+    if conn.execute("SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed'",
+                    (contact_id,)).fetchone():
+        return True
+    if creator['state'] != 'supported' or not conn.execute('SELECT creator_identity_eligible(%s) eligible',
+                                                         (contact_id,)).fetchone()['eligible']:
+        return False
+    if pack.get('_rules'):
+        assistant_rules.creator_validate_access(conn, pack['_rules'], 'admit')
+    inserted = conn.execute("""INSERT INTO contact_roles(contact_id,role,status,source,is_primary,reviewed_at)
+        VALUES(%s,'creator','confirmed',%s,TRUE,NOW()) ON CONFLICT DO NOTHING RETURNING contact_id""",
+        (contact_id, source)).fetchone()
+    if not inserted:
+        return False
+    conn.execute("SELECT enqueue_creator_responsibility(%s,'history')", (contact_id,))
+    _audit(conn, None, 'creator_identity_auto_confirmed', {'contact_id': str(contact_id),
+        'task_id': str(job_id) if job_id else None, 'source': source,
+        'rules_digest': pack.get('_rules', {}).get('digest'), 'refs': creator['refs']})
+    return True
 
 
 def _confirmation_changed(conn, job, pack):
@@ -132,7 +188,7 @@ def configuration_changed(conn):
     )
 
 
-def touch_chats(conn, chat_ids):
+def touch_chats(conn, chat_ids, *, recognition_message_ids=()):
     """One lightweight signal per committed sync page, not a model call per message."""
     if not chat_ids or not _enabled(_config(conn)):
         return
@@ -145,6 +201,17 @@ def touch_chats(conn, chat_ids):
         JOIN contact_roles r ON r.contact_id=p.contact_id AND r.role='creator' AND r.status='confirmed'""",
         (chat_ids, chat_ids),
     )
+    if recognition_message_ids:
+        conn.execute("""SELECT enqueue_creator_identity(i.contact_id,CASE WHEN bool_or(
+              c.created_at>=f.creator_recognition_started_at AND m.message_type IN ('text','post')
+              AND m.body_ciphertext IS NOT NULL AND EXISTS(SELECT 1 FROM creator_handle_jobs j
+                WHERE j.contact_id=i.contact_id AND j.purpose='identity' AND j.status='waiting_evidence'
+                  AND j.reason_code='no_text')) THEN NOW()
+              ELSE max(GREATEST(m.message_create_time,m.message_update_time)) END)
+            FROM chat_messages m JOIN lark_identities i ON i.open_id=m.sender_open_id AND i.identity_type='user'
+            JOIN contacts c ON c.id=i.contact_id JOIN ai_feature_configs f ON f.feature='creator_handle_matching'
+            WHERE m.chat_id=ANY(%s::text[]) AND m.message_id=ANY(%s::text[]) AND i.contact_id IS NOT NULL
+              AND NOT m.is_deleted GROUP BY i.contact_id""", (chat_ids, list(recognition_message_ids)))
 
 
 def _recover(conn):
@@ -159,8 +226,10 @@ def _recover(conn):
         AND r.error_code='' AND r.billed_tokens IS NULL""")
     conn.execute("""UPDATE creator_handle_jobs j SET status='cancelled',desired_version=desired_version+1,
         reason_code='identity_removed',updated_at=NOW()
-        WHERE j.status NOT IN ('completed','failed','cancelled') AND NOT EXISTS(
-        SELECT 1 FROM contact_roles r WHERE r.contact_id=j.contact_id AND r.role='creator' AND r.status='confirmed')""")
+        WHERE j.status NOT IN ('completed','failed','cancelled') AND (
+          j.purpose='identity' AND NOT creator_identity_eligible(j.contact_id)
+          OR j.purpose='handles' AND NOT EXISTS(SELECT 1 FROM contact_roles r
+            WHERE r.contact_id=j.contact_id AND r.role='creator' AND r.status='confirmed'))""")
 
 
 def _reuse_history_association(conn, job):
@@ -229,13 +298,25 @@ def prepare_next(settings):
             (token, job["id"]),
         )
         version = job["desired_version"]
-        config_hash = _config_hash(config)
+        config_hash = _job_config_hash(config, job['purpose'])
     try:
         handles, catalog_version = reference_catalog()
         with connection() as conn, conn.transaction():
             conn.execute("SET LOCAL statement_timeout='90s'")
-            prepared = evidence.build(conn, settings, job["contact_id"], handles, recheck=job["source"] == "manual")
+            pinned = assistant_rules.creator_snapshot(conn, settings)
+            stage = 'match' if job['purpose'] == 'identity' else 'handle'
+            assistant_rules.creator_validate_access(conn, pinned, stage)
+            prepared = evidence.build(conn, settings, job["contact_id"], handles,
+                                      recheck=job["source"] == "manual",
+                                      **({'purpose': 'identity'} if job['purpose'] == 'identity' else {}))
+            if prepared['pack']:
+                prepared['pack']['_rules'] = pinned
+                prepared['fingerprint'] = evidence_hash([prepared['fingerprint'], pinned['digest']])
+            prepared['stats']['rules_digest'] = pinned['digest']
             prepared["stats"] = {**prepared["stats"], "prompt_version": evidence.PROMPT_VERSION}
+    except PermissionError:
+        _finish_preparation(job['id'], token, version, 'waiting_evidence', 'rules_unavailable')
+        return True
     except (OSError, ValueError, KeyError):
         _finish_preparation(job["id"], token, version, "waiting_evidence", "catalog_unavailable")
         return True
@@ -250,7 +331,8 @@ def prepare_next(settings):
             return True
         if _reuse_history_association(conn, current):
             return True
-        if current["desired_version"] != version or not _enabled(config) or _config_hash(config) != config_hash:
+        if (current["desired_version"] != version or not _enabled(config)
+                or _job_config_hash(config, job['purpose']) != config_hash):
             _invalidate(conn, current)
             return True
         pack = prepared["pack"]
@@ -278,18 +360,37 @@ def prepare_next(settings):
         ).fetchone()
         storage = creator_data.cipher(settings)
         if pack and job["source"] != "manual" and not cached:
+            request_fingerprint = evidence_hash(pack)
+            receipt = (conn.execute("""SELECT r.response_ciphertext FROM creator_handle_requests r
+                JOIN creator_handle_jobs j ON j.id=r.job_id WHERE j.contact_id=%s
+                AND r.material_fingerprint=%s AND r.config_fingerprint=%s
+                AND r.error_code='' AND r.billed_tokens IS NOT NULL
+                AND r.response_ciphertext IS NOT NULL ORDER BY r.created_at DESC LIMIT 1""",
+                (job['contact_id'], request_fingerprint, config_hash)).fetchone()
+                       if job['purpose'] == 'identity' else None)
+            if receipt:
+                returned = json.loads(storage.decrypt(receipt['response_ciphertext'])).get('validated')
+                if returned:
+                    try:
+                        returned = evidence.validate(pack, returned)
+                    except api.ModelOutputError:
+                        returned = None
+                if returned:
+                    cached = {'result_ciphertext': storage.encrypt(creator_data.encode({'result': returned})),
+                              'status': 'review_required', 'reason_code': 'cached',
+                              'stats': prepared['stats'], 'attempts': 0}
             unknown = conn.execute("""SELECT 1 FROM creator_handle_requests r
                 JOIN creator_handle_jobs j ON j.id=r.job_id
-                WHERE j.contact_id=%s AND r.material_fingerprint=%s
+                WHERE j.contact_id=%s AND r.material_fingerprint=ANY(%s::text[])
                 AND (r.error_code='request_unknown' OR r.error_code='' AND r.billed_tokens IS NULL) LIMIT 1""",
-                (job["contact_id"], evidence_hash(pack))).fetchone()
+                (job["contact_id"], [request_fingerprint, evidence_hash(pack)])).fetchone()
             if not unknown:
                 # Older attempts have no frozen hash. Their failed encrypted material remains readable locally.
                 prior = conn.execute("""SELECT pack_ciphertext FROM creator_handle_jobs WHERE contact_id=%s
                     AND status='failed' AND reason_code='request_unknown' AND pack_ciphertext IS NOT NULL""",
                     (job["contact_id"],)).fetchall()
                 unknown = any(json.loads(storage.decrypt(row["pack_ciphertext"])) == pack for row in prior)
-            if unknown:
+            if unknown and not cached:
                 cached = {"status": "failed", "reason_code": "request_unknown", "result_ciphertext": None,
                           "stats": prepared["stats"], "attempts": 0}
         if cached:
@@ -297,7 +398,7 @@ def prepare_next(settings):
         if cached and cached["result_ciphertext"]:
             if (
                 not evidence.still_valid(conn, prepared["refs"], settings)
-                or not conn.execute(
+                or job['purpose'] == 'handles' and not conn.execute(
                     "SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed'",
                     (job["contact_id"],),
                 ).fetchone()
@@ -305,7 +406,7 @@ def prepare_next(settings):
                 _invalidate(conn, current)
                 return True
             saved = evidence.validate(pack, json.loads(storage.decrypt(cached["result_ciphertext"]))["result"])
-            cached["stats"] = _apply_links(
+            cached["stats"] = _apply_result(
                 conn,
                 current,
                 pack,
@@ -386,7 +487,7 @@ def _invalidate(conn, job):
 
 
 def _needs_review(result, stats):
-    return any(
+    return result['creator']['state'] == 'review' or any(
         link["decision"] == "review"
         or link["needed"]
         or link["period"] == "historical"
@@ -536,6 +637,26 @@ def _apply_links(conn, job, pack, result, stats, refs, settings, catalog_version
     }
 
 
+def _apply_result(conn, job, pack, result, stats, refs, settings, catalog_version):
+    with conn.transaction() as admission:
+        _manual_access(conn, pack)
+        if job.get('purpose') == 'identity':
+            creator = evidence.identity_validate(pack, result['creator'],
+                threshold=max(0.95, float(_config(conn)['auto_confirm_threshold'])))
+            result['creator'] = creator
+            admitted = confirm_identity(conn, job['contact_id'], creator, pack, refs, settings,
+                threshold=max(0.95, float(_config(conn)['auto_confirm_threshold'])), job_id=job['id'])
+            stats = {**stats, 'identity_confirmed': admitted, 'identity_state': creator['state']}
+            if not admitted:
+                return {**stats, 'claimed_handles': [], 'auto_linked_handles': []}
+            pack = {**pack, 'creator_known': True}
+        applied = _apply_links(conn, job, pack, result, stats, refs, settings, catalog_version)
+        if applied is None:
+            raise Rollback(admission)
+        return applied
+    return None
+
+
 def claim():
     with connection() as conn, conn.transaction():
         config = _config(conn, lock=True)
@@ -556,20 +677,29 @@ def claim():
             return None
         if _reuse_history_association(conn, job):
             return None
-        if job["config_fingerprint"] != _config_hash(config) or job["snapshot_version"] != job["desired_version"]:
+        if (job["config_fingerprint"] != _job_config_hash(config, job['purpose'])
+                or job["snapshot_version"] != job["desired_version"]):
             _invalidate(conn, job)
             return None
         from .config import get_settings
 
         storage = creator_data.cipher(get_settings())
         pack = json.loads(storage.decrypt(job["pack_ciphertext"]))
+        try:
+            _manual_access(conn, pack)
+        except PermissionError:
+            conn.execute("""UPDATE creator_handle_jobs SET status='waiting_evidence',reason_code='rules_unavailable'
+                WHERE id=%s""",
+                         (job['id'],))
+            return None
         if _confirmation_changed(conn, job, pack):
             _invalidate(conn, job)
             return None
         reservation = uuid4()
         conn.execute(
-            "INSERT INTO creator_handle_requests(id,job_id,material_fingerprint) VALUES(%s,%s,%s)",
-            (reservation, job["id"], evidence_hash(pack)),
+            "INSERT INTO creator_handle_requests(id,job_id,material_fingerprint,config_fingerprint) "
+            "VALUES(%s,%s,%s,%s)",
+            (reservation, job["id"], evidence_hash(pack), job['config_fingerprint']),
         )
         token = uuid4()
         conn.execute(
@@ -597,15 +727,24 @@ def _current(conn, job):
     if (
         row["desired_version"] != job["snapshot_version"]
         or not _enabled(config)
-        or _config_hash(config) != job["config_fingerprint"]
+        or _job_config_hash(config, job['purpose']) != job["config_fingerprint"]
         or _confirmation_changed(conn, row, job["pack"])
     ):
         _invalidate(conn, row)
         return None
-    if not conn.execute(
+    try:
+        _manual_access(conn, job['pack'])
+    except PermissionError:
+        conn.execute("""UPDATE creator_handle_jobs SET status='waiting_evidence',reason_code='rules_unavailable',
+            lease_until=NULL,claim_token=NULL WHERE id=%s""", (job['id'],))
+        return None
+    eligible = (conn.execute('SELECT creator_identity_eligible(%s) eligible',
+                            (job['contact_id'],)).fetchone()['eligible']
+                if job['purpose'] == 'identity' else bool(conn.execute(
         "SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' AND status='confirmed'",
         (job["contact_id"],),
-    ).fetchone():
+    ).fetchone()))
+    if not eligible:
         conn.execute(
             """UPDATE creator_handle_jobs SET status='cancelled',reason_code='identity_removed',
             lease_until=NULL WHERE id=%s""",
@@ -633,7 +772,7 @@ def _compact_result(pack, value):
     """Whitelist protocol fields: never persist model prose, quotations or arbitrary strings."""
     if not isinstance(value, dict):
         return {"parseable": False}
-    schema = evidence.output_format()["schema"]["properties"]
+    schema = evidence.output_format(pack)["schema"]["properties"]
     handle_ids = {h["id"] for h in pack["handles"]}
     message_ids = {m["id"] for m in pack["messages"]}
 
@@ -652,6 +791,8 @@ def _compact_result(pack, value):
                 )
             elif key == "h":
                 clean[key] = child if isinstance(child, str) and child in handle_ids else "[invalid]"
+            elif spec['type'] == 'number':
+                clean[key] = child if type(child) in (int, float) and 0 <= child <= 1 else '[invalid]'
             else:
                 clean[key] = child if isinstance(child, str) and child in spec["enum"] else "[invalid]"
         code = item.get("validation_error")
@@ -673,12 +814,14 @@ def review(pack, config, contact_id, settings):
     result, telemetry, error, diagnostic = None, {}, None, None
     try:
         key = ai_feature_config.api_key_cipher(settings.token_encryption_key).decrypt(config["api_key_ciphertext"])
+        instructions = (assistant_rules.creator_instructions(pack['_rules'], _manual_stage(pack))
+                        if pack.get('_rules') else evidence.instructions())
         response = api.call_openai(
             config,
             key,
-            pack,
+            {k: v for k, v in pack.items() if k != '_rules'},
             str(contact_id),
-            instructions=evidence.instructions(),
+            instructions=instructions,
             output_format=evidence.output_format(pack),
             max_output_tokens=MAX_OUTPUT,
             reasoning_effort="none",
@@ -798,7 +941,7 @@ def run(job, settings):
             )
         else:
             by_handle = {h["id"]: h["handle"] for h in job["pack"]["handles"]}
-            stats = _apply_links(
+            stats = _apply_result(
                 conn,
                 current,
                 job["pack"],
@@ -811,7 +954,7 @@ def run(job, settings):
             if stats is None:
                 _invalidate(conn, current)
                 return
-            needs_review = _needs_review(result, current["stats"])
+            needs_review = _needs_review(result, stats)
             view = {"handles": by_handle, "result": result}
             conn.execute(
                 """UPDATE creator_handle_jobs SET status=%s,reason_code='suggestions_saved',
@@ -876,6 +1019,7 @@ def page_data(conn, actor, settings, page=1):
             {"handle": row["handle"], "human_confirmed": row["human_confirmed"]}
         )
     for job in jobs:
+        job['identity_state'] = job['stats'].get('identity_state')
         job["associations"] = associations.get(str(job["contact_id"]), [])
         job["suggestions"] = []
         reused = job["source"] == "history" and job["reason_code"] == "already_confirmed"
@@ -950,7 +1094,10 @@ def action(conn, actor, job_id, operation):
     elif operation == "recheck":
         if not _enabled(_config(conn)):
             raise ValueError("匹配功能未启用。")
-        conn.execute("SELECT enqueue_creator_handle(%s,'manual',TRUE)", (row["contact_id"],))
+        if row['purpose'] == 'identity':
+            conn.execute('SELECT enqueue_creator_identity(%s,NOW(),TRUE)', (row['contact_id'],))
+        else:
+            conn.execute("SELECT enqueue_creator_handle(%s,'manual',TRUE)", (row["contact_id"],))
     else:
         raise ValueError("操作无效。")
     _audit(conn, actor, "creator_handle_job_" + operation, {"job_id": str(job_id)})

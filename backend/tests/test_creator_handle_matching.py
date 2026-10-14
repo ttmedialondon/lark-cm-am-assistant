@@ -163,6 +163,162 @@ def _enqueue(pg, contact, source="manual"):
     return pg.execute("SELECT enqueue_creator_handle(%s,%s,TRUE) id", (contact, source)).fetchone()["id"]
 
 
+def test_new_person_identity_queue_admits_without_handle_and_preserves_existing_facts(
+    pg, matching_flow, pilot, monkeypatch
+):
+    flow = matching_flow
+    flow.enable()
+    monkeypatch.setattr(matching.evidence, 'build', flow.real_build)
+    monkeypatch.setattr(matching.evidence, 'still_valid', flow.real_still_valid)
+    protected = _snapshot(pg, ('contact_assignments', 'contact_social_accounts'))
+    roles = _snapshot(pg, ('contact_roles',))['contact_roles']
+    new_id, old_id = uuid4(), uuid4()
+    for contact, name, age in ((old_id, 'old_unread', 2), (new_id, 'new_creator', 0)):
+        pg.execute("INSERT INTO contacts(id,entity_type,display_name,created_at) "
+                   "VALUES(%s,'person',%s,NOW()-(%s*INTERVAL '1 day'))", (contact, name, age))
+        pg.execute("INSERT INTO lark_identities(open_id,contact_id,identity_type,tenant_classification) "
+                   "VALUES(%s,%s,'user','known_external')", ('ou_' + name, contact))
+    assert not pg.execute('SELECT 1 FROM creator_handle_jobs WHERE contact_id=%s', (old_id,)).fetchone()
+    assert pg.execute('SELECT purpose FROM creator_handle_jobs WHERE contact_id=%s',
+                      (new_id,)).fetchone()['purpose'] == 'identity'
+    pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('new_private','New creator','p2p')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id,p2p_counterpart_open_id) "
+               "VALUES(%s,'new_private','ou_new_creator')", (pilot.ids['cm'],))
+    cipher = message_body_cipher(flow.settings.token_encryption_key)
+    pg.execute("INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,"
+               "message_create_time,body_ciphertext) VALUES('new_private','new_activity','ou_new_creator',"
+               "'user','text',NOW(),%s)",
+               (cipher.encrypt(json.dumps({'text': 'I film TikTok videos and post my sponsored video tonight.'})),))
+    pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+               "VALUES(%s,'new_private','new_activity')", (pilot.ids['cm'],))
+    matching.touch_chats(pg, ['new_private'], recognition_message_ids=['new_activity'])
+    version = pg.execute('SELECT desired_version FROM creator_handle_jobs WHERE contact_id=%s',
+                         (new_id,)).fetchone()['desired_version']
+    matching.touch_chats(pg, ['new_private'], recognition_message_ids=['new_activity'])
+    assert pg.execute('SELECT desired_version FROM creator_handle_jobs WHERE contact_id=%s',
+                      (new_id,)).fetchone()['desired_version'] == version
+    # A historic first-body hydration cannot requeue an old identity task.
+    pg.execute("INSERT INTO creator_handle_jobs(contact_id,purpose,status,identity_signal_at) "
+               "VALUES(%s,'identity','waiting_evidence',NOW())", (old_id,))
+    pg.execute("INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,"
+               "message_create_time,message_update_time) VALUES('new_private','old_hydration','ou_old_unread',"
+               "'user','text',NOW()-INTERVAL '2 days',NOW()-INTERVAL '2 days')")
+    pg.execute("UPDATE chat_messages SET body_fingerprint=%s WHERE message_id='old_hydration'", ('f' * 64,))
+    assert pg.execute('SELECT desired_version FROM creator_handle_jobs WHERE contact_id=%s',
+                      (old_id,)).fetchone()['desired_version'] == 1
+    pg.execute("UPDATE creator_handle_jobs SET not_before=NOW() WHERE contact_id=%s", (new_id,))
+    calls = []
+
+    def identity_response(_config, _key, payload, _contact, **kwargs):
+        calls.append(kwargs)
+        assert '_rules' not in payload and payload['handles'] == []
+        assert '达人身份证据规则' in kwargs['instructions'] and '历史案例与识别验收' not in kwargs['instructions']
+        own = next(m['id'] for m in payload['messages'] if m['speaker'] == payload['target'])
+        return {'text': json.dumps({'creator': {'state': 'supported', 'code': 'own_activity',
+            'confidence': 0.99, 'refs': [own]}, 'links': []}), 'response_id': 'resp_identity_synthetic',
+            'usage': {'input_tokens': 100, 'output_tokens': 50}, 'telemetry': {}}
+
+    monkeypatch.setattr(matching.api, 'call_openai', identity_response)
+    assert matching.prepare_next(flow.settings)
+    job = matching.claim()
+    assert job and job['purpose'] == 'identity'
+    matching.run(job, flow.settings)
+    saved = pg.execute('SELECT status,stats FROM creator_handle_jobs WHERE id=%s', (job['id'],)).fetchone()
+    assert saved['status'] == 'completed' and saved['stats']['identity_confirmed'] is True
+    assert pg.execute("SELECT source FROM contact_roles WHERE contact_id=%s AND role='creator'",
+                      (new_id,)).fetchone() == {
+        'source': 'creator_identity_auto_verified'}
+    assert _snapshot(pg, protected.keys()) == protected
+    assert all(role in _snapshot(pg, ('contact_roles',))['contact_roles'] for role in roles)
+    assert len(calls) == 1 and not matching.prepare_next(flow.settings)
+    assert pg.execute('SELECT enqueue_creator_identity(%s,NOW(),TRUE) id', (new_id,)).fetchone()['id'] is None
+    assert not pg.execute('SELECT 1 FROM contact_assignments WHERE contact_id=%s', (new_id,)).fetchone()
+
+    def add_private_person(name, handle):
+        contact = uuid4()
+        chat, message, open_id = 'private_' + name, 'activity_' + name, 'ou_' + name
+        pg.execute("INSERT INTO contacts(id,entity_type,display_name) VALUES(%s,'person',%s)", (contact, name))
+        pg.execute("INSERT INTO lark_identities(open_id,contact_id,identity_type,tenant_classification) "
+                   "VALUES(%s,%s,'user','known_external')", (open_id, contact))
+        pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES(%s,%s,'p2p')", (chat, name))
+        pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id,p2p_counterpart_open_id) "
+                   "VALUES(%s,%s,%s)", (pilot.ids['cm'], chat, open_id))
+        pg.execute("INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,"
+                   "message_create_time,body_ciphertext) VALUES(%s,%s,%s,'user','text',NOW(),%s)",
+                   (chat, message, open_id, cipher.encrypt(json.dumps({'text':
+                       f'My TikTok account is {handle}. I film TikTok videos and post my sponsored review tonight.'}))))
+        pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+                   "VALUES(%s,%s,%s)", (pilot.ids['cm'], chat, message))
+        matching.touch_chats(pg, [chat], recognition_message_ids=[message])
+        pg.execute("UPDATE creator_handle_jobs SET not_before=NOW() WHERE contact_id=%s", (contact,))
+        return contact
+
+    def identity_with_handle(_config, _key, payload, _contact, **kwargs):
+        calls.append(kwargs)
+        assert payload['purpose'] == 'identity' and '_rules' not in payload
+        assert len(payload['handles']) == 1
+        own = next(m['id'] for m in payload['messages'] if m['speaker'] == payload['target'])
+        if flow.before_response:
+            flow.before_response()
+        return {'text': json.dumps({'creator': {'state': 'supported', 'code': 'own_activity',
+            'confidence': 0.99, 'refs': [own]}, 'links': [{
+                'h': payload['handles'][0]['id'], 'decision': 'supported', 'relation': 'self_account',
+                'period': 'at_message', 'code': 'self_claim', 'refs': [own], 'needed': []}]}),
+            'response_id': 'resp_identity_handle', 'usage': {'input_tokens': 110, 'output_tokens': 60},
+            'telemetry': {'openai_request_id': 'req_identity_handle'}}
+
+    monkeypatch.setattr(matching.api, 'call_openai', identity_with_handle)
+    with_handle = add_private_person('new_with_handle', 'fresh.creator')
+    original_assignments = _snapshot(pg, ('contact_assignments', 'creator_account_assignments'))
+    old_links = _snapshot(pg, ('contact_social_accounts',))['contact_social_accounts']
+    assert matching.prepare_next(flow.settings)
+    linked_job = matching.claim()
+    assert linked_job and linked_job['contact_id'] == with_handle and linked_job['purpose'] == 'identity'
+    # A duplicate sync signal can advance a version while the same evidence's paid response is in flight.
+    flow.before_response = lambda: pg.execute(
+        "SELECT enqueue_creator_identity(%s,NOW()+INTERVAL '1 second',TRUE)", (with_handle,))
+    matching.run(linked_job, flow.settings)
+    pending = pg.execute('SELECT status,desired_version FROM creator_handle_jobs WHERE id=%s',
+                         (linked_job['id'],)).fetchone()
+    assert pending['status'] == 'queued' and pending['desired_version'] > linked_job['snapshot_version']
+    receipt = pg.execute('SELECT error_code,billed_tokens,response_ciphertext FROM creator_handle_requests '
+                         'WHERE id=%s', (linked_job['reservation_id'],)).fetchone()
+    assert receipt['error_code'] == '' and receipt['billed_tokens'] == 170 and receipt['response_ciphertext']
+    assert not pg.execute("SELECT 1 FROM contact_roles WHERE contact_id=%s", (with_handle,)).fetchone()
+    flow.before_response = None
+    assert matching.prepare_next(flow.settings)
+    saved = pg.execute('SELECT id,status,reason_code,stats FROM creator_handle_jobs WHERE contact_id=%s',
+                       (with_handle,)).fetchone()
+    assert saved['id'] == linked_job['id'] and saved['status'] == 'completed' and saved['reason_code'] == 'cached'
+    assert saved['stats']['identity_confirmed'] is True and saved['stats']['auto_linked_handles'] == ['fresh.creator']
+    assert contact_handles.for_contacts(pg, [with_handle])[with_handle] == ['fresh.creator']
+    assert pg.execute("SELECT source FROM contact_roles WHERE contact_id=%s AND role='creator'",
+                      (with_handle,)).fetchone() == {'source': 'creator_identity_auto_verified'}
+    assert len(calls) == 2 and matching.claim() is None
+    assert pg.execute('SELECT count(*) n FROM creator_handle_requests WHERE job_id=%s',
+                      (linked_job['id'],)).fetchone()['n'] == 1
+    assert _snapshot(pg, original_assignments.keys()) == original_assignments
+    assert all(link in _snapshot(pg, ('contact_social_accounts',))['contact_social_accounts'] for link in old_links)
+    assert not pg.execute('SELECT 1 FROM contact_assignments WHERE contact_id=%s', (with_handle,)).fetchone()
+
+    revoked = add_private_person('new_revoked', 'revoked.creator')
+    unchanged = _snapshot(pg, ('contact_roles', 'contact_social_accounts', 'contact_assignments',
+                               'creator_account_assignments'))
+    assert matching.prepare_next(flow.settings)
+    revoked_job = matching.claim()
+    assert revoked_job and revoked_job['contact_id'] == revoked
+    flow.before_response = lambda: pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s",
+                                              (pilot.ids['cm'],))
+    matching.run(revoked_job, flow.settings)
+    assert _snapshot(pg, unchanged.keys()) == unchanged
+    assert not pg.execute('SELECT 1 FROM contact_roles WHERE contact_id=%s', (revoked,)).fetchone()
+    assert contact_handles.for_contacts(pg, [revoked])[revoked] == []
+    paid = pg.execute('SELECT billed_tokens,response_ciphertext,error_code FROM creator_handle_requests WHERE id=%s',
+                      (revoked_job['reservation_id'],)).fetchone()
+    assert paid['billed_tokens'] == 170 and paid['response_ciphertext'] and paid['error_code'] == ''
+    assert len(calls) == 3
+
+
 def _prepared_job(pg, flow, source="manual"):
     _enqueue(pg, flow.contact, source)
     assert matching.prepare_next(flow.settings)

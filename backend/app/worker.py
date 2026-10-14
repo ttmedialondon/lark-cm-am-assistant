@@ -2304,7 +2304,8 @@ def _record_claimed_page(
         if not updated:
             raise StaleSyncJob
         if inserted:
-            creator_handle_matching.touch_chats(conn, [claim.chat_id])
+            creator_handle_matching.touch_chats(conn, [claim.chat_id],
+                recognition_message_ids=[m['message_id'] for m in messages if m.get('message_id')])
             creator_group_matching.touch_chats(conn, [claim.chat_id])
     return PageCommit(True, inserted, own_inserted)
 

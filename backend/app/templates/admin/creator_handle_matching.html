@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}达人—handle 匹配{% endblock %}
+{% block title %}达人识别与账号匹配{% endblock %}
 {% block body %}
 {% set status_labels = {
   'queued': '待处理', 'preparing': '整理证据', 'ready': '待调用', 'running': '匹配中',
@@ -10,6 +10,7 @@
   'ready': '证据已准备', 'cached': '复用已有结果', 'suggestions_saved': '匹配结果已保存',
   'no_text': '没有可读消息', 'no_candidates': '未找到新的账号线索', 'restricted': '不在处理范围',
   'no_account_evidence': '缺少可用关联证据',
+  'rules_unavailable': '处理手册未发布，等待恢复',
   'material_limit': '证据超出处理上限', 'catalog_unavailable': 'Curva 名单暂不可用',
   'preparation_failed': '证据准备失败', 'snapshot_changed': '证据或配置已更新',
   'lease_expired': '任务超时，正在恢复', 'identity_removed': '达人身份已取消',
@@ -46,7 +47,7 @@
   {% include "admin/_nav.html" %}
 <div class="page-wrapper"><div class="container-xl py-4">
   <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-3">
-    <div><h2 class="mb-1">达人—handle 匹配</h2><div class="text-secondary">{{ '已启用' if matching.enabled else '未启用' }} · 强证据自动关联，其他待核实</div></div>
+    <div><h2 class="mb-1">达人识别与账号匹配</h2><div class="text-secondary">{{ '已启用' if matching.enabled else '未启用' }} · 规则通过自动入库，其他待核实</div></div>
     <div class="d-flex gap-2"><a class="btn" href="/admin/ai/creator-handle-matching?page={{ matching.page }}">刷新</a><a class="btn" href="/admin/ai">{{ 'API Key 配置' if admin_role == 'owner' else 'AI 功能' }}</a>
       {% if admin_role == 'owner' %}
       <form method="post" action="/admin/ai/creator-handle-matching/enqueue"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-primary" {% if not matching.enabled %}disabled{% endif %}>补入全部未处理达人</button></form>
@@ -54,9 +55,10 @@
     </div>
   </div>
   <div class="d-flex flex-wrap gap-3 mb-3">{% for item in matching.counts %}<span>{{ status_labels.get(item.status, item.status) }}：{{ item.n }}</span>{% else %}<span class="text-secondary">暂无任务</span>{% endfor %}</div>
-  <div class="card table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>达人</th><th>状态</th><th>账号匹配</th><th>Token</th><th>操作</th></tr></thead><tbody>
+  <div class="card table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>人员</th><th>状态</th><th>识别结果</th><th>Token</th><th>操作</th></tr></thead><tbody>
     {% for job in matching.jobs %}{% set display_status = job.display_status|default(job.status) %}{% set display_reason = job.display_reason_code|default(job.reason_code) %}<tr><td>{{ job.display_name or '未命名' }}</td><td>{{ status_labels.get(display_status, display_status) }}{% if display_reason %}<div class="text-secondary small">{{ reason_labels.get(display_reason, display_reason) }}</div>{% endif %}{% if job.validation_error and job.validation_error != display_reason %}<div class="text-secondary small">{{ error_labels.get(job.validation_error, job.validation_error) }}</div>{% endif %}</td>
       <td>
+        {% if job.purpose == 'identity' %}<div class="mb-1">{{ {'supported':'达人身份已确认','known':'复用已确认身份','review':'达人身份待核实','not_supported':'本轮未支持达人身份'}.get(job.identity_state, '达人身份识别') }}</div>{% endif %}
         {% for item in job.handle_rows %}<div class="{{ 'text-danger' if item.conflict else 'text-secondary' }}"><a class="text-reset" href="https://www.tiktok.com/@{{ item.handle }}" rel="noopener noreferrer" target="_blank">@{{ item.handle }}</a>{% if item.associated %} · {{ '人工已核准' if item.human_confirmed else '已关联' }}{% endif %}{% if item.conflict %} · 归属冲突{% endif %}{% if item.check %} · 本轮：{{ decision_labels.get(item.check.decision, item.check.decision) }}{% if not item.associated or item.check.decision != 'supported' or item.conflict %}<div class="small">{{ relation_labels.get(item.check.relation, item.check.relation) }} · {{ code_labels.get(item.check.code, item.check.code) }} · {{ period_labels.get(item.check.period, '时点不明') }}{% if item.check.validation_error %} · {{ error_labels.get(item.check.validation_error, item.check.validation_error) }}{% endif %}</div>{% endif %}{% endif %}</div>{% else %}—{% endfor %}
       </td>
       <td>{{ job.input_tokens + job.output_tokens }}</td><td><div class="d-flex gap-2">

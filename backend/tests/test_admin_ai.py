@@ -399,13 +399,32 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     creator_key = "creator-identity"
     creator_page = client.get(path + "?document=" + creator_key)
     assert creator_page.status_code == 200 and "达人识别" in creator_page.text
-    assert "固定用途：达人识别 · 处理规范" in creator_page.text
-    assert "处理规范尚未接入自动执行；保存不触发识别或重跑" in creator_page.text
+    assert "固定用途：达人识别 · 身份判定" in creator_page.text
+    assert "已接入名单导入、新人员识别和账号补配" in creator_page.text
+    assert "不全量重跑，不修改已有确认关系" in creator_page.text
     assert 'name="kind" value="manual"' in creator_page.text and 'name="visibility" value="owner"' in creator_page.text
     assert 'id="document-status" name="status"' in creator_page.text and "查看默认规则" in creator_page.text
     assert '<select class="form-select" id="document-kind"' not in creator_page.text
     assert '<select class="form-select" id="document-visibility"' not in creator_page.text
     creator_document = assistant_rules.library(pg, settings)[creator_key]
+    creator_pinned = assistant_rules.creator_snapshot(pg, settings)
+    creator_pinned_before = json.dumps(creator_pinned, sort_keys=True)
+    assert set(creator_pinned["documents"]) == assistant_rules.CREATOR_KEYS
+    identity_rules = assistant_rules.creator_instructions(creator_pinned, "identity")
+    handle_rules = assistant_rules.creator_instructions(creator_pinned, "handle")
+    assert creator_document["text"] in identity_rules and creator_document["text"] not in handle_rules
+    assert creator_pinned["documents"]["creator-handle-link"]["text"] in handle_rules
+    assert creator_pinned["documents"]["creator-handle-link"]["text"] not in identity_rules
+    assert creator_pinned["documents"]["creator-regression"]["text"] not in identity_rules + handle_rules
+    for changed_field, value in (("text", "未经版本校验的规则"), ("title", "篡改标题"), ("revision", 10)):
+        damaged = json.loads(creator_pinned_before)
+        damaged["documents"][creator_key][changed_field] = value
+        with pytest.raises(ValueError):
+            assistant_rules.creator_instructions(damaged, "identity")
+    damaged = json.loads(creator_pinned_before)
+    del damaged["documents"][creator_key]
+    with pytest.raises(ValueError):
+        assistant_rules.creator_instructions(damaged, "identity")
     creator_content = creator_document["text"] + "\n测试识别规范 <script>alert(3)</script>。"
     creator_form = {"csrf_token": "csrf", "document": creator_key, "revision": "0", "content": creator_content,
                     **{name: creator_document[name]
@@ -415,6 +434,9 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     creator_row = pg.execute("SELECT * FROM assistant_rule_overrides WHERE rule_key=%s", (creator_key,)).fetchone()
     assert creator_row["revision"] == 1 and creator_content not in creator_row["content_ciphertext"]
     assert assistant_rules.library(pg, settings)[creator_key]["text"] == creator_content
+    assert assistant_rules.creator_snapshot(pg, settings)["digest"] != creator_pinned["digest"]
+    assert json.dumps(creator_pinned, sort_keys=True) == creator_pinned_before
+    assistant_rules.creator_validate_access(pg, creator_pinned, "identity")  # Published edits keep the pinned task.
     assert assistant_rules.snapshot(pg, settings, owner=True) == navigation_before
     creator_conflict = client.post(path, data={**creator_form, "content": creator_content + "\n未保存的识别修改。"})
     assert creator_conflict.status_code == 409 and "未保存的识别修改。" in creator_conflict.text
@@ -422,11 +444,75 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     assert "&lt;script&gt;alert(3)&lt;/script&gt;" in creator_conflict.text
     for field, value in (("kind", "knowledge"), ("visibility", "all")):
         assert client.post(path, data={**creator_form, "revision": "1", field: value}).status_code == 400
+    regression = assistant_rules.library(pg, settings)["creator-regression"]
+    assistant_rules.save_document(pg, settings, owner, "creator-regression", regression["title"],
+        regression["description"], "manual", "draft", "owner", regression["text"], 0)
+    development_only = assistant_rules.creator_snapshot(pg, settings)
+    assistant_rules.creator_validate_access(pg, development_only, "identity")
+    with pytest.raises(PermissionError):
+        assistant_rules.creator_instructions(development_only, "regression")
+    regression_page = client.get(path + "?document=creator-regression")
+    assert "固定用途：达人识别 · 开发验收" in regression_page.text
+    assert "不随生产请求发送全文" in regression_page.text
+    paused_jobs = {}
+    for name, purpose, state, reason in (("identity", "identity", "waiting_evidence", "rules_unavailable"),
+            ("handles", "handles", "waiting_evidence", "rules_unavailable"),
+            ("no_text", "identity", "waiting_evidence", "no_text"),
+            ("running", "identity", "running", "rules_unavailable"),
+            ("closed", "identity", "completed", "rules_unavailable")):
+        contact, job = uuid4(), uuid4()
+        pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)", (contact, name))
+        pg.execute("INSERT INTO creator_handle_jobs(id,contact_id,purpose,status,reason_code) VALUES(%s,%s,%s,%s,%s)",
+                   (job, contact, purpose, state, reason))
+        paused_jobs[name] = job
+    paused_imports = {}
+    old_pack = assistant_rules.codec.encode({"group": {"pack": {"_rules": creator_pinned}}}, settings)
+    for state in ("running", "paused", "completed"):
+        batch, row_id = uuid4(), uuid4()
+        pg.execute("INSERT INTO creator_import_batches(id,cm_authorization_id,uploaded_by,filename,file_fingerprint,"
+            "policy_version,status) VALUES(%s,%s,%s,'roster.xlsx',%s,'test',%s)",
+            (batch, owner, owner, str(batch), state))
+        pg.execute("INSERT INTO creator_import_rows(id,batch_id,cm_authorization_id,row_number,original_handle,handle,"
+            "status,reason_code,pack_ciphertext,stats) VALUES(%s,%s,%s,1,'test','test','invalid',"
+            "'rules_unavailable',%s,"
+            "'{\"analysis_stage\":\"person\",\"analysis_generation\":2}')", (row_id, batch, owner, old_pack))
+        paused_imports[state] = row_id
     for revision, status in enumerate(("draft", "published", "archived"), 1):
         assert client.post(path, data={**creator_form, "revision": str(revision), "status": status},
                            follow_redirects=False).status_code == 303
         assert assistant_rules.library(pg, settings)[creator_key]["status"] == status
         assert assistant_rules.snapshot(pg, settings, owner=True) == navigation_before
+        current_creator = assistant_rules.creator_snapshot(pg, settings)
+        assistant_rules.creator_validate_access(pg, current_creator, "handle")
+        if status == "published":
+            assistant_rules.creator_validate_access(pg, creator_pinned, "identity")
+            resumed = pg.execute("SELECT status,desired_version FROM creator_handle_jobs WHERE id=%s",
+                                 (paused_jobs["identity"],)).fetchone()
+            assert resumed == {"status": "queued", "desired_version": 2}
+            for name, state in (("handles", "waiting_evidence"), ("no_text", "waiting_evidence"),
+                                ("running", "running"), ("closed", "completed")):
+                unchanged = pg.execute("SELECT status,desired_version FROM creator_handle_jobs WHERE id=%s",
+                                       (paused_jobs[name],)).fetchone()
+                assert unchanged == {"status": state, "desired_version": 1}
+            resumed_import = pg.execute("SELECT * FROM creator_import_rows WHERE id=%s",
+                                        (paused_imports["running"],)).fetchone()
+            assert resumed_import["status"] == "pending" and resumed_import["reason_code"] == ""
+            assert resumed_import["pack_ciphertext"] is None and resumed_import["result_ciphertext"] is None
+            assert resumed_import["stats"]["analysis_generation"] == 3
+            assert resumed_import["stats"]["analysis_stage"] == "group"
+            for state in ("paused", "completed"):
+                untouched = pg.execute("SELECT status,pack_ciphertext FROM creator_import_rows WHERE id=%s",
+                                       (paused_imports[state],)).fetchone()
+                assert untouched == {"status": "invalid", "pack_ciphertext": old_pack}
+            archived = pg.execute("SELECT metadata FROM audit_events "
+                "WHERE action='creator_import_evidence_invalidated' "
+                "AND metadata->>'row_id'=%s", (str(paused_imports["running"]),)).fetchone()["metadata"]
+            assert archived["previous"]["pack_ciphertext"] == old_pack
+        else:
+            with pytest.raises(PermissionError):
+                assistant_rules.creator_instructions(current_creator, "identity")
+            with pytest.raises(PermissionError):
+                assistant_rules.creator_validate_access(pg, creator_pinned, "identity")
     creator_audit = pg.execute("SELECT metadata FROM audit_events WHERE action='assistant_rule_updated' "
         "AND metadata->>'document'=%s ORDER BY (metadata->>'revision')::int DESC LIMIT 1",
         (creator_key,)).fetchone()["metadata"]
