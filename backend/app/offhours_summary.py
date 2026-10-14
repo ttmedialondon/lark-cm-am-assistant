@@ -1019,7 +1019,7 @@ closed/waiting 分组填 null，不把员工索取资料后的等待对方时间
 _INSTRUCTIONS += HANDLING_INSTRUCTIONS
 
 
-def handling_fields(refs, messages, staff=()):
+def handling_fields(refs, messages, staff=(), *, customer_refs=None):
     reply_refs = [ref for ref, message in messages.items()
                   if (message.get("is_staff", message.get("speaker") == "CM" or message.get("speaker") in staff)
                       or message.get("speaker") == "CM")
@@ -1027,9 +1027,16 @@ def handling_fields(refs, messages, staff=()):
     reply_items = {"type": "string"}
     if reply_refs:
         reply_items["enum"] = reply_refs
+    waiting_refs = [ref for ref in refs if ref in messages
+                    and (customer_refs is None or ref in customer_refs)
+                    and not (messages[ref].get("is_staff") or messages[ref].get("speaker") == "CM"
+                             or messages[ref].get("speaker") in staff)
+                    and not messages[ref].get("unreadable") and messages[ref].get("text", "").strip()]
     return {
         "action_group": {"type": "string", "enum": ["reply", "followup", "waiting", "closed"]},
-        "waiting_since_ref": {"type": ["string", "null"], "enum": [*refs, None]},
+        "waiting_since_ref": {"type": ["string", "null"], "enum": [*waiting_refs, None],
+                              "description": "只引用目标达人可读的请求正文；图片、附件和员工消息不作起点。"
+                                             "无法核实或无需计算等待时间时填 null。"},
         "handling_status": {"type": "string", "enum": ["resolved", "unresolved", "uncertain", "not_required"]},
         "handling_reason": {"type": "string", "minLength": 1, "maxLength": 500},
         "handling_evidence_refs": {"type": "array", "items": {"type": "string", "enum": list(refs)},
@@ -1092,7 +1099,9 @@ def validate_handling(item, messages):
 def _format(evidence):
     messages = {message["ref"]: message for message in evidence["pack"]["messages"]}
     properties = {
-        **handling_fields(evidence["refs"], messages, evidence["pack"].get("staff", {})),
+        **handling_fields(evidence["refs"], messages, evidence["pack"].get("staff", {}),
+                          customer_refs=[ref for ref, message in messages.items()
+                                         if message["speaker"] in evidence["users"]]),
         "user": {"type": "string", "enum": list(evidence["users"])},
         "handle": {"type": ["string", "null"]},
         "priority": {"type": ["string", "null"], "enum": ["P0", "P1", "P2", "P3", None]},

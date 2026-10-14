@@ -138,6 +138,10 @@ def test_reply_and_resolution_remain_independent_through_context_and_merge(monke
 
     no_staff = ai._format(pack())["schema"]["properties"]["events"]["items"]["properties"]["reply_evidence_refs"]
     assert no_staff["maxItems"] == 0
+    unreadable_only = pack()
+    unreadable_only["pack"]["messages"][0]["unreadable"] = True
+    assert ai._format(unreadable_only)["schema"]["properties"]["events"]["items"]["properties"][
+        "waiting_since_ref"]["enum"] == [None]
     first = {"chat_id": "one", "message_id": "first", "created_at": "2026-10-12T08:00:00+00:00",
              "speaker": "U1", "is_staff": False, "text": "Please send the link by today"}
     assert summary_dialogues.merge_format({"E1": first})["schema"]["properties"]["reply_evidence_refs"]["maxItems"] == 0
@@ -178,6 +182,8 @@ def test_reply_and_resolution_remain_independent_through_context_and_merge(monke
         for m in data["pack"]["messages"]}
     reply_schema = ai._format(data)["schema"]["properties"]["events"]["items"]["properties"]["reply_evidence_refs"]
     assert set(reply_schema["items"]["enum"]) == {"M2", "M3"}
+    assert ai._format(data)["schema"]["properties"]["events"]["items"]["properties"][
+        "waiting_since_ref"]["enum"] == ["M1", None]
     with pytest.raises(ai.InvalidModelOutput, match="reply evidence is not staff"):
         ai._validate(json.dumps({"events": [sample_event(reply_evidence_refs=[ref])
                                             for ref in ("M2", "M3", "M1")]}), data)
@@ -188,7 +194,7 @@ def test_reply_and_resolution_remain_independent_through_context_and_merge(monke
     origin = ai._validate(json.dumps({"events": [sample_event(waiting_since_ref="M1", evidence_refs=["M4"])]}),
                           data)[0]
     assert origin["waiting_since_ref"] == "M1" and "M1" in origin["evidence_refs"]
-    for ref in ("M2", {"invented": "ref"}):
+    for ref in ("M2", "M4", "M0", {"invented": "ref"}):
         with pytest.raises(ai.InvalidModelOutput, match="waiting"):
             ai._validate(json.dumps({"events": [sample_event(waiting_since_ref=ref)]}), data)
     waiting = ai._validate(json.dumps({"events": [sample_event(action_group="waiting",
@@ -207,6 +213,8 @@ def test_reply_and_resolution_remain_independent_through_context_and_merge(monke
     merge_reply_refs = summary_dialogues.merge_format(refs, pending, done)["schema"]["properties"][
         "reply_evidence_refs"]["items"]["enum"]
     assert {refs[ref]["message_id"] for ref in merge_reply_refs} == {"M2", "M3", "done"}
+    assert set(summary_dialogues.merge_format(refs, pending, done)["schema"]["properties"][
+        "waiting_since_ref"]["enum"]) == {request_ref, None}
     value = {"same": True, "basis_kind": "identifier", "basis_value": "ABC-123", "quote_a_ref": request_ref,
         "quote_b_ref": done_ref, "title": "样品订单", "summary": "样品已送达", "latest_progress": "同事已确认送达",
         "handling_status": "resolved", "handling_reason": "已确认对应样品送达", "handling_evidence_refs": [done_ref],
@@ -215,45 +223,54 @@ def test_reply_and_resolution_remain_independent_through_context_and_merge(monke
     def unexpected_provider_call(*_args, **_kwargs):
         pytest.fail("saved provider response must not cause another API call")
     monkeypatch.setattr(openai_client, "call_openai", unexpected_provider_call)
-    for chat_id, query, schema, valid, forged, all_refs in (
+    for chat_id, query, schema, valid, forged, unreadable_wait, all_refs in (
         ("chat", data["pack"], ai._format(data), {"events": [sample_event(reply_evidence_refs=["M2"])]},
-         {"events": [sample_event(reply_evidence_refs=["M1"])]}, list(data["refs"])),
+         {"events": [sample_event(reply_evidence_refs=["M1"])]},
+         {"events": [sample_event(evidence_refs=["M4", "M1"], waiting_since_ref="M4")]}, list(data["refs"])),
         (None, {"a": pending, "b": done, "evidence_messages": refs},
          summary_dialogues.merge_format(refs, pending, done),
-         value, {**value, "reply_evidence_refs": [request_ref]}, list(refs)),
+         value, {**value, "reply_evidence_refs": [request_ref]},
+         {**value, "waiting_since_ref": next(r for r, m in refs.items() if m["message_id"] == "M4")}, list(refs)),
     ):
         before = json.loads(json.dumps(schema))
-        legacy = json.loads(json.dumps(schema))
-        fields = legacy["schema"]["properties"]
-        if chat_id:
-            fields = fields["events"]["items"]["properties"]
-        fields["reply_evidence_refs"] = {"type": "array", "items": {"type": "string", "enum": all_refs}, "maxItems": 20}
-        instructions = "fixed paid event manuals"
-        response = {"text": json.dumps(valid), "usage": {"input_tokens": 7}, "response_id": "paid-old-response"}
-        checkpoint = {"response_received": {"signature": ai._hash([query, legacy, instructions]), "response": response}}
-        job = {"chat_id": chat_id}
-        assert summary_dialogues.request(job, None, None, query, schema, instructions,
-                                         checkpoint=checkpoint) is response
-        assert schema == before
-        for changed_query, changed_rules, reply in (
-            ({**query, "changed_material": True}, instructions, False),
-            (query, instructions + " changed", False), (query, instructions, True),
-        ):
-            with pytest.raises(ai.SummaryInputError, match="调用材料或处理阶段已变化"):
-                summary_dialogues.request(job, None, None, changed_query, schema, changed_rules,
-                                          checkpoint=checkpoint, reply=reply)
-        with pytest.raises(openai_client.OpenAIRequestError, match="请求结果未知"):
-            summary_dialogues.request(job, None, None, query, schema, instructions,
-                                      checkpoint={"provider_call": {"id": "paid-without-received-return"}})
-        bad_checkpoint = {"response_received": {
-            **checkpoint["response_received"], "response": {"text": json.dumps(forged)}}}
-        restored = summary_dialogues.request(job, None, None, query, schema, instructions, checkpoint=bad_checkpoint)
-        with pytest.raises(ai.InvalidModelOutput, match="reply evidence is not staff"):
+        for old_reply_schema in (False, True):
+            legacy = json.loads(json.dumps(schema))
+            fields = legacy["schema"]["properties"]
             if chat_id:
-                ai._validate(restored["text"], data)
-            else:
-                summary_dialogues.combine(restored["text"], pending, done)
-        assert schema == before
+                fields = fields["events"]["items"]["properties"]
+            fields["waiting_since_ref"] = {"type": ["string", "null"], "enum": [*all_refs, None]}
+            if old_reply_schema:
+                fields["reply_evidence_refs"] = {
+                    "type": "array", "items": {"type": "string", "enum": all_refs}, "maxItems": 20}
+            instructions = "fixed paid event manuals"
+            response = {"text": json.dumps(valid), "usage": {"input_tokens": 7}, "response_id": "paid-old-response"}
+            checkpoint = {"response_received": {
+                "signature": ai._hash([query, legacy, instructions]), "response": response}}
+            job = {"chat_id": chat_id}
+            assert summary_dialogues.request(job, None, None, query, schema, instructions,
+                                             checkpoint=checkpoint) is response
+            assert schema == before
+            for changed_query, changed_rules, reply in (
+                ({**query, "changed_material": True}, instructions, False),
+                (query, instructions + " changed", False), (query, instructions, True),
+            ):
+                with pytest.raises(ai.SummaryInputError, match="调用材料或处理阶段已变化"):
+                    summary_dialogues.request(job, None, None, changed_query, schema, changed_rules,
+                                              checkpoint=checkpoint, reply=reply)
+            with pytest.raises(openai_client.OpenAIRequestError, match="请求结果未知"):
+                summary_dialogues.request(job, None, None, query, schema, instructions,
+                                          checkpoint={"provider_call": {"id": "paid-without-received-return"}})
+            for bad, error in ((forged, "reply evidence is not staff"), (unreadable_wait, "invalid waiting evidence")):
+                bad_checkpoint = {"response_received": {
+                    **checkpoint["response_received"], "response": {"text": json.dumps(bad)}}}
+                restored = summary_dialogues.request(job, None, None, query, schema, instructions,
+                                                    checkpoint=bad_checkpoint)
+                with pytest.raises(ai.InvalidModelOutput, match=error):
+                    if chat_id:
+                        ai._validate(restored["text"], data)
+                    else:
+                        summary_dialogues.combine(restored["text"], pending, done)
+            assert schema == before
     with pytest.raises(ai.InvalidModelOutput, match="reply evidence is not staff"):
         summary_dialogues.combine(json.dumps({**value, "reply_evidence_refs": [request_ref]}), pending, done)
     merged = summary_dialogues.combine(json.dumps(value), pending, done)
@@ -263,6 +280,9 @@ def test_reply_and_resolution_remain_independent_through_context_and_merge(monke
                 "text": "My sample order ABC-123 too", "created_at": "M6"}
     mixed = {**pending, "evidence": [*pending["evidence"], outsider]}
     mixed_refs = summary_dialogues.merged_evidence(mixed, done)
+    assert set(summary_dialogues.merge_format(mixed_refs, mixed, done)["schema"]["properties"][
+        "waiting_since_ref"]["enum"]) == {
+            next(r for r, m in mixed_refs.items() if m["message_id"] == "request"), None}
     wrong_origin = {**value, "handling_status": "unresolved",
         "quote_a_ref": next(r for r, m in mixed_refs.items() if m["message_id"] == "request"),
         "quote_b_ref": next(r for r, m in mixed_refs.items() if m["message_id"] == "done"),
@@ -290,6 +310,9 @@ def test_reply_and_resolution_remain_independent_through_context_and_merge(monke
     with pytest.raises(ai.InvalidModelOutput, match="waiting"):
         ai._validate(json.dumps({"events": [sample_event(waiting_since_ref="M5")]}), data)
     data["refs"].update(M5={}, M6={})
+    only_alice = {**data, "users": {"U1": data["users"]["U1"]}}
+    assert ai._format(only_alice)["schema"]["properties"]["events"]["items"]["properties"][
+        "waiting_since_ref"]["enum"] == ["M1", None]
     selected, _ = summary_dialogues.parts(data, "U1")
     assert "broadcast" not in {m["message_id"] for m in selected}
     # A request in a neighboring chunk still anchors a natural colleague response.

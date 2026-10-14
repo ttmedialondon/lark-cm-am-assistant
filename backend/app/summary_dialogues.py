@@ -393,10 +393,14 @@ def merged_evidence(left, right):
 
 
 def merge_format(refs=("E1",), left=None, right=None):
+    customer_refs = None if left is None or right is None else [
+        ref for ref, message in refs.items() if any(
+            message in side["evidence"] and ((side.get("user") and message.get("speaker") == side["user"])
+            or message in side.get("waiting_evidence", [])) for side in (left, right))]
     props = {
         "quote_a_ref": {"type": "string", "enum": [r for r in refs if left is None or refs[r] in left["evidence"]]},
         "quote_b_ref": {"type": "string", "enum": [r for r in refs if right is None or refs[r] in right["evidence"]]},
-        **core.handling_fields(refs, refs if isinstance(refs, dict) else {}),
+        **core.handling_fields(refs, refs if isinstance(refs, dict) else {}, customer_refs=customer_refs),
         "same": {"type": "boolean"},
         "basis_kind": {"type": "string", "enum": ["identifier", "product", "amount", "reference", "none"]},
         **{
@@ -687,6 +691,9 @@ def request(job, settings, cfg, pack, schema, instructions, *, checkpoint, reply
             fields = legacy["schema"]["properties"]
             if job["chat_id"]:
                 fields = fields["events"]["items"]["properties"]
+            fields["waiting_since_ref"] = {"type": ["string", "null"],
+                                           "enum": [*fields["handling_evidence_refs"]["items"]["enum"], None]}
+            signatures.add(core._hash([material, legacy, instructions]))
             fields["reply_evidence_refs"] = {"type": "array", "items": {"type": "string",
                 "enum": fields["handling_evidence_refs"]["items"]["enum"]}, "maxItems": 20}
             signatures.add(core._hash([material, legacy, instructions]))
