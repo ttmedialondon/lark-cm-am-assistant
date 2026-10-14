@@ -73,6 +73,8 @@ _VALID_SOURCE = f"""EXISTS(SELECT 1 FROM chat_messages m
       AND md5(m.mentions_json::text) IS NOT DISTINCT FROM s->>'mentions_fingerprint'
       AND (m.sender_open_id=a.open_id OR i.contact_id=p.contact_id AND i.identity_type='user'))"""
 _PROFILE_VALID = "creator_importance_is_eligible(p.contact_id,p.responsible_authorization_id) AND p.auto_valid " \
+                 "AND NOT EXISTS(SELECT 1 FROM creator_authorization_rescans r " \
+                 "WHERE r.authorization_id=p.responsible_authorization_id) " \
                  "AND p.prompt_version='" + facts.PROMPT_VERSION + "' " \
                  "AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(p.sources) s WHERE NOT " + _VALID_SOURCE + ")"
 
@@ -587,7 +589,9 @@ def prepare_next(settings):
         _recover(conn)
         if conn.execute("SELECT count(*) n FROM creator_importance_jobs WHERE status='ready'").fetchone()["n"] >= 5:
             return False
-        job = conn.execute("""SELECT * FROM creator_importance_jobs WHERE status='queued' AND not_before<=NOW()
+        job = conn.execute("""SELECT j.* FROM creator_importance_jobs j WHERE status='queued' AND not_before<=NOW()
+            AND NOT EXISTS(SELECT 1 FROM creator_authorization_rescans r
+              WHERE r.authorization_id=j.responsible_authorization_id)
             ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1""").fetchone()
         if not job:
             return False
@@ -667,6 +671,8 @@ def _current(conn, job, settings, *, lock=False):
     if (not current or current["status"] != "running" or current["claim_token"] != job["claim_token"]
             or current["desired_version"] != job["snapshot_version"] or not _enabled(config)
             or _config_hash(config) != job["config_fingerprint"] or not all(valid.values())
+            or conn.execute("SELECT 1 FROM creator_authorization_rescans WHERE authorization_id=%s",
+                            (job["responsible_authorization_id"],)).fetchone()
             or not conn.execute("SELECT creator_importance_is_eligible(%s,%s) ok",
                 (job["contact_id"], job["responsible_authorization_id"])).fetchone()["ok"]):
         return None
@@ -680,8 +686,11 @@ def claim():
         if not _enabled(config):
             return None
         _recover(conn)
-        candidate = conn.execute("""SELECT * FROM creator_importance_jobs WHERE status IN ('ready','retry_wait')
-            AND not_before<=NOW() AND attempts<3 ORDER BY created_at,id LIMIT 1""").fetchone()
+        candidate = conn.execute("""SELECT j.* FROM creator_importance_jobs j WHERE status IN ('ready','retry_wait')
+            AND not_before<=NOW() AND attempts<3
+            AND NOT EXISTS(SELECT 1 FROM creator_authorization_rescans r
+              WHERE r.authorization_id=j.responsible_authorization_id)
+            ORDER BY created_at,id LIMIT 1""").fetchone()
         if not candidate:
             return None
         valid = _source_checks(conn, candidate["refs"], candidate["contact_id"],

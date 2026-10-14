@@ -224,6 +224,97 @@ def test_reauthorization_restarts_an_active_job_with_a_new_generation() -> None:
     assert "last_http_status = NULL" in query
 
 
+def test_oauth_reauthorization_defers_creator_scans_for_a_large_existing_roster(pg, monkeypatch):  # noqa: F811
+    scopes = ("offline_access", "im:chat:read", "im:message:readonly", "im:chat.members:read")
+    settings = Settings(
+        database_url="fixture", lark_app_id="fixture-app", lark_app_secret="fixture-secret",
+        lark_redirect_uri="https://testserver/auth/lark/callback", token_encryption_key=b"o" * 32,
+        oauth_authorize_url="https://lark.test/authorize", oauth_token_url="https://lark.test/token",
+        user_info_url="https://lark.test/user", lark_api_base_url="https://lark.test", oauth_scopes=scopes,
+        sync_lookback_days=0, sync_interval_seconds=300, sync_overlap_seconds=600,
+        member_count_refresh_seconds=86400, worker_idle_seconds=3,
+    )
+    cipher = TokenCipher(settings.token_encryption_key)
+    actor, person, job = uuid4(), uuid4(), uuid4()
+    pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,'Creator')", (person,))
+    pg.execute("""INSERT INTO authorizations(id,open_id,display_name,access_token_ciphertext,scopes,
+               body_consent_at) VALUES(%s,'ou_bulk_cm','CM',%s,%s,NOW()-INTERVAL '30 days')""",
+               (actor, cipher.encrypt("old-access"), list(scopes)))
+    pg.execute("""INSERT INTO sync_jobs(id,authorization_id,mode,status,discovery_generation)
+               VALUES(%s,%s,'backfill','running',9)""", (job, actor))
+    pg.execute("""INSERT INTO chats(chat_id,chat_mode)
+               SELECT 'oc_bulk_'||lpad(n::text,4,'0'),'group' FROM generate_series(1,2933) n""")
+    pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,sync_generation,sync_status,
+               backfill_complete,backfill_page_token,incremental_page_token,incremental_job_id,
+               member_snapshot_status,member_snapshot_checked_at)
+               SELECT %s,chat_id,17,'succeeded',TRUE,'backfill-cursor','incremental-cursor',%s,
+                 'succeeded',NOW() FROM chats""", (actor, job))
+    pg.execute("""INSERT INTO creator_importance_profiles(contact_id,responsible_authorization_id,sources)
+               VALUES(%s,%s,'[{"chat_id":"oc_bulk_0001"}]')""", (person, actor))
+    pg.execute("""INSERT INTO creator_authorization_rescans(authorization_id,generation,stage,
+               contact_cursor,chat_cursor,not_before,last_error_code)
+               VALUES(%s,7,'chats',%s,'old-chat',NOW()+INTERVAL '1 day','old-error')""", (actor, person))
+    pg.execute("""UPDATE ai_feature_configs SET enabled=TRUE,api_key_ciphertext=%s,key_suffix='test'
+               WHERE feature IN ('creator_handle_matching','creator_group_classification')""",
+               (cipher.encrypt("fixture-key"),))
+    # A synchronous authorization scan or snapshot-reset signal must fail this callback.
+    for signature, return_type in (
+        ("enqueue_creator_importance(target UUID, cm UUID, reset BOOLEAN DEFAULT FALSE, "
+         "message_chat TEXT DEFAULT NULL, message_id TEXT DEFAULT NULL)", "UUID"),
+        ("creator_handle_chat_signal(chat TEXT)", "VOID"),
+        ("enqueue_creator_group(target TEXT, origin TEXT DEFAULT 'incremental', force BOOLEAN DEFAULT FALSE)", "UUID"),
+    ):
+        pg.execute(f"CREATE OR REPLACE FUNCTION {signature} RETURNS {return_type} LANGUAGE plpgsql "
+                   "AS $$ BEGIN RAISE EXCEPTION 'creator scan ran inside OAuth'; END $$")
+
+    class FakeLark:
+        def __init__(self, received):
+            assert received == settings
+
+        def authorization_url(self, state, challenge):
+            assert challenge
+            return settings.oauth_authorize_url + "?" + urlencode({"state": state})
+
+        def exchange_code(self, code, verifier):
+            assert code == "fixture-code" and verifier
+            return SimpleNamespace(access_token="new-access", refresh_token="new-refresh", expires_in=3600,
+                                   refresh_expires_in=86400, scope=" ".join(scopes))
+
+        def user_info(self, token):
+            assert token == "new-access"
+            return LarkProfile(open_id="ou_bulk_cm", union_id=None, name="CM", en_name=None, avatar_url=None)
+
+    monkeypatch.setattr(main, "connection", lambda: nullcontext(pg))
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "LarkClient", FakeLark)
+    client = TestClient(main.app, base_url="https://testserver")
+    started = client.get("/auth/lark/start", follow_redirects=False)
+    assert started.status_code == 303
+    state = client.cookies[main.OAUTH_STATE_COOKIE]
+    assert parse_qs(urlparse(started.headers["location"]).query)["state"] == [state]
+    response = client.get("/auth/lark/callback", params={"state": state, "code": "fixture-code"},
+                          follow_redirects=False)
+    assert response.status_code == 303 and response.headers["location"] == "/dashboard"
+    session = response.cookies[main.SESSION_COOKIE]
+    assert pg.execute("SELECT authorization_id FROM web_sessions WHERE session_hash=%s",
+                      (main._sha256(session),)).fetchone()["authorization_id"] == actor
+    assert not pg.execute("SELECT 1 FROM oauth_states").fetchone()
+    pending = pg.execute("SELECT * FROM creator_authorization_rescans WHERE authorization_id=%s",
+                         (actor,)).fetchone()
+    assert pending["generation"] == 8 and pending["stage"] == "importance"
+    assert pending["contact_cursor"] is pending["chat_cursor"] is None
+    assert pending["last_error_code"] == "" and pending["not_before"] <= datetime.now(UTC)
+    chats = pg.execute("SELECT * FROM authorization_chats WHERE authorization_id=%s", (actor,)).fetchall()
+    assert len(chats) == 2933
+    for chat in chats:
+        assert chat["sync_generation"] == 18 and not chat["backfill_complete"]
+        assert chat["sync_status"] == chat["member_snapshot_status"] == "pending"
+        assert all(chat[field] is None for field in ("backfill_page_token", "incremental_page_token",
+                                                    "incremental_job_id", "member_snapshot_checked_at"))
+    queued = pg.execute("SELECT * FROM sync_jobs WHERE id=%s", (job,)).fetchone()
+    assert queued["status"] == "queued" and queued["mode"] == "backfill" and queued["discovery_generation"] == 10
+
+
 @pytest.mark.parametrize("upgrade,owner,initial_status,broadcast_enabled", (
     ("profile", True, "attention_required", False),
     ("send", True, "active", False),

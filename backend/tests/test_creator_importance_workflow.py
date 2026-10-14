@@ -10,6 +10,7 @@ from uuid import uuid4
 import pytest
 
 from app import ai_feature_config, creator_access, openai_client
+from app import creator_authorization_rescans as rescans
 from app import creator_importance as importance
 from app.crypto import message_body_cipher, message_body_fingerprint
 
@@ -125,7 +126,14 @@ def ranking_flow(pg, monkeypatch):
     def due():
         pg.execute("UPDATE creator_importance_jobs SET not_before=NOW()-INTERVAL '1 second'")
 
+    def drain_rescans():
+        for _ in range(40):
+            if not rescans.prepare_next(settings):
+                return
+        pytest.fail("authorization rescan queue did not drain")
+
     def drain():
+        drain_rescans()
         for _ in range(40):
             due()
             progressed = importance.prepare_next(settings)
@@ -137,10 +145,12 @@ def ranking_flow(pg, monkeypatch):
         pytest.fail("importance queue did not drain")
 
     monkeypatch.setattr(importance, "connection", lambda: nullcontext(pg))
+    monkeypatch.setattr(rescans, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(importance, "get_settings", lambda: settings)
     monkeypatch.setattr(importance.api, "call_openai", respond)
     monkeypatch.setattr(importance, "MAX_MESSAGES", 1)
     state.message, state.enable, state.due, state.drain = message, enable, due, drain
+    state.drain_rescans = drain_rescans
     state.cipher = cipher
     message("a1", "ONGOING Acme: please join our agreed weekly lives", at=now - timedelta(days=20))
     message(
@@ -546,11 +556,14 @@ def test_paid_retry_cache_and_stale_results_keep_billing_without_repeat(pg, rank
             "SELECT * FROM creator_importance_requests WHERE id=%s", (second["reservation_id"],)
         ).fetchone()
         assert billed["input_tokens"] == 101 and billed["output_tokens"] == 23 and billed["finished_at"]
+        assert importance.view_for(pg, flow.person, flow.owner, flow.settings)["grounds"] == []
+        flow.drain_rescans()
         assert not pg.execute(
             "SELECT auto_valid FROM creator_importance_profiles WHERE responsible_authorization_id=%s", (flow.owner,)
         ).fetchone()["auto_valid"]
     # Recovering a lost paid lease cannot blindly resubmit a possibly billed request.
     pg.execute("UPDATE authorizations SET status='active' WHERE id=%s", (flow.owner,))
+    flow.drain_rescans()
     flow.message(
         "unknown_reservation",
         "A newly received statement, no cooperation",
@@ -626,3 +639,52 @@ def test_paid_retry_cache_and_stale_results_keep_billing_without_repeat(pg, rank
     assert pg.execute("SELECT status,reason_code FROM creator_importance_jobs WHERE id=%s",
                       (incomplete["id"],)).fetchone() == {"status": "failed", "reason_code": "invalid_output"}
     assert importance.claim() is None and len(flow.calls) == calls + 1
+
+
+def test_pending_authorization_rescan_blocks_old_ranking_and_paid_work(pg, ranking_flow):
+    flow = ranking_flow
+    flow.enable()
+    flow.drain()
+    old_profile = pg.execute("SELECT * FROM creator_importance_profiles WHERE responsible_authorization_id=%s",
+                             (flow.owner,)).fetchone()
+    assert old_profile["auto_valid"]
+    flow.message("pending_rescan", "A new unrelated acknowledgement", creator=True, at=flow.now)
+    flow.due()
+    assert importance.prepare_next(flow.settings)
+    pg.execute("SAVEPOINT pending_candidate")
+    pg.execute("INSERT INTO creator_authorization_rescans(authorization_id) VALUES(%s)", (flow.owner,))
+    assert importance.claim() is None
+    pg.execute("UPDATE creator_importance_jobs SET status='queued' WHERE responsible_authorization_id=%s",
+               (flow.owner,))
+    assert not importance.prepare_next(flow.settings)
+    pg.execute("ROLLBACK TO SAVEPOINT pending_candidate")
+    job = importance.claim()
+    assert job and job["responsible_authorization_id"] == flow.owner
+    flow.before_response = lambda: pg.execute(
+        "INSERT INTO creator_authorization_rescans(authorization_id) VALUES(%s)", (flow.owner,))
+    importance.run(job, flow.settings)
+    billed = pg.execute("SELECT input_tokens,output_tokens FROM creator_importance_requests WHERE id=%s",
+                        (job["reservation_id"],)).fetchone()
+    assert billed == {"input_tokens": 101, "output_tokens": 23}
+    assert pg.execute("SELECT revision FROM creator_importance_profiles WHERE responsible_authorization_id=%s",
+                      (flow.owner,)).fetchone()["revision"] == old_profile["revision"]
+    # Legacy empty sources cannot prove that an old ranking belongs to the current authorization.
+    pg.execute("UPDATE creator_importance_profiles SET sources='[]',facts_ciphertext='not-a-ciphertext' "
+               "WHERE responsible_authorization_id=%s", (flow.owner,))
+    view = importance.view_for(pg, flow.person, flow.owner, flow.settings)
+    assert view["tier"] == "pending" and view["grounds"] == []
+    join, args = importance.roster_sql(flow.owner)
+    assert pg.execute("SELECT ip.effective_tier FROM contacts c" + join + " WHERE c.id=%s",
+                      [*args, flow.person]).fetchone()["effective_tier"] == "pending"
+    importance.set_manual(pg, flow.owner, flow.person, flow.owner, "normal", "Human-reviewed priority", flow.settings)
+    view = importance.view_for(pg, flow.person, flow.owner, flow.settings)
+    assert view["tier"] == "normal" and not view["grounds"] and view["manual_reason"] == "Human-reviewed priority"
+    assert pg.execute("SELECT ip.effective_tier FROM contacts c" + join + " WHERE c.id=%s",
+                      [*args, flow.person]).fetchone()["effective_tier"] == "normal"
+    flow.enable(False)
+    flow.drain_rescans()
+    assert not pg.execute("SELECT 1 FROM creator_authorization_rescans WHERE authorization_id=%s",
+                          (flow.owner,)).fetchone()
+    profile = pg.execute("SELECT auto_valid,manual_tier FROM creator_importance_profiles "
+                         "WHERE responsible_authorization_id=%s", (flow.owner,)).fetchone()
+    assert profile == {"auto_valid": False, "manual_tier": "normal"}

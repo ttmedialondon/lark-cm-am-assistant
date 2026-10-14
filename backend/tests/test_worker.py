@@ -1,12 +1,16 @@
+import time
 from collections import Counter
 from concurrent.futures import Future as TaskFuture
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from types import SimpleNamespace
 from uuid import UUID
 
+import psycopg
 import pytest
+from psycopg.rows import dict_row
 
-from app import worker
+from app import creator_authorization_rescans, worker
 from app.crypto import TokenCipher
 from app.lark_api import TokenBundle
 from app.worker import (
@@ -473,6 +477,7 @@ def test_creator_previews_are_fair_single_flight_and_back_off_without_work(monke
     monkeypatch.setattr(worker.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(worker.assistant, "prepare", lambda _: False)
     monkeypatch.setattr(worker.creator_importance, "prepare_next", lambda _: False)
+    monkeypatch.setattr(worker.creator_authorization_rescans, "prepare_next", lambda _: False)
     monkeypatch.setattr(worker.offhours_summary, "prepare_next_summary",
                         lambda _: prepare("summary", summary_jobs))
     monkeypatch.setattr(worker.creator_imports, "prepare_next_import",
@@ -512,6 +517,250 @@ def test_creator_previews_are_fair_single_flight_and_back_off_without_work(monke
     monkeypatch.setattr(worker.offhours_summary, "prepare_next_summary", failed)
     monkeypatch.setattr(worker.creator_imports, "prepare_next_import", lambda _: True)
     assert worker._prepare_creator_preview(settings, 2) == (True, 2)
+
+    prepared.clear()
+    monkeypatch.setattr(worker.creator_imports, "prepare_next_import", lambda _: prepared.append("import") or True)
+    monkeypatch.setattr(worker.offhours_summary, "prepare_next_summary", lambda _: prepared.append("summary") or True)
+    monkeypatch.setattr(worker.creator_authorization_rescans, "prepare_next",
+                        lambda _: prepared.append("rescan") or True)
+    queue = 0
+    for _ in range(6):
+        progressed, queue = worker._prepare_creator_preview(settings, queue)
+        assert progressed
+    assert prepared == ["import", "summary", "rescan", "import", "summary", "rescan"]
+
+
+@pytest.fixture
+def creator_rescan(pg, monkeypatch):
+    actor = UUID(int=500)
+    pg.execute("""INSERT INTO authorizations(id,open_id,access_token_ciphertext,body_consent_at)
+               VALUES(%s,'ou_rescan_cm','test',NOW()-INTERVAL '30 days')""", (actor,))
+    pg.execute("CREATE TABLE rescan_calls(id SERIAL,kind TEXT,target TEXT,reset BOOLEAN)")
+    pg.execute("""CREATE OR REPLACE FUNCTION enqueue_creator_importance(target UUID, cm UUID,
+               reset BOOLEAN DEFAULT FALSE, message_chat TEXT DEFAULT NULL, message_id TEXT DEFAULT NULL)
+               RETURNS UUID LANGUAGE plpgsql AS $$ BEGIN
+                 INSERT INTO rescan_calls(kind,target,reset) VALUES('importance',target::text,reset);
+                 RETURN NULL;
+               END $$""")
+    pg.execute("""CREATE OR REPLACE FUNCTION creator_handle_chat_signal(chat TEXT)
+               RETURNS VOID LANGUAGE plpgsql AS $$ BEGIN
+                 INSERT INTO rescan_calls(kind,target) VALUES('handle',chat);
+               END $$""")
+    pg.execute("""CREATE OR REPLACE FUNCTION enqueue_creator_group(target TEXT,
+               origin TEXT DEFAULT 'incremental', force BOOLEAN DEFAULT FALSE)
+               RETURNS UUID LANGUAGE plpgsql AS $$ BEGIN
+                 INSERT INTO rescan_calls(kind,target) VALUES('group',target);
+                 RETURN NULL;
+               END $$""")
+    monkeypatch.setattr(creator_authorization_rescans, "connection", lambda: nullcontext(pg))
+    return pg, actor
+
+
+def test_authorization_rescan_resumes_bounded_importance_then_chat_batches(creator_rescan):
+    pg, actor = creator_rescan
+    people = [UUID(int=1000 + index) for index in range(14)]
+    for index, person in enumerate(people):
+        pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,'Creator')", (person,))
+        if index < 10 or index == 13:
+            pg.execute("""INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source,
+                       started_at,ended_at) VALUES(%s,%s,%s,'manual',NOW()-INTERVAL '1 day',%s)""",
+                       (UUID(int=2000 + index), person, actor, None if index < 10 else
+                        pg.execute("SELECT NOW() at").fetchone()["at"]))
+    # Include historical profiles/jobs and account ownership, deduplicating a direct assignment.
+    for person in (people[0], people[10]):
+        pg.execute("INSERT INTO creator_importance_profiles(contact_id,responsible_authorization_id) VALUES(%s,%s)",
+                   (person, actor))
+    pg.execute("INSERT INTO creator_importance_jobs(contact_id,responsible_authorization_id) VALUES(%s,%s)",
+               (people[11], actor))
+    account, candidate = UUID(int=3000), UUID(int=3001)
+    pg.execute("""INSERT INTO social_accounts(id,platform,normalized_handle,display_handle)
+               VALUES(%s,'tiktok','creator','creator')""", (account,))
+    pg.execute("INSERT INTO creator_workflow_candidates(id) VALUES(%s)", (candidate,))
+    pg.execute("""INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,
+               contact_id,relationship,source,candidate_id,created_by_authorization_id)
+               VALUES(%s,%s,%s,%s,'owner','cm_confirmation',%s,%s)""",
+               (UUID(int=3002), account, actor, people[12], candidate, actor))
+    for index in range(13):
+        chat = f"oc_rescan_{index:02}"
+        pg.execute("INSERT INTO chats(chat_id) VALUES(%s)", (chat,))
+        pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,%s)", (actor, chat))
+    pg.execute("DELETE FROM rescan_calls")
+    pg.execute("INSERT INTO creator_authorization_rescans(authorization_id) VALUES(%s)", (actor,))
+    settings = SimpleNamespace()
+    assert creator_authorization_rescans.prepare_next(settings)
+    pending = pg.execute("SELECT * FROM creator_authorization_rescans").fetchone()
+    assert pending["stage"] == "importance" and pending["contact_cursor"] == people[9]
+    assert [row["target"] for row in pg.execute("SELECT * FROM rescan_calls ORDER BY id").fetchall()] == [
+        str(person) for person in people[:10]]
+
+    # Durable cursors are sufficient for the next worker invocation; no in-memory progress is needed.
+    assert creator_authorization_rescans.prepare_next(settings)
+    pending = pg.execute("SELECT * FROM creator_authorization_rescans").fetchone()
+    assert pending["stage"] == "chats" and pending["contact_cursor"] == people[12]
+    calls = pg.execute("SELECT * FROM rescan_calls ORDER BY id").fetchall()
+    assert [row["target"] for row in calls] == [str(person) for person in people[:13]]
+    assert all(row["reset"] is True for row in calls)
+    assert creator_authorization_rescans.prepare_next(settings)
+    pending = pg.execute("SELECT chat_cursor FROM creator_authorization_rescans").fetchone()
+    assert pending["chat_cursor"] == "oc_rescan_09"
+    assert pg.execute("SELECT count(*) n FROM rescan_calls WHERE kind='handle'").fetchone()["n"] == 10
+    assert creator_authorization_rescans.prepare_next(settings)
+    assert not pg.execute("SELECT 1 FROM creator_authorization_rescans").fetchone()
+    chats = pg.execute("SELECT kind,target FROM rescan_calls WHERE kind<>'importance' ORDER BY id").fetchall()
+    assert [(row["kind"], row["target"]) for row in chats] == [
+        (kind, f"oc_rescan_{index:02}") for index in range(13) for kind in ("handle", "group")]
+    assert not creator_authorization_rescans.prepare_next(settings)
+
+
+def test_authorization_rescan_failure_retries_and_cannot_back_off_a_new_generation(creator_rescan, monkeypatch, caplog):
+    pg, actor = creator_rescan
+    pg.execute("INSERT INTO chats(chat_id) VALUES('oc_retry')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'oc_retry')", (actor,))
+    pg.execute("DELETE FROM rescan_calls")
+    pg.execute("INSERT INTO creator_authorization_rescans(authorization_id,stage) VALUES(%s,'chats')", (actor,))
+    pg.execute("""CREATE OR REPLACE FUNCTION creator_handle_chat_signal(chat TEXT)
+               RETURNS VOID LANGUAGE plpgsql AS $$ BEGIN
+                 RAISE EXCEPTION 'private fixture body and token';
+               END $$""")
+    settings = SimpleNamespace()
+    assert not creator_authorization_rescans.prepare_next(settings)
+    failed = pg.execute("SELECT *,not_before>NOW() deferred FROM creator_authorization_rescans").fetchone()
+    assert failed["deferred"] and failed["last_error_code"] == "P0001"
+    assert failed["stage"] == "chats" and failed["chat_cursor"] is None
+    assert "private fixture body" not in caplog.text and "token" not in caplog.text
+    assert not creator_authorization_rescans.prepare_next(settings)
+    pg.execute("""CREATE OR REPLACE FUNCTION creator_handle_chat_signal(chat TEXT)
+               RETURNS VOID LANGUAGE plpgsql AS $$ BEGIN
+                 INSERT INTO rescan_calls(kind,target) VALUES('handle',chat);
+               END $$""")
+    pg.execute("UPDATE creator_authorization_rescans SET not_before=NOW()")
+    assert creator_authorization_rescans.prepare_next(settings)
+    assert not pg.execute("SELECT 1 FROM creator_authorization_rescans").fetchone()
+    assert [row["kind"] for row in pg.execute("SELECT kind FROM rescan_calls ORDER BY id").fetchall()] == [
+        "handle", "group"]
+
+    pg.execute("INSERT INTO creator_authorization_rescans(authorization_id,generation,stage) VALUES(%s,7,'chats')",
+               (actor,))
+    pg.execute("""CREATE OR REPLACE FUNCTION creator_handle_chat_signal(chat TEXT)
+               RETURNS VOID LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'safe fixture failure'; END $$""")
+    connections = 0
+
+    def connection():
+        nonlocal connections
+        connections += 1
+        if connections == 2:
+            # A new authorization arrives after rollback, before recording the old batch failure.
+            pg.execute("UPDATE authorizations SET scopes=array_append(scopes,'new-scope') WHERE id=%s", (actor,))
+        return nullcontext(pg)
+
+    monkeypatch.setattr(creator_authorization_rescans, "connection", connection)
+    assert not creator_authorization_rescans.prepare_next(settings)
+    pending = pg.execute("SELECT *,not_before<=NOW() due FROM creator_authorization_rescans").fetchone()
+    assert pending["generation"] == 8 and pending["stage"] == "importance" and pending["due"]
+    assert pending["last_error_code"] == "" and pending["chat_cursor"] is None
+
+    pg.execute("DELETE FROM creator_authorization_rescans")
+    old_request = pg.execute("""INSERT INTO creator_authorization_rescans(authorization_id,stage)
+                            VALUES(%s,'chats') RETURNING request_id""", (actor,)).fetchone()["request_id"]
+    connections = 0
+
+    def replace_request_connection():
+        nonlocal connections
+        connections += 1
+        if connections == 2:
+            # Completion and a new OAuth can reuse generation 1 after the failed transaction releases its lock.
+            pg.execute("DELETE FROM creator_authorization_rescans")
+            pg.execute("INSERT INTO creator_authorization_rescans(authorization_id) VALUES(%s)", (actor,))
+        return nullcontext(pg)
+
+    monkeypatch.setattr(creator_authorization_rescans, "connection", replace_request_connection)
+    assert not creator_authorization_rescans.prepare_next(settings)
+    pending = pg.execute("SELECT *,not_before<=NOW() due FROM creator_authorization_rescans").fetchone()
+    assert pending["generation"] == 1 and pending["request_id"] != old_request
+    assert pending["stage"] == "importance" and pending["due"] and pending["last_error_code"] == ""
+
+
+@pytest.mark.parametrize("stage", ("importance", "chats"))
+def test_authorization_rescan_old_generation_cannot_advance_or_delete_a_new_request(creator_rescan, stage):
+    pg, actor = creator_rescan
+    person = UUID(int=1000)
+    pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,'Creator')", (person,))
+    pg.execute("INSERT INTO creator_importance_profiles(contact_id,responsible_authorization_id) VALUES(%s,%s)",
+               (person, actor))
+    pg.execute("INSERT INTO chats(chat_id) VALUES('oc_generation')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'oc_generation')", (actor,))
+    pg.execute("INSERT INTO creator_authorization_rescans(authorization_id,generation,stage) VALUES(%s,7,%s)",
+               (actor, stage))
+    if stage == "importance":
+        pg.execute("""CREATE OR REPLACE FUNCTION enqueue_creator_importance(target UUID, cm UUID,
+                   reset BOOLEAN DEFAULT FALSE, message_chat TEXT DEFAULT NULL, message_id TEXT DEFAULT NULL)
+                   RETURNS UUID LANGUAGE plpgsql AS $$ BEGIN
+                     UPDATE authorizations SET status='attention_required' WHERE id=cm;
+                     RETURN NULL;
+                   END $$""")
+    else:
+        pg.execute("""CREATE OR REPLACE FUNCTION creator_handle_chat_signal(chat TEXT)
+                   RETURNS VOID LANGUAGE plpgsql AS $$ BEGIN
+                     UPDATE authorizations SET status='attention_required' WHERE open_id='ou_rescan_cm';
+                   END $$""")
+    assert creator_authorization_rescans.prepare_next(SimpleNamespace())
+    pending = pg.execute("SELECT * FROM creator_authorization_rescans").fetchone()
+    assert pending["generation"] == 8 and pending["stage"] == "importance"
+    assert pending["contact_cursor"] is pending["chat_cursor"] is None and pending["last_error_code"] == ""
+
+
+def test_authorization_rescan_serializes_workers_without_blocking_reauthorization(creator_rescan, monkeypatch):
+    pg, actor = creator_rescan
+    pg.execute("INSERT INTO chats(chat_id) VALUES('oc_concurrent')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'oc_concurrent')", (actor,))
+    pg.execute("INSERT INTO creator_authorization_rescans(authorization_id,generation,stage) VALUES(%s,7,'chats')",
+               (actor,))
+    guard = 913374005
+    pg.execute("""CREATE OR REPLACE FUNCTION creator_handle_chat_signal(chat TEXT)
+               RETURNS VOID LANGUAGE plpgsql AS $$ BEGIN
+                 PERFORM set_config('lock_timeout','5s',TRUE);
+                 PERFORM pg_advisory_xact_lock(913374005);
+                 INSERT INTO rescan_calls(kind,target) VALUES('handle',chat);
+               END $$""")
+    schema = pg.execute("SELECT current_schema() name").fetchone()["name"]
+    worker_pid = pg.info.backend_pid
+    # Two real connections need committed fixtures; remove this isolated schema ourselves below.
+    pg.commit()
+    try:
+        pg.execute(psycopg.sql.SQL("SET search_path TO {}").format(psycopg.sql.Identifier(schema)))
+        pg.commit()
+        with psycopg.connect(pg.info.dsn, row_factory=dict_row) as other:
+            other.execute(psycopg.sql.SQL("SET search_path TO {}").format(psycopg.sql.Identifier(schema)))
+            other.execute("SELECT pg_advisory_lock(%s)", (guard,))
+            other.commit()
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(creator_authorization_rescans.prepare_next, SimpleNamespace())
+                try:
+                    deadline = time.monotonic() + 3
+                    while not other.execute("""SELECT EXISTS(SELECT 1 FROM pg_locks
+                                             WHERE pid=%s AND locktype='advisory' AND NOT granted) waiting""",
+                                             (worker_pid,)).fetchone()["waiting"]:
+                        assert time.monotonic() < deadline, "rescan did not reach its chat signal"
+                        time.sleep(0.01)
+                    monkeypatch.setattr(creator_authorization_rescans, "connection", lambda: nullcontext(other))
+                    assert not creator_authorization_rescans.prepare_next(SimpleNamespace())
+                    other.execute("SET LOCAL lock_timeout='500ms'")
+                    other.execute("UPDATE authorizations SET scopes=array_append(scopes,'new-scope') WHERE id=%s",
+                                  (actor,))
+                    other.commit()
+                finally:
+                    other.rollback()
+                    other.execute("SELECT pg_advisory_unlock(%s)", (guard,))
+                    other.commit()
+                assert future.result(timeout=10)
+        pending = pg.execute("SELECT * FROM creator_authorization_rescans").fetchone()
+        assert pending["generation"] == 8 and pending["stage"] == "importance"
+        assert pending["contact_cursor"] is pending["chat_cursor"] is None
+        assert pg.execute("SELECT count(*) n FROM rescan_calls WHERE kind='handle'").fetchone()["n"] == 1
+    finally:
+        pg.rollback()
+        pg.execute(psycopg.sql.SQL("DROP SCHEMA {} CASCADE").format(psycopg.sql.Identifier(schema)))
+        pg.commit()
 
 
 def test_page_claim_uses_locked_conversation_cursor(monkeypatch) -> None:

@@ -19,6 +19,7 @@ from . import (
     ai_dispatch,
     assistant,
     broadcast_images,
+    creator_authorization_rescans,
     creator_broadcast_delivery,
     creator_group_matching,
     creator_handle_matching,
@@ -325,7 +326,8 @@ def _prepare_creator_preview(settings: Settings, next_queue: int) -> tuple[bool,
               creator_handle_matching.prepare_next,
               creator_responsibility_matching.prepare_next,
               creator_group_matching.prepare_next,
-              creator_importance.prepare_next)
+              creator_importance.prepare_next,
+              creator_authorization_rescans.prepare_next)
     for offset in range(len(queues)):
         index = (next_queue + offset) % len(queues)
         try:
