@@ -491,7 +491,7 @@ def run(job, settings):
         if not current:
             return
         auto_linked = _auto_classify(
-            conn, current, job["pack"], current["refs"], result, _config(conn), settings) if error is None else False
+            conn, current, job["pack"], current["refs"], result, job["config"], settings) if error is None else False
         reason = ("suggestions_saved" if error is None else "request_unknown" if unknown else "quota_paused"
                   if getattr(error, "is_quota", False) else "provider_retry" if retry else "invalid_output"
                   if isinstance(error, api.ModelOutputError) else "provider_failed")

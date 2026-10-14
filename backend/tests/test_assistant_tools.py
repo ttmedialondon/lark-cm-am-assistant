@@ -856,8 +856,16 @@ def test_five_tools_keep_reports_private_resume_and_recheck_sources(pg, seeded, 
         "handling_status": "unresolved", "topic": "样品", "cursor": None,
     }, s.settings, context)
     assert filtered["total"] == 1 and filtered["events"][0]["event_ref"] == event_ref and len(s.calls) == 1
-    period = tools.execute(pg, s.ids["cm"], turn, "read_event_context", {"event_ref": event_ref, "mode": "period"},
-                           s.settings, context)
+    source_reads = []
+    original_source = tools.summary_replies.source
+    def source(*args, **kwargs):
+        source_reads.append(True)
+        return original_source(*args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(tools.summary_replies, "source", source)
+        period = tools.execute(pg, s.ids["cm"], turn, "read_event_context", {
+            "event_ref": event_ref, "mode": "period"}, s.settings, context)
+    assert len(source_reads) == 1
     latest = tools.execute(pg, s.ids["cm"], turn, "read_event_context", {"event_ref": event_ref, "mode": "latest"},
                            s.settings, context)
     assert "Sample please" in json.dumps(period) and "unrelated outsider secret" not in json.dumps(latest)

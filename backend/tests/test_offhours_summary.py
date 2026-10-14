@@ -1531,12 +1531,10 @@ def test_creator_enrollment_backfills_closed_periods_without_repaying_or_replaci
         (legacy, s.account, s.ids['reviewer'], s.ids['person'], s.ids['owner'], s.candidate_id))
     assert not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
     pg.execute("UPDATE creator_account_assignments SET relationship='owner' WHERE id=%s", (legacy,))
-    legacy_signal = pg.execute('SELECT * FROM offhours_summary_backfills').fetchone()
-    assert legacy_signal['contact_id'] == s.ids['person']
-    assert legacy_signal['responsible_authorization_id'] == s.ids['reviewer']
+    assert not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
+    assert not ai._roster(pg, s.ids['reviewer'])
     pg.execute("UPDATE creator_account_assignments SET source='excel_verified' WHERE id=%s", (legacy,))
-    assert pg.execute('SELECT version FROM offhours_summary_backfills').fetchone()['version'] == \
-        legacy_signal['version']
+    assert not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
     pg.execute('ROLLBACK TO SAVEPOINT legacy_backfill_trigger')
     # The same creator can belong to another CM, but only that CM's observed messages are exported.
     second_cm = s.ids['reviewer']
@@ -1902,7 +1900,7 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
             ai.run_claimed_summary(job, s.settings)
         else:
             pytest.fail("targeted merge did not finish")
-        refreshed = ai.read_assistant_run(pg, s.ids["cm"], saved_run["id"], s.settings)
+        refreshed = ai.get_summary_view(pg, s.ids["cm"], run_id=saved_run["id"], settings=s.settings)
         assert refreshed["run"]["status"] == "completed" and len(refreshed["events"]) == 1, refreshed["run"]
         assert {item["chat_id"] for item in refreshed["events"][0]["evidence"]} == {"chat", "second"}
         assert pg.execute("SELECT * FROM offhours_summary_runs WHERE id=%s", (saved_run["id"],)).fetchone()[
@@ -2268,7 +2266,17 @@ def test_assistant_window_uses_cm_identity_separate_switch_and_frozen_cutoff(pg,
                                    [s.ids["person"]], s.settings)["run"]["id"] == run_id
     assert ai.prepare_next_summary(s.settings)
     ai.run_claimed_summary(ai.claim_next_summary(interactive=True), s.settings)
-    result = ai.read_assistant_run(pg, s.ids["cm"], run_id, s.settings)
+    read_chats = []
+    original_load = ai._load_chat
+
+    def load_once(*args, **kwargs):
+        read_chats.append(args[2])
+        return original_load(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ai, "_load_chat", load_once)
+        result = ai.get_summary_view(pg, s.ids["cm"], run_id=run_id, settings=s.settings)
+    assert read_chats == ["chat"]
     assert result["run"]["status"] == "completed" and len(result["events"]) == 1
     assert len(summary_instructions) == 1
     assert assistant_rules.event_instructions(pinned_rules, "extract") in summary_instructions[0]
@@ -2276,13 +2284,13 @@ def test_assistant_window_uses_cm_identity_separate_switch_and_frozen_cutoff(pg,
     assert "after-assistant" not in json.dumps(s.calls)
     assert pg.execute("SELECT * FROM offhours_summary_settings").fetchone() == settings_before
     with pytest.raises(PermissionError):
-        ai.read_assistant_run(pg, s.ids["owner"], run_id, s.settings)
+        ai.get_summary_view(pg, s.ids["owner"], run_id=run_id, settings=s.settings)
     event = result["events"][0]
     context = replies.read_event_context(pg, s.ids["cm"], event["id"], s.settings, mode="period")
     assert context["version"] == event["version"]
     assert all(m["message_id"] != "after-assistant" for m in context["messages"])
     ai._stop_tasks(pg, "old function stopped")
-    assert ai.read_assistant_run(pg, s.ids["cm"], run_id, s.settings)["events"]
+    assert ai.get_summary_view(pg, s.ids["cm"], run_id=run_id, settings=s.settings)["events"]
     # Identical messages/cutoff under an edited manual must not reuse the old completed cache.
     pg.execute("UPDATE assistant_turns SET status='completed' WHERE id=%s", (turn_id,))
     next_turn = uuid4()
@@ -2297,9 +2305,10 @@ def test_assistant_window_uses_cm_identity_separate_switch_and_frozen_cutoff(pg,
     assert next_job["input_fingerprint"] != job["input_fingerprint"]
     ai.run_claimed_summary(next_job, s.settings)
     finish_merges(pg, s)
-    assert ai.read_assistant_run(pg, s.ids["cm"], next_view["run"]["id"], s.settings)["run"]["status"] == "completed"
+    assert ai.get_summary_view(pg, s.ids["cm"], run_id=next_view["run"]["id"],
+                               settings=s.settings)["run"]["status"] == "completed"
     assert len(summary_instructions) == 2 and "new-event-priority-marker" in summary_instructions[-1]
-    assert ai.read_assistant_run(pg, s.ids["cm"], run_id, s.settings)["run"]["status"] == "completed"
+    assert ai.get_summary_view(pg, s.ids["cm"], run_id=run_id, settings=s.settings)["run"]["status"] == "completed"
     pg.execute("UPDATE assistant_turns SET status='completed' WHERE id=%s", (next_turn,))
     with pg.transaction(force_rollback=True):
         pg.execute("UPDATE assistant_rule_overrides SET content_ciphertext='broken' WHERE rule_key='event-priority'")
@@ -2309,7 +2318,7 @@ def test_assistant_window_uses_cm_identity_separate_switch_and_frozen_cutoff(pg,
         with pytest.raises(ValueError, match="invalid encrypted token"):
             ai.ensure_assistant_run(pg, s.ids["cm"], damaged_turn, s.ids["cm"], s.start, s.end,
                                     [s.ids["person"]], s.settings)
-        assert ai.read_assistant_run(pg, s.ids["cm"], run_id, s.settings)["run"]["status"] == "completed"
+        assert ai.get_summary_view(pg, s.ids["cm"], run_id=run_id, settings=s.settings)["run"]["status"] == "completed"
     # Drafting from a scheduled report must also use the explicit assistant credential.
     s.save(key="")
     ai.stop_assistant_tasks(pg)
@@ -2385,7 +2394,7 @@ def test_assistant_window_uses_cm_identity_separate_switch_and_frozen_cutoff(pg,
     with pytest.raises(PermissionError):
         replies.read(pg, s.ids["owner"], owner_reply, s.settings, fresh=True)
     with pytest.raises(PermissionError):
-        ai.read_assistant_run(pg, s.ids["owner"], owner_run, s.settings)
+        ai.get_summary_view(pg, s.ids["owner"], run_id=owner_run, settings=s.settings)
     with pytest.raises(PermissionError):
         ai.ensure_assistant_run(pg, s.ids["owner"], owner_turn, s.ids["cm"], s.start, s.end,
                                 [s.ids["person"]], s.settings)
@@ -2428,7 +2437,8 @@ def test_assistant_unknown_material_cannot_be_replayed_by_a_new_turn(pg, seeded,
     first = request()
     assert ai.prepare_next_summary(s.settings)
     ai.run_claimed_summary(ai.claim_next_summary(interactive=True), s.settings)
-    assert ai.read_assistant_run(pg, s.ids["cm"], first["run"]["id"], s.settings)["run"]["status"] == "unknown"
+    assert ai.get_summary_view(pg, s.ids["cm"], run_id=first["run"]["id"],
+                               settings=s.settings)["run"]["status"] == "unknown"
     document = assistant_rules.event_snapshot(pg, s.settings)["documents"]["event-extraction"]
     assistant_rules.save_document(pg, s.settings, s.ids["owner"], "event-extraction",
         document["title"], document["description"], "manual", "published", "owner",
@@ -2437,7 +2447,8 @@ def test_assistant_unknown_material_cannot_be_replayed_by_a_new_turn(pg, seeded,
     if repeated["run"]["id"] != first["run"]["id"]:
         ai.prepare_next_summary(s.settings)
     assert ai.claim_next_summary(interactive=True) is None and len(calls) == 1
-    assert ai.read_assistant_run(pg, s.ids["cm"], repeated["run"]["id"], s.settings)["run"]["status"] == "unknown"
+    assert ai.get_summary_view(pg, s.ids["cm"], run_id=repeated["run"]["id"],
+                               settings=s.settings)["run"]["status"] == "unknown"
     # A real message change is new material, so the frozen request cannot hide it.
     s.add("new-material", text="Please check sample SKU-200", at=s.start + timedelta(hours=2))
     monkeypatch.setattr(openai_client, "call_openai", original_model)
@@ -2449,7 +2460,8 @@ def test_assistant_unknown_material_cannot_be_replayed_by_a_new_turn(pg, seeded,
     ai.run_claimed_summary(fresh, s.settings)
     ai.prepare_next_summary(s.settings)
     ai.run_claimed_summary(ai.claim_next_summary(interactive=True), s.settings)
-    assert ai.read_assistant_run(pg, s.ids["cm"], changed["run"]["id"], s.settings)["run"]["status"] == "completed"
+    assert ai.get_summary_view(pg, s.ids["cm"], run_id=changed["run"]["id"],
+                               settings=s.settings)["run"]["status"] == "completed"
 
 
 def test_message_material_cache_rechecks_access_and_recovers_one_paid_receipt(pg, seeded, monkeypatch):

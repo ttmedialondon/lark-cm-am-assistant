@@ -70,7 +70,9 @@ def _scope(conn, actor_id, cm_id):
     cm = _selected_cm(actor_id, cm_id, owner)
     if cm is None:
         return None
-    return creator_access.access(conn, actor_id, cm, read_only=True)[0]
+    if not creator_access.authorized_cm(conn, cm):
+        raise PermissionError("该负责人的聊天授权不可用，请先完成授权。")
+    return cm
 
 
 def _purpose(value):
@@ -85,10 +87,8 @@ def _people(conn, cm_id, contact_ids=None):
     params = []
     if cm_id is not None:
         clauses.append("""c.id IN (SELECT contact_id FROM contact_assignments
-            WHERE responsible_authorization_id=%s AND ended_at IS NULL
-            UNION SELECT contact_id FROM creator_account_assignments
             WHERE responsible_authorization_id=%s AND ended_at IS NULL)""")
-        params.extend((cm_id, cm_id))
+        params.append(cm_id)
     if contact_ids is not None:
         clauses.append("c.id=ANY(%s::uuid[])")
         params.append(contact_ids)
@@ -97,9 +97,8 @@ def _people(conn, cm_id, contact_ids=None):
           AND i.identity_type='user' AND NULLIF(btrim(i.display_name),'') IS NOT NULL) AS aliases
         FROM contacts c WHERE """ + " AND ".join(clauses)
         + " ORDER BY c.display_name NULLS LAST,c.id", params).fetchall()
-    handles = contact_handles.for_contacts(conn, [person["id"] for person in people], cm_id)
     return [{"id": str(person["id"]), "name": person["display_name"] or "未命名用户",
-             "aliases": person["aliases"], "handles": handles[person["id"]]} for person in people]
+             "aliases": person["aliases"]} for person in people]
 
 
 def _groups(conn, contact_ids, cm_id, purpose, chat_ids=None):
@@ -264,22 +263,21 @@ def page_data(actor_id):
 
 def permission_check(actor_id, cm_id, *, media=False):
     """Check token acceptance and recorded grants, not external-group or @all sendability."""
-    from .worker import ReauthorizationRequired, _authorization, _usable_access_token
+    from .worker import ReauthorizationRequired, _usable_access_token
 
     actor = creator_access.parse_id(actor_id)
-    sql = """SELECT id,open_id,display_name,status,body_consent_at,scopes,access_token_ciphertext,broadcast_enabled
+    sql = """SELECT id,open_id,display_name,status,body_consent_at,scopes,access_token_ciphertext,
+        access_token_expires_at,refresh_token_expires_at,refresh_token_ciphertext,broadcast_enabled
         FROM authorizations WHERE id=%s"""
     with connection() as conn:
         owner = creator_access.require_broadcast_access(conn, actor)
-        actor_row = conn.execute(sql, (actor,)).fetchone()
+        row = conn.execute(sql, (actor,)).fetchone()
         _selected_cm(actor, cm_id, owner)
-        target = actor
-        row = actor_row
-    result = {"status": "unavailable", "account_id": str(target) if target else None,
+    result = {"status": "unavailable", "account_id": str(actor),
               "account_name": row["display_name"] or "未命名用户" if row else "",
               "is_self": True, "is_sender": True,
               "missing_scopes": [], "authorization_url": None, "resource_authorized": False,
-              "feature_enabled": owner or bool(actor_row and actor_row["broadcast_enabled"]),
+              "feature_enabled": owner or bool(row and row["broadcast_enabled"]),
               "message": "暂时无法核验本人授权。", "checked_at": datetime.now(UTC).isoformat()}
     if not row or row["status"] == "revoked" or not row["body_consent_at"]:
         result.update(status="needs_authorization", message="该账号尚未完成有效的聊天授权，请本人先完成接入。")
@@ -290,16 +288,12 @@ def permission_check(actor_id, cm_id, *, media=False):
     checked = row
     result["message"] = "暂时无法核验授权，请稍后重试。"
     try:
-        authorization = _authorization(target)
-        if (not authorization or authorization["status"] == "revoked"
-                or authorization["open_id"] != row["open_id"] or not authorization["body_consent_at"]):
-            raise ReauthorizationRequired
         with httpx.Client(timeout=8) as http:
             client = LarkClient(settings, http_client=http)
-            access_token = _usable_access_token(target, authorization, client, settings)
+            access_token = _usable_access_token(actor, row, client, settings)
             # A refresh can replace tokens/scopes. Read its committed generation before probing.
             with connection() as conn:
-                checked = conn.execute(sql, (target,)).fetchone()
+                checked = conn.execute(sql, (actor,)).fetchone()
             if (not checked or checked["status"] == "revoked" or not checked["body_consent_at"]
                     or checked["open_id"] != row["open_id"]):
                 raise ReauthorizationRequired
@@ -321,7 +315,7 @@ def permission_check(actor_id, cm_id, *, media=False):
                                   else "本人发送授权有效；发送前逐群检查权限。")
     except ReauthorizationRequired:
         with connection() as conn:
-            checked = conn.execute(sql, (target,)).fetchone()
+            checked = conn.execute(sql, (actor,)).fetchone()
         result.update(status="needs_authorization", message="账号连接已失效，请本人重新授权。")
         if checked and checked["open_id"] == row["open_id"]:
             result["missing_scopes"] = sorted(required - set(checked["scopes"] or ()))
@@ -333,10 +327,9 @@ def permission_check(actor_id, cm_id, *, media=False):
         pass
     with connection() as conn:
         owner = creator_access.require_broadcast_access(conn, actor)
-        current_actor = conn.execute(sql, (actor,)).fetchone()
-        result["feature_enabled"] = owner or bool(current_actor and current_actor["broadcast_enabled"])
+        current = conn.execute(sql, (actor,)).fetchone()
+        result["feature_enabled"] = owner or bool(current and current["broadcast_enabled"])
         _selected_cm(actor, cm_id, owner)
-        current = conn.execute(sql, (target,)).fetchone()
     if not current or current["status"] == "revoked" or not current["body_consent_at"]:
         result.update(status="needs_authorization", missing_scopes=[], message="聊天授权已失效，请本人先完成接入。")
     elif not checked or any(current[key] != checked[key] for key in (
@@ -344,7 +337,7 @@ def permission_check(actor_id, cm_id, *, media=False):
     )):
         result.update(status="unavailable", missing_scopes=[], message="授权已更新，请重新检查。")
     elif result["status"] == "needs_authorization":
-        result["authorization_url"] = BroadcastAuthorizationRequired(target, media=media).authorization_url
+        result["authorization_url"] = BroadcastAuthorizationRequired(actor, media=media).authorization_url
     result["resource_authorized"] = bool(result["status"] == "ready" and current
                                         and "im:resource" in (current["scopes"] or ()))
     result["checked_at"] = datetime.now(UTC).isoformat()
@@ -357,7 +350,10 @@ def match(actor_id, cm_id, raw, purpose):
         cm = _scope(conn, actor_id, cm_id)
         if _purpose(purpose) != "support":
             raise ValueError("此类群请直接选择 CM/AM 已加入的群。")
-        entries, duplicates = _match_entries(raw, _people(conn, cm))
+        people = _people(conn, cm)
+        handles = {str(key): values for key, values in contact_handles.for_contacts(
+            conn, [creator_access.parse_id(person["id"]) for person in people]).items()}
+        entries, duplicates = _match_entries(raw, [{**person, "handles": handles[person["id"]]} for person in people])
         candidates = {candidate["id"]: candidate for entry in entries for candidate in entry["candidates"]}
         groups = _groups(conn, list(candidates), cm, purpose)
         for group in groups:
@@ -405,6 +401,8 @@ def _resolve(conn, cm, purpose, contact_ids, selections=None, scope_reason=""):
     if fixed is not None and set(fixed) != set(ids):
         raise ValueError("保存的目标必须与固定达人名单一致。")
     people = {} if scope_reason else {p["id"]: p for p in _people(conn, cm, ids)}
+    handles = {str(key): values for key, values in contact_handles.for_contacts(
+        conn, [creator_access.parse_id(value) for value in people]).items()}
     groups = [] if scope_reason else _groups(conn, list(people), cm, purpose)
     memberships = {contact_id: [] for contact_id in ids}
     for group in groups:
@@ -413,7 +411,7 @@ def _resolve(conn, cm, purpose, contact_ids, selections=None, scope_reason=""):
     entries, routes, issues = [], [], []
     for contact_id in ids:
         current = people.get(contact_id)
-        person = ({"id": contact_id, "name": current["name"], "handles": current["handles"],
+        person = ({"id": contact_id, "name": current["name"], "handles": handles[contact_id],
                    "groups": memberships[contact_id]} if current else None)
         reason = scope_reason or ("达人已不在当前入库或负责人范围内" if not person else "")
         chat_id = fixed.get(contact_id, "") if fixed is not None else (

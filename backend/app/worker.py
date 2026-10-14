@@ -194,8 +194,6 @@ def run_forever() -> None:
                     next_broadcast_check = _schedule_broadcast(
                         settings, broadcast_executor, broadcast_futures, next_broadcast_check,
                     )
-                    _finish_completed_jobs(page_futures)
-                    _fill_lark_slots(settings, client, lark_executor, page_futures)
                     discovery_future, next_discovery_check = _schedule_discovery(
                         settings, client, discovery_executor, discovery_future, next_discovery_check,
                     )
@@ -649,6 +647,8 @@ def _fill_lark_slots(
 ) -> None:
     """Give distinct users the first slots, then use any spare capacity."""
 
+    if len(futures) >= settings.lark_sync_max_inflight:
+        return
     jobs = [job for job in _running_jobs() if job.discovery_status == "succeeded"]
     authorization_cache: dict[uuid.UUID, tuple[dict[str, Any], str] | None] = {}
     while len(futures) < settings.lark_sync_max_inflight:

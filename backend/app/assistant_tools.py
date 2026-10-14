@@ -291,7 +291,7 @@ def current_context(conn, actor_id, selected_context, settings, *, now=None, rea
             event_ref = f"{task_id}:{int(index)}:{task['input_fingerprint']}"
         event_context = _reference_context(conn, actor_id, {"scope": scope}, {"event_ref": event_ref}, settings,
                                            read_cache=read_cache)
-        _event_id(conn, actor_id, event_ref, settings, event_context)
+        _event_id(conn, actor_id, event_ref, event_context, read_cache=read_cache)
         scope["event_ref"] = event_ref
         if audience == "creators" and event_context["scope"]["cm_id"] == scope["cm_id"]:
             task_id, _index, _version = _event_parts(event_ref)
@@ -647,7 +647,7 @@ def _validate_reply_material(conn, actor_id, result, settings, context, *, turn=
         if assistant_search._open(current, "m.", settings) != assistant_search._open(source["source"], "m.", settings):
             raise SourceChangedError("消息引用已变化。")
     else:
-        _event_id(conn, actor_id, source["ref"], settings, context)
+        _event_id(conn, actor_id, source["ref"], context, read_cache=read_cache)
     fresh = assistant_replies.material(conn, actor_id, context, source, settings,
                                       cutoff=saved["context"]["checked_at"], read_cache=read_cache)
     if fresh["fingerprint"] != saved["context"]["fingerprint"]:
@@ -709,7 +709,7 @@ def _prepare_reply(conn, actor_id, turn, args, settings, context, *, read_cache=
                                                read_cache=read_cache)}
         else:
             source = {"kind": "event", "ref": args["event_ref"],
-                      "source": _event_id(conn, actor_id, args["event_ref"], settings, context)}
+                      "source": _event_id(conn, actor_id, args["event_ref"], context, read_cache=read_cache)}
     else:
         if args["event_ref"] or args["message_ref"] or not args["draft_ref"]:
             raise ValueError("改写时请使用已有草稿引用。")
@@ -887,23 +887,22 @@ def _event_parts(ref):
         raise ValueError("事件引用无效。") from exc
 
 
-def _event_id(conn, actor_id, ref, settings, context=None):
+def _event_id(conn, actor_id, ref, context=None, *, read_cache=None):
     task_id, index, version = _event_parts(ref)
-    task = conn.execute("SELECT t.*,r.responsible_authorization_id FROM offhours_summary_tasks t "
+    task = conn.execute("SELECT t.is_current,t.status,t.input_fingerprint,r.responsible_authorization_id "
+                        "FROM offhours_summary_tasks t "
                         "JOIN offhours_summary_runs r ON r.id=t.run_id WHERE t.id=%s", (task_id,)).fetchone()
     if (not task or not task["is_current"] or task["status"] != "succeeded"
             or task["input_fingerprint"] != version):
         raise ValueError("事件材料已更新，请重新读取报告。")
     if context and str(task["responsible_authorization_id"]) != context["scope"]["cm_id"]:
         raise PermissionError("事件不属于当前查询范围。")
-    assistant_search.authorize_all(conn, actor_id, task["responsible_authorization_id"])
-    # The core verifies current roster, source messages and consent, not just an old stored report.
-    summary_replies.source(conn, actor_id, f"{task_id}:{index}", settings, require_unresolved=False)
+    assistant_search.authorize_all(conn, actor_id, task["responsible_authorization_id"], read_cache=read_cache)
     return f"{task_id}:{index}"
 
 
-def _card(event, version):
-    ref = f"{event['id']}:{version}"
+def _card(event):
+    ref = f"{event['id']}:{event['version']}"
     return {
         "event_ref": ref, "evidence_ref": ref, "contact_id": str(event["contact_id"]),
         "title": event["title"], "summary": event["summary"], "latest_progress": event["latest_progress"],
@@ -913,7 +912,6 @@ def _card(event, version):
         "handling_status": event["handling_status"],
         "reply_status": "replied" if event.get("replied_by") else "unreplied",
         "replied_by": event.get("replied_by", []), "evidence_count": len(event.get("evidence", [])),
-        **assistant_worklist.decorate(event),
     }
 
 
@@ -930,18 +928,14 @@ def _read_results(conn, actor_id, run_ids, settings, context):
     events, views, gaps = [], [], []
     pending = False
     for run_id in run_ids:
-        view = summaries.read_assistant_run(conn, actor_id, run_id, settings)
+        view = summaries.get_summary_view(conn, actor_id, run_id=run_id, settings=settings)
         if str(view["responsible"]["id"]) != context["scope"]["cm_id"]:
             raise PermissionError("报告不属于当前查询范围。")
         views.append(view)
         gaps.extend(view.get("run", {}).get("gaps", []))
         pending |= view.get("run", {}).get("status") in {"queued", "running", "preparing"}
-        task_ids = list({UUID(event["id"].split(":")[0]) for event in view["events"]})
-        versions = {str(row["id"]): row["input_fingerprint"] for row in conn.execute(
-            "SELECT id,input_fingerprint FROM offhours_summary_tasks WHERE id=ANY(%s::uuid[])", (task_ids,),
-        ).fetchall()} if task_ids else {}
         for event in view["events"]:
-            card = _card(event, versions[event["id"].split(":")[0]])
+            card = _card(event)
             card.update(cm_id=context["scope"]["cm_id"], cm_name=context["scope"].get("cm_name", "CM"))
             card["window"] = view["window"]
             card.update(assistant_worklist.decorate(event, view["window"]["end"]))
@@ -1167,7 +1161,7 @@ def execute(conn, actor_id, turn, name, args, settings, context, *, read_cache=N
         except ValueError as exc:
             raise ValueError("分页位置无效。") from exc
         return {**_page(result, cursor), "_assistant_turn_id": str(turn["id"])}
-    event_id = _event_id(conn, actor_id, args["event_ref"], settings, context)
+    event_id = _event_id(conn, actor_id, args["event_ref"], context, read_cache=read_cache)
     if name == "read_event_context":
         result = summary_replies.read_event_context(conn, actor_id, event_id, settings, mode=args["mode"],
                                                     cutoff=datetime.now(UTC))
@@ -1202,35 +1196,22 @@ def _page(result, cursor):
 
 
 def resume_wait(conn, actor_id, turn, waiting, settings, context):
+    if waiting["kind"] not in {"summary", "message_materials"}:
+        raise ValueError("等待任务无效。")
     if waiting.get("scope"):
         context = context_for_scope(conn, actor_id, context, waiting["scope"])
     elif waiting["kind"] == "summary":
         context = _reference_context(conn, actor_id, context, {"result_id": _result_ref(waiting["ids"])}, settings)
-    elif waiting.get("event_ref"):
-        context = _reference_context(conn, actor_id, context, waiting, settings)
     if waiting["kind"] == "message_materials":
         cm = assistant_search.authorize_all(conn, actor_id, context["scope"]["cm_id"])
         return (None if message_materials.pending(conn, actor_id, cm["id"], waiting["ids"])
                 else {"materials_ready": True})
-    _scope(conn, actor_id, context)
-    if waiting["kind"] == "summary":
-        result = _read_results(conn, actor_id, [UUID(value) for value in waiting["ids"]], settings, context)
-        if result["pending"]:
-            return None
-        if waiting.get("purpose") == "unreplied_creators":
-            return _unreplied_result(conn, actor_id, turn, result, waiting["creator_snapshot"], settings, context)
-        return {**_page(result, 0), "_assistant_turn_id": str(turn["id"])}
-    if waiting["kind"] != "reply" or len(waiting["ids"]) != 1:
-        raise ValueError("等待任务无效。")
-    _event_id(conn, actor_id, waiting["event_ref"], settings, context)
-    job_id = waiting["ids"][0]
-    result = summary_replies.read(conn, actor_id, job_id, settings, fresh=True)
-    if result["status"] in {"queued", "running"}:
+    result = _read_results(conn, actor_id, [UUID(value) for value in waiting["ids"]], settings, context)
+    if result["pending"]:
         return None
-    if result["status"] != "succeeded":
-        return {"draft_ref": job_id, "status": result["status"], "error": result["error"], "draft": None}
-    return {"draft_ref": job_id, "status": "completed", "draft": result["result"],
-            "event_ref": waiting["event_ref"]}
+    if waiting.get("purpose") == "unreplied_creators":
+        return _unreplied_result(conn, actor_id, turn, result, waiting["creator_snapshot"], settings, context)
+    return {**_page(result, 0), "_assistant_turn_id": str(turn["id"])}
 
 
 def evidence(conn, actor_id, ref, settings):
@@ -1245,7 +1226,7 @@ def evidence(conn, actor_id, ref, settings):
         result["message"] = next(message for message in result["messages"] if message.get("message_ref"))
         _audit_context(conn, actor_id, ref, "message", len(result.get("messages", [])))
         return public_query(result)
-    event_id = _event_id(conn, actor_id, ref, settings)
+    event_id = _event_id(conn, actor_id, ref, read_cache=read_cache)
     context = _reference_context(conn, actor_id, {"scope": {"cm_id": str(actor_id), "creator_ids": None}},
                                  {"event_ref": ref}, settings, read_cache=read_cache)
     result = summary_replies.read_event_context(conn, actor_id, event_id, settings, mode="period")

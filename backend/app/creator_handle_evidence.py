@@ -969,19 +969,21 @@ def _mentions(body, handle):
     return bool(re.search(r"(?<![A-Za-z0-9_.])" + re.escape(handle) + r"(?=\.*(?:[^A-Za-z0-9_.]|$))", body, re.I))
 
 
-def still_valid(conn, refs, settings=None, *, ciphertext_only=False):
+def still_valid(conn, refs, settings, *, ciphertext_only=False):
     """Recheck original grants, identities, plaintext and reply relations before use."""
-    if settings is None:
-        from .config import get_settings
-        settings = get_settings()
     cipher = message_body_cipher(settings.token_encryption_key)
-    for person in (r for r in refs if r["kind"] == "person"):
-        if person.get("contact_id") in RESTRICTED_CONTACTS:
-            return False
-        condition = "contact_id=%s AND identity_type='user'" if person.get("contact_id") else "open_id=ANY(%s::text[])"
-        value = person["contact_id"] if person.get("contact_id") else [i["open_id"] for i in person["identities"]]
-        current = conn.execute("SELECT " + _SPEAKER_COLUMNS + " FROM lark_identities WHERE " + condition
-                               + " ORDER BY open_id", (value,)).fetchall()
+    people = [r for r in refs if r["kind"] == "person"]
+    if any(person.get("contact_id") in RESTRICTED_CONTACTS for person in people):
+        return False
+    identities = conn.execute("SELECT " + _SPEAKER_COLUMNS + " FROM lark_identities WHERE "
+        "(contact_id=ANY(%s::uuid[]) AND identity_type='user') OR open_id=ANY(%s::text[]) ORDER BY open_id",
+        ([person["contact_id"] for person in people if person.get("contact_id")],
+         [i["open_id"] for person in people if not person.get("contact_id") for i in person["identities"]]
+        )).fetchall() if people else []
+    for person in people:
+        current = ([row for row in identities if str(row["contact_id"]) == str(person["contact_id"])
+                    and row["identity_type"] == "user"] if person.get("contact_id") else
+                   [row for row in identities if row["open_id"] in {i["open_id"] for i in person["identities"]}])
         if access._hash(current) != person["identity_hash"]:
             return False
     chats = [r for r in refs if r["kind"] == "chat"]

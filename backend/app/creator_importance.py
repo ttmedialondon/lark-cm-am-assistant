@@ -172,9 +172,8 @@ def _source_checks(conn, refs, contact_id, cm_id, *, lock=False):
                      (sorted({r["sender_open_id"] for r in refs}),)).fetchall()
         conn.execute("SELECT contact_id FROM contact_roles WHERE contact_id=%s ORDER BY role FOR SHARE",
                      (contact_id,)).fetchall()
-        for table in ("contact_assignments", "creator_account_assignments"):
-            conn.execute(f"SELECT id FROM {table} WHERE contact_id=%s AND responsible_authorization_id=%s "
-                         "ORDER BY id FOR SHARE", (contact_id, cm_id)).fetchall()
+        conn.execute("SELECT id FROM contact_assignments WHERE contact_id=%s AND responsible_authorization_id=%s "
+                     "ORDER BY id FOR SHARE", (contact_id, cm_id)).fetchall()
         conn.execute("""SELECT m.message_id FROM chat_messages m JOIN jsonb_to_recordset(%s::jsonb)
             AS r(chat_id text,message_id text) ON r.chat_id=m.chat_id AND r.message_id=m.message_id
             ORDER BY m.chat_id,m.message_id FOR SHARE OF m""", (creator_data.encode(refs),)).fetchall()
@@ -317,13 +316,11 @@ def configuration_changed(conn):
         WHERE status<>'completed' AND reason_code<>'request_unknown'
         AND (%s OR status NOT IN ('failed','cancelled'))""", (enabled, enabled))
     if enabled:
-        conn.execute("""SELECT enqueue_creator_importance(pair.contact_id,pair.cm_id)
-            FROM (SELECT contact_id,responsible_authorization_id cm_id FROM contact_assignments WHERE ended_at IS NULL
-              UNION SELECT contact_id,responsible_authorization_id FROM creator_account_assignments
-              WHERE ended_at IS NULL AND relationship='owner') pair
-            WHERE creator_importance_is_eligible(pair.contact_id,pair.cm_id)
+        conn.execute("""SELECT enqueue_creator_importance(pair.contact_id,pair.responsible_authorization_id)
+            FROM contact_assignments pair WHERE pair.ended_at IS NULL
+              AND creator_importance_is_eligible(pair.contact_id,pair.responsible_authorization_id)
               AND NOT EXISTS(SELECT 1 FROM creator_importance_jobs j WHERE j.contact_id=pair.contact_id
-                AND j.responsible_authorization_id=pair.cm_id
+                AND j.responsible_authorization_id=pair.responsible_authorization_id
                 AND (j.status NOT IN ('failed','cancelled') OR j.reason_code='request_unknown'))""")
 
 
@@ -424,11 +421,15 @@ def build_batch(conn, job, settings, state):
     names = mention_names(conn, list(by_key.values()), lock=False)
     chats = {}
     coverage = state.setdefault("chat_coverage", {})
+    members_by_chat = {}
+    for member in conn.execute("""SELECT m.chat_id,m.open_id,i.tenant_classification,i.contact_id FROM chat_members m
+        LEFT JOIN lark_identities i ON i.open_id=m.open_id WHERE m.chat_id=ANY(%s::text[])""",
+        (list(boundaries),)).fetchall() if boundaries else []:
+        members_by_chat.setdefault(member["chat_id"], []).append(member)
     for row in rows:
         if row["chat_id"] in chats:
             continue
-        members = conn.execute("""SELECT m.open_id,i.tenant_classification,i.contact_id FROM chat_members m
-            LEFT JOIN lark_identities i ON i.open_id=m.open_id WHERE m.chat_id=%s""", (row["chat_id"],)).fetchall()
+        members = members_by_chat.get(row["chat_id"], [])
         unique = (row["member_snapshot_status"] == "succeeded" and row["member_count"] is not None
                   and len(members) >= row["member_count"] and any(m["open_id"] in opens for m in members)
                   and all(m["open_id"] in opens or m["open_id"] == cm["open_id"]

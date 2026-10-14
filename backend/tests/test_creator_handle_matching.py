@@ -781,21 +781,16 @@ def test_auto_link_preserves_rejections_non_owner_links_and_other_account_claims
     _enqueue(pg, flow.contact)
     assert matching.prepare_next(flow.settings) and matching.claim() is None and len(flow.calls) == 1
     assert _snapshot(pg, before.keys()) == before
-    # Replace only fixture-created blockers: a different owner and a separate active account assignment.
+    # Replace only fixture-created blockers with another person's confirmed account relations.
     pg.execute("DELETE FROM contact_social_accounts WHERE contact_id=%s", (flow.contact,))
     pg.execute(
         "INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source) "
         "VALUES(%s,%s,'owner','confirmed','manual')",
         (pilot.ids["legacy"], accounts["first.handle"]),
     )
-    candidate = pg.execute(
-        "SELECT id FROM creator_workflow_candidates WHERE contact_id=%s", (pilot.ids["legacy"],)
-    ).fetchone()["id"]
     pg.execute(
-        "INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,"
-        "contact_id,relationship,source,candidate_id,created_by_authorization_id) "
-        "VALUES(%s,%s,%s,%s,'associated','cm_confirmation',%s,%s)",
-        (uuid4(), accounts["backup_2"], pilot.ids["cm"], pilot.ids["legacy"], candidate, pilot.ids["owner"]),
+        "INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source) "
+        "VALUES(%s,%s,'associated','confirmed','manual')", (pilot.ids["legacy"], accounts["backup_2"]),
     )
     before = _snapshot(pg, before.keys())
     flow.material_version += 1
@@ -808,6 +803,23 @@ def test_auto_link_preserves_rejections_non_owner_links_and_other_account_claims
     assert _snapshot(pg, before.keys()) == before
     assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
     assert not pg.execute("SELECT 1 FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()
+
+    other = _enqueue(pg, pilot.ids["legacy"])
+    pg.execute("UPDATE creator_handle_jobs SET status='review_required',result_ciphertext=%s,"
+               "stats=jsonb_build_object('claimed_handles',jsonb_build_array('first.handle','backup_2')) WHERE id=%s",
+               (creator_data.cipher(flow.settings).encrypt(creator_data.encode(view)), other))
+    queries = []
+
+    class Meter:
+        def execute(self, sql, *args, **kwargs):
+            queries.append(sql)
+            return pg.execute(sql, *args, **kwargs)
+
+    displayed = matching.page_data(Meter(), pilot.ids["owner"], flow.settings)["jobs"]
+    target = next(row for row in displayed if row["id"] == job["id"])
+    assert all(link["decision"] == "review" and link["conflict"] for link in target["suggestions"])
+    assert sum("AS conflict FROM unnest" in sql for sql in queries) == 1
+    assert sum("JOIN unnest(%s::text[]) h(handle)" in sql for sql in queries) == 1
 
 
 def test_role_and_chat_events_shared_slots_and_catalog_changes(pg, matching_flow, pilot, monkeypatch, tmp_path):

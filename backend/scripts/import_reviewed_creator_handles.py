@@ -60,10 +60,8 @@ def admit(conn, actor, rows, catalog):
                 (uuid4(), handle, handle)).fetchone()['id']
             if conn.execute("""SELECT 1 FROM contact_social_accounts WHERE social_account_id=%s
                 AND (status='confirmed' AND contact_id<>%s AND relationship='owner'
-                  OR contact_id=%s AND (status='rejected' OR relationship<>'owner'))
-                UNION ALL SELECT 1 FROM creator_account_assignments WHERE social_account_id=%s
-                  AND ended_at IS NULL AND contact_id<>%s LIMIT 1""",
-                (account, contact, contact, account, contact)).fetchone():
+                  OR contact_id=%s AND (status='rejected' OR relationship<>'owner')) LIMIT 1""",
+                (account, contact, contact)).fetchone():
                 raise ValueError('Account relationship conflict: ' + handle)
             inserted = conn.execute("""INSERT INTO contact_social_accounts(contact_id,social_account_id,
                 relationship,status,source,reviewed_by_authorization_id,reviewed_at)

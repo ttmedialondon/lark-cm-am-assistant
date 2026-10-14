@@ -39,11 +39,9 @@ def prepare_next(_settings):
                     UNION SELECT contact_id FROM creator_importance_jobs WHERE responsible_authorization_id=%s
                     UNION SELECT contact_id FROM contact_assignments
                       WHERE responsible_authorization_id=%s AND ended_at IS NULL
-                    UNION SELECT contact_id FROM creator_account_assignments
-                      WHERE responsible_authorization_id=%s AND ended_at IS NULL AND relationship='owner'
                     ) people WHERE (%s::uuid IS NULL OR contact_id>%s)
                     ORDER BY contact_id LIMIT %s""",
-                    (actor, actor, actor, actor, job["contact_cursor"], job["contact_cursor"], BATCH_SIZE)).fetchall()
+                    (actor, actor, actor, job["contact_cursor"], job["contact_cursor"], BATCH_SIZE)).fetchall()
                 for person in people:
                     conn.execute("SELECT enqueue_creator_importance(%s,%s,TRUE)", (person["contact_id"], actor))
                 stage = "importance" if len(people) == BATCH_SIZE else "chats"

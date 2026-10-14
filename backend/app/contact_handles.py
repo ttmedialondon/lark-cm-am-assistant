@@ -18,20 +18,14 @@ def confirmed_pairs(conn, contact_ids):
           AND s.platform='tiktok' ORDER BY l.contact_id,s.normalized_handle""", (contact_ids,)).fetchall()
 
 
-def for_contacts(conn, contact_ids, cm_id=None):
+def for_contacts(conn, contact_ids):
     result = {contact_id: [] for contact_id in contact_ids}
     if not result:
         return result
-    rows = conn.execute("""WITH links AS (
-        SELECT contact_id,social_account_id FROM contact_social_accounts
-        WHERE contact_id=ANY(%s::uuid[]) AND status='confirmed' AND relationship='owner'
-        UNION SELECT contact_id,social_account_id FROM creator_account_assignments
-        WHERE contact_id=ANY(%s::uuid[]) AND ended_at IS NULL
-          AND (%s::uuid IS NULL OR responsible_authorization_id=%s::uuid)
-    ) SELECT links.contact_id,s.display_handle FROM links
-      JOIN social_accounts s ON s.id=links.social_account_id
-      WHERE s.platform='tiktok' ORDER BY s.normalized_handle""",
-        (contact_ids, contact_ids, cm_id, cm_id)).fetchall()
+    rows = conn.execute("""SELECT links.contact_id,s.display_handle FROM contact_social_accounts links
+        JOIN social_accounts s ON s.id=links.social_account_id
+        WHERE links.contact_id=ANY(%s::uuid[]) AND links.status='confirmed' AND links.relationship='owner'
+          AND s.platform='tiktok' ORDER BY s.normalized_handle""", (contact_ids,)).fetchall()
     for row in rows:
         result[row['contact_id']].append(row['display_handle'])
     return result
@@ -49,7 +43,8 @@ def _manual_scope(conn, actor_id, cm_id, *, lock=False):
     owner = creator_access.is_owner(conn, actor_id)
     if actor_id != cm_id and not owner:
         raise PermissionError("只能维护您自己的达人。")
-    creator_access.access(conn, actor_id, cm_id, read_only=True)
+    if not creator_access.authorized_cm(conn, cm_id):
+        raise PermissionError("该负责人的聊天授权不可用，请先完成授权。")
     return cm_id, owner
 
 
@@ -96,7 +91,6 @@ def search_people(conn, actor_id, cm_id, query):
               AND ac.is_visible AND ac.sync_enabled AND COALESCE(ch.chat_status,'normal')='normal'))
           ORDER BY i.last_seen_at DESC,i.open_id LIMIT 1) identity ON TRUE
         ORDER BY c.display_name,c.id""", (query, query, cm_id, cm_id, cm_id)).fetchall()
-    _manual_scope(conn, actor_id, cm_id)
     handles = for_contacts(conn, [row["id"] for row in rows])
     return {"cm_id": str(cm_id), "items": [{"contact_id": str(row["id"]),
         "display_name": row["display_name"] or "未命名用户", "open_id": row["open_id"],
@@ -118,9 +112,7 @@ def _conflict(conn, account_id, contact_id, actor_id, owner):
     if conn.execute("""SELECT 1 FROM contact_social_accounts WHERE social_account_id=%s
         AND (status='confirmed' AND (contact_id<>%s OR relationship<>'owner')
           OR contact_id=%s AND relationship<>'owner')
-        UNION ALL SELECT 1 FROM creator_account_assignments WHERE social_account_id=%s
-          AND ended_at IS NULL AND (contact_id<>%s OR relationship<>'owner') LIMIT 1""",
-        (account_id, contact_id, contact_id, account_id, contact_id)).fetchone():
+        LIMIT 1""", (account_id, contact_id, contact_id)).fetchone():
         raise ValueError("此账号已关联其他人员或存在身份冲突，未覆盖原资料。")
     if not owner and conn.execute("""SELECT 1 FROM contact_social_accounts WHERE social_account_id=%s
         AND contact_id=%s AND relationship='owner' AND status='rejected'
@@ -151,24 +143,12 @@ def _confirm(conn, contact_id, account_id, handle, actor_id):
 
 
 def _reject(conn, contact_id, account_id, actor_id):
-    # Keep a rejection and lift legacy CM responsibility to the person, never move it.
     conn.execute("""INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,
         source,reviewed_by_authorization_id,reviewed_at)
         VALUES(%s,%s,'owner','rejected','cm_confirmation',%s,NOW())
         ON CONFLICT(contact_id,social_account_id,relationship) DO UPDATE SET status='rejected',
           source='cm_confirmation',reviewed_by_authorization_id=EXCLUDED.reviewed_by_authorization_id,
           reviewed_at=NOW(),updated_at=NOW()""", (contact_id, account_id, actor_id))
-    conn.execute("""INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source,
-        created_by_authorization_id,started_at)
-        SELECT gen_random_uuid(),contact_id,responsible_authorization_id,
-          CASE WHEN source IN ('excel_ai_verified','ai_business_verified') THEN 'ai' ELSE 'manual' END,
-          created_by_authorization_id,started_at FROM creator_account_assignments
-        WHERE contact_id=%s AND social_account_id=%s AND ended_at IS NULL
-        ON CONFLICT(contact_id,responsible_authorization_id) WHERE ended_at IS NULL DO NOTHING""",
-        (contact_id, account_id))
-    return conn.execute("""UPDATE creator_account_assignments SET ended_at=NOW()
-        WHERE contact_id=%s AND social_account_id=%s AND ended_at IS NULL RETURNING id""",
-        (contact_id, account_id)).fetchall()
 
 
 def set_manual(conn, actor_id, contact_id, cm_id, old_handle, handle, *, operation="replace"):
@@ -196,11 +176,9 @@ def set_manual(conn, actor_id, contact_id, cm_id, old_handle, handle, *, operati
     if not conn.execute("SELECT creator_importance_is_eligible(%s,%s) ok", (contact_id, cm_id)).fetchone()["ok"]:
         raise PermissionError("该达人不在此负责人的有效名单中。")
     current = conn.execute("""SELECT s.id,lower(s.normalized_handle) handle FROM social_accounts s
-        WHERE s.platform='tiktok' AND (
-          EXISTS(SELECT 1 FROM contact_social_accounts l WHERE l.social_account_id=s.id
-            AND l.contact_id=%s AND l.relationship='owner' AND l.status='confirmed')
-          OR EXISTS(SELECT 1 FROM creator_account_assignments a WHERE a.social_account_id=s.id
-            AND a.contact_id=%s AND a.ended_at IS NULL)) ORDER BY s.id""", (contact_id, contact_id)).fetchall()
+        JOIN contact_social_accounts l ON l.social_account_id=s.id
+        WHERE s.platform='tiktok' AND l.contact_id=%s AND l.relationship='owner' AND l.status='confirmed'
+        ORDER BY s.id""", (contact_id,)).fetchall()
     before = {row["handle"] for row in current}
     old_accounts = [row["id"] for row in current if row["handle"] == old_handle]
     if (old_handle and not old_accounts) or (operation == "replace" and not old_handle and before):
@@ -208,21 +186,19 @@ def set_manual(conn, actor_id, contact_id, cm_id, old_handle, handle, *, operati
     if len(old_accounts) > 1 or creator_imports._identity_conflict(conn, contact_id):
         raise ValueError(creator_imports.REASONS["account_conflict"])
     if old_handle == handle:
-        return {"saved": True, "handles": for_contacts(conn, [contact_id], cm_id)[contact_id]}
+        return {"saved": True, "handles": for_contacts(conn, [contact_id])[contact_id]}
     if handle:
         account_id = _account(conn, handle)
         _conflict(conn, account_id, contact_id, actor_id, owner)
         _confirm(conn, contact_id, account_id, handle, actor_id)
-    retired = []
     if old_accounts:
-        retired = _reject(conn, contact_id, old_accounts[0], actor_id)
+        _reject(conn, contact_id, old_accounts[0], actor_id)
     conn.execute("INSERT INTO audit_events(id,authorization_id,action,metadata) VALUES(%s,%s,%s,%s::jsonb)",
         (uuid4(), actor_id, "creator_handle_manual", creator_data.encode({
             "contact_id": str(contact_id), "cm_id": str(cm_id), "before": sorted(before),
             "after": sorted((before - {old_handle}) | ({handle} if handle else set())), "operation": operation,
-            "retired_account_assignment_ids": [str(row["id"]) for row in retired],
         })))
-    return {"saved": True, "handles": for_contacts(conn, [contact_id], cm_id)[contact_id]}
+    return {"saved": True, "handles": for_contacts(conn, [contact_id])[contact_id]}
 
 
 def link_manual(conn, actor_id, cm_id, handle, contact_id, *, old_contact_id=None):
@@ -255,15 +231,12 @@ def link_manual(conn, actor_id, cm_id, handle, contact_id, *, old_contact_id=Non
     if creator_imports._identity_conflict(conn, contact_id):
         raise ValueError("人员身份存在冲突，未覆盖已确认资料。")
     account_id = _account(conn, handle)
-    retired = []
     if old_contact_id:
         owners = conn.execute("""SELECT contact_id FROM contact_social_accounts WHERE social_account_id=%s
-            AND relationship='owner' AND status='confirmed'
-            UNION SELECT contact_id FROM creator_account_assignments WHERE social_account_id=%s
-            AND relationship='owner' AND ended_at IS NULL""", (account_id, account_id)).fetchall()
+            AND relationship='owner' AND status='confirmed'""", (account_id,)).fetchall()
         if {row["contact_id"] for row in owners} != {old_contact_id}:
             raise ValueError("原账号关联已变化，请刷新后重新核对。")
-        retired = _reject(conn, old_contact_id, account_id, actor_id)
+        _reject(conn, old_contact_id, account_id, actor_id)
     _conflict(conn, account_id, contact_id, actor_id, owner)
     _confirm(conn, contact_id, account_id, handle, actor_id)
     if not conn.execute("SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator' "
@@ -280,7 +253,6 @@ def link_manual(conn, actor_id, cm_id, handle, contact_id, *, old_contact_id=Non
         (uuid4(), actor_id, "creator_handle_manual_link", creator_data.encode({"handle": handle,
             "contact_id": str(contact_id), "cm_id": str(cm_id),
             "old_contact_id": str(old_contact_id) if old_contact_id else None,
-            "responsibility_added": responsibility_added,
-            "retired_account_assignment_ids": [str(row["id"]) for row in retired]})))
+            "responsibility_added": responsibility_added})))
     return {"saved": True, "contact_id": str(contact_id), "correction": old_contact_id is not None,
-            "handles": for_contacts(conn, [contact_id], cm_id)[contact_id]}
+            "handles": for_contacts(conn, [contact_id])[contact_id]}

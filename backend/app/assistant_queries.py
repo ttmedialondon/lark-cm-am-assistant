@@ -60,7 +60,7 @@ def _page(kind, context, values, args, cm, now):
 
 
 def _creator_facts(conn, cm, roster, ids):
-    handles = contact_handles.for_contacts(conn, ids, cm["id"])
+    handles = contact_handles.for_contacts(conn, ids)
     assignments = creator_responsibility_matching._existing_assignments(conn, ids)
     aliases, identities = {}, {}
     for person in roster:

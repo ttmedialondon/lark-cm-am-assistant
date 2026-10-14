@@ -34,21 +34,15 @@ def page_data(actor_id, cm_id=None, tab="", query="", page=1, sort="importance",
             if can_select_cm or r["id"] == cm_id
         ]
         import_batches = [] if read_only else creator_imports.batch_summaries(conn, cm_id)
-        # Person-level and older account-level assignments describe the same
-        # library. UNION ensures that a person with several handles appears once.
         formal_base = """FROM contacts c WHERE EXISTS(SELECT 1 FROM contact_roles r
             WHERE r.contact_id=c.id AND r.role='creator' AND r.status='confirmed') AND c.id IN (
             SELECT contact_id FROM contact_assignments
-            WHERE responsible_authorization_id=%s AND ended_at IS NULL
-            UNION SELECT contact_id FROM creator_account_assignments
             WHERE responsible_authorization_id=%s AND ended_at IS NULL)"""
-        args = [cm_id, cm_id]
+        args = [cm_id]
         if unassigned:
             formal_base = """FROM contacts c WHERE EXISTS(SELECT 1 FROM contact_roles r
                 WHERE r.contact_id=c.id AND r.role='creator' AND r.status='confirmed')
-                AND NOT EXISTS(SELECT 1 FROM contact_assignments a WHERE a.contact_id=c.id AND a.ended_at IS NULL)
-                AND NOT EXISTS(SELECT 1 FROM creator_account_assignments a
-                    WHERE a.contact_id=c.id AND a.ended_at IS NULL)"""
+                AND NOT EXISTS(SELECT 1 FROM contact_assignments a WHERE a.contact_id=c.id AND a.ended_at IS NULL)"""
             args = []
         confirmed = (conn.execute("SELECT count(*) n " + formal_base, args).fetchone()["n"]
                      if not query and (not tier or not can_view_importance) else None)
@@ -91,7 +85,7 @@ def page_data(actor_id, cm_id=None, tab="", query="", page=1, sort="importance",
                 FROM lark_identities WHERE contact_id=ANY(%s::uuid[]) AND identity_type='user'
                 ORDER BY contact_id,last_seen_at DESC,open_id""", (ids,),
         ).fetchall()}
-        handles = contact_handles.for_contacts(conn, ids, cm_id)
+        handles = contact_handles.for_contacts(conn, ids)
         items = []
         for person in people:
             identity = identities.get(person["id"])

@@ -397,9 +397,8 @@ def _apply_assignments(conn, job, material, result, config, settings):
                  (sorted(identity_ids),)).fetchall()
     conn.execute("SELECT contact_id FROM contact_roles WHERE contact_id=%s ORDER BY role FOR SHARE",
                  (job["contact_id"],)).fetchall()
-    for table in ("contact_assignments", "creator_account_assignments"):
-        conn.execute(f"SELECT id FROM {table} WHERE contact_id=%s ORDER BY id FOR SHARE",
-                     (job["contact_id"],)).fetchall()
+    conn.execute("SELECT id FROM contact_assignments WHERE contact_id=%s ORDER BY id FOR SHARE",
+                 (job["contact_id"],)).fetchall()
     messages = [ref for ref in refs if ref.get("kind") == "message"]
     if not messages or any(not all(key in ref for key in ("chat_id", "message_id", "authorization_id"))
                            for ref in messages):
@@ -415,11 +414,11 @@ def _apply_assignments(conn, job, material, result, config, settings):
         ORDER BY a.id,m.chat_id,m.message_id FOR SHARE OF m,o,a,ac,c""",
         ([ref["chat_id"] for ref in messages], [ref["message_id"] for ref in messages],
          [ref["authorization_id"] for ref in messages])).fetchall()
-    if len(locked) != len(messages) or not evidence.still_valid(conn, refs, settings):
-        return None
     state = evidence._state(conn, job["contact_id"])
-    if (evidence.access._hash(state) != state_refs[0]["state_hash"]
-            or not any(row["status"] == "confirmed" for row in state["role"])):
+    if (len(locked) != len(messages) or evidence.access._hash(state) != state_refs[0]["state_hash"]
+            or not any(row["status"] == "confirmed" for row in state["role"])
+            or not evidence.source.still_valid(conn, [ref for ref in refs if ref["kind"] != "responsibility_state"],
+                                               settings)):
         return None
     people = {str(row["id"]): str(row["contact_id"]) for row in state["authorizations"] if row["contact_id"]}
     admitted = {}
@@ -560,7 +559,7 @@ def run(job, settings):
                 ),
             )
         else:
-            applied = _apply_assignments(conn, current, job, result, _config(conn), settings)
+            applied = _apply_assignments(conn, current, job, result, job["config"], settings)
             if applied is None:
                 _invalidate(conn, current)
                 return
@@ -590,16 +589,13 @@ def _no_request(conn, job):
 def _existing_assignments(conn, contact_ids):
     rows = (
         conn.execute(
-            """SELECT DISTINCT s.contact_id,a.id authorization_id,s.level,s.handle,
+            """SELECT DISTINCT s.contact_id,a.id authorization_id,'person' level,NULL::text handle,
         COALESCE(c.display_name,a.display_name,'未命名负责人') name,i.contact_id cm_contact_id
-        FROM (SELECT contact_id,responsible_authorization_id,'person' level,NULL::text handle
-          FROM contact_assignments WHERE ended_at IS NULL
-          UNION SELECT x.contact_id,x.responsible_authorization_id,'account',p.normalized_handle
-          FROM creator_account_assignments x LEFT JOIN social_accounts p ON p.id=x.social_account_id
-          WHERE x.ended_at IS NULL) s
+        FROM contact_assignments s
         JOIN authorizations a ON a.id=s.responsible_authorization_id
         LEFT JOIN lark_identities i ON i.open_id=a.open_id AND i.identity_type='user'
-        LEFT JOIN contacts c ON c.id=i.contact_id WHERE s.contact_id=ANY(%s::uuid[]) ORDER BY s.contact_id,name,a.id""",
+        LEFT JOIN contacts c ON c.id=i.contact_id WHERE s.contact_id=ANY(%s::uuid[]) AND s.ended_at IS NULL
+        ORDER BY s.contact_id,name,a.id""",
             (list(contact_ids),),
         ).fetchall()
         if contact_ids
@@ -607,32 +603,20 @@ def _existing_assignments(conn, contact_ids):
     )
     grouped = {}
     for row in rows:
-        row["scope_label"] = (
-            "达人本人" if row["level"] == "person" else "@" + row["handle"] if row["handle"] else "账号级关系"
-        )
+        row["scope_label"] = "达人本人"
         grouped.setdefault(str(row["contact_id"]), []).append(row)
     return grouped
 
 
-def _results(conn, view, existing=()):
-    ids = list(view["candidate_ids"].values())
-    ids = [str(cid) for cid in ids]
-    people = {
-        str(r["id"]): r
-        for r in conn.execute(
-            "SELECT id,display_name FROM contacts WHERE id=ANY(%s::uuid[])",
-            (ids,),
-        ).fetchall()
-    }
+def _results(view, names, existing=()):
     results = []
     known = {str(row["cm_contact_id"]) for row in existing if row["cm_contact_id"]}
     for suggestion in view["result"]["suggestions"]:
         person_id = str(view["candidate_ids"][suggestion["cm"]])
-        person = people.get(person_id, {})
         results.append(
             {
                 **suggestion,
-                "name": person.get("display_name") or suggestion["cm"],
+                "name": names.get(person_id) or suggestion["cm"],
                 "existing": person_id in known,
                 "confidence_label": f"{suggestion['confidence']:.0%}" if 'confidence' in suggestion else "—",
                 "association_label": ASSOCIATIONS.get(suggestion.get("association_status"), "旧版建议"),
@@ -659,13 +643,14 @@ def page_data(conn, actor, settings, page=1):
     jobs = conn.execute(
         latest
         + """SELECT j.id,j.contact_id,j.status,j.reason_code,j.stats,j.created_at,j.updated_at,
-        j.result_ciphertext,c.display_name FROM latest j JOIN contacts c ON c.id=j.contact_id
+        j.result_ciphertext,j.refs,c.display_name FROM latest j JOIN contacts c ON c.id=j.contact_id
         ORDER BY j.updated_at DESC,j.id LIMIT 26 OFFSET %s""",
         ((page - 1) * 25,),
     ).fetchall()
     has_more = len(jobs) > 25
     jobs = jobs[:25]
     existing = _existing_assignments(conn, [job["contact_id"] for job in jobs])
+    views = {}
     for job in jobs:
         job.update(
             name=job.pop("display_name"),
@@ -677,19 +662,22 @@ def page_data(conn, actor, settings, page=1):
         )
         job["existing_assignments"] = existing.get(str(job["contact_id"]), [])
         ciphertext = job.pop("result_ciphertext")
+        refs = job.pop("refs")
         if ciphertext:
-            refs = conn.execute("SELECT refs FROM creator_responsibility_jobs WHERE id=%s", (job["id"],)).fetchone()[
-                "refs"
-            ]
             if evidence.still_valid(conn, refs, settings, lightweight=True):
-                job["results"] = _results(
-                    conn, json.loads(creator_data.cipher(settings).decrypt(ciphertext)), job["existing_assignments"]
-                )
-                for result in job["results"]:
-                    for field in ("reason", "scope_note", "association_reason"):
-                        result.pop(field, None)
+                views[job["id"]] = json.loads(creator_data.cipher(settings).decrypt(ciphertext))
             else:
                 job.update(reason="规则或材料已更新，请重新分析", stale=True)
+    names = {str(row["id"]): row["display_name"] for row in conn.execute(
+        "SELECT id,display_name FROM contacts WHERE id=ANY(%s::uuid[])",
+        (sorted({str(cid) for view in views.values() for cid in view["candidate_ids"].values()}),)
+    ).fetchall()} if views else {}
+    for job in jobs:
+        if job["id"] in views:
+            job["results"] = _results(views[job["id"]], names, job["existing_assignments"])
+            for result in job["results"]:
+                for field in ("reason", "scope_note", "association_reason"):
+                    result.pop(field, None)
     if any(job["results"] for job in jobs):
         _audit(
             conn, actor, "creator_responsibility_results_viewed", {"jobs": [str(j["id"]) for j in jobs if j["results"]]}
@@ -761,7 +749,7 @@ def task_evidence(conn, actor, settings, job_id):
         "job_id": str(job_id),
         "chats": pack["chats"],
         "messages": messages,
-        "results": _results(conn, result, existing) if result else [],
+        "results": _results(result, names, existing) if result else [],
         "existing_assignments": existing,
         "coverage": pack.get("coverage", job["stats"]),
     }

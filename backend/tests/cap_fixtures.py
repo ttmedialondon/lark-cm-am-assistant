@@ -1,4 +1,4 @@
-"""CAP fixtures including historical data to protect migration compatibility."""
+"""Confirmed creators with canonical person-level responsibilities and account links."""
 import json
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
@@ -73,21 +73,14 @@ def pilot(pg, monkeypatch):
     ids["creator"] = person("creator", pairs=8)
     ids["silent"] = person("silent")
     ids["legacy"] = person("legacy")
-    account_id, candidate_id = uuid4(), uuid4()
+    account_id = uuid4()
     pg.execute("INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) "
                "VALUES(%s,'tiktok','legacy_account','legacy_account')", (account_id,))
     pg.execute("INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source) "
                "VALUES(%s,%s,'owner','confirmed','cm_confirmation')", (ids["legacy"], account_id))
     pg.execute(
-        "INSERT INTO creator_workflow_candidates(id,normalized_handle,responsible_authorization_id,contact_id,"
-        "relationship,status,social_account_id) VALUES(%s,'legacy_account',%s,%s,'owner','confirmed',%s)",
-        (candidate_id, ids["owner"], ids["legacy"], account_id),
-    )
-    pg.execute(
-        "INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,contact_id,"
-        "relationship,source,candidate_id,created_by_authorization_id) "
-        "VALUES(%s,%s,%s,%s,'owner','cm_confirmation',%s,%s)",
-        (uuid4(), account_id, ids["owner"], ids["legacy"], candidate_id, ids["owner"]),
+        "INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
+        "VALUES(%s,%s,%s,'manual')", (uuid4(), ids["legacy"], ids["owner"]),
     )
     monkeypatch.setattr(admin_reporting, "connection", lambda: nullcontext(pg))
     return SimpleNamespace(pg=pg, ids=ids, settings=settings, person=person, calls=[], after_request=[])

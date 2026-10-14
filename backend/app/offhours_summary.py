@@ -284,29 +284,22 @@ def _roster(conn, cm_id=REMI_ID):
         """WITH people AS MATERIALIZED (
                SELECT contact_id FROM contact_assignments
                WHERE responsible_authorization_id=%s AND ended_at IS NULL FOR SHARE
-           ), legacy AS MATERIALIZED (
-               SELECT contact_id,social_account_id FROM creator_account_assignments
-               WHERE responsible_authorization_id=%s AND ended_at IS NULL
-                 AND relationship='owner' FOR SHARE
            ), owners AS MATERIALIZED (
                SELECT contact_id,social_account_id FROM contact_social_accounts
                WHERE status='confirmed' AND relationship='owner'
-                 AND contact_id IN (SELECT contact_id FROM people UNION SELECT contact_id FROM legacy)
+                 AND contact_id IN (SELECT contact_id FROM people)
                FOR SHARE
            )
            SELECT c.id AS contact_id, sa.display_handle, sa.id AS account_id, i.open_id,
                   COALESCE(i.display_name,c.display_name) AS name
            FROM contacts c JOIN lark_identities i ON i.contact_id=c.id AND i.identity_type='user'
-           LEFT JOIN (
-               SELECT contact_id,social_account_id FROM owners
-               UNION SELECT contact_id,social_account_id FROM legacy
-           ) links ON links.contact_id=c.id
+           LEFT JOIN owners links ON links.contact_id=c.id
            LEFT JOIN social_accounts sa ON sa.id=links.social_account_id
            WHERE EXISTS(SELECT 1 FROM contact_roles r WHERE r.contact_id=c.id
              AND r.role='creator' AND r.status='confirmed')
-             AND c.id IN (SELECT contact_id FROM people UNION SELECT contact_id FROM legacy)
+             AND c.id IN (SELECT contact_id FROM people)
            ORDER BY c.id,sa.id,i.open_id FOR SHARE OF c,i""",
-        (cm_id, cm_id),
+        (cm_id,),
     ).fetchall()
 
 
@@ -1406,7 +1399,7 @@ def ensure_assistant_run(conn, actor_id, turn, cm_id, start, end, contact_ids, s
         if not same_turn and (not prior_cutoff or datetime.fromisoformat(prior_cutoff) != cutoff):
             continue
         try:
-            view = read_assistant_run(conn, actor_id, candidate["id"], settings)
+            view = get_summary_view(conn, actor_id, run_id=candidate["id"], settings=settings)
         except (PermissionError, SummaryInputError, InvalidTag, ValueError):
             continue
         if same_turn or view["run"]["status"] == "unknown":
@@ -1424,49 +1417,21 @@ def ensure_assistant_run(conn, actor_id, turn, cm_id, start, end, contact_ids, s
         next_check_at,refresh_until,event_rules_ciphertext,event_rules_digest)
         VALUES(%s,%s,%s,%s,%s,'assistant',%s,%s,NOW(),%s,%s,%s)""",
         (run_id, actor_id, cm_id, start, end, turn_id, selected, cutoff, event_rules, rules_digest))
-    return read_assistant_run(conn, actor_id, run_id, settings)
-
-
-def read_assistant_run(conn, actor_id, run_id, settings):
-    view = get_summary_view(conn, actor_id, run_id=run_id, settings=settings)
-    if view["run"]["status"] in ("completed", "unknown"):
-        run = conn.execute("SELECT * FROM offhours_summary_runs WHERE id=%s", (UUID(str(run_id)),)).fetchone()
-        roster = _roster(conn, run["responsible_authorization_id"])
-        chats = _related_chats(conn, roster, settings=settings, cm_id=run["responsible_authorization_id"])
-        targets = set(run["selected_contact_ids"]) if run["selected_contact_ids"] is not None else None
-        cutoff = datetime.fromisoformat(view["run"]["cutoff"])
-        saved_tasks = {task["chat_id"]: task for task in conn.execute(
-            "SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND is_current AND chat_id IS NOT NULL",
-            (run["id"],)).fetchall()}
-        material = {}
-        for chat in chats:
-            if targets is not None and not chat["contact_ids"] & targets:
-                continue
-            if chat["sync_status"] == "not_readable":
-                continue
-            data = _load_chat(conn, _task_run(run, saved_tasks.get(chat["chat_id"])), chat["chat_id"], cutoff,
-                              settings=settings, roster=roster, related_chats=chats)
-            if data:
-                material[chat["chat_id"]] = data["fingerprint"]
-        saved = {chat_id: task["input_fingerprint"] for chat_id, task in saved_tasks.items()}
-        if material != saved:
-            view["run"]["status"] = "partial"
-            view["run"]["gaps"].append("会话或消息资料已变化，需按当前材料重新分析。")
-            view["events"] = []
-    return view
+    return get_summary_view(conn, actor_id, run_id=run_id, settings=settings)
 
 
 def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None, run_id=None, settings=None):
+    read_cache = {}
     explicit = conn.execute("SELECT * FROM offhours_summary_runs WHERE id=%s",
                             (UUID(str(run_id)),)).fetchone() if run_id else None
     if run_id and not explicit:
         raise SummaryInputError("报告不存在。")
     if explicit:
         cm_id = explicit["responsible_authorization_id"]
-    cm, owner = _authorize(conn, actor_id, cm_id=cm_id)
+    cm, owner = _authorize(conn, actor_id, cm_id=cm_id, read_cache=read_cache)
     if explicit:
         row = explicit
-        _authorize_run(conn, row, actor_id=actor_id)
+        _authorize_run(conn, row, actor_id=actor_id, read_cache=read_cache)
         start, end = row["window_start"], row["window_end"]
     elif period is not None:
         from .summary_periods import window
@@ -1510,7 +1475,8 @@ def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None, ru
     roster = _roster(conn, cm_id)
     related_chats = _related_chats(conn, roster, settings=settings, cm_id=cm_id)
     from . import summary_dialogues
-    read_cache = {}
+    chat_tasks = [t for t in tasks if t["chat_id"] is not None]
+    read_cache["sources"] = sorted(chat_tasks, key=lambda task: task["id"])
     for task in tasks:
         name = {"succeeded": "completed", "queued": "queued", "running": "running"}.get(task["status"], "failed")
         counts[name] += 1
@@ -1527,7 +1493,6 @@ def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None, ru
             counts["completed"] -= 1
             counts["failed"] += 1
             gaps.append("部分结果因当前授权、名单或消息资料变化已隐藏；需重新处理。")
-    chat_tasks = [t for t in tasks if t["chat_id"] is not None]
     if chat_tasks and all(t["status"] == "succeeded" for t in chat_tasks):
         if not any(t["chat_id"] is None for t in tasks):
             counts["queued"] += 1  # Preparation must still create the within-period merge.
@@ -1554,6 +1519,30 @@ def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None, ru
         "gaps": list(dict.fromkeys(gaps)),
         "cutoff": coverage.get("cutoff"),
     }
+    if explicit and coverage.get("cutoff") and status in ("completed", "unknown"):
+        targets = set(row["selected_contact_ids"]) if row["selected_contact_ids"] is not None else None
+        cutoff = datetime.fromisoformat(view["run"]["cutoff"])
+        saved_tasks = {task["chat_id"]: task for task in chat_tasks}
+        material = {}
+        for chat in related_chats:
+            if targets is not None and not chat["contact_ids"] & targets:
+                continue
+            if chat["sync_status"] == "not_readable":
+                continue
+            source = saved_tasks.get(chat["chat_id"])
+            key = ("fingerprint", source["id"]) if source else None
+            if source and source["cutoff"] == cutoff and key in read_cache:
+                fingerprint = read_cache[key]
+            else:
+                data = _load_chat(conn, _task_run(row, source), chat["chat_id"], cutoff,
+                                  settings=settings, roster=roster, related_chats=related_chats, read_cache=read_cache)
+                fingerprint = data["fingerprint"] if data else None
+            if fingerprint is not None:
+                material[chat["chat_id"]] = fingerprint
+        if material != {chat_id: task["input_fingerprint"] for chat_id, task in saved_tasks.items()}:
+            view["run"]["status"] = "partial"
+            view["run"]["gaps"].append("会话或消息资料已变化，需按当前材料重新分析。")
+            view["events"] = []
     view["coverage"] = {key: coverage.get(key, 0) for key in (
         "confirmed_creators", "conversations", "messages", "private_conversations", "group_conversations",
         "related_private_chats", "related_groups",

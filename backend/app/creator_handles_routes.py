@@ -195,8 +195,6 @@ def create_router(*, current_authorization, render_template, csrf_token):
                         creator_broadcast.template_delete, auth["id"], fields.get("id"), fields.get("revision"),
                     )
             elif action == "permissions":
-                if not isinstance(fields.get("media", False), bool):
-                    raise ValueError("图片授权参数无效。")
                 result = await run_in_threadpool(creator_broadcast.permission_check, args[0], args[1],
                                                 media=fields.get("media", False))
             elif action == "groups":

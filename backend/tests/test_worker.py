@@ -490,20 +490,14 @@ def test_authorization_rescan_resumes_bounded_importance_then_chat_batches(creat
                        started_at,ended_at) VALUES(%s,%s,%s,'manual',NOW()-INTERVAL '1 day',%s)""",
                        (UUID(int=2000 + index), person, actor, None if index < 10 else
                         pg.execute("SELECT NOW() at").fetchone()["at"]))
-    # Include historical profiles/jobs and account ownership, deduplicating a direct assignment.
+    # Historical profiles/jobs and current responsibilities share one deduplicated scan.
     for person in (people[0], people[10]):
         pg.execute("INSERT INTO creator_importance_profiles(contact_id,responsible_authorization_id) VALUES(%s,%s)",
                    (person, actor))
     pg.execute("INSERT INTO creator_importance_jobs(contact_id,responsible_authorization_id) VALUES(%s,%s)",
                (people[11], actor))
-    account, candidate = UUID(int=3000), UUID(int=3001)
-    pg.execute("""INSERT INTO social_accounts(id,platform,normalized_handle,display_handle)
-               VALUES(%s,'tiktok','creator','creator')""", (account,))
-    pg.execute("INSERT INTO creator_workflow_candidates(id) VALUES(%s)", (candidate,))
-    pg.execute("""INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,
-               contact_id,relationship,source,candidate_id,created_by_authorization_id)
-               VALUES(%s,%s,%s,%s,'owner','cm_confirmation',%s,%s)""",
-               (UUID(int=3002), account, actor, people[12], candidate, actor))
+    pg.execute("""INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source)
+               VALUES(%s,%s,%s,'manual')""", (UUID(int=3002), people[12], actor))
     for index in range(13):
         chat = f"oc_rescan_{index:02}"
         pg.execute("INSERT INTO chats(chat_id) VALUES(%s)", (chat,))
@@ -799,6 +793,9 @@ def test_all_due_accounts_rotate_through_three_page_slots_and_resume_cursors(pg,
         futures = {}
         worker._fill_lark_slots(settings, object(), executor, futures)
         assert len(futures) == 3
+        with monkeypatch.context() as patch:
+            patch.setattr(worker, "_running_jobs", lambda: pytest.fail("Full slots must not query for more work"))
+            worker._fill_lark_slots(settings, object(), executor, futures)
         assert max(Counter(claim.job.authorization_id for claim in futures.values()).values()) <= 2
         for claim in futures.values():
             seen.add(claim.job.authorization_id)

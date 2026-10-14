@@ -58,9 +58,7 @@ def seed_due(conn, now):
         return
     cms = conn.execute("SELECT a.id FROM authorizations a WHERE a.status='active' "
                        "AND a.body_consent_at IS NOT NULL AND (EXISTS (SELECT 1 FROM contact_assignments c "
-                       "WHERE c.responsible_authorization_id=a.id AND c.ended_at IS NULL) OR EXISTS "
-                       "(SELECT 1 FROM creator_account_assignments c WHERE c.responsible_authorization_id=a.id "
-                       "AND c.ended_at IS NULL)) ORDER BY a.id").fetchall()
+                       "WHERE c.responsible_authorization_id=a.id AND c.ended_at IS NULL)) ORDER BY a.id").fetchall()
     event_rules, rules_digest = summaries._event_rules(conn, summaries.get_settings())
     for cm in cms:
         if not summaries._roster(conn, cm['id']):
@@ -98,12 +96,10 @@ def backfill_due(conn, now):
     person, cm = signal['contact_id'], signal['responsible_authorization_id']
     params = (person, cm, signal['version'])
     eligible = conn.execute("""SELECT EXISTS(SELECT 1 FROM contact_roles WHERE contact_id=%s
-        AND role='creator' AND status='confirmed') AND (
+        AND role='creator' AND status='confirmed') AND
         EXISTS(SELECT 1 FROM contact_assignments WHERE contact_id=%s
-            AND responsible_authorization_id=%s AND ended_at IS NULL) OR
-        EXISTS(SELECT 1 FROM creator_account_assignments WHERE contact_id=%s
-            AND responsible_authorization_id=%s AND ended_at IS NULL AND relationship='owner')) AS valid""",
-        (person, person, cm, person, cm)).fetchone()['valid']
+            AND responsible_authorization_id=%s AND ended_at IS NULL) AS valid""",
+        (person, person, cm)).fetchone()['valid']
     if not eligible:
         conn.execute("""DELETE FROM offhours_summary_backfills WHERE contact_id=%s
             AND responsible_authorization_id=%s AND version=%s""", params)

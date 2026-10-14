@@ -107,17 +107,18 @@ def test_manual_handle_workflow_preserves_siblings_history_and_all_cm_responsibi
         pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,'Creator')", (contact,))
         pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) "
                    "VALUES(%s,'creator','confirmed','manual')", (contact,))
-    for contact, responsible in ((person, cm), (person, second_cm), (empty_person, cm)):
+    for contact, responsible in ((person, cm), (person, second_cm), (empty_person, cm),
+                                 (legacy_person, cm), (legacy_person, second_cm)):
         pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
                    "VALUES(%s,%s,%s,'manual')", (uuid4(), contact, responsible))
-    accounts = {handle: uuid4() for handle in ("old_handle", "sibling", "occupied", "represented", "legacy_old",
-                                              "legacy_occupied", "legacy_represented")}
+    accounts = {handle: uuid4() for handle in ("old_handle", "sibling", "occupied", "represented", "legacy_old")}
     for handle, account in accounts.items():
         pg.execute("INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) "
                    "VALUES(%s,'tiktok',%s,%s)", (account, handle, handle))
     for contact, handle, relationship in ((person, "old_handle", "owner"), (person, "sibling", "owner"),
                                           (foreign_person, "occupied", "owner"),
-                                          (person, "represented", "representative")):
+                                          (person, "represented", "representative"),
+                                          (legacy_person, "legacy_old", "owner")):
         pg.execute("""INSERT INTO contact_social_accounts(contact_id,social_account_id,relationship,status,source)
             VALUES(%s,%s,%s,'confirmed','excel_ai_verified')""", (contact, accounts[handle], relationship))
     batch, import_row = uuid4(), uuid4()
@@ -130,21 +131,6 @@ def test_manual_handle_workflow_preserves_siblings_history_and_all_cm_responsibi
         (import_row, batch, cm, person))
     pg.execute("UPDATE contact_social_accounts SET import_row_id=%s WHERE contact_id=%s AND social_account_id=%s",
                (import_row, person, accounts["old_handle"]))
-    candidate = uuid4()
-    pg.execute("INSERT INTO creator_workflow_candidates(id,contact_id) VALUES(%s,%s)", (candidate, legacy_person))
-    for responsible in (cm, second_cm):
-        pg.execute("""INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,
-            contact_id,relationship,source,candidate_id,created_by_authorization_id)
-            VALUES(%s,%s,%s,%s,'owner','cm_confirmation',%s,%s)""",
-            (uuid4(), accounts["legacy_old"], responsible, legacy_person, candidate, owner))
-    for contact, handle, relationship in ((foreign_person, "legacy_occupied", "owner"),
-                                          (person, "legacy_represented", "representative")):
-        linked_candidate = uuid4()
-        pg.execute("INSERT INTO creator_workflow_candidates(id,contact_id) VALUES(%s,%s)", (linked_candidate, contact))
-        pg.execute("""INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,
-            contact_id,relationship,source,candidate_id,created_by_authorization_id)
-            VALUES(%s,%s,%s,%s,%s,'cm_confirmation',%s,%s)""",
-            (uuid4(), accounts[handle], cm, contact, relationship, linked_candidate, owner))
     monkeypatch.setattr(creator_handles_routes, "connection", lambda: nullcontext(pg))
     url = f"/creators/people/{person}/handle"
     fields = {"csrf_token": "csrf", "cm_id": str(cm), "old_handle": "@OLD_HANDLE", "handle": "new_handle"}
@@ -164,15 +150,11 @@ def test_manual_handle_workflow_preserves_siblings_history_and_all_cm_responsibi
     actor["status"] = "active"
     for changes, code in (({"cm_id": str(manager)}, 403), ({"handle": "invalid handle"}, 400),
                           ({"old_handle": "stale"}, 400), ({"old_handle": ""}, 400),
-                          ({"handle": "occupied"}, 400), ({"handle": "represented"}, 400),
-                          ({"handle": "legacy_occupied"}, 400), ({"handle": "legacy_represented"}, 400)):
+                          ({"handle": "occupied"}, 400), ({"handle": "represented"}, 400)):
         assert client.post(url, data={**fields, **changes}).status_code == code
         assert facts() == original
     saved = client.post(url, data=fields)
-    assert saved.status_code == 200 and saved.json()["handles"] == ["legacy_represented", "new_handle", "sibling"]
-    for responsible in (cm, second_cm):
-        expected = ["legacy_represented", "new_handle", "sibling"] if responsible == cm else ["new_handle", "sibling"]
-        assert contact_handles.for_contacts(pg, [person], responsible)[person] == expected
+    assert saved.status_code == 200 and saved.json()["handles"] == ["new_handle", "sibling"]
     changed = facts()
     for table in ("contacts", "contact_roles", "contact_assignments", "creator_account_assignments",
                   "creator_import_rows"):
@@ -187,8 +169,8 @@ def test_manual_handle_workflow_preserves_siblings_history_and_all_cm_responsibi
     assert next(row for row in contact_handles.confirmed_pairs(pg, [person])
                 if row["handle"] == "new_handle")["human_confirmed"]
     audit = pg.execute("SELECT metadata FROM audit_events WHERE action='creator_handle_manual'").fetchone()["metadata"]
-    assert audit["before"] == ["legacy_represented", "old_handle", "sibling"]
-    assert audit["after"] == ["legacy_represented", "new_handle", "sibling"]
+    assert audit["before"] == ["old_handle", "sibling"]
+    assert audit["after"] == ["new_handle", "sibling"]
     assert client.post(url, data=fields).status_code == 400  # A second stale save cannot remove the new account.
     assert facts() == changed
 
@@ -201,10 +183,10 @@ def test_manual_handle_workflow_preserves_siblings_history_and_all_cm_responsibi
     restore = {**fields, "old_handle": "new_handle", "handle": "https://www.tiktok.com/@old_handle"}
     assert client.post(url, data=restore).status_code == 200
     assert contact_handles.for_contacts(pg, [person])[person] == [
-        "concurrent_extra", "legacy_represented", "old_handle", "sibling"]
+        "concurrent_extra", "old_handle", "sibling"]
     assert creator_imports._conflicts(pg, [(None, person, "new_handle")]) == [True]
     assert client.post(url, data={**fields, "old_handle": "old_handle", "handle": "sibling"}).status_code == 200
-    assert contact_handles.for_contacts(pg, [person])[person] == ["concurrent_extra", "legacy_represented", "sibling"]
+    assert contact_handles.for_contacts(pg, [person])[person] == ["concurrent_extra", "sibling"]
 
     add_url = f"/creators/people/{empty_person}/handle"
     add_fields = {**fields, "old_handle": "", "handle": "first_account"}
@@ -215,12 +197,10 @@ def test_manual_handle_workflow_preserves_siblings_history_and_all_cm_responsibi
     legacy_url = f"/creators/people/{legacy_person}/handle"
     legacy_fields = {**fields, "old_handle": "legacy_old", "handle": "legacy_new"}
     assert client.post(legacy_url, data=legacy_fields).status_code == 200
+    assert contact_handles.for_contacts(pg, [legacy_person])[legacy_person] == ["legacy_new"]
     for responsible in (cm, second_cm):
-        assert contact_handles.for_contacts(pg, [legacy_person], responsible)[legacy_person] == ["legacy_new"]
         assert pg.execute("SELECT creator_importance_is_eligible(%s,%s) ok", (legacy_person, responsible)
                           ).fetchone()["ok"]
-    assert pg.execute("SELECT count(*) n FROM creator_account_assignments WHERE contact_id=%s AND ended_at IS NOT NULL",
-                      (legacy_person,)).fetchone()["n"] == 2
     assert creator_imports._conflicts(pg, [(None, legacy_person, "legacy_old")]) == [True]
     assert pg.execute("SELECT reviewed_by_authorization_id FROM contact_social_accounts "
                       "WHERE contact_id=%s AND social_account_id=%s", (legacy_person, accounts["legacy_old"])
@@ -237,9 +217,8 @@ def test_manual_handle_workflow_preserves_siblings_history_and_all_cm_responsibi
     assert client.post(url, data={**added, "operation": "remove", "old_handle": "cm_extra", "handle": ""}
                        ).status_code == 200
     assert pg.execute("SELECT * FROM contact_assignments ORDER BY id").fetchall() == responsibilities
-    for responsible in (cm, second_cm):
-        assert "cm_current" in contact_handles.for_contacts(pg, [person], responsible)[person]
-        assert "cm_extra" not in contact_handles.for_contacts(pg, [person], responsible)[person]
+    assert "cm_current" in contact_handles.for_contacts(pg, [person])[person]
+    assert "cm_extra" not in contact_handles.for_contacts(pg, [person])[person]
     assert creator_imports._conflicts(pg, [(None, person, "cm_extra")]) == [True]
     assert client.post(url, data={**added, "handle": "old_handle"}).status_code == 403
     assert client.post(f"/creators/people/{unassigned_person}/handle", data=added).status_code == 403
@@ -838,6 +817,8 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
     monkeypatch.setattr(creator_broadcast, "_people", lambda _conn, cm, ids=None: [
         person for person in people if (ids is None or person["id"] in ids) and (cm is None or person["id"] == p1)
     ])
+    monkeypatch.setattr(contact_handles, "for_contacts", lambda _conn, ids: {
+        key: next(person["handles"] for person in people if person["id"] == str(key)) for key in ids})
     monkeypatch.setattr(creator_broadcast, "_groups", lambda _conn, ids, _cm, purpose: [dict(group, purpose=purpose,
                         members=[contact for contact in group["members"] if contact in ids])]
                         if ids and not changed["routes"] else [])

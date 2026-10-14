@@ -101,6 +101,7 @@ def _state(conn, contact_id):
            LEFT JOIN lark_identities i ON i.open_id=a.open_id AND i.identity_type='user'
            ORDER BY a.id"""
     ).fetchall()
+    # Ended legacy relationships are manual detachments, not active responsibility fallbacks.
     assignments = conn.execute(
         """SELECT 'person' AS level,id,responsible_authorization_id,source,started_at,ended_at,
              ended_by_authorization_id,NULL::uuid AS account_id,
@@ -111,7 +112,7 @@ def _state(conn, contact_id):
              NULL::uuid AS ended_by_authorization_id,a.social_account_id,
              s.normalized_handle,s.platform
            FROM creator_account_assignments a LEFT JOIN social_accounts s ON s.id=a.social_account_id
-           WHERE a.contact_id=%s
+           WHERE a.contact_id=%s AND a.ended_at IS NOT NULL
            ORDER BY level,id""",
         (contact_id, contact_id),
     ).fetchall()

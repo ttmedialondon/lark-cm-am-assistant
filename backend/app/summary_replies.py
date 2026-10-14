@@ -86,25 +86,31 @@ def source(conn, actor_id, event_id, settings, *, require_unresolved=True, featu
     if not task or not task["is_current"] or task["status"] != "succeeded" or task["chat_id"] is not None:
         raise core.SummaryInputError("事件已更新，请刷新报告后重新生成。")
     run = conn.execute("SELECT * FROM offhours_summary_runs WHERE id=%s", (task["run_id"],)).fetchone()
-    cm, owner = core._authorize_run(conn, run, actor_id=actor_id)
+    read_cache = {}
+    cm, owner = core._authorize_run(conn, run, actor_id=actor_id, read_cache=read_cache)
     if feature == core.ASSISTANT_FEATURE and not owner and UUID(str(actor_id)) != cm["id"]:
         raise PermissionError("运营助手只允许本人或 Owner 查看该 CM 的聊天。")
     if require_unresolved and not core._enabled(conn, feature or core.run_feature(run)):
         raise core.SummaryInputError("消息总结 AI 已关闭，暂不能生成建议。")
     roster = core._roster(conn, cm["id"])
     chats = core._related_chats(conn, roster, settings=settings, cm_id=cm["id"])
-    _, person = dialogues.merge_input(conn, run, task, settings, roster, chats)
+    _, person = dialogues.merge_input(conn, run, task, settings, roster, chats, read_cache=read_cache)
     events = dialogues.decode(task["result_ciphertext"], settings)["events"]
     if index >= len(events):
         raise core.SummaryInputError("事件已更新。")
     if require_unresolved and events[index].get("handling_status") != "unresolved":
         raise core.SummaryInputError("仅为尚未处理完成的事件生成建议。")
-    return task, run, cm, person, chats, events[index]
+    return task, run, cm, person, chats, events[index], roster
 
 
 def collect(conn, actor_id, event_id, settings, *, require_unresolved=True, cutoff=None, feature=None):
-    task, run, cm, person, chats, event = source(conn, actor_id, event_id, settings,
-                                              require_unresolved=require_unresolved, feature=feature)
+    selected = source(conn, actor_id, event_id, settings,
+                      require_unresolved=require_unresolved, feature=feature)
+    return _collect(conn, actor_id, event_id, settings, selected, cutoff=cutoff, feature=feature)
+
+
+def _collect(conn, actor_id, event_id, settings, selected, *, cutoff=None, feature=None):
+    task, run, cm, person, chats, event, roster = selected
     now = cutoff or datetime.now(UTC)
     if isinstance(now, str):
         now = datetime.fromisoformat(now)
@@ -114,7 +120,7 @@ def collect(conn, actor_id, event_id, settings, *, require_unresolved=True, cuto
     start = run["window_start"] - timedelta(days=7)
     opens = set(person["open_ids"])
     staff = core._staff(conn, cm)
-    people = {r["open_id"]: str(r["contact_id"]) for r in core._roster(conn, cm["id"])}
+    people = {r["open_id"]: str(r["contact_id"]) for r in roster}
     speakers = {**people, **{openid: value["speaker"] for openid, value in staff.items()},
                 **dict.fromkeys(opens, "creator")}
     staff_names = {v["speaker"]: {"name": v["name"]} for v in staff.values()}
@@ -196,9 +202,10 @@ def collect(conn, actor_id, event_id, settings, *, require_unresolved=True, cuto
 def read_event_context(conn, actor_id, event_id, settings, *, mode="period", cutoff=None):
     if mode not in ("period", "latest"):
         raise core.SummaryInputError("请选择原时段或最新进展。")
-    task, run, _, _, _, event = source(conn, actor_id, event_id, settings, require_unresolved=False)
-    data = collect(conn, actor_id, event_id, settings, require_unresolved=False,
-                   cutoff=task["cutoff"] if mode == "period" else cutoff)
+    selected = source(conn, actor_id, event_id, settings, require_unresolved=False)
+    task, run, _, _, _, event, _ = selected
+    data = _collect(conn, actor_id, event_id, settings, selected,
+                    cutoff=task["cutoff"] if mode == "period" else cutoff)
     data.update(event_ref=event_id, version=task["input_fingerprint"], mode=mode,
                 original_window={"start": run["window_start"].isoformat(), "end": task["cutoff"].isoformat()},
                 original_evidence=event["evidence"], messages_are_candidates=mode == "latest")
@@ -233,7 +240,7 @@ def enqueue(conn, actor, event_id, settings, *, parent_id=None, text=None, featu
         raise core.SummaryInputError("起草要求过长。")
     if language is not None and (not isinstance(language, str) or len(language) > 80):
         raise core.SummaryInputError("目标语言无效。")
-    task, _, _, _, _, _ = source(conn, actor, event_id, settings, feature=feature)
+    task, *_ = source(conn, actor, event_id, settings, feature=feature)
     action = "translate" if parent_id else "generate"
     parent_state = {}
     if parent_id:
@@ -390,8 +397,8 @@ def step(job, settings):
         index = checkpoint.get("index", 0)
         if index < len(batches):
             batch = batches[index]
-            positions = [current["messages"].index(m) for m in batch]
-            context = current["messages"][max(0, min(positions) - 3) : max(positions) + 4]
+            offset = sum(len(part) for part in batches[:index])
+            context = current["messages"][max(0, offset - 3) : offset + len(batch) + 3]
             by_id = {(m["chat_id"], m["message_id"]): [] for m in current["messages"]}
             for m in current["messages"]:
                 by_id[(m["chat_id"], m["message_id"])].append(m)
@@ -563,7 +570,8 @@ def read(conn, actor, job_id, settings, *, fresh=False):
     if not job:
         raise PermissionError("回复建议不存在或无权查看。")
     feature = job.get("feature", core.FEATURE)
-    task, run, *_ = source(conn, actor, event_id(job), settings, require_unresolved=False, feature=feature)
+    selected = source(conn, actor, event_id(job), settings, require_unresolved=False, feature=feature)
+    task, run, *_ = selected
     checkpoint = dialogues.decode(job["checkpoint_ciphertext"], settings) or {}
     _rules_access(conn, actor, checkpoint)
     result = None
@@ -580,10 +588,10 @@ def read(conn, actor, job_id, settings, *, fresh=False):
             dialogues._check_merge_access(conn, run, task,
                 dict(enumerate(original.get("evidence", []))), actor_id=actor)
         if fresh:
-            current = collect(conn, actor, event_id(job), settings, require_unresolved=False, feature=feature)
+            current = _collect(conn, actor, event_id(job), settings, selected, feature=feature)
             if current["fingerprint"] != checkpoint["fingerprint"]:
-                previous = collect(conn, actor, event_id(job), settings, require_unresolved=False,
-                                   feature=feature, cutoff=result["checked_at"])
+                previous = _collect(conn, actor, event_id(job), settings, selected,
+                                    feature=feature, cutoff=result["checked_at"])
                 if previous["fingerprint"] == checkpoint["fingerprint"]:
                     return {"id": str(job["id"]), "status": "stale", "reason_code": "new_messages",
                             "error": "有新消息，请核对后使用。", "result": result}

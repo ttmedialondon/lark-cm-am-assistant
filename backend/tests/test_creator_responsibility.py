@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 from jinja2 import Environment, FileSystemLoader, select_autoescape
-from psycopg.errors import DivisionByZero
+from psycopg.errors import DivisionByZero, RaiseException
 
 from app import ai_dispatch, ai_feature_config, config, creator_data, openai_client
 from app import creator_handle_evidence as handle_evidence
@@ -126,7 +126,15 @@ def test_shared_evidence_uses_connected_cm_roster_and_keeps_other_staff_as_conte
     assert "RESTRICTED SECRET" not in encoded
     assert len(material["pack"]["messages"]) <= evidence.MAX_MESSAGES
     assert sum(len(row["text"]) for row in material["pack"]["messages"]) <= evidence.MAX_CHARS
-    assert evidence.still_valid(pg, material["refs"], pilot.settings)
+    queries = []
+
+    class Meter:
+        def execute(self, sql, *args, **kwargs):
+            queries.append(sql)
+            return pg.execute(sql, *args, **kwargs)
+
+    assert evidence.still_valid(Meter(), material["refs"], pilot.settings)
+    assert sum(sql.startswith("SELECT " + handle_evidence._SPEAKER_COLUMNS) for sql in queries) == 1
     with monkeypatch.context() as no_plaintext:
         no_plaintext.setattr(handle_evidence.text, "_decrypt_body", lambda *_: pytest.fail("list must not decrypt"))
         assert evidence.still_valid(pg, material["refs"], pilot.settings, lightweight=True)
@@ -164,35 +172,32 @@ def test_shared_evidence_uses_connected_cm_roster_and_keeps_other_staff_as_conte
     refreshed = evidence.build(pg, pilot.settings, creator)
     assert next(c for c in refreshed["pack"]["candidates"] if c["id"] == by_id[cm])["known_assignment"]
     assert any(a["cm"] == by_id[cm] for a in refreshed["pack"]["existing_assignments"])
-    account, candidate = uuid4(), uuid4()
+    second_authorization = pg.execute("SELECT id FROM authorizations WHERE open_id='ou_second_cm'").fetchone()["id"]
     pg.execute(
-        "INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) "
-        "VALUES(%s,'tiktok','creator.one','creator.one')",
-        (account,),
-    )
-    pg.execute(
-        "INSERT INTO creator_workflow_candidates(id,normalized_handle,responsible_authorization_id,contact_id,"
-        "relationship,status,social_account_id) VALUES(%s,'creator.one',%s,%s,'owner','confirmed',%s)",
-        (candidate, cm, creator, account),
-    )
-    pg.execute(
-        "INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,contact_id,"
-        "relationship,source,candidate_id,created_by_authorization_id) "
-        "VALUES(%s,%s,%s,%s,'owner','cm_confirmation',%s,%s)",
-        (uuid4(), account, cm, creator, candidate, pilot.ids["owner"]),
+        "INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
+        "VALUES(%s,%s,%s,'manual')", (uuid4(), creator, second_authorization),
     )
     scoped = evidence.build(pg, pilot.settings, creator)
-    assert any(
-        a["cm"] == by_id[cm] and a["level"] == "account" and a["handle"] == "creator.one"
-        for a in scoped["pack"]["existing_assignments"]
-    )
+    assert {a["cm"] for a in scoped["pack"]["existing_assignments"]} == {by_id[cm], by_id[second_cm]}
     scopes = matching._existing_assignments(pg, [creator])[str(creator)]
-    assert {row["scope_label"] for row in scopes} == {"达人本人", "@creator.one"}
-    pg.execute(
-        "UPDATE contact_assignments SET ended_at=NOW(),ended_by_authorization_id=%s WHERE contact_id=%s",
-        (pilot.ids["owner"], creator),
-    )
-    account_facts = _snapshot(pg, ("creator_account_assignments",))
+    assert {row["scope_label"] for row in scopes} == {"达人本人"} and len(scopes) == 2
+    pg.execute("DELETE FROM contact_assignments WHERE contact_id=%s AND responsible_authorization_id=%s",
+               (creator, cm))
+    historical_candidate = uuid4()
+    pg.execute("INSERT INTO creator_workflow_candidates(id,contact_id) VALUES(%s,%s)",
+               (historical_candidate, creator))
+    pg.execute("""INSERT INTO creator_account_assignments(id,responsible_authorization_id,contact_id,
+        relationship,source,candidate_id,created_by_authorization_id,ended_at)
+        VALUES(%s,%s,%s,'owner','cm_confirmation',%s,%s,NOW())""",
+        (uuid4(), cm, creator, historical_candidate, pilot.ids["owner"]))
+    assignment_facts = _snapshot(pg, ("contact_assignments", "creator_account_assignments"))
+    with pytest.raises(RaiseException, match="Migrate active account-level"), pg.transaction():
+        account = uuid4()
+        pg.execute("INSERT INTO social_accounts(id,platform,normalized_handle,display_handle) "
+                   "VALUES(%s,'tiktok','retirement_guard','retirement_guard')", (account,))
+        pg.execute("UPDATE creator_account_assignments SET social_account_id=%s,ended_at=NULL WHERE contact_id=%s",
+                   (account, creator))
+        pg.execute((Path(__file__).parents[1] / "migrations/105_retire_legacy_creator_assignments.sql").read_text())
     # Real source fingerprints remain valid after OUR additions, not after unrelated manual changes.
     monkeypatch.setattr(matching, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(config, "get_settings", lambda: pilot.settings)
@@ -239,8 +244,8 @@ def test_shared_evidence_uses_connected_cm_roster_and_keeps_other_staff_as_conte
             "SELECT count(*) n FROM contact_assignments WHERE contact_id=%s AND ended_at IS NULL", (creator,)
         ).fetchone()["n"]
         == 1
-    )  # An account-scoped CM is not widened to person-level responsibility.
-    assert _snapshot(pg, account_facts.keys()) == account_facts
+    )  # Keep the other CM; never restore a manually ended responsibility, even from the retired table.
+    assert _snapshot(pg, assignment_facts.keys()) == assignment_facts
     assert evidence.still_valid(pg, applied["refs"], pilot.settings)
     assert evidence.still_valid(pg, applied["refs"], pilot.settings, lightweight=True)
     pg.execute("UPDATE contact_roles SET status='rejected' WHERE contact_id=%s AND role='creator'", (creator,))
@@ -629,7 +634,7 @@ def test_stale_queue_version_prompt_and_revocation_fence_publication(pg, pilot, 
             (changed_rules["id"],),
         ).fetchone() == {"status": "queued", "result_ciphertext": None, "reason_code": "snapshot_changed"}
         assert len(flow.calls) == 3
-    assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 0
+    assert not pg.execute("SELECT 1 FROM contact_assignments WHERE contact_id=%s", (flow.contact,)).fetchone()
     flow.before_response = None
     # Confidence alone never turns a suggestion, old responsibility, uncertain scope or conflict into a write.
     for first, second in (
@@ -644,7 +649,7 @@ def test_stale_queue_version_prompt_and_revocation_fence_publication(pg, pilot, 
             _suggestion("CM2", ["M1", "M3"], **{"decision": "responsible", **second}),
         ]
         matching.run(_prepared_job(pg, flow), flow.settings)
-        assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 0
+        assert not pg.execute("SELECT 1 FROM contact_assignments WHERE contact_id=%s", (flow.contact,)).fetchone()
     flow.suggestions = None
     pg.execute("SAVEPOINT coverage_guards")
     flow.coverage = {"critical_evidence_omitted": True}
@@ -658,7 +663,7 @@ def test_stale_queue_version_prompt_and_revocation_fence_publication(pg, pilot, 
         "suggestions"
     ]
     assert all(result["association_status"] == "review_required" and result["association_reason"] for result in results)
-    assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 0
+    assert not pg.execute("SELECT 1 FROM contact_assignments WHERE contact_id=%s", (flow.contact,)).fetchone()
     flow.coverage = {"missing_reply_ids": ["M2"]}
     flow.material_version += 1
     partial = _prepared_job(pg, flow)
@@ -704,7 +709,7 @@ def test_stale_queue_version_prompt_and_revocation_fence_publication(pg, pilot, 
         (candidate_auths[0], candidate_auths[1], candidate_auths),
     )
     matching.run(_prepared_job(pg, flow), flow.settings)
-    assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 0
+    assert not pg.execute("SELECT 1 FROM contact_assignments WHERE contact_id=%s", (flow.contact,)).fetchone()
     pg.execute(
         "UPDATE authorizations SET status='active',body_consent_at=NOW() WHERE id=ANY(%s::uuid[])", (candidate_auths,)
     )
@@ -720,8 +725,10 @@ def test_stale_queue_version_prompt_and_revocation_fence_publication(pg, pilot, 
 
     flow.before_response = manual_end
     matching.run(_prepared_job(pg, flow), flow.settings)
-    assert pg.execute("SELECT count(*) n FROM contact_assignments WHERE ended_at IS NULL").fetchone()["n"] == 0
-    assert pg.execute("SELECT count(*) n FROM contact_assignments WHERE ended_at IS NOT NULL").fetchone()["n"] == 2
+    assert not pg.execute("SELECT 1 FROM contact_assignments WHERE contact_id=%s AND ended_at IS NULL",
+                          (flow.contact,)).fetchone()
+    assert pg.execute("SELECT count(*) n FROM contact_assignments WHERE contact_id=%s AND ended_at IS NOT NULL",
+                      (flow.contact,)).fetchone()["n"] == 2
 
 
 def test_retry_ledger_and_disabled_config_keep_suggestions_isolated(pg, responsibility_flow):
@@ -947,6 +954,21 @@ def test_ai_readonly_routes_csrf_lazy_evidence_and_safe_audit(pg, pilot, respons
     assert "99%" in response.text and "已自动关联" in response.text
     assert "helper" in response.text  # CM contact ID differs from the current authorization ID.
     assert "/confirm" not in response.text and "/apply" not in response.text
+    with pg.transaction(force_rollback=True):
+        extra = _enqueue(pg, pilot.person("second_page_creator"))
+        pg.execute("UPDATE creator_responsibility_jobs SET status='completed',result_ciphertext=%s WHERE id=%s",
+                   (storage.encrypt(json.dumps(result)), extra))
+        queries = []
+
+        class Meter:
+            def execute(self, sql, *args, **kwargs):
+                queries.append(sql)
+                return pg.execute(sql, *args, **kwargs)
+
+        page = matching.page_data(Meter(), owner, flow.settings)
+        assert len([row for row in page["jobs"] if row["results"]]) == 2
+        assert sum(sql.startswith("SELECT id,display_name FROM contacts") for sql in queries) == 1
+        assert not any(sql.startswith("SELECT refs FROM creator_responsibility_jobs") for sql in queries)
     pg.execute("SAVEPOINT unknown_page")
     pg.execute("UPDATE creator_responsibility_jobs SET status='failed',reason_code='request_unknown',"
                "result_ciphertext=NULL WHERE id=%s", (job["id"],))

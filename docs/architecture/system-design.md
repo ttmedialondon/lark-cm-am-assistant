@@ -30,7 +30,7 @@ Caddy → FastAPI + Jinja2 / HTMX / Tabler → PostgreSQL
 | `organizations`、`organization_tenants`、`contact_organization_links` | 组织及可验证租户/人员关系；租户相同不等于达人、员工或负责人 |
 | `social_accounts`、`contact_social_accounts` | 平台账号及关联用户；一个用户可以关联多个 handle |
 | `creator_workflow_candidates`、`creator_workflow_sources`、`creator_workflow_requests` | 保留的旧线索、来源和请求历史；无现行写入入口 |
-| `creator_account_assignments` | 旧账号级正式归属，继续作为冲突和旧名单读取依据；新版不往旧名单表写入 |
+| `creator_account_assignments` | 已退役的账号级归属历史；不参与当前名单、冲突或调度，仅保留已结束关系供解除历史核对及审计 |
 | `contact_assignments` | 人级负责人；当前人工入库事务与账号绑定同时完成，引用 `import_row_id`；旧 AI 任务引用保留为历史 |
 | `creator_ownership_runs`、`creator_ownership_tasks`、`creator_ownership_refs` | 历史负责人扫描批次、人×CM任务/受控结论（已退役）、授权绑定且冻结的消息引用；输入与派生说明加密，原文仍来自原存储 |
 | `creator_handle_runs`、`creator_handle_tasks` | 旧反向 handle 扫描历史；无现行扫描或确认入口 |

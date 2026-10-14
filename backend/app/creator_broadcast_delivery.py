@@ -38,7 +38,6 @@ def _audit(conn, actor, action, metadata):
 
 
 def _authorization(conn, actor):
-    # Demo visibility never grants a send scope or another CM's identity.
     creator_access.require_broadcast_access(conn, actor)
     row = conn.execute("SELECT * FROM authorizations WHERE id=%s", (actor,)).fetchone()
     if not row or row["status"] != "active" or not row["body_consent_at"]:
@@ -157,28 +156,31 @@ def prepare(actor_id, fields):
     )
     groups, issues = [], list(data.get("issues", []))
     with connection() as conn:
-        _authorization(conn, actor)
         image_assets = _images(conn, actor, data["message"], settings)
         image_keys = {key: image["image_key"] for key, image in image_assets.items()}
+        targets = {(person["id"], group["id"]) for group in data["groups"] for person in group.get("mentions", [])}
+        identities = {}
+        if targets:
+            contacts, chats = zip(*targets, strict=True)
+            for row in conn.execute("""SELECT DISTINCT i.contact_id,m.chat_id,i.open_id FROM lark_identities i
+                JOIN chat_members m ON m.open_id=i.open_id
+                JOIN unnest(%s::uuid[],%s::text[]) wanted(contact_id,chat_id)
+                  ON wanted.contact_id=i.contact_id AND wanted.chat_id=m.chat_id
+                WHERE i.identity_type='user' AND m.member_type='user'""", (list(contacts), list(chats))).fetchall():
+                identities.setdefault((str(row["contact_id"]), row["chat_id"]), []).append(row["open_id"])
         for original in data["groups"]:
             group = {**original, "mentions": [], "mention_all": bool(original.get("mention_all"))}
             invalid = False
             for person in original.get("mentions", []):
-                identities = conn.execute(
-                    """SELECT i.open_id FROM lark_identities i
-                    JOIN chat_members m ON m.open_id=i.open_id
-                    WHERE i.contact_id=%s AND i.identity_type='user' AND m.chat_id=%s AND m.member_type='user'
-                    ORDER BY i.open_id""",
-                    (creator_access.parse_id(person["id"]), group["id"]),
-                ).fetchall()
-                if len(identities) != 1:
+                candidates = identities.get((person["id"], group["id"]), [])
+                if len(candidates) != 1:
                     issues.append(
                         {"chat_id": group["id"], "name": group["name"], "reason": "被 @ 人员的群内身份不唯一，请先核实"}
                     )
                     invalid = True
                     break
                 group["mentions"].append(
-                    {"id": identities[0]["open_id"], "name": person["name"], "contact_id": person["id"]}
+                    {"id": candidates[0], "name": person["name"], "contact_id": person["id"]}
                 )
             if not invalid:
                 try:
@@ -307,15 +309,16 @@ def _owned_batch(conn, actor, batch_id):
     return row
 
 
-def _summary(conn, row):
+def _summary(conn, row, targets=None):
     counts = dict.fromkeys(STATUSES, 0)
     can_retry = False
-    for item in conn.execute(
-        """SELECT status,COUNT(*) AS n,BOOL_OR(retryable) AS retryable FROM creator_broadcast_targets
-        WHERE batch_id=%s GROUP BY status""",
-        (row["id"],),
-    ).fetchall():
-        counts[item["status"]] = item["n"]
+    if targets is None:
+        targets = conn.execute(
+            """SELECT status,COUNT(*) AS n,BOOL_OR(retryable) AS retryable FROM creator_broadcast_targets
+            WHERE batch_id=%s GROUP BY status""", (row["id"],),
+        ).fetchall()
+    for item in targets:
+        counts[item["status"]] += item.get("n", 1)
         can_retry = can_retry or bool(item["retryable"])
     total = sum(counts.values())
     if counts["sending"]:
@@ -340,8 +343,10 @@ def _summary(conn, row):
 
 def _existing(conn, actor, preview_id, request_id):
     row = conn.execute(
-        """SELECT * FROM creator_broadcast_batches
-        WHERE sender_authorization_id=%s AND (request_id=%s OR preview_id=%s) ORDER BY created_at LIMIT 1""",
+        """SELECT b.*,p.sender_name,p.purpose FROM creator_broadcast_batches b
+        JOIN creator_broadcast_previews p ON p.id=b.preview_id
+        WHERE b.sender_authorization_id=%s AND (b.request_id=%s OR b.preview_id=%s)
+        ORDER BY b.created_at LIMIT 1""",
         (actor, request_id, preview_id),
     ).fetchone()
     if row and row["request_id"] == request_id and row["preview_id"] != preview_id:
@@ -357,7 +362,7 @@ def submit(actor_id, preview_id, request_id):
         creator_access.require_broadcast_access(conn, actor)
         existing = _existing(conn, actor, preview_id, request_id)
         if existing:
-            return {"batch": _summary(conn, _owned_batch(conn, actor, existing["id"])), "deduplicated": True}
+            return {"batch": _summary(conn, existing), "deduplicated": True}
         preview = _owned_preview(conn, actor, preview_id)
         if preview["expires_at"] <= datetime.now(UTC):
             raise ValueError("预览已过期，请重新准备发送。")
@@ -365,7 +370,7 @@ def submit(actor_id, preview_id, request_id):
         if authorization["open_id"] != preview["sender_open_id"]:
             raise PermissionError("发送账号已变化，请重新准备。")
         existing = conn.execute(
-            """SELECT b.* FROM creator_broadcast_batches b
+            """SELECT b.*,p.sender_name,p.purpose FROM creator_broadcast_batches b
             JOIN creator_broadcast_previews p ON p.id=b.preview_id
             WHERE b.sender_authorization_id=%s AND
               (p.fingerprint=ANY(%s::text[]) OR p.snapshot->'content_fingerprints' ?| %s::text[])
@@ -377,7 +382,7 @@ def submit(actor_id, preview_id, request_id):
              preview["snapshot"].get("content_fingerprints", [preview["fingerprint"]])),
         ).fetchone()
         if existing:
-            return {"batch": _summary(conn, _owned_batch(conn, actor, existing["id"])), "deduplicated": True}
+            return {"batch": _summary(conn, existing), "deduplicated": True}
         settings = get_settings()
         _images(conn, actor, _body(preview["body_ciphertext"], preview["snapshot"], settings), settings)
         _routes_current(conn, actor, preview["purpose"], preview["snapshot"]["groups"])
@@ -406,7 +411,13 @@ def history(actor_id):
             WHERE b.sender_authorization_id=%s ORDER BY b.created_at DESC,b.id DESC LIMIT 30""",
             (actor,),
         ).fetchall()
-        return {"batches": [_summary(conn, row) for row in rows]}
+        targets = {row["id"]: [] for row in rows}
+        if rows:
+            for item in conn.execute("""SELECT batch_id,status,COUNT(*) AS n,BOOL_OR(retryable) AS retryable
+                FROM creator_broadcast_targets WHERE batch_id=ANY(%s::uuid[]) GROUP BY batch_id,status""",
+                (list(targets),)).fetchall():
+                targets[item["batch_id"]].append(item)
+        return {"batches": [_summary(conn, row, targets[row["id"]]) for row in rows]}
 
 
 def batch(actor_id, batch_id):
@@ -422,7 +433,7 @@ def batch(actor_id, batch_id):
             "SELECT body_ciphertext,snapshot FROM creator_broadcast_previews WHERE id=%s", (row["preview_id"],)
         ).fetchone()
         return {
-            "batch": _summary(conn, row),
+            "batch": _summary(conn, row, targets),
             "targets": [{**target, "id": str(target["id"])} for target in targets],
             "message": _body(preview["body_ciphertext"], preview["snapshot"], get_settings()),
         }
@@ -568,7 +579,6 @@ def run_claimed(job, settings=None):
     send_attempted = False
     try:
         with connection() as conn:
-            _authorization(conn, actor)
             _routes_current(conn, actor, job["purpose"], [job["snapshot"]])
         with httpx.Client(timeout=8) as http:
             client = LarkClient(settings, http_client=http)

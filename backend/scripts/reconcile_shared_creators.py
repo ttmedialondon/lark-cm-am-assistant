@@ -50,8 +50,6 @@ def library_check(conn):
       (SELECT count(*) FROM creator_import_rows WHERE review_status='confirmed') confirmed_imports,
       (SELECT count(*) FROM creator_import_rows r WHERE r.review_status='confirmed' AND (
         NOT EXISTS (SELECT 1 FROM contact_assignments a WHERE a.contact_id=r.contact_id
-          AND a.responsible_authorization_id=r.cm_authorization_id AND a.ended_at IS NULL)
-        AND NOT EXISTS (SELECT 1 FROM creator_account_assignments a WHERE a.contact_id=r.contact_id
           AND a.responsible_authorization_id=r.cm_authorization_id AND a.ended_at IS NULL))) missing_current_assignment,
       (SELECT count(*) FROM creator_import_rows r WHERE r.review_status='confirmed' AND
         NOT EXISTS (SELECT 1 FROM contact_social_accounts l JOIN social_accounts s ON s.id=l.social_account_id

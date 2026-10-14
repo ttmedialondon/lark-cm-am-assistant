@@ -623,11 +623,11 @@ def _apply_result(conn, job, pack, result, stats, refs, settings):
     with conn.transaction() as admission:
         _manual_access(conn, pack)
         if job.get('purpose') == 'identity':
-            creator = evidence.identity_validate(pack, result['creator'],
-                threshold=max(0.95, float(_config(conn)['auto_confirm_threshold'])))
+            threshold = max(0.95, float(_config(conn)['auto_confirm_threshold']))
+            creator = evidence.identity_validate(pack, result['creator'], threshold=threshold)
             result['creator'] = creator
             admitted = confirm_identity(conn, job['contact_id'], creator, pack, refs, settings,
-                threshold=max(0.95, float(_config(conn)['auto_confirm_threshold'])), job_id=job['id'])
+                threshold=threshold, job_id=job['id'])
             stats = {**stats, 'identity_confirmed': admitted, 'identity_state': creator['state']}
             if not admitted:
                 return {**stats, 'claimed_handles': [], 'auto_linked_handles': []}
@@ -1005,27 +1005,27 @@ def page_data(conn, actor, settings, page=1):
                 }
                 for link in view["result"]["links"]
             ]
-            conflicts = creator_imports._conflicts(
-                conn, [(None, job["contact_id"], link["handle"]) for link in job["suggestions"]]
-            )
-            for link, actual_conflict in zip(job["suggestions"], conflicts, strict=True):
-                if (
-                    link["decision"] == "supported"
-                    and link["relation"] == "self_account"
-                    and conn.execute(
-                        """SELECT 1 FROM creator_handle_jobs WHERE contact_id<>%s
-                    AND status IN ('completed','review_required') AND stats->'claimed_handles' ? %s
-                    AND NOT EXISTS(SELECT 1 FROM creator_handle_jobs newer
-                      WHERE newer.contact_id=creator_handle_jobs.contact_id
-                        AND (newer.created_at,newer.id)>(creator_handle_jobs.created_at,creator_handle_jobs.id))
-                    UNION ALL SELECT 1 FROM contact_social_accounts l JOIN social_accounts s ON s.id=l.social_account_id
-                    WHERE l.contact_id<>%s AND s.platform='tiktok' AND s.normalized_handle=%s
-                      AND l.relationship='owner' AND l.status='confirmed' LIMIT 1""",
-                        (job["contact_id"], link["handle"], job["contact_id"], link["handle"]),
-                    ).fetchone()
-                ):
-                    link.update(decision="review", relation="uncertain", code="conflict")
-                link["conflict"] = actual_conflict
+    suggestions = [(None, job["contact_id"], link["handle"]) for job in jobs for link in job["suggestions"]]
+    conflicts = iter(creator_imports._conflicts(conn, suggestions))
+    handles = sorted({handle for _, _, handle in suggestions})
+    claims = conn.execute("""SELECT j.contact_id,h.handle FROM (
+        SELECT DISTINCT ON(contact_id) contact_id,status,stats FROM creator_handle_jobs
+        ORDER BY contact_id,created_at DESC,id DESC) j
+        JOIN unnest(%s::text[]) h(handle) ON j.stats->'claimed_handles' ? h.handle
+        WHERE j.status IN ('completed','review_required')
+        UNION SELECT l.contact_id,s.normalized_handle FROM contact_social_accounts l
+        JOIN social_accounts s ON s.id=l.social_account_id WHERE s.platform='tiktok'
+          AND s.normalized_handle=ANY(%s::text[]) AND l.relationship='owner' AND l.status='confirmed'""",
+        (handles, handles)).fetchall() if handles else []
+    owners = {}
+    for claim in claims:
+        owners.setdefault(claim["handle"], set()).add(claim["contact_id"])
+    for job in jobs:
+        for link in job["suggestions"]:
+            if (link["decision"] == "supported" and link["relation"] == "self_account"
+                    and owners.get(link["handle"], set()) - {job["contact_id"]}):
+                link.update(decision="review", relation="uncertain", code="conflict")
+            link["conflict"] = next(conflicts)
         rows = {item["handle"]: {**item, "associated": True, "check": None, "conflict": False}
                 for item in job["associations"]}
         for link in job["suggestions"]:

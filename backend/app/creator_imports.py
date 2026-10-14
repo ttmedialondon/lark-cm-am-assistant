@@ -190,12 +190,10 @@ def _conflicts(conn, items):
             OR EXISTS (SELECT 1 FROM lark_identities i WHERE i.contact_id=x.contact_id
                 AND i.identity_type='user' AND i.tenant_classification='internal')
             OR EXISTS (SELECT 1 FROM social_accounts s WHERE s.platform='tiktok'
-                AND lower(s.normalized_handle)=x.handle AND (
-                    EXISTS (SELECT 1 FROM contact_social_accounts l WHERE l.social_account_id=s.id
+                AND lower(s.normalized_handle)=x.handle
+                AND EXISTS (SELECT 1 FROM contact_social_accounts l WHERE l.social_account_id=s.id
                         AND (l.status='confirmed' AND (l.contact_id<>x.contact_id OR l.relationship<>'owner')
-                            OR l.contact_id=x.contact_id AND l.status='rejected'))
-                    OR EXISTS (SELECT 1 FROM creator_account_assignments a WHERE a.social_account_id=s.id
-                        AND a.ended_at IS NULL AND a.contact_id<>x.contact_id)))
+                            OR l.contact_id=x.contact_id AND l.status='rejected')))
         ) AS conflict FROM unnest(%s::uuid[],%s::text[])
           WITH ORDINALITY AS x(contact_id,handle,position) ORDER BY x.position""",
         ([contact_id for _, contact_id, _ in items],
@@ -459,12 +457,9 @@ def _existing(conn, row):
     # A confirmed account/person fact is reusable across CMs; responsibility is separate.
     found = conn.execute(
         """SELECT DISTINCT s.id,l.contact_id FROM social_accounts s
-        LEFT JOIN LATERAL (
-            SELECT contact_id FROM contact_social_accounts WHERE social_account_id=s.id
-              AND status='confirmed' AND relationship='owner'
-            UNION SELECT contact_id FROM creator_account_assignments WHERE social_account_id=s.id
-              AND ended_at IS NULL AND relationship='owner'
-        ) l ON TRUE WHERE s.platform='tiktok' AND lower(s.normalized_handle)=%s""",
+        LEFT JOIN contact_social_accounts l ON l.social_account_id=s.id
+          AND l.status='confirmed' AND l.relationship='owner'
+        WHERE s.platform='tiktok' AND lower(s.normalized_handle)=%s""",
         (row["handle"],),
     ).fetchall()
     if len(found) > 1:

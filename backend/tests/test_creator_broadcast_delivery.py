@@ -23,6 +23,7 @@ from app.lark_api import LarkApiError, LarkProfile, build_chat_post_payload
 
 
 def test_confirmed_delivery_is_scoped_idempotent_and_recoverable(pg, monkeypatch):
+    real_preview = creator_broadcast.preview
     settings = SimpleNamespace(oauth_scopes=("offline_access", "im:chat:read"), token_encryption_key=b"d" * 32)
     cipher = TokenCipher(settings.token_encryption_key)
     actor, other = uuid4(), uuid4()
@@ -309,6 +310,30 @@ def test_confirmed_delivery_is_scoped_idempotent_and_recoverable(pg, monkeypatch
     assert not any(
         fields["message"] in str(row["metadata"]) for row in pg.execute("SELECT metadata FROM audit_events").fetchall()
     )
+    pg.execute("UPDATE authorizations SET scopes=array_append(scopes,'im:message:readonly') WHERE id=%s", (actor,))
+    pg.execute("UPDATE chat_group_classifications SET purpose='support' WHERE chat_id='oc_a'")
+    selections = []
+    for name in ("First", "Second"):
+        person = uuid4()
+        pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)", (person, name))
+        pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) VALUES(%s,'creator','confirmed','manual')",
+                   (person,))
+        pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
+                   "VALUES(%s,%s,%s,'manual')", (uuid4(), person, actor))
+        pg.execute("INSERT INTO lark_identities(open_id,contact_id) VALUES(%s,%s)", ("ou_" + name, person))
+        pg.execute("INSERT INTO chat_members(chat_id,open_id,member_type) VALUES('oc_a',%s,'user')", ("ou_" + name,))
+        selections.append({"contact_id": str(person), "chat_id": "oc_a"})
+    with monkeypatch.context() as patch:
+        patch.setattr(creator_broadcast, "connection", lambda: nullcontext(pg))
+        patch.setattr(creator_broadcast, "preview", real_preview)
+        support = {**fields, "purpose": "support", "selections": selections}
+        prepared = delivery.prepare(actor, support)
+        assert prepared["can_send"] and {item["id"] for item in prepared["groups"][0]["mentions"]} == {
+            "ou_First", "ou_Second"}
+        pg.execute("INSERT INTO lark_identities(open_id,contact_id) VALUES('ou_duplicate',%s)", (person,))
+        pg.execute("INSERT INTO chat_members(chat_id,open_id,member_type) VALUES('oc_a','ou_duplicate','user')")
+        ambiguous = delivery.prepare(actor, support)
+        assert not ambiguous["can_send"] and "身份不唯一" in ambiguous["issues"][0]["reason"]
 
 
 def test_rich_content_upload_template_frozen_delivery_and_legacy_dedup(pg, tmp_path, monkeypatch):

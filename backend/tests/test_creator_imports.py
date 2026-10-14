@@ -282,7 +282,7 @@ def test_cap_excel_two_stage_matching_manual_confirmation_and_replays_preserve_p
     matched = row_for(pg, batch, "beauty.one_12")
     assert matched["contact_id"] == creator and matched["review_status"] == "confirmed"
     assert matched["reason_code"] == "ai_confirmed"
-    assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 1
+    assert pg.execute("SELECT count(*) n FROM contact_assignments WHERE contact_id=%s", (creator,)).fetchone()["n"] == 1
     assert matched["api_requests"] == 1 and imports.source_labels(matched) == ["Excel", "AI"]
     assert [p["stage"] for p in calls if p["imported_handle"] == "beauty.one_12"] == ["person"]
     assert all(p['roster'] == {'responsibility_confirmed': False, 'purpose': 'candidate_handles'} for p in calls)
@@ -290,7 +290,7 @@ def test_cap_excel_two_stage_matching_manual_confirmation_and_replays_preserve_p
     imports.confirm_row(cm, first["id"], "@Beauty.One_12", creator)
     imports.confirm_row(cm, second["id"], "corrected_02", creator)
     imports.defer_row(cm, missing["id"])
-    assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 1
+    assert pg.execute("SELECT count(*) n FROM contact_assignments WHERE contact_id=%s", (creator,)).fetchone()["n"] == 1
     assert pg.execute(
         "SELECT creator_type FROM contacts WHERE id=%s", (creator,),
     ).fetchone()["creator_type"] == "pending"
@@ -481,7 +481,8 @@ def test_manual_import_concurrent_confirmations_create_one_person_and_account_li
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = [pool.submit(confirm, row_id) for row_id in row_ids]
             assert all(f.result(timeout=10)["status"] == "confirmed" for f in futures)
-        assert pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 1
+        assert pg.execute("SELECT count(*) n FROM contact_assignments WHERE contact_id=%s",
+                          (creator,)).fetchone()["n"] == 1
         assert pg.execute("SELECT count(*) n FROM social_accounts "
                           "WHERE normalized_handle='same_account'").fetchone()["n"] == 1
         assert pg.execute("SELECT count(*) n FROM contact_social_accounts WHERE contact_id=%s",
@@ -687,7 +688,8 @@ def test_shared_group_identifies_each_handle_person_and_preserves_the_evidence_c
             pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (cm,))
             hidden = imports.row_evidence(cm, row["id"])
             assert not hidden["groups"] and not hidden["person"] and hidden["warnings"]
-    assert len(calls) == 4 and pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 2
+    assert len(calls) == 4 and pg.execute("SELECT count(*) n FROM contact_assignments WHERE contact_id=ANY(%s::uuid[])",
+                                        ([first, second],)).fetchone()["n"] == 2
 
 
 def test_import_admission_respects_configured_threshold_without_curva_and_scopes_batch_review(pg, pilot, monkeypatch):
@@ -762,7 +764,7 @@ def test_silent_unique_person_needs_person_evidence_and_recheck_keeps_usage(pg, 
     drain(pilot)
     final = row_for(pg, batch, "silent_handle")
     assert final["review_status"] == "pending" and final["contact_id"] is None
-    assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
+    assert not pg.execute("SELECT 1 FROM contact_assignments WHERE contact_id=%s", (pilot.ids["creator"],)).fetchone()
     assert (final["api_requests"], final["input_tokens"], final["output_tokens"]) == (3, 36, 24)
     assert pg.execute("SELECT count(*) n FROM creator_import_rows WHERE batch_id=%s",
                       (batch["id"],)).fetchone()["n"] == 1
@@ -840,7 +842,8 @@ def test_multiple_groups_merge_the_same_person_without_hiding_other_people_or_pa
         assert row["review_status"] == "pending" and row["contact_id"] is None
         assert row["reason_code"] == "person_uncertain"
         assert row["stats"]["person_candidate_count"] == count and row["api_requests"] == 1
-    assert len(calls) == 4 and pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 0
+    assert len(calls) == 4 and not pg.execute("SELECT 1 FROM contact_assignments WHERE contact_id=%s",
+                                             (creator,)).fetchone()
 
 
 def test_two_person_stages_for_one_creator_do_not_drop_paid_results_after_classification(pg, pilot, monkeypatch):
@@ -880,7 +883,8 @@ def test_two_person_stages_for_one_creator_do_not_drop_paid_results_after_classi
         assert row["review_status"] == "confirmed"
         assert row_for(pg, batch, handle)["review_status"] == "confirmed"
         assert (row["api_requests"], row["input_tokens"], row["output_tokens"]) == (2, 24, 16)
-    assert len(calls) == 4 and pg.execute("SELECT count(*) n FROM contact_assignments").fetchone()["n"] == 1
+    assert len(calls) == 4 and pg.execute("SELECT count(*) n FROM contact_assignments WHERE contact_id=%s",
+                                        (pilot.ids["creator"],)).fetchone()["n"] == 1
     settled = _snapshot(pg, ("creator_import_rows", "contact_assignments", "contact_social_accounts"))
     results = imports._decode(row_for(pg, batch, people[0]["handle"]), pilot.settings, "result_ciphertext")
     imports._finish(people[0], pilot.settings, response=results["person"]["response"], result=results["person"])
@@ -950,7 +954,8 @@ def test_inflight_person_result_cannot_overwrite_changed_evidence_or_manual_sele
         assert not pg.execute("SELECT 1 FROM social_accounts WHERE normalized_handle='creator_one'").fetchone()
     else:
         assert row["review_status"] == "pending" and row["contact_id"] is None
-        assert not pg.execute("SELECT 1 FROM contact_assignments").fetchone()
+        assert not pg.execute("SELECT 1 FROM contact_assignments WHERE contact_id=%s",
+                              (pilot.ids["creator"],)).fetchone()
 
 
 def test_import_pages_and_user_search_only_expose_currently_accessible_identities(pg, pilot, monkeypatch):
