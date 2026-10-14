@@ -8,6 +8,7 @@ import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
+from email.message import Message
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -229,6 +230,81 @@ class LarkClient:
             access_token=access_token,
             params=params,
         )
+
+    def get_message(self, access_token: str, message_id: str) -> dict[str, Any]:
+        _require_im_id(message_id, "om_")
+        try:
+            return self._request(
+                "GET", f"{self.settings.lark_api_base_url}/open-apis/im/v1/messages/{message_id}",
+                access_token=access_token, params={"user_id_type": "open_id"},
+            )
+        except LarkApiError as exc:
+            raise LarkApiError(
+                exc.status_code, exc.lark_code, "Lark message could not be read", exc.retry_after,
+            ) from None
+
+    def download_message_resource(
+        self, access_token: str, message_id: str, file_key: str, resource_type: str,
+        max_bytes: int = 10 * 1024 * 1024,
+    ) -> dict[str, Any]:
+        """Read a message-bound resource into bounded memory, never follow resource URLs."""
+        _require_im_id(message_id, "om_")
+        if not isinstance(resource_type, str) or resource_type not in {"image", "file"}:
+            raise ValueError("Invalid Lark resource type")
+        prefix = "img_" if resource_type == "image" else "file_"
+        if not isinstance(file_key, str) or not re.fullmatch(prefix + r"[A-Za-z0-9_-]{1,256}", file_key):
+            raise ValueError("Invalid Lark resource key")
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+            raise ValueError("Invalid Lark resource size limit")
+        url = f"{self.settings.lark_api_base_url}/open-apis/im/v1/messages/{message_id}/resources/{file_key}"
+        gate = self._admission.request() if self._admission else nullcontext()
+        client_context = (nullcontext(self._http_client) if self._http_client else
+                          httpx.Client(timeout=httpx.Timeout(20.0, connect=8.0)))
+        with gate, client_context as client:
+            try:
+                with client.stream(
+                    "GET", url, headers={"Authorization": f"Bearer {access_token}"},
+                    params={"type": resource_type}, follow_redirects=False,
+                ) as response:
+                    retry_after = _rate_limit_reset(response.headers)
+                    mime_type = response.headers.get("content-type", "application/octet-stream")
+                    mime_type = mime_type.split(";", 1)[0].strip().lower()
+                    json_response = mime_type == "application/json" or mime_type.endswith("+json")
+                    length = _optional_int(response.headers.get("content-length"))
+                    if response.is_success and not json_response and length is not None and length > max_bytes:
+                        raise LarkApiError(413, None, "Lark resource exceeds the size limit")
+                    content = bytearray()
+                    # Error bodies are inspected for codes only, never propagated or persisted.
+                    limit = max_bytes if response.is_success and not json_response else min(max_bytes, 64 * 1024)
+                    for chunk in response.iter_bytes(chunk_size=min(64 * 1024, limit + 1)):
+                        if len(content) + len(chunk) > limit:
+                            if response.is_success and not json_response:
+                                raise LarkApiError(413, None, "Lark resource exceeds the size limit")
+                            break
+                        content.extend(chunk)
+                    if not response.is_success or json_response:
+                        try:
+                            raw = json.loads(content)
+                        except (ValueError, UnicodeError):
+                            raw = None
+                        code = _optional_int(raw.get("code")) if isinstance(raw, dict) else None
+                        self._pause_for_rate_limit(response.status_code, code, retry_after)
+                        raise LarkApiError(
+                            response.status_code if not response.is_success else 502,
+                            code, "Lark message resource could not be read", retry_after,
+                        )
+                    if not content:
+                        raise LarkApiError(502, None, "Lark message resource was empty")
+                    disposition = Message()
+                    disposition["content-disposition"] = response.headers.get("content-disposition", "")
+                    filename = disposition.get_filename()
+                    if filename:
+                        filename = filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
+                        if not filename or len(filename) > 255 or any(ord(char) < 32 for char in filename):
+                            filename = None
+                    return {"content": bytes(content), "mime_type": mime_type, "filename": filename}
+            except httpx.HTTPError:
+                raise LarkApiError(503, None, "Network failure while reading a Lark message resource") from None
 
     def list_chat_members(
         self, access_token: str, chat_id: str, page_token: str | None = None

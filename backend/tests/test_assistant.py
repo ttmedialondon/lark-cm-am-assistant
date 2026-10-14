@@ -68,6 +68,33 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
         pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
             VALUES(%s,'chat',%s)""", (chat.ids['cm'], message_id))
         ids.append(message_id)
+    pg.execute("UPDATE chat_messages SET message_type='image',body_ciphertext=%s WHERE message_id='window-11'",
+               (chat.cipher.encrypt(json.dumps({'image_key': 'fixture-in-memory-image'})),))
+    materials_ready, material_changed, material_enqueues = False, False, []
+    material_id = str(uuid4())
+
+    def attach_materials(conn, actor, cm_id, rows, settings, *, feature='operations_assistant', enqueue=False):
+        pending = []
+        for row in rows:
+            if row['message_id'] != 'window-11':
+                continue
+            assert actor == cm_id == chat.ids['cm'] and feature == 'operations_assistant'
+            if enqueue:
+                material_enqueues.append(row['message_id'])
+            if materials_ready:
+                row['_material'] = {'text': 'Changed parsed fact' if material_changed else 'LONG_PRIVATE_BODY 11',
+                                    'complete': False,
+                                    'notes': ['部分图片无法完整识别']}
+            else:
+                pending.append(material_id)
+        return {'rows': rows, 'pending_ids': pending}
+
+    def materials_pending(conn, actor, cm_id, ids):
+        assert actor == cm_id == chat.ids['cm'] and ids == [material_id]
+        return not materials_ready
+
+    monkeypatch.setattr(assistant_search.message_materials, 'attach', attach_materials)
+    monkeypatch.setattr(assistant_search.message_materials, 'pending', materials_pending)
     monkeypatch.setattr(assistant_search, 'WINDOW_PAGE_SIZE', 1)
     monkeypatch.setattr(assistant_window, 'INPUT_CHARS', 6_000)
     monkeypatch.setattr(assistant, 'MAX_MODEL_STEPS', 1)
@@ -142,6 +169,21 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
         row = assistant._turn(pg, chat.ids['cm'], turn['id'])
         checkpoint = summary_dialogues.decode(row['checkpoint_ciphertext'], chat.settings)
         window = checkpoint.get('window_job')
+        if value['status'] == 'waiting':
+            assert window['phase'] == 'collect' and len(window['page_refs']) == 1
+            assert checkpoint['pending_calls'][0]['call_id'] == 'window-call'
+            assert 'window-call' not in checkpoint['tool_outputs'] and len(calls) == 1
+            assert row['lease_until'] is None and assistant.claim() is None
+            saved_window = deepcopy(window)
+            assert not assistant.prepare(chat.settings)
+            materials_ready = True
+            pg.execute('UPDATE assistant_turns SET scheduled_at=NOW() WHERE id=%s', (turn['id'],))
+            assert assistant.prepare(chat.settings)
+            resumed = summary_dialogues.decode(assistant._turn(pg, chat.ids['cm'], turn['id'])[
+                'checkpoint_ciphertext'], chat.settings)
+            assert resumed['window_job'] == saved_window and resumed['pending_calls'] == checkpoint['pending_calls']
+            assert 'window-call' not in resumed['tool_outputs']
+            continue
         if window and window.get('summaries'):
             _material, refmap = assistant_window.summary_input(checkpoint, window)
             if not checked_structured_size:
@@ -192,6 +234,7 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
         if value['status'] not in assistant.ACTIVE:
             break
     assert value['status'] == 'completed' and len(calls) > 2 and reduced
+    assert materials_ready and material_enqueues
     assert len(total_reads) == 2 and roster_reads == []
     assert raw_ids == {*ids, 'm1', 'outside'}
     parts.sort()
@@ -203,15 +246,22 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
     source = value['result']['data'][0]
     assert source['page_count'] == 15 and source['page'] == 1 and source['has_more']
     assert source['coverage']['returned'] == 15
+    assert any('部分图片无法完整识别' in gap.get('reason', '') for gap in source['gaps'])
     untouched = {table: pg.execute(f'SELECT count(*) n FROM {table}').fetchone()['n']
                  for table in ('assistant_turns', 'offhours_summary_runs', 'summary_reply_tasks')}
     read_ids = set()
+    enqueues_before_read = len(material_enqueues)
     for page in range(1, 16):
         found = assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings, page=page)
         read_ids.update(message['message_id'] for message in found['messages'])
         assert found['has_more'] == (page < 15)
     assert read_ids == raw_ids and all(pg.execute(f'SELECT count(*) n FROM {table}').fetchone()['n'] == count
                                     for table, count in untouched.items())
+    assert len(material_enqueues) == enqueues_before_read
+    material_changed = True
+    with pytest.raises(assistant.tools.SourceChangedError, match='解析内容已变化'):
+        assistant.source_page(pg, chat.ids['cm'], source['query_ref'], chat.settings)
+    material_changed = False
     paid_count = len(calls)
     with pytest.raises(LookupError):
         assistant.source_page(pg, chat.ids['reviewer'], source['query_ref'], chat.settings)
@@ -568,6 +618,66 @@ def test_search_source_get_continues_without_model_and_cleared_refs_stay_unreada
                    (chat.ids['cm'],))
         assert assistant._history(pg, {**next_row, 'id': uuid4()}, chat.settings, next_context) == ([], [])
     assert len(calls) == 2
+    ready, enqueues, context_calls = False, [], []
+    material_id = str(uuid4())
+    original_attach = assistant_search.message_materials.attach
+
+    def pending_context_material(conn, actor, cm_id, rows, settings, *, feature='operations_assistant', enqueue=False):
+        attached = original_attach(conn, actor, cm_id, rows, settings, feature=feature, enqueue=False)
+        if enqueue:
+            assert actor == cm_id == chat.ids['cm']
+            enqueues.append(True)
+            if not ready:
+                attached['pending_ids'] = [material_id]
+        return attached
+
+    def context_model(*_args, **_kwargs):
+        context_calls.append(True)
+        return {'text': '', 'output': [{'type': 'function_call', 'call_id': 'context-material-call',
+            'name': 'read_message_context', 'arguments': json.dumps({'message_ref': ref, 'mode': 'period'})}],
+            'usage': {}}
+
+    with monkeypatch.context() as patch:
+        patch.setattr(assistant_search.message_materials, 'attach', pending_context_material)
+        patch.setattr(assistant_search.message_materials, 'pending', lambda *_args: not ready)
+        patch.setattr(openai_client, 'call_openai_tools', context_model)
+        waiting_turn = assistant.submit(pg, chat.ids['cm'], payload('读取这条消息的附件与完整问答'), chat.settings)
+        finish(chat)
+        finish(chat)
+        waiting_row = assistant._turn(pg, chat.ids['cm'], waiting_turn['id'])
+        waiting_checkpoint = summary_dialogues.decode(waiting_row['checkpoint_ciphertext'], chat.settings)
+        assert waiting_row['status'] == 'waiting' and waiting_row['lease_until'] is None
+        assert waiting_checkpoint['waiting']['kind'] == 'message_materials'
+        assert waiting_checkpoint['pending_calls'][0]['call_id'] == 'context-material-call'
+        assert 'context-material-call' not in waiting_checkpoint['tool_outputs'] and len(context_calls) == 1
+        pg.execute('UPDATE assistant_turns SET scheduled_at=NOW() WHERE id=%s', (waiting_turn['id'],))
+        assert not assistant.prepare(chat.settings) and assistant.claim() is None
+        before_read = len(enqueues)
+        evidence = assistant.tools.evidence(pg, chat.ids['cm'], ref, chat.settings)
+        assert evidence['message']['text'] == 'Find fixture facts'
+        assert len(enqueues) == before_read
+        with pg.transaction(force_rollback=True):
+            pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (chat.ids['cm'],))
+            pg.execute('UPDATE assistant_turns SET scheduled_at=NOW() WHERE id=%s', (waiting_turn['id'],))
+            assert assistant.prepare(chat.settings)
+            assert pg.execute('SELECT error_code FROM assistant_turns WHERE id=%s', (waiting_turn['id'],)).fetchone()[
+                'error_code'] == 'permission'
+            with pytest.raises(PermissionError):
+                assistant._turn(pg, chat.ids['cm'], waiting_turn['id'])
+        ready = True
+        pg.execute('UPDATE assistant_turns SET scheduled_at=NOW() WHERE id=%s', (waiting_turn['id'],))
+        assert assistant.prepare(chat.settings)
+        resumed = summary_dialogues.decode(assistant._turn(pg, chat.ids['cm'], waiting_turn['id'])[
+            'checkpoint_ciphertext'], chat.settings)
+        assert resumed['pending_calls'] == waiting_checkpoint['pending_calls']
+        assert 'context-material-call' not in resumed['tool_outputs']
+        finish(chat)
+        resumed = summary_dialogues.decode(assistant._turn(pg, chat.ids['cm'], waiting_turn['id'])[
+            'checkpoint_ciphertext'], chat.settings)
+        assert resumed['pending_calls'] == [] and resumed['items'][-1]['call_id'] == 'context-material-call'
+        assert resumed['tool_outputs']['context-material-call']['message']['text'] == 'Find fixture facts'
+        assert len(context_calls) == 1
+        assistant.cancel(pg, chat.ids['cm'], waiting_turn['id'], chat.settings)
     assistant.clear_conversations(pg, chat.ids['cm'], chat.settings)
     with pytest.raises(LookupError):
         assistant.tools.evidence(pg, chat.ids['cm'], ref, chat.settings)
@@ -838,6 +948,19 @@ def test_owner_multi_person_loop_preserves_sources_and_revocation_boundary(pg, c
         SELECT %s,chat_id,message_id FROM chat_messages WHERE chat_id='chat'""", (other_id,))
     question = '比较 cm 和 reviewer 的样品消息并列出来源'
     calls = []
+    pg.execute("UPDATE chat_messages SET message_type='image',body_ciphertext=%s WHERE message_id='m1'",
+               (chat.cipher.encrypt(json.dumps({'image_key': 'owner-test-image'})),))
+    material_scopes = []
+
+    def owner_materials(conn, actor, cm_id, rows, settings, *, feature='operations_assistant', enqueue=False):
+        for row in rows:
+            if row['message_id'] == 'm1':
+                assert actor == chat.ids['owner'] and cm_id in {chat.ids['cm'], other_id}
+                material_scopes.append(cm_id)
+                row['_material'] = {'text': 'Sample please', 'complete': True, 'notes': []}
+        return {'rows': rows, 'pending_ids': []}
+
+    monkeypatch.setattr(assistant_search.message_materials, 'attach', owner_materials)
 
     def model(_cfg, _key, items, actor, **kwargs):
         calls.append(True)
@@ -895,6 +1018,7 @@ def test_owner_multi_person_loop_preserves_sources_and_revocation_boundary(pg, c
             break
     view = assistant.turn_view(pg, chat.ids['owner'], turn['id'], chat.settings)
     assert view['status'] == 'completed' and len(calls) == 4
+    assert set(material_scopes) == {chat.ids['cm'], other_id}
     assert view['result']['scope']['cm_id'] == str(chat.ids['owner'])
     assert set(view['result']['scope']['cm_ids']) == {str(chat.ids['cm']), str(other_id)}
     assert len(view['result']['sections'][0]['sources']) == 1

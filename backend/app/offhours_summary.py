@@ -487,10 +487,20 @@ def _staff(conn, cm, *, read_cache=None):
 
 
 def _body(row, cipher, names=None):
-    if not row["body_ciphertext"] or row["message_type"] not in {"text", "post", "share_chat", "share_user"}:
+    from . import message_material
+
+    kind = row["message_type"]
+    if not row["body_ciphertext"] or kind not in {
+        "text", "post", "share_chat", "share_user", "interactive", "merge_forward", "image", "file"
+    }:
         return "[附件或正文不可读取，需人工查看原消息]", True
     raw = cipher.decrypt(row["body_ciphertext"])
-    if row["message_type"] == "text":
+    material = row.get("_material") or {}
+    if kind in {"interactive", "merge_forward"}:
+        text = material.get("text") or message_material.text_material(raw, kind)["text"]
+    elif kind in {"image", "file"}:
+        text = material.get("text") or ""
+    elif kind == "text":
         text = evidence_body(raw, "text")
     else:
         try:
@@ -513,13 +523,17 @@ def _body(row, cipher, names=None):
                     yield from fragments(value)
 
         text = " ".join(fragments(payload))
+    if kind == "post" and material.get("text"):
+        text += "\n\n" + material["text"]
     text = resolve_mentions(text, row.get("mentions_json"), names)
     text = re.sub(r"([?&](?:token|access_token|key|signature)=)[^&\s]+", r"\1[redacted]", text, flags=re.I)
     incomplete = not text.replace("[未解析的@用户]", "").strip()
     return (text or "[正文不可读取，需人工查看原消息]"), incomplete
 
 
-def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, related_chats=None, read_cache=None):
+def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, related_chats=None, read_cache=None,
+               prepare_materials=False):
+    from . import message_materials
     cm_id = run.get("responsible_authorization_id", REMI_ID)
     cm, _ = _authorize_run(conn, run, read_cache=read_cache)
     conn.execute(
@@ -579,7 +593,10 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
     selected = [*reversed(earlier), *rows]
     selected = [r for r in selected if r["sender_open_id"] in staff or r["sender_open_id"] in speaker_labels]
     names = mention_names(conn, selected)
-    cipher = message_body_cipher((settings or get_settings()).token_encryption_key)
+    settings = settings or get_settings()
+    materials = message_materials.attach(conn, run["requested_by_authorization_id"], cm_id, selected, settings,
+                                        feature=run_feature(run), enqueue=prepare_materials)
+    cipher = message_body_cipher(settings.token_encryption_key)
     messages, refs, mention_fingerprints = [], {}, {}
     incomplete = False
     for row in selected:
@@ -590,7 +607,8 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
         )
         label = f"M{len(messages) + 1}"
         body, unavailable = _body(row, cipher, names)
-        incomplete = incomplete or unavailable
+        partial = unavailable or not row.get("_material", {}).get("complete", True)
+        incomplete = incomplete or partial
         messages.append(
             {
                 "ref": label,
@@ -599,7 +617,7 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
                 "text": body,
                 "time": row["message_create_time"].isoformat(),
                 "in_window": row["message_create_time"] >= run["window_start"],
-                "unavailable_or_truncated": unavailable,
+                "unavailable_or_truncated": partial,
                 "unreadable": body.startswith("[附件或正文不可读取") or body.startswith("[正文不可读取"),
                 "parent_message_id": row.get("parent_id"),
                 "root_message_id": row.get("root_id"),
@@ -630,7 +648,7 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
             "chat_id": chat_id,
             "text": body,
             "created_at": row["message_create_time"].isoformat(),
-            "unavailable_or_truncated": unavailable,
+            "unavailable_or_truncated": partial,
             "unreadable": messages[-1]["unreadable"],
             "speaker": speaker,
             "is_staff": bool(colleague),
@@ -690,7 +708,28 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
         "incomplete": incomplete,
         "synced": watermark >= cutoff,
         "history_complete": complete,
+        "material_pending_ids": materials["pending_ids"],
     }
+
+
+def request_material_refresh(conn, job, source):
+    """Wake only reports whose material contains this message, never a full rerun."""
+    conn.execute("""UPDATE offhours_summary_runs r SET next_check_at=NOW(),updated_at=NOW(),
+        coverage=jsonb_set(coverage,'{material_chats}',
+            CASE WHEN COALESCE(coverage->'material_chats','[]'::jsonb) @> %s::jsonb
+                 THEN COALESCE(coverage->'material_chats','[]'::jsonb)
+                 ELSE COALESCE(coverage->'material_chats','[]'::jsonb) || %s::jsonb END)
+        WHERE r.responsible_authorization_id=%s
+        AND ((r.origin='scheduled' AND r.period IS NOT NULL
+          AND r.report_date >= (NOW() AT TIME ZONE 'Europe/London')::date-6)
+          OR (r.origin='assistant' AND EXISTS(SELECT 1 FROM assistant_turns t
+              WHERE t.id=r.assistant_turn_id AND t.status IN ('queued','running','waiting'))))
+        AND %s >= r.window_start-INTERVAL '7 days' AND %s < r.window_end
+        AND (COALESCE(coverage->'material_chats','[]'::jsonb) @> %s::jsonb
+             OR EXISTS(SELECT 1 FROM offhours_summary_tasks t
+                       WHERE t.run_id=r.id AND t.chat_id=%s AND t.is_current))""",
+        (json.dumps([job['chat_id']]), json.dumps([job['chat_id']]), job['cm_id'],
+         source['message_create_time'], source['message_create_time'], json.dumps([job['chat_id']]), job['chat_id']))
 
 
 def schedule_if_due(conn, *, force=False):
@@ -736,7 +775,7 @@ def schedule_if_due(conn, *, force=False):
     return _schedule_run(conn, dict(state), now)
 
 
-def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None):
+def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None, chat_ids=None):
     inserted = 0
     cm_id = state["responsible_authorization_id"]
     _authorize_run(conn, state, executing=True)
@@ -750,7 +789,11 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
     # Discover every related conversation before applying the bounded content limit.
     chats = _related_chats(conn, roster, cm_id=cm_id) if chats is None else chats
     targets = set(state["selected_contact_ids"]) if state.get("selected_contact_ids") is not None else None
+    chat_ids = chat_ids or set((state.get("coverage") or {}).get("material_chats", [])) or None
+    partial_refresh = contact_ids is not None or chat_ids is not None
     selected_chats = chats if contact_ids is None else [c for c in chats if c['contact_ids'] & contact_ids]
+    if chat_ids is not None:
+        selected_chats = [c for c in selected_chats if c['chat_id'] in chat_ids]
     if targets is not None:
         selected_chats = [c for c in selected_chats if c['contact_ids'] & targets]
     deferred = False
@@ -758,6 +801,7 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
     count, messages, synced = 0, 0, True
     private_count = 0
     selected_ids, cutoffs = [], []
+    material_chats = []
     run = {**dict(state), "id": state["run_id"]}
     for chat in selected_chats:
         if chat["sync_status"] == "not_readable":
@@ -767,9 +811,9 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
         previous = conn.execute("""SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND chat_id=%s
             ORDER BY is_current DESC,created_at DESC LIMIT 1""", (state["run_id"], chat["chat_id"])).fetchone()
         active = previous and previous['is_current'] and previous['status'] in ('queued', 'running')
-        chat_cutoff = previous['cutoff'] if active else cutoff
+        chat_cutoff = previous['cutoff'] if active or (chat_ids is not None and previous) else cutoff
         evidence = _load_chat(conn, _task_run(run, previous), chat["chat_id"], chat_cutoff,
-                              roster=roster, related_chats=chats)
+                              roster=roster, related_chats=chats, prepare_materials=True)
         if not evidence:
             watermark = max(
                 [t for t in (chat["last_incremental_at"], chat["last_backfill_at"]) if t]
@@ -784,11 +828,18 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
         if evidence["incomplete"]:
             gaps.append("部分附件或正文不可读取；分析仅依据可读消息。")
         cutoffs.append(chat_cutoff)
+        if evidence["material_pending_ids"]:
+            material_chats.append(chat['chat_id'])
+            if previous:
+                selected_ids.append(previous['id'])
+            continue
         if active:
-            if contact_ids is not None and previous['input_fingerprint'] != evidence['fingerprint']:
+            if partial_refresh and previous['input_fingerprint'] != evidence['fingerprint']:
                 # Do not supersede an in-flight paid request. Its normal source guard
                 # will reject stale material; the admission signal retries afterwards.
                 deferred = True
+                if chat_ids is not None:
+                    material_chats.append(chat['chat_id'])
             selected_ids.append(previous['id'])
             continue
         conn.execute(
@@ -837,10 +888,10 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
                  WHERE run_id=%s AND chat_id IS NOT NULL AND NOT(id=ANY(%s::uuid[]))
                    AND (%s::text[] IS NULL OR chat_id=ANY(%s::text[]))""",
         (state["run_id"], selected_ids,
-         None if contact_ids is None else [c['chat_id'] for c in selected_chats],
-         None if contact_ids is None else [c['chat_id'] for c in selected_chats]),
+         None if not partial_refresh else [c['chat_id'] for c in selected_chats],
+         None if not partial_refresh else [c['chat_id'] for c in selected_chats]),
     )
-    if contact_ids is not None and not assistant:
+    if partial_refresh and not assistant:
         # Accurate whole-report totals from authorized IDs/times only; never decrypt
         # unrelated conversations merely to refresh the coverage counters.
         opens = sorted({r['open_id'] for r in roster})
@@ -892,18 +943,25 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
         "cutoff": min(cutoffs, default=cutoff).isoformat(),
         "synced": synced,
         "content_incomplete": any("上限" in gap or "附件" in gap for gap in gaps),
+        "material_chats": sorted(set(material_chats)),
     }
     conn.execute(
         "UPDATE offhours_summary_runs SET coverage=%s::jsonb,updated_at=NOW() WHERE id=%s",
         (json.dumps(coverage, ensure_ascii=False), state["run_id"]),
     )
     if assistant:
-        conn.execute("UPDATE offhours_summary_runs SET next_check_at=NULL WHERE id=%s", (state["run_id"],))
+        conn.execute("UPDATE offhours_summary_runs SET next_check_at=%s WHERE id=%s",
+                     (datetime.now(UTC) + timedelta(seconds=2) if material_chats else None, state["run_id"]))
         return None if deferred else inserted
     if contact_ids is not None:
+        if material_chats:
+            conn.execute("UPDATE offhours_summary_runs SET next_check_at=NOW()+INTERVAL '2 seconds' WHERE id=%s",
+                         (state["run_id"],))
         return None if deferred else inserted
     continue_checking = now < state["refresh_until"]
     next_check = now + timedelta(minutes=10 if now < state["window_end"] else 60) if continue_checking else None
+    if material_chats:
+        next_check = datetime.now(UTC) + timedelta(seconds=2)
     if state.get("period"):
         conn.execute("UPDATE offhours_summary_runs SET next_check_at=%s WHERE id=%s",
                      (next_check, state["run_id"]))
@@ -1432,6 +1490,7 @@ def get_summary_view(conn, actor_id, *, cm_id=REMI_ID, day=None, period=None, ru
         return view
     counts = {"queued": 0, "running": 0, "completed": 0, "failed": 0}
     coverage = dict(row["coverage"])
+    counts['queued'] += len(coverage.get('material_chats', []))
     gaps = list(coverage.get("gaps", []))
     admission = ai_dispatch.status(conn)
     if admission["state"] != "ready":

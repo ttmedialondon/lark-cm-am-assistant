@@ -77,12 +77,13 @@ def call_openai(
     max_output_tokens: int = 500,
     reasoning_effort: str = "low",
     total_timeout: float | None = None,
+    input_content: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Call Responses once for an evidence-bound internal AI feature."""
 
     headers, payload = _request_parts(
         config, api_key, pack, contact_id, instructions, output_format,
-        max_output_tokens, reasoning_effort, total_timeout,
+        max_output_tokens, reasoning_effort, total_timeout, input_content,
     )
     started = time.perf_counter()
     try:
@@ -106,11 +107,12 @@ async def call_openai_async(
     max_output_tokens: int = 500,
     reasoning_effort: str = "low",
     total_timeout: float = 45.0,
+    input_content: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """The same Responses transport, cancellable by an interactive HTTP request."""
     headers, payload = _request_parts(
         config, api_key, pack, contact_id, instructions, output_format,
-        max_output_tokens, reasoning_effort, total_timeout,
+        max_output_tokens, reasoning_effort, total_timeout, input_content,
     )
     started = time.perf_counter()
     try:
@@ -121,7 +123,7 @@ async def call_openai_async(
 
 
 def _request_parts(config, api_key, pack, contact_id, instructions, output_format,
-                   max_output_tokens, reasoning_effort, total_timeout):
+                   max_output_tokens, reasoning_effort, total_timeout, input_content=None):
     if total_timeout is not None and (not math.isfinite(total_timeout) or total_timeout <= 0):
         raise AIInputError("AI 请求超时设置无效。")
     payload = {
@@ -135,6 +137,9 @@ def _request_parts(config, api_key, pack, contact_id, instructions, output_forma
         "safety_identifier": hashlib.sha256(str(contact_id).encode("ascii")).hexdigest(),
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if input_content is not None:
+        payload["input"] = [{"role": "user", "content": [
+            {"type": "input_text", "text": payload["input"]}, *input_content]}]
     if config.get("project_id"):
         headers["OpenAI-Project"] = config["project_id"]
     return headers, payload

@@ -149,10 +149,14 @@ def collect(conn, actor_id, event_id, settings, *, require_unresolved=True, cuto
             })
         selected = dialogues.participant_messages(dialogue, "creator", staff_names,
             chat["chat_mode"] == "p2p" or chat.get("unique_contact_id") == task["contact_id"])
+        from . import message_materials
+        message_materials.attach(conn, actor_id, cm['id'], [m['row'] for m in selected], settings,
+                                 feature=feature or core.run_feature(run))
         for message in selected:
             row = message["row"]
             own = row["sender_open_id"] in opens
             body, unavailable = core._body(row, cipher, names)
+            unavailable = unavailable or not row.get('_material', {}).get('complete', True)
             for offset in range(0, max(1, len(body)), dialogues.PART_CHARS):
                 messages.append(
                     {

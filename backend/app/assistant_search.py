@@ -10,6 +10,7 @@ from uuid import UUID
 
 from cryptography.exceptions import InvalidTag
 
+from . import message_materials
 from . import offhours_summary as core
 from .crypto import TokenCipher, message_body_cipher
 from .message_mentions import mention_names
@@ -178,7 +179,9 @@ def _message(row, chat, text, unavailable, *, reference=None, terms=(), clip=Tru
             "contact_id": str(row["contact_id"]) if row.get("contact_id") else None,
             "time": row["message_create_time"].isoformat(),
             "created_at": row["message_create_time"].isoformat(), "text": snippet,
-            "unreadable": unavailable, "unavailable_or_truncated": unavailable or len(snippet) < len(text),
+            "unreadable": unavailable,
+            "unavailable_or_truncated": unavailable or len(snippet) < len(text)
+            or not row.get("_material", {}).get("complete", True),
             "parent_message_id": row.get("parent_id"), "root_message_id": row.get("root_id"),
             "matched_terms": matched}
     if audience == "all":
@@ -228,22 +231,25 @@ def _scope_version(cm, roster, chats, selected, audience="creators"):
                       sorted(chat["chat_id"] for chat in chats)])
 
 
-def query(conn, actor_id, context, args, settings, *, read_cache=None):
+def query(conn, actor_id, context, args, settings, *, read_cache=None, enqueue_materials=False):
     terms = args.get("query")
     if (not isinstance(terms, list) or not 1 <= len(terms) <= 8
             or not all(isinstance(term, str) and term.strip() and len(term) <= 256 for term in terms)):
         raise ValueError("请提供一至八个有效检索词。")
     terms = list(dict.fromkeys(term.strip() for term in terms))
-    return _collect(conn, actor_id, context, args, settings, terms=terms, read_cache=read_cache)
+    return _collect(conn, actor_id, context, args, settings, terms=terms, read_cache=read_cache,
+                    enqueue_materials=enqueue_materials)
 
 
-def window_messages(conn, actor_id, context, args, settings, *, read_cache=None, window_counts=None):
+def window_messages(conn, actor_id, context, args, settings, *, read_cache=None, window_counts=None,
+                    enqueue_materials=False):
     """Read every permitted sender; page and body limits are explicit, not sampling."""
     return _collect(conn, actor_id, context, args, settings, terms=None, read_cache=read_cache,
-                    window_counts=window_counts)
+                    window_counts=window_counts, enqueue_materials=enqueue_materials)
 
 
-def _collect(conn, actor_id, context, args, settings, *, terms, read_cache=None, window_counts=None):
+def _collect(conn, actor_id, context, args, settings, *, terms, read_cache=None, window_counts=None,
+             enqueue_materials=False):
     audience = _audience(args.get("audience", "all"))
     kind = "window_messages" if terms is None else "messages"
     page_size = WINDOW_PAGE_SIZE if terms is None else PAGE_SIZE
@@ -269,9 +275,14 @@ def _collect(conn, actor_id, context, args, settings, *, terms, read_cache=None,
             raise ValueError("分页引用无效，请重新检索。")
     cipher = message_body_cipher(settings.token_encryption_key)
     messages, scanned, readable, unreadable, non_text, unreadable_text, truncated, more = [], 0, 0, 0, 0, 0, 0, False
+    pending_ids = []
+    material_notes = {}
     while scanned < scan_limit and len(messages) < page_size:
         size = min(BATCH_SIZE, scan_limit - scanned)
         rows = _rows(conn, cm["id"], sorted(by_chat), start, end, speakers, limit=size + 1, after=after)
+        materials = message_materials.attach(conn, actor_id, cm["id"], rows[:size], settings,
+                                            enqueue=enqueue_materials)
+        pending_ids.extend(materials["pending_ids"])
         names = mention_names(conn, rows[:size])
         consumed = 0
         for row in rows[:size]:
@@ -279,6 +290,8 @@ def _collect(conn, actor_id, context, args, settings, *, terms, read_cache=None,
             scanned += 1
             after = [row["message_create_time"].isoformat(), row["chat_id"], row["message_id"]]
             text, unavailable = _text(row, cipher, names)
+            for note in dict.fromkeys(row.get("_material", {}).get("notes", [])):
+                material_notes[note] = material_notes.get(note, 0) + 1
             unreadable += int(unavailable)
             non_text += int(unavailable and row["message_type"] not in {"text", "post"})
             unreadable_text += int(unavailable and row["message_type"] in {"text", "post"})
@@ -298,6 +311,7 @@ def _collect(conn, actor_id, context, args, settings, *, terms, read_cache=None,
         if not more:
             break
     sources, gaps = _coverage(chats, start, end)
+    gaps.extend({"reason": note, "category": "material", "count": count} for note, count in material_notes.items())
     if non_text:
         gaps.append({"reason": "非文字消息未分析", "category": "non_text", "count": non_text})
     if unreadable_text:
@@ -334,6 +348,8 @@ def _collect(conn, actor_id, context, args, settings, *, terms, read_cache=None,
         result.update(window_counts if window_counts is not None else
                       _totals(conn, cm["id"], sorted(by_chat), start, end, speakers),
                       returned=len(messages), counts_scope="window_total")
+    if pending_ids:
+        result["material_pending_ids"] = list(dict.fromkeys(pending_ids))
     return result
 
 
@@ -400,12 +416,22 @@ def validate_result(conn, actor_id, context, result, settings, *, history_only=F
                  limit=len(references), extra=" AND m.message_id=ANY(%s::text[])",
                  extra_args=([ref["message_id"] for ref in references],)) if references else []
     current = {(row["chat_id"], row["message_id"]): row for row in rows}
+    message_materials.attach(conn, actor_id, cm["id"], rows, settings)
+    names, cipher = mention_names(conn, rows), message_body_cipher(settings.token_encryption_key)
+    shown = {(message["chat_id"], message["message_id"]): message for message in messages}
     for ref in references:
         row = current.get((ref["chat_id"], ref["message_id"]))
         if not row:
             raise PermissionError("命中消息已删除或当前授权无法读取。")
         if _version(row) != ref.get("version"):
             raise ValueError("命中消息已更新，请重新检索。")
+        text, unavailable = _text(row, cipher, names)
+        fresh = _message(row, by_chat[ref["chat_id"]], text, unavailable,
+                         terms=result.get("scope", {}).get("query", ()),
+                         clip=result.get("kind") != "window_messages", audience=audience)
+        previous = shown[(ref["chat_id"], ref["message_id"])]
+        if any(fresh[key] != previous[key] for key in ("text", "unreadable", "unavailable_or_truncated")):
+            raise ValueError("消息解析内容已变化，请重新检索。")
     sources, gaps = _coverage(chats, start, end)
     gaps.extend(gap for gap in result.get("gaps", []) if not gap.get("chat_id"))
     return {"sources": sources, "gaps": gaps,
@@ -413,7 +439,7 @@ def validate_result(conn, actor_id, context, result, settings, *, history_only=F
                          "source_complete": (bool(chats) or audience == "all") and not gaps}}
 
 
-def read(conn, actor_id, context, args, settings, *, cutoff=None, read_cache=None):
+def read(conn, actor_id, context, args, settings, *, cutoff=None, read_cache=None, enqueue_materials=False):
     mode = args.get("mode") or "period"
     if mode not in {"period", "latest"}:
         raise ValueError("请选择原时段或最新进展。")
@@ -476,6 +502,7 @@ def read(conn, actor_id, context, args, settings, *, cutoff=None, read_cache=Non
     if any(message_id and message_id not in visited for message_id, _ in pending):
         gaps.append({"reason": "引用链超过本次上下文上限"})
     rows = [row for row, _ in collected.values()]
+    materials = message_materials.attach(conn, actor_id, cm["id"], rows, settings, enqueue=enqueue_materials)
     names, cipher = mention_names(conn, rows), message_body_cipher(settings.token_encryption_key)
     messages = []
     for row, relation in sorted(collected.values(), key=lambda item: (
@@ -489,6 +516,8 @@ def read(conn, actor_id, context, args, settings, *, cutoff=None, read_cache=Non
                            clip=False, audience=audience)
         message.update(relation=relation, in_window=row["message_create_time"] >= start)
         messages.append(message)
+        gaps.extend({"reason": note, "message_id": row["message_id"], "category": "material"}
+                    for note in dict.fromkeys(row.get("_material", {}).get("notes", [])))
         if message["unavailable_or_truncated"]:
             gaps.append({"reason": "上下文正文不可读取或超过展示长度", "message_id": row["message_id"]})
     sources, sync_gaps = _coverage(chats, start, read_end)
@@ -508,4 +537,6 @@ def read(conn, actor_id, context, args, settings, *, cutoff=None, read_cache=Non
     if mode == "latest":
         result.update(latest_window={"start": end.isoformat(), "end": read_end.isoformat()},
                       context_scope="referenced_messages_and_bounded_latest", latest_limit=20)
+    if materials["pending_ids"]:
+        result["material_pending_ids"] = materials["pending_ids"]
     return result

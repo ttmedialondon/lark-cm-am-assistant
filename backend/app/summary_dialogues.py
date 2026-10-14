@@ -143,8 +143,8 @@ def checked_chat(conn, job, settings):
     return data
 
 
-def _blocked_people(chats, tasks):
-    pending = {task["chat_id"] for task in tasks if task["status"] != "succeeded"}
+def _blocked_people(chats, tasks, *, material_chats=()):
+    pending = {task["chat_id"] for task in tasks if task["status"] != "succeeded"} | set(material_chats)
     return {str(person) for chat in chats if chat["chat_id"] in pending for person in chat["contact_ids"]}
 
 
@@ -175,11 +175,12 @@ def schedule_merges(conn, settings):
         ).fetchall()
         blocked = set()
         roster, chats = None, None
-        if any(task["status"] != "succeeded" for task in tasks):
+        material_chats = (run.get('coverage') or {}).get('material_chats', [])
+        if material_chats or any(task["status"] != "succeeded" for task in tasks):
             roster = core._roster(conn, run["responsible_authorization_id"])
             chats = core._related_chats(conn, roster, settings=settings,
                                        cm_id=run["responsible_authorization_id"])
-            blocked = _blocked_people(chats, tasks)
+            blocked = _blocked_people(chats, tasks, material_chats=material_chats)
         people = {}
         for task in tasks:
             if task["status"] != "succeeded":
@@ -310,7 +311,9 @@ def merge_input(conn, run, task, settings, roster=None, chats=None, *, read_cach
             AND chat_id IS NOT NULL ORDER BY id""", (task["run_id"],),
         ).fetchall()
     sources = cache["sources"]
-    if str(task["contact_id"]) in _blocked_people(chats, sources):
+    if str(task["contact_id"]) in _blocked_people(
+        chats, sources, material_chats=(run.get('coverage') or {}).get('material_chats', [])
+    ):
         raise core.SummaryInputError("会话尚未完成。")
     events, source_hashes, person = [], [], None
     for source in sources:

@@ -512,10 +512,13 @@ def prepare(settings):
             conn.execute('UPDATE assistant_turns SET scheduled_at=NOW()+INTERVAL \'1 second\',checkpoint_ciphertext=%s '
                          'WHERE id=%s', (codec.encode(checkpoint, settings), row['id']))
             return False
-        call = checkpoint['pending_calls'][0]
-        if checkpoint.get('waiting_cache_key'):
-            checkpoint.setdefault('tool_cache', {})[checkpoint.pop('waiting_cache_key')] = result
-        _accept_tool(checkpoint, call, result)
+        if checkpoint['waiting']['kind'] == 'message_materials':
+            checkpoint.pop('waiting_cache_key', None)
+        else:
+            call = checkpoint['pending_calls'][0]
+            if checkpoint.get('waiting_cache_key'):
+                checkpoint.setdefault('tool_cache', {})[checkpoint.pop('waiting_cache_key')] = result
+            _accept_tool(checkpoint, call, result)
         checkpoint.pop('waiting', None)
         checkpoint['progress'] = '整理结果'
         conn.execute("UPDATE assistant_turns SET status='queued',scheduled_at=NOW(),checkpoint_ciphertext=%s "
@@ -556,6 +559,10 @@ def _collect_window(conn, row, checkpoint, settings, context, *, read_cache=None
     counts = {key: previous[0][key] for key in ('total_messages', 'total_conversations')} if previous else None
     result = tools.execute(conn, row['actor_id'], current_turn, 'summarize_messages',
                            window['args'], settings, context, read_cache=read_cache, window_counts=counts)
+    if result.get('waiting'):
+        checkpoint['waiting'] = result['waiting']
+        checkpoint['progress'] = '正在读取图片或附件'
+        return
     window['task'] = {'question': codec.decode(row['input_ciphertext'], settings)['message'],
                       'scope': result['scope'], 'window': result['window']}
     try:
@@ -794,7 +801,7 @@ def step(job, settings):
         window = checkpoint.get('window_job')
         if window and window['phase'] == 'collect':
             _collect_window(conn, row, checkpoint, settings, context, read_cache=read_cache)
-            _save(conn, job, checkpoint, settings)
+            _save(conn, job, checkpoint, settings, status='waiting' if checkpoint.get('waiting') else 'queued')
             return
         if checkpoint['pending_calls'] and not window:
             while checkpoint['pending_calls']:
@@ -826,7 +833,8 @@ def step(job, settings):
                             continue
                         checkpoint['window_job'] = windows.begin(call, args)
                         _collect_window(conn, row, checkpoint, settings, context, read_cache=read_cache)
-                        _save(conn, job, checkpoint, settings)
+                        _save(conn, job, checkpoint, settings,
+                              status='waiting' if checkpoint.get('waiting') else 'queued')
                         return
                     cache_key = json.dumps([call['name'], args], sort_keys=True, ensure_ascii=False)
                     cached = checkpoint.setdefault('tool_cache', {}).get(cache_key)
@@ -863,7 +871,8 @@ def step(job, settings):
                 if result.get('waiting'):
                     checkpoint['waiting'] = result['waiting']
                     checkpoint['waiting_cache_key'] = cache_key
-                    checkpoint['progress'] = '正在分析记录'
+                    checkpoint['progress'] = ('正在读取图片或附件' if result['waiting']['kind'] == 'message_materials'
+                                              else '正在分析记录')
                     _save(conn, job, checkpoint, settings, status='waiting')
                     return
                 _accept_tool(checkpoint, call, result, cached=was_cached)

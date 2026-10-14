@@ -316,7 +316,7 @@ def test_full_ai_slots_do_not_attempt_another_claim(monkeypatch) -> None:
     assert worker._fill_ai_slots(object(), object(), {Future() for _ in range(5)}, 2) == 2
 
 
-def test_dispatch_uses_at_most_five_slots_and_fairly_rotates_all_eight_queues(monkeypatch) -> None:
+def test_dispatch_uses_at_most_five_slots_and_fairly_rotates_all_nine_queues(monkeypatch) -> None:
     submitted: list[tuple[object, object]] = []
 
     class Future:
@@ -336,6 +336,8 @@ def test_dispatch_uses_at_most_five_slots_and_fairly_rotates_all_eight_queues(mo
     group_jobs = iter(({"id": "group-1"},))
     assistant_jobs = iter(({"id": "assistant-1"},))
     importance_jobs = iter(({"id": "importance-1"},))
+    material_jobs = iter(({"id": "material-1"},))
+    monkeypatch.setattr(worker.message_materials, "claim", lambda: next(material_jobs, None))
     monkeypatch.setattr(worker.assistant, "claim", lambda: next(assistant_jobs, None))
     monkeypatch.setattr(worker.creator_importance, "claim", lambda: next(importance_jobs, None))
     monkeypatch.setattr(worker.summary_replies, "claim", lambda: next(reply_jobs, None))
@@ -361,12 +363,12 @@ def test_dispatch_uses_at_most_five_slots_and_fairly_rotates_all_eight_queues(mo
     preference = worker._fill_ai_slots(object(), Executor(), futures, preference)
     assert preference == 2
     assert [job["id"] for _runner, job in submitted[5:]] == [
-        "responsibility-1", "group-1", "importance-1", "summary-2", "summary-3"
+        "responsibility-1", "group-1", "importance-1", "material-1", "summary-2"
     ]
     assert submitted[6][0] is worker.creator_group_matching.run
     futures.clear()
     assert worker._fill_ai_slots(object(), Executor(), futures, preference) == 2
-    assert [job["id"] for _runner, job in submitted[10:]] == []
+    assert [job["id"] for _runner, job in submitted[10:]] == ["summary-3"]
 
     # Exhausted queues must not query on every busy Lark tick. Completion wakes
     # the dispatcher immediately so a chained summary/reply is not delayed.

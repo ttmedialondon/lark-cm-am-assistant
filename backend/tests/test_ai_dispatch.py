@@ -46,6 +46,7 @@ def test_shared_gate_allows_four_and_rejects_five_valid_running_leases() -> None
     assert "creator_handle_jobs" in combined_query
     assert "creator_responsibility_jobs" in combined_query
     assert "creator_group_jobs" in combined_query
+    assert "message_material_jobs" in combined_query
     assert "lease_until > NOW()" in combined_query
 
 
@@ -82,6 +83,13 @@ def test_single_request_transport_preserves_retry_hints_and_safe_failure_metadat
     request(reasoning_effort="none")
     assert calls[-1][1]["json"]["reasoning"] == {"effort": "none"}
     assert calls[-1][1]["json"]["store"] is False
+    inline = [{"type": "input_image", "image_url": "data:image/png;base64,dGVzdA=="},
+              {"type": "input_file", "filename": "test.pdf", "file_data": "data:application/pdf;base64,dGVzdA=="}]
+    parsed = request(input_content=inline)
+    payload = calls[-1][1]["json"]
+    assert payload["input"][0]["content"][0] == {"type": "input_text", "text": '{"target":"U1"}'}
+    assert payload["input"][0]["content"][1:] == inline and payload["store"] is False
+    assert "dGVzdA" not in str(parsed)  # Receipts never retain original attachment data.
 
     result = httpx.Response(200, json={"status": "completed", "output": [
         {"type": "reasoning", "summary": [{"type": "summary_text", "text": "PRIVATE REASONING"}]},

@@ -166,6 +166,107 @@ def test_message_list_requests_sender_names(monkeypatch) -> None:
         "sort_type": "ByCreateTimeDesc",
         "page_token": "page-2",
     }
+    assert client.get_message("user-token", "om_saved") == {"items": []}
+    assert captured == {
+        "method": "GET", "url": "https://open.larksuite.com/open-apis/im/v1/messages/om_saved",
+        "access_token": "user-token", "params": {"user_id_type": "open_id"},
+    }
+    with pytest.raises(ValueError, match="Invalid Lark identity"):
+        client.get_message("user-token", "om_saved/resources/img_other")
+
+    def rejected(*_args, **_kwargs):
+        raise LarkApiError(403, 99991672, "secret body img_private", 7)
+
+    monkeypatch.setattr(client, "_request", rejected)
+    with pytest.raises(LarkApiError) as raised:
+        client.get_message("user-token", "om_saved")
+    assert (raised.value.status_code, raised.value.lark_code, raised.value.retry_after) == (403, 99991672, 7)
+    assert raised.value.likely_auth_problem and "secret" not in str(raised.value)
+
+
+def test_message_resources_are_bounded_in_memory_and_never_follow_redirects_or_expose_errors():
+    calls, events, yielded, closed = [], [], [], []
+
+    class Admission:
+        @contextmanager
+        def request(self):
+            events.append("request")
+            try:
+                yield
+            finally:
+                events.append("release")
+
+        def pause(self, seconds):
+            events.append(("pause", seconds))
+
+    class ResourceStream(httpx.SyncByteStream):
+        def __iter__(self):
+            for chunk in (b"1234", b"56789", b"not-read"):
+                yielded.append(chunk)
+                yield chunk
+
+        def close(self):
+            closed.append(True)
+
+    responses = iter((
+        httpx.Response(200, content=b"pixels", headers={
+            "content-type": "image/png", "content-disposition": "attachment; filename*=UTF-8''test%20image.png"}),
+        httpx.Response(200, content=b"%PDF-x", headers={
+            "content-type": "application/pdf; charset=binary",
+            "content-disposition": 'attachment; filename="../a.pdf"'}),
+        httpx.Response(200, stream=ResourceStream(), headers={"content-type": "application/pdf"}),
+        httpx.Response(200, stream=ResourceStream(), headers={"content-length": "999"}),
+        httpx.Response(429, json={"code": 99991400, "msg": "secret body img_private"},
+                       headers={"x-ogw-ratelimit-reset": "7"}),
+        httpx.Response(200, json={"code": 230020, "msg": "secret body img_private"}, headers={"Retry-After": "3"}),
+        httpx.Response(403, json={"code": 99991672, "msg": "secret body img_private"}),
+        httpx.Response(302, headers={"Location": "https://elsewhere.example/private"}),
+        httpx.Response(200, content=b""),
+        httpx.ReadTimeout("secret-token img_private secret body"),
+    ))
+
+    def handle(request):
+        calls.append(request)
+        assert request.url.host == "open.larksuite.com"
+        assert request.headers["Authorization"] == "Bearer secret-token"
+        assert request.url.path.startswith("/open-apis/im/v1/messages/om_saved/resources/")
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    with httpx.Client(transport=httpx.MockTransport(handle), follow_redirects=True) as http_client:
+        client = LarkClient(settings(), http_client=http_client, admission=Admission())
+        assert client.download_message_resource("secret-token", "om_saved", "img_private", "image", 8) == {
+            "content": b"pixels", "mime_type": "image/png", "filename": "test image.png"}
+        assert dict(calls[-1].url.params) == {"type": "image"}
+        assert client.download_message_resource("secret-token", "om_saved", "file_private", "file", 8) == {
+            "content": b"%PDF-x", "mime_type": "application/pdf", "filename": "a.pdf"}
+        assert dict(calls[-1].url.params) == {"type": "file"}
+        for size in (8, 8):
+            with pytest.raises(LarkApiError) as raised:
+                client.download_message_resource("secret-token", "om_saved", "file_private", "file", size)
+            assert raised.value.status_code == 413 and not raised.value.retryable
+        assert yielded == [b"1234", b"56789"] and closed == [True, True]
+        for status, code, retry in ((429, 99991400, 7), (502, 230020, 3), (403, 99991672, None),
+                                    (302, None, None), (502, None, None), (503, None, None)):
+            before = len(calls)
+            with pytest.raises(LarkApiError) as raised:
+                client.download_message_resource("secret-token", "om_saved", "file_private", "file", 128)
+            assert (raised.value.status_code, raised.value.lark_code, raised.value.retry_after) == (status, code, retry)
+            assert len(calls) == before + 1 and events[-1] == "release"
+            assert not any(secret in str(raised.value) for secret in ("secret", "img_private", "file_private"))
+            if retry:
+                assert raised.value.rate_limited and ("pause", retry) in events
+        before = len(calls)
+        for message_id, key, resource_type, limit in (
+            ("om_saved/other", "img_private", "image", 8), ("om_saved", "img_other/redirect", "image", 8),
+            ("om_saved", "file_private", "image", 8), ("om_saved", "img_private", "audio", 8),
+            ("om_saved", "img_private", "image", 0), ("om_saved", "img_private", "image", True),
+        ):
+            with pytest.raises(ValueError):
+                client.download_message_resource("secret-token", message_id, key, resource_type, limit)
+        assert len(calls) == before
 
 
 def test_p2p_discovery_uses_the_user_chat_type_filter(monkeypatch) -> None:

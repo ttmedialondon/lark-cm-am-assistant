@@ -15,6 +15,7 @@ from . import (
     assistant_search,
     assistant_worklist,
     creator_importance,
+    message_materials,
     summary_replies,
 )
 from . import offhours_summary as summaries
@@ -425,8 +426,11 @@ def _validate_query(conn, actor_id, context, result, settings, *, history_only=F
                 messages=[{**message, **{key: source if message.get(key) == result.get(key)
                     else refs.get(message.get(key), message.get(key)) for key in ("message_ref", "evidence_ref")}}
                     for message in result["messages"]])
-        metadata = assistant_search.validate_result(conn, actor_id, context, restored, settings,
-                                                    history_only=history_only, read_cache=read_cache)
+        try:
+            metadata = assistant_search.validate_result(conn, actor_id, context, restored, settings,
+                                                        history_only=history_only, read_cache=read_cache)
+        except ValueError as exc:
+            raise SourceChangedError(str(exc)) from exc
     else:
         metadata = assistant_queries.validate_result(conn, actor_id, context, result, settings, read_cache=read_cache)
     if metadata:
@@ -473,7 +477,8 @@ def _query(conn, actor_id, turn, name, args, settings, context, visible, *, read
         source = _saved_message(conn, actor_id, args["message_ref"], settings, read_cache=read_cache)
         mode = args.get("mode") or "period"
         result = assistant_search.read(conn, actor_id, context, {"message_ref": source, "mode": mode}, settings,
-                                       cutoff=turn["created_at"] if mode == "latest" else None, read_cache=read_cache)
+                                       cutoff=turn["created_at"] if mode == "latest" else None, read_cache=read_cache,
+                                       enqueue_materials=True)
         result["_source_ref"] = source
         result["message_ref"] = args["message_ref"]
         result["evidence_ref"] = args["message_ref"]
@@ -495,11 +500,17 @@ def _query(conn, actor_id, turn, name, args, settings, context, visible, *, read
                     if snapshot is not None:
                         break
         query_options = {"read_cache": read_cache}
+        if name in {"search_chat_history", "summarize_messages"}:
+            query_options["enqueue_materials"] = True
         if name == "summarize_messages":
             query_options["window_counts"] = window_counts
         result = (_QUERIES[name](conn, actor_id, context, args, settings, snapshot=snapshot, **query_options)
                   if name == "query_creators" else _QUERIES[name](conn, actor_id, context, args, settings,
                                                                 **query_options))
+    if result.get("material_pending_ids"):
+        return {"waiting": {"kind": "message_materials", "ids": result["material_pending_ids"],
+                            "scope": result["scope"]},
+                "scope": result["scope"], "window": result.get("window")}
     if name == "query_creators" and args["query"] and result["total"] == 1:
         ids = [person["id"] for person in result["creators"]]
         selected = context["scope"].get("creator_ids")
@@ -1168,6 +1179,10 @@ def resume_wait(conn, actor_id, turn, waiting, settings, context):
         context = _reference_context(conn, actor_id, context, {"result_id": _result_ref(waiting["ids"])}, settings)
     elif waiting.get("event_ref"):
         context = _reference_context(conn, actor_id, context, waiting, settings)
+    if waiting["kind"] == "message_materials":
+        cm = assistant_search.authorize_all(conn, actor_id, context["scope"]["cm_id"])
+        return (None if message_materials.pending(conn, actor_id, cm["id"], waiting["ids"])
+                else {"materials_ready": True})
     _scope(conn, actor_id, context)
     if waiting["kind"] == "summary":
         result = _read_results(conn, actor_id, [UUID(value) for value in waiting["ids"]], settings, context)

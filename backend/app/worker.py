@@ -26,6 +26,7 @@ from . import (
     creator_imports,
     creator_responsibility_matching,
     identity_profiles,
+    message_materials,
     offhours_summary,
     organization_sync,
     summary_replies,
@@ -268,6 +269,7 @@ def _dispatch_ai_turn(
         (creator_responsibility_matching.claim, creator_responsibility_matching.run),
         (creator_group_matching.claim, creator_group_matching.run),
         (creator_importance.claim, creator_importance.run),
+        (message_materials.claim, message_materials.run),
     )
     for offset in range(len(queues)):
         index = (next_queue + offset) % len(queues)

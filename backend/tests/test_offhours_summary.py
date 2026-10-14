@@ -2415,3 +2415,220 @@ def test_assistant_unknown_material_cannot_be_replayed_by_a_new_turn(pg, seeded,
     ai.prepare_next_summary(s.settings)
     ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
     assert ai.read_assistant_run(pg, s.ids["cm"], changed["run"]["id"], s.settings)["run"]["status"] == "completed"
+
+
+def test_message_material_cache_rechecks_access_and_recovers_one_paid_receipt(pg, seeded, monkeypatch):
+    import io
+
+    from PIL import Image
+
+    from app import message_materials as materials
+    from app import worker
+
+    s = seeded
+    s.settings.lark_sync_max_inflight = 1
+    s.settings.lark_sync_requests_per_second = 1
+    monkeypatch.setattr(materials, "connection", lambda: nullcontext(pg))
+    monkeypatch.setattr(materials, "get_settings", lambda: s.settings)
+    monkeypatch.setattr(worker, "_usable_access_token", lambda *_args: "synthetic-user-token")
+    save_feature_config(pg, api_key_cipher(s.settings.token_encryption_key), ai.ASSISTANT_FEATURE,
+        provider="openai", project_id="attachment-test", model="attachment-model", enabled=True,
+        api_key="synthetic-attachment-key", updated_by_authorization_id=s.ids["owner"])
+    image = io.BytesIO()
+    Image.new("RGB", (2, 2), "white").save(image, format="PNG")
+    downloaded, called = [], []
+
+    def download(_token, message_id, key, kind):
+        downloaded.append(message_id)
+        assert _token == "synthetic-user-token" and key.startswith("img_") and kind == "image"
+        if len(downloaded) == 1:
+            raise materials.LarkApiError(429, 99991400, "synthetic resource rate limit", 1)
+        return {"content": image.getvalue(), "filename": "synthetic.png", "mime_type": "image/png"}
+
+    monkeypatch.setattr(materials, "LarkClient", lambda *_args, **_kwargs:
+                        SimpleNamespace(download_message_resource=download))
+
+    def model(_cfg, _key, payload, cm_id, **options):
+        called.append(payload)
+        assert _key == "synthetic-attachment-key" and cm_id == s.ids["cm"]
+        assert options["input_content"][0]["image_url"].startswith("data:image/png;base64,")
+        if len(called) == 2:
+            raise openai_client.OpenAIRequestError("synthetic timeout", retryable=True)
+        return {"text": json.dumps({"text": "截图显示样品已寄出", "complete": True, "notes": []}),
+                "usage": {"input_tokens": 7, "output_tokens": 3}, "response_id": "synthetic-material-response"}
+
+    monkeypatch.setattr(openai_client, "call_openai", model)
+
+    def add_image(message_id, actor=None):
+        s.add(message_id, kind="image")
+        pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE chat_id='chat' AND message_id=%s",
+                   (s.cipher.encrypt(json.dumps({"image_key": "img_" + message_id})), message_id))
+        row = materials._sources(pg, s.ids["cm"], [{"chat_id": "chat", "message_id": message_id}])[
+            ("chat", message_id)]
+        result = materials.attach(pg, actor or s.ids["cm"], s.ids["cm"], [row], s.settings, enqueue=True)
+        assert len(result["pending_ids"]) == 1
+        return row, UUID(result["pending_ids"][0])
+
+    first_row, first_id = add_image("om_first")
+    second_row, second_id = add_image("om_unknown")
+    pg.execute("UPDATE message_material_jobs SET scheduled_at=NOW()-INTERVAL '1 minute' WHERE id=%s", (first_id,))
+    first = materials.claim()
+    assert first["id"] == first_id and materials.claim() is None  # One global attachment lease.
+    materials.run(first, s.settings)
+    assert pg.execute(
+        "SELECT status FROM message_material_jobs WHERE id=%s", (first_id,)
+    ).fetchone()["status"] == "queued"
+    assert called == []  # The first read may be rate limited before a checkpoint has been saved.
+    pg.execute("UPDATE message_material_jobs SET scheduled_at=NOW()-INTERVAL '1 minute' WHERE id=%s", (first_id,))
+    materials.run(materials.claim(), s.settings)
+    assert pg.execute(
+        "SELECT status FROM message_material_jobs WHERE id=%s", (first_id,)
+    ).fetchone()["status"] == "succeeded"
+    cached = materials.attach(pg, s.ids["owner"], s.ids["cm"], [dict(first_row)], s.settings, enqueue=True)
+    assert cached["pending_ids"] == []
+    assert cached["rows"][0]["_material"]["text"] == "[图片解析，非发言人原话]\n截图显示样品已寄出"
+    assert cached["rows"][0]["_material"]["complete"] and len(called) == 1
+    with pytest.raises(PermissionError):
+        materials.attach(pg, s.ids["tester"], s.ids["cm"], [dict(first_row)], s.settings)
+
+    second = materials.claim()
+    assert second["id"] == second_id
+    materials.run(second, s.settings)
+    saved = pg.execute("SELECT * FROM message_material_jobs WHERE id=%s", (second_id,)).fetchone()
+    assert saved["status"] == "unknown" and len(called) == 2
+    frozen = materials.attach(pg, s.ids["cm"], s.ids["cm"], [dict(second_row)], s.settings, enqueue=True)
+    assert frozen["pending_ids"] == [] and not frozen["rows"][0]["_material"]["complete"]
+    assert materials.claim() is None  # A new query must not repeat an unknown paid request.
+    checkpoint = materials._decode(saved["checkpoint_ciphertext"], s.settings)
+    assert not {"inputs", "content", "image_url", "file_data"} & checkpoint.keys()
+    response = {"text": json.dumps({"text": "截图显示收款成功", "complete": True, "notes": []}),
+                "usage": {"input_tokens": 11, "output_tokens": 4}, "response_id": "synthetic-late-response"}
+    materials._receipt(second, s.settings, checkpoint, response)
+    materials._receipt(second, s.settings, checkpoint, response)
+    recovered = materials.claim()
+    assert recovered["id"] == second_id
+    materials.run(recovered, s.settings)
+    current = pg.execute("SELECT * FROM message_material_jobs WHERE id=%s", (second_id,)).fetchone()
+    assert current["status"] == "succeeded" and current["usage"] == {"input_tokens": 11, "output_tokens": 4}
+    assert "截图显示收款成功" in materials._decode(current["result_ciphertext"], s.settings)["text"]
+    assert len(called) == 2 and downloaded == ["om_first", "om_first", "om_unknown"]
+    # A duplicate late receipt remains idempotent even after its result was finalized.
+    materials._receipt(second, s.settings, checkpoint, response)
+    assert pg.execute(
+        "SELECT usage FROM message_material_jobs WHERE id=%s", (second_id,)
+    ).fetchone()["usage"] == current["usage"]
+
+    _, owner_job = add_image("om_owner_revoked", s.ids["owner"])
+    pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (s.ids["owner"],))
+    with pytest.raises(PermissionError):
+        materials.attach(pg, s.ids["owner"], s.ids["cm"], [dict(first_row)], s.settings)
+    assert materials.claim() is None
+    assert pg.execute(
+        "SELECT status FROM message_material_jobs WHERE id=%s", (owner_job,)
+    ).fetchone()["status"] == "cancelled"
+    pg.execute("UPDATE admin_roles SET is_active=TRUE WHERE authorization_id=%s", (s.ids["owner"],))
+    _, consent_job = add_image("om_consent_revoked")
+    pg.execute("UPDATE authorizations SET body_consent_at=NULL WHERE id=%s", (s.ids["cm"],))
+    with pytest.raises((PermissionError, ai.SummaryInputError)):
+        materials.attach(pg, s.ids["cm"], s.ids["cm"], [dict(first_row)], s.settings)
+    assert materials.claim() is None
+    assert pg.execute(
+        "SELECT status FROM message_material_jobs WHERE id=%s", (consent_job,)
+    ).fetchone()["status"] == "cancelled"
+    assert len(called) == 2 and len(downloaded) == 3
+
+
+def test_pending_material_refresh_targets_one_chat_and_keeps_original_cutoff(pg, seeded, monkeypatch):
+    from app import message_materials, summary_replies
+
+    s = seeded
+    pg.execute("DELETE FROM authorization_message_observations WHERE message_id='outside'")
+    pg.execute("DELETE FROM chat_messages WHERE message_id='outside'")
+    pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
+               "VALUES(%s,%s,%s,'manual')", (uuid4(), s.ids['other'], s.ids['cm']))
+    pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('peer','Other creator','p2p')")
+    pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,p2p_counterpart_open_id,
+        p2p_counterpart_type,backfill_complete,backfill_window_start_at,last_incremental_at,sync_status)
+        VALUES(%s,'peer','ou_other','user',TRUE,%s,%s,'succeeded')""",
+               (s.ids['cm'], s.start - timedelta(days=9), s.end))
+    pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,
+        body_ciphertext,message_create_time) VALUES('peer','peer_request','ou_other','text',%s,%s)""",
+               (s.cipher.encrypt(json.dumps({'text': 'My sample request'})), s.start + timedelta(hours=1)))
+    pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+               "VALUES(%s,'peer','peer_request')", (s.ids['cm'],))
+    saved = s.save()
+    assert saved['queued'] == 2
+    for _ in range(2):
+        ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
+    finish_merges(pg, s)
+    run_id = UUID(saved['run_id'])
+    original = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s ORDER BY id",
+                          (run_id,)).fetchall()
+    target = next(t for t in original if t['chat_id'] == 'chat')
+    peer = next(t for t in original if t['chat_id'] == 'peer')
+    assert target['status'] == peer['status'] == 'succeeded'
+    before_calls = len(s.calls)
+    pg.execute("""UPDATE offhours_summary_runs SET period='work',report_date=%s,
+        refresh_until=%s,next_check_at=NULL WHERE id=%s""",
+               (datetime.now(ai.LONDON).date(), target['cutoff'], run_id))
+    pg.execute("UPDATE chat_messages SET message_type='image',body_ciphertext=%s WHERE message_id='m1'",
+               (s.cipher.encrypt(json.dumps({'image_key': 'synthetic_image'})),))
+    s.add('after_original_cutoff', text='Do not include this newer request',
+          at=target['cutoff'] + timedelta(minutes=1))
+    ready, attaches = False, []
+
+    def attach(_conn, actor, cm, rows, _settings, *, feature='operations_assistant', enqueue=False):
+        assert cm == s.ids['cm'] and actor in (s.ids['cm'], s.ids['owner'])
+        attaches.append((enqueue, {r['chat_id'] for r in rows}))
+        pending = []
+        for row in rows:
+            if row['chat_id'] == 'chat' and row['message_id'] == 'm1':
+                row['_material'] = {'text': '[图片解析，非发言人原话]\n样品已寄出' if ready else '',
+                                    'complete': ready, 'notes': [] if ready else ['图片正在解析']}
+                if not ready:
+                    pending.append('synthetic-material-job')
+        return {'rows': rows, 'pending_ids': pending}
+
+    monkeypatch.setattr(message_materials, 'attach', attach)
+
+    def state():
+        row = pg.execute('SELECT *,id AS run_id FROM offhours_summary_runs WHERE id=%s', (run_id,)).fetchone()
+        return dict(row)
+
+    later = target['cutoff'] + timedelta(minutes=10)
+    assert ai._schedule_run(pg, state(), later, chat_ids={'chat'}) == 0
+    assert pg.execute('SELECT * FROM offhours_summary_tasks WHERE run_id=%s ORDER BY id',
+                      (run_id,)).fetchall() == original
+    assert state()['coverage']['material_chats'] == ['chat']
+    assert summary_dialogues._blocked_people(
+        [{'chat_id': 'new_material', 'contact_ids': {s.ids['person']}},
+         {'chat_id': 'peer', 'contact_ids': {s.ids['other']}}], [], material_chats=['new_material']
+    ) == {str(s.ids['person'])}  # A pending new chat has no source task yet, but must block its creator's merge.
+    assert ai.get_summary_view(pg, s.ids['owner'], run_id=run_id, settings=s.settings)['run']['status'] == 'running'
+    assert len(s.calls) == before_calls
+    assert all(chats <= {'chat'} for enqueue, chats in attaches if enqueue)
+
+    ready = True
+    ai.request_material_refresh(pg, {'cm_id': s.ids['cm'], 'chat_id': 'chat'},
+                                {'message_create_time': s.start + timedelta(hours=1)})
+    assert state()['next_check_at'] is not None
+    assert pg.execute('SELECT * FROM offhours_summary_tasks WHERE run_id=%s ORDER BY id',
+                      (run_id,)).fetchall() == original
+    assert ai._schedule_run(pg, state(), later) == 1
+    new = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND chat_id='chat' AND is_current",
+                     (run_id,)).fetchone()
+    assert new['id'] != target['id'] and new['cutoff'] == target['cutoff'] and new['status'] == 'queued'
+    assert state()['coverage']['material_chats'] == []
+    assert pg.execute('SELECT * FROM offhours_summary_tasks WHERE id=%s', (target['id'],)).fetchone() == {
+        **target, 'is_current': False}
+    assert pg.execute('SELECT * FROM offhours_summary_tasks WHERE id=%s', (peer['id'],)).fetchone() == peer
+    assert len(s.calls) == before_calls
+    ai.run_claimed_summary(ai.claim_next_summary(), s.settings)
+    assert '样品已寄出' in json.dumps(s.calls[-1], ensure_ascii=False)
+    assert 'Do not include this newer request' not in json.dumps(s.calls[-1])
+    finish_merges(pg, s)
+    view = ai.get_summary_view(pg, s.ids['owner'], run_id=run_id, settings=s.settings)
+    event = next(e for e in view['events'] if e['contact_id'] == str(s.ids['person']))
+    attaches.clear()
+    summary_replies.read_event_context(pg, s.ids['owner'], event['id'], s.settings)
+    assert attaches and all(not enqueue for enqueue, _chats in attaches)
