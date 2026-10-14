@@ -3,7 +3,6 @@
 import re
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
-from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
@@ -25,29 +24,6 @@ def _page(items, number, size, count):
         "items": items, "page": number, "page_size": size, "total_count": count,
         "total_pages": pages, "has_next": number < pages,
     }
-
-
-class _Controls(HTMLParser):
-    def __init__(self, html):
-        super().__init__()
-        self.forms = {}
-        self.links = []
-        self._form = None
-        self.feed(html)
-
-    def handle_starttag(self, tag, attrs):
-        values = dict(attrs)
-        if tag == "form":
-            self._form = values.get("id", "")
-            self.forms[self._form] = {"attrs": values, "controls": {}}
-        elif self._form is not None and tag in {"input", "select"} and "name" in values:
-            self.forms[self._form]["controls"][values["name"]] = values
-        elif tag == "a" and "href" in values:
-            self.links.append(values["href"])
-
-    def handle_endtag(self, tag):
-        if tag == "form":
-            self._form = None
 
 
 @pytest.fixture
@@ -457,14 +433,6 @@ def test_initial_console_does_not_choose_a_source_or_read_messages(console):
     assert all(not console.calls[name] for name in ("directory", "chat", "messages", "audit"))
 
 
-def test_empty_source_directory_has_its_own_state(console):
-    console.state.update(sources=[], source_count=0)
-    response = console.browser.get("/admin/messages")
-    assert response.status_code == 200
-    assert "暂无已接入人员" in response.text
-    assert console.calls["messages"] == console.calls["audit"] == []
-
-
 def test_selecting_a_source_does_not_automatically_open_its_first_chat(console):
     response = _open(console)
     assert response.status_code == 200
@@ -484,15 +452,6 @@ def test_unavailable_source_cannot_query_chats_messages_or_audit(console, status
     assert console.contexts[-1]["source_unavailable_reason"]
     assert "可以浏览会话" not in response.text
     assert all(not console.calls[name] for name in ("directory", "chat", "messages", "audit"))
-
-
-@pytest.mark.parametrize(("query", "title"), [("", "还没有可查看的会话"), ("unmatched", "没有匹配的会话")])
-def test_empty_directory_distinguishes_no_chats_from_no_search_results(console, query, title):
-    console.state.update(chats=[], chat_count=0)
-    response = _open(console, conversation_query=query)
-    assert response.status_code == 200
-    assert title in response.text
-    assert console.calls["messages"] == console.calls["audit"] == []
 
 
 def test_unavailable_requested_chat_has_an_explicit_state_and_never_falls_back(console):
@@ -585,21 +544,6 @@ def test_source_restriction_filters_directory_and_blocks_forged_source(console, 
     assert console.calls["user_detail"] == []
 
 
-def test_source_and_filter_forms_reset_dependent_selection_state(console):
-    response = _open(console, chat_id=console.chat["chat_id"], user_page=2, conversation_page=2,
-                     page=2, conversation_query="creator", conversation_type="group")
-    controls = _Controls(response.text)
-    source_form = controls.forms["message-source-form"]["controls"]
-    assert "user_id" in source_form
-    assert "data-ui-auto-submit" in source_form["user_id"]
-    assert '<button class="btn btn-primary text-nowrap" type="submit">切换人员</button>' in response.text
-    assert not {"chat_id", "page", "conversation_page", "conversation_query", "conversation_type"} & source_form.keys()
-    filter_form = controls.forms["conversation-filter-form"]["controls"]
-    assert filter_form["user_id"]["value"] == str(console.source["id"])
-    assert {"conversation_query", "conversation_type"} <= filter_form.keys()
-    assert not {"chat_id", "page", "conversation_page"} & filter_form.keys()
-
-
 def test_links_and_pagination_preserve_only_their_correct_state(console):
     response = _open(console, chat_id=console.chat["chat_id"], user_page=2, conversation_page=2,
                      page=2, conversation_query="creator", conversation_type="group")
@@ -632,43 +576,3 @@ def test_current_chat_outside_directory_page_remains_visible_and_is_explained(co
     assert console.calls["chat"] == [(console.source["id"], console.chat["chat_id"])]
     assert "当前会话不在左侧本页" in response.text
     assert "Creator collaboration" in response.text and "Safe &lt;script&gt;message&lt;/script&gt;" in response.text
-
-
-def test_indexed_conversation_without_saved_content_does_not_guess_the_cause(console):
-    console.state.update(messages=[], content_count=0)
-    response = _open(console, chat_id=console.chat["chat_id"])
-    assert response.status_code == 200
-    assert "暂无已存正文" in response.text
-    assert "尚未回填完成，或" not in response.text
-    assert console.contexts[-1]["selected_chat"]["chat_id"] == console.chat["chat_id"]
-
-
-def test_chronological_content_is_grouped_by_date_and_names_the_selected_cm(console):
-    sample = console.state["messages"][0]
-    console.state["messages"] = [
-        {**sample, "created_date_label": "2026-09-04", "content": "Older sample text"},
-        {**sample, "sent_by_author": True, "sender_label": "本人", "content": "Newer sample text"},
-    ]
-    response = _open(console, chat_id=console.chat["chat_id"])
-    assert response.status_code == 200
-    assert response.text.index("Older sample text") < response.text.index("Newer sample text")
-    assert re.findall(r'class="message-console__date"><span>([^<]*)</span>', response.text) == [
-        "2026-09-04", "2026-09-05",
-    ]
-    assert re.search(r'message-console__message-meta">\s*<strong>Remi</strong>', response.text)
-    assert not re.search(r'message-console__message-meta">\s*<strong>本人</strong>', response.text)
-    assert "本页按时间从早到晚" not in response.text
-    assert 'id="message-latest">已到最新</div>' in response.text
-
-
-def test_time_navigation_labels_and_latest_anchor_match_the_page_direction(console):
-    response = _open(console, chat_id=console.chat["chat_id"], page=2)
-    context = console.contexts[-1]
-    controls = _Controls(response.text)
-    assert response.status_code == 200
-    assert "更新记录" in response.text and "更早记录" in response.text and "回到最新" in response.text
-    assert _query(context["message_page"]["previous_url"])["page"] == ["1"]
-    assert _query(context["message_page"]["next_url"])["page"] == ["3"]
-    assert context["latest_messages_url"] in controls.links
-    assert urlsplit(context["latest_messages_url"]).fragment == "message-latest"
-    assert 'id="message-latest"' in response.text

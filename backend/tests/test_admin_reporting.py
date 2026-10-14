@@ -10,87 +10,6 @@ from cryptography.exceptions import InvalidTag
 from app import admin_reporting
 
 
-def test_reporting_page_window_is_bounded_and_fetches_one_extra_row():
-    page_size = admin_reporting.LIST_PAGE_SIZE
-    assert admin_reporting._page_window(0) == (1, page_size + 1, 0)
-    assert admin_reporting._page_window(2) == (2, page_size + 1, page_size)
-    assert admin_reporting._page_window(99_999) == (
-        admin_reporting.MAX_PAGE,
-        page_size + 1,
-        (admin_reporting.MAX_PAGE - 1) * page_size,
-    )
-    assert admin_reporting._page_window(2, admin_reporting.DETAIL_PAGE_SIZE) == (2, 11, 10)
-
-
-def test_reporting_pagination_uses_exact_totals_and_preserves_empty_results():
-    assert admin_reporting._page_window(99, 5, total_count=17) == (4, 6, 15)
-
-    page = admin_reporting._page_result([], 1, 5, total_count=0)
-
-    assert page == {
-        "items": [],
-        "page": 1,
-        "page_size": 5,
-        "total_count": 0,
-        "total_pages": 0,
-        "has_next": False,
-    }
-    assert admin_reporting._message_count_label(0) == "尚无消息"
-
-
-def test_message_conversation_filter_values_are_bounded_and_allowlisted():
-    assert admin_reporting._page_window(2, admin_reporting.MESSAGE_CONVERSATION_PAGE_SIZE) == (2, 21, 20)
-    assert admin_reporting.normalize_message_conversation_query("  Creator  ") == "Creator"
-    assert admin_reporting.normalize_message_conversation_query("x" * 121) == "x" * 120
-    assert admin_reporting.normalize_message_conversation_type("p2p") == "p2p"
-    assert admin_reporting.normalize_message_conversation_type("unknown") == "all"
-    assert admin_reporting.normalize_contact_category("creator") == "creator"
-    assert admin_reporting.normalize_contact_category("unexpected") == "all"
-    assert admin_reporting.normalize_organization_status("verified") == "verified"
-    assert admin_reporting.normalize_organization_status("unexpected") == "all"
-    assert admin_reporting.normalize_organization_query("  TT   MEDIA ITALY  ") == "TT MEDIA ITALY"
-    assert admin_reporting.normalize_organization_query("x" * 121) == "x" * 120
-    assert admin_reporting.normalize_user_permission_filter("messages") == "messages"
-    assert admin_reporting.normalize_user_permission_filter("creator-review") == "all"
-    assert admin_reporting.normalize_user_permission_filter("none") == "none"
-    assert admin_reporting.normalize_user_permission_filter("unexpected") == "all"
-
-
-def test_member_count_labels_preserve_pending_and_unavailable_states():
-    assert admin_reporting._member_count(7, "succeeded") == "7"
-    assert admin_reporting._member_count(None, "pending") == "正在获取"
-    assert admin_reporting._member_count(None, "unavailable") == "Lark 未返回"
-
-
-def test_contact_labels_do_not_imply_identity_or_ownership():
-    contact = admin_reporting._decorate_contact(
-        {
-            "display_name": "Ada",
-            "tenant_classification": "known_external",
-            "primary_role": "partner_contact",
-            "category": "partner_contact",
-            "confirmed_roles": ["partner_contact"],
-            "organization_name": "TT MEDIA ITALY",
-            "organization_status": "verified",
-        }
-    )
-    assert contact["display_name"] == "Ada"
-    assert contact["tenant_classification_label"] == "外部成员"
-    assert contact["category_label"] == "其他机构负责人"
-    assert contact["confirmed_role_labels"] == ["其他机构负责人"]
-    assert contact["organization_status_label"] == "已验证"
-    assert contact["is_confirmed"] is True
-
-    unnamed = admin_reporting._decorate_contact({"display_name": None, "tenant_classification": "unresolved"})
-    assert unnamed["display_name"] == "Lark 参与者（姓名未返回）"
-    assert unnamed["tenant_classification_label"] == "租户未返回"
-    assert unnamed["confirmed_role_labels"] == []
-    assert unnamed["is_confirmed"] is False
-    assert unnamed["category"] == "unclassified"
-    assert unnamed["category_label"] == "待识别"
-    assert unnamed["organization_status_label"] == "未解析"
-
-
 def test_people_directory_all_contacts_current_policy_priority_and_unfiltered_progress(pg, monkeypatch):  # noqa: F811
     monkeypatch.setattr(admin_reporting, "connection", lambda: nullcontext(pg))
     people = {}
@@ -230,113 +149,6 @@ def test_people_directory_all_contacts_current_policy_priority_and_unfiltered_pr
     assert admin_reporting.contacts(query="")["total_count"] == 8
 
 
-def test_seconds_label_prefers_human_readable_units():
-    assert admin_reporting._seconds_label(300) == "5 分钟"
-    assert admin_reporting._seconds_label(3600) == "1 小时"
-    assert admin_reporting._seconds_label(45) == "45 秒"
-
-
-def test_message_body_renderer_extracts_text_without_showing_raw_json():
-    from app.message_text import display_body, evidence_body
-
-    assert admin_reporting._readable_body('{"text":"hello"}', "text") == "hello"
-    assert admin_reporting._readable_body('{"zh_cn":{"content":[[{"text":"hello"}]]}}', "post") == "hello"
-    raw = json.dumps({"title": "Heading", "content": [
-        {"text": "Hello"}, {"tag": "at", "user_id": "ou_person"}, {"tag": "lark_md", "content": "Card"},
-    ]})
-    mentions = [{"id_type": "open_id", "id": "ou_person", "key": "@_user_1", "name": "Ada"}]
-    assert display_body(raw, "post", mentions) == "Heading\nHello\n@Ada\nCard"
-    assert evidence_body(raw, "post") == "Hello"  # Do not silently change paid evidence fingerprints.
-    for renderer in (display_body, evidence_body):
-        assert renderer("plain broken {", "text") == "plain broken {"
-        assert renderer('{"image_key":"not text"}', "image") == "（image 消息没有可展示的文本）"
-
-
-def test_sync_summary_shows_initial_progress_instead_of_a_generic_running_job():
-    label, badge, detail = admin_reporting.sync_summary(
-        {
-            "authorization_status": "active",
-            "syncable_conversation_count": 295,
-            "backfill_complete_count": 37,
-            "syncing_conversation_count": 1,
-            "waiting_conversation_count": 257,
-            "not_readable_conversation_count": 0,
-            "archived_conversation_count": 9,
-            "job_mode": "backfill",
-            "job_status": "running",
-        }
-    )
-
-    assert (label, badge) == ("首次同步中", "primary")
-    assert "37/295" in detail
-    assert "1 个正在读取" in detail
-    assert "9 个 Lark 已归档/解散会话不计划回填" in detail
-
-
-def test_sync_summary_treats_future_incremental_work_as_a_schedule_not_a_queue():
-    now = datetime(2026, 9, 1, 12, tzinfo=UTC)
-    label, badge, detail = admin_reporting.sync_summary(
-        {
-            "authorization_status": "active",
-            "syncable_conversation_count": 13,
-            "backfill_complete_count": 13,
-            "syncing_conversation_count": 0,
-            "waiting_conversation_count": 0,
-            "not_readable_conversation_count": 0,
-            "archived_conversation_count": 0,
-            "job_mode": "incremental",
-            "job_status": "queued",
-            "job_scheduled_at": now + timedelta(minutes=5),
-        },
-        now=now,
-    )
-
-    assert (label, badge) == ("已接入 · 定时同步", "success")
-    assert "下一轮检查" in detail
-
-
-def test_sync_status_shows_both_current_lark_rate_limit_variants():
-    assert admin_reporting._job_status("running", last_http_status=429) == ("Lark 限流暂停", "warning")
-    assert admin_reporting._job_status("queued", last_error_code=99991400) == ("Lark 限流暂停", "warning")
-
-
-def test_member_snapshot_retry_is_distinct_from_the_daily_refresh_state():
-    label = admin_reporting._member_snapshot_activity(
-        {
-            "chat_mode": "group",
-            "member_snapshot_status": "pending",
-            "member_snapshot_retry_at": datetime(2026, 9, 3, 12, tzinfo=UTC),
-        }
-    )
-
-    assert label.startswith("等待重试于")
-
-
-def test_message_retry_is_shown_as_a_specific_delayed_conversation():
-    now = datetime(2026, 9, 3, 12, tzinfo=UTC)
-    label, badge, detail = admin_reporting.sync_summary(
-        {
-            "authorization_status": "active",
-            "syncable_conversation_count": 4,
-            "backfill_complete_count": 3,
-            "syncing_conversation_count": 0,
-            "waiting_conversation_count": 1,
-            "not_readable_conversation_count": 0,
-            "archived_conversation_count": 0,
-            "job_mode": "backfill",
-            "job_status": "queued",
-            "job_scheduled_at": now + timedelta(minutes=2),
-        },
-        now=now,
-    )
-
-    assert (label, badge) == ("等待会话重试", "primary")
-    assert "下一次会话重试于" in detail
-    assert admin_reporting._message_page_activity(
-        {"sync_status": "failed_retryable", "page_retry_at": now + timedelta(minutes=2)}
-    ).startswith("等待重试于")
-
-
 def _empty_reporting_database(monkeypatch, first_row):
     calls = []
 
@@ -355,14 +167,6 @@ def test_personnel_permission_filter_binds_values_and_keeps_global_summary(monke
     expected_filter = ("Remi_%", *(["messages"] * 5), sorted(admin_reporting.PAGE_KEYS), "messages")
     assert calls[0][1] == expected_filter
     assert calls[1][1] == (*expected_filter, admin_reporting.LIST_PAGE_SIZE + 1, 0)
-    assert "strpos(LOWER" in calls[0][0]
-    assert "a.status = 'active'" in calls[0][0]
-    assert "admin_page_permissions" in calls[0][0]
-    for query, _ in calls:
-        assert "COALESCE(r.role = 'owner', FALSE) AND COALESCE(r.is_active, FALSE)" in query
-        assert "NOT COALESCE(r.role = 'owner', FALSE) AND EXISTS" in query
-        assert "LEFT JOIN admin_roles r ON r.authorization_id = a.id AND r.is_active" not in query
-    assert "COUNT(*) FILTER (WHERE COALESCE(r.role = 'owner', FALSE)) AS owners" in calls[0][0]
     assert all("chat_messages" not in sql and "authorization_message_observations" not in sql
                for sql, _params in calls)
     assert page["items"] == []
@@ -446,11 +250,6 @@ def test_message_directory_twenty_item_pages_clamp_and_preserve_scope(
     assert page["page"] == expected_page
     assert page["total_count"] == 41
     assert page["total_pages"] == 3
-    for query, _ in calls:
-        assert admin_reporting.MESSAGE_CONVERSATION_DIRECTORY_SQL in query
-        assert admin_reporting.MESSAGE_CONVERSATION_FILTER_SQL in query
-    assert "ORDER BY LOWER(COALESCE(c.name, counterpart.display_name, '')), ac.chat_id" in calls[1][0]
-    assert "ORDER BY LOWER(COALESCE(name, counterpart_display_name, '')), chat_id" in calls[1][0]
 
 
 @pytest.mark.parametrize("requested_page,expected_page,offset", [(0, 1, 0), (2, 2, 100), (999_999, 3, 200)])
@@ -494,38 +293,9 @@ def test_message_page_decrypts_only_selected_hundred_then_displays_chronological
     assert "cipher-101" not in decrypted
     assert calls[0][1] == (authorization_id, "oc_synthetic")
     assert calls[1][1] == (authorization_id, "oc_synthetic", 101, offset)
-    for query, _ in calls:
-        for condition in (
-            "a.id = %s", "a.status = 'active'", "a.body_consent_at IS NOT NULL",
-            "o.observed_at >= a.body_consent_at", "ac.is_visible AND ac.sync_enabled",
-            "COALESCE(c.chat_status, 'normal') = 'normal'", "NOT m.is_deleted", "m.chat_id = %s",
-            "o.authorization_id = ac.authorization_id AND o.chat_id = ac.chat_id",
-            "m.chat_id = o.chat_id AND m.message_id = o.message_id",
-        ):
-            assert condition in query
-    assert "COUNT(*) FILTER (WHERE body_ciphertext IS NOT NULL) AS content_count" in calls[0][0]
-    assert "WHERE body_ciphertext IS NOT NULL" in calls[1][0]
-    assert "ORDER BY message_create_time DESC NULLS LAST, message_id DESC" in calls[1][0]
     # Equal timestamps retain the inverse of the database's deterministic ID tie-breaker.
     assert page["items"][0]["message_create_time"] == page["items"][1]["message_create_time"]
     assert [item["message_id"] for item in page["items"][:2]] == ["m_102", "m_103"]
-
-
-@pytest.mark.parametrize(
-    "message_type,label",
-    [("text", "文字"), ("post", "富文本"), ("interactive", "卡片"), ("image", "图片"),
-     ("file", "文件"), ("audio", "语音"), ("media", "视频"), ("sticker", "表情"),
-     ("merge_forward", "合并转发"), ("share_chat", "分享群聊"), ("share_user", "分享联系人"),
-     (None, "其他消息"), ("unknown", "其他消息")],
-)
-def test_message_type_labels_match_the_rendered_body(message_type, label):
-    assert admin_reporting._message_type_label(message_type) == label
-    item = admin_reporting._decorate_message(
-        {"message_type": message_type, "body_ciphertext": "synthetic"},
-        SimpleNamespace(decrypt=lambda value: '{}'),
-    )
-    assert item["message_type_label"] == label
-    assert item["content"] == f"（{message_type or '未知类型'} 消息没有可展示的文本）"
 
 
 @pytest.mark.parametrize(

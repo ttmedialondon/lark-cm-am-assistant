@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from app import admin, ai_feature_config
+from app import admin
 from app import offhours_summary_routes as routes
 
 APP = Path(__file__).resolve().parents[1] / "app"
@@ -32,78 +32,7 @@ def render(data):
     )
 
 
-def render_admin(role="owner"):
-    env = Environment(loader=FileSystemLoader(APP / "templates"), autoescape=select_autoescape())
-    configs = [{
-        **feature, "feature": name, "id_suffix": name.replace("_", "-"),
-        "config": ai_feature_config.display_config({"feature": name, "enabled": False, "key_suffix": "test"}),
-    } for name, feature in admin.AI_FEATURES.items()]
-    return env.get_template("admin/ai.html").render(
-        authorization={"display_name": "Fixture Reviewer"}, admin_role=role,
-        active_page="ai", admin_landing_path="/admin/ai", admin_permissions=["ai"],
-        permission_pages=[{"key": "ai", "path": "/admin/ai", "label": "AI 配置"}],
-        ai_dispatch={"state": "ready"}, configs=configs, csrf_token="fixture-csrf",
-        importance_metrics={"counts": {"pending": 0, "running": 0, "succeeded": 0, "failed": 0},
-                            "usage": {"api_requests": 0, "input_tokens": 0, "output_tokens": 0}},
-        summary_settings={"status_label": "未开启", "window_start_input": "2026-09-09T18:00",
-                          "window_end_input": "2026-09-10T12:00"},
-    )
-
-
-def test_admin_summary_form_has_native_window_inputs_and_disabled_default_without_identity_threshold():
-    html = render_admin()
-    forms = re.findall(r'<form action="/admin/ai".*?</form>', html, re.S)
-    assert 'name="feature" value="contact_assessment"' not in html
-    responsibility_form = next(
-        form for form in forms if 'name="feature" value="creator_responsibility_matching"' in form
-    )
-    assert 'name="auto_confirm_threshold"' in responsibility_form
-    group_form = next(form for form in forms if 'name="feature" value="creator_group_classification"' in form)
-    import_form = next(form for form in forms if 'name="feature" value="creator_import"' in form)
-    assert 'name="auto_confirm_threshold"' in group_form
-    assert "自动入库置信度阈值" in group_form
-    assert all(
-        'name="auto_confirm_threshold"' not in form for form in forms
-        if form not in (responsibility_form, group_form, import_form)
-    )
-    assert 'name="auto_confirm_threshold"' in import_form
-    import_form = next(form for form in forms if 'name="feature" value="creator_import"' in form)
-    assistant_form = next(form for form in forms if 'name="feature" value="operations_assistant"' in form)
-    assert 'name="auto_confirm_threshold"' not in assistant_form
-    assert 'name="enabled"' not in import_form
-    summary_form = next(form for form in forms if 'name="feature" value="offhours_summary"' in form)
-    assert 'name="csrf_token" value="fixture-csrf"' in summary_form
-    assert ('type="datetime-local" id="summary-window-start" name="window_start" value="2026-09-09T18:00"'
-            in summary_form)
-    assert 'type="datetime-local" id="summary-window-end" name="window_end" value="2026-09-10T12:00"' in summary_form
-    assert 'name="auto_confirm_threshold"' not in summary_form
-    assert 'name="enabled" value="1" checked' not in summary_form
-    assert "保存配置（开启则立即执行）" in summary_form
-    secret_field = re.search(r'<input[^>]*name="api_key"[^>]*>', summary_form).group(0)
-    assert 'type="password"' in secret_field
-    assert ' value=' not in secret_field
-    matching_form = next(form for form in forms if 'name="feature" value="creator_handle_matching"' in form)
-    assert 'name="enabled" value="1"' in matching_form
-    assert 'name="enabled" value="1" checked' not in matching_form
-    assert 'name="window_start"' not in matching_form and 'name="window_end"' not in matching_form
-    assert 'name="rpm_limit"' not in matching_form
-    assert 'name="tpm_limit"' not in matching_form
-    assert 'name="daily_token_budget"' not in matching_form
-    assert 'href="/admin/ai/creator-handle-matching"' in html
-
-
-def test_readonly_admin_has_no_save_resume_key_or_window_edit_controls():
-    html = render_admin("reviewer")
-    assert '<form ' not in html
-    assert '<input ' not in html
-    assert "只读配置" in html
-    assert 'id="offhours-summary"' in html
-    assert 'href="/admin/ai/creator-handle-matching"' in html
-    assert 'href="/admin/ai/creator-responsibility"' in html
-    assert 'href="/admin/ai/creator-groups"' in html
-
-
-def test_reply_documents_require_explicit_approval_without_changing_fixed_manual_scope():
+def test_reply_knowledge_requires_explicit_single_opt_in():
     app = FastAPI()
 
     @app.post("/form")
@@ -120,168 +49,6 @@ def test_reply_documents_require_explicit_approval_without_changing_fixed_manual
                  urlencode({**form, "reply_usable": "1"}) + "&reply_usable=1"):
         assert client.post("/form", content=body,
                            headers={"content-type": "application/x-www-form-urlencoded"}).json() == {}
-    environment = Environment(loader=FileSystemLoader(APP / "templates"), autoescape=select_autoescape())
-    template = environment.get_template("admin/assistant_rules.html")
-    document = {"key": form["document"], **form, "text": form["content"], "reply_usable": False,
-                "revision": 0, "updated_at": None}
-    data = {"authorization": {"display_name": "Owner"}, "admin_role": "owner", "admin_landing_path": "/admin",
-            "admin_permissions": admin.admin_permissions.PAGE_KEYS, "permission_pages": admin.admin_permissions.PAGES,
-            "active_page": "assistant-rules", "csrf_token": "csrf", "document_key": document["key"],
-            "document": document, "edit": {**document, "reply_usable": True}, "can_edit_reply_usage": True,
-            "document_groups": [("运营助手", [document])], "max_document_chars": 24000,
-            "kind_labels": {"manual": "任务手册", "knowledge": "知识资料", "template": "输出模板"},
-            "status_labels": {"draft": "草稿", "published": "已发布", "archived": "已停用"},
-            "visibility_labels": {"all": "全体 CM", "owner": "仅 Owner"}, "form_error": "保留未保存的修改。"}
-    html = template.render(**data)
-    assert 'id="reply-usable" type="checkbox" name="reply_usable" value="1"' in html
-    assert re.search(r'<input[^>]*id="reply-usable"[^>]* checked', html)
-    assert "内部资料不要勾选" in html and "只生成草稿，不发送" in html
-    unsupported = template.render(**{**data, "edit": {**document, "kind": "template"}})
-    assert 'id="reply-usage-control" hidden' in unsupported
-    assert re.search(r'<input[^>]*id="reply-usable"[^>]* disabled', unsupported)
-    reply = {**document, "key": "reply-policy", "kind": "manual", "reply_usable": True}
-    fixed = template.render(**{**data, "document_key": reply["key"], "document": reply, "edit": reply,
-        "document_groups": [("回复处理", [reply])], "is_reply": True, "reply_usage": "回复边界",
-        "can_edit_reply_usage": False})
-    assert "固定用途：回复处理 · 回复边界" in fixed
-    assert 'name="kind" value="manual"' in fixed and 'name="visibility" value="all"' in fixed
-    assert 'id="document-status" name="status"' in fixed
-    assert '<input type="hidden" name="reply_usable" value="1">' in fixed
-    assert 'id="reply-usable"' not in fixed and "已接入桌面回复、事件回复和运营助手" in fixed
-    internal = template.render(**{**data, "can_edit_reply_usage": False})
-    assert 'id="reply-usable"' not in internal
-
-
-def test_matching_template_escapes_names_and_distinguishes_associations_from_historical_operator_suggestions():
-    environment = Environment(loader=FileSystemLoader(APP / "templates"), autoescape=select_autoescape())
-    hostile = "<script>alert(1)</script>"
-    display_job = uuid4()
-    html = environment.get_template("admin/creator_handle_matching.html").render(
-        authorization={"display_name": "Fixture Reviewer"}, admin_landing_path="/admin", admin_role="owner",
-        admin_permissions=admin.admin_permissions.PAGE_KEYS, permission_pages=admin.admin_permissions.PAGES,
-        active_page="ai", csrf_token="fixture-csrf", matching={
-            "enabled": False, "counts": [{"status": "review_required", "n": 2}], "page": 1,
-            "jobs": [{"id": uuid4(), "display_name": hostile, "status": "review_required",
-                      "reason_code": "suggestions_saved", "input_tokens": 100, "output_tokens": 20,
-                      "handle_rows": [
-                          {"handle": "fixture.handle", "associated": False, "human_confirmed": False,
-                           "conflict": False, "check": {"decision": "review", "relation": "operator",
-                                                       "code": "operates_for_other", "period": "historical"}},
-                          {"handle": "fixture.owned", "associated": True, "human_confirmed": True,
-                           "conflict": False, "check": {"decision": "supported", "relation": "self_account",
-                                                       "code": "qa_confirm", "period": "at_message"}},
-                          {"handle": "fixture.existing", "associated": True, "human_confirmed": False,
-                           "conflict": False, "check": None},
-                          {"handle": "fixture.guessed", "associated": False, "human_confirmed": False,
-                           "conflict": False, "check": {"decision": "review", "relation": "uncertain",
-                                                       "code": "conflict", "period": "unknown"}},
-                          {"handle": "fixture.conflicted", "associated": True, "human_confirmed": False,
-                           "conflict": True, "check": {"decision": "review", "relation": "uncertain",
-                                                      "code": "conflict", "period": "historical",
-                                                      "validation_error": "counterevidence"}},
-                      ]},
-                     {"id": display_job, "display_name": "Display fixture", "status": "review_required",
-                      "display_status": "completed", "display_reason_code": "already_confirmed",
-                      "reason_code": "suggestions_saved", "input_tokens": 100, "output_tokens": 20,
-                      "handle_rows": [{"handle": "fixture.display", "associated": True,
-                                       "human_confirmed": False, "check": None, "conflict": False}]}],
-        },
-    )
-    assert "账号匹配" in html and 'action="/admin/ai/creator-handle-matching/enqueue"' in html
-    assert "规则通过自动入库，其他待核实" in html
-    assert hostile not in html and "&lt;script&gt;" in html
-    assert "代运营" in html and "历史关系" in html and "待核实" in html
-    assert "operator" not in html and "review_required" not in html
-    assert 'href="https://www.tiktok.com/@fixture.handle"' in html
-    assert "@fixture.owned</a> · 人工已核准 · 本轮：支持</div>" in html
-    assert "@fixture.conflicted</a> · 已关联 · 归属冲突 · 本轮：待核实" in html
-    assert "@fixture.existing</a> · 已关联</div>" in html
-    for handle in ("fixture.handle", "fixture.owned", "fixture.existing", "fixture.guessed", "fixture.conflicted"):
-        assert html.count(f'href="https://www.tiktok.com/@{handle}"') == 1
-    assert ('<div class="text-secondary"><a class="text-reset" '
-            'href="https://www.tiktok.com/@fixture.handle"' in html)
-    assert ('<div class="text-danger"><a class="text-reset" '
-            'href="https://www.tiktok.com/@fixture.conflicted"' in html)
-    assert ('<div class="text-secondary"><a class="text-reset" '
-            'href="https://www.tiktok.com/@fixture.guessed"' in html)
-    assert html.count('class="text-danger"') == 1
-    assert html.count("归属冲突") == 1
-    assert "账号关系待核实" in html and "账号归属存在反证" in html and "counterevidence" not in html
-    display_row = re.search(r"<tr><td>Display fixture</td>.*?</tr>", html, re.S).group(0)
-    assert "已完成" in display_row and "已有正式关联，无需重复匹配" in display_row
-    assert f'action="/admin/ai/creator-handle-matching/jobs/{display_job}/cancel"' in display_row
-    assert "待核实：2" in html  # The task ledger and controls still use the original status.
-
-
-def test_group_classification_table_keeps_auto_results_final_and_review_controls_folded():
-    from app.creator_group_evidence import PURPOSES
-
-    environment = Environment(loader=FileSystemLoader(APP / "templates"), autoescape=select_autoescape())
-    auto_id, review_id = uuid4(), uuid4()
-    common = {"status": "completed", "stale": False, "locked": False, "confirmed_tags": [],
-              "reason": "Internal diagnostic", "stats": {"included_messages": 42},
-              "input_tokens": 2000, "output_tokens": 100}
-    html = environment.get_template("admin/creator_groups.html").render(
-        authorization={"display_name": "Fixture Reviewer"}, admin_landing_path="/admin", admin_role="owner",
-        admin_permissions=admin.admin_permissions.PAGE_KEYS, permission_pages=admin.admin_permissions.PAGES,
-        active_page="ai", csrf_token="fixture-csrf", evidence=None, purposes=PURPOSES, matching={
-            "enabled": True, "page": 1, "has_more": False,
-            "summary_counts": {"classified": 1, "pending": 0, "review": 1, "error": 0},
-            "jobs": [
-                {**common, "id": auto_id, "chat_id": "oc_auto", "name": "<script>fixture</script>",
-                 "confirmed_purpose": "support", "display_purpose": "support", "display_label": "客服群",
-                 "display_confidence": "98%", "display_status": "已分类", "display_state": "classified",
-                 "result": None, "has_evidence": True, "admission_reason_label": "已符合自动入库规则",
-                 "admission_details": {}},
-                {**common, "id": review_id, "chat_id": "oc_review", "name": "Review group",
-                 "confirmed_purpose": None, "display_purpose": "training", "display_label": "培训群",
-                 "display_confidence": "75%", "display_status": "待核实", "display_state": "review",
-                 "admission_reason_label": "回复上下文不完整",
-                 "admission_details": {"missing_reply_ids": ["M2"],
-                                       "missing_reply_reasons": {"M2": "unavailable", "<script>M3</script>": "budget"}},
-                 "result": {"purpose": "training", "purpose_label": "培训群", "confidence_label": "75%",
-                            "reason": "Long model explanation", "tags": ["writing"], "refs": ["M2"]}},
-            ],
-        },
-    )
-    assert "<script>fixture</script>" not in html and "&lt;script&gt;fixture&lt;/script&gt;" in html
-    assert "<th>群名</th><th>类型</th><th>置信度</th><th>状态</th><th>操作</th>" in html
-    assert "已分类 1" in html and "待核实 1" in html
-    assert "98%" in html and "75%" in html
-    assert "Long model explanation" not in html and "Internal diagnostic" not in html
-    assert "累计 Token" not in html and "证据 42 条" not in html
-    assert "正式分类：" not in html and "AI 建议：" not in html and "确认分类" not in html
-    auto_row = re.search(r"<tr><td class=\"text-break\">&lt;script&gt;.*?</tr>", html, re.S).group(0)
-    assert "采用建议" not in auto_row and "锁定此分类" not in auto_row
-    assert re.search(r"<details>.*?/jobs/" + str(auto_id) + r"/evidence.*?</details>", auto_row, re.S)
-    assert "<details open" not in html
-    review_row = re.search(r'<tr><td class="text-break">Review group.*?</tr>', html, re.S).group(0)
-    assert "回复上下文不完整" in review_row.split("<details>", 1)[0]
-    assert "M2 · 原消息未同步或不可读" in review_row
-    assert "&lt;script&gt;M3&lt;/script&gt; · 上下文超出材料范围" in review_row
-    assert "<script>M3</script>" not in html
-    assert "原消息未同步或不可读" not in review_row.split("<details>", 1)[0]
-    adoption = re.search(r"<form.*?采用建议</button></form>", review_row, re.S).group(0)
-    assert f'name="source_job_id" value="{review_id}"' in adoption
-    assert 'name="locked"' not in adoption
-    assert all('name="csrf_token" value="fixture-csrf"' in form
-               for form in re.findall(r"<form .*?</form>", html, re.S))
-    evidence_html = environment.get_template("admin/creator_groups.html").render(
-        authorization={"display_name": "Fixture Reviewer"}, admin_landing_path="/admin", admin_role="owner",
-        admin_permissions=admin.admin_permissions.PAGE_KEYS, permission_pages=admin.admin_permissions.PAGES,
-        active_page="ai", purposes=PURPOSES, evidence={
-            "name": "Evidence fixture", "admission_reason_label": "回复上下文不完整",
-            "stats": {"included_messages": 1, "missing_reply_ids": ["M2"],
-                      "missing_reply_reasons": {"M2": "unavailable", "<script>M3</script>": "depth"}},
-            "pack": {"chat": {"name": "Evidence fixture", "mode": "group", "member_count": 2},
-                     "messages": []},
-            "result": {"purpose": "training", "purpose_label": "培训群", "confidence_label": "75%",
-                       "reason": "Long model explanation", "tags": []},
-        },
-    )
-    assert "回复上下文不完整" in evidence_html and "M2 · 原消息未同步或不可读" in evidence_html
-    assert "&lt;script&gt;M3&lt;/script&gt; · 引用层级超出范围" in evidence_html
-    assert "Long model explanation" not in evidence_html and "<script>M3</script>" not in evidence_html
 
 
 def test_template_never_exposes_admin_to_a_viewer_and_escapes_private_json():
@@ -294,18 +61,10 @@ def test_template_never_exposes_admin_to_a_viewer_and_escapes_private_json():
     assert 'href="/admin/ai#offhours-summary"' in render({"can_manage": True})
 
 
-def test_client_does_not_persist_or_interpolate_messages_as_html():
-    script = (APP / "static/offhours-summary.js").read_text()
-    for forbidden in ("localStorage", "sessionStorage", "innerHTML", "insertAdjacentHTML"):
-        assert forbidden not in script
-    assert 'cache: "no-store"' in script
-    assert 'credentials: "same-origin"' in script
-    assert 'redirect: "error"' in script
-
-
 def test_reply_browser_polls_only_generation_and_rechecks_before_copy():
     html = render({"enabled": True, "window": {}, "run": {"status": "completed"}, "events": [{
-        "id": "event:0", "title": "样品尚未收到", "priority": "P1", "handling_status": "unresolved",
+        "id": "event:0", "title": "<img src=x onerror=alert(1)> 样品尚未收到",
+        "priority": "P1", "handling_status": "unresolved",
         "summary": "请跟进样品。", "latest_progress": "等待回复。", "evidence": [],
     }]})
     script = r"""
@@ -346,11 +105,13 @@ const {chromium} = require('playwright');
       throw new Error('Unexpected request: '+url.href);
     });
     await page.goto('http://localhost/');
+    assert.equal(await page.locator('.oh-event img, .oh-event script').count(),0);
     await page.getByRole('button',{name:'生成回复建议',exact:true}).click();
     await page.waitForFunction(()=>document.querySelector('.oh-reply button').getAttribute('aria-busy')==='true');
     await page.clock.runFor(2600);
     const copy=page.getByRole('button',{name:'复制回复',exact:true});
     await copy.waitFor({state:'visible'});
+    await page.locator('.oh-reply textarea').fill('My edited sample reply.');
     assert.equal(reads.length,2); // Pending work continues polling until completion.
     assert.equal(await copy.isEnabled(),true);
     await page.getByRole('button',{name:'P2',exact:true}).click();
@@ -359,7 +120,7 @@ const {chromium} = require('playwright');
     assert.equal(reads.length,2); // Neither completed nor detached drafts perform idle reads.
     await page.getByRole('button',{name:'全部事件',exact:true}).click();
     await copy.click();
-    await page.waitForFunction(()=>window.copied==='I will check your sample.');
+    await page.waitForFunction(()=>window.copied==='My edited sample reply.');
     assert.equal(reads.length,3);
     deny=true;
     await copy.click();

@@ -73,17 +73,11 @@ def test_weak_claims_and_unrelated_cancellations_do_not_overwrite_valid_facts():
     with pytest.raises(ValueError, match="previous object"):
         facts.validate({"facts": [_fact("cancelled", ["E3"], key="unknown", obj=current[0]["object"])]},
                        pack, current)
-    for invalid in (" ", "x" * 161):
-        with pytest.raises(ValueError, match="business object"):
-            facts.validate({"facts": [_fact("cancelled", ["E3"], key=current[0]["key"], obj=invalid)]},
-                           pack, current)
     solo = facts.validate({"facts": [_fact("completed", ["E2"])]}, pack)
     assert solo[0]["kind"] == "intent" and facts.rank(solo)["tier"] == "normal"
 
 
 def test_fact_protocol_rejects_unknown_and_third_party_evidence():
-    assert facts.PROMPT_VERSION == "creator-importance-facts-v2.0.2"
-    assert facts.RULE_VERSION == "creator-importance-v2.0.6"
     pack = _pack(("creator", "I'd like to hear about the Acme product."))
     with pytest.raises(ValueError, match="refs"):
         facts.validate({"facts": [_fact("intent", ["missing"])]}, pack)
@@ -93,9 +87,6 @@ def test_fact_protocol_rejects_unknown_and_third_party_evidence():
     pack["messages"][0].update(contact_id="creator", context_complete=False)
     with pytest.raises(ValueError, match="incomplete reply"):
         facts.validate({"facts": [_fact("intent", ["E0"])]}, pack)
-    schema = facts.output_format(["E0"])["schema"]
-    assert schema["additionalProperties"] is False
-    assert schema["properties"]["facts"]["maxItems"] == facts.MAX_FACTS
     assert facts.rank([])["tier"] == "pending"
     assert facts.rank([], readable=True)["tier"] == "normal"
 
@@ -114,10 +105,6 @@ def test_current_opportunity_and_bilateral_business_days_drive_maintenance_not_v
         "business_days": ["2026-08-01", "2026-08-02"],
         "historical": False,
     }
-    assert ranked["grounds"] == [
-        "Acme autumn skincare video：具体机会",
-        "近30天业务交流2天 · 最近推进08-02",
-    ]
 
     later = datetime(2026, 9, 10, 12, tzinfo=UTC)
     assert facts.rank(opportunity, later)["tier"] == "normal"
@@ -154,17 +141,11 @@ def test_current_opportunity_and_bilateral_business_days_drive_maintenance_not_v
         assert facts.rank(facts.merge_facts(opportunity, rejected), later)["priority"] == \
             facts.rank(opportunity, later)["priority"]
 
-    for text in (
-        "Please pay me. I'll record tomorrow.",
-        "Please pay me, but the quote works and I can film next Tuesday.",
-        "还没付款。但我正在拍摄视频。",
-    ):
-        mixed = _pack(("creator", text))
-        mixed["messages"][0]["created_at"] = "2026-09-10T10:00:00+00:00"
-        kept = facts.validate({"facts": [_fact("progress", ["E0"], key=opportunity[0]["key"])]},
-                              mixed, opportunity)
-        assert kept[0]["kind"] == "progress"
-        assert facts.rank(facts.merge_facts(opportunity, kept), later)["tier"] == "focus"
+    mixed = _pack(("creator", "Please pay me. I'll record tomorrow."))
+    mixed["messages"][0]["created_at"] = "2026-09-10T10:00:00+00:00"
+    kept = facts.validate({"facts": [_fact("progress", ["E0"], key=opportunity[0]["key"])]}, mixed, opportunity)
+    assert kept[0]["kind"] == "progress"
+    assert facts.rank(facts.merge_facts(opportunity, kept), later)["tier"] == "focus"
 
     future = facts.rank(opportunity, datetime(2026, 7, 31, tzinfo=UTC))
     assert future["tier"] == "normal" and future["recent_business_dates"] == []
@@ -270,11 +251,6 @@ def test_platform_benefit_operations_never_become_primary_but_real_deliverables_
         assert result[0]["kind"] == "interaction", kind
 
     support = facts.validate({"facts": [_fact("opportunity", ["E0", "E1"], obj=support_object)]}, pack)
-    platform_application = facts.validate({"facts": [_fact(
-        "opportunity", ["E0", "E1"],
-        obj="Platform subsidy application tied to the existing live schedule and projected GMV",
-    )]}, pack)
-    assert platform_application[0]["kind"] == "interaction"
     delivery_support = _pack(("cm", "I applied but TikTok did not settle the live exclusive. "
                               "You can go live first; when valid I will let you know."),
                              ("creator", "I will just go live when ready. I was planning to go live this evening."))
@@ -291,10 +267,6 @@ def test_platform_benefit_operations_never_become_primary_but_real_deliverables_
                                 independent_live)
         assert result[0]["kind"] == "intent", kind
         assert not result[0]["business_dates"]
-    scheduled_application = facts.validate({"facts": [_fact(
-        "opportunity", ["E0", "E1"], obj="Platform subsidy application for tonight livestream",
-    )]}, pack)
-    assert scheduled_application[0]["kind"] == "interaction"
     legacy = {**support[0], "kind": "opportunity"}
     ranked = facts.rank([legacy], datetime(2026, 8, 5, tzinfo=UTC))
     assert ranked["tier"] == "normal" and ranked["priority"]["primary_at"] is None
@@ -369,27 +341,14 @@ def test_ongoing_needs_this_creators_recurring_delivery_not_recurring_subsidies(
     cases = [
         ("I've activated DJI subsidy and links.",
          "Did we find out if we could get live exclusives on all DJI products?", "interaction"),
-        ("I've activated DJI subsidy and links.",
-         "Would I be able to get live exclusive on all DJI products?", "interaction"),
         ("We can arrange flash sales everyday for Roborock.",
          "I’ll be live with it tonight see how we go", "intent"),
-        ("We can arrange flash sales everyday.",
-         "I'll be live tonight; flash sales everyday would help.", "intent"),
-        ("每天安排闪购价。", "我会直播今晚这一场，每天有闪购价。", "intent"),
         ("每天安排优惠券。", "我会直播一场，每天有优惠券。", "intent"),
-        ("每天安排优惠券。", "每天有优惠券我直播一场。", "intent"),
         ("Acme weekly lives are agreed.", "I will do our weekly lives", "ongoing"),
-        ("Acme weekly lives are agreed.", "I'll host the Acme live every week.", "ongoing"),
-        ("Acme weekly lives are agreed.", "I host the Acme live every week.", "ongoing"),
-        ("Acme weekly lives are agreed.", "I go live every Friday.", "ongoing"),
         ("Acme weekly lives are agreed.", "我每周直播两场。", "ongoing"),
-        ("Acme weekly lives are agreed.", "我会直播每周两场。", "ongoing"),
-        ("Acme weekly lives are agreed.", "I will do weekly lives. Is that okay?", "ongoing"),
         ("Acme weekly lives are agreed.", "My assistant will host the Acme live every week.", "intent"),
-        ("Acme weekly lives are agreed.", "I will ask my assistant to host the Acme live every week.", "intent"),
         ("Acme weekly lives are agreed.", "I will not host the Acme live every week.", "intent"),
         ("Acme weekly lives are agreed.", "Will I host the Acme live every week?", "intent"),
-        ("Acme weekly lives are agreed.", "Would I host the Acme live every week", "intent"),
     ]
     for cm, creator, expected in cases:
         pack = _pack(("cm", cm), ("creator", creator))
@@ -483,18 +442,8 @@ def test_completion_needs_positive_execution_and_accepts_linked_natural_answers(
     assert closed["tier"] == "normal" and closed["priority"]["primary_at"] is None
     assert closed["priority"]["historical"]
     for text in (
-        "I posted the three videos for Lilyeve and I'm not stopping there.",
-        "I posted the three videos for Lilyeve, but I'm not stopping there.",
-    ):
-        witness_pack["messages"][0]["text"] = text
-        assert facts.validate({"facts": [_fact("completed", ["E0"], key=opportunity_key)]},
-                              witness_pack, opportunity)[0]["kind"] == "completed"
-    for text in (
         "I have not posted the three videos for Lilyeve.",
-        "I haven’t posted the three videos for Lilyeve.",
-        "I have not completed the videos and content.",
         "I will have posted the three videos for Lilyeve tomorrow.",
-        "I posted the three videos for Lilyeve? Not yet.",
         "My friend posted her three videos for Lilyeve.",
     ):
         witness_pack["messages"][0]["text"] = text

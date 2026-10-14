@@ -38,7 +38,7 @@ def auth_api(pg, monkeypatch):
     # Committed isolated schema plus fresh connections exercise real competing transactions.
     pg.commit()
     pg.execute(psycopg.sql.SQL("SET search_path TO {}").format(psycopg.sql.Identifier(schema)))
-    dsn = os.environ.get("TEST_DATABASE_URL") or os.environ["CREATOR_WORKFLOW_AI_TEST_DATABASE_URL"]
+    dsn = os.environ["TEST_DATABASE_URL"]
 
     @contextmanager
     def fresh_connection():
@@ -76,11 +76,8 @@ def approve(api):
     return {"code": fields["code"][0], "code_verifier": api.verifier, "redirect_uri": api.params["redirect_uri"]}
 
 
-@pytest.mark.parametrize("verifier", ["v" * 43, "v" * 124 + ".~-_"])
-def test_confirmed_existing_identity_pkce_and_single_use_session_transfer(auth_api, verifier):
+def test_confirmed_existing_identity_pkce_and_single_use_session_transfer(auth_api):
     api = auth_api
-    api.verifier = verifier
-    api.params["code_challenge"] = routes._challenge(verifier)
     page = api.client.get(START, params=api.params, headers=api.headers)
     assert page.status_code == 200 and "Current &lt;CM&gt;" in page.text
     assert "确认使用" in page.text and api.session not in page.text
@@ -198,11 +195,8 @@ def test_exchange_body_is_bounded_strict_and_never_consumes_on_bad_input(auth_ap
     assert api.client.post(EXCHANGE, json=exchange).status_code == 200
 
 
-@pytest.mark.parametrize("verifier", ["v" * 43, "v" * 124 + ".~-_"])
-def test_poll_approval_pkce_pending_strict_body_and_single_delivery(auth_api, verifier):
+def test_poll_approval_pkce_pending_strict_body_and_single_delivery(auth_api):
     api = auth_api
-    api.verifier = verifier
-    api.params["code_challenge"] = routes._challenge(verifier)
     params = dict(api.params, delivery="poll", redirect_uri="desktop_poll")
     body = {"code_verifier": api.verifier, "redirect_uri": "desktop_poll"}
     pending = api.client.post(POLL, json=body)

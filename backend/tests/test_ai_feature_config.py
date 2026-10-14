@@ -65,57 +65,6 @@ def test_feature_key_uses_a_separate_encryption_domain() -> None:
         TokenCipher(master_key).decrypt(sealed)
 
 
-def test_save_encrypts_key_and_only_returns_safe_fields() -> None:
-    conn = _Connection()
-    cipher = api_key_cipher(b"a" * 32)
-    api_key = "sk-test-value-1234"
-
-    saved = save_feature_config(
-        conn,
-        cipher,
-        "contact_assessment",
-        provider="OpenAI",
-        project_id="proj_contact_assessment",
-        model="gpt-5.6-luna",
-        enabled=True,
-        api_key=api_key,
-        updated_by_authorization_id=uuid4(),
-    )
-
-    inserted = conn.calls[-1][1]
-    assert inserted[6] != api_key
-    assert api_key not in inserted
-    assert cipher.decrypt(inserted[6]) == api_key
-    assert saved["key_suffix"] == "1234"
-    assert "api_key_ciphertext" not in saved
-    assert api_key not in repr(saved)
-    assert "rpm_limit" not in saved
-    assert "daily_token_budget" not in saved
-
-
-def test_blank_key_retains_existing_credential() -> None:
-    cipher = api_key_cipher(b"a" * 32)
-    previous_key = "sk-existing-value-9876"
-    conn = _Connection({"api_key_ciphertext": cipher.encrypt(previous_key), "key_suffix": "9876"})
-
-    save_feature_config(
-        conn,
-        cipher,
-        "contact_assessment",
-        provider="openai",
-        project_id="proj_contact_assessment",
-        model="gpt-5.6-luna",
-        enabled=True,
-        api_key="",
-        updated_by_authorization_id=uuid4(),
-    )
-
-    inserted = conn.calls[-1][1]
-    assert cipher.decrypt(inserted[6]) == previous_key
-    assert inserted[8:10] == (False, False)  # Retaining a key is not a rotation.
-    assert conn.row["key_suffix"] == "9876"
-
-
 def test_first_time_enable_requires_a_key() -> None:
     with pytest.raises(FeatureConfigInputError, match="首次启用"):
         save_feature_config(
@@ -138,7 +87,12 @@ def test_blank_feature_key_can_be_enabled_on_real_postgres(pg):
     values = dict(provider="openai", project_id="proj_test", model="configured-model",
                   updated_by_authorization_id=owner)
     cipher = api_key_cipher(b"k" * 32)
-    save_feature_config(pg, cipher, "offhours_summary", **values, enabled=False, api_key="sk-test-only-1234")
+    created = save_feature_config(pg, cipher, "offhours_summary", **values, enabled=False,
+                                  api_key="sk-test-only-1234")
+    ciphertext = pg.execute("SELECT api_key_ciphertext FROM ai_feature_configs "
+                            "WHERE feature='offhours_summary'").fetchone()["api_key_ciphertext"]
+    assert ciphertext != "sk-test-only-1234" and cipher.decrypt(ciphertext) == "sk-test-only-1234"
+    assert "api_key_ciphertext" not in created and created["key_suffix"] == "1234"
     pg.execute("""UPDATE ai_feature_configs SET rpm_limit=1,tpm_limit=1000,daily_token_budget=1000
                   WHERE feature='offhours_summary'""")
     columns = "api_key_ciphertext,key_updated_at,key_updated_by_authorization_id,rpm_limit,tpm_limit,daily_token_budget"

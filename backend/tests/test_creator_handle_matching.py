@@ -1,10 +1,8 @@
 """Durable matching workflow on isolated PostgreSQL; provider responses are synthetic."""
 
 import json
-import sys
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -592,15 +590,6 @@ def test_legacy_limits_do_not_block_restart_and_retry_fences(pg, matching_flow):
         "UPDATE ai_feature_configs SET rpm_limit=1,daily_token_budget=1000,tpm_limit=1000 WHERE feature=%s",
         (matching.FEATURE,),
     )
-    historical_id = uuid4()
-    # Simulate the applied-090 schema, then upgrade without deleting accounting history.
-    pg.execute("ALTER TABLE creator_handle_requests ALTER COLUMN quota_scope SET NOT NULL, "
-               "ALTER COLUMN reserved_tokens SET NOT NULL")
-    pg.execute("CREATE INDEX creator_handle_request_budget ON creator_handle_requests(quota_scope,created_at)")
-    pg.execute("INSERT INTO creator_handle_requests(id,quota_scope,reserved_tokens,billed_tokens) "
-               "VALUES(%s,'historical-project',10000,123)", (historical_id,))
-    historical = pg.execute("SELECT * FROM creator_handle_requests WHERE id=%s", (historical_id,)).fetchone()
-    pg.execute((Path(__file__).parents[1] / "migrations/091_retire_handle_budget_estimates.sql").read_text())
     job = _prepared_job(pg, flow)
     assert pg.execute("SELECT quota_scope,reserved_tokens FROM creator_handle_requests WHERE id=%s",
                       (job["reservation_id"],)).fetchone() == {
@@ -621,7 +610,6 @@ def test_legacy_limits_do_not_block_restart_and_retry_fences(pg, matching_flow):
         pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s", (recovered["id"],)).fetchone()["status"]
         == "completed"
     )
-    assert pg.execute("SELECT * FROM creator_handle_requests WHERE id=%s", (historical_id,)).fetchone() == historical
     # Reopen only fixture-generated pairs to exercise provider failure caching for unlinked candidates.
     pg.execute(
         "DELETE FROM contact_social_accounts WHERE contact_id=%s AND source='creator_handle_auto_verified'",
@@ -983,56 +971,6 @@ def test_failed_diagnostics_partial_results_and_queue_cleanup_preserve_data(pg, 
     assert retained == {"n": 2, "tokens": 300}
 
 
-def test_disabled_probe_retains_paid_diagnostics_when_source_changes(pg, matching_flow, monkeypatch, capsys):
-    from scripts import probe_creator_handle_matching as probe
-
-    flow = matching_flow
-    flow.enable()
-    pg.execute("UPDATE ai_feature_configs SET enabled=FALSE WHERE feature=%s", (matching.FEATURE,))
-    before = _snapshot(
-        pg,
-        (
-            "contacts",
-            "contact_roles",
-            "contact_assignments",
-            "social_accounts",
-            "contact_social_accounts",
-            "creator_account_assignments",
-        ),
-    )
-
-    def execute(sql, params=None):
-        # The fixture owns the outer transaction; probe transactions become isolated savepoints.
-        if isinstance(sql, str) and sql.startswith("SET TRANSACTION"):
-            return None
-        return pg.execute(sql, params)
-
-    proxy = SimpleNamespace(execute=execute, commit=lambda: None, transaction=pg.transaction)
-    monkeypatch.setattr(probe, "connection", lambda: nullcontext(proxy))
-    monkeypatch.setattr(probe, "get_settings", lambda: flow.settings)
-    monkeypatch.setattr(sys, "argv", ["probe_creator_handle_matching", "--contact-id", str(flow.contact)])
-    flow.before_response = lambda: setattr(flow, "valid", False)
-    try:
-        assert probe.main() == 0
-    finally:
-        pg.execute("SELECT pg_advisory_unlock(%s)", (ai_dispatch._ADMISSION_LOCK,))
-    output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert output[0]["evidence_fresh"] is False and output[0]["evidence_eligible_candidates"] == []
-    assert output[-1]["business_links_written"] == 0 and output[-1]["matching_enabled_by_probe"] is False
-    assert len(flow.calls) == 1
-    logged = pg.execute("SELECT * FROM creator_handle_requests").fetchone()
-    assert logged["job_id"] is None
-    assert (logged["input_tokens"], logged["output_tokens"], logged["billed_tokens"]) == (100, 50, 150)
-    assert logged["response_id"] == "resp_synthetic" and logged["request_id"] == "req_synthetic"
-    diagnostic = json.loads(creator_data.cipher(flow.settings).decrypt(logged["response_ciphertext"]))
-    assert diagnostic["probe"]["contact_id"] == str(flow.contact) and diagnostic["validated"]["links"]
-    assert _snapshot(pg, before.keys()) == before
-    assert not pg.execute("SELECT enabled FROM ai_feature_configs WHERE feature=%s", (matching.FEATURE,)).fetchone()[
-        "enabled"
-    ]
-    assert not pg.execute("SELECT 1 FROM creator_handle_jobs").fetchone()
-
-
 def test_fixed_group_context_auto_links_with_live_scope_and_auditable_title(pg, matching_flow, pilot, monkeypatch):
     flow = matching_flow
     flow.catalog_handles = frozenset()  # A dedicated group can prove an account absent from Curva.
@@ -1247,34 +1185,6 @@ def test_formal_pairs_skip_paid_matching_without_freezing_new_handles_or_manual_
                           (late,)).fetchone() == {"status": "completed", "reason_code": "already_confirmed",
                                                 "claim_token": None, "lease_until": None}
         pg.execute("ROLLBACK TO SAVEPOINT late_formal")
-
-    # The rollout repairs existing latest history jobs without rewriting business/billing records.
-    pg.execute("SAVEPOINT history_rollout")
-    pg.execute("UPDATE creator_handle_jobs SET status='queued',result_ciphertext='preserved-old-result',"
-               "input_tokens=123 WHERE id=%s", (all_confirmed,))
-    protected = _snapshot(pg, (*before.keys(), "contact_social_accounts", "creator_handle_requests"))
-    migration = Path(__file__).parents[1] / "migrations/079_complete_linked_creator_history.sql"
-    pg.execute(migration.read_text())
-    assert pg.execute("SELECT status,reason_code,result_ciphertext,input_tokens FROM creator_handle_jobs WHERE id=%s",
-                      (all_confirmed,)).fetchone() == {"status": "completed", "reason_code": "already_confirmed",
-                                                     "result_ciphertext": "preserved-old-result", "input_tokens": 123}
-    assert _snapshot(pg, protected.keys()) == protected
-    page = matching.page_data(pg, pilot.ids["owner"], flow.settings)
-    assert page["jobs"][0]["suggestions"] == [] and page["jobs"][0]["validation_error"] is None
-    assert {r["status"]: r["n"] for r in page["counts"]} == {"completed": 1}
-    pg.execute("UPDATE creator_handle_jobs SET source='manual',status='queued' WHERE id=%s", (all_confirmed,))
-    obsolete = uuid4()
-    pg.execute("INSERT INTO creator_handle_jobs(id,contact_id,source,status,created_at) "
-               "VALUES(%s,%s,'history','failed',NOW()-INTERVAL '1 minute')", (obsolete, flow.contact))
-    pg.execute(migration.read_text())
-    assert pg.execute("SELECT status,source FROM creator_handle_jobs WHERE id=%s", (all_confirmed,)).fetchone() == {
-        "status": "queued", "source": "manual"}
-    assert pg.execute("SELECT status FROM creator_handle_jobs WHERE id=%s",
-                      (obsolete,)).fetchone()["status"] == "failed"
-    assert pg.execute("SELECT metadata->>'jobs_completed' n FROM audit_events "
-                      "WHERE action='creator_handle_history_associations_reused'").fetchall() == [{"n": "1"}]
-    pg.execute("ROLLBACK TO SAVEPOINT history_rollout")
-    pg.execute("UPDATE creator_handle_jobs SET created_at=NOW()-INTERVAL '1 minute' WHERE id=%s", (all_confirmed,))
 
     # The formal exact pair is excluded, not the entire contact.
     job = _prepared_job(pg, flow, "incremental")

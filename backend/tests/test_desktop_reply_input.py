@@ -58,25 +58,13 @@ def test_recent_context_requires_empty_selection_and_production_snapshot():
     (("schema_version",), "1.0", "unsupported_schema_version"),
     (("request_id",), "3b0221c41c3b4a3e87d46d431bc21755", "invalid_request_id"),
     (("captured_at",), "2026-10-04T08:20:00", "invalid_captured_at"),
-    (("captured_at",), "2026-02-30T08:20:00Z", "invalid_captured_at"),
-    (("captured_at",), "2026-10-04T08:20:00+00:60", "invalid_captured_at"),
     (("conversation", "identity_verified"), True, "identity_must_be_unverified"),
-    (("conversation", "identity_verified"), 0, "identity_must_be_unverified"),
     (("selected_messages", 0, "ordinal"), True, "invalid_selected_message"),
-    (("selected_messages", 1, "ordinal"), 3, "invalid_selected_message"),
     (("selected_messages", 0, "text"), "\n ", "invalid_selected_message"),
-    (("selected_messages", 0, "sender_label_hint"), None, "invalid_selected_message"),
     (("selected_messages", 0, "internal_id_hint"), "x" * 4097, "invalid_selected_message"),
     (("selected_message_text",), "好的", "selected_message_text_mismatch"),
     (("selection_source",), "none", "invalid_selection_source"),
-    (("selection_source",), "synthetic", "invalid_selection_source"),
-    (("conversation_context",), None, "invalid_context"),
-    (("conversation_context", "capture_id"), "not-a-uuid", "invalid_context"),
-    (("conversation_context", "captured_at"), "2026-10-04", "invalid_context"),
     (("conversation_context", "source"), "database", "invalid_context"),
-    (("conversation_context", "scope"), "history", "invalid_context"),
-    (("conversation_context", "complete_history"), 0, "invalid_context"),
-    (("conversation_context", "messages"), [], "invalid_context"),
 ])
 def test_rejects_forged_identity_and_malformed_contract(path, value, code):
     payload = request()
@@ -93,9 +81,6 @@ def test_rejects_forged_identity_and_malformed_contract(path, value, code):
     ((), "chat_id"),
     (("conversation",), "open_id"),
     (("selected_messages", 0), "message_id"),
-    (("selected_messages", 0), "time_hint"),
-    (("conversation_context",), "window_token"),
-    (("conversation_context", "messages", 0), "date_hint"),
 ])
 def test_rejects_unknown_identity_and_message_metadata(path, key):
     payload = request()

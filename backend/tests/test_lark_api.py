@@ -1,5 +1,5 @@
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from uuid import UUID
 
 import httpx
@@ -73,27 +73,13 @@ def test_token_response_distinguishes_missing_scope_from_an_explicit_empty_grant
         assert client.refresh_token("fixture-refresh").scope == expected
 
 
-@pytest.mark.parametrize(
-    "fields,expected",
-    [
-        ({"name": "Quanzhen Liang", "en_name": "Remi"}, "Remi（Quanzhen Liang）"),
-        ({"name": "Shang Ma", "en_name": "Shang Ma", "avatar_url": "https://s16-imfile-sg.feishucdn.com/a"},
-         "Shang Ma"),
-        ({"name": " Shuxuan Li ", "en_name": "shuxuan li"}, "shuxuan li"),
-        ({"en_name": "Remi"}, "Remi"),
-        ({"name": "Quanzhen Liang"}, "Quanzhen Liang"),
-    ],
-)
-def test_user_profile_preserves_both_names(monkeypatch, fields, expected) -> None:
+def test_user_profile_preserves_both_names(monkeypatch) -> None:
     client = LarkClient(settings())
+    fields = {"name": "Quanzhen Liang", "en_name": "Remi", "avatar_url": "https://test.feishucdn.com/avatar"}
     monkeypatch.setattr(client, "_request", lambda *args, **kwargs: {"open_id": "ou_person", **fields})
     profile = client.user_info("user-token")
-    assert profile.display_name == expected
-    assert profile.en_name_present == ("en_name" in fields)
-    assert profile.name == ((fields.get("name") or "").strip() or None)
-    assert profile.en_name == fields.get("en_name")
-    assert profile.avatar_present == ("avatar_url" in fields)
-    assert profile.avatar_url == fields.get("avatar_url")
+    assert (profile.name, profile.en_name, profile.display_name) == ("Quanzhen Liang", "Remi", "Remi（Quanzhen Liang）")
+    assert profile.en_name_present and profile.avatar_present and profile.avatar_url == fields["avatar_url"]
 
 
 def test_contact_profile_keeps_avatar_bound_to_requested_id_and_distinguishes_missing_fields(monkeypatch):
@@ -312,49 +298,38 @@ def test_trust_party_mapping_uses_a_short_lived_tenant_token(monkeypatch) -> Non
     assert calls[1][2]["params"] == {"page_size": 100, "page_token": "next-page"}
 
 
-def test_missing_app_scope_is_treated_as_an_authorization_problem() -> None:
-    assert LarkApiError(400, 99991672, "scope missing").likely_auth_problem
 
 
-def test_rate_limit_pauses_shared_admission_gate() -> None:
-    events = []
+def test_rate_limit_pauses_shared_admission_gate(pg, monkeypatch) -> None:
+    from app import lark_sync_admission
 
-    class Admission:
-        @contextmanager
-        def request(self):
-            events.append("request")
-            try:
-                yield
-            finally:
-                events.append("release")
-
-        def pause(self, seconds):
-            events.append(("pause", seconds))
+    monkeypatch.setattr(lark_sync_admission, "connection", lambda: nullcontext(pg))
+    admission = lark_sync_admission.LarkSyncAdmission(max_inflight=3, requests_per_second=10)
 
     class HttpClient:
         @staticmethod
         def request(*_args, **_kwargs):
             return httpx.Response(
-                429,
+                400,
                 headers={"x-ogw-ratelimit-reset": "7"},
                 json={"code": 99991400, "msg": "rate limited"},
             )
 
-    client = LarkClient(settings(), http_client=HttpClient(), admission=Admission())
+    client = LarkClient(settings(), http_client=HttpClient(), admission=admission)
 
     with pytest.raises(LarkApiError) as raised:
         client.list_chats("user-token")
 
-    assert raised.value.rate_limited
+    assert raised.value.rate_limited and raised.value.retryable
     assert raised.value.retry_after == 7
-    assert events == ["request", ("pause", 7), "release"]
+    before = pg.execute("SELECT * FROM lark_sync_admission_state").fetchone()
+    assert before["rate_limited_count"] == 1
+    assert not pg.execute("SELECT 1 FROM lark_sync_request_leases").fetchone()
+    admission.pause(1)
+    after = pg.execute("SELECT * FROM lark_sync_admission_state").fetchone()
+    assert after["paused_until"] == before["paused_until"] and after["rate_limited_count"] == 2
 
 
-def test_legacy_rate_limit_code_is_retryable_without_http_429() -> None:
-    error = LarkApiError(400, 99991400, "legacy rate limit")
-
-    assert error.rate_limited
-    assert error.retryable
 
 
 def test_broadcast_preflight_checks_live_members_posting_and_mention_permissions():

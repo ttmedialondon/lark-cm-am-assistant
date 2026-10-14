@@ -493,7 +493,7 @@ def test_parallel_claims_allow_only_one_inflight_target_per_sender(pg, monkeypat
     schema = pg.execute("SELECT current_schema() AS name").fetchone()["name"]
     assert re.fullmatch(r"test_people_[0-9a-f]{32}", schema)
     actor, preview_id, batch_id = uuid4(), uuid4(), uuid4()
-    dsn = os.environ.get("TEST_DATABASE_URL") or os.environ["CREATOR_WORKFLOW_AI_TEST_DATABASE_URL"]
+    dsn = os.environ["TEST_DATABASE_URL"]
 
     @contextmanager
     def connect():

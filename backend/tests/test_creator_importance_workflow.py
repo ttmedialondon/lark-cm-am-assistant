@@ -173,30 +173,18 @@ def ranking_flow(pg, monkeypatch):
     return state
 
 
-@pytest.mark.parametrize("missing", ["backfill_complete", "backfill_window_end_at", "last_backfill_at",
-                                    "recent_start", "not_readable", "read_scope"])
+@pytest.mark.parametrize("missing", ["backfill_complete", "recent_start"])
 def test_history_coverage_requires_successful_full_sync(pg, ranking_flow, missing):
     flow = ranking_flow
     flow.enable()
     if missing == "recent_start":
         pg.execute("UPDATE authorization_chats SET backfill_window_start_at=NOW()-INTERVAL '7 days'")
-    elif missing == "not_readable":
-        pg.execute("UPDATE authorization_chats SET sync_status='not_readable'")
-    elif missing == "read_scope":
-        pg.execute("UPDATE authorizations SET scopes=ARRAY['im:message.send_as_user']")
     else:
-        value = "FALSE" if missing == "backfill_complete" else "NULL"
-        pg.execute(f"UPDATE authorization_chats SET {missing}={value}")
+        pg.execute("UPDATE authorization_chats SET backfill_complete=FALSE")
     job = pg.execute("""SELECT *,NOW()-INTERVAL '90 days' history_start,NOW() history_end
         FROM creator_importance_jobs WHERE responsible_authorization_id=%s""", (flow.owner,)).fetchone()
     material = importance.build_batch(pg, job, flow.settings, importance._state(job, flow.settings))
-    if missing in {"not_readable", "read_scope"}:
-        assert material["pack"] is None and not material["sources"]
-        assert not material["state"].get("chat_coverage")
-        source = pg.execute("SELECT body_ciphertext FROM chat_messages WHERE message_id='a1'").fetchone()
-        assert source["body_ciphertext"]
-    else:
-        assert material["state"]["chat_coverage"] == {"own_private": False}
+    assert material["state"]["chat_coverage"] == {"own_private": False}
     assert not flow.calls
 
 

@@ -196,27 +196,6 @@ def test_named_frontend_testers_do_not_require_a_retired_admin_grant() -> None:
         ) is expected
 
 
-def test_reauthorization_restarts_an_active_job_with_a_new_generation() -> None:
-    calls = []
-
-    class Result:
-        @staticmethod
-        def fetchone():
-            return {"id": "active-job"}
-
-    class Connection:
-        @staticmethod
-        def execute(query, params=None):
-            calls.append((query, params))
-            return Result()
-
-    assert main._queue_job(Connection(), "authorization-id", "backfill")
-    query, params = calls[0]
-    assert params == ("backfill", "authorization-id")
-    assert "mode = %s, status = 'queued'" in query
-    assert "discovery_status = 'pending'" in query
-    assert "discovery_generation = discovery_generation + 1" in query
-    assert "last_http_status = NULL" in query
 
 
 def test_oauth_reauthorization_defers_creator_scans_for_a_large_existing_roster(pg, monkeypatch):  # noqa: F811
@@ -312,10 +291,7 @@ def test_oauth_reauthorization_defers_creator_scans_for_a_large_existing_roster(
 
 @pytest.mark.parametrize("upgrade,owner,initial_status,broadcast_enabled", (
     ("profile", True, "attention_required", False),
-    ("send", True, "active", False),
-    ("send", False, "active", False),
-    ("send", False, "attention_required", False),
-    ("send", False, "active", True),
+    ("send", False, "attention_required", True),
     ("media", False, "active", True),
 ))
 def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapping_grants(

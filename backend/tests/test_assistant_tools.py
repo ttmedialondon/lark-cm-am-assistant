@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from test_offhours_summary import finish_merges, pg, seeded  # noqa: F401
+from test_offhours_summary import finish_merges, seeded  # noqa: F401
 
 from app import assistant_queries, assistant_search, summary_dialogues
 from app import assistant_tools as tools

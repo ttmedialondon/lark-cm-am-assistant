@@ -5,7 +5,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -15,72 +14,14 @@ from psycopg.rows import dict_row
 
 from app import identity_profiles, worker
 from app.crypto import TokenCipher
-from app.identity_names import format_display_name, update_identity_names
+from app.identity_names import update_identity_names
 from app.lark_api import LarkApiError, LarkProfile
 from scripts import backfill_identity_names as backfill
 
 
-@pytest.mark.parametrize(
-    ("name", "english", "expected"),
-    [
-        ("Quanzhen Liang", "Remi", "Remi（Quanzhen Liang）"),
-        ("  Alex   Smith ", "alex smith", "alex smith"),
-        ("Ａlex", "Alex", "Alex（Ａlex）"),
-        ("张三", None, "张三"),
-        (None, "Alice", "Alice"),
-        ("", "  ", None),
-        (None, None, None),
-        ("Remi（Quanzhen Liang）", None, "Remi（Quanzhen Liang）"),
-    ],
-)
-def test_display_format(name, english, expected):
-    assert format_display_name(name, english) == expected
-
-
-def test_member_records_keep_sources_and_distinguish_missing_english():
-    values = worker._member_records(
-        {
-            "items": [
-                {"member_id": "ou_a", "name": "Quanzhen Liang", "en_name": "Remi"},
-                {"member_id": "ou_b", "name": "No English"},
-                {"member_id": "ou_c", "name": "Cleared English", "en_name": ""},
-            ]
-        }
-    )
-    assert values[0]["name"] == "Quanzhen Liang" and values[0]["en_name"] == "Remi"
-    assert values[0]["display_name"] == "Remi（Quanzhen Liang）"
-    assert not values[1]["en_name_present"]
-    assert values[2]["en_name_present"] and values[2]["en_name"] is None
-
-
 @pytest.fixture
-def pg(monkeypatch):
-    dsn = os.environ.get("IDENTITY_NAMES_TEST_DATABASE_URL")
-    if not dsn:
-        pytest.skip("Set IDENTITY_NAMES_TEST_DATABASE_URL for isolated PostgreSQL checks")
-    with psycopg.connect(dsn, row_factory=dict_row) as conn:
-        schema = "test_identity_names_" + uuid4().hex
-        conn.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(psycopg.sql.Identifier(schema)))
-        conn.execute(psycopg.sql.SQL("SET LOCAL search_path TO {}").format(psycopg.sql.Identifier(schema)))
-        for path in sorted((Path(__file__).parents[1] / "migrations").glob("*.sql")):
-            if int(path.name[:3]) < 33:
-                conn.execute(path.read_text())
-        conn.execute("INSERT INTO lark_identities(open_id,display_name) VALUES('ou_legacy','Old Raw Name')")
-        conn.execute((Path(__file__).parents[1] / "migrations/033_identity_names.sql").read_text())
-        for path in sorted((Path(__file__).parents[1] / "migrations").glob("*.sql")):
-            if int(path.name[:3]) > 33:
-                conn.execute(path.read_text())
-        conn.execute("ALTER TABLE authorizations ALTER scopes SET DEFAULT "
-                     "ARRAY['im:chat:read','im:message:readonly']::text[]")
-        monkeypatch.setattr(worker, "connection", lambda: nullcontext(conn))
-        try:
-            yield conn
-        finally:
-            conn.rollback()
-
-
-@pytest.fixture
-def person(pg):
+def person(pg, monkeypatch):
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
     contact_id, authorization_id = uuid4(), uuid4()
     pg.execute("INSERT INTO contacts(id,display_name,entity_type) VALUES(%s,'Old Name','person')", (contact_id,))
     pg.execute(
@@ -101,11 +42,6 @@ def person(pg):
             (chat_id,),
         )
     return contact_id, authorization_id
-
-
-def test_migration_preserves_legacy_raw_name_without_inventing_english(pg):
-    row = pg.execute("SELECT name,en_name,display_name FROM lark_identities WHERE open_id='ou_legacy'").fetchone()
-    assert row == {"name": "Old Raw Name", "en_name": None, "display_name": "Old Raw Name"}
 
 
 def test_authoritative_update_propagates_unambiguous_labels_but_not_authorization(pg, person):
@@ -201,7 +137,6 @@ def test_tenant_refresh_updates_changed_facts_without_rewriting_other_identities
     }
     assert before["ou_person"]["tenant_classification"] == "known_external"
     assert before["ou_external"]["tenant_classification"] == "known_external"
-    assert before["ou_legacy"]["tenant_classification"] == "unresolved"
     assert before["ou_app"]["tenant_classification"] == "internal"
 
     worker._refresh_tenant_classifications(pg, {"company"})
@@ -473,6 +408,7 @@ def test_avatar_cache_permission_backoff_visibility_and_late_response_guards(pg,
     profiles = identity_profiles
     key, own_id = b"x" * 32, person[1]
     settings, cipher = SimpleNamespace(token_encryption_key=key), TokenCipher(key)
+    pg.execute("INSERT INTO lark_identities(open_id) VALUES('ou_unreachable')")
     old_url, new_url = ("https://s16-imfile-sg.feishucdn.com/old", "https://s16-imfile-sg.feishucdn.com/new")
     for bad in ("http://cdn.feishucdn.com/a", "https://cdn.feishucdn.com.evil/a", "https://127.0.0.1/a",
                 "https://u@cdn.feishucdn.com/a", "https://cdn.feishucdn.com:444/a", "javascript:alert(1)"):
@@ -550,7 +486,7 @@ def test_avatar_cache_permission_backoff_visibility_and_late_response_guards(pg,
     assert statuses["ou_person"]["avatar_status"] == "succeeded"
     assert statuses["ou_external_3"]["avatar_status"] == "unavailable"
     assert statuses["ou_external_3"]["avatar_url"] == old_url  # Kept, but unavailable is hidden by the read model.
-    assert pg.execute("SELECT avatar_error_code FROM lark_identities WHERE open_id='ou_legacy'").fetchone()[
+    assert pg.execute("SELECT avatar_error_code FROM lark_identities WHERE open_id='ou_unreachable'").fetchone()[
         "avatar_error_code"] == "no_visible_authorization"
     assert pg.execute("SELECT open_id,contact_id,name,en_name,display_name,last_seen_at FROM lark_identities "
                       "ORDER BY open_id").fetchall() == before
@@ -676,9 +612,9 @@ def test_avatar_cache_permission_backoff_visibility_and_late_response_guards(pg,
 
 def test_avatar_provider_authorization_race_preserves_new_consent(monkeypatch):
     """OAuth, profile refresh and the two-write provider gate used to deadlock."""
-    dsn = os.environ.get("IDENTITY_NAMES_TEST_DATABASE_URL")
+    dsn = os.environ.get("TEST_DATABASE_URL")
     if not dsn:
-        pytest.skip("Set IDENTITY_NAMES_TEST_DATABASE_URL for isolated PostgreSQL checks")
+        pytest.skip("Set TEST_DATABASE_URL for isolated PostgreSQL checks")
     schema = "test_avatar_lock_" + uuid4().hex
     actor = uuid4()
     with psycopg.connect(dsn, autocommit=True, row_factory=dict_row) as setup:

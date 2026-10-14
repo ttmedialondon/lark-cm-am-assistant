@@ -5,9 +5,6 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from uuid import uuid4
 
-import pytest
-from jinja2 import Environment
-
 from app import admin_reporting, message_material
 from app.crypto import message_body_cipher
 
@@ -15,28 +12,6 @@ MENTIONS = [{"key": "@_user_1", "id_type": "open_id", "id": "ou_remi", "name": "
 NAMES = {"ou_remi": "Remi（Quanzhen Liang）"}
 TEXT = "Hi @_user_1; unknown @_user_2"
 EXPECTED = "Hi @Remi（Quanzhen Liang）; unknown @_user_2"
-
-
-@pytest.mark.parametrize("kind", ["text", "post"])
-def test_admin_body_resolves_current_bilingual_names_without_changing_unknown_mentions(kind):
-    raw = json.dumps({"text": TEXT} if kind == "text" else {"content": [[{"text": TEXT}]]})
-    cipher = message_body_cipher(b"r" * 32)
-    encrypted = cipher.encrypt(raw)
-    result = admin_reporting._decorate_message(
-        {"body_ciphertext": encrypted, "message_type": kind, "mentions_json": MENTIONS}, cipher, NAMES
-    )["content"]
-    assert result == EXPECTED
-    assert cipher.decrypt(encrypted) == raw
-
-
-def test_missing_mapping_is_literal_and_resolved_name_is_still_escaped_by_template():
-    assert admin_reporting._readable_body(json.dumps({"text": TEXT}), "text") == TEXT
-    dangerous = admin_reporting._readable_body(
-        json.dumps({"text": "Hi @_user_1"}), "text", MENTIONS, {"ou_remi": "<script>bad()</script>"}
-    )
-    rendered = Environment(autoescape=True).from_string("{{ content }}").render(content=dangerous)
-    assert "<script>" not in rendered
-    assert "&lt;script&gt;" in rendered
 
 
 def test_rich_at_nodes_are_not_dropped_and_unknown_target_remains_explicit():

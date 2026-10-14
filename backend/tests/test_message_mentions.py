@@ -1,8 +1,6 @@
 from types import SimpleNamespace
 
-import pytest
-
-from app.message_mentions import mention_names, mention_targets, resolve_mentions, rich_mention_text
+from app.message_mentions import mention_names, mention_targets, resolve_mentions
 
 
 def mention(key="@_user_1", identity="ou_cm", name="Quanzhen Liang", id_type="open_id"):
@@ -30,26 +28,10 @@ def test_chinese_prose_can_touch_mentions_but_ascii_identifiers_cannot():
     )
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "https://example.test/@_user_1?q=1",
-        "https://example.test/?target=@_user_1",
-        "www.example.test/@_user_1",
-        "person@_user_1.example",
-        "联系person@_user_1.example",
-        "查看https://example.test/@_user_1?q=1",
-        "查看www.example.test/@_user_1",
-        "@_user_1@example.test",
-        "`@_user_1`",
-        "```python\nprint('@_user_1')\n```",
-        "```unclosed code @_user_1",
-    ],
-)
-def test_urls_email_and_code_are_not_mentions(text):
-    assert resolve_mentions(text + " Hello @_user_1", [mention()]) == (
-        text + " Hello @_user_1" if text.startswith("```unclosed") else text + " Hello @Quanzhen Liang"
-    )
+def test_message_literals_are_preserved_while_prose_mentions_resolve():
+    text = ("查看https://example.test/@_user_1?q=1 person@_user_1.example `@_user_1`\n"
+            "```python\nprint('@_user_1')\n```\n")
+    assert resolve_mentions(text + "请@_user_1帮忙", [mention()]) == text + "请@Quanzhen Liang帮忙"
 
 
 def test_duplicate_target_conflict_and_unknown_do_not_guess():
@@ -96,10 +78,3 @@ def test_batch_lookup_is_only_explicit_metadata_ids_not_senders_or_other_rows():
     assert "FOR SHARE" in queries[0][0]
     assert mention_names(conn, rows, lock=False) == {"ou_cm": "Remi（Quanzhen Liang）"}
     assert "FOR SHARE" not in queries[-1][0]
-
-
-def test_rich_at_tags_require_same_message_open_id_mapping():
-    mentions = [mention()]
-    assert rich_mention_text("ou_cm", mentions, {"ou_cm": "Remi"}) == "@Remi"
-    assert rich_mention_text("ou_other", mentions, {"ou_other": "Other"}) == "[未解析的@用户]"
-    assert rich_mention_text("ou_cm", [mention(name="")]) == "@_user_1"

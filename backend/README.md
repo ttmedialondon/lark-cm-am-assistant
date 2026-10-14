@@ -13,11 +13,11 @@ python3 -m venv .venv
 .venv/bin/python -m pytest
 ```
 
-数据库测试需要独立 PostgreSQL；CI 已配置隔离服务。完整本地验证将 `TEST_DATABASE_URL`、`IDENTITY_NAMES_TEST_DATABASE_URL`、`OFFHOURS_SUMMARY_TEST_DATABASE_URL`、`CREATOR_WORKFLOW_AI_TEST_DATABASE_URL` 指向测试库，并注入示例应用配置。未设置时相关用例会跳过，不能当作完整验证。不要使用生产数据库跑测试。
+数据库测试统一使用 `TEST_DATABASE_URL`，指向独立 PostgreSQL，并注入示例应用配置；CI 已配置隔离服务。未设置时数据库用例会跳过，不能当作完整验证。不要使用生产数据库跑测试。
 
 浏览器工作流使用 Node、Chrome 和 Playwright 1.62.1；CI 统一安装。本地可在本目录运行 `npm install --no-save --package-lock=false --ignore-scripts playwright@1.62.1`，或通过 `NODE_PATH` 使用已安装的同版依赖。
 
-测试不设覆盖率门槛，不要求逐函数补测；日常运行受影响的关键链，跨业务发布合并回归一次。保留权限、正文隔离、同步恢复、入库、幂等与数据完整性验证；旧功能专属测试随功能删除。不重复测试 helper、文案和 CSS，不靠 skip 或缩小收集范围掩盖失败。
+测试按核心链路保留：授权与隔离、同步与导出、达人入库与关系、AI 查询与回复、群发防重。日常只运行受影响的测试文件，跨业务变更合并回归一次；同一风险不重复铺多套矩阵。不常驻已执行的一次性数据迁移回放，不检查文案、CSS 或 helper 的实现写法，不设数量和覆盖率门槛，也不靠 skip 或缩小收集范围掩盖失败。
 
 ## 运行服务
 
@@ -30,7 +30,7 @@ python3 -m venv .venv
 .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8100
 ```
 
-另开终端，用同一开发环境运行 `.venv/bin/python -m app.worker`。worker 会领取同步、已启用的 AI 任务及用户明确确认的群发任务；群发使用独立并发，不占 AI 槽位。不要把生产授权或 API Key 放进普通本地测试。正式发送及临时演示配置见 [部署手册](../docs/runbooks/deploy-mvp.md#群发页面与正式发送)。
+另开终端，用同一开发环境运行 `.venv/bin/python -m app.worker`。worker 会领取同步、已启用的 AI 任务及用户明确确认的群发任务；群发使用独立并发，不占 AI 槽位。不要把生产授权或 API Key 放进普通本地测试。正式发送配置见 [部署手册](../docs/runbooks/deploy-mvp.md#群发页面与正式发送)。
 
 ## 桌面回复接口（schema 1.1）
 

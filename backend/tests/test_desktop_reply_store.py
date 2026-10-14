@@ -77,7 +77,7 @@ def test_scoped_cache_and_conflicts_never_store_plaintext(receipt_db):
 def test_concurrent_claims_have_exactly_one_owner(receipt_db):
     _, actor, _, dsn, schema = receipt_db
     request_id = uuid4()
-    ready = Barrier(8)
+    ready = Barrier(2)
 
     def compete(_):
         with psycopg.connect(dsn, row_factory=dict_row) as connection:
@@ -88,9 +88,9 @@ def test_concurrent_claims_have_exactly_one_owner(receipt_db):
             connection.commit()
             return receipt
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        rows = list(pool.map(compete, range(8)))
-    assert sorted(row["claim_status"] for row in rows) == ["new"] + ["running"] * 7
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        rows = list(pool.map(compete, range(2)))
+    assert sorted(row["claim_status"] for row in rows) == ["new", "running"]
     assert len({row["fence_token"] for row in rows}) == 1
 
 

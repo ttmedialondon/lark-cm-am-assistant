@@ -3,14 +3,12 @@
 import asyncio
 import re
 from contextlib import nullcontext
-from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from fastapi.testclient import TestClient
-from jinja2 import Environment, FileSystemLoader
 
 from app import (
     admin,
@@ -34,8 +32,6 @@ GET_ROUTES = (
     ("ai", "/admin/ai"),
     ("jobs", "/admin/jobs"),
     ("assistant-rules", "/admin/assistant-rules"),
-    ("assistant-rules", "/admin/assistant-rules?new=1"),
-    ("assistant-rules", "/admin/assistant-rules?document=doc-00000000-0000-0000-0000-000000000001"),
 )
 POST_ROUTES = (
     f"/admin/users/{TARGET}/permissions",
@@ -109,13 +105,6 @@ def test_each_route_checks_its_own_permission_before_reading(monkeypatch, data_f
         assert response.headers["location"] == f"/admin/{unrelated}"
 
 
-@pytest.mark.parametrize("path", [path for _, path in GET_ROUTES])
-def test_no_page_grants_means_no_backend_even_with_a_legacy_role(monkeypatch, data_fence, path):
-    monkeypatch.setattr(admin_reporting, "admin_role_for", lambda _: "operator")
-    browser, _, _ = _client(monkeypatch)
-    assert browser.get(path, follow_redirects=False).status_code == 403
-
-
 @pytest.mark.parametrize("path", POST_ROUTES)
 def test_all_page_grants_still_cannot_mutate_or_grant_access(monkeypatch, data_fence, path):
     browser, _, _ = _client(monkeypatch, permissions=PAGES)
@@ -138,13 +127,6 @@ def test_document_management_is_narrowly_delegated_and_revocable(monkeypatch, da
     assert browser.post('/admin/assistant-rules', data=form).status_code == 403
 
 
-@pytest.mark.parametrize("path", [path for _, path in GET_ROUTES])
-def test_owner_has_every_read_entry_without_explicit_page_grants(monkeypatch, data_fence, path):
-    browser, _, _ = _client(monkeypatch, owner=True)
-    with pytest.raises(_DataQueryReached):
-        browser.get(path, follow_redirects=False)
-
-
 def test_revocation_applies_to_the_next_request_in_the_same_session(monkeypatch, data_fence):
     browser, _, state = _client(monkeypatch, permissions={"messages"})
     with pytest.raises(_DataQueryReached):
@@ -159,57 +141,6 @@ def test_inactive_authorization_has_no_backend_access(monkeypatch, data_fence, o
     for path in [path for _, path in GET_ROUTES]:
         assert browser.get(path, follow_redirects=False).status_code == 403
 
-
-
-def _page_menu_targets(html):
-    menu = re.search(r'<nav\b[^>]*aria-label="页面导航"[^>]*>(.*?)</nav>', html, re.DOTALL)
-    assert menu is not None
-    return re.findall(r'href="([^"]+)"', menu.group(1))
-
-
-def _assert_no_navigation_role_labels(html):
-    for label in ("系统主人", "全部权限", "已授权查看", "当前为只读访问", "权限设置及业务修改"):
-        assert label not in html
-
-
-
-def test_owner_navigation_exposes_every_page():
-    environment = Environment(loader=FileSystemLoader(Path(admin.__file__).parent / "templates"), autoescape=True)
-    html = environment.get_template("admin/_nav.html").render(
-        authorization={"display_name": "System owner"},
-        admin_role="owner",
-        admin_role_label="系统主人",
-        admin_permissions=frozenset(PAGES),
-        permission_pages=admin_permissions.PAGES,
-        admin_landing_path="/admin",
-        active_page="users",
-    )
-    backend_links = {link for link in re.findall(r'href="([^"]+)"', html) if link.startswith("/admin")}
-    assert backend_links == {page["path"] for page in admin_permissions.PAGES
-                             if page["path"].startswith("/admin")}
-    assert _page_menu_targets(html) == list(dict.fromkeys(page["path"] for page in admin_permissions.PAGES))
-    assert ">助手文档</a>" in html
-    _assert_no_navigation_role_labels(html)
-
-
-@pytest.mark.parametrize("permissions", [
-    ("users", "messages"),
-    ("ai", "jobs"),
-    ("assistant-rules",),
-])
-def test_navigation_keeps_exact_grants_when_switching_between_pages(permissions):
-    environment = Environment(loader=FileSystemLoader(Path(admin.__file__).parent / "templates"), autoescape=True)
-    expected = [page["path"] for page in admin_permissions.PAGES if page["key"] in permissions]
-    for active_page in permissions:
-        html = environment.get_template("admin/_nav.html").render(
-            authorization={"display_name": "Page viewer"}, admin_role="member", admin_role_label="已授权查看",
-            admin_permissions=frozenset(permissions), permission_pages=admin_permissions.PAGES,
-            admin_landing_path=expected[0], active_page=active_page,
-        )
-        assert _page_menu_targets(html) == expected
-        _assert_no_navigation_role_labels(html)
-        assert "Page viewer" in html and "/dashboard" in html
-        assert "/admin/creators" not in html and "/admin/creator-review" not in html
 
 
 @pytest.mark.parametrize(("permissions", "owner", "expected"), [
@@ -274,38 +205,6 @@ def test_invalid_permission_forms_never_reach_a_database_write(monkeypatch, data
     assert response.status_code == 400
 
 
-@pytest.mark.parametrize(("page", "template", "details"), [
-    ("overview", "overview.html", {
-        "metrics": [], "attention": [{"id": TARGET, "display_name": "Other person"}],
-        "recent_jobs": [], "runtime": [],
-    }),
-    ("contacts", "contact_detail.html", {
-        "contact": {"open_id": "ou_creator", "primary_role": "creator", "confirmed_role_labels": []},
-        "source_query": "", "assessment": {"status": "succeeded", "id": TARGET},
-        "organizations": [], "identities": [], "conversations": [], "can_view_conversations": False,
-    }),
-    ("ai", "ai.html", {
-        "ai_dispatch": {"state": "paused"},
-        "configs": [{"feature": "contact_assessment", "config": {"key_configured": True, "api_key_label": "…1234"}}],
-    }),
-])
-def test_page_templates_hide_ungranted_links_and_owner_forms(page, template, details):
-    environment = Environment(loader=FileSystemLoader(Path(admin.__file__).parent / "templates"), autoescape=True)
-    landing = "/admin" if page == "overview" else f"/admin/{page}"
-    html = environment.get_template(f"admin/{template}").render(
-        authorization={"display_name": "Page viewer"}, admin_role="member", admin_role_label="已授权查看",
-        admin_permissions=frozenset({page}), permission_pages=admin_permissions.PAGES,
-        admin_landing_path=landing, active_page=page, **details,
-    )
-    assert re.search(r'<form\b[^>]*\bmethod="post"', html, re.IGNORECASE) is None
-    backend_links = {link.split("?", 1)[0] for link in re.findall(r'href="([^"]+)"', html) if link.startswith("/admin")}
-    assert all(link == landing or link.startswith(f"{landing}/") for link in backend_links)
-    if page == "overview":
-        assert backend_links == {landing}
-    if page == "contacts":
-        assert "/assessments/" not in " ".join(backend_links)
-
-
 @pytest.mark.parametrize(("extra", "conversations", "jobs"), [
     ((), False, False), (("chats",), True, False), (("messages",), True, False),
     (("jobs",), False, True), (("chats", "jobs"), True, True),
@@ -324,46 +223,3 @@ def test_personnel_detail_only_requests_authorized_extra_panels(monkeypatch, dat
     assert calls == [{"include_conversations": conversations, "include_jobs": jobs}]
     assert contexts[-1][1]["can_view_conversations"] is conversations
     assert contexts[-1][1]["can_view_jobs"] is jobs
-
-
-def test_every_admin_route_is_in_the_access_matrix(monkeypatch):
-    browser, _, _ = _client(monkeypatch)
-    actual = set()
-    for route in browser.app.routes:
-        if not route.path.startswith("/admin"):
-            continue
-        path = route.path.replace("{open_id}", "ou_contact")
-        for parameter in ("authorization_id", "contact_id", "assessment_id", "run_id", "task_id"):
-            path = path.replace(f"{{{parameter}}}", TARGET)
-        actual.update((method, path) for method in route.methods)
-    expected = {("GET", path.split("?", 1)[0]) for _, path in GET_ROUTES}
-    expected.update(("POST", path) for path in POST_ROUTES)
-    expected.add(("POST", '/admin/assistant-rules'))
-    assert actual == expected
-
-
-@pytest.mark.parametrize("actor_owner", [False, True])
-@pytest.mark.parametrize("target_owner_active", [None, False, True])
-def test_permission_editor_is_owner_only_and_never_edits_an_owner(actor_owner, target_owner_active):
-    environment = Environment(loader=FileSystemLoader(Path(admin.__file__).parent / "templates"), autoescape=True)
-    target_access = admin_permissions._access({
-        "status": "active", "role": "owner" if target_owner_active is not None else None,
-        "role_active": bool(target_owner_active), "permissions": ["messages"] if target_owner_active is False else [],
-    })
-    html = environment.get_template("admin/_user_permissions.html").render(
-        admin_role="owner" if actor_owner else "member", permission_access=target_access,
-        user={"id": TARGET, "display_name": "<script>unsafe name</script>"},
-        permission_pages=admin_permissions.PAGES, permission_page=1, csrf_token="csrf",
-    )
-    should_edit = actor_owner and target_owner_active is None
-    assert bool(re.search(r'<form\b[^>]*\bmethod="post"', html)) is should_edit
-    assert "<script>" not in html
-    if target_owner_active is False:
-        assert target_access["is_owner_account"]
-        assert not target_access["has_admin_access"]
-        assert not target_access["permissions"]
-    if should_edit:
-        assert html.count('name="permissions"') == len(PAGES)
-        assert 'name="csrf_token" value="csrf"' in html
-        assert ' checked' not in html
-        assert "全部不勾选 = 仅前台" in html

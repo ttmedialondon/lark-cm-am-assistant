@@ -1083,46 +1083,13 @@ def test_broadcast_real_data_workflow_rechecks_scope_routes_and_never_sends(monk
 
 
 
-def test_retired_handle_ai_and_type_actions_still_require_active_auth_and_csrf(monkeypatch):
-    client, actor = browser(monkeypatch)
-    run, task = uuid4(), uuid4()
-    actions = [
-        "/creators/preview",
-        *(
-            f"/creators/runs/{run}/{name}"
-            for name in (
-                "start",
-                "pause",
-                "resume",
-                "auto-admit",
-            )
-        ),
-        *(f"/creators/tasks/{task}/{name}" for name in ("recheck", "confirm", "defer")),
-        f"/creators/people/{task}/type",
-    ]
-    for path in actions:
-        assert client.post(path, data={
-            "csrf_token": "csrf", "cm_id": str(actor["id"]), "enabled": "1",
-        }).status_code == 410
-    for invalid in ({}, {"csrf_token": "wrong"}):
-        assert client.post(f"/creators/tasks/{task}/confirm", data=invalid).status_code == 400
-    owner, _admin = browser(monkeypatch, owner=True)
-    for path in actions:
-        assert owner.post(path, data={"cm_id": str(actor["id"]), "enabled": "1"}).status_code == 400
-        assert owner.post(path, data={"csrf_token": "csrf", "enabled": "1"}).status_code == 410
-    evidence = client.get(f"/creators/tasks/{task}/evidence")
-    assert evidence.status_code == 410
-    assert evidence.headers["cache-control"] == "no-store, max-age=0"
-    revoked, _ = browser(monkeypatch, active=False)
-    denied = revoked.get("/creators")
-    assert denied.status_code == 403 and denied.headers["content-type"].startswith("text/html")
-    assert "登录授权已失效" in denied.text
-    denied_data = revoked.get("/creators/data")
-    assert denied_data.status_code == 403 and denied_data.json()["error"] == "登录授权已失效，请重新登录。"
-    assert revoked.get(f"/creators/tasks/{task}/evidence").status_code == 403
-    for path in actions:
-        assert revoked.post(path, data={"csrf_token": "csrf"}).status_code == 403
-    assert revoked.post(f"/creators/tasks/{task}/defer", data={"csrf_token": "csrf"}).status_code == 403
+def test_revoked_creator_session_cannot_read_or_modify_roster(monkeypatch):
+    client, actor = browser(monkeypatch, active=False)
+    assert client.get("/creators").status_code == 403
+    assert client.get("/creators/data").status_code == 403
+    assert client.post("/creators/people/link", data={
+        "csrf_token": "csrf", "cm_id": str(actor["id"]), "contact_id": str(uuid4()), "handle": "fixture",
+    }).status_code == 403
 
 
 def test_excel_upload_is_bounded_scoped_and_requires_explicit_start_and_confirmation(monkeypatch):

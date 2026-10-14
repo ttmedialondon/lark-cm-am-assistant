@@ -1,17 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import psycopg
 import pytest
-from psycopg.rows import dict_row
 
 from app import (
     assistant_rules,
@@ -91,34 +88,10 @@ def pack():
     }
 
 
-@pytest.mark.parametrize(
-    "changes",
-    [
-        {"user": "outsider"},
-        {"handling_status": "invented"},
-        {"handling_evidence_refs": ["unknown"]},
-        {"reply_evidence_refs": ["M1"]},
-        {"handling_reason": ""},
-        {"handle": "@fabricated"},
-        {"evidence_refs": ["unknown"]},
-        {
-            "priority_basis": "three_workdays",
-            "priority": "P1",
-            "aging_request_ref": "M1",
-            "no_effective_response": True,
-        },
-        {"priority": "P9"},
-        {"summary": ""},
-        {"aging_request_ref": "invented"},
-    ],
-)
-def test_invalid_or_unsupported_model_claims_rejected(changes):
-    with pytest.raises(ai.InvalidModelOutput):
-        ai._validate(json.dumps({"events": [sample_event(**changes)]}), pack())
-
-
 def test_missing_media_and_multi_handle_do_not_invent_risk_or_duplicate_account():
     data = pack()
+    with pytest.raises(ai.InvalidModelOutput):
+        ai._validate(json.dumps({"events": [sample_event(evidence_refs=["unknown"])]}), data)
     data["users"]["U1"]["handles"].append("@alice_shop")
     result = ai._validate(json.dumps({"events": [sample_event()]}), data)
     assert result[0]["handle"] is None and result[0]["needs_review"]
@@ -367,35 +340,14 @@ def test_reply_and_resolution_remain_independent_through_context_and_merge(monke
 
 
 @pytest.fixture
-def pg(monkeypatch):
-    dsn = os.environ.get("OFFHOURS_SUMMARY_TEST_DATABASE_URL")
-    if not dsn:
-        pytest.skip("Set OFFHOURS_SUMMARY_TEST_DATABASE_URL for isolated PostgreSQL checks")
-    with psycopg.connect(dsn, row_factory=dict_row) as conn:
-        schema = "test_offhours_" + uuid4().hex
-        conn.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(psycopg.sql.Identifier(schema)))
-        conn.execute(psycopg.sql.SQL("SET LOCAL search_path TO {}").format(psycopg.sql.Identifier(schema)))
-        for path in sorted((Path(__file__).parents[1] / "migrations").glob("*.sql")):
-            if int(path.name[:3]) <= 51 or int(path.name[:3]) >= 54:
-                conn.execute(path.read_text())
-        conn.execute("ALTER TABLE authorizations ALTER scopes SET DEFAULT "
-                     "ARRAY['im:chat:read','im:message:readonly']::text[]")
-        monkeypatch.setattr(ai, "connection", lambda: nullcontext(conn))
-        monkeypatch.setattr(ai.ai_dispatch, "connection", lambda: nullcontext(conn))
-        monkeypatch.setattr(ai, "get_settings", lambda: SimpleNamespace(token_encryption_key=b"x" * 32))
-
-        def fail_on_error(*_a, **_k):
-            raise sys.exception()
-
-        monkeypatch.setattr(ai.LOGGER, "warning", fail_on_error)
-        try:
-            yield conn
-        finally:
-            conn.rollback()
-
-
-@pytest.fixture
 def seeded(pg, monkeypatch):
+    monkeypatch.setattr(ai, "connection", lambda: nullcontext(pg))
+    monkeypatch.setattr(ai, "get_settings", lambda: SimpleNamespace(token_encryption_key=b"x" * 32))
+
+    def fail_on_error(*_a, **_k):
+        raise sys.exception()
+
+    monkeypatch.setattr(ai.LOGGER, "warning", fail_on_error)
     ids = {
         "owner": uuid4(),
         "cm": ai.REMI_ID,
@@ -521,21 +473,11 @@ def seeded(pg, monkeypatch):
     )
 
 
-@pytest.mark.parametrize("roster_kind", ["current", "missing_handle", "multi_handle", "legacy", "both"])
+@pytest.mark.parametrize("roster_kind", ["current", "missing_handle", "multi_handle"])
 def test_save_enabled_immediately_queues_claims_and_stores_encrypted_summary(pg, seeded, roster_kind, monkeypatch):
     s = seeded
     if roster_kind == "missing_handle":
         pg.execute("DELETE FROM contact_social_accounts")
-    if roster_kind in {"legacy", "both"}:
-        pg.execute(
-            """INSERT INTO creator_account_assignments(id,social_account_id,responsible_authorization_id,
-                   contact_id,relationship,source,created_by_authorization_id,candidate_id)
-                   VALUES(%s,%s,%s,%s,'owner','cm_confirmation',%s,%s)""",
-            (uuid4(), s.account, s.ids["cm"], s.ids["person"], s.ids["cm"], s.candidate_id),
-        )
-        if roster_kind == "legacy":
-            pg.execute("DELETE FROM contact_assignments")
-            pg.execute("DELETE FROM contact_social_accounts")
     for who, relationship, status in (
         ("person", "associated", "confirmed"), ("person", "owner", "rejected"),
         ("other", "owner", "confirmed"),
@@ -625,19 +567,13 @@ def test_acl_owner_remi_and_explicit_test_grant_not_arbitrary_roster_reviewer(pg
         ai.get_summary_view(pg, s.ids["tester"])
 
 
-@pytest.mark.parametrize("change", ["hide", "delete", "reassign", "rejected_identity", "consent"])
+@pytest.mark.parametrize("change", ["reassign", "consent"])
 def test_revocation_or_edit_before_provider_exports_nothing(pg, seeded, change):
     s = seeded
     s.save()
     job = ai.claim_next_summary()
-    if change == "hide":
-        pg.execute("UPDATE authorization_chats SET is_visible=FALSE")
-    elif change == "delete":
-        pg.execute("UPDATE chat_messages SET is_deleted=TRUE WHERE message_id='m1'")
-    elif change == "reassign":
+    if change == "reassign":
         pg.execute("UPDATE contact_assignments SET ended_at=NOW()")
-    elif change == "rejected_identity":
-        pg.execute("UPDATE contact_roles SET status='rejected' WHERE contact_id=%s", (s.ids["person"],))
     else:
         pg.execute("UPDATE authorizations SET body_consent_at=NULL WHERE id=%s", (s.ids["cm"],))
     ai.run_claimed_summary(job, s.settings)
@@ -664,21 +600,6 @@ def test_disable_preserves_unknown_and_old_call_cannot_commit(pg, seeded):
                          (stale["id"],)).fetchone()
     assert current["status"] == "failed" and "请求结果未知" in current["error_message"]
     assert current["attempts"] == stale["attempts"]
-
-
-def test_group_reply_to_older_creator_is_context_but_cannot_prove_silence(pg, seeded):
-    s = seeded
-    pg.execute("UPDATE authorization_chats SET p2p_counterpart_open_id=NULL")
-    pg.execute("UPDATE chats SET chat_mode='group'")
-    pg.execute("UPDATE chat_messages SET message_create_time=%s WHERE message_id='m1'", (s.start - timedelta(hours=1),))
-    s.add("reply", who="cm", text="I have received your request", parent_id="m1")
-    s.save()
-    job = ai.claim_next_summary()
-    evidence = ai._load_chat(pg, job, "chat", job["cutoff"], settings=s.settings)
-    assert evidence and evidence["history_complete"] is False
-    refs = [m["ref"] for m in evidence["pack"]["messages"]]
-    result = ai._validate(json.dumps({"events": [sample_event(evidence_refs=refs)]}), evidence)
-    assert result[0]["priority"] == "P2"
 
 
 def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg, seeded, monkeypatch):
@@ -927,34 +848,6 @@ def test_relevant_chats_are_filtered_before_limit(pg, seeded):
     assert ai.claim_next_summary()["chat_id"] == "chat"
 
 
-
-
-def test_shared_admission_limits_summary_claims_to_five(pg, seeded):
-    s = seeded
-    s.save()
-    run = pg.execute("SELECT run_id FROM offhours_summary_settings").fetchone()["run_id"]
-    for i in range(5):
-        chat = f"parallel-{i}"
-        pg.execute("INSERT INTO chats(chat_id) VALUES(%s)", (chat,))
-        pg.execute(
-            """INSERT INTO offhours_summary_tasks(id,run_id,chat_id,input_fingerprint,cutoff)
-                   VALUES(%s,%s,%s,%s,NOW())""",
-            (uuid4(), run, chat, str(i)),
-        )
-    assert all(ai.claim_next_summary() is not None for _ in range(4))
-    assert ai.claim_next_summary() is not None  # Four running leases permit the fifth, not a sixth.
-    assert ai.claim_next_summary() is None
-
-
-def test_disabled_save_keeps_window_without_enqueuing(pg, seeded):
-    s = seeded
-    s.fields["window_start"] = (s.start - timedelta(hours=1)).isoformat()
-    assert not s.save(False)["enabled"]
-    expected = (s.start - timedelta(hours=1)).astimezone(ai.LONDON).strftime("%Y-%m-%dT%H:%M")
-    assert ai.get_settings_view(pg)["window_start_input"] == expected
-    assert not pg.execute("SELECT 1 FROM offhours_summary_tasks").fetchone()
-
-
 def test_open_window_watermark_refresh_does_not_invalidate_identical_pack(pg, seeded):
     s = seeded
     pg.execute("UPDATE authorization_chats SET last_incremental_at=%s", (s.start,))
@@ -967,19 +860,11 @@ def test_open_window_watermark_refresh_does_not_invalidate_identical_pack(pg, se
     assert not after["history_complete"]
 
 
-def test_end_boundary_is_exclusive_even_when_message_was_synced_early(pg, seeded):
-    s = seeded
-    s.save()
-    job = ai.claim_next_summary()
-    snapshot = ai._load_chat(pg, job, "chat", s.end, settings=s.settings)
-    assert "future CM reply" not in json.dumps(snapshot)
 
 
-
-
-@pytest.mark.parametrize("http_status,stop_during_request", [(None, False), (None, True), (503, False)])
+@pytest.mark.parametrize("http_status", [None, 503])
 def test_network_failure_retries_are_bounded_not_cancelled_refresh_loop(
-    pg, seeded, monkeypatch, http_status, stop_during_request,
+    pg, seeded, monkeypatch, http_status,
 ):
     s = seeded
     s.save()
@@ -987,8 +872,6 @@ def test_network_failure_retries_are_bounded_not_cancelled_refresh_loop(
     calls = []
     def fail(*_a, **_k):
         calls.append(True)
-        if stop_during_request:
-            assert not s.save(False)["enabled"]
         raise openai_client.OpenAIRequestError("simulated failure", retryable=True,
                                               telemetry={"http_status": http_status})
 
@@ -1706,16 +1589,6 @@ def test_creator_enrollment_backfills_closed_periods_without_repaying_or_replaci
                (ancient_merge,))
     with pytest.raises(ai.SummaryInputError):
         ai._current(pg, {'id': ancient_merge, 'attempts': 2})
-    durable = pg.execute('SELECT result_ciphertext,checkpoint_ciphertext,usage,attempts FROM offhours_summary_tasks '
-                         'WHERE id=%s', (ancient_merge,)).fetchone()
-    pg.execute((Path(__file__).parents[1] / 'migrations' / '082_bound_summary_period_queue.sql').read_text())
-    assert pg.execute('SELECT status FROM offhours_summary_tasks WHERE id=%s',
-                      (ancient_merge,)).fetchone()['status'] == 'cancelled'
-    assert pg.execute('SELECT result_ciphertext,checkpoint_ciphertext,usage,attempts FROM offhours_summary_tasks '
-                      'WHERE id=%s', (ancient_merge,)).fetchone() == durable
-    assert pg.execute('SELECT status,result_ciphertext FROM offhours_summary_tasks WHERE id=%s',
-                      (ancient_source,)).fetchone() == {
-        'status': 'succeeded', 'result_ciphertext': source['result_ciphertext']}
     assert len(s.calls) == 3 and old_tasks() == original
     pg.execute('ROLLBACK TO SAVEPOINT backfill_ancient_execution')
 

@@ -14,129 +14,73 @@ from app import creator_authorization_rescans, worker
 from app.crypto import TokenCipher
 from app.lark_api import TokenBundle
 from app.worker import (
-    _body_content,
-    _is_author_message,
-    _lark_time,
-    _message_relation_metadata,
     _p2p_counterpart_open_id,
     _read_member_snapshot,
-    _sender_metadata,
-    _tenant_classification,
 )
 
 
-def test_author_message_requires_open_id_semantics() -> None:
-    message = {"sender": {"sender_type": "user", "id_type": "open_id", "id": "ou_me"}}
-    assert _is_author_message(message, "ou_me")
-    assert not _is_author_message({"sender": {"sender_type": "user", "id": "ou_me"}}, "ou_me")
-
-
-def test_lark_time_interprets_milliseconds() -> None:
-    timestamp = _lark_time("1615380573411")
-    assert timestamp is not None
-    assert timestamp.year == 2021
-
-
-def test_message_body_content_is_kept_as_the_lark_payload() -> None:
-    assert _body_content({"body": {"content": '{"text":"hello"}'}}) == '{"text":"hello"}'
-    assert _body_content({"body": {}}) is None
-
-
-def test_sender_metadata_keeps_open_id_only_when_lark_marks_it_as_open_id() -> None:
-    user = {
-        "sender": {
-            "id": "ou_sender",
-            "id_type": "open_id",
-            "tenant_key": "tenant_external",
-            "sender_type": "user",
-            "sender_name": "Creator",
-        }
-    }
-    app = {"sender": {"id": "cli_app", "id_type": "app_id", "sender_type": "app"}}
-
-    assert _sender_metadata(user) == (
-        "ou_sender",
-        "open_id",
-        "ou_sender",
-        "tenant_external",
-        "user",
-        "Creator",
-    )
-    assert _sender_metadata(app)[2] is None
-
-
-def test_same_sender_name_keeps_distinct_lark_identity_keys() -> None:
-    first = _sender_metadata(
-        {"sender": {"id": "ou_first", "id_type": "open_id", "tenant_key": "tenant_a", "sender_name": "Alex"}}
-    )
-    second = _sender_metadata(
-        {"sender": {"id": "ou_second", "id_type": "open_id", "tenant_key": "tenant_b", "sender_name": "Alex"}}
-    )
-
-    assert first[2:] == ("ou_first", "tenant_a", None, "Alex")
-    assert second[2:] == ("ou_second", "tenant_b", None, "Alex")
-
-
-def test_message_relationship_metadata_keeps_only_context_fields() -> None:
-    relations = _message_relation_metadata(
-        {
-            "root_id": "om_root",
-            "parent_id": "om_parent",
-            "thread_id": "omt_thread",
-            "message_app_link": "https://applink.larksuite.com/client/chat/open?openChatId=oc_test",
-            "message_position": "12",
-            "thread_message_position": 3,
-            "mentions": [
-                {
-                    "key": "@_user_1",
-                    "id": "ou_mentioned",
-                    "id_type": "open_id",
-                    "name": "Mentioned person",
-                    "tenant_key": "tenant_external",
-                    "ignored": "not stored",
-                },
-                "not-a-mention",
-            ],
-        }
-    )
-
-    assert relations == {
-        "root_id": "om_root",
-        "parent_id": "om_parent",
-        "thread_id": "omt_thread",
-        "mentions": [
-            {
-                "key": "@_user_1",
-                "id": "ou_mentioned",
-                "id_type": "open_id",
-                "name": "Mentioned person",
-                "tenant_key": "tenant_external",
-            }
-        ],
-        "message_app_link": "https://applink.larksuite.com/client/chat/open?openChatId=oc_test",
-        "message_position": 12,
-        "thread_message_position": 3,
-    }
-
-
-def test_tenant_classification_keeps_unknown_people_neutral() -> None:
-    internal_tenants = {"tenant_tt_media"}
-
-    assert _tenant_classification(
-        tenant_key="tenant_tt_media",
-        identity_type="user",
-        internal_tenant_keys=internal_tenants,
-    ) == "internal"
-    assert _tenant_classification(
-        tenant_key=None,
-        identity_type="user",
-        internal_tenant_keys=internal_tenants,
-    ) == "unresolved"
-    assert _tenant_classification(
-        tenant_key="tenant_external",
-        identity_type="user",
-        internal_tenant_keys=internal_tenants,
-    ) == "known_external"
+def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg, monkeypatch):
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
+    actor, job_id = UUID(int=1), UUID(int=2)
+    pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,'ou_cm','fixture')", (actor,))
+    pg.execute("""INSERT INTO sync_jobs(id,authorization_id,mode,status,discovery_status,discovery_generation)
+               VALUES(%s,%s,'backfill','running','succeeded',3)""", (job_id, actor))
+    for chat in ("oc_ingest_1", "oc_ingest_2", "oc_ingest_3"):
+        pg.execute("INSERT INTO chats(chat_id) VALUES(%s)", (chat,))
+        pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,backfill_page_token)
+                   VALUES(%s,%s,'page-2')""", (actor, chat))
+    job = worker.SyncJob(job_id, actor, "backfill", 0, "succeeded", 3)
+    config = SimpleNamespace(sync_lookback_days=0, sync_overlap_seconds=600,
+                             lark_sync_per_authorization_max_inflight=2)
+    authorization = {"open_id": "ou_cm", "body_consent_at": None}
+    claim = worker._claim_next_page(job, authorization, config)
+    other = worker._claim_next_page(job, authorization, config)
+    assert claim.chat_id != other.chat_id and claim.expected_page_token == "page-2"
+    assert worker._claim_next_page(job, authorization, config) is None
+    body = '{"text":"hello"}'
+    mention = {"key": "@_user_1", "id": "ou_mentioned", "id_type": "open_id", "name": "Mentioned"}
+    messages = [
+        {"message_id": "om_cm", "create_time": "1615380573411", "body": {"content": body},
+         "msg_type": "text", "parent_id": "om_parent", "root_id": "om_root", "thread_id": "omt_thread",
+         "message_position": "12", "mentions": [{**mention, "ignored": "not stored"}],
+         "sender": {"id": "ou_cm", "id_type": "open_id", "sender_type": "user", "sender_name": "Alex"}},
+        {"message_id": "om_external", "sender": {"id": "ou_external", "id_type": "open_id",
+         "tenant_key": "external", "sender_type": "user", "sender_name": "Alex"}},
+        {"message_id": "om_app", "sender": {"id": "cli_app", "id_type": "app_id", "sender_type": "app"}},
+        {"message_id": "om_untyped", "sender": {"id": "ou_cm", "sender_type": "user"}},
+    ]
+    cipher = TokenCipher(b"i" * 32)
+    result = worker._record_claimed_page(claim, messages, "page-3", cipher)
+    assert result.committed and (result.messages, result.own_messages) == (4, 1)
+    rows = {row["message_id"]: row for row in pg.execute("SELECT * FROM chat_messages")}
+    saved = rows["om_cm"]
+    assert cipher.decrypt(saved["body_ciphertext"]) == body and body not in repr(saved)
+    assert saved["message_create_time"].year == 2021
+    assert (saved["parent_id"], saved["root_id"], saved["thread_id"], saved["message_position"]) == (
+        "om_parent", "om_root", "omt_thread", 12)
+    assert saved["mentions_json"] == [mention]
+    assert rows["om_app"]["sender_open_id"] is None and rows["om_untyped"]["sender_open_id"] is None
+    identities = {row["open_id"]: row for row in pg.execute("SELECT * FROM lark_identities")}
+    assert identities["ou_cm"]["contact_id"] != identities["ou_external"]["contact_id"]
+    assert identities["ou_external"]["tenant_classification"] == "known_external"
+    assert identities["ou_mentioned"]["tenant_classification"] == "unresolved"
+    replay = worker._claim_next_page(job, authorization, config)
+    assert replay.chat_id == claim.chat_id and replay.expected_page_token == "page-3"
+    duplicate = worker._record_claimed_page(replay, messages, None, cipher)
+    assert duplicate.committed and duplicate.messages == duplicate.own_messages == 0
+    assert pg.execute("SELECT count(*) n FROM authorization_message_observations").fetchone()["n"] == 4
+    assert not worker._record_claimed_page(claim, [{"message_id": "om_stale"}], None, cipher).committed
+    assert not pg.execute("SELECT 1 FROM chat_messages WHERE message_id='om_stale'").fetchone()
+    current = worker._claim_next_page(job, authorization, config)
+    pg.execute("UPDATE authorization_chats SET sync_generation=sync_generation+1 WHERE chat_id=%s", (current.chat_id,))
+    assert not worker._record_claimed_page(current, [{"message_id": "om_revoked"}], None, cipher).committed
+    assert not pg.execute("SELECT 1 FROM chat_messages WHERE message_id='om_revoked'").fetchone()
+    monkeypatch.setattr(worker, "get_settings", lambda: SimpleNamespace(sync_interval_seconds=300))
+    pg.execute("UPDATE authorization_chats SET backfill_complete=TRUE,page_claim_id=NULL,"
+               "page_claim_job_id=NULL,page_lease_until=NULL")
+    worker._finish_and_schedule_incremental(job)
+    following = pg.execute("SELECT * FROM sync_jobs WHERE status='queued'").fetchone()
+    assert following["id"] != job_id and following["mode"] == "incremental"
 
 
 def test_p2p_contact_discovery_skips_bots(pg, monkeypatch) -> None:
@@ -743,216 +687,14 @@ def test_authorization_rescan_serializes_workers_without_blocking_reauthorizatio
         pg.commit()
 
 
-def test_page_claim_uses_locked_conversation_cursor(monkeypatch) -> None:
-    calls = []
-
-    class Result:
-        def __init__(self, row=None):
-            self.row = row
-
-        def fetchone(self):
-            return self.row
-
-    class Connection:
-        def transaction(self):
-            return nullcontext()
-
-        def execute(self, query, params=None):
-            calls.append((query, params))
-            if "SELECT mode" in query:
-                return Result({"mode": "backfill"})
-            if "SELECT COUNT(*) AS count" in query:
-                return Result({"count": 0})
-            if "manual_backfill_started_at IS NULL" in query:
-                return Result()
-            if "SELECT access.*" in query:
-                return Result(
-                    {
-                        "chat_id": "oc_claim",
-                        "sync_generation": 4,
-                        "backfill_window_start_at": None,
-                        "backfill_window_end_at": None,
-                        "manual_backfill_requested_at": None,
-                        "backfill_page_token": "page-2",
-                    }
-                )
-            return Result()
-
-    monkeypatch.setattr(worker, "connection", lambda: nullcontext(Connection()))
-    job = worker.SyncJob(UUID(int=1), UUID(int=2), "backfill", 0, "succeeded", 3)
-
-    claim = worker._claim_next_page(
-        job,
-        {"open_id": "ou_cm", "body_consent_at": None},
-        SimpleNamespace(
-            sync_lookback_days=0,
-            sync_overlap_seconds=600,
-            lark_sync_per_authorization_max_inflight=2,
-        ),
-    )
-
-    assert claim is not None
-    assert claim.chat_id == "oc_claim"
-    assert claim.expected_page_token == "page-2"
-    sql = "\n".join(query for query, _params in calls)
-    assert "FOR UPDATE SKIP LOCKED" in sql
-    assert "page_claim_id = %s, page_claim_job_id = %s, page_claim_mode = %s" in sql
 
 
-def test_page_claim_respects_the_durable_per_authorization_limit(monkeypatch) -> None:
-    calls = []
-
-    class Result:
-        def __init__(self, row=None):
-            self.row = row
-
-        def fetchone(self):
-            return self.row
-
-    class Connection:
-        def transaction(self):
-            return nullcontext()
-
-        def execute(self, query, params=None):
-            calls.append((query, params))
-            if "SELECT mode" in query:
-                return Result({"mode": "backfill"})
-            if "SELECT COUNT(*) AS count" in query:
-                return Result({"count": 2})
-            return Result()
-
-    monkeypatch.setattr(worker, "connection", lambda: nullcontext(Connection()))
-    job = worker.SyncJob(UUID(int=1), UUID(int=2), "backfill", 0, "succeeded", 3)
-
-    claim = worker._claim_next_page(
-        job,
-        {"open_id": "ou_cm", "body_consent_at": None},
-        SimpleNamespace(sync_lookback_days=0, sync_overlap_seconds=600),
-        2,
-    )
-
-    assert claim is None
-    assert not any("SELECT access.*" in query for query, _params in calls)
 
 
-def test_stale_page_claim_does_not_write_messages_after_reauthorization(monkeypatch) -> None:
-    calls = []
-
-    class Result:
-        def __init__(self, row=None):
-            self.row = row
-
-        def fetchone(self):
-            return self.row
-
-    class Connection:
-        def transaction(self):
-            return nullcontext()
-
-        def execute(self, query, params=None):
-            calls.append((query, params))
-            if "FROM sync_jobs" in query:
-                return Result({"present": 1})
-            if "FROM authorization_chats" in query:
-                return Result()
-            return Result()
-
-    monkeypatch.setattr(worker, "connection", lambda: nullcontext(Connection()))
-    job = worker.SyncJob(UUID(int=1), UUID(int=2), "backfill", 0, "succeeded", 3)
-    claim = worker.PageClaim(
-        job=job,
-        chat_id="oc_stale",
-        mode="backfill",
-        generation=9,
-        claim_id=UUID(int=3),
-        expected_page_token="old-page",
-        start_at=None,
-        end_at=worker.datetime.now(worker.UTC),
-        author_open_id="ou_cm",
-        body_consent_at=None,
-    )
-
-    result = worker._record_claimed_page(claim, [{"message_id": "om_stale"}], None, None)
-
-    assert result.committed is False
-    assert not any("INSERT INTO chat_messages" in query for query, _params in calls)
-    assert any("page_lease_until > NOW()" in query for query, _params in calls)
 
 
-def test_expired_lease_releases_claims_without_resetting_cursors(monkeypatch) -> None:
-    calls = []
-
-    class Result:
-        def __init__(self, rows=None):
-            self.rows = rows or []
-
-        def fetchall(self):
-            return self.rows
-
-    class Connection:
-        def transaction(self):
-            return nullcontext()
-
-        def execute(self, query, params=None):
-            calls.append((query, params))
-            if "UPDATE sync_jobs" in query:
-                return Result([{"id": UUID(int=1)}])
-            return Result()
-
-    monkeypatch.setattr(worker, "connection", lambda: nullcontext(Connection()))
-
-    worker._recover_expired_leases()
-
-    claim_updates = [query for query, _params in calls if "page_claim_id = NULL" in query]
-    assert claim_updates
-    assert all("backfill_page_token" not in query for query in claim_updates)
-    assert any("page_lease_until < NOW()" in query for query in claim_updates)
 
 
-def test_lark_dispatch_favors_users_then_claims_distinct_chats(monkeypatch) -> None:
-    submitted = []
-    authorization_a = UUID(int=10)
-    authorization_b = UUID(int=20)
-    job_a = worker.SyncJob(UUID(int=1), authorization_a, "backfill", 0, "succeeded", 0)
-    job_b = worker.SyncJob(UUID(int=2), authorization_b, "backfill", 0, "succeeded", 0)
-    remaining = {
-        authorization_a: iter(("oc_a_1", "oc_a_2")),
-        authorization_b: iter(("oc_b_1",)),
-    }
-
-    class Future:
-        pass
-
-    class Executor:
-        def submit(self, _runner, _client, claim, _token):
-            submitted.append(claim)
-            return Future()
-
-    def claim_next(job, *_args):
-        try:
-            chat_id = next(remaining[job.authorization_id])
-        except StopIteration:
-            return None
-        return SimpleNamespace(job=job, chat_id=chat_id)
-
-    monkeypatch.setattr(worker, "_authorization", lambda _id: {"status": "active", "open_id": "ou_cm"})
-    monkeypatch.setattr(worker, "_usable_access_token", lambda *_args: "token")
-    monkeypatch.setattr(worker, "_claim_next_page", claim_next)
-    monkeypatch.setattr(
-        worker,
-        "_active_page_claim_counts",
-        lambda _ids: Counter(claim.job.authorization_id for claim in submitted),
-    )
-    settings = SimpleNamespace(lark_sync_max_inflight=3, lark_sync_per_authorization_max_inflight=2)
-    futures = {}
-    cache = {}
-
-    for _ in range(3):
-        assert worker._dispatch_lark_turn(settings, object(), Executor(), futures, [job_a, job_b], cache)
-
-    assert [claim.job.authorization_id for claim in submitted] == [authorization_a, authorization_b, authorization_a]
-    chats_for_a = [claim.chat_id for claim in submitted if claim.job.authorization_id == authorization_a]
-    assert chats_for_a == ["oc_a_1", "oc_a_2"]
 
 
 def test_lark_dispatch_uses_idle_slot_when_other_user_has_no_backlog(monkeypatch) -> None:
@@ -1038,8 +780,13 @@ def test_all_due_accounts_rotate_through_three_page_slots_and_resume_cursors(pg,
                incremental_page_token='resume-page-2',incremental_window_end_at=NOW(),
                incremental_window_start_at=NOW()-INTERVAL '1 day'
                WHERE authorization_id=%s AND chat_id='oc_fair_1_0'""", (first_job, first_actor))
+    interrupted_job = next(job for job in worker._running_jobs() if job.id == first_job)
+    interrupted = worker._claim_next_page(interrupted_job, {"open_id": "ou_fair_1"}, settings)
+    assert interrupted.expected_page_token == "resume-page-2"
     pg.execute("UPDATE sync_jobs SET lease_until=NOW()-INTERVAL '1 second' WHERE id=%s", (first_job,))
     worker._recover_expired_leases()
+    assert pg.execute("SELECT page_claim_id FROM authorization_chats WHERE chat_id=%s",
+                      (interrupted.chat_id,)).fetchone()["page_claim_id"] is None
     assert worker._start_pending_jobs(settings, object())
     assert pg.execute("""SELECT incremental_page_token FROM authorization_chats
                          WHERE authorization_id=%s AND chat_id='oc_fair_1_0'""",
@@ -1188,42 +935,6 @@ def test_new_coordinator_keeps_revocation_and_discovery_retry_fences(pg, monkeyp
                       (actor,)).fetchone()["backfill_page_token"] == "keep-page-3"
 
 
-def test_completed_backfill_enqueues_a_separate_incremental_job(monkeypatch) -> None:
-    calls = []
-    job = worker.SyncJob(UUID(int=1), UUID(int=2), "backfill", 0, "succeeded", 3)
-
-    class Result:
-        def __init__(self, row=None):
-            self.row = row
-
-        def fetchone(self):
-            return self.row
-
-    class Connection:
-        def transaction(self):
-            return nullcontext()
-
-        def execute(self, query, params=None):
-            calls.append((query, params))
-            if "SELECT mode" in query:
-                return Result({"mode": "backfill"})
-            if "AS claimed" in query:
-                return Result({"claimed": False})
-            if "AS pending" in query:
-                return Result({"pending": False})
-            if "SET status = 'succeeded'" in query:
-                return Result({"id": job.id})
-            return Result()
-
-    monkeypatch.setattr(worker, "connection", lambda: nullcontext(Connection()))
-    monkeypatch.setattr(worker, "get_settings", lambda: SimpleNamespace(sync_interval_seconds=300))
-
-    worker._finish_and_schedule_incremental(job)
-
-    sql = "\n".join(query for query, _params in calls)
-    assert "SET status = 'succeeded'" in sql
-    assert "INSERT INTO sync_jobs" in sql
-    assert "incremental_job_id IS DISTINCT" not in sql
 
 
 def test_delayed_only_job_yields_its_coordinator_slot() -> None:

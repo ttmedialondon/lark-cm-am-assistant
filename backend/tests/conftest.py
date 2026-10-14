@@ -14,7 +14,7 @@ from app import ai_dispatch
 
 @pytest.fixture
 def pg(monkeypatch):
-    dsn = os.environ.get("TEST_DATABASE_URL") or os.environ.get("CREATOR_WORKFLOW_AI_TEST_DATABASE_URL")
+    dsn = os.environ.get("TEST_DATABASE_URL")
     if not dsn:
         pytest.skip("Set TEST_DATABASE_URL for isolated PostgreSQL checks")
     with psycopg.connect(dsn, row_factory=dict_row) as conn:
