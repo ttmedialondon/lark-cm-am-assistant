@@ -2013,7 +2013,16 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
         VALUES(%s,'reply-group','broadcast')""", (s.ids["cm"],))
     with pytest.raises(PermissionError):
         replies.enqueue(pg, s.ids["reviewer"], event_id, s.settings)
+    payment_knowledge = assistant_rules.save_document(pg, s.settings, s.ids["owner"], None,
+        "付款核对资料", "仅用于付款咨询", "knowledge", "published", "all", "PAYMENT_KNOWLEDGE_V1", 0,
+        reply_usable=True)
+    assistant_rules.save_document(pg, s.settings, s.ids["owner"], None,
+        "活动资料", "仅用于活动报名", "knowledge", "published", "all", "UNSELECTED_EVENT_KNOWLEDGE", 0,
+        reply_usable=True)
+    assistant_rules.save_document(pg, s.settings, s.ids["owner"], None,
+        "内部诊断", "内部资料", "knowledge", "published", "all", "UNAPPROVED_INTERNAL_KNOWLEDGE", 0)
     calls = []
+    instructions_seen = []
     saved_receipt = summary_dialogues._receipt
     crashed = local_failed = False
 
@@ -2032,11 +2041,18 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
 
     def model(cfg, key, pack, actor, **kwargs):
         calls.append(pack)
+        instructions_seen.append(kwargs["instructions"])
         receipt = {"response_id": f"resp-reply-{len(calls)}", "usage": {"input_tokens": 5, "output_tokens": 3}}
         assert "unrelated outsider secret" not in json.dumps(pack)
         assert "OUTSIDER_GROUP_SECRET" not in json.dumps(pack)
         assert "future CM reply" not in json.dumps(pack)
+        assert "UNAPPROVED_INTERNAL_KNOWLEDGE" not in json.dumps(pack) + kwargs["instructions"]
+        assert "UNSELECTED_EVENT_KNOWLEDGE" not in json.dumps(pack) + kwargs["instructions"]
+        if "document_catalog" in pack:
+            assert "PAYMENT_KNOWLEDGE" not in json.dumps(pack) + kwargs["instructions"]
+            return {**receipt, "text": json.dumps({"document_ids": [payment_knowledge]})}
         if "edited_draft" in pack:
+            assert set(pack) == {"edited_draft"}
             return {**receipt, "text": json.dumps({"chinese_translation": "我可以帮你核对这笔 £200 的付款。"})}
         if "core_refs" in pack:
             return {**receipt, "text": json.dumps({"processed_refs": pack["core_refs"],
@@ -2053,6 +2069,9 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
     monkeypatch.setattr(openai_client, "call_openai", model)
     job_id = replies.enqueue(pg, s.ids["cm"], event_id, s.settings)
     assert replies.enqueue(pg, s.ids["cm"], event_id, s.settings) == job_id
+    assistant_rules.save_document(pg, s.settings, s.ids["owner"], payment_knowledge,
+        "付款核对资料", "仅用于付款咨询", "knowledge", "published", "all", "PAYMENT_KNOWLEDGE_V2", 1,
+        reply_usable=True)
 
     def finish():
         for _ in range(12):
@@ -2086,12 +2105,29 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
     state = summary_dialogues.decode(stored["checkpoint_ciphertext"], s.settings)
     assert state["usage"] == {"input_tokens": len(calls) * 5, "output_tokens": len(calls) * 3}
     assert len(state["receipts"]) == len(calls) and not state.get("response_received")
+    assert state["document_ids"] == [payment_knowledge] and state["reply_rules"]["entry"] == "event"
+    assert sum("document_catalog" in pack for pack in calls) == 1
+    assert calls[-1]["business_documents"][0]["key"] == payment_knowledge
+    assert calls[-1]["business_documents"][0]["text"] == "PAYMENT_KNOWLEDGE_V1"
+    assert calls[-1]["business_documents"][0]["document_ref"] == "doc." + payment_knowledge
     with pytest.raises(PermissionError):
         replies.read(pg, s.ids["owner"], job_id, s.settings)
     translated = replies.enqueue(pg, s.ids["cm"], event_id, s.settings, parent_id=job_id,
                                  text="Happy to check the £200 payment with you.")
     finish()
     assert replies.read(pg, s.ids["cm"], translated, s.settings, fresh=True)["result"]["draft"].startswith("Happy")
+    translated_state = summary_dialogues.decode(pg.execute(
+        "SELECT checkpoint_ciphertext FROM summary_reply_tasks WHERE id=%s", (translated,)
+    ).fetchone()["checkpoint_ciphertext"], s.settings)
+    assert translated_state["reply_rules"] == state["reply_rules"]
+    assert translated_state["document_ids"] == state["document_ids"]
+    with pg.transaction(force_rollback=True):
+        assistant_rules.save_document(pg, s.settings, s.ids["owner"], payment_knowledge,
+            "付款核对资料", "仅用于付款咨询", "knowledge", "draft", "all", "PAYMENT_KNOWLEDGE_V2", 2,
+            reply_usable=True)
+        for saved_id in (job_id, translated):
+            with pytest.raises(PermissionError):
+                replies.read(pg, s.ids["cm"], saved_id, s.settings)
     s.add("resolved-later", text="This specific issue is now resolved, thank you.", at=datetime.now(UTC))
     paid_count = len(calls)
     for previous_id in (job_id, translated):
@@ -2110,6 +2146,19 @@ def test_reply_draft_latest_dialogue_translation_staleness_and_access(pg, seeded
     latest_result = replies.read(pg, s.ids["cm"], latest, s.settings, fresh=True)["result"]
     assert latest_result["outcome"] == "resolved" and latest_result["draft"] == ""
     assert ai.get_summary_view(pg, s.ids["cm"])["events"][0]["handling_status"] == "unresolved"
+    # Existing paid phases without a document pin retain their original request and validator.
+    legacy_id = replies.enqueue(pg, s.ids["cm"], event_id, s.settings)
+    pg.execute("UPDATE summary_reply_tasks SET checkpoint_ciphertext=NULL WHERE id=%s", (legacy_id,))
+    before_legacy = len(calls)
+    crashed = False
+    finish()
+    legacy_state = summary_dialogues.decode(pg.execute(
+        "SELECT checkpoint_ciphertext FROM summary_reply_tasks WHERE id=%s", (legacy_id,)
+    ).fetchone()["checkpoint_ciphertext"], s.settings)
+    assert "reply_rules" not in legacy_state and "document_ids" not in legacy_state
+    assert all("document_catalog" not in pack and "business_documents" not in pack
+               for pack in calls[before_legacy:])
+    assert instructions_seen[before_legacy] == replies.SELECT_INSTRUCTIONS
     # A late response cannot replace a newer phase even when the attempt number repeats.
     late_id = replies.enqueue(pg, s.ids["cm"], event_id, s.settings)
     late = replies.claim()
@@ -2291,6 +2340,8 @@ def test_assistant_window_uses_cm_identity_separate_switch_and_frozen_cutoff(pg,
     observed = []
     def reply_model(cfg, key, pack, actor, **kwargs):
         observed.append((cfg["model"], key, pack))
+        if "document_catalog" in pack:
+            return {"text": json.dumps({"document_ids": []})}
         if "core_refs" in pack:
             return {"text": json.dumps({"processed_refs": pack["core_refs"],
                 "relevant_refs": pack["core_refs"], "style_refs": []})}

@@ -54,6 +54,8 @@ def provider_logs(caplog):
 
 @pytest.fixture
 def api(pg, monkeypatch):
+    from app import reply_rules
+
     settings = SimpleNamespace(token_encryption_key=b"d" * 32)
     for module in (main, desktop_reply_routes, desktop_replies):
         monkeypatch.setattr(module, "connection", lambda: nullcontext(pg))
@@ -73,6 +75,9 @@ def api(pg, monkeypatch):
         (api_key_cipher(settings.token_encryption_key).encrypt("sk-fixture-only-test"),),
     )
     state = SimpleNamespace(calls=[], output=None)
+    state.catalog = reply_rules.catalog
+    # Existing contract checks exercise the supported no-optional-documents path.
+    monkeypatch.setattr(reply_rules, 'catalog', lambda _: [])
 
     async def model(config, api_key, pack, contact_id, **kwargs):
         assert api_key == "sk-fixture-only-test"
@@ -86,11 +91,94 @@ def api(pg, monkeypatch):
         current_authorization=main._current_authorization, csrf_token=lambda _: "fixture-csrf",
     ))
     return SimpleNamespace(
-        pg=pg, app=app, client=TestClient(app), actor=actor, other_actor=other_actor, state=state,
+        pg=pg, app=app, client=TestClient(app), actor=actor, other_actor=other_actor, state=state, settings=settings,
         headers={"Authorization": "Bearer desktop-session"},
         other_headers={"Authorization": "Bearer other-session"},
         cookie_headers={"Cookie": f"{main.SESSION_COOKIE}=desktop-session", "X-CSRF-Token": "fixture-csrf"},
     )
+
+
+def test_document_navigation_pins_facts_and_rechecks_private_cached_drafts(api, monkeypatch, caplog):
+    from app import assistant_rules, reply_rules
+
+    monkeypatch.setattr(reply_rules, 'catalog', api.state.catalog)
+    api.pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (api.actor,))
+    secret = 'PRIVATE POLICY: standard sample handling takes two working days.'
+    document = assistant_rules.save_document(api.pg, api.settings, api.actor, None,
+        'Sample policy', 'Answer questions about sample handling', 'knowledge', 'published', 'owner',
+        secret, 0, reply_usable=True)
+    assistant_rules.save_document(api.pg, api.settings, api.actor, None,
+        'Unapproved secret', 'Not available to reply generation', 'knowledge', 'published', 'owner',
+        'UNAPPROVED PRIVATE FACT', 0)
+    caplog.set_level(logging.INFO, logger='app.desktop_reply_routes')
+    calls = []
+
+    async def model(config, key, pack, actor, **options):
+        calls.append((copy.deepcopy(pack), options))
+        assert actor == api.actor and key == 'sk-fixture-only-test'
+        if 'document_ids' in options['output_format']['schema']['properties']:
+            assert 'Sample policy' in options['instructions'] and secret not in options['instructions']
+            assert 'Unapproved secret' not in options['instructions']
+            assert 'business_documents' not in pack
+            return {'text': json.dumps({'document_ids': [document]}),
+                    'usage': {'input_tokens': 12, 'output_tokens': 3},
+                    'telemetry': {'http_status': 200, 'response_status': 'completed',
+                                  'response_id': 'resp_document_navigation'}}
+        assert pack['business_documents'] == [{'key': document, 'title': 'Sample policy', 'text': secret,
+                                                'revision': 1, 'document_ref': 'doc.' + document}]
+        assert 0 < options['total_timeout'] <= calls[0][1]['total_timeout'] <= 45
+        return model_response('Samples usually take two working days.', refs=['S1', 'C1'])
+
+    monkeypatch.setattr(openai_client, 'call_openai_async', model)
+    submitted = payload()
+    first = api.client.post(PATH, json=submitted, headers=api.headers)
+    assert first.status_code == 200 and len(calls) == 2
+    assert set(first.json()) == {'request_id', 'suggestion', 'chinese_translation', 'english_translation', 'is_mock'}
+    assert '_reply_rules' not in first.text and 'PRIVATE POLICY' not in first.text
+    assert calls[0][0]['selected_messages'] == calls[1][0]['selected_messages']
+    receipt = api.pg.execute('SELECT * FROM desktop_reply_requests WHERE request_id=%s',
+                             (submitted['request_id'],)).fetchone()
+    assert receipt['usage'] == {'input_tokens': 42, 'output_tokens': 23}
+    stored = json.loads(desktop_reply_routes.store.result_cipher(api.settings.token_encryption_key).decrypt(
+        receipt['result_ciphertext']))
+    assert stored['_reply_rules']['document_ids'] == [document]
+    assert stored['_reply_rules']['snapshot']['documents'][document]['text'] == secret
+    cached = api.client.post(PATH, json=submitted, headers=api.headers)
+    assert cached.json() == first.json() and len(calls) == 2
+    api.pg.execute('UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s', (api.actor,))
+    denied = api.client.post(PATH, json=submitted, headers=api.headers)
+    assert denied.status_code == 403 and denied.json()['error']['code'] == 'reply_rules_unavailable'
+    assert 'PRIVATE' not in denied.text and len(calls) == 2
+    api.pg.execute('UPDATE admin_roles SET is_active=TRUE WHERE authorization_id=%s', (api.actor,))
+    api.pg.execute('UPDATE assistant_rule_overrides SET reply_usable=FALSE WHERE rule_key=%s', (document,))
+    assert api.client.post(PATH, json=submitted, headers=api.headers).status_code == 403 and len(calls) == 2
+    # Old encrypted results have no document metadata and are not regenerated during release.
+    stored.pop('_reply_rules')
+    api.pg.execute('UPDATE desktop_reply_requests SET result_ciphertext=%s WHERE request_id=%s', (
+        desktop_reply_routes.store.result_cipher(api.settings.token_encryption_key).encrypt(json.dumps(stored)),
+        submitted['request_id']))
+    assert api.client.post(PATH, json=submitted, headers=api.headers).json() == first.json() and len(calls) == 2
+    assert 'PRIVATE POLICY' not in caplog.text and 'UNAPPROVED PRIVATE FACT' not in caplog.text
+
+    api.pg.execute('UPDATE assistant_rule_overrides SET reply_usable=TRUE WHERE rule_key=%s', (document,))
+    async def fail_after_navigation(config, key, pack, actor, **options):
+        if 'document_ids' in options['output_format']['schema']['properties']:
+            return await model(config, key, pack, actor, **options)
+        calls.append((copy.deepcopy(pack), options))
+        failure = openai_client.OpenAIRequestError('PRIVATE provider error',
+                                                  telemetry={'usage': {'input_tokens': 7}})
+        raise failure from httpx.ReadTimeout('PRIVATE timeout')
+
+    monkeypatch.setattr(openai_client, 'call_openai_async', fail_after_navigation)
+    failed = payload()
+    first = api.client.post(PATH, json=failed, headers=api.headers)
+    duplicate = api.client.post(PATH, json=failed, headers=api.headers)
+    assert first.status_code == duplicate.status_code == 504 and first.json() == duplicate.json()
+    assert len(calls) == 4
+    receipt = api.pg.execute('SELECT status,usage FROM desktop_reply_requests WHERE request_id=%s',
+                             (failed['request_id'],)).fetchone()
+    assert receipt == {'status': 'failed', 'usage': {'input_tokens': 19, 'output_tokens': 3}}
+    assert provider_logs(caplog)[-1]['request_unknown']
 
 
 def test_reply_scopes_translation_cached_id_and_actor_isolation(api, caplog, monkeypatch):

@@ -758,6 +758,11 @@ def test_model_prepares_saves_and_returns_message_draft_without_child_job(pg, ch
     pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='outside'",
                (chat.cipher.encrypt(json.dumps({'text': 'When will the sample be dispatched?'})),))
     calls = []
+    knowledge_key = assistant_rules.save_document(pg, chat.settings, chat.ids['owner'], None,
+        '公开样品流程', '用于回复样品申请流程', 'knowledge', 'published', 'all',
+        'APPROVED_SAMPLE_PROCESS，具体物流仍需查真实记录。', 0, reply_usable=True)
+    internal_key = assistant_rules.save_document(pg, chat.settings, chat.ids['owner'], None,
+        '内部报价', '内部测试资料', 'knowledge', 'published', 'all', 'PRIVATE_MARGIN_DO_NOT_REPLY', 0)
 
     def model(_cfg, _key, items, _actor, **kwargs):
         assert '本人' in kwargs['instructions']
@@ -768,8 +773,10 @@ def test_model_prepares_saves_and_returns_message_draft_without_child_job(pg, ch
             assert {tool['name'] for tool in kwargs['tools']} == {'read_documents'}
             return {'text': '', 'output': [{'type': 'function_call', 'name': 'read_documents',
                 'call_id': 'reply-guide', 'arguments': json.dumps({'document_ids': [
-                    'reply-writing', 'history-search']})}], 'usage': {}}
+                    'reply-writing', 'history-search', knowledge_key]})}], 'usage': {}}
         assert 'save_reply_draft' in kwargs['instructions']
+        assert '回复事实与处理边界' in kwargs['instructions']
+        assert 'PRIVATE_MARGIN_DO_NOT_REPLY' not in json.dumps(items, ensure_ascii=False)
         if latest and latest.get('kind') == 'reply_draft':
             final = {'answer': '英文草稿已准备。', 'event_refs': [], 'result_refs': [],
                      'source_mode': 'detailed', 'reply_enabled': True,
@@ -815,6 +822,38 @@ def test_model_prepares_saves_and_returns_message_draft_without_child_job(pg, ch
     assert view['result']['draft']['context']['message']['message_id'] == 'outside'
     assert pg.execute('SELECT count(*) n FROM summary_reply_tasks').fetchone()['n'] == 0
     assert pg.execute('SELECT count(*) n FROM offhours_summary_runs').fetchone()['n'] == 0
+    assert view['result']['draft']['knowledge_sources'] == [
+        {'document_ref': 'doc.' + knowledge_key, 'title': '公开样品流程', 'revision': 1}]
+    checkpoint = summary_dialogues.decode(stored['checkpoint_ciphertext'], chat.settings)
+    prepared = next(result for result in checkpoint['tool_results'] if result.get('kind') == 'reply_material')
+    assert prepared['_reply_material']['reply_document_ids'] == [knowledge_key]
+    with pg.transaction(force_rollback=True):
+        pg.execute('UPDATE assistant_rule_overrides SET reply_usable=FALSE WHERE rule_key=%s', (knowledge_key,))
+        denied = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
+        assert denied['result'] is None and denied['error_code'] == 'permission'
+    with pg.transaction(force_rollback=True):
+        document = assistant_rules.library(pg, chat.settings)['reply-policy']
+        assistant_rules.save_document(pg, chat.settings, chat.ids['owner'], 'reply-policy', document['title'],
+            document['description'], 'manual', 'draft', 'all', document['text'], 0)
+        fresh = assistant_rules.snapshot(pg, chat.settings)
+        assert fresh['reply_protocol'] == 'reply-documents-v1' and 'reply-policy' not in fresh['documents']
+        pending = assistant.submit(pg, chat.ids['cm'], payload('继续起草'), chat.settings)
+        row = assistant._turn(pg, chat.ids['cm'], pending['id'])
+        context = assistant.tools.current_context(pg, chat.ids['cm'], {}, chat.settings)
+        with pytest.raises(PermissionError, match='尚未发布'):
+            assistant.tools.execute(pg, chat.ids['cm'], row, 'draft_reply', {
+                'event_ref': None, 'message_ref': prepared['source_ref'], 'draft_ref': None,
+                'edited_draft': None, 'action': 'generate', 'instruction': None, 'language': 'en'},
+                chat.settings, context)
+    with pg.transaction(force_rollback=True):
+        unsafe = {**checkpoint, 'tool_results': [*checkpoint['tool_results'], {'kind': 'documents',
+            'documents': [checkpoint['rules']['documents'][internal_key]]}]}
+        row = {**stored, 'checkpoint_ciphertext': summary_dialogues.encode(unsafe, chat.settings)}
+        with pytest.raises(PermissionError, match='内部查询'):
+            assistant.tools.execute(pg, chat.ids['cm'], row, 'draft_reply', {
+                'event_ref': None, 'message_ref': prepared['source_ref'], 'draft_ref': None,
+                'edited_draft': None, 'action': 'generate', 'instruction': None, 'language': 'en'},
+                chat.settings, checkpoint['context'])
 
 
 def test_model_first_lookup_replay_history_and_actor_isolation(pg, chat, monkeypatch):
@@ -1100,6 +1139,44 @@ def test_document_navigation_pins_selected_versions_and_blocks_private_sources(p
     with pytest.raises(ValueError, match='未读取'):
         assistant.tools.build_result(pg, chat.ids['owner'], row, bad_final, chat.settings,
             checkpoint['context'], checkpoint['tool_results'])
+    derived = assistant.submit(pg, chat.ids['owner'], {
+        **payload('继续分析这些内部资料'), 'session_id': str(row['session_id'])}, chat.settings)
+    monkeypatch.setattr(openai_client, 'call_openai_tools', lambda *_args, **_kwargs: {
+        'text': json.dumps({'answer': '内部分析已完成。', 'sections': [], 'event_refs': [],
+            'result_refs': [], 'data_refs': [], 'document_refs': [], 'draft_ref': None}),
+        'output': [], 'usage': {}})
+    finish(chat)
+    derived_row = assistant._turn(pg, chat.ids['owner'], derived['id'])
+    derived_checkpoint = summary_dialogues.decode(derived_row['checkpoint_ciphertext'], chat.settings)
+    assert derived_checkpoint['reply_unsafe_history'] and not assistant._loaded_documents(derived_checkpoint)
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE assistant_turns SET status='cancelled' WHERE id=%s", (turn['id'],))
+        history, _ = assistant._history(pg, row, chat.settings, checkpoint['context'])
+        assert any(json.loads(item['content']).get('reply_internal_sources')
+                   for item in history if item.get('role') == 'assistant')
+    inherited = assistant.submit(pg, chat.ids['owner'], {
+        **payload('给达人写回复'), 'session_id': str(row['session_id'])}, chat.settings)
+    guarded_calls = []
+
+    def guarded_model(_cfg, _key, items, _actor, **kwargs):
+        guarded_calls.append(True)
+        assert any(json.loads(item['content']).get('reply_internal_sources')
+                   for item in items if item.get('role') == 'assistant')
+        return {'text': '', 'output': [{'type': 'function_call', 'name': 'read_documents',
+            'call_id': 'reply-after-private', 'arguments': json.dumps({'document_ids': ['reply-writing']})}],
+            'usage': {}}
+
+    monkeypatch.setattr(openai_client, 'call_openai_tools', guarded_model)
+    finish(chat)
+    finish(chat)
+    guarded = summary_dialogues.decode(assistant._turn(pg, chat.ids['owner'], inherited['id'])[
+        'checkpoint_ciphertext'], chat.settings)
+    assert guarded['reply_unsafe_history'] and len(guarded_calls) == 1
+    assert guarded['tool_outputs']['reply-after-private']['error_code'] == 'permission'
+    assert '新对话' in guarded['tool_outputs']['reply-after-private']['error']
+    finish(chat)
+    denied = assistant.turn_view(pg, chat.ids['owner'], inherited['id'], chat.settings)
+    assert denied['status'] == 'failed' and denied['error_code'] == 'permission' and len(guarded_calls) == 1
     with pg.transaction(force_rollback=True):
         assistant_rules.save_document(pg, chat.settings, chat.ids['owner'], key,
             '公开资料', '可用于全部CM', 'knowledge', 'published', 'all', 'PUBLIC_REPLACEMENT', 2)

@@ -298,8 +298,8 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     client, path = TestClient(app), "/admin/assistant-rules"
     pinned = assistant_rules.snapshot(pg, settings)
     defaults = assistant_rules.builtin_snapshot()
-    assert pinned["protocol"] == 2 and len(pinned["documents"]) == 16 and len(pinned["catalog"]) == 12
-    assert len(assistant_rules.library(pg, settings)) == 26
+    assert pinned["protocol"] == 2 and len(pinned["documents"]) == 24 and len(pinned["catalog"]) == 15
+    assert len(assistant_rules.library(pg, settings)) == 34
     backend_keys = assistant_rules.EVENT_KEYS | assistant_rules.CREATOR_KEYS
     for owner_scope in (False, True):
         navigation = assistant_rules.snapshot(pg, settings, owner=owner_scope)

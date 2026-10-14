@@ -5,10 +5,12 @@ import re
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Annotated
+from urllib.parse import urlencode
 from uuid import uuid4
 
 import pytest
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -97,6 +99,55 @@ def test_readonly_admin_has_no_save_resume_key_or_window_edit_controls():
     assert 'href="/admin/ai/creator-handle-matching"' in html
     assert 'href="/admin/ai/creator-responsibility"' in html
     assert 'href="/admin/ai/creator-groups"' in html
+
+
+def test_reply_documents_require_explicit_approval_without_changing_fixed_manual_scope():
+    app = FastAPI()
+
+    @app.post("/form")
+    async def parse_reply_form(fields: Annotated[dict[str, str], Depends(admin.assistant_rule_fields)]):
+        return fields
+
+    client = TestClient(app)
+    form = {"csrf_token": "csrf", "document": "doc-fixture", "revision": "0", "title": "Reply policy",
+            "description": "Approved facts", "kind": "knowledge", "status": "published",
+            "visibility": "all", "content": "Approved customer-facing facts."}
+    assert "reply_usable" not in client.post("/form", data=form).json()
+    assert client.post("/form", data={**form, "reply_usable": "1"}).json()["reply_usable"] == "1"
+    for body in (urlencode({**form, "reply_usable": "true"}),
+                 urlencode({**form, "reply_usable": "1"}) + "&reply_usable=1"):
+        assert client.post("/form", content=body,
+                           headers={"content-type": "application/x-www-form-urlencoded"}).json() == {}
+    environment = Environment(loader=FileSystemLoader(APP / "templates"), autoescape=select_autoescape())
+    template = environment.get_template("admin/assistant_rules.html")
+    document = {"key": form["document"], **form, "text": form["content"], "reply_usable": False,
+                "revision": 0, "updated_at": None}
+    data = {"authorization": {"display_name": "Owner"}, "admin_role": "owner", "admin_landing_path": "/admin",
+            "admin_permissions": admin.admin_permissions.PAGE_KEYS, "permission_pages": admin.admin_permissions.PAGES,
+            "active_page": "assistant-rules", "csrf_token": "csrf", "document_key": document["key"],
+            "document": document, "edit": {**document, "reply_usable": True}, "can_edit_reply_usage": True,
+            "document_groups": [("运营助手", [document])], "max_document_chars": 24000,
+            "kind_labels": {"manual": "任务手册", "knowledge": "知识资料", "template": "输出模板"},
+            "status_labels": {"draft": "草稿", "published": "已发布", "archived": "已停用"},
+            "visibility_labels": {"all": "全体 CM", "owner": "仅 Owner"}, "form_error": "保留未保存的修改。"}
+    html = template.render(**data)
+    assert 'id="reply-usable" type="checkbox" name="reply_usable" value="1"' in html
+    assert re.search(r'<input[^>]*id="reply-usable"[^>]* checked', html)
+    assert "内部资料不要勾选" in html and "只生成草稿，不发送" in html
+    unsupported = template.render(**{**data, "edit": {**document, "kind": "template"}})
+    assert 'id="reply-usage-control" hidden' in unsupported
+    assert re.search(r'<input[^>]*id="reply-usable"[^>]* disabled', unsupported)
+    reply = {**document, "key": "reply-policy", "kind": "manual", "reply_usable": True}
+    fixed = template.render(**{**data, "document_key": reply["key"], "document": reply, "edit": reply,
+        "document_groups": [("回复处理", [reply])], "is_reply": True, "reply_usage": "回复边界",
+        "can_edit_reply_usage": False})
+    assert "固定用途：回复处理 · 回复边界" in fixed
+    assert 'name="kind" value="manual"' in fixed and 'name="visibility" value="all"' in fixed
+    assert 'id="document-status" name="status"' in fixed
+    assert '<input type="hidden" name="reply_usable" value="1">' in fixed
+    assert 'id="reply-usable"' not in fixed and "已接入桌面回复、事件回复和运营助手" in fixed
+    internal = template.render(**{**data, "can_edit_reply_usage": False})
+    assert 'id="reply-usable"' not in internal
 
 
 def test_matching_template_escapes_names_and_distinguishes_associations_from_historical_operator_suggestions():

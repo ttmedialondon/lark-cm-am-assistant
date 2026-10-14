@@ -26,6 +26,7 @@ _ERROR_MESSAGES = {
     "provider_timeout": "AI 请求超时，是否产生费用尚不确定；本请求不会自动重跑。",
     "invalid_ai_response": "AI 返回格式无效，本请求不会自动重跑。",
     "feature_disabled": "桌面回复功能当前未启用。",
+    "reply_rules_unavailable": "回复资料已停用或当前账号无权访问，请重新生成或联系管理员。",
     "actor_inactive": "账号授权已失效，请重新登录。",
     "unauthorized": "登录已失效，请重新登录。",
     "csrf_invalid": "请求校验失败，请刷新页面。",

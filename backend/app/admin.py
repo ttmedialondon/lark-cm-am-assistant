@@ -122,12 +122,13 @@ async def assistant_rule_fields(request: Request) -> dict[str, str]:
     if len(body) > max_bytes:
         return {}
     try:
-        fields = parse_qs(body.decode("utf-8"), keep_blank_values=True, errors="strict", max_num_fields=9)
+        fields = parse_qs(body.decode("utf-8"), keep_blank_values=True, errors="strict", max_num_fields=10)
     except (UnicodeError, ValueError):
         return {}
-    if (set(fields) != {"csrf_token", "document", "revision", "title", "description",
-                       "kind", "status", "visibility", "content"}
-            or any(len(values) != 1 for values in fields.values())):
+    required = {"csrf_token", "document", "revision", "title", "description",
+                "kind", "status", "visibility", "content"}
+    if (set(fields) - {"reply_usable"} != required or any(len(values) != 1 for values in fields.values())
+            or fields.get("reply_usable", ["1"])[0] != "1"):
         return {}
     return {key: values[0].replace("\r\n", "\n").replace("\r", "\n") for key, values in fields.items()}
 
@@ -334,24 +335,34 @@ def create_admin_router(
                                   render_template=render_template, return_url="/admin/assistant-rules")
         document = documents[key] if key else {
             "key": "", "title": "", "description": "", "kind": "manual", "status": "draft",
-            "visibility": "all", "text": "", "revision": 0, "updated_at": None,
+            "visibility": "all", "text": "", "revision": 0, "updated_at": None, "reply_usable": False,
         }
         edit = {**document, **({field: draft[field] for field in (
             "title", "description", "kind", "status", "visibility")} if draft else {})}
         edit["text"] = draft["content"] if draft else document["text"]
+        edit["reply_usable"] = draft.get("reply_usable") == "1" if draft else document.get("reply_usable", False)
         core = key in {"core", "understand", "evidence", "answer"}
         event = key in assistant_rules.EVENT_KEYS
         creator = key in assistant_rules.CREATOR_KEYS
+        reply = key in assistant_rules.REPLY_KEYS
         return render_template(request, "admin/assistant_rules.html", {
             **page_context(access_context, "assistant-rules"),
             "document_groups": [("运营助手", [item for name, item in documents.items()
-                                            if name not in assistant_rules.EVENT_KEYS | assistant_rules.CREATOR_KEYS]),
+                                            if name not in assistant_rules.EVENT_KEYS | assistant_rules.CREATOR_KEYS
+                                                | assistant_rules.REPLY_KEYS]),
+                                ("回复处理", [item for name, item in documents.items()
+                                            if name in assistant_rules.REPLY_KEYS]),
                                 ("事件总结", [item for name, item in documents.items()
                                             if name in assistant_rules.EVENT_KEYS]),
                                 ("达人识别", [item for name, item in documents.items()
                                             if name in assistant_rules.CREATOR_KEYS])],
             "document_key": key or "", "document": document, "edit": edit, "is_core": core, "is_event": event,
-            "is_creator": creator,
+            "is_creator": creator, "is_reply": reply,
+            "can_edit_reply_usage": not (core or event or creator or reply) and (
+                not key or key.startswith("doc-") or document["kind"] == "knowledge"),
+            "reply_usage": {"reply-policy": "回复边界", "reply-facts": "事实与来源", "reply-tone": "写作口吻",
+                            "reply-desktop": "桌面回复", "reply-event": "事件回复", "reply-samples": "样品跟进",
+                            "reply-collaboration": "合作咨询", "reply-activities": "活动问答"}.get(key),
             "event_usage": {"event-extraction": "事项抽取", "event-state": "处理状态",
                             "event-priority": "紧急度分级", "event-merge": "跨群合并"}.get(key),
             "creator_usage": {"creator-recognition-flow": "入口与任务准备", "creator-identity": "身份判定",
@@ -360,7 +371,7 @@ def create_admin_router(
             "kind_labels": {"rule": "规则", "manual": "任务手册", "knowledge": "知识资料", "template": "输出模板"},
             "status_labels": {"draft": "草稿", "published": "已发布", "archived": "已停用"},
             "visibility_labels": {"all": "全体 CM", "owner": "仅 Owner"},
-            "default_text": assistant_rules.default_text(key) if core or event or creator else None,
+            "default_text": assistant_rules.default_text(key) if core or event or creator or reply else None,
             "max_document_chars": assistant_rules.MAX_DOCUMENT_CHARS,
             "current_text": document["text"] if conflict else None,
             "form_error": error, "saved": bool(key and request.query_params.get("saved") == key),
@@ -1027,7 +1038,7 @@ def create_admin_router(
             with connection() as conn, conn.transaction():
                 saved_key = assistant_rules.save_document(conn, get_settings(), access_context["authorization"]["id"],
                     key, form["title"], form["description"], form["kind"], form["status"], form["visibility"],
-                    form["content"], revision)
+                    form["content"], revision, reply_usable=form.get("reply_usable") == "1")
         except assistant_rules.RuleConflict as exc:
             return render_assistant_rules(request, access_context, key, error=str(exc), status_code=409,
                                           draft=form, conflict=True)

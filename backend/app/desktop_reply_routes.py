@@ -150,6 +150,7 @@ def create_router(*, current_authorization, csrf_token):
         stopped = asyncio.Event()
         usage = {}
         telemetry = {}
+        progress = {}
         failure = None
         try:
             async with asyncio.timeout(TOTAL_TIMEOUT):
@@ -168,6 +169,7 @@ def create_router(*, current_authorization, csrf_token):
                 if state == "cached":
                     value = json.loads(cipher.decrypt(receipt["result_ciphertext"]))
                     value["request_id"] = payload["request_id"]
+                    value = await run_in_threadpool(replies.public_result, actor, value)
                     await run_in_threadpool(authenticate, request, current_authorization, csrf_token)
                     return response(value)
                 config, api_key = await run_in_threadpool(replies.configuration, settings)
@@ -176,6 +178,7 @@ def create_router(*, current_authorization, csrf_token):
                 remaining = TOTAL_TIMEOUT - (time.monotonic() - started)
                 model_task = asyncio.create_task(replies.generate(
                     payload, actor, config, api_key, total_timeout=min(45.0, remaining),
+                    settings=settings, progress=progress,
                 ))
                 watcher = asyncio.create_task(disconnected(request, stopped))
                 done, _ = await asyncio.wait((model_task, watcher), return_when=asyncio.FIRST_COMPLETED)
@@ -190,7 +193,7 @@ def create_router(*, current_authorization, csrf_token):
                 if not saved:
                     raise replies.ReplyError("abandoned", "请求已失效，请重新生成。", 409)
                 await run_in_threadpool(authenticate, request, current_authorization, csrf_token)
-                return response(result)
+                return response(await run_in_threadpool(replies.public_result, actor, result))
         except (AuthError, ReplyInputError, replies.ReplyError) as exc:
             failure = exc
             usage = getattr(exc, "usage", None) or usage
@@ -238,6 +241,9 @@ def create_router(*, current_authorization, csrf_token):
                 elif model_error is None:
                     completed = model_task.result()
                     usage, telemetry = completed[1] or usage, completed[2] or telemetry
+            if progress:
+                usage = progress['usage']
+                telemetry = progress['telemetry']
             if failure is not None and receipt is not None and receipt["claim_status"] == "new":
                 failure.code, failure.message = store.safe_error(failure.code, failure.message)
                 context_reason = next((key for key, message in store.CONTEXT_MESSAGES.items()

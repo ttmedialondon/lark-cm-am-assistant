@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
-from . import ai_dispatch
+from . import ai_dispatch, reply_rules
 from . import assistant_rules as rules
 from . import assistant_tools as tools
 from . import assistant_window as windows
@@ -681,6 +681,8 @@ def _history(conn, row, settings, context, *, read_cache=None):
             material = _saved_window_material(checkpoint, checked.get('data_refs', []))
             history.append({'role': 'user', 'content': codec.decode(previous['input_ciphertext'], settings)['message']})
             history.append({'role': 'assistant', 'content': json.dumps({
+                'reply_internal_sources': bool(checkpoint.get('reply_unsafe_history')) or any(
+                    reply_rules.internal_only(document) for document in _loaded_documents(checkpoint)),
                 'answer': checked['answer'], 'events': checked.get('events', [])[:25],
                 'scope': checked.get('scope', {}), 'window': checked.get('window'),
                 'checked_at': checked.get('checked_at') or next((item.get('checked_at')
@@ -812,6 +814,9 @@ def step(job, settings):
                     if call['name'] == 'read_documents':
                         tools._validate(call['name'], args)
                         args['document_ids'] = sorted(set(args['document_ids']))
+                    if (call['name'] in {'draft_reply', 'save_reply_draft'} or
+                            (call['name'] == 'read_documents' and 'reply-writing' in args['document_ids'])):
+                        checkpoint['reply_requested'] = True
                     if call['name'] == 'summarize_messages' and args.get('audience') == 'all':
                         tools._validate('summarize_messages', args)
                         start, end = tools._window(args['start'], args['end'], row['created_at'])
@@ -847,6 +852,13 @@ def step(job, settings):
                         current_turn = {**row, 'checkpoint_ciphertext': codec.encode(checkpoint, settings)}
                         if call['name'] == 'read_documents':
                             keys = args['document_ids']
+                            replying = (checkpoint.get('reply_requested') or any(document['key'] == 'reply-writing'
+                                            for document in _loaded_documents(checkpoint))
+                                        or any(result.get('_reply_material') for result in checkpoint['tool_results']))
+                            if replying and (checkpoint.get('reply_unsafe_history') or any(
+                                               reply_rules.internal_only(checkpoint['rules']['documents'][key])
+                                               for key in keys if key in checkpoint['rules']['documents'])):
+                                raise PermissionError('对话含仅供内部查询的资料，请开启新对话起草。')
                             was_cached = set(keys) <= {document['key'] for document in _loaded_documents(checkpoint)}
                             rules.validate_access(conn, checkpoint['rules'], keys,
                                                   owner=context.get('can_query_other_cm', False))
@@ -897,6 +909,8 @@ def step(job, settings):
             return
         if not checkpoint['items']:
             history, results = _history(conn, row, settings, context, read_cache=read_cache)
+            checkpoint['reply_unsafe_history'] = any(json.loads(item['content']).get('reply_internal_sources')
+                for item in history if item.get('role') == 'assistant')
             checkpoint['tool_results'] = results
             checkpoint['followup_scope'] = json.loads(history[-1]['content']).get('scope', {}) if history else {}
             checkpoint['items'] = history + [{'role': 'user', 'content': json.dumps({
@@ -921,9 +935,21 @@ def step(job, settings):
             model_instructions = rules.main_instructions(checkpoint['rules'])
             loaded_documents = _loaded_documents(checkpoint)
             if (checkpoint['rules'].get('protocol') != 2
+                    or checkpoint.get('reply_requested')
                     or any(document['key'] == 'reply-writing' for document in loaded_documents)
                     or any(result.get('_reply_material') for result in checkpoint['tool_results'])):
                 model_instructions += '\n' + REPLY_INSTRUCTIONS
+                if checkpoint['rules'].get('reply_protocol') == 'reply-documents-v1':
+                    if (checkpoint.get('reply_unsafe_history') or any(reply_rules.internal_only(document)
+                                                                     for document in loaded_documents)):
+                        raise PermissionError('对话含仅供内部查询的资料，请开启新对话起草。')
+                    pinned_reply = reply_rules.from_snapshot(checkpoint['rules'], 'assistant')
+                    allowed = {item['key'] for item in reply_rules.catalog(pinned_reply)}
+                    ids = list(dict.fromkeys(document['key'] for document in loaded_documents
+                                             if document['key'] in allowed))
+                    reply_rules.validate_access(conn, row['actor_id'], pinned_reply, ids)
+                    model_instructions = rules.main_instructions(checkpoint['rules']) + '\n' + reply_rules.instructions(
+                        pinned_reply, 'assistant', loaded=ids)
             documents_ready = (any(document['kind'] == 'manual' for document in loaded_documents)
                                or not any(document['kind'] == 'manual'
                                           for document in checkpoint['rules'].get('catalog', [])))

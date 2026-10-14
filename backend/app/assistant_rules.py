@@ -20,6 +20,9 @@ KEYS = frozenset(item["key"] for item in DOCUMENTS)
 EVENT_KEYS = frozenset(("event-extraction", "event-state", "event-priority", "event-merge"))
 CREATOR_KEYS = frozenset(("creator-recognition-flow", "creator-identity", "creator-handle-link",
                           "creator-evidence", "creator-admission", "creator-regression"))
+REPLY_KEYS = frozenset(("reply-policy", "reply-facts", "reply-tone", "reply-desktop", "reply-event",
+                        "reply-samples", "reply-collaboration", "reply-activities"))
+REPLY_SHARED_KEYS = frozenset(("reply-policy", "reply-facts", "reply-tone", "reply-desktop", "reply-event"))
 CREATOR_STAGES = {
     "prepare": ("creator-recognition-flow", "creator-evidence"),
     "identity": ("creator-identity", "creator-evidence"),
@@ -66,6 +69,8 @@ def _seed_text(item):
 def _snapshot(documents, *, metadata=False):
     names = (("revision", "digest", "title", "description", "kind", "status", "visibility")
              if metadata or "kind" in documents.get("core", {}) else ("revision", "digest"))
+    if any("reply_usable" in item for item in documents.values()):
+        names = (*names, "reply_usable")
     return {"documents": documents, "digest": _digest(json.dumps(
         {key: {name: documents[key].get(name) for name in names}
          for key in sorted(documents)}, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
@@ -106,6 +111,8 @@ def _entry(key, text, metadata, *, revision=0, updated_by=None, updated_at=None)
     validate(key, text)
     return {"key": key, **{name: metadata[name] for name in ("title", "description", "kind", "status", "visibility")},
             "text": text, "revision": revision, "digest": _digest(text),
+            **({"reply_usable": bool(metadata.get("reply_usable", key in REPLY_KEYS))}
+               if key not in EVENT_KEYS | CREATOR_KEYS else {}),
             "updated_by": str(updated_by) if updated_by else None,
             "updated_at": updated_at.isoformat() if updated_at else None}
 
@@ -123,10 +130,10 @@ def snapshot(conn, settings, *, owner=False):
     documents = {key: item for key, item in library(conn, settings).items()
                  if key not in EVENT_KEYS | CREATOR_KEYS and item["status"] == "published"
                  and (item["visibility"] == "all" or owner)}
-    return {**_snapshot(documents), "protocol": 2, "catalog": [
+    return {**_snapshot(documents), "protocol": 2, "reply_protocol": "reply-documents-v1", "catalog": [
         {**{name: item[name] for name in ("key", "title", "kind")},
          "description": item["description"][:240]}
-        for item in documents.values() if item["kind"] != "rule"]}
+        for item in documents.values() if item["kind"] != "rule" and item["key"] not in REPLY_SHARED_KEYS]}
 
 
 def event_snapshot(conn, settings):
@@ -284,16 +291,25 @@ def _metadata(key, title, description, kind, status, visibility):
         raise ValueError("事件总结手册固定为已发布的后台专用手册；暂停处理请使用 AI 功能开关。")
     if key in CREATOR_KEYS and (kind != "manual" or visibility != "owner"):
         raise ValueError("达人识别手册的类型和后台专用范围固定。")
+    if key in REPLY_KEYS and (kind != "manual" or visibility != "all"):
+        raise ValueError("回复处理手册固定为全体 CM 可用的任务手册。")
     if key not in KEYS and kind == "rule":
         raise ValueError("不能新增基础规则，请选择任务手册、知识资料或输出模板。")
 
 
-def save_document(conn, settings, actor_id, key_or_none, title, description, kind, status, visibility, text, revision):
+def save_document(conn, settings, actor_id, key_or_none, title, description, kind, status, visibility, text, revision,
+                  *, reply_usable=False):
     key = key_or_none if key_or_none is not None else "doc-" + str(uuid4())
     if isinstance(text, str):
         text = text.replace("\r\n", "\n").replace("\r", "\n")
     validate(key, text)
     _metadata(key, title, description, kind, status, visibility)
+    if type(reply_usable) is not bool:
+        raise ValueError("回复资料使用标记无效。")
+    if key in REPLY_KEYS:
+        reply_usable = True
+    elif reply_usable and (kind not in {"knowledge", "manual"} or not key.startswith("doc-")):
+        raise ValueError("只有知识资料或自定义处理手册可以批准用于回复起草。")
     if type(revision) is not int or not 0 <= revision < 2_147_483_647:
         raise ValueError("规则版本无效，请刷新页面后重试。")
     account = conn.execute("SELECT status FROM authorizations WHERE id=%s FOR NO KEY UPDATE", (actor_id,)).fetchone()
@@ -312,14 +328,14 @@ def save_document(conn, settings, actor_id, key_or_none, title, description, kin
         raise RuleConflict("文档已被更新。你的修改已保留在编辑框，请核对当前版本后重新保存。")
     next_revision = revision + 1
     conn.execute("""INSERT INTO assistant_rule_overrides
-        (rule_key,content_ciphertext,revision,updated_by_authorization_id,title,description,kind,status,visibility)
-        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        (rule_key,content_ciphertext,revision,updated_by_authorization_id,title,description,kind,status,visibility,reply_usable)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT(rule_key) DO UPDATE SET content_ciphertext=EXCLUDED.content_ciphertext,
         revision=EXCLUDED.revision,updated_by_authorization_id=EXCLUDED.updated_by_authorization_id,updated_at=NOW(),
         title=EXCLUDED.title,description=EXCLUDED.description,kind=EXCLUDED.kind,status=EXCLUDED.status,
-        visibility=EXCLUDED.visibility""",
+        visibility=EXCLUDED.visibility,reply_usable=EXCLUDED.reply_usable""",
         (key, codec.encode(text, settings), next_revision, actor_id, title.strip(), description.strip(),
-         kind, status, visibility))
+         kind, status, visibility, reply_usable))
     if (key in CREATOR_KEYS - {"creator-regression"} and status == "published"
             and current and current["status"] != "published"):
         states = {name: item["status"] for name, item in _defaults().items() if name in CREATOR_KEYS}
@@ -351,7 +367,7 @@ def save_document(conn, settings, actor_id, key_or_none, title, description, kin
         (uuid4(), actor_id, "assistant_rule_updated",
          json.dumps({"document": key, "before_revision": revision,
                      "revision": next_revision, "digest": _digest(text), "kind": kind,
-                     "status": status, "visibility": visibility})))
+                     "status": status, "visibility": visibility, "reply_usable": reply_usable})))
     return key
 
 

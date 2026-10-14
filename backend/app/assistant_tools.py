@@ -16,6 +16,7 @@ from . import (
     assistant_worklist,
     creator_importance,
     message_materials,
+    reply_rules,
     summary_replies,
 )
 from . import offhours_summary as summaries
@@ -636,6 +637,8 @@ def _saved_reply(conn, actor_id, turn, ref, settings):
 
 def _validate_reply_material(conn, actor_id, result, settings, context, *, turn=None, read_cache=None):
     saved = result["_reply_material"]
+    if saved.get("reply_rules"):
+        reply_rules.validate_access(conn, actor_id, saved["reply_rules"], saved.get("reply_document_ids", []))
     source = saved["source"]
     context = context_for_scope(conn, actor_id, context, saved["scope"], read_cache=read_cache)
     if source["kind"] == "message":
@@ -723,6 +726,18 @@ def _prepare_reply(conn, actor_id, turn, args, settings, context, *, read_cache=
     digest = summaries._hash([source, data["fingerprint"], args])[0:20]
     ref = f"d.{turn['id']}.{digest}"
     saved = {"source": source, "context": data, "scope": data["scope"], "request": args}
+    checkpoint = codec.decode(turn.get("checkpoint_ciphertext"), settings) or {}
+    pinned = checkpoint.get("rules", {})
+    if pinned.get("reply_protocol") == "reply-documents-v1":
+        reply_pin = reply_rules.from_snapshot(pinned, "assistant")
+        loaded = [document for result in checkpoint.get("tool_results", []) if result.get("kind") == "documents"
+                  for document in result["documents"]]
+        if checkpoint.get("reply_unsafe_history") or any(reply_rules.internal_only(document) for document in loaded):
+            raise PermissionError("当前对话含仅供内部查询的资料，请开启新对话起草，避免混入内部资料。")
+        ids = list(dict.fromkeys(document["key"] for document in loaded
+                                 if document["key"] in {item["key"] for item in reply_rules.catalog(reply_pin)}))
+        reply_rules.validate_access(conn, actor_id, reply_pin, ids)
+        saved.update(reply_rules=reply_pin, reply_document_ids=ids)
     _audit_context(conn, actor_id, source["ref"], "reply", len(data["messages"]))
     return {"kind": "reply_material", "draft_ref": ref, "status": "prepared", "action": action,
             "instruction": args["instruction"], "language": args["language"], "edited_draft": args["edited_draft"],
@@ -737,6 +752,16 @@ def _save_reply(conn, actor_id, turn, args, settings, context, *, read_cache=Non
     prepared = _saved_reply(conn, actor_id, turn, args["draft_ref"], settings)
     material = _validate_reply_material(conn, actor_id, prepared, settings, context, turn=turn, read_cache=read_cache)
     saved = prepared["_reply_material"]
+    if saved.get("reply_rules"):
+        checkpoint = codec.decode(turn.get("checkpoint_ciphertext"), settings) or {}
+        loaded = [document for result in checkpoint.get("tool_results", []) if result.get("kind") == "documents"
+                  for document in result["documents"]]
+        if checkpoint.get("reply_unsafe_history") or any(reply_rules.internal_only(document) for document in loaded):
+            raise PermissionError("仅供内部查询的知识不能用于对外回复。")
+        allowed = {item["key"] for item in reply_rules.catalog(saved["reply_rules"])}
+        ids = list(dict.fromkeys(document["key"] for document in loaded if document["key"] in allowed))
+        reply_rules.validate_access(conn, actor_id, saved["reply_rules"], ids)
+        saved = {**saved, "reply_document_ids": ids}
     known = {item["ref"]: item for item in material["messages"]}
     target = material["message"]
     target_refs = [ref for ref, item in known.items()
@@ -767,6 +792,10 @@ def _save_reply(conn, actor_id, turn, args, settings, context, *, read_cache=Non
                  context={key: value for key, value in material.items() if key != "fingerprint"},
                  evidence=[known[ref] for ref in dict.fromkeys(evidence_refs)],
                  checked_at=material["checked_at"])
+    if saved.get("reply_rules"):
+        draft["knowledge_sources"] = [
+            {key: item[key] for key in ("document_ref", "title", "revision")}
+            for item in reply_rules.knowledge(saved["reply_rules"], saved["reply_document_ids"])]
     return {"kind": "reply_draft", "draft_ref": args["draft_ref"], "status": "completed",
             "source_ref": source["ref"], source["kind"] + "_ref": source["ref"],
             "scope": material["scope"], "draft": draft, "_reply_material": saved}

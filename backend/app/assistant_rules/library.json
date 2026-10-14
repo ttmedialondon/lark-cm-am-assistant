@@ -196,5 +196,45 @@
     "path": "manuals/creator-regression.md",
     "status": "published",
     "visibility": "owner"
+  },
+  {
+    "key": "reply-policy", "title": "回复事实与处理边界",
+    "description": "三个回复入口的共同事实、权限、承诺与草稿边界，不发送或修改业务状态。",
+    "kind": "manual", "path": "manuals/reply-policy.md", "status": "published", "visibility": "all"
+  },
+  {
+    "key": "reply-facts", "title": "知识选择与事实核验",
+    "description": "按诉求读取已批准知识，核对品牌、市场、有效期和当前进展，区分资料、手册与实际操作。",
+    "kind": "manual", "path": "manuals/reply-facts.md", "status": "published", "visibility": "all"
+  },
+  {
+    "key": "reply-tone", "title": "回复口吻与翻译",
+    "description": "自然简洁的聊天语气、本人风格与忠实中文参考，不用样例承诺替代真实事实。",
+    "kind": "manual", "path": "manuals/reply-tone.md", "status": "published", "visibility": "all"
+  },
+  {
+    "key": "reply-desktop", "title": "桌面选区与可见对话回复",
+    "description": "固定选区或可见对话目标，使用本次文字及已选知识，不凭窗口名称读取服务器历史。",
+    "kind": "manual", "path": "manuals/reply-desktop.md", "status": "published", "visibility": "all"
+  },
+  {
+    "key": "reply-event", "title": "事件回复的取材、状态与翻译",
+    "description": "完整取材、最新进展、ready/waiting/resolved/verify判断与纯翻译，仍由原队列执行。",
+    "kind": "manual", "path": "manuals/reply-event.md", "status": "published", "visibility": "all"
+  },
+  {
+    "key": "reply-samples", "title": "样品申请与寄送咨询",
+    "description": "Can I get a sample、样品未收到、尺码色号、寄送与拍摄安排；不处理付费合作付款和活动报名。",
+    "kind": "manual", "path": "manuals/reply-samples.md", "status": "published", "visibility": "all"
+  },
+  {
+    "key": "reply-collaboration", "title": "合作邀请与内容沟通",
+    "description": "targeted collaboration invite、合作方式、视频直播与内容履约；不处理物流、付款审批或活动报名。",
+    "kind": "manual", "path": "manuals/reply-collaboration.md", "status": "published", "visibility": "all"
+  },
+  {
+    "key": "reply-activities", "title": "活动信息与报名沟通",
+    "description": "is it too late to attend、活动时间地点、报名、名额与出席确认；不处理普通商品合作、物流或付款。",
+    "kind": "manual", "path": "manuals/reply-activities.md", "status": "published", "visibility": "all"
   }
 ]

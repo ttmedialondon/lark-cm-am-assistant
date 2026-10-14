@@ -6,7 +6,7 @@
   {% include "admin/_nav.html" %}
   <div class="page-wrapper"><div class="page-body pt-0"><div class="container-xl">
     <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3"><h2 class="mb-0">助手文档</h2><a class="btn btn-primary" href="/admin/assistant-rules?new=1">新建文档</a></div>
-    <p class="text-secondary small">运营助手按问题选用文档；事件总结与达人识别按处理阶段读取。修改用于新任务，原任务保留原版本。</p>
+    <p class="text-secondary small">运营助手按问题选用文档；回复、事件总结与达人识别按处理阶段读取。修改用于新任务，原任务保留原版本。</p>
     {% if form_error %}<div class="alert alert-danger" role="alert">{{ form_error }}</div>{% endif %}
     {% if saved %}<div class="alert alert-success" role="status">文档已保存。</div>{% endif %}
     <div class="row g-3">
@@ -22,14 +22,16 @@
       <h3 class="mb-3">{% if document_key %}编辑文档{% else %}新建文档{% endif %}</h3>
       {% if is_event %}<p class="text-secondary small">固定用途：事件总结 · {{ event_usage }}</p>{% endif %}
       {% if is_creator %}<p class="text-secondary small">固定用途：达人识别 · {{ creator_usage }}</p>{% endif %}
+      {% if is_reply %}<p class="text-secondary small">固定用途：回复处理 · {{ reply_usage }}</p>{% endif %}
       <form method="post" action="/admin/assistant-rules">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="document" value="{{ document_key }}"><input type="hidden" name="revision" value="{{ document.revision }}">
+        {% if is_reply %}<input type="hidden" name="reply_usable" value="1">{% endif %}
         <div class="mb-3"><label class="form-label" for="document-title">名称</label><input class="form-control" id="document-title" name="title" value="{{ edit.title }}" maxlength="160" required></div>
-        <div class="mb-3"><label class="form-label" for="document-description">{% if is_event or is_creator %}用途说明{% else %}适用问题与说明{% endif %}</label><textarea class="form-control" id="document-description" name="description" rows="2" maxlength="1000" placeholder="{% if is_event or is_creator %}说明这份手册的处理用途。{% else %}说明它适合回答什么问题，供助手选择相关文档。{% endif %}">{{ edit.description }}</textarea></div>
+        <div class="mb-3"><label class="form-label" for="document-description">{% if is_event or is_creator or is_reply %}用途说明{% else %}适用问题与说明{% endif %}</label><textarea class="form-control" id="document-description" name="description" rows="2" maxlength="1000" placeholder="{% if is_event or is_creator or is_reply %}说明这份手册的处理用途。{% else %}说明它适合回答什么问题，供助手选择相关文档。{% endif %}">{{ edit.description }}</textarea></div>
         <div class="row g-3 mb-3">
           <div class="col-md-4"><label class="form-label" for="document-kind">类型</label>
             {% if is_core %}<input type="hidden" name="kind" value="rule"><input class="form-control" id="document-kind" value="规则" readonly>
-            {% elif is_event or is_creator %}<input type="hidden" name="kind" value="manual"><input class="form-control" id="document-kind" value="任务手册" readonly>
+            {% elif is_event or is_creator or is_reply %}<input type="hidden" name="kind" value="manual"><input class="form-control" id="document-kind" value="任务手册" readonly>
             {% else %}<select class="form-select" id="document-kind" name="kind">{% for key, label in kind_labels.items() if key != 'rule' %}<option value="{{ key }}"{% if edit.kind == key %} selected{% endif %}>{{ label }}</option>{% endfor %}</select>{% endif %}
           </div>
           <div class="col-md-4"><label class="form-label" for="document-status">状态</label>
@@ -37,16 +39,20 @@
             {% else %}<select class="form-select" id="document-status" name="status">{% for key, label in status_labels.items() %}<option value="{{ key }}"{% if edit.status == key %} selected{% endif %}>{{ label }}</option>{% endfor %}</select>{% endif %}
           </div>
           <div class="col-md-4"><label class="form-label" for="document-visibility">发布范围</label>
-            {% if is_core %}<input type="hidden" name="visibility" value="all"><input class="form-control" id="document-visibility" value="全体 CM" readonly>
+            {% if is_core or is_reply %}<input type="hidden" name="visibility" value="all"><input class="form-control" id="document-visibility" value="全体 CM" readonly>
             {% elif is_event or is_creator %}<input type="hidden" name="visibility" value="owner"><input class="form-control" id="document-visibility" value="后台专用" readonly>
             {% else %}<select class="form-select" id="document-visibility" name="visibility">{% for key, label in visibility_labels.items() %}<option value="{{ key }}"{% if edit.visibility == key %} selected{% endif %}>{{ label }}</option>{% endfor %}</select>{% endif %}
           </div>
         </div>
+        {% if can_edit_reply_usage %}<div class="mb-3" id="reply-usage-control"{% if edit.kind not in ['knowledge', 'manual'] %} hidden{% endif %}>
+          <label class="form-check"><input class="form-check-input" id="reply-usable" type="checkbox" name="reply_usable" value="1" aria-describedby="reply-usage-hint"{% if edit.reply_usable %} checked{% endif %}{% if edit.kind not in ['knowledge', 'manual'] %} disabled{% endif %}><span class="form-check-label">可用于回复起草</span></label>
+          <div class="text-secondary small" id="reply-usage-hint">允许三个回复入口读取；内部资料不要勾选。只生成草稿，不发送。</div>
+        </div>{% endif %}
         {% if is_core %}<p class="text-secondary small">基础规则始终发布给全体 CM，类型、状态和范围不可更改。核心与证据规则须保留原有主对话、分段归纳标题。</p>{% endif %}
         <label class="form-label" for="rule-content">Markdown 正文</label>
         <textarea class="form-control assistant-rules__editor" id="rule-content" name="content" rows="24" maxlength="{{ max_document_chars }}" aria-describedby="document-scope-hint" required spellcheck="false">{{ edit.text }}</textarea>
-        <p class="text-secondary small mt-2 mb-0" id="document-scope-hint">{% if is_creator and document_key == 'creator-regression' %}开发验收手册，不随生产请求发送全文。保存不触发识别或重跑；仅供 Owner 管理，不参与运营助手导航。{% elif is_creator %}已接入名单导入、新人员识别和账号补配。修改用于新准备的任务；草稿或停用会暂停依赖此手册的任务。不全量重跑，不修改已有确认关系。仅供 Owner 管理，不参与运营助手导航。{% elif is_event %}后台专用手册不参与运营助手导航，也不展示给 CM；事件总结的人员范围仍由原有权限决定。修改用于新报告，不全量重跑；暂停请使用 AI 配置中的对应功能开关。{% else %}发布为「全体 CM」后，会用于所有已接入 CM 的助手。草稿和停用文档不参与处理；知识资料建议仅向 Owner 发布，其正文只提供事实，不授予访问权限。{% endif %}</p>
-        <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mt-3"><span class="text-secondary small">当前版本 {{ document.revision }}{% if is_core and document.revision == 0 %} · 默认规则{% elif (is_event or is_creator) and document.revision == 0 %} · 默认手册{% endif %}{% if document.updated_at %} · {{ document.updated_at }}{% endif %}</span><button class="btn btn-primary" type="submit">保存文档</button></div>
+        <p class="text-secondary small mt-2 mb-0" id="document-scope-hint">{% if is_reply %}已接入桌面回复、事件回复和运营助手。修改用于新草稿；草稿或停用会暂停相关阶段。只生成草稿，不发送。{% elif is_creator and document_key == 'creator-regression' %}开发验收手册，不随生产请求发送全文。保存不触发识别或重跑；仅供 Owner 管理，不参与运营助手导航。{% elif is_creator %}已接入名单导入、新人员识别和账号补配。修改用于新准备的任务；草稿或停用会暂停依赖此手册的任务。不全量重跑，不修改已有确认关系。仅供 Owner 管理，不参与运营助手导航。{% elif is_event %}后台专用手册不参与运营助手导航，也不展示给 CM；事件总结的人员范围仍由原有权限决定。修改用于新报告，不全量重跑；暂停请使用 AI 配置中的对应功能开关。{% else %}发布为「全体 CM」后，会用于所有已接入 CM 的助手。草稿和停用文档不参与处理；资料访问范围仍由现有权限决定。{% endif %}</p>
+        <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mt-3"><span class="text-secondary small">当前版本 {{ document.revision }}{% if is_core and document.revision == 0 %} · 默认规则{% elif (is_event or is_creator or is_reply) and document.revision == 0 %} · 默认手册{% endif %}{% if document.updated_at %} · {{ document.updated_at }}{% endif %}</span><button class="btn btn-primary" type="submit">保存文档</button></div>
       </form>
       {% if current_text %}<details class="mt-3" open><summary>当前已保存版本（请核对后再保存编辑框）</summary><pre class="assistant-rules__preview mt-2">{{ current_text }}</pre></details>{% endif %}
       {% if default_text %}<details class="mt-3 text-secondary"><summary>查看默认规则</summary><pre class="assistant-rules__preview mt-2">{{ default_text }}</pre></details>{% endif %}
@@ -59,6 +65,21 @@
   const selectedDocument = documentDirectory.querySelector('[aria-current="page"]');
   if (selectedDocument) documentDirectory.scrollTop += selectedDocument.getBoundingClientRect().top - documentDirectory.getBoundingClientRect().top;
 }
+{% if can_edit_reply_usage %}
+{
+  const kind = document.getElementById('document-kind');
+  const usage = document.getElementById('reply-usage-control');
+  const checkbox = document.getElementById('reply-usable');
+  function updateReplyUsage() {
+    const available = ['knowledge', 'manual'].includes(kind.value);
+    usage.hidden = !available;
+    checkbox.disabled = !available;
+    if (!available) checkbox.checked = false;
+  }
+  kind.addEventListener('change', updateReplyUsage);
+  updateReplyUsage();
+}
+{% endif %}
 {% if not document_key %}
 document.getElementById('document-kind').addEventListener('change', function () {
   if (this.value === 'knowledge') document.getElementById('document-visibility').value = 'owner';
