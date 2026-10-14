@@ -299,13 +299,15 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     pinned = assistant_rules.snapshot(pg, settings)
     defaults = assistant_rules.builtin_snapshot()
     assert pinned["protocol"] == 2 and len(pinned["documents"]) == 16 and len(pinned["catalog"]) == 12
-    assert len(assistant_rules.library(pg, settings)) == 20
+    assert len(assistant_rules.library(pg, settings)) == 26
+    backend_keys = assistant_rules.EVENT_KEYS | assistant_rules.CREATOR_KEYS
     for owner_scope in (False, True):
         navigation = assistant_rules.snapshot(pg, settings, owner=owner_scope)
-        assert not assistant_rules.EVENT_KEYS.intersection(navigation["documents"])
-        assert not assistant_rules.EVENT_KEYS.intersection(item["key"] for item in navigation["catalog"])
-        with pytest.raises(PermissionError):
-            assistant_rules.read_documents(navigation, ["event-extraction"])
+        assert not backend_keys.intersection(navigation["documents"])
+        assert not backend_keys.intersection(item["key"] for item in navigation["catalog"])
+        for backend_key in backend_keys:
+            with pytest.raises(PermissionError):
+                assistant_rules.read_documents(navigation, [backend_key])
     assert {key: pinned["documents"][key]["text"] for key in assistant_rules.KEYS} == {
         key: document["text"] for key, document in defaults["documents"].items()}
     pinned_before = json.dumps(pinned, sort_keys=True)
@@ -394,6 +396,42 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     for field, value in (("kind", "knowledge"), ("status", "draft"), ("status", "archived"), ("visibility", "all")):
         assert client.post(path, data={**event_form, "revision": "1", field: value}).status_code == 400
     assert assistant_rules.library(pg, settings)["event-extraction"]["revision"] == 1
+    creator_key = "creator-identity"
+    creator_page = client.get(path + "?document=" + creator_key)
+    assert creator_page.status_code == 200 and "达人识别" in creator_page.text
+    assert "固定用途：达人识别 · 处理规范" in creator_page.text
+    assert "处理规范尚未接入自动执行；保存不触发识别或重跑" in creator_page.text
+    assert 'name="kind" value="manual"' in creator_page.text and 'name="visibility" value="owner"' in creator_page.text
+    assert 'id="document-status" name="status"' in creator_page.text and "查看默认规则" in creator_page.text
+    assert '<select class="form-select" id="document-kind"' not in creator_page.text
+    assert '<select class="form-select" id="document-visibility"' not in creator_page.text
+    creator_document = assistant_rules.library(pg, settings)[creator_key]
+    creator_content = creator_document["text"] + "\n测试识别规范 <script>alert(3)</script>。"
+    creator_form = {"csrf_token": "csrf", "document": creator_key, "revision": "0", "content": creator_content,
+                    **{name: creator_document[name]
+                       for name in ("title", "description", "kind", "status", "visibility")}}
+    assert client.post(path, data={**creator_form, "csrf_token": "wrong"}).status_code == 400
+    assert client.post(path, data=creator_form, follow_redirects=False).status_code == 303
+    creator_row = pg.execute("SELECT * FROM assistant_rule_overrides WHERE rule_key=%s", (creator_key,)).fetchone()
+    assert creator_row["revision"] == 1 and creator_content not in creator_row["content_ciphertext"]
+    assert assistant_rules.library(pg, settings)[creator_key]["text"] == creator_content
+    assert assistant_rules.snapshot(pg, settings, owner=True) == navigation_before
+    creator_conflict = client.post(path, data={**creator_form, "content": creator_content + "\n未保存的识别修改。"})
+    assert creator_conflict.status_code == 409 and "未保存的识别修改。" in creator_conflict.text
+    assert "当前已保存版本" in creator_conflict.text and "<script>alert(3)</script>" not in creator_conflict.text
+    assert "&lt;script&gt;alert(3)&lt;/script&gt;" in creator_conflict.text
+    for field, value in (("kind", "knowledge"), ("visibility", "all")):
+        assert client.post(path, data={**creator_form, "revision": "1", field: value}).status_code == 400
+    for revision, status in enumerate(("draft", "published", "archived"), 1):
+        assert client.post(path, data={**creator_form, "revision": str(revision), "status": status},
+                           follow_redirects=False).status_code == 303
+        assert assistant_rules.library(pg, settings)[creator_key]["status"] == status
+        assert assistant_rules.snapshot(pg, settings, owner=True) == navigation_before
+    creator_audit = pg.execute("SELECT metadata FROM audit_events WHERE action='assistant_rule_updated' "
+        "AND metadata->>'document'=%s ORDER BY (metadata->>'revision')::int DESC LIMIT 1",
+        (creator_key,)).fetchone()["metadata"]
+    assert creator_audit["revision"] == 4 and "content" not in creator_audit
+    assert "测试识别" not in json.dumps(creator_audit, ensure_ascii=False)
     session["auth"] = {"id": member, "status": "active"}
     assert client.get(path).status_code == 403 and client.post(path, data=form).status_code == 403
     assert client.get(path + "?new=1").status_code == 403
@@ -401,13 +439,22 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     assert client.post(path, data=publish_form).status_code == 403
     assert client.get(path + "?document=event-extraction").status_code == 403
     assert client.post(path, data=event_form).status_code == 403
+    assert client.get(path + "?document=" + creator_key).status_code == 403
+    assert client.post(path, data=creator_form).status_code == 403
     session["auth"] = {"id": owner, "status": "active"}
     pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (owner,))
     assert client.get(path).status_code == 403 and client.post(path, data=form).status_code == 403
     assert client.post(path, data=event_form).status_code == 403
+    assert client.post(path, data=creator_form).status_code == 403
     with pg.transaction(), pytest.raises(PermissionError):
         assistant_rules.save_override(pg, settings, owner, "core", content, 1)
+    with pg.transaction(), pytest.raises(PermissionError):
+        assistant_rules.save_document(pg, settings, owner, creator_key, creator_document["title"],
+            creator_document["description"], "manual", "published", "owner", creator_content, 4)
     assert pg.execute("SELECT revision FROM assistant_rule_overrides WHERE rule_key='core'").fetchone()["revision"] == 1
+    saved_creator = pg.execute("SELECT revision FROM assistant_rule_overrides WHERE rule_key=%s",
+                              (creator_key,)).fetchone()
+    assert saved_creator["revision"] == 4
 
 
 @pytest.mark.parametrize("feature", [

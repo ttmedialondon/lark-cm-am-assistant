@@ -142,5 +142,59 @@
     "path": "manuals/event-merge.md",
     "status": "published",
     "visibility": "owner"
+  },
+  {
+    "key": "creator-recognition-flow",
+    "title": "达人识别流程与入口",
+    "description": "固定导入名单、新联系人及已确认达人的处理分支，明确现行能力、待接入环节和各阶段所需手册。",
+    "kind": "manual",
+    "path": "manuals/creator-recognition-flow.md",
+    "status": "published",
+    "visibility": "owner"
+  },
+  {
+    "key": "creator-identity",
+    "title": "达人身份证据规则",
+    "description": "独立判断本人是否从事 TikTok 创作、直播或带货，接受自然业务表达，区分助理、商家、代理和材料不足。",
+    "kind": "manual",
+    "path": "manuals/creator-identity.md",
+    "status": "published",
+    "visibility": "owner"
+  },
+  {
+    "key": "creator-handle-link",
+    "title": "人员与账号关联规则",
+    "description": "以本人声明、完整问答及精确合作群与本人业务组成账号证据链，保护已确认关系，分别核对多账号及归属冲突。",
+    "kind": "manual",
+    "path": "manuals/creator-handle-link.md",
+    "status": "published",
+    "visibility": "owner"
+  },
+  {
+    "key": "creator-evidence",
+    "title": "识别材料与补查规则",
+    "description": "按人员和账号组织有权限的真实消息、群名、私聊和问答，保留反证及读取边界，只在新证据出现时继续处理。",
+    "kind": "manual",
+    "path": "manuals/creator-evidence.md",
+    "status": "published",
+    "visibility": "owner"
+  },
+  {
+    "key": "creator-admission",
+    "title": "入库与后续处理规则",
+    "description": "分开提交达人身份、账号与负责人，固定幂等、人工结论保护、冲突和授权复核，以及确认后的七天事件补算。",
+    "kind": "manual",
+    "path": "manuals/creator-admission.md",
+    "status": "published",
+    "visibility": "owner"
+  },
+  {
+    "key": "creator-regression",
+    "title": "历史案例与识别验收",
+    "description": "保留自然问答、群名联合证据、改名和商家误判的真实案例，区分开发回归与独立验证，不把模型分数当准确率。",
+    "kind": "manual",
+    "path": "manuals/creator-regression.md",
+    "status": "published",
+    "visibility": "owner"
   }
 ]

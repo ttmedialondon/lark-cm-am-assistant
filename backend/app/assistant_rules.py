@@ -18,6 +18,8 @@ DOCUMENTS = (
 )
 KEYS = frozenset(item["key"] for item in DOCUMENTS)
 EVENT_KEYS = frozenset(("event-extraction", "event-state", "event-priority", "event-merge"))
+CREATOR_KEYS = frozenset(("creator-recognition-flow", "creator-identity", "creator-handle-link",
+                          "creator-evidence", "creator-admission", "creator-regression"))
 MAX_DOCUMENT_CHARS = 24_000
 MAX_TITLE_CHARS = 160
 MAX_DESCRIPTION_CHARS = 1000
@@ -111,7 +113,7 @@ def library(conn, settings):
 
 def snapshot(conn, settings, *, owner=False):
     documents = {key: item for key, item in library(conn, settings).items()
-                 if key not in EVENT_KEYS and item["status"] == "published"
+                 if key not in EVENT_KEYS | CREATOR_KEYS and item["status"] == "published"
                  and (item["visibility"] == "all" or owner)}
     return {**_snapshot(documents), "protocol": 2, "catalog": [
         {**{name: item[name] for name in ("key", "title", "kind")},
@@ -226,6 +228,8 @@ def _metadata(key, title, description, kind, status, visibility):
         raise ValueError("基础四份规则的类型、发布状态和全体范围固定。")
     if key in EVENT_KEYS and (kind != "manual" or status != "published" or visibility != "owner"):
         raise ValueError("事件总结手册固定为已发布的后台专用手册；暂停处理请使用 AI 功能开关。")
+    if key in CREATOR_KEYS and (kind != "manual" or visibility != "owner"):
+        raise ValueError("达人识别规范固定为后台专用手册；发布文档不会开启自动识别。")
     if key not in KEYS and kind == "rule":
         raise ValueError("不能新增基础规则，请选择任务手册、知识资料或输出模板。")
 
