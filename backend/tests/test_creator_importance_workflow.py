@@ -519,13 +519,16 @@ def test_paid_retry_cache_and_stale_results_keep_billing_without_repeat(pg, rank
 
     first = prepared()
     flow.error = openai_client.OpenAIRequestError(
-        "synthetic 503", retryable=True, telemetry={"http_status": 503, "usage": {"input_tokens": 2}}
+        "synthetic 503", retryable=True, telemetry={"http_status": 503, "usage": {"input_tokens": 2},
+            "provider_error": {"code": "server_is_overloaded", "type": "server_error"}}
     )
     importance.run(first, flow.settings)
     assert (
         pg.execute("SELECT status FROM creator_importance_jobs WHERE id=%s", (first["id"],)).fetchone()["status"]
         == "retry_wait"
     )
+    stats = pg.execute("SELECT stats FROM creator_importance_jobs WHERE id=%s", (first["id"],)).fetchone()["stats"]
+    assert stats["provider_error"] == {"code": "server_is_overloaded", "type": "server_error"}
     retry_before = pg.execute(
         "SELECT status,attempts,not_before FROM creator_importance_jobs WHERE id=%s", (first["id"],)
     ).fetchone()
@@ -694,6 +697,19 @@ def test_paid_retry_cache_and_stale_results_keep_billing_without_repeat(pg, rank
                         (restarted["id"],)).fetchone()
     assert failed["status"] == "failed" and failed["stats"]["output_error"] == "json_extra_data"
     assert failed["checkpoint_ciphertext"] == checkpoint["checkpoint_ciphertext"]
+    pg.execute("UPDATE creator_importance_jobs SET status='ready' WHERE id=%s", (incomplete["id"],))
+    invalid_schema = importance.claim()
+    flow.error = openai_client.OpenAIRequestError("HTTP 400", telemetry={
+        "http_status": 400, "provider_error": {"code": "invalid_json_schema"}},
+        provider_diagnostic={"code": "invalid_json_schema", "message": "PRIVATE PROVIDER DETAIL"})
+    importance.run(invalid_schema, flow.settings)
+    receipt = pg.execute("SELECT error_code,response_ciphertext FROM creator_importance_requests WHERE id=%s",
+                         (invalid_schema["reservation_id"],)).fetchone()
+    assert receipt["error_code"] == "http_400"
+    assert json.loads(importance._cipher(flow.settings).decrypt(receipt["response_ciphertext"])) == {
+        "provider_diagnostic": {"code": "invalid_json_schema", "message": "PRIVATE PROVIDER DETAIL"}}
+    stats = pg.execute("SELECT stats FROM creator_importance_jobs WHERE id=%s", (incomplete["id"],)).fetchone()["stats"]
+    assert "PRIVATE PROVIDER DETAIL" not in str(stats) and importance.claim() is None
 
 
 def test_document_versions_preserve_incremental_ranking_and_reuse_paused_paid_work(pg, ranking_flow):

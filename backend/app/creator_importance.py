@@ -836,6 +836,8 @@ def run(job, settings):
         error = api.ModelOutputError(str(exc), telemetry=telemetry) if isinstance(exc, ValueError) \
             and not isinstance(exc, api.OpenAIRequestError | api.ModelOutputError) else exc
         telemetry = getattr(error, "telemetry", {}) or telemetry
+        if isinstance(error, api.OpenAIRequestError) and error.provider_diagnostic:
+            raw = creator_data.encode({"provider_diagnostic": error.provider_diagnostic})
     status = telemetry.get("http_status")
     unknown = isinstance(error, api.OpenAIRequestError) and error.request_unknown
     retry = isinstance(error, api.OpenAIRequestError) and error.retryable and not unknown and job["attempts"] < 3
@@ -868,6 +870,7 @@ def run(job, settings):
                  creator_data.encode({"output_error": output_error, "output_shape": telemetry.get("output_shape", []),
                      "response_status": telemetry.get("response_status"),
                      "incomplete_reason": telemetry.get("incomplete_reason"),
+                     "provider_error": telemetry.get("provider_error", {}),
                      "usage": telemetry.get("usage", {})}),
                  job["id"]))
         conn.execute("UPDATE ai_feature_configs SET last_tested_at=NOW(),last_test_status=%s WHERE feature=%s",

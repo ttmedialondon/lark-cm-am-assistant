@@ -545,7 +545,10 @@ def review(pack, config, contact_id, settings):
                       "output_shape": telemetry.get("output_shape", []),
                       "response_status": telemetry.get("response_status"),
                       "incomplete_reason": telemetry.get("incomplete_reason"),
+                      "provider_error": telemetry.get("provider_error", {}),
                       "usage": telemetry.get("usage", {})}
+        if isinstance(exc, api.OpenAIRequestError) and exc.provider_diagnostic:
+            diagnostic["provider_diagnostic"] = exc.provider_diagnostic
         if isinstance(exc, json.JSONDecodeError | TypeError):
             error = api.ModelOutputError("invalid_json", telemetry=telemetry)
     return result, telemetry, error, diagnostic

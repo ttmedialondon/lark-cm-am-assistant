@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import random
+import re
 import time
 from collections.abc import Mapping
 from email.utils import parsedate_to_datetime
@@ -21,7 +22,7 @@ class AIInputError(ValueError):
 
 
 class OpenAIRequestError(AIInputError):
-    """A provider transport failure with only safe retry metadata."""
+    """Safe retry metadata; bounded provider diagnostics are for encrypted receipts only."""
 
     def __init__(
         self,
@@ -31,11 +32,13 @@ class OpenAIRequestError(AIInputError):
         is_quota: bool = False,
         retryable: bool = False,
         telemetry: Mapping[str, Any] | None = None,
+        provider_diagnostic: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
         self.is_quota = is_quota
         self.telemetry = dict(telemetry or {})
+        self.provider_diagnostic = dict(provider_diagnostic or {})
         # A timeout can occur after the provider has accepted a billable request.
         self.request_unknown = not is_quota and not isinstance(self.telemetry.get("http_status"), int)
         self.retryable = retryable and not self.request_unknown and not is_quota
@@ -172,6 +175,22 @@ def call_openai_tools(config, api_key, items, actor_id, *, instructions, tools, 
 def _read_response(response, started, *, full_output=False):
     telemetry = _openai_telemetry(response, started)
     if response.status_code < 200 or response.status_code >= 300:
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            payload = None
+        error = payload.get("error") if isinstance(payload, Mapping) else None
+        if isinstance(error, Mapping):
+            telemetry["provider_error"] = {
+                field: value for field in ("code", "type", "param")
+                if isinstance(value := error.get(field), str)
+                and re.fullmatch(r"[A-Za-z0-9_.\[\]]{1,120}", value)
+            }
+        provider_diagnostic = None
+        if response.status_code == 400 and isinstance(error, Mapping):
+            provider_diagnostic = dict(telemetry.get("provider_error", {}))
+            if isinstance(message := error.get("message"), str):
+                provider_diagnostic["message"] = message[:2000]
         is_quota = _is_quota_response(response)
         raise OpenAIRequestError(
             f"AI 服务请求未完成（HTTP {response.status_code}）。",
@@ -179,6 +198,7 @@ def _read_response(response, started, *, full_output=False):
             is_quota=is_quota,
             retryable=not is_quota and response.status_code in {408, 429, 500, 502, 503, 504},
             telemetry=telemetry,
+            provider_diagnostic=provider_diagnostic,
         )
     try:
         data = response.json()

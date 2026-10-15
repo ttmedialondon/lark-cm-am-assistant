@@ -253,6 +253,38 @@ def test_shared_evidence_uses_connected_cm_roster_and_keeps_other_staff_as_conte
     assert evidence.build(pg, pilot.settings, creator)["pack"] is None
 
 
+def test_late_reply_context_includes_its_readable_original_without_widening_access(pg, pilot, monkeypatch):
+    cipher = message_body_cipher(pilot.settings.token_encryption_key)
+    for key, sender, age, parent in (
+        ('context_question', 'ou_cm', 180, None),
+        ('context_reply', 'ou_cm', 120, 'context_question'),
+        ('context_creator', 'ou_creator', 60, None),
+        ('context_latest', 'ou_cm', 0, None),
+    ):
+        pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,
+            body_ciphertext,message_create_time,parent_id) VALUES('chat_creator',%s,%s,'user','text',%s,
+            NOW()-(%s*INTERVAL '1 second'),%s)""",
+            (key, sender, cipher.encrypt(json.dumps({'text': key + ': campaign payment follow-up'})), age, parent))
+        pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+                   "VALUES(%s,'chat_creator',%s)", (pilot.ids['cm'], key))
+    monkeypatch.setattr(evidence, 'SEARCH_LIMIT', 1)
+    protected = _snapshot(pg, ('contact_roles', 'contact_assignments', 'contact_social_accounts'))
+    material = evidence.build(pg, pilot.settings, pilot.ids['creator'])
+    labels = {ref['message_id']: ref['label'] for ref in material['refs'] if ref['kind'] == 'message'}
+    reply = next(m for m in material['pack']['messages'] if m['id'] == labels['context_reply'])
+    assert reply['reply'] == labels['context_question']
+    assert reply['id'] not in material['pack']['coverage']['missing_reply_ids']
+    assert len(material['pack']['messages']) <= evidence.MAX_MESSAGES
+    assert sum(len(m['text']) for m in material['pack']['messages']) <= evidence.MAX_CHARS
+    pg.execute("DELETE FROM authorization_message_observations WHERE authorization_id=%s "
+               "AND message_id='context_question'", (pilot.ids['cm'],))
+    limited = evidence.build(pg, pilot.settings, pilot.ids['creator'])
+    refs = {ref['message_id']: ref['label'] for ref in limited['refs'] if ref['kind'] == 'message'}
+    assert 'context_question' not in refs
+    assert refs['context_reply'] in limited['pack']['coverage']['missing_reply_ids']
+    assert _snapshot(pg, protected.keys()) == protected
+
+
 def test_factual_validation_preserves_independent_cm_results_without_lexical_veto():
     pack = {
         "target": "U1",
@@ -863,7 +895,7 @@ def test_retry_ledger_and_disabled_config_keep_suggestions_isolated(pg, responsi
     flow.enable()
     job = _prepared_job(pg, flow)
     flow.error = openai_client.OpenAIRequestError("synthetic overload", retry_after_seconds=120, retryable=True,
-                                                telemetry={"http_status": 429})
+        telemetry={"http_status": 429, "provider_error": {"code": "rate_limit_exceeded"}})
     matching.run(job, flow.settings)
     row = pg.execute(
         "SELECT status,EXTRACT(EPOCH FROM not_before-NOW()) seconds FROM creator_responsibility_jobs WHERE id=%s",
@@ -872,6 +904,10 @@ def test_retry_ledger_and_disabled_config_keep_suggestions_isolated(pg, responsi
     assert row["status"] == "retry_wait" and row["seconds"] >= 120
     usage = pg.execute("SELECT input_tokens,output_tokens FROM creator_responsibility_requests").fetchone()
     assert usage == {"input_tokens": None, "output_tokens": None}
+    receipt = pg.execute("SELECT response_ciphertext FROM creator_responsibility_requests WHERE id=%s",
+                         (job["reservation_id"],)).fetchone()
+    diagnostic = json.loads(creator_data.cipher(flow.settings).decrypt(receipt["response_ciphertext"]))
+    assert diagnostic["provider_error"] == {"code": "rate_limit_exceeded"}
     ai_dispatch.resume(pg)
     pg.execute("UPDATE creator_responsibility_jobs SET not_before=NOW() WHERE id=%s", (job["id"],))
     retry = matching.claim()
@@ -941,6 +977,20 @@ def test_retry_ledger_and_disabled_config_keep_suggestions_isolated(pg, responsi
     assert receipt["error_code"] == "invalid_output" and diagnostic["response_status"] == "incomplete"
     assert diagnostic["incomplete_reason"] == "max_output_tokens"
     assert diagnostic["usage"] == {"input_tokens": 15073, "output_tokens": 2200}
+    assert matching.claim() is None
+    assert pg.execute("SELECT * FROM contact_assignments ORDER BY id").fetchall() == before
+    flow.material_version += 1
+    invalid_schema = _prepared_job(pg, flow)
+    flow.error = openai_client.OpenAIRequestError("HTTP 400", telemetry={
+        "http_status": 400, "provider_error": {"code": "invalid_json_schema"}},
+        provider_diagnostic={"code": "invalid_json_schema", "message": "PRIVATE PROVIDER DETAIL"})
+    matching.run(invalid_schema, flow.settings)
+    receipt = pg.execute("SELECT error_code,response_ciphertext FROM creator_responsibility_requests WHERE id=%s",
+                         (invalid_schema["reservation_id"],)).fetchone()
+    diagnostic = json.loads(creator_data.cipher(flow.settings).decrypt(receipt["response_ciphertext"]))
+    assert receipt["error_code"] == "http_400" and diagnostic["provider_diagnostic"] == {
+        "code": "invalid_json_schema", "message": "PRIVATE PROVIDER DETAIL"}
+    assert "PRIVATE PROVIDER DETAIL" not in diagnostic["error"]
     assert matching.claim() is None
     assert pg.execute("SELECT * FROM contact_assignments ORDER BY id").fetchall() == before
     flow.enable(enabled=False)

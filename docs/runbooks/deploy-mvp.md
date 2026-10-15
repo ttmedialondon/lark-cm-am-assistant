@@ -91,11 +91,13 @@ curl --fail --silent --show-error https://larkbot.ttapp.help/healthz
 
 `scripts/repair_creator_initialization.py --manifest <固定名单.json>` 默认只读预览。名单包含 `cm_id`、`created_at`、`identity_contact_ids`、`importance_job_ids`、`responsibility_job_ids`；只保存 UUID，不保存聊天或凭证。先固定授权范围内有本人文字、尚未识别的联系人，不能执行时重新扩大名单或用实时 `LIMIT` 代替固定名单。
 
-按发布步骤停止服务、验证数据库与素材备份后，使用同一文件加 `--apply`。已入身份队列、已确认或不再有有效可读文字的联系人会跳过；其余进入原身份队列，不直接写身份或负责人。仅恢复列出的 `failed / invalid_output` 任务：材料、手册、配置和版本仍有效时从冻结批次续跑，否则重取当前批次，保留历史 checkpoint、游标、待处理消息、尝试次数和旧费用记录。未知结果不重试，原有确认关系不修改，重复执行不会再次重排已恢复的任务。
+按发布步骤停止服务、验证数据库与素材备份后，使用同一文件加 `--apply`。已入身份队列、已确认或不再有有效可读文字的联系人会跳过；其余进入原身份队列，不直接写身份或负责人。仅恢复列出的 `failed / invalid_output` 或明确 HTTP 400 任务：材料、手册、配置和版本仍有效时从冻结批次续跑，否则重取当前批次，保留历史 checkpoint、游标、待处理消息、尝试次数和旧费用记录。未知结果不重试，原有确认关系不修改，重复执行不会再次重排已恢复的任务。HTTP 400 不自动循环重试，定向恢复后应先核对诊断。
 
 结构化响应优先读取正式消息的 `final_answer`，不把 commentary 混入结果；拒答和未完成输出仍拒绝。只兼容完整 JSON 代码围栏，不截断 `HOOK`、`pruned` 或其他任意尾文，更不能从两个矛盾 JSON 中挑一个入库。负责人失败返回加密保留有界原文与校验错误，常规日志仅记录安全输出结构。协议依据 [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs) 和 [Responses 消息 phase](https://developers.openai.com/api/docs/guides/reasoning)。
 
 负责人和重要度只要求最终 JSON，不请求前言或中间说明；负责人按候选数量预留输出容量，重要度最多 8192 token。这是单次返回长度，不是每日预算或额外调用；未完成的返回仍不入库，并记录响应状态、截断原因和实际用量。身份／handle 共用队列保留历史轮转，按本次可执行时间排队；失效或新材料重排的旧任务不凭最初创建时间反复占先。
+
+HTTP 错误常规诊断仅保留有界的错误代码、类型和参数标识。HTTP 400 的简短服务端说明单独加密保存在失败回执，不进入普通日志或统计；失败回执不作为成功缓存复用。负责人取材须补入选中上下文的实际原问题，仍受条数、长度和授权限制；确实无法读取的引用继续标记缺口，不凭高分绕过。
 
 #### 负责人匹配手册
 

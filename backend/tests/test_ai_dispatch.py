@@ -157,6 +157,36 @@ def test_single_request_transport_preserves_retry_hints_and_safe_failure_metadat
     assert openai_client.retry_delay(stopped.value.retry_after_seconds, 1) == 7200.5
     assert stopped.value.telemetry["openai_request_id"] == "req_test"
     assert stopped.value.telemetry["http_status"] == 503
+    assert stopped.value.telemetry["provider_error"] == {"code": "server_is_overloaded"}
+    assert stopped.value.provider_diagnostic == {}
+    assert "PRIVATE BODY" not in str(stopped.value) + str(stopped.value.telemetry)
+
+    result = httpx.Response(400, json={"error": {
+        "code": "invalid_json_schema", "type": "invalid_request_error", "param": "text.format.schema",
+        "message": "PRIVATE BODY test-key", "other": {"text": "PRIVATE BODY"},
+    }})
+    with pytest.raises(openai_client.OpenAIRequestError) as stopped:
+        request()
+    assert stopped.value.telemetry["provider_error"] == {
+        "code": "invalid_json_schema", "type": "invalid_request_error", "param": "text.format.schema"}
+    assert not stopped.value.retryable and not stopped.value.request_unknown
+    assert "PRIVATE BODY" not in str(stopped.value) + str(stopped.value.telemetry)
+    assert stopped.value.provider_diagnostic == {
+        "code": "invalid_json_schema", "type": "invalid_request_error", "param": "text.format.schema",
+        "message": "PRIVATE BODY test-key"}
+    assert "PRIVATE BODY" not in repr(stopped.value)
+    result = httpx.Response(400, json={"error": {
+        "code": "sk-private-key", "type": {"text": "PRIVATE BODY"}, "param": "input." + "a" * 120,
+        "message": "PRIVATE BODY" * 200,
+    }})
+    with pytest.raises(openai_client.OpenAIRequestError) as stopped:
+        request()
+    assert stopped.value.telemetry["provider_error"] == {}
+    assert stopped.value.provider_diagnostic == {"message": ("PRIVATE BODY" * 200)[:2000]}
+    result = httpx.Response(400, text="PRIVATE BODY")
+    with pytest.raises(openai_client.OpenAIRequestError) as stopped:
+        request()
+    assert "provider_error" not in stopped.value.telemetry
     assert "PRIVATE BODY" not in str(stopped.value) + str(stopped.value.telemetry)
 
     date = format_datetime(datetime.fromtimestamp(1_700_007_200, UTC), usegmt=True)

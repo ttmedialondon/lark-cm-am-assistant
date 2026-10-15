@@ -13,6 +13,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+REPAIRABLE_ERRORS = ('invalid_output', 'http_400')
 
 
 def repair(conn, manifest, settings, *, apply=False):
@@ -64,7 +65,7 @@ def repair(conn, manifest, settings, *, apply=False):
     ):
         for job_id in groups[key]:
             job = conn.execute(f'SELECT * FROM {table} WHERE id=%s', (job_id,)).fetchone()
-            if not job or job['status'] != 'failed' or job['reason_code'] != 'invalid_output':
+            if not job or job['status'] != 'failed' or job['reason_code'] not in REPAIRABLE_ERRORS:
                 counts[feature + '_unchanged'] += 1
                 continue
             if feature == 'importance' and job['responsible_authorization_id'] != cm:
@@ -93,8 +94,8 @@ def repair(conn, manifest, settings, *, apply=False):
             if apply:
                 changed = conn.execute(f"""UPDATE {table} SET status=%s,reason_code=%s,claim_token=NULL,
                     lease_until=NULL,finished_at=NULL,not_before=NOW(),updated_at=NOW()
-                    WHERE id=%s AND status='failed' AND reason_code='invalid_output'""",
-                    (status, reason, job_id)).rowcount
+                    WHERE id=%s AND status='failed' AND reason_code=ANY(%s::text[])""",
+                    (status, reason, job_id, list(REPAIRABLE_ERRORS))).rowcount
                 if changed != 1:
                     raise ValueError('Selected failed job changed during repair.')
             counts[feature + '_' + status] += 1

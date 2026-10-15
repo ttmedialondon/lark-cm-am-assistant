@@ -307,6 +307,22 @@ def build(conn, settings, contact_id):
                 MAX_MESSAGES + 1,
             )
         )
+    frontier = {key for item in anchors for key in (
+        source._key(item['row']), (item['row']['chat_id'], item['row'].get('parent_id')),
+        (item['row']['chat_id'], previous.get(source._key(item['row']))))}
+    # Context fetched after the first search may itself reply to an older, readable question.
+    for _ in range(8):
+        parents = {(material[key]['row']['chat_id'], material[key]['row']['parent_id'])
+                   for key in frontier if key in material and material[key]['row'].get('parent_id')}
+        missing = sorted(parents - material.keys())[:MAX_MESSAGES]
+        if missing:
+            read(source._rows(conn, "EXISTS(SELECT 1 FROM jsonb_to_recordset(%s::jsonb) "
+                "AS parent(chat_id text,message_id text) WHERE parent.chat_id=m.chat_id "
+                "AND parent.message_id=m.message_id)",
+                (json.dumps([{'chat_id': chat, 'message_id': mid} for chat, mid in missing]),), MAX_MESSAGES))
+        if not parents:
+            break
+        frontier = parents
     chosen, seen, chars = [], set(), 0
     for anchor in anchors:
         row = anchor["row"]
@@ -315,6 +331,13 @@ def build(conn, settings, contact_id):
             (row["chat_id"], previous.get(source._key(row))),
             source._key(row),
         ]
+        for _ in range(8):
+            parents = [(material[key]['row']['chat_id'], material[key]['row']['parent_id'])
+                       for key in context_keys if key in material and material[key]['row'].get('parent_id')
+                       and (material[key]['row']['chat_id'], material[key]['row']['parent_id']) not in context_keys]
+            if not parents:
+                break
+            context_keys = list(dict.fromkeys([*parents, *context_keys]))
         part = list({key: material[key] for key in context_keys if key in material and key not in seen}.values())
         size = sum(len(i["text"]) for i in part)
         if len(chosen) + len(part) > MAX_MESSAGES or chars + size > MAX_CHARS:

@@ -77,6 +77,12 @@ def test_targeted_initialization_repair_is_readonly_by_default_and_idempotent(pg
     assert repeated['identity_already_processed'] == 2
     assert repeated['importance_unchanged'] == repeated['responsibility_unchanged'] == 1
     assert {table: pg.execute(f'SELECT * FROM {table}').fetchall() for table in tables} == before
+    pg.execute("UPDATE creator_importance_jobs SET status='failed',reason_code='http_400' WHERE id=%s",
+               (importance_id,))
+    targeted = {**manifest, 'identity_contact_ids': [], 'responsibility_job_ids': []}
+    assert repair(pg, targeted, settings, apply=True) == {'importance_ready': 1}
+    assert pg.execute('SELECT attempts,cursor_message_id FROM creator_importance_jobs WHERE id=%s',
+                      (importance_id,)).fetchone() == {'attempts': 1, 'cursor_message_id': 'keep-cursor'}
     pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (cm,))
     with pytest.raises(ValueError, match='reading grant'):
         repair(pg, manifest, settings, apply=True)
