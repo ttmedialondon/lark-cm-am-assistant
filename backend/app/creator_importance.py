@@ -609,7 +609,9 @@ def prepare_next(settings):
         job = conn.execute("""SELECT j.* FROM creator_importance_jobs j WHERE status='queued' AND not_before<=NOW()
             AND NOT EXISTS(SELECT 1 FROM creator_authorization_rescans r
               WHERE r.authorization_id=j.responsible_authorization_id)
-            ORDER BY not_before,created_at,id FOR UPDATE SKIP LOCKED LIMIT 1""").fetchone()
+            ORDER BY EXISTS(SELECT 1 FROM creator_importance_profiles p WHERE p.contact_id=j.contact_id
+                AND p.responsible_authorization_id=j.responsible_authorization_id),
+                not_before,created_at,id FOR UPDATE SKIP LOCKED LIMIT 1""").fetchone()
         if not job:
             return False
         if not conn.execute("SELECT creator_importance_is_eligible(%s,%s) ok",
@@ -739,7 +741,9 @@ def claim():
                 AND r.error_code='' AND r.response_ciphertext IS NOT NULL))
             AND NOT EXISTS(SELECT 1 FROM creator_authorization_rescans r
               WHERE r.authorization_id=j.responsible_authorization_id)
-            ORDER BY not_before,created_at,id LIMIT 1""").fetchone()
+            ORDER BY EXISTS(SELECT 1 FROM creator_importance_profiles p WHERE p.contact_id=j.contact_id
+                AND p.responsible_authorization_id=j.responsible_authorization_id),
+                not_before,created_at,id LIMIT 1""").fetchone()
         if not candidate:
             return None
         valid = _source_checks(conn, candidate["refs"], candidate["contact_id"],

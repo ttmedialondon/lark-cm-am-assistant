@@ -16,7 +16,7 @@ from . import openai_client as api
 from . import summary_dialogues as codec
 from .ai_feature_config import api_key_cipher
 from .assistant_replies import INSTRUCTIONS as REPLY_INSTRUCTIONS
-from .db import connection
+from .db import connection, lock_sync_material
 
 FEATURE = 'operations_assistant'
 MAX_MODEL_STEPS = 12
@@ -478,6 +478,7 @@ def claim():
 
 def prepare(settings):
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn, read=True)
         read_cache = {}
         row = conn.execute('''SELECT t.*,s.actor_id FROM assistant_turns t
             JOIN assistant_sessions s ON s.id=t.session_id

@@ -476,79 +476,49 @@ def test_broadcast_uses_two_independent_slots_and_idle_backoff(monkeypatch):
     assert len(futures) == 1
 
 
-def test_creator_previews_are_fair_single_flight_and_back_off_without_work(monkeypatch) -> None:
+def test_creator_previews_are_independent_single_flight_and_back_off_without_work(monkeypatch) -> None:
     now = [10.0]
     submitted = []
-    prepared = []
     settings = SimpleNamespace(worker_idle_seconds=3)
-    summary_jobs, import_jobs = iter((True, False)), iter((True, False))
-
-    def prepare(name, jobs):
-        prepared.append(name)
-        return next(jobs, False)
 
     class Executor:
-        def submit(self, runner, argument, next_queue):
-            assert runner is worker._prepare_creator_preview
+        def submit(self, runner, argument):
             assert argument is settings
             future = TaskFuture()
-            submitted.append((future, runner, next_queue))
+            submitted.append((runner, future))
             return future
 
     monkeypatch.setattr(worker.time, "monotonic", lambda: now[0])
-    monkeypatch.setattr(worker.assistant, "prepare", lambda _: False)
-    monkeypatch.setattr(worker.creator_importance, "prepare_next", lambda _: False)
-    monkeypatch.setattr(worker.creator_authorization_rescans, "prepare_next", lambda _: False)
-    monkeypatch.setattr(worker.offhours_summary, "prepare_next_summary",
-                        lambda _: prepare("summary", summary_jobs))
-    monkeypatch.setattr(worker.creator_imports, "prepare_next_import",
-                        lambda _: prepare("import", import_jobs))
-    monkeypatch.setattr(worker.creator_handle_matching, "prepare_next", lambda _: False)
-    monkeypatch.setattr(worker.creator_responsibility_matching, "prepare_next", lambda _: False)
-    monkeypatch.setattr(worker.creator_group_matching, "prepare_next", lambda _: False)
     executor = Executor()
-    future, next_check, queue = worker._schedule_creator_preview(settings, executor, None, 0, 0)
-    assert future is submitted[0][0]
-    assert worker._schedule_creator_preview(settings, executor, future, next_check, queue) == (
-        future, next_check, queue)
-    assert len(submitted) == 1 and not prepared
+    futures, deadlines = {}, {}
+    queues = worker._creator_preview_queues()
+    worker._schedule_creator_preview(settings, executor, futures, deadlines)
+    assert [runner for runner, _ in submitted] == list(queues)
+    original = dict(futures)
+    worker._schedule_creator_preview(settings, executor, futures, deadlines)
+    assert futures == original and len(submitted) == len(queues)
 
-    for index in range(2):
-        task, runner, preference = submitted[index]
-        task.set_result(runner(settings, preference))
-        future, next_check, queue = worker._schedule_creator_preview(settings, executor, future, next_check, queue)
-        assert future is submitted[index+1][0]
-    assert prepared == ["import", "summary"]
-    task, runner, preference = submitted[2]
-    task.set_result(runner(settings, preference))
-    future, next_check, queue = worker._schedule_creator_preview(settings, executor, future, next_check, queue)
-    assert future is None and next_check == 13.0
-    assert worker._schedule_creator_preview(settings, executor, future, next_check, queue) == (None, 13.0, queue)
-    assert len(submitted) == 3 and prepared == ["import", "summary", "import", "summary"]
+    # The summary stays blocked; importance can finish and prepare its next batch.
+    importance = queues.index(worker.creator_importance.prepare_next)
+    summary = queues.index(worker.offhours_summary.prepare_next_summary)
+    original[importance].set_result(True)
+    worker._schedule_creator_preview(settings, executor, futures, deadlines)
+    assert futures[summary] is original[summary] and not original[summary].done()
+    assert futures[importance] is not original[importance] and len(submitted) == len(queues) + 1
+
+    futures[importance].set_result(False)
+    original[summary].set_exception(RuntimeError("one preparation queue failed"))
+    worker._schedule_creator_preview(settings, executor, futures, deadlines)
+    assert deadlines == {importance: 13.0, summary: 13.0}
+    assert importance not in futures and summary not in futures
+    worker._schedule_creator_preview(settings, executor, futures, deadlines)
+    assert len(submitted) == len(queues) + 1
 
     now[0] = 13.0
-    future, next_check, queue = worker._schedule_creator_preview(settings, executor, future, next_check, queue)
-    assert future is submitted[3][0]
-    future.set_exception(RuntimeError("preview failed"))
-    assert worker._schedule_creator_preview(settings, executor, future, next_check, queue) == (None, 16.0, queue)
-
-    def failed(_):
-        raise RuntimeError("one preparation queue failed")
-
-    monkeypatch.setattr(worker.offhours_summary, "prepare_next_summary", failed)
-    monkeypatch.setattr(worker.creator_imports, "prepare_next_import", lambda _: True)
-    assert worker._prepare_creator_preview(settings, 2) == (True, 2)
-
-    prepared.clear()
-    monkeypatch.setattr(worker.creator_imports, "prepare_next_import", lambda _: prepared.append("import") or True)
-    monkeypatch.setattr(worker.offhours_summary, "prepare_next_summary", lambda _: prepared.append("summary") or True)
-    monkeypatch.setattr(worker.creator_authorization_rescans, "prepare_next",
-                        lambda _: prepared.append("rescan") or True)
-    queue = 0
-    for _ in range(6):
-        progressed, queue = worker._prepare_creator_preview(settings, queue)
-        assert progressed
-    assert prepared == ["import", "summary", "rescan", "import", "summary", "rescan"]
+    worker._schedule_creator_preview(settings, executor, futures, deadlines)
+    assert len(futures) == len(queues) and len(submitted) == len(queues) + 3
+    assert all(futures[index] is future for index, future in original.items()
+               if index not in (importance, summary))
 
 
 @pytest.fixture

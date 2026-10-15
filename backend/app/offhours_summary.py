@@ -1366,7 +1366,7 @@ def run_claimed_summary(job, settings):
 
 
 def prepare_next_summary(settings):
-    # Reuse the existing single preparation executor; never block AI dispatch.
+    # Local preparation never occupies a paid API slot.
     from . import summary_dialogues
     with connection() as conn, conn.transaction():
         inserted = schedule_if_due(conn)

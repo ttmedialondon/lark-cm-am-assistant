@@ -196,6 +196,20 @@ def test_history_batches_yield_to_other_waiting_jobs(pg, ranking_flow):
     pg.execute("""UPDATE creator_importance_jobs SET created_at=NOW()-CASE
         WHEN responsible_authorization_id=%s THEN INTERVAL '7 days' ELSE INTERVAL '1 day' END""", (flow.owner,))
     flow.due()
+    pg.execute("SAVEPOINT first_assessment")
+    pg.execute("INSERT INTO creator_importance_profiles(contact_id,responsible_authorization_id) VALUES(%s,%s)",
+               (flow.person, flow.owner))
+    pg.execute("UPDATE creator_importance_jobs SET not_before=NOW()-INTERVAL '2 seconds' "
+               "WHERE responsible_authorization_id=%s", (flow.owner,))
+    assert importance.prepare_next(flow.settings)
+    assert pg.execute("SELECT status FROM creator_importance_jobs WHERE responsible_authorization_id=%s",
+                      (flow.owner,)).fetchone()["status"] == "queued"
+    assert importance.prepare_next(flow.settings)
+    initial = importance.claim()
+    assert initial and initial["responsible_authorization_id"] == flow.other
+    pg.execute("ROLLBACK TO SAVEPOINT first_assessment")
+    pg.execute("""INSERT INTO creator_importance_profiles(contact_id,responsible_authorization_id)
+        SELECT contact_id,responsible_authorization_id FROM creator_importance_jobs""")
     assert importance.prepare_next(flow.settings)
     first = importance.claim()
     assert first and first["responsible_authorization_id"] == flow.owner

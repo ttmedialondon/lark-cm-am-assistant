@@ -128,10 +128,11 @@ def run_forever() -> None:
     next_broadcast_check = 0.0
     next_broadcast_recovery = 0.0
     next_image_cleanup = 0.0
-    preview_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="creator-preview")
-    preview_future: Future[tuple[bool, int]] | None = None
-    next_preview_check = 0.0
-    next_preview_queue = 0
+    preview_executor = ThreadPoolExecutor(
+        max_workers=len(_creator_preview_queues()), thread_name_prefix="creator-preview",
+    )
+    preview_futures: dict[int, Future[bool]] = {}
+    next_preview_checks: dict[int, float] = {}
     avatar_executor = ThreadPoolExecutor(max_workers=identity_profiles.MAX_WORKERS, thread_name_prefix="lark-avatar")
     avatar_futures: set[Future[Any]] = set()
     # PostgreSQL owns the cross-process limit; this executor only provides the
@@ -170,9 +171,7 @@ def run_forever() -> None:
                 next_ai_queue, next_ai_check = _schedule_ai(
                     settings, ai_executor, ai_futures, next_ai_queue, next_ai_check,
                 )
-                preview_future, next_preview_check, next_preview_queue = _schedule_creator_preview(
-                    settings, preview_executor, preview_future, next_preview_check, next_preview_queue,
-                )
+                _schedule_creator_preview(settings, preview_executor, preview_futures, next_preview_checks)
                 if settings.app_secret_configured and time.monotonic() >= next_organization_check:
                     _run_organization_sync(settings, client)
                     # The database keeps the real daily cadence. This local bound
@@ -202,7 +201,7 @@ def run_forever() -> None:
                     _schedule_member_snapshot(settings, client, lark_executor, page_futures, member_futures)
                     identity_profiles.fill_slots(settings, client, avatar_executor, avatar_futures)
                 time.sleep(
-                    0.05 if page_futures or member_futures or avatar_futures or preview_future or broadcast_futures
+                    0.05 if page_futures or member_futures or avatar_futures or preview_futures or broadcast_futures
                     or discovery_future
                     else settings.worker_idle_seconds
                 )
@@ -328,50 +327,36 @@ def _schedule_ai(settings, executor, futures, next_queue, next_check, *, interac
     return next_queue, next_check
 
 
-def _prepare_creator_preview(settings: Settings, next_queue: int) -> tuple[bool, int]:
-    """Give each local preparation queue a turn; an idle queue does not delay the other."""
-
-    # Retired handle scanning is not produced or dispatched; historical review stays available.
-    queues = (assistant.prepare, creator_imports.prepare_next_import,
-              offhours_summary.prepare_next_summary,
-              creator_handle_matching.prepare_next,
-              creator_responsibility_matching.prepare_next,
-              creator_group_matching.prepare_next,
-              creator_importance.prepare_next,
-              creator_authorization_rescans.prepare_next)
-    for offset in range(len(queues)):
-        index = (next_queue + offset) % len(queues)
-        try:
-            if queues[index](settings):
-                return True, (index + 1) % len(queues)
-        except Exception:
-            LOGGER.exception("creator preview failed without exposing user data")
-    return False, next_queue
+def _creator_preview_queues():
+    return (assistant.prepare, creator_imports.prepare_next_import,
+            offhours_summary.prepare_next_summary, creator_handle_matching.prepare_next,
+            creator_responsibility_matching.prepare_next, creator_group_matching.prepare_next,
+            creator_importance.prepare_next, creator_authorization_rescans.prepare_next)
 
 
 def _schedule_creator_preview(
     settings: Settings,
     executor: ThreadPoolExecutor,
-    future: Future[tuple[bool, int]] | None,
-    next_check: float,
-    next_queue: int,
-) -> tuple[Future[tuple[bool, int]] | None, float, int]:
-    """Prepare one person's local evidence without using an OpenAI slot or blocking sync."""
+    futures: dict[int, Future[bool]],
+    next_checks: dict[int, float],
+) -> None:
+    """One local preparation per feature; a slow feature cannot occupy the others' slots."""
 
-    if future is not None:
-        if not future.done():
-            return future, next_check, next_queue
-        progressed = False
-        try:
-            progressed, next_queue = future.result()
-        except Exception:
-            LOGGER.exception("creator preview failed without exposing user data")
-        future = None
-        if not progressed:
-            next_check = time.monotonic() + max(settings.worker_idle_seconds, 1.0)
-    if time.monotonic() >= next_check:
-        future = executor.submit(_prepare_creator_preview, settings, next_queue)
-    return future, next_check, next_queue
+    for index, prepare in enumerate(_creator_preview_queues()):
+        future = futures.get(index)
+        if future is not None:
+            if not future.done():
+                continue
+            progressed = False
+            try:
+                progressed = future.result()
+            except Exception:
+                LOGGER.exception("creator preview failed without exposing user data")
+            del futures[index]
+            if not progressed:
+                next_checks[index] = time.monotonic() + max(settings.worker_idle_seconds, 1.0)
+        if time.monotonic() >= next_checks.get(index, 0.0):
+            futures[index] = executor.submit(prepare, settings)
 
 
 def _reap_ai_futures(futures: set[Future[Any]]) -> None:

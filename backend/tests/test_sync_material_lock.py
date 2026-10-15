@@ -15,7 +15,7 @@ from psycopg import sql
 from psycopg.rows import dict_row
 from starlette.requests import Request
 
-from app import main, summary_dialogues, worker
+from app import assistant, main, summary_dialogues, worker
 from app.ai_feature_config import api_key_cipher
 from app.crypto import TokenCipher
 from app.db import lock_sync_material
@@ -110,6 +110,29 @@ def test_summary_provider_request_runs_after_material_lock_released(monkeypatch)
     monkeypatch.setattr(summary_dialogues.openai_client, "call_openai", provider_probe)
     assert summary_dialogues.request(job, settings, cfg, {}, {}, "fixture", checkpoint={}) == {
         "text": "fixture response"}
+
+
+def test_assistant_preparation_locks_material_before_waiting_turn(monkeypatch):
+    dsn = _dsn()
+    checks = []
+
+    @contextmanager
+    def preparation_connection():
+        with psycopg.connect(dsn) as conn:
+            def execute(query, params=None):
+                if "FROM assistant_turns" not in query:
+                    return conn.execute(query, params)
+                with psycopg.connect(dsn) as writer:
+                    assert writer.execute("SELECT pg_try_advisory_xact_lock("
+                                          "hashtextextended('lark-sync-material',0))").fetchone() == (False,)
+                checks.append("turn locked after material")
+                return SimpleNamespace(fetchone=lambda: None)
+
+            yield SimpleNamespace(transaction=conn.transaction, execute=execute)
+
+    monkeypatch.setattr(assistant, "connection", preparation_connection)
+    assert not assistant.prepare(SimpleNamespace())
+    assert checks == ["turn locked after material"]
 
 
 @pytest.mark.parametrize("oauth_first", [True, False])
