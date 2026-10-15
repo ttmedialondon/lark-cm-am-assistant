@@ -34,6 +34,7 @@ _CHANGE = re.compile(
 
 @lru_cache(maxsize=1)
 def instructions():
+    """Immutable v1.3 prompt for requests prepared before document-backed rules."""
     document = (Path(__file__).resolve().parents[2] / "docs/specs/creator-responsibility-matching_v1.0.md").read_text()
     return document.split("```text\n", 1)[1].split("```", 1)[0].strip()
 

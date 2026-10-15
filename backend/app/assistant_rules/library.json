@@ -198,6 +198,21 @@
     "visibility": "owner"
   },
   {
+    "key": "responsibility-judgment", "title": "达人与负责人关系判断",
+    "description": "判断明确负责、共同负责、临时协助、历史负责和证据不足；达人身份已确认，不以同群或频率代替负责关系。",
+    "kind": "manual", "path": "manuals/responsibility-judgment.md", "status": "published", "visibility": "owner"
+  },
+  {
+    "key": "responsibility-evidence", "title": "负责人取材与交接判断",
+    "description": "结合具体业务、完整问答、真实提及和交接反证，分别判断负责事实与当前延续，不以沉默推断解除。",
+    "kind": "manual", "path": "manuals/responsibility-evidence.md", "status": "published", "visibility": "owner"
+  },
+  {
+    "key": "responsibility-linking", "title": "负责人关联与案例",
+    "description": "说明高置信度自动新增、多负责人、人工事实保护与典型正反例；实际授权、阈值和关联写入由系统执行。",
+    "kind": "manual", "path": "manuals/responsibility-linking.md", "status": "published", "visibility": "owner"
+  },
+  {
     "key": "reply-policy", "title": "回复事实与处理边界",
     "description": "三个回复入口的共同事实、权限、承诺与草稿边界，不发送或修改业务状态。",
     "kind": "manual", "path": "manuals/reply-policy.md", "status": "published", "visibility": "all"

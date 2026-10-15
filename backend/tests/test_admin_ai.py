@@ -289,7 +289,7 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     pinned = assistant_rules.snapshot(pg, settings)
     defaults = assistant_rules.builtin_snapshot()
     assert pinned["protocol"] == 2
-    backend_keys = assistant_rules.EVENT_KEYS | assistant_rules.CREATOR_KEYS
+    backend_keys = assistant_rules.BACKEND_KEYS
     assert backend_keys <= assistant_rules.library(pg, settings).keys()
     assert {item["key"] for item in pinned["catalog"]} <= pinned["documents"].keys()
     for owner_scope in (False, True):
@@ -299,6 +299,8 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
         for backend_key in backend_keys:
             with pytest.raises(PermissionError):
                 assistant_rules.read_documents(navigation, [backend_key])
+        from app import reply_rules
+        assert not backend_keys.intersection(reply_rules.from_snapshot(navigation, 'desktop')['documents'])
     assert {key: pinned["documents"][key]["text"] for key in assistant_rules.KEYS} == {
         key: document["text"] for key, document in defaults["documents"].items()}
     pinned_before = json.dumps(pinned, sort_keys=True)
@@ -368,6 +370,25 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     for field, value in (("kind", "knowledge"), ("status", "draft"), ("status", "archived"), ("visibility", "all")):
         assert client.post(path, data={**event_form, "revision": "1", field: value}).status_code == 400
     assert assistant_rules.library(pg, settings)["event-extraction"]["revision"] == 1
+    responsibility_key = "responsibility-judgment"
+    responsibility_document = assistant_rules.library(pg, settings)[responsibility_key]
+    responsibility_pinned = assistant_rules.responsibility_snapshot(pg, settings)
+    assert set(responsibility_pinned["documents"]) == assistant_rules.RESPONSIBILITY_KEYS
+    assert all(doc["text"] in assistant_rules.responsibility_instructions(responsibility_pinned)
+               for doc in responsibility_pinned["documents"].values())
+    responsibility_page = client.get(path + '?document=' + responsibility_key)
+    assert responsibility_page.status_code == 200 and '固定用途：负责人匹配' in responsibility_page.text
+    assert 'id="reply-usable"' not in responsibility_page.text
+    responsibility_form = {"csrf_token": "csrf", "document": responsibility_key, "revision": "0",
+        "content": responsibility_document["text"] + "\n测试负责人规则。", "title": responsibility_document["title"],
+        "description": responsibility_document["description"], "kind": "manual", "status": "published",
+        "visibility": "owner"}
+    for field, value in (("kind", "knowledge"), ("visibility", "all"), ("reply_usable", "1")):
+        assert client.post(path, data={**responsibility_form, field: value}).status_code == 400
+    assert client.post(path, data=responsibility_form, follow_redirects=False).status_code == 303
+    assert assistant_rules.responsibility_snapshot(pg, settings)["digest"] != responsibility_pinned["digest"]
+    assistant_rules.responsibility_validate_access(pg, responsibility_pinned)
+    assert assistant_rules.snapshot(pg, settings, owner=True) == navigation_before
     creator_key = "creator-identity"
     creator_document = assistant_rules.library(pg, settings)[creator_key]
     creator_pinned = assistant_rules.creator_snapshot(pg, settings)
@@ -482,6 +503,11 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
                "VALUES(%s,'assistant-rules',%s)", (member, owner))
     assert client.get(path + '?new=1').status_code == 200
     assert client.get(path + '?document=' + creator_key).status_code == 200
+    assert client.get(path + '?document=' + responsibility_key).status_code == 200
+    assert client.post(path, data={**responsibility_form, "revision": "1",
+        "content": responsibility_form["content"] + "\n文档管理员维护。"}, follow_redirects=False).status_code == 303
+    saved_responsibility = assistant_rules.library(pg, settings)[responsibility_key]
+    assert saved_responsibility["revision"] == 2 and saved_responsibility["updated_by"] == str(member)
     delegated = client.post(path, data={**draft_form, 'kind': 'knowledge', 'status': 'published',
         'visibility': 'owner', 'content': 'PRIVATE_DELEGATED_FACT'}, follow_redirects=False)
     assert delegated.status_code == 303
@@ -498,11 +524,13 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     pg.execute("DELETE FROM admin_page_permissions WHERE authorization_id=%s AND permission='assistant-rules'",
                (member,))
     assert client.get(path + '?document=' + delegated_key).status_code == 403
+    assert client.get(path + '?document=' + responsibility_key).status_code == 403
     assert client.post(path, data={**draft_form, 'document': delegated_key, 'revision': '1'}).status_code == 403
     with pytest.raises(PermissionError):
         assistant_rules.save_document(pg, settings, member, delegated_key, stored['title'], stored['description'],
             stored['kind'], stored['status'], stored['visibility'], stored['text'], stored['revision'])
     assert assistant_rules.library(pg, settings)[delegated_key] == stored
+    assert assistant_rules.library(pg, settings)[responsibility_key] == saved_responsibility
     session["auth"] = {"id": owner, "status": "active"}
     pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (owner,))
     assert client.get(path).status_code == 403 and client.post(path, data=form).status_code == 403

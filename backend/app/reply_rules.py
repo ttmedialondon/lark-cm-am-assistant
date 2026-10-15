@@ -26,7 +26,7 @@ def from_snapshot(pinned, entry):
     required = {*COMMON, ENTRIES[entry]}
     documents = {key: item for key, item in pinned["documents"].items()
                  if key in required or item.get("reply_usable") and item["kind"] in {"manual", "knowledge"}
-                 and key not in rules.REPLY_SHARED_KEYS | rules.EVENT_KEYS | rules.CREATOR_KEYS}
+                 and key not in rules.REPLY_SHARED_KEYS | rules.BACKEND_KEYS}
     if not required <= documents.keys() or any(documents[key]["status"] != "published" for key in required):
         raise PermissionError("本入口的回复处理手册尚未发布。")
     return {**rules._snapshot(documents, metadata=True), "protocol": "reply-documents-v1", "entry": entry}

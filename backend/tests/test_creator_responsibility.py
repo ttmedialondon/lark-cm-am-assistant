@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from psycopg.errors import DivisionByZero, RaiseException
 
-from app import ai_dispatch, ai_feature_config, config, creator_data, openai_client
+from app import ai_dispatch, ai_feature_config, assistant_rules, config, creator_data, openai_client
 from app import creator_handle_evidence as handle_evidence
 from app import creator_matching_routes as routes
 from app import creator_responsibility_evidence as evidence
@@ -529,7 +529,11 @@ def test_one_creator_one_call_formal_multi_cm_idempotency_and_cache_gates(pg, pi
     assert flow.calls[0]["contact"] == flow.contact
     assert flow.calls[0]["reasoning_effort"] == "none"
     assert 0 < flow.calls[0]["total_timeout"] <= 75
-    assert flow.calls[0]["instructions"] == evidence.instructions()
+    pinned = job["pack"]["_rules"]
+    assert set(pinned["documents"]) == assistant_rules.RESPONSIBILITY_KEYS
+    assert row["stats"]["rules_digest"] == pinned["digest"]
+    assert flow.calls[0]["instructions"] == assistant_rules.responsibility_instructions(pinned)
+    assert "_rules" not in flow.calls[0]["pack"]
     assert "suggestions" in flow.calls[0]["output_format"]["schema"]["properties"]
     assert row["input_tokens"] == 100 and row["output_tokens"] == 50
     usage = pg.execute("SELECT input_tokens,output_tokens,key_feature FROM creator_responsibility_requests").fetchone()
@@ -911,7 +915,7 @@ def test_retry_ledger_and_disabled_config_keep_suggestions_isolated(pg, responsi
     assert import_config["enabled"] is False
 
 
-def test_unknown_request_after_config_race_only_blocks_identical_material(pg, responsibility_flow, monkeypatch):
+def test_unknown_request_after_config_race_only_blocks_identical_material(pg, pilot, responsibility_flow, monkeypatch):
     flow = responsibility_flow
     flow.enable()
     job = _prepared_job(pg, flow)
@@ -919,6 +923,11 @@ def test_unknown_request_after_config_race_only_blocks_identical_material(pg, re
     flow.before_response = lambda: flow.enable("sk-rotated-during-call")
     matching.run(job, flow.settings)
     flow.before_response = None
+    document = assistant_rules.library(pg, flow.settings)["responsibility-judgment"]
+    assistant_rules.save_document(pg, flow.settings, pilot.ids["owner"], document["key"], document["title"],
+        document["description"], "manual", "published", "owner", document["text"] + "\n测试：更新判断手册。",
+        document["revision"])
+    # A rules edit is not new chat material and cannot silently repeat an unknown paid request.
     assert matching.prepare_next(flow.settings) and matching.claim() is None and len(flow.calls) == 1
     assert pg.execute("SELECT reason_code FROM creator_responsibility_jobs WHERE id=%s", (job["id"],)).fetchone() == {
         "reason_code": "request_unknown",
@@ -939,6 +948,78 @@ def test_unknown_request_after_config_race_only_blocks_identical_material(pg, re
     assert fresh is not None
     matching.run(fresh, flow.settings)
     assert len(flow.calls) == 2
+
+
+def test_document_versions_pause_only_affected_work_without_rewriting_relationships(pg, pilot, responsibility_flow):
+    flow = responsibility_flow
+    flow.enable()
+
+    def save(*, status="published", append=""):
+        document = assistant_rules.library(pg, flow.settings)["responsibility-judgment"]
+        assistant_rules.save_document(pg, flow.settings, pilot.ids["owner"], document["key"], document["title"],
+            document["description"], "manual", status, "owner", document["text"] + append, document["revision"])
+
+    running = _prepared_job(pg, flow)
+    pinned = running["pack"]["_rules"]
+    before = _snapshot(pg, ("contact_assignments", "creator_responsibility_jobs", "creator_responsibility_requests"))
+    save(append="\n测试：新准备的任务使用此版本。")
+    assert _snapshot(pg, before.keys()) == before  # Saving a manual never starts a historical batch.
+    updated = assistant_rules.responsibility_snapshot(pg, flow.settings)
+    assert updated["digest"] != pinned["digest"]
+    matching.run(running, flow.settings)
+    assert flow.calls[-1]["instructions"] == assistant_rules.responsibility_instructions(pinned)
+    assert len(flow.calls) == 1
+    formal = _snapshot(pg, ("contact_assignments",))
+    assert len(formal["contact_assignments"]) == len(before["contact_assignments"]) + 2
+
+    refreshed = _prepared_job(pg, flow)
+    assert refreshed["pack"]["_rules"]["digest"] == updated["digest"]
+    matching.run(refreshed, flow.settings)
+    assert len(flow.calls) == 2  # Changed rules cannot reuse an older ruleset's completed cache.
+    assert flow.calls[-1]["instructions"] == assistant_rules.responsibility_instructions(updated)
+    assert _snapshot(pg, formal.keys()) == formal
+
+    flow.material_version += 1
+    blocked = _enqueue(pg, flow.contact)
+    assert matching.prepare_next(flow.settings)
+    requests = _snapshot(pg, ("creator_responsibility_requests",))
+    save(status="archived")
+    assert matching.claim() is None and len(flow.calls) == 2
+    assert _snapshot(pg, requests.keys()) == requests
+    assert pg.execute("SELECT status,reason_code FROM creator_responsibility_jobs WHERE id=%s",
+                      (blocked,)).fetchone() == {"status": "waiting_evidence", "reason_code": "rules_unavailable"}
+    save()
+    assert pg.execute("SELECT status FROM creator_responsibility_jobs WHERE id=%s",
+                      (blocked,)).fetchone()["status"] == "queued"
+    assert matching.prepare_next(flow.settings)
+    claimed = matching.claim()
+    assert claimed is not None and claimed["id"] == blocked
+    flow.before_response = lambda: save(status="archived")
+    matching.run(claimed, flow.settings)
+    flow.before_response = None
+    paid = pg.execute("SELECT input_tokens,output_tokens,finished_at,response_ciphertext "
+                      "FROM creator_responsibility_requests WHERE id=%s", (claimed["reservation_id"],)).fetchone()
+    assert paid["input_tokens"] == 100 and paid["output_tokens"] == 50
+    assert paid["finished_at"] is not None and paid["response_ciphertext"]
+    assert pg.execute("SELECT status,reason_code,result_ciphertext FROM creator_responsibility_jobs WHERE id=%s",
+                      (blocked,)).fetchone() == {
+                          "status": "waiting_evidence", "reason_code": "rules_unavailable", "result_ciphertext": None}
+    assert _snapshot(pg, formal.keys()) == formal
+    save()
+    assert pg.execute("SELECT status FROM creator_responsibility_jobs WHERE id=%s",
+                      (blocked,)).fetchone()["status"] == "waiting_evidence"
+    matching.configuration_changed(pg)
+    assert pg.execute("SELECT status FROM creator_responsibility_jobs WHERE id=%s",
+                      (blocked,)).fetchone()["status"] == "waiting_evidence"
+    _enqueue(pg, flow.contact, "history")  # A new signal need not mean the bounded evidence actually changed.
+    assert matching.prepare_next(flow.settings)
+    assert pg.execute("SELECT status,reason_code FROM creator_responsibility_jobs WHERE id=%s",
+                      (blocked,)).fetchone() == {"status": "waiting_evidence", "reason_code": "rules_unavailable"}
+    assert not matching.prepare_next(flow.settings) and matching.claim() is None and len(flow.calls) == 3
+    legacy = {key: value for key, value in claimed["pack"].items() if key != "_rules"}
+    _result, _usage, error, _diagnostic = matching.review(legacy, claimed["config"], flow.contact, flow.settings)
+    assert error is None and flow.calls[-1]["instructions"] == evidence.instructions()
+    assert _snapshot(pg, formal.keys()) == formal  # Legacy frozen input can be read without changing relationships.
 
 
 def test_post_response_sql_failure_keeps_usage_and_never_redispatches_unknown_or_sample_tasks(

@@ -8,7 +8,7 @@ from copy import deepcopy
 from decimal import Decimal
 from uuid import uuid4
 
-from . import admin_permissions, ai_dispatch, ai_feature_config, creator_data
+from . import admin_permissions, ai_dispatch, ai_feature_config, assistant_rules, creator_data
 from . import creator_responsibility_evidence as evidence
 from . import openai_client as api
 from .creator_access import require_owner
@@ -70,6 +70,7 @@ REASONS = {
     "cached": "复用相同材料的结果",
     "suggestions_saved": "结果已保存",
     "failure_cached": "相同材料上次调用失败",
+    "rules_unavailable": "负责人匹配手册未发布，任务暂停",
 }
 
 
@@ -110,7 +111,10 @@ def configuration_changed(conn):
     # A setting save never scans the company or starts a new historical batch.
     conn.execute("""UPDATE creator_responsibility_jobs SET desired_version=desired_version+1,
         status=CASE WHEN status IN ('running','preparing') THEN status ELSE 'queued' END,
-        not_before=NOW(),updated_at=NOW() WHERE status NOT IN ('completed','failed','cancelled')""")
+        not_before=NOW(),updated_at=NOW() WHERE status NOT IN ('completed','failed','cancelled')
+          AND NOT(reason_code='rules_unavailable' AND EXISTS(
+            SELECT 1 FROM creator_responsibility_requests r WHERE r.job_id=creator_responsibility_jobs.id
+              AND (r.finished_at IS NULL OR r.error_code<>'not_sent')))""")
 
 
 def touch_chats(conn, chat_ids, *, authorization_id, message_ids=(), observed_message_ids=(), new_scope=False):
@@ -280,12 +284,32 @@ def _invalidate(conn, job):
     )
 
 
+def _payment_material(material):
+    return {**material, "pack": {key: value for key, value in material["pack"].items() if key != "_rules"}}
+
+
+def _manual_access(conn, pack):
+    if pack and "_rules" in pack:
+        assistant_rules.responsibility_validate_access(conn, pack["_rules"])
+
+
+def _pause_rules(conn, job):
+    conn.execute("""UPDATE creator_responsibility_jobs SET status='waiting_evidence',
+        reason_code='rules_unavailable',claim_token=NULL,lease_until=NULL,updated_at=NOW() WHERE id=%s""",
+        (job["id"],))
+
+
 def _store_prepared(conn, job, material, config, settings):
     # Rotation fences an in-flight request, but does not invalidate a semantic result cache.
+    pack = material["pack"]
+    try:
+        _manual_access(conn, pack)
+    except PermissionError:
+        _pause_rules(conn, job)
+        return
     fingerprint = _hash(
         [material["fingerprint"], config["provider"], config["project_id"], config["model"], evidence.PROMPT_VERSION]
     )
-    pack = material["pack"]
     stats = {**material["stats"], "prompt_version": evidence.PROMPT_VERSION,
              **({"auto_signals": job["stats"]["auto_signals"]} if job["stats"].get("auto_signals") else {})}
     cache = (
@@ -305,15 +329,18 @@ def _store_prepared(conn, job, material, config, settings):
     envelope = {"pack": pack, "candidate_ids": material["candidate_ids"]}
     unknown = False
     if pack and job["source"] != "manual" and not cache:
-        unknown = conn.execute("""SELECT 1 FROM creator_responsibility_requests r
+        unknown = conn.execute("""SELECT r.error_code FROM creator_responsibility_requests r
             JOIN creator_responsibility_jobs j ON j.id=r.job_id WHERE j.contact_id=%s
-            AND r.material_fingerprint=%s AND (r.error_code='request_unknown' OR r.finished_at IS NULL) LIMIT 1""",
-            (job["contact_id"], _hash(envelope))).fetchone()
+            AND r.material_fingerprint=%s
+            AND (r.error_code IN ('request_unknown','rules_unavailable') OR r.finished_at IS NULL) LIMIT 1""",
+            (job["contact_id"], _hash(_payment_material(envelope)))).fetchone()
         if not unknown:
             prior = conn.execute("""SELECT pack_ciphertext FROM creator_responsibility_jobs WHERE contact_id=%s
                 AND status='failed' AND reason_code='request_unknown' AND pack_ciphertext IS NOT NULL""",
                 (job["contact_id"],)).fetchall()
-            unknown = any(json.loads(storage.decrypt(row["pack_ciphertext"])) == envelope for row in prior)
+            unknown = any(_payment_material(json.loads(storage.decrypt(row["pack_ciphertext"])))
+                          == _payment_material(envelope) for row in prior)
+    rules_paused = isinstance(unknown, dict) and unknown.get("error_code") == "rules_unavailable"
     if cache:
         cached = json.loads(storage.decrypt(cache["result_ciphertext"]))
         cached["result"] = evidence.validate(pack, cached["result"])
@@ -330,8 +357,10 @@ def _store_prepared(conn, job, material, config, settings):
         result_ciphertext=%s,attempts=0,claim_token=NULL,lease_until=NULL,prepared_at=NOW(),updated_at=NOW(),
         finished_at=CASE WHEN %s THEN NOW() ELSE NULL END WHERE id=%s""",
         (
-            "completed" if cache else "failed" if unknown else "ready" if pack else "waiting_evidence",
-            "cached" if cache else "request_unknown" if unknown else material["reason"],
+            "completed" if cache else "waiting_evidence" if rules_paused else "failed" if unknown
+                else "ready" if pack else "waiting_evidence",
+            "cached" if cache else "rules_unavailable" if rules_paused else "request_unknown" if unknown
+                else material["reason"],
             fingerprint,
             _config_hash(config),
             storage.encrypt(creator_data.encode(envelope))
@@ -367,7 +396,21 @@ def prepare_next(settings):
     try:
         with connection() as conn, conn.transaction():
             conn.execute("SET LOCAL statement_timeout='90s'")
+            pinned = assistant_rules.responsibility_snapshot(conn, settings)
+            assistant_rules.responsibility_validate_access(conn, pinned)
             material = evidence.build(conn, settings, job["contact_id"])
+            if material["pack"]:
+                material["pack"]["_rules"] = pinned
+                material["fingerprint"] = _hash([material["fingerprint"], pinned["digest"]])
+            material["stats"] = {**material["stats"], "rules_digest": pinned["digest"],
+                                 "rules_protocol": pinned["protocol"]}
+    except PermissionError:
+        with connection() as conn, conn.transaction():
+            current = conn.execute("SELECT * FROM creator_responsibility_jobs WHERE id=%s FOR UPDATE",
+                                   (job["id"],)).fetchone()
+            if current and current["status"] == "preparing" and current["claim_token"] == token:
+                _pause_rules(conn, current)
+        return True
     except Exception:
         with connection() as conn, conn.transaction():
             conn.execute(
@@ -416,11 +459,16 @@ def claim():
             _invalidate(conn, job)
             return None
         material = json.loads(creator_data.cipher(settings).decrypt(job["pack_ciphertext"]))
+        try:
+            _manual_access(conn, material["pack"])
+        except PermissionError:
+            _pause_rules(conn, job)
+            return None
         token, reservation = uuid4(), uuid4()
         conn.execute(
             "INSERT INTO creator_responsibility_requests(id,job_id,key_feature,material_fingerprint) "
             "VALUES(%s,%s,%s,%s)",
-            (reservation, job["id"], FEATURE, _hash(material)),
+            (reservation, job["id"], FEATURE, _hash(_payment_material(material))),
         )
         conn.execute(
             """UPDATE creator_responsibility_jobs SET status='running',claim_token=%s,
@@ -474,9 +522,10 @@ def review(pack, config, contact_id, settings):
         response = api.call_openai(
             config,
             key,
-            pack,
+            {key: value for key, value in pack.items() if key != "_rules"},
             contact_id,
-            instructions=evidence.instructions(),
+            instructions=(assistant_rules.responsibility_instructions(pack["_rules"])
+                          if "_rules" in pack else evidence.instructions()),
             output_format=evidence.output_format(pack),
             max_output_tokens=min(12000, 1000 + 400 * len(pack["candidates"])),
             reasoning_effort="none",
@@ -587,6 +636,8 @@ def _apply_assignments(conn, job, material, result, config, settings):
                 "responsible_authorization_id": str(admitted[cm][0]),
                 "confidence": suggestion["confidence"], "threshold": str(threshold),
                 "support_refs": suggestion["support_refs"],
+                "rules_digest": material["pack"].get("_rules", {}).get("digest"),
+                "rules_protocol": material["pack"].get("_rules", {}).get("protocol"),
             })
     refreshed = deepcopy(refs)
     if added:
@@ -601,6 +652,12 @@ def run(job, settings):
     with connection() as conn, conn.transaction():
         current = _current(conn, job)
         if not current:
+            _no_request(conn, job)
+            return
+        try:
+            _manual_access(conn, job["pack"])
+        except PermissionError:
+            _pause_rules(conn, current)
             _no_request(conn, job)
             return
         if not evidence.still_valid(conn, current["refs"], settings):
@@ -642,6 +699,14 @@ def run(job, settings):
     with connection() as conn, conn.transaction():
         current = _current(conn, job)
         if not current:
+            return
+        try:
+            _manual_access(conn, job["pack"])
+        except PermissionError:
+            _pause_rules(conn, current)
+            if error is None:
+                conn.execute("UPDATE creator_responsibility_requests SET error_code='rules_unavailable' WHERE id=%s",
+                             (job["reservation_id"],))
             return
         if not evidence.still_valid(conn, current["refs"], settings):
             _invalidate(conn, current)

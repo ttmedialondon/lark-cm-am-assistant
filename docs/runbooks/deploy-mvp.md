@@ -85,6 +85,12 @@ curl --fail --silent --show-error https://larkbot.ttapp.help/healthz
 - 新确认的达人进入现有负责人队列。新 CM 接入或真实相关材料变化会唤醒受影响任务；重复页和无关消息不反复调用，人工解除与已有正式关系保留。新增负责关系继续触发重要度与七天事件补算，不因发布全量重跑。
 - 单群拒绝只延后该会话，明确的账号令牌／权限错误才要求重新授权。私聊列表暂不可用时，在后续会话发现中间隔一小时重试；明确缺权限仍由本人重新授权，不阻止正常群聊继续同步。
 
+#### 负责人匹配手册
+
+文档管理员在「助手文档 → 负责人匹配」维护关系判断、取材与交接、关联与案例三份手册。新准备的任务加密固定手册快照，一次请求判断本批全部 CM；文档版本参与结果缓存，手册元数据不重复发送到模型，也不作为新聊天绕过未知费用保护。类型和后台范围固定，不加入普通助手导航或回复资料。
+
+普通编辑不重排旧任务、不修改已有关系。草稿或停用会暂停依赖任务；恢复发布仅续跑尚未实际调用的缺手册任务。已付费但暂停的相同材料不因恢复发布、配置保存或重复材料信号自动重发，真实新材料和明确人工重查沿用原入口。历史结果与原文仍按原授权可查。发布不提升旧任务全局版本、不全量重跑、不修改阈值或开关。
+
 #### 群发页面与正式发送
 
 采用按功能增量授权，参考 [Google](https://developers.google.com/identity/protocols/oauth2/resources/granular-permissions)、[Microsoft](https://learn.microsoft.com/en-us/entra/identity-platform/consent-types-developer) 和 [Slack](https://docs.slack.dev/authentication/installing-with-oauth/) 的官方流程。不把应用已开通的全部权限都要求用户授权。
