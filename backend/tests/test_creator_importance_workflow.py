@@ -101,6 +101,8 @@ def ranking_flow(pg, monkeypatch):
 
     def respond(_config, key, pack, target, **kwargs):
         assert key == "sk-synthetic-ranking" and str(target) == str(person)
+        assert kwargs["max_output_tokens"] == 8192
+        assert kwargs["reasoning_effort"] == "none" and kwargs["total_timeout"] == 70
         state.calls.append(deepcopy(pack))
         state.instructions.append(kwargs["instructions"])
         if state.before_response:
@@ -667,6 +669,9 @@ def test_paid_retry_cache_and_stale_results_keep_billing_without_repeat(pg, rank
     }
     assert pg.execute("SELECT status,reason_code FROM creator_importance_jobs WHERE id=%s",
                       (incomplete["id"],)).fetchone() == {"status": "failed", "reason_code": "invalid_output"}
+    stats = pg.execute("SELECT stats FROM creator_importance_jobs WHERE id=%s", (incomplete["id"],)).fetchone()["stats"]
+    assert stats["response_status"] == "incomplete" and stats["incomplete_reason"] == "max_output_tokens"
+    assert stats["usage"] == {"input_tokens": 31, "output_tokens": 17}
     assert importance.claim() is None and len(flow.calls) == calls + 1
     view = importance.view_for(pg, incomplete["contact_id"], incomplete["responsible_authorization_id"],
                                flow.settings, details=False)
@@ -722,7 +727,8 @@ def test_document_versions_preserve_incremental_ranking_and_reuse_paused_paid_wo
         (importance._cipher(flow.settings).encrypt(json.dumps(legacy_material)),
          importance._hash([legacy_material["pack"], legacy["config_fingerprint"]]), legacy["id"]))
     importance.run(importance.claim(), flow.settings)
-    assert flow.instructions[-1] == importance.facts.instructions()  # Deploying does not rewrite a frozen old batch.
+    assert flow.instructions[-1] == (
+        importance.facts.instructions() + "\n只输出最终 JSON 对象，不输出前言、中间说明或重复结果。")
 
     ready("rules_pinned", 6)
     running = importance.claim()
@@ -736,7 +742,8 @@ def test_document_versions_preserve_incremental_ranking_and_reuse_paused_paid_wo
     updated = assistant_rules.importance_snapshot(pg, flow.settings)
     assert updated["digest"] == facts_digest and updated["digest"] != pinned["digest"]
     importance.run(running, flow.settings)
-    assert flow.instructions[-1] == assistant_rules.importance_instructions(pinned)
+    assert flow.instructions[-1] == (
+        assistant_rules.importance_instructions(pinned) + "\n只输出最终 JSON 对象，不输出前言、中间说明或重复结果。")
     assert "测试：档位规则仍由程序执行。" not in flow.instructions[-1]
     previous = importance._state(running, flow.settings)["facts"]
     profile = importance.view_for(pg, flow.person, flow.owner, flow.settings)
@@ -748,7 +755,8 @@ def test_document_versions_preserve_incremental_ranking_and_reuse_paused_paid_wo
     assert following["material"]["_rules"]["digest"] == updated["digest"]
     assert following["material"]["state"]["facts"] == previous
     importance.run(following, flow.settings)
-    assert flow.instructions[-1] == assistant_rules.importance_instructions(updated)
+    assert flow.instructions[-1] == (
+        assistant_rules.importance_instructions(updated) + "\n只输出最终 JSON 对象，不输出前言、中间说明或重复结果。")
     assert "测试：新的事实判断规则。" in flow.instructions[-1]
     assert "测试：档位规则仍由程序执行。" not in flow.instructions[-1]
     checkpoint = importance._state(pg.execute("SELECT * FROM creator_importance_jobs WHERE id=%s",

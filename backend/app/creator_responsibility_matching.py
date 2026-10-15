@@ -525,9 +525,10 @@ def review(pack, config, contact_id, settings):
             {key: value for key, value in pack.items() if key != "_rules"},
             contact_id,
             instructions=(assistant_rules.responsibility_instructions(pack["_rules"])
-                          if "_rules" in pack else evidence.instructions()),
+                          if "_rules" in pack else evidence.instructions())
+                         + "\n只输出最终 JSON 对象，不输出前言、中间说明或重复结果。",
             output_format=evidence.output_format(pack),
-            max_output_tokens=min(12000, 1000 + 400 * len(pack["candidates"])),
+            max_output_tokens=min(12000, 4000 + 800 * len(pack["candidates"])),
             reasoning_effort="none",
             total_timeout=70,
         )
@@ -541,7 +542,10 @@ def review(pack, config, contact_id, settings):
         error = exc
         telemetry = getattr(exc, "telemetry", {}) or telemetry
         diagnostic = {**(diagnostic or {}), "error": str(exc)[:160],
-                      "output_shape": telemetry.get("output_shape", [])}
+                      "output_shape": telemetry.get("output_shape", []),
+                      "response_status": telemetry.get("response_status"),
+                      "incomplete_reason": telemetry.get("incomplete_reason"),
+                      "usage": telemetry.get("usage", {})}
         if isinstance(exc, json.JSONDecodeError | TypeError):
             error = api.ModelOutputError("invalid_json", telemetry=telemetry)
     return result, telemetry, error, diagnostic

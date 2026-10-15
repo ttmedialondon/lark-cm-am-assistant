@@ -817,10 +817,11 @@ def run(job, settings):
             job["config"]["api_key_ciphertext"])
         response = api.call_openai(job["config"], key, pack, job["contact_id"],
             instructions=(assistant_rules.importance_instructions(material["_rules"])
-                          if "_rules" in material else facts.instructions()),
+                          if "_rules" in material else facts.instructions())
+                         + "\n只输出最终 JSON 对象，不输出前言、中间说明或重复结果。",
             output_format=facts.output_format([m["ref"] for m in pack["messages"]
                 if m["role"] in {"creator", "cm"} and m["context_complete"]], material["state"]["facts"]),
-            max_output_tokens=4_096, reasoning_effort="none", total_timeout=70)
+            max_output_tokens=8_192, reasoning_effort="none", total_timeout=70)
         raw = response["text"]
         telemetry = {**response["telemetry"], "usage": response["usage"], "response_id": response["response_id"]}
         result = facts.validate(api.parse_json(raw), pack, material["state"]["facts"])
@@ -864,7 +865,10 @@ def run(job, settings):
                 stats=stats||%s::jsonb,updated_at=NOW() WHERE id=%s""",
                 ("retry_wait" if retry else "failed", code,
                  api.retry_delay(error.retry_after_seconds, job["attempts"]) if retry else 0, not retry,
-                 creator_data.encode({"output_error": output_error, "output_shape": telemetry.get("output_shape", [])}),
+                 creator_data.encode({"output_error": output_error, "output_shape": telemetry.get("output_shape", []),
+                     "response_status": telemetry.get("response_status"),
+                     "incomplete_reason": telemetry.get("incomplete_reason"),
+                     "usage": telemetry.get("usage", {})}),
                  job["id"]))
         conn.execute("UPDATE ai_feature_configs SET last_tested_at=NOW(),last_test_status=%s WHERE feature=%s",
                      ("failed" if error else "succeeded", FEATURE))

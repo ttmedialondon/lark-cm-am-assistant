@@ -528,11 +528,13 @@ def test_one_creator_one_call_formal_multi_cm_idempotency_and_cache_gates(pg, pi
     assert flow.calls[0]["key"] == "sk-responsibility-test-only"  # No creator_import or handle key fallback.
     assert flow.calls[0]["contact"] == flow.contact
     assert flow.calls[0]["reasoning_effort"] == "none"
-    assert 0 < flow.calls[0]["total_timeout"] <= 75
+    assert flow.calls[0]["total_timeout"] == 70 and flow.calls[0]["max_output_tokens"] == 5600
     pinned = job["pack"]["_rules"]
     assert set(pinned["documents"]) == assistant_rules.RESPONSIBILITY_KEYS
     assert row["stats"]["rules_digest"] == pinned["digest"]
-    assert flow.calls[0]["instructions"] == assistant_rules.responsibility_instructions(pinned)
+    assert flow.calls[0]["instructions"] == (
+        assistant_rules.responsibility_instructions(pinned)
+        + "\n只输出最终 JSON 对象，不输出前言、中间说明或重复结果。")
     assert "_rules" not in flow.calls[0]["pack"]
     assert "suggestions" in flow.calls[0]["output_format"]["schema"]["properties"]
     assert row["input_tokens"] == 100 and row["output_tokens"] == 50
@@ -926,6 +928,21 @@ def test_retry_ledger_and_disabled_config_keep_suggestions_isolated(pg, responsi
     diagnostic = json.loads(creator_data.cipher(flow.settings).decrypt(receipt["response_ciphertext"]))
     assert " pruned" in diagnostic["raw"] and "Extra data" in diagnostic["error"]
     assert pg.execute("SELECT * FROM contact_assignments ORDER BY id").fetchall() == before
+    flow.material_version += 1
+    incomplete = _prepared_job(pg, flow)
+    flow.error = openai_client.ModelOutputError("unfinished response", telemetry={
+        "http_status": 200, "response_status": "incomplete", "incomplete_reason": "max_output_tokens",
+        "usage": {"input_tokens": 15073, "output_tokens": 2200},
+    })
+    matching.run(incomplete, flow.settings)
+    receipt = pg.execute("SELECT error_code,response_ciphertext FROM creator_responsibility_requests WHERE id=%s",
+                         (incomplete["reservation_id"],)).fetchone()
+    diagnostic = json.loads(creator_data.cipher(flow.settings).decrypt(receipt["response_ciphertext"]))
+    assert receipt["error_code"] == "invalid_output" and diagnostic["response_status"] == "incomplete"
+    assert diagnostic["incomplete_reason"] == "max_output_tokens"
+    assert diagnostic["usage"] == {"input_tokens": 15073, "output_tokens": 2200}
+    assert matching.claim() is None
+    assert pg.execute("SELECT * FROM contact_assignments ORDER BY id").fetchall() == before
     flow.enable(enabled=False)
     matching.configuration_changed(pg)
     assert _enqueue(pg, flow.contact) is None and matching.claim() is None
@@ -985,7 +1002,9 @@ def test_document_versions_pause_only_affected_work_without_rewriting_relationsh
     updated = assistant_rules.responsibility_snapshot(pg, flow.settings)
     assert updated["digest"] != pinned["digest"]
     matching.run(running, flow.settings)
-    assert flow.calls[-1]["instructions"] == assistant_rules.responsibility_instructions(pinned)
+    assert flow.calls[-1]["instructions"] == (
+        assistant_rules.responsibility_instructions(pinned)
+        + "\n只输出最终 JSON 对象，不输出前言、中间说明或重复结果。")
     assert len(flow.calls) == 1
     formal = _snapshot(pg, ("contact_assignments",))
     assert len(formal["contact_assignments"]) == len(before["contact_assignments"]) + 2
@@ -994,7 +1013,9 @@ def test_document_versions_pause_only_affected_work_without_rewriting_relationsh
     assert refreshed["pack"]["_rules"]["digest"] == updated["digest"]
     matching.run(refreshed, flow.settings)
     assert len(flow.calls) == 2  # Changed rules cannot reuse an older ruleset's completed cache.
-    assert flow.calls[-1]["instructions"] == assistant_rules.responsibility_instructions(updated)
+    assert flow.calls[-1]["instructions"] == (
+        assistant_rules.responsibility_instructions(updated)
+        + "\n只输出最终 JSON 对象，不输出前言、中间说明或重复结果。")
     assert _snapshot(pg, formal.keys()) == formal
 
     flow.material_version += 1
@@ -1036,7 +1057,8 @@ def test_document_versions_pause_only_affected_work_without_rewriting_relationsh
     assert not matching.prepare_next(flow.settings) and matching.claim() is None and len(flow.calls) == 3
     legacy = {key: value for key, value in claimed["pack"].items() if key != "_rules"}
     _result, _usage, error, _diagnostic = matching.review(legacy, claimed["config"], flow.contact, flow.settings)
-    assert error is None and flow.calls[-1]["instructions"] == evidence.instructions()
+    assert error is None and flow.calls[-1]["instructions"] == (
+        evidence.instructions() + "\n只输出最终 JSON 对象，不输出前言、中间说明或重复结果。")
     assert _snapshot(pg, formal.keys()) == formal  # Legacy frozen input can be read without changing relationships.
 
 

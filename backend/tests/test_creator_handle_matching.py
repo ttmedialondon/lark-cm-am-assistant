@@ -374,7 +374,7 @@ def _prepared_job(pg, flow, source="manual"):
     return job
 
 
-def test_paid_handle_receipt_survives_inflight_signal_without_another_request(pg, matching_flow):
+def test_paid_handle_receipt_survives_inflight_signal_without_another_request(pg, matching_flow, monkeypatch):
     flow = matching_flow
     flow.enable()
     flow.review = True
@@ -384,6 +384,25 @@ def test_paid_handle_receipt_survives_inflight_signal_without_another_request(pg
     assert pg.execute('SELECT status,result_ciphertext FROM creator_handle_jobs WHERE id=%s',
                       (job['id'],)).fetchone() == {'status': 'queued', 'result_ciphertext': None}
     flow.before_response = None
+    pg.execute("UPDATE creator_handle_jobs SET created_at=NOW()-INTERVAL '7 days' WHERE id=%s", (job['id'],))
+    waiting = uuid4()
+    pg.execute("INSERT INTO contacts(id,created_at) VALUES(%s,NOW()-INTERVAL '30 days')", (waiting,))
+    pg.execute("INSERT INTO lark_identities(open_id,contact_id) VALUES('ou_waiting_identity',%s)", (waiting,))
+    pg.execute("INSERT INTO creator_handle_jobs(contact_id,purpose,not_before) "
+               "VALUES(%s,'identity',NOW()-INTERVAL '1 second')", (waiting,))
+
+    def earlier_identity(_conn, _settings, contact, _catalog, *, purpose, recheck=False):
+        assert contact == waiting and purpose == 'identity' and not recheck
+        return {'pack': None, 'refs': [], 'fingerprint': 'empty-identity', 'reason': 'no_text',
+                'stats': {'confirmed_handles': [], 'manual_recheck': False}}
+
+    with monkeypatch.context() as material:
+        material.setattr(matching.evidence, 'build', earlier_identity)
+        assert matching.prepare_next(flow.settings)
+    assert pg.execute('SELECT status FROM creator_handle_jobs WHERE contact_id=%s',
+                      (waiting,)).fetchone()['status'] == 'waiting_evidence'
+    assert pg.execute('SELECT status FROM creator_handle_jobs WHERE id=%s',
+                      (job['id'],)).fetchone()['status'] == 'queued'
     flow.valid = False
     assert matching.prepare_next(flow.settings)
     assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []

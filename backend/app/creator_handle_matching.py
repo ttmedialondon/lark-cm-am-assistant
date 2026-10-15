@@ -289,7 +289,7 @@ def prepare_next(settings):
         history_turn = len(recent) == 4 and all(row["source"] != "history" for row in recent)
         job = conn.execute(
             """SELECT * FROM creator_handle_jobs WHERE status='queued' AND not_before<=NOW()
-            ORDER BY CASE WHEN source='history' THEN %s ELSE %s END,created_at
+            ORDER BY CASE WHEN source='history' THEN %s ELSE %s END,not_before,created_at,id
             FOR UPDATE SKIP LOCKED LIMIT 1""",
             (0 if history_turn else 1, 1 if history_turn else 0),
         ).fetchone()
@@ -672,7 +672,8 @@ def claim():
         job = conn.execute(
             """SELECT * FROM creator_handle_jobs WHERE status IN ('ready','retry_wait')
             AND not_before<=NOW() AND attempts<3 ORDER BY
-              CASE WHEN source='history' THEN %s ELSE %s END,created_at FOR UPDATE SKIP LOCKED LIMIT 1""",
+              CASE WHEN source='history' THEN %s ELSE %s END,not_before,created_at,id
+              FOR UPDATE SKIP LOCKED LIMIT 1""",
             (0 if history_turn else 1, 1 if history_turn else 0),
         ).fetchone()
         if not job:

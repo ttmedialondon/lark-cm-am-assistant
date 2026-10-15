@@ -95,6 +95,8 @@ curl --fail --silent --show-error https://larkbot.ttapp.help/healthz
 
 结构化响应优先读取正式消息的 `final_answer`，不把 commentary 混入结果；拒答和未完成输出仍拒绝。只兼容完整 JSON 代码围栏，不截断 `HOOK`、`pruned` 或其他任意尾文，更不能从两个矛盾 JSON 中挑一个入库。负责人失败返回加密保留有界原文与校验错误，常规日志仅记录安全输出结构。协议依据 [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs) 和 [Responses 消息 phase](https://developers.openai.com/api/docs/guides/reasoning)。
 
+负责人和重要度只要求最终 JSON，不请求前言或中间说明；负责人按候选数量预留输出容量，重要度最多 8192 token。这是单次返回长度，不是每日预算或额外调用；未完成的返回仍不入库，并记录响应状态、截断原因和实际用量。身份／handle 共用队列保留历史轮转，按本次可执行时间排队；失效或新材料重排的旧任务不凭最初创建时间反复占先。
+
 #### 负责人匹配手册
 
 文档管理员在「助手文档 → 负责人匹配」维护关系判断、取材与交接、关联与案例三份手册。新准备的任务加密固定手册快照，一次请求判断本批全部 CM；文档版本参与结果缓存，手册元数据不重复发送到模型，也不作为新聊天绕过未知费用保护。类型和后台范围固定，不加入普通助手导航或回复资料。
