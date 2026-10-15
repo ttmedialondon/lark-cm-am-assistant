@@ -62,11 +62,13 @@ def test_template_never_exposes_admin_to_a_viewer_and_escapes_private_json():
 
 
 def test_reply_browser_polls_only_generation_and_rechecks_before_copy():
-    html = render({"enabled": True, "window": {}, "run": {"status": "completed"}, "events": [{
+    html = render({"enabled": True, "preparing": True, "window": {}, "run": {"status": "completed"}, "events": [{
         "id": "event:0", "title": "<img src=x onerror=alert(1)> 样品尚未收到",
         "priority": "P1", "handling_status": "unresolved",
         "summary": "请跟进样品。", "latest_progress": "等待回复。", "evidence": [],
     }]})
+    preparing_html = render({"enabled": True, "preparing": True, "window": {}, "events": [],
+        "run": {"status": "queued", "counts": {"failed": 0}, "gaps": ["模型暂不可用，请联系管理员。"]}})
     script = r"""
 const assert = require('node:assert/strict'), fs = require('node:fs'), path = require('node:path');
 const {chromium} = require('playwright');
@@ -75,7 +77,7 @@ const {chromium} = require('playwright');
   const browser=await chromium.launch({headless:true,channel:'chrome'});
   try {
     const page=await browser.newPage(), errors=[], reads=[];
-    let deny=false;
+    let deny=false, html=input.preparing_html;
     page.on('pageerror',error=>errors.push(error.message));
     await page.addInitScript(()=>Object.defineProperty(navigator,'clipboard',{
       value:{writeText:async text=>{window.copied=text;}}
@@ -84,7 +86,7 @@ const {chromium} = require('playwright');
     await page.route('**/*',async route=>{
       const request=route.request(), url=new URL(request.url());
       if(url.origin!=='http://localhost') return route.abort();
-      if(url.pathname==='/') return route.fulfill({contentType:'text/html',body:input.html});
+      if(url.pathname==='/') return route.fulfill({contentType:'text/html',body:html});
       if(url.pathname.startsWith('/static/')) return route.fulfill({
         contentType:url.pathname.endsWith('.js')?'text/javascript':'text/css',
         body:url.pathname.endsWith('.js')?fs.readFileSync(path.join(input.app,url.pathname.slice(1)),'utf8'):''
@@ -105,6 +107,15 @@ const {chromium} = require('playwright');
       throw new Error('Unexpected request: '+url.href);
     });
     await page.goto('http://localhost/');
+    assert.equal(await page.locator('#oh-status-title').textContent(),'正在准备近期聊天');
+    assert.equal(await page.locator('#oh-empty').isVisible(),false);
+    assert.equal(await page.locator('#oh-analysis-spinner').isVisible(),false);
+    assert.equal(await page.locator('#oh-refresh').isEnabled(),true);
+    assert.equal(await page.locator('#oh-issues').isVisible(),true);
+    assert.equal(await page.locator('#oh-issues').getAttribute('open'),null);
+    html=input.html;
+    await page.reload();
+    assert.notEqual(await page.locator('#oh-status-title').textContent(),'正在准备近期聊天');
     assert.equal(await page.locator('.oh-event img, .oh-event script').count(),0);
     await page.getByRole('button',{name:'生成回复建议',exact:true}).click();
     await page.waitForFunction(()=>document.querySelector('.oh-reply button').getAttribute('aria-busy')==='true');
@@ -131,7 +142,8 @@ const {chromium} = require('playwright');
   } finally {await browser.close();}
 })().catch(error=>{console.error(error);process.exit(1);});
 """
-    result = subprocess.run(["node", "-e", script], input=json.dumps({"html": html, "app": str(APP)}),
+    result = subprocess.run(["node", "-e", script], input=json.dumps({
+        "html": html, "preparing_html": preparing_html, "app": str(APP)}),
                             text=True, capture_output=True, timeout=30, env=os.environ.copy())
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -142,6 +154,7 @@ def client(monkeypatch):
     calls = []
     conn = SimpleNamespace(transaction=nullcontext)
     monkeypatch.setattr(routes, "connection", lambda: nullcontext(conn))
+    monkeypatch.setattr(routes.user_preparation, "status_for", lambda *_: {"preparing": False})
     monkeypatch.setattr(
         routes.offhours_summary, "get_summary_view",
         lambda connection, actor, **kwargs: calls.append((connection, actor)) or {"events": []},

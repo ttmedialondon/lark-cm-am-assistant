@@ -140,9 +140,10 @@ def test_dashboard_navigation_preserves_access_and_connection_controls(pg, monke
     restricted = main._template(request, "dashboard.html", {
         **context, "authorization": {**disabled_authorization, "body_consent_at": None},
         "body_consent": False, "offhours_summary_visible": False,
+        "stats": {"needs_authorization": True, "status": "需要重新连接 Lark", "badge": "warning"},
     }).body.decode()
     assert "/creators/broadcast" not in restricted and "/dashboard/offhours-summary" not in restricted
-    assert "重新使用 Lark 授权" in restricted
+    assert "重新连接 Lark" in restricted
     assert 'id="operations-assistant"' not in restricted
     assert "business_nav" not in context
     for retired in ("/dashboard/creators", "creator-setup-preview", "creator-candidates",
@@ -165,34 +166,65 @@ def test_dashboard_requires_login_and_retired_creator_endpoints_are_absent(monke
         assert client.post(path).status_code == 404
 
 
-def test_dashboard_polling_distinguishes_active_sync_from_scheduled_or_paused_work(pg, monkeypatch):  # noqa: F811
+def test_dashboard_preparation_is_nonblocking_and_ends_before_old_history(pg, monkeypatch):  # noqa: F811
     monkeypatch.setattr(main, "connection", lambda: nullcontext(pg))
     actor, job = uuid4(), uuid4()
-    pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,'dashboard_actor','fixture')",
-               (actor,))
-    pg.execute("INSERT INTO chats(chat_id) VALUES('dashboard_chat')")
-    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id,backfill_complete,sync_status) "
-               "VALUES(%s,'dashboard_chat',TRUE,'succeeded')", (actor,))
-    pg.execute("INSERT INTO sync_jobs(id,authorization_id,mode,status) VALUES(%s,%s,'incremental','queued')",
+    authorization = pg.execute("""INSERT INTO authorizations(id,open_id,access_token_ciphertext,body_consent_at)
+        VALUES(%s,'dashboard_actor','fixture',NOW()) RETURNING *""", (actor,)).fetchone()
+    pg.execute("INSERT INTO sync_jobs(id,authorization_id,mode,status) VALUES(%s,%s,'backfill','queued')",
                (job, actor))
-    monkeypatch.setattr(main, "_current_authorization", lambda _: {"id": actor})
+    monkeypatch.setattr(main, "_current_authorization", lambda _: authorization)
+    monkeypatch.setattr(main.admin_permissions, "access_for", lambda _: {
+        "is_owner": False, "has_admin_access": False, "landing_path": None,
+    })
+    monkeypatch.setattr(main.assistant, "configured", lambda _: True)
+    monkeypatch.setattr(main, "_admin_csrf_token", lambda _: "fixture-csrf")
     client = TestClient(main.app)
-    now = datetime.now(UTC)
-    for status, scheduled, discovery, http_status, error_code, label, syncing in (
-        ("queued", now + timedelta(minutes=5), "succeeded", None, None, "已接入 · 定时同步", False),
-        ("queued", now - timedelta(minutes=1), "succeeded", None, None, "准备定时更新", False),
-        ("running", now, "succeeded", None, None, "定时更新中", True),
-        ("running", now, "pending", None, None, "正在发现会话", True),
-        ("running", now, "succeeded", 429, None, "Lark 限流暂停", False),
-        ("running", now, "succeeded", None, 99991400, "Lark 限流暂停", False),
-    ):
-        pg.execute("UPDATE sync_jobs SET status=%s,scheduled_at=%s,discovery_status=%s,last_http_status=%s,"
-                   "last_error_code=%s WHERE id=%s", (status, scheduled, discovery, http_status, error_code, job))
+
+    def check(preparing, label):
         response = client.get("/dashboard/stats")
         assert response.status_code == 200 and label in response.text
-        assert ('class="ui-spinner"' in response.text) is syncing
+        assert main._dashboard_stats(actor)["preparing"] is preparing
+        assert 'class="ui-spinner"' not in response.text
         assert 'hx-trigger="every 10s [!document.hidden]"' in response.text
         assert 'hx-trigger="load' not in response.text
+        assert all(word not in response.text for word in ('worker', '会话', '回填', '同步', '水位'))
+        return response.text
+
+    check(True, '正在为你准备工作台')
+    pg.execute("UPDATE sync_jobs SET mode='incremental' WHERE id=%s", (job,))
+    check(True, '正在为你准备工作台')  # Alternating recent/history pages cannot flicker the welcome card.
+    home = client.get('/dashboard').text
+    for path in ('/creators', '/creators/broadcast', '/dashboard/offhours-summary'):
+        assert f'href="{path}"' in home  # Preparation is informational, never a feature gate.
+    assert 'id="operations-assistant"' in home
+    assert home.index('id="dashboard-stats"') < home.index('aria-label="常用功能"')
+    pg.execute("INSERT INTO chats(chat_id,chat_status) VALUES('recent','normal'),('restricted','normal'),"
+               "('archived','archived'),('hidden','normal'),('disabled','normal')")
+    for chat in ('recent', 'restricted', 'archived', 'hidden', 'disabled'):
+        pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,%s)", (actor, chat))
+    pg.execute("UPDATE authorization_chats SET sync_status='not_readable' WHERE chat_id='restricted'")
+    pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='hidden'")
+    pg.execute("UPDATE authorization_chats SET sync_enabled=FALSE WHERE chat_id='disabled'")
+    pg.execute("UPDATE sync_jobs SET status='running',discovery_status='succeeded' WHERE id=%s", (job,))
+    check(True, '正在为你准备工作台')
+    pg.execute("UPDATE authorization_chats SET recent_coverage_start_at=NOW()-INTERVAL '7 days' "
+               "WHERE chat_id='recent'")
+    check(True, '正在为你准备工作台')  # A first unfinished page is not a complete recent window.
+    pg.execute("UPDATE authorization_chats SET last_incremental_at=NOW() WHERE chat_id='recent'")
+    check(False, 'Lark 已连接')  # Restricted/hidden/archived chats and older history cannot hold the banner.
+    assert not pg.execute("SELECT backfill_complete FROM authorization_chats WHERE chat_id='recent'"
+                          ).fetchone()['backfill_complete']
+    pg.execute("UPDATE sync_jobs SET status='succeeded',created_at=NOW()-INTERVAL '1 hour' WHERE id=%s", (job,))
+    pg.execute("INSERT INTO sync_jobs(id,authorization_id,mode,status) VALUES(%s,%s,'incremental','running')",
+               (uuid4(), actor))
+    pg.execute("UPDATE authorization_chats SET recent_coverage_start_at=NULL,last_incremental_at=NULL "
+               "WHERE chat_id='recent'")
+    check(False, 'Lark 已连接')  # Later discovery and regular refreshes are not first-use preparation.
+    pg.execute("UPDATE sync_jobs SET status='failed',last_error='fixture-private-error' WHERE status='running'")
+    assert 'fixture-private-error' not in check(False, '资料暂时无法更新')
+    pg.execute("UPDATE sync_jobs SET status='attention_required' WHERE status='failed'")
+    assert 'href="/auth/lark/start"' in check(False, '需要重新连接 Lark')
 
 
 def test_named_frontend_testers_do_not_require_a_retired_admin_grant() -> None:

@@ -9,6 +9,7 @@
     <div class="page-body">
       <div class="container-xl">
         <div class="business-heading"><h1 class="page-title">工作台</h1></div>
+        {% include "partials/stats.html" %}
         <section class="row g-3 mb-5" aria-label="常用功能">
           <div class="col-md-4">
             <div class="card business-feature-card h-100">
@@ -44,15 +45,9 @@
           </div>
           {% endif %}
         </section>
-        <section aria-labelledby="connection-title">
-          <h2 id="connection-title" class="h3 mb-3">账号连接</h2>
-          {% include "partials/stats.html" %}
-        </section>
-        {% if not body_consent %}
-        <div class="alert alert-info mt-4">提醒功能需要重新确认 Lark 授权，请 <a href="/auth/lark/start" class="alert-link">重新使用 Lark 授权</a>。</div>
-        {% elif authorization.p2p_discovery_status == 'unavailable' %}
+        {% if body_consent and not stats.needs_authorization and authorization.p2p_discovery_status == 'unavailable' %}
         <div class="alert alert-warning mt-4">私聊暂时无法接入，系统会定期重试；群聊可继续使用。</div>
-        {% elif authorization.p2p_discovery_status == 'attention_required' %}
+        {% elif body_consent and not stats.needs_authorization and authorization.p2p_discovery_status == 'attention_required' %}
         <div class="alert alert-warning mt-4">私聊权限需要重新确认，请 <a href="/auth/lark/start" class="alert-link">重新使用 Lark 授权</a>。</div>
         {% endif %}
         <div class="card mt-4">

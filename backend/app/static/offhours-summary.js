@@ -27,6 +27,10 @@
   function priority(event) { return priorities.includes(event.priority) ? event.priority : null; }
   function needsReview(event) { return event.handling_status ? event.handling_status === "uncertain" : event.needs_review || !priority(event); }
   function events() { return Array.isArray(data.events) ? data.events : []; }
+  function isPreparing() {
+    return data.preparing && !events().length && data.enabled && !data.window?.is_future
+      && !data.run?.counts?.failed && !["failed", "cancelled", "disabled", "paused"].includes(data.run?.status);
+  }
 
   const replyStates = new Map();
   function clearReplies() {
@@ -284,7 +288,7 @@
     for (const detail of $("oh-events").querySelectorAll("details[data-detail-key]")) {
       detail.open = openDetails.has(detail.dataset.detailKey);
     }
-    $("oh-empty").hidden = filtered.length > 0;
+    $("oh-empty").hidden = filtered.length > 0 || isPreparing();
     $("oh-visible-count").textContent = `显示 ${filtered.length} / ${all.length} 条已归纳事件`;
     if (all.length && !filtered.length) {
       $("oh-empty-title").textContent = "没有符合筛选条件的事件";
@@ -313,13 +317,16 @@
   }
 
   function render() {
-    const run = data.run, counts = run?.counts || {};
+    const run = data.run, counts = run?.counts || {}, preparing = isPreparing();
     const settingsLink = document.querySelector('.oh-actions a[href^="/admin/"]');
     if (settingsLink) settingsLink.hidden = !data.can_manage;
     const failed = Number(counts.failed || 0);
     const pending = Number(counts.queued || 0) + Number(counts.running || 0);
     let title = "尚未开启分析", description = "开启后将自动整理达人消息。";
-    if (run) {
+    if (preparing) {
+      title = "正在准备近期聊天";
+      description = "首次整理需要一些时间，有结果后会自动显示。无需停留在此页面。";
+    } else if (run) {
       const status = {
         queued: "正在整理", running: "正在整理", succeeded: "整理完成",
         completed: "整理完成", partial: "部分结果待更新", failed: "暂时无法更新",
@@ -337,12 +344,12 @@
       description = "有结果后将自动更新。";
     }
     $("oh-status-title").textContent = title;
-    $("oh-analysis-spinner").hidden = denied || !data.enabled || !(pending || ["queued", "running"].includes(run?.status));
+    $("oh-analysis-spinner").hidden = preparing || denied || !data.enabled || !(pending || ["queued", "running"].includes(run?.status));
     $("oh-status-description").textContent = description;
     const gaps = [...new Set(run?.gaps || [])];
     $("oh-issues").hidden = !gaps.length;
     $("oh-issue-list").replaceChildren(...gaps.map(gap => node("li", "oh-small", gap)));
-    $("oh-updated").textContent = run?.updated_at ? `结果更新 ${date(run.updated_at)}` : "";
+    $("oh-updated").textContent = !preparing && run?.updated_at ? `结果更新 ${date(run.updated_at)}` : "";
     const all = events();
     for (const level of priorities) {
       const count = all.filter(event => priority(event) === level).length;
@@ -356,7 +363,7 @@
 
   function schedule() {
     clearTimeout(timer);
-    const active = data.enabled && (!data.run || data.window?.is_open
+    const active = data.enabled && (data.preparing || !data.run || data.window?.is_open
       || ["queued", "running"].includes(data.run.status));
     if (!denied && !navigating && !document.hidden) timer = setTimeout(refresh, active ? 30000 : 120000);
   }

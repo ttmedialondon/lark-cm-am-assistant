@@ -1,6 +1,6 @@
 """Confirmed creator rosters, independent of retired candidate pages and scanners."""
 
-from . import admin_permissions, contact_handles, creator_access, creator_importance, creator_imports
+from . import admin_permissions, contact_handles, creator_access, creator_importance, creator_imports, user_preparation
 from .config import get_settings
 from .db import connection
 from .identity_profiles import safe_avatar_url
@@ -111,6 +111,7 @@ def page_data(actor_id, cm_id=None, tab="", query="", page=1, sort="importance",
                 "importance": importance,
             })
         return {
+            "preparing": not unassigned and user_preparation.status_for(conn, cm_id)["preparing"],
             "cms": cms, "selected_cm_id": str(cm_id), "can_manage": can_manage, "tab": tab,
             "can_select_cm": can_select_cm, "read_only": read_only,
             "can_view_unassigned": can_view_unassigned,

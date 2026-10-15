@@ -5,7 +5,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import offhours_summary, summary_periods, summary_replies
+from . import offhours_summary, summary_periods, summary_replies, user_preparation
 from .db import connection
 from .http_helpers import conditional_response, error_response, secure_response
 from .http_helpers import csrf_matches as _csrf_matches
@@ -46,6 +46,7 @@ def create_router(*, current_authorization, render_template, csrf_token=lambda a
                 period=selection["period"],
             )
             data["selection"] = selection
+            data["preparing"] = user_preparation.status_for(conn, cm_id)["preparing"]
         return auth, jsonable_encoder(data)
 
     def denied(exc):

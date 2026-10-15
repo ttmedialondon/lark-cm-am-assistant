@@ -35,6 +35,11 @@ html[data-ui-navigating="true"]::before { content: ""; position: fixed; inset: 0
 .business-page .business-heading p { margin: 6px 0 0; color: var(--tblr-secondary); }
 .business-page .business-feature-card { transition: border-color .15s; }
 .business-page .business-feature-card:hover { border-color: var(--tblr-primary); }
+.workbench-preparing { display: flex; align-items: flex-start; gap: 16px; padding: 24px; border: 1px solid #dce6f3; border-radius: 12px; background: linear-gradient(120deg, #f0f5fd, #fff); }
+.workbench-preparing__symbol { display: grid; place-items: center; width: 40px; height: 40px; flex: 0 0 40px; border-radius: 12px; background: #e3edfc; color: #4169a6; font-size: 24px; }
+.workbench-preparing h2 { margin: 0 0 6px; font-size: 17px; font-weight: 600; }
+.workbench-preparing p { margin: 0; color: var(--tblr-secondary, #64748b); line-height: 1.75; }
+.workbench-connection { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 12px; font-size: 13px; }
 .business-page#broadcast-app .page-body { padding-top: 32px; }
 .business-page#broadcast-app .card { border-radius: 12px; box-shadow: none; }
 .business-nav { background: var(--tblr-bg-surface, #fff); border-bottom: 1px solid var(--tblr-border-color); }

@@ -289,6 +289,8 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
             refresh_token_ciphertext,access_token_expires_at,refresh_token_expires_at,body_consent_at)
             VALUES(%s,%s,%s,'unused','unused',NOW()+INTERVAL '1 hour',NOW()+INTERVAL '1 day',NOW())""",
                    (account, "ou_" + account.hex, name))
+    pg.execute("INSERT INTO sync_jobs(id,authorization_id,mode,status) VALUES(%s,%s,'backfill','queued')",
+               (uuid4(), cm))
     pg.execute("INSERT INTO admin_roles(authorization_id,role) VALUES(%s,'owner')", (actor["id"],))
     for person, name in ((assigned, "Assigned"), (unassigned, "Unassigned")):
         pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)", (person, name))
@@ -317,6 +319,7 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
         assert not default.json()["read_only"] and default.json()["can_edit_handles"]
     pending = client.get(f"/creators/data?tab=mine&cm_id={cm}&sort=importance&tier=pending")
     assert pending.status_code == 200 and pending.json()["total_count"] == 1
+    assert pending.json()["preparing"] and pending.json()["can_link_people"]
     assert pending.json()["items"][0]["importance"]["tier"] == "pending"
     assert set(pending.json()["items"][0]["importance"]) == {"tier", "tier_label", "manual_tier", "manual_reason"}
     assert "evidence_rows" not in pending.json()["items"][0]
@@ -360,7 +363,7 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
     one = creator_roster.page_data(actor["id"], cm)
     assert len(one["items"]) == 1
     one_count = len(queries)
-    assert sum("LEFT JOIN LATERAL" in sql for sql in queries) == 1
+    assert sum("LEFT JOIN LATERAL" in sql and "creator_importance_profiles" in sql for sql in queries) == 1
     pg.execute("SAVEPOINT roster_validity")
     pg.execute("""UPDATE creator_importance_profiles SET manual_tier=NULL,auto_valid=TRUE,
         facts_ciphertext='not-a-ciphertext',prompt_version=%s,sources='[]',
@@ -394,7 +397,7 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
     queries.clear()
     first_page = client.get(f"/creators/data?tab=mine&cm_id={cm}&sort=importance&page=1").json()
     assert len(queries) == one_count
-    assert sum("LEFT JOIN LATERAL" in sql for sql in queries) == 1
+    assert sum("LEFT JOIN LATERAL" in sql and "creator_importance_profiles" in sql for sql in queries) == 1
     second_page = client.get(f"/creators/data?tab=mine&cm_id={cm}&sort=importance&page=2").json()
     assert first_page["total_count"] == second_page["total_count"] == 31
     assert first_page["total_pages"] == second_page["total_pages"] == 2
@@ -439,6 +442,7 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
     pg.execute("UPDATE admin_roles SET is_active=TRUE WHERE authorization_id=%s", (owner,))
     separate = client.get("/creators/data?tab=unassigned&sort=importance&tier=focus")
     assert separate.status_code == 200
+    assert not separate.json()["preparing"]
     assert separate.json()["items"][0]["id"] == str(unassigned)
     assert separate.json()["items"][0]["importance"] is None
     assert separate.json()["sort"] == "name" and separate.json()["tier"] == ""

@@ -74,7 +74,7 @@
     el("import-cm").textContent = ""; importMessage("");
     el("review-title").textContent = "核对导入账号"; el("review-page-label").textContent = "";
     el("import-dialog").close(); el("review-dialog").close(); clearLink(); el("link-dialog")?.close();
-    data = {...data, items: [], import_batches: [], cms: [], selected_cm_id: "", read_only: true,
+    data = {...data, items: [], import_batches: [], cms: [], selected_cm_id: "", preparing: false, read_only: true,
       can_view_unassigned: false, can_select_cm: false, can_broadcast: false,
       can_view_importance: false, can_adjust_importance: false, can_edit_handles: false, can_link_people: false, importance_running: false,
       total_count: 0, total_pages: 1, page: 1};
@@ -500,7 +500,8 @@
       if (!parts.actions.childElementCount) parts.actions.textContent = "—";
     }
     page = data.page || 1;
-    el("empty").textContent = tab === "unassigned" ? "暂无未分配达人。" : "暂无达人。";
+    el("empty").textContent = tab === "unassigned" ? "暂无未分配达人。"
+      : data.preparing && !query && !tier ? "正在整理你的达人资料…" : "暂无达人。";
     renderImports();
     renderSelection();
     renderLoading();
@@ -705,7 +706,7 @@
       }}));
       selectedContacts.clear();
       tab = "mine";
-      data = {...data, tab, items: [], import_batches: [], page: 1, total_count: 0, total_pages: 0};
+      data = {...data, tab, items: [], import_batches: [], preparing: false, page: 1, total_count: 0, total_pages: 0};
       page = 1; clearRows(); render(); refresh();
     });
   }
@@ -713,6 +714,6 @@
   document.addEventListener("visibilitychange", () => { if (!document.hidden) void refresh(true); });
   window.addEventListener("pageshow", event => { if (event.persisted) void refresh(true); });
   setInterval(() => {
-    if (data.importance_running || data.import_batches?.some(batch => batch.status === "running")) void refresh(true);
+    if (data.preparing || data.importance_running || data.import_batches?.some(batch => batch.status === "running")) void refresh(true);
   }, 30000);
 })();

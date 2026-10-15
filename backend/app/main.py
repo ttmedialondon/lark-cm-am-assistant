@@ -13,7 +13,6 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import psycopg
 from cryptography.exceptions import InvalidTag
@@ -33,8 +32,8 @@ from . import (
     desktop_auth_routes,
     desktop_reply_routes,
     offhours_summary_routes,
+    user_preparation,
 )
-from .admin_reporting import sync_summary
 from .config import get_settings
 from .crypto import TokenCipher
 from .db import connection, database_is_ready, lock_sync_material
@@ -52,7 +51,6 @@ OAUTH_STATE_COOKIE = "__Host-lark_oauth_state"
 SESSION_DAYS = 30
 PROFILE_SCOPE_UPGRADE_REASON = "profile_scope_upgrade_required"
 SEND_OAUTH_SCOPES = ("im:message", "im:message.send_as_user")
-LONDON_TIME_ZONE = ZoneInfo("Europe/London")
 LOGGER = logging.getLogger(__name__)
 REMI_TEST_OWNER_ID = uuid.UUID("9d5f4370-6463-4c3a-a2ed-67753a1cabc0")
 REMI_TEST_SHANG_MA_ID = uuid.UUID("1225b4a0-fbd8-431e-962e-25e66943a8a0")
@@ -575,98 +573,7 @@ def _current_authorization(request: Request) -> dict[str, Any] | None:
 
 def _dashboard_stats(authorization_id: uuid.UUID) -> dict[str, Any]:
     with connection() as conn:
-        row = conn.execute(
-            """
-            WITH conversation_counts AS (
-                SELECT
-                    access.authorization_id,
-                    COUNT(*) FILTER (
-                        WHERE COALESCE(c.chat_status, 'normal') = 'normal'
-                    ) AS syncable_conversation_count,
-                    COUNT(*) FILTER (
-                        WHERE COALESCE(c.chat_status, 'normal') = 'normal'
-                          AND access.backfill_complete
-                    ) AS backfill_complete_count,
-                    COUNT(*) FILTER (
-                        WHERE COALESCE(c.chat_status, 'normal') = 'normal'
-                          AND access.sync_status = 'syncing'
-                    ) AS syncing_conversation_count,
-                    COUNT(*) FILTER (
-                        WHERE COALESCE(c.chat_status, 'normal') = 'normal'
-                          AND access.sync_status IN ('pending', 'failed_retryable')
-                    ) AS waiting_conversation_count,
-                    COUNT(*) FILTER (
-                        WHERE COALESCE(c.chat_status, 'normal') = 'normal'
-                          AND access.sync_status = 'not_readable'
-                    ) AS not_readable_conversation_count,
-                    COUNT(*) FILTER (
-                        WHERE COALESCE(c.chat_status, 'normal') <> 'normal'
-                    ) AS archived_conversation_count,
-                    MAX(COALESCE(access.last_incremental_at, access.last_backfill_at)) FILTER (
-                        WHERE COALESCE(c.chat_status, 'normal') = 'normal'
-                    ) AS last_synced_at
-                FROM authorization_chats AS access
-                JOIN chats AS c ON c.chat_id = access.chat_id
-                WHERE access.authorization_id = %s AND access.is_visible
-                GROUP BY access.authorization_id
-            ), latest_job AS (
-                SELECT mode, status, scheduled_at, pages_processed, chats_discovered,
-                       messages_indexed, own_messages_indexed, discovery_status,
-                       last_http_status, last_error_code, last_error, updated_at
-                FROM sync_jobs
-                WHERE authorization_id = %s
-                ORDER BY created_at DESC
-                LIMIT 1
-            )
-            SELECT
-                a.status AS authorization_status,
-                COALESCE(c.syncable_conversation_count, 0) AS syncable_conversation_count,
-                COALESCE(c.backfill_complete_count, 0) AS backfill_complete_count,
-                COALESCE(c.syncing_conversation_count, 0) AS syncing_conversation_count,
-                COALESCE(c.waiting_conversation_count, 0) AS waiting_conversation_count,
-                COALESCE(c.not_readable_conversation_count, 0) AS not_readable_conversation_count,
-                COALESCE(c.archived_conversation_count, 0) AS archived_conversation_count,
-                c.last_synced_at,
-                j.mode AS job_mode,
-                j.status AS job_status,
-                j.scheduled_at AS job_scheduled_at,
-                j.discovery_status AS job_discovery_status,
-                j.last_http_status AS job_last_http_status,
-                j.last_error_code AS job_last_error_code,
-                j.pages_processed,
-                j.chats_discovered,
-                j.messages_indexed,
-                j.own_messages_indexed,
-                j.last_error,
-                j.updated_at
-            FROM authorizations a
-            LEFT JOIN conversation_counts c ON c.authorization_id = a.id
-            LEFT JOIN latest_job j ON TRUE
-            WHERE a.id = %s
-            """,
-            (authorization_id, authorization_id, authorization_id),
-        ).fetchone()
-
-    facts = dict(row) if row else {"authorization_status": "attention_required"}
-    status, badge, detail = sync_summary(facts)
-    job = {
-        "mode": facts.get("job_mode"),
-        "status": facts.get("job_status"),
-        "pages_processed": facts.get("pages_processed"),
-        "chats_discovered": facts.get("chats_discovered"),
-        "messages_indexed": facts.get("messages_indexed"),
-        "own_messages_indexed": facts.get("own_messages_indexed"),
-        "last_error": facts.get("last_error"),
-        "updated_at": facts.get("updated_at"),
-    }
-    return {
-        "last_synced_at": _format_time(facts.get("last_synced_at")),
-        "status": status,
-        "detail": detail,
-        "badge": badge,
-        "syncing": job["status"] == "running" and badge == "primary",
-        "job": job,
-    }
+        return user_preparation.status_for(conn, authorization_id)
 
 
 def _queue_job(conn: psycopg.Connection, authorization_id: uuid.UUID, mode: str) -> bool:
@@ -717,12 +624,6 @@ def _code_challenge(verifier: str) -> str:
 
 def _expiry(seconds: int | None) -> datetime | None:
     return datetime.now(UTC) + timedelta(seconds=seconds) if seconds else None
-
-
-def _format_time(value: datetime | None) -> str:
-    if not value:
-        return "尚未完成"
-    return value.astimezone(LONDON_TIME_ZONE).strftime("%Y-%m-%d %H:%M %Z")
 
 
 def _admin_csrf_token(authorization: dict[str, Any]) -> str:
