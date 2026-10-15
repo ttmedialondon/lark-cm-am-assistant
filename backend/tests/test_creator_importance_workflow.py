@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import pytest
 
-from app import ai_feature_config, creator_access, openai_client
+from app import ai_feature_config, assistant_rules, creator_access, openai_client
 from app import creator_authorization_rescans as rescans
 from app import creator_importance as importance
 from app.crypto import message_body_cipher, message_body_fingerprint
@@ -57,6 +57,7 @@ def ranking_flow(pg, monkeypatch):
         person=person,
         now=now,
         calls=[],
+        instructions=[],
         before_response=None,
         error=None,
     )
@@ -101,6 +102,7 @@ def ranking_flow(pg, monkeypatch):
     def respond(_config, key, pack, target, **kwargs):
         assert key == "sk-synthetic-ranking" and str(target) == str(person)
         state.calls.append(deepcopy(pack))
+        state.instructions.append(kwargs["instructions"])
         if state.before_response:
             callback, state.before_response = state.before_response, None
             callback()
@@ -627,6 +629,123 @@ def test_paid_retry_cache_and_stale_results_keep_billing_without_repeat(pg, rank
     assert pg.execute("SELECT status,reason_code FROM creator_importance_jobs WHERE id=%s",
                       (incomplete["id"],)).fetchone() == {"status": "failed", "reason_code": "invalid_output"}
     assert importance.claim() is None and len(flow.calls) == calls + 1
+
+
+def test_document_versions_preserve_incremental_ranking_and_reuse_paused_paid_work(pg, ranking_flow):
+    flow = ranking_flow
+    flow.enable()
+    flow.drain()
+    importance.set_manual(pg, flow.owner, flow.person, flow.owner, "normal", "Reviewed by owner", flow.settings)
+
+    def save(key="importance-facts", *, status="published", append=""):
+        document = assistant_rules.library(pg, flow.settings)[key]
+        assistant_rules.save_document(pg, flow.settings, flow.owner, key, document["title"], document["description"],
+            "manual", status, "owner", document["text"] + append, document["revision"])
+
+    def persisted():
+        return {table: pg.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall() for table in (
+            "creator_importance_jobs", "creator_importance_profiles", "creator_importance_requests",
+            "contact_assignments")}
+
+    def ready(identifier, minutes):
+        flow.message(identifier, "Thank you, no new cooperation", creator=True,
+                     at=flow.now - timedelta(minutes=minutes))
+        flow.due()
+        assert importance.prepare_next(flow.settings)
+        return pg.execute("SELECT * FROM creator_importance_jobs WHERE responsible_authorization_id=%s",
+                          (flow.owner,)).fetchone()
+
+    legacy = ready("legacy_frozen", 7)
+    legacy_material = json.loads(importance._cipher(flow.settings).decrypt(legacy["pack_ciphertext"]))
+    del legacy_material["_rules"]
+    pg.execute("UPDATE creator_importance_jobs SET pack_ciphertext=%s,fingerprint=%s WHERE id=%s",
+        (importance._cipher(flow.settings).encrypt(json.dumps(legacy_material)),
+         importance._hash([legacy_material["pack"], legacy["config_fingerprint"]]), legacy["id"]))
+    importance.run(importance.claim(), flow.settings)
+    assert flow.instructions[-1] == importance.facts.instructions()  # Deploying does not rewrite a frozen old batch.
+
+    ready("rules_pinned", 6)
+    running = importance.claim()
+    assert running is not None and not running["needs_history"]
+    pinned = running["material"]["_rules"]
+    before = persisted()
+    save(append="\n测试：新的事实判断规则。")
+    facts_digest = assistant_rules.importance_snapshot(pg, flow.settings)["digest"]
+    save("importance-tiers", status="archived", append="\n测试：档位规则仍由程序执行。")
+    assert persisted() == before  # Editing manuals never restarts history or rewrites a manual choice.
+    updated = assistant_rules.importance_snapshot(pg, flow.settings)
+    assert updated["digest"] == facts_digest and updated["digest"] != pinned["digest"]
+    importance.run(running, flow.settings)
+    assert flow.instructions[-1] == assistant_rules.importance_instructions(pinned)
+    assert "测试：档位规则仍由程序执行。" not in flow.instructions[-1]
+    previous = importance._state(running, flow.settings)["facts"]
+    profile = importance.view_for(pg, flow.person, flow.owner, flow.settings)
+    assert profile["tier"] == "normal" and profile["manual_reason"] == "Reviewed by owner"
+
+    ready("rules_next_batch", 5)
+    following = importance.claim()
+    assert following is not None and not following["needs_history"]
+    assert following["material"]["_rules"]["digest"] == updated["digest"]
+    assert following["material"]["state"]["facts"] == previous
+    importance.run(following, flow.settings)
+    assert flow.instructions[-1] == assistant_rules.importance_instructions(updated)
+    assert "测试：新的事实判断规则。" in flow.instructions[-1]
+    assert "测试：档位规则仍由程序执行。" not in flow.instructions[-1]
+    checkpoint = importance._state(pg.execute("SELECT * FROM creator_importance_jobs WHERE id=%s",
+                                            (following["id"],)).fetchone(), flow.settings)
+    assert checkpoint["last_rules"] == {"digest": updated["digest"], "protocol": updated["protocol"],
+        "revisions": {key: item["revision"] for key, item in updated["documents"].items()}}
+
+    waiting = ready("rules_archived", 4)
+    requests = pg.execute("SELECT count(*) n FROM creator_importance_requests").fetchone()["n"]
+    calls = len(flow.calls)
+    save(status="archived")
+    assert importance.claim() is None and len(flow.calls) == calls
+    paused = pg.execute("SELECT * FROM creator_importance_jobs WHERE id=%s", (waiting["id"],)).fetchone()
+    assert paused["status"] == "cancelled" and paused["reason_code"] == "rules_unavailable"
+    assert paused["checkpoint_ciphertext"] == waiting["checkpoint_ciphertext"]
+    assert paused["cursor_time"] == waiting["cursor_time"] and paused["pack_ciphertext"]
+    assert pg.execute("SELECT count(*) n FROM creator_importance_requests").fetchone()["n"] == requests
+
+    save()
+    resumed = importance.claim()
+    assert resumed is not None and resumed["id"] == waiting["id"]
+    assert resumed["material"]["_rules"]["digest"] == updated["digest"]
+    profile_before = pg.execute("SELECT * FROM creator_importance_profiles WHERE responsible_authorization_id=%s",
+                               (flow.owner,)).fetchone()
+    flow.before_response = lambda: save(status="archived")
+    importance.run(resumed, flow.settings)
+    paid = pg.execute("SELECT * FROM creator_importance_requests WHERE id=%s",
+                      (resumed["reservation_id"],)).fetchone()
+    assert paid["input_tokens"] == 101 and paid["output_tokens"] == 23
+    assert paid["response_ciphertext"] and paid["finished_at"] and not paid["error_code"]
+    assert pg.execute("SELECT * FROM creator_importance_profiles WHERE responsible_authorization_id=%s",
+                      (flow.owner,)).fetchone() == profile_before
+    paused = pg.execute("SELECT * FROM creator_importance_jobs WHERE id=%s", (waiting["id"],)).fetchone()
+    assert paused["status"] == "cancelled" and paused["reason_code"] == "rules_unavailable"
+    assert paused["checkpoint_ciphertext"] == waiting["checkpoint_ciphertext"]
+    assert paused["cursor_time"] == waiting["cursor_time"]
+    pg.execute("UPDATE creator_importance_jobs SET attempts=3 WHERE id=%s", (waiting["id"],))
+    importance.configuration_changed(pg)
+    assert pg.execute("SELECT status,pack_ciphertext FROM creator_importance_jobs WHERE id=%s",
+                      (waiting["id"],)).fetchone() == {
+                          "status": "cancelled", "pack_ciphertext": paused["pack_ciphertext"]}
+    flow.message("rules_arrival_while_paused", "Another new message, no cooperation", creator=True,
+                 at=flow.now - timedelta(minutes=3))
+    flow.due()
+    assert importance.prepare_next(flow.settings) and importance.claim() is None
+    assert len(flow.calls) == calls + 1
+    calls = len(flow.calls)
+    save()
+    importance.configuration_changed(pg)  # Saving unchanged settings after republishing must retain paid material.
+    assert importance.claim() is None and len(flow.calls) == calls  # Reuse the paid, frozen response locally.
+    finished = pg.execute("SELECT * FROM creator_importance_jobs WHERE id=%s", (waiting["id"],)).fetchone()
+    assert finished["status"] == "queued" and not finished["needs_history"]
+    assert list(finished["pending_messages"]) == ["own_private/rules_arrival_while_paused"]
+    assert pg.execute("SELECT count(*) n FROM creator_importance_requests").fetchone()["n"] == requests + 1
+    flow.drain()
+    assert len(flow.calls) == calls + 1  # Only the genuinely new message needs a provider request.
+    assert importance.view_for(pg, flow.person, flow.owner, flow.settings)["tier"] == "normal"
 
 
 def test_pending_authorization_rescan_blocks_old_ranking_and_paid_work(pg, ranking_flow):

@@ -91,6 +91,12 @@ curl --fail --silent --show-error https://larkbot.ttapp.help/healthz
 
 普通编辑不重排旧任务、不修改已有关系。草稿或停用会暂停依赖任务；恢复发布仅续跑尚未实际调用的缺手册任务。已付费但暂停的相同材料不因恢复发布、配置保存或重复材料信号自动重发，真实新材料和明确人工重查沿用原入口。历史结果与原文仍按原授权可查。发布不提升旧任务全局版本、不全量重跑、不修改阈值或开关。
 
+#### 维护优先级手册
+
+文档管理员在「助手文档 → 维护优先级」编辑事实提取、分档说明、判断案例。只有事实和案例进入模型，一次请求使用两份手册；分档说明仅供查阅，修改它不改变程序中的五档、7／30 天窗口或人工调整优先规则。
+
+新准备的批次加密固定规则版本，已冻结批次仍用原版本，后续增量读取新版；不清空历史检查点、不全量重跑、不更改旧画像或人工值。事实或案例手册转为草稿／停用后暂停依赖批次，恢复发布后续跑；已有有效付费返回先本地复用，不重复请求。未知费用、来源、授权与配置变更仍走原有校验，不因改手册自动重试。后台手册不加入运营助手导航或回复资料，不增加查询权限、表、队列或 API Key。
+
 #### 群发页面与正式发送
 
 采用按功能增量授权，参考 [Google](https://developers.google.com/identity/protocols/oauth2/resources/granular-permissions)、[Microsoft](https://learn.microsoft.com/en-us/entra/identity-platform/consent-types-developer) 和 [Slack](https://docs.slack.dev/authentication/installing-with-oauth/) 的官方流程。不把应用已开通的全部权限都要求用户授权。

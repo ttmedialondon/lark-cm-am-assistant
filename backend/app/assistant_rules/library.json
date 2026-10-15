@@ -213,6 +213,21 @@
     "kind": "manual", "path": "manuals/responsibility-linking.md", "status": "published", "visibility": "owner"
   },
   {
+    "key": "importance-facts", "title": "维护优先级事实提取",
+    "description": "从达人与具体 CM 的完整聊天提取业务机会、合作进展、完成和一般业务交流，保留真实问答与对象状态。",
+    "kind": "manual", "path": "manuals/importance-facts.md", "status": "published", "visibility": "owner"
+  },
+  {
+    "key": "importance-tiers", "title": "维护优先级分档与人工调整",
+    "description": "说明现有五档、时效变化和人工优先规则；只供维护人员查阅，不随模型请求发送，也不修改分档算法。",
+    "kind": "manual", "path": "manuals/importance-tiers.md", "status": "published", "visibility": "owner"
+  },
+  {
+    "key": "importance-cases", "title": "维护优先级判断案例",
+    "description": "用机会、合作成立、完成和日常沟通案例校准事实提取，不将模型分数、聊天频率或 GMV 当作分档结论。",
+    "kind": "manual", "path": "manuals/importance-cases.md", "status": "published", "visibility": "owner"
+  },
+  {
     "key": "reply-policy", "title": "回复事实与处理边界",
     "description": "三个回复入口的共同事实、权限、承诺与草稿边界，不发送或修改业务状态。",
     "kind": "manual", "path": "manuals/reply-policy.md", "status": "published", "visibility": "all"

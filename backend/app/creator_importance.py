@@ -8,7 +8,7 @@ import json
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from . import ai_dispatch, ai_feature_config, creator_access, creator_data, offhours_summary
+from . import ai_dispatch, ai_feature_config, assistant_rules, creator_access, creator_data, offhours_summary
 from . import creator_importance_facts as facts
 from . import openai_client as api
 from .config import get_settings
@@ -313,7 +313,7 @@ def configuration_changed(conn):
     conn.execute("""UPDATE creator_importance_jobs SET claim_token=NULL,lease_until=NULL,
         status=CASE WHEN %s THEN 'queued' ELSE 'cancelled' END,attempts=0,
         reason_code='configuration_changed',not_before=NOW(),updated_at=NOW()
-        WHERE status<>'completed' AND reason_code<>'request_unknown'
+        WHERE status<>'completed' AND reason_code NOT IN ('request_unknown','rules_unavailable')
         AND (%s OR status NOT IN ('failed','cancelled'))""", (enabled, enabled))
     if enabled:
         conn.execute("""SELECT enqueue_creator_importance(pair.contact_id,pair.responsible_authorization_id)
@@ -321,7 +321,8 @@ def configuration_changed(conn):
               AND creator_importance_is_eligible(pair.contact_id,pair.responsible_authorization_id)
               AND NOT EXISTS(SELECT 1 FROM creator_importance_jobs j WHERE j.contact_id=pair.contact_id
                 AND j.responsible_authorization_id=pair.responsible_authorization_id
-                AND (j.status NOT IN ('failed','cancelled') OR j.reason_code='request_unknown'))""")
+                AND (j.status NOT IN ('failed','cancelled')
+                  OR j.reason_code IN ('request_unknown','rules_unavailable')))""")
 
 
 _READABLE = f"""FROM chat_messages m JOIN authorization_message_observations o USING(chat_id,message_id)
@@ -558,6 +559,10 @@ def _recover(conn):
 
 def _finish_batch(conn, job, material, settings, incoming=()):
     state = material["state"]
+    if material["pack"] and "_rules" in material:
+        pinned = material["_rules"]
+        state["last_rules"] = {"digest": pinned["digest"], "protocol": pinned["protocol"],
+                               "revisions": {key: item["revision"] for key, item in pinned["documents"].items()}}
     state["facts"] = facts.merge_facts(state["facts"], incoming)
     state["sources"].update({source["ref"]: source for source in material["sources"]})
     # Even an empty-fact assessment needs a revocable source proving that text was actually read.
@@ -582,6 +587,17 @@ def _finish_batch(conn, job, material, settings, incoming=()):
             "evaluated" if finished else "next_batch", finished, job["id"]))
 
 
+def _manual_access(conn, material):
+    if "_rules" in material:
+        assistant_rules.importance_validate_access(conn, material["_rules"])
+
+
+def _pause_rules(conn, job, *, keep_material=True):
+    conn.execute("""UPDATE creator_importance_jobs SET status='cancelled',reason_code='rules_unavailable',
+        pack_ciphertext=CASE WHEN %s THEN pack_ciphertext END,claim_token=NULL,lease_until=NULL,
+        updated_at=NOW() WHERE id=%s""", (keep_material, job["id"]))
+
+
 def prepare_next(settings):
     with connection() as conn, conn.transaction():
         config = _config(conn)
@@ -602,6 +618,18 @@ def prepare_next(settings):
                          "WHERE id=%s",
                          (job["id"],))
             return True
+        # New-message signals may wake a paused job; finish its frozen paid batch before preparing new material.
+        if (job["reason_code"] == "rules_unavailable" and job["pack_ciphertext"]
+                and job["snapshot_version"] == job["desired_version"]):
+            material = json.loads(_cipher(settings).decrypt(job["pack_ciphertext"]))
+            try:
+                _manual_access(conn, material)
+            except PermissionError:
+                _pause_rules(conn, job)
+            else:
+                conn.execute("UPDATE creator_importance_jobs SET status='ready',"
+                             "updated_at=NOW() WHERE id=%s", (job["id"],))
+            return True
         token = uuid4()
         job = conn.execute("""UPDATE creator_importance_jobs SET status='preparing',snapshot_version=desired_version,
             claim_token=%s,lease_until=NOW()+INTERVAL '10 minutes',
@@ -611,10 +639,13 @@ def prepare_next(settings):
     try:
         with connection() as conn, conn.transaction():
             conn.execute("SET LOCAL statement_timeout='90s'")
+            pinned = assistant_rules.importance_snapshot(conn, settings)
+            assistant_rules.importance_validate_access(conn, pinned)
             # A fresh snapshot must rebuild attribution, not carry facts from the old chat topology.
             state = _state({"checkpoint_ciphertext": None}, settings) if job["needs_history"] \
                 and not job["cursor_time"] else _prune(conn, _state(job, settings), job)
             material = build_batch(conn, job, settings, state)
+            material["_rules"] = pinned
             if material["gap"]:
                 state["gaps"] += 1
             checks = _source_checks(conn, material["sources"], job["contact_id"],
@@ -629,11 +660,12 @@ def prepare_next(settings):
                 conn.execute("UPDATE creator_importance_jobs SET status='queued',claim_token=NULL,lease_until=NULL,"
                              "reason_code='snapshot_changed' WHERE id=%s", (job["id"],))
                 return True
+            _manual_access(conn, material)
             pack = material["pack"]
             if not pack:
                 _finish_batch(conn, current, material, settings)
                 return True
-            fingerprint = _hash([pack, _config_hash(config)])
+            fingerprint = _hash([pack, _config_hash(config), pinned["digest"]])
             cached = conn.execute("""SELECT response_ciphertext FROM creator_importance_requests
                 WHERE job_id=%s AND fingerprint=%s AND error_code='' AND response_ciphertext IS NOT NULL
                 ORDER BY created_at DESC LIMIT 1""", (job["id"], fingerprint)).fetchone()
@@ -654,7 +686,15 @@ def prepare_next(settings):
                 reason_code='prepared',stats=%s::jsonb,updated_at=NOW() WHERE id=%s""",
                 (_cipher(settings).encrypt(creator_data.encode(material)), creator_data.encode(material["sources"]),
                  fingerprint, _config_hash(config), creator_data.encode({"messages": len(pack["messages"]),
-                    "history": job["needs_history"], "prompt_version": facts.PROMPT_VERSION}), job["id"]))
+                    "history": job["needs_history"], "prompt_version": facts.PROMPT_VERSION,
+                    "rules_digest": pinned["digest"], "rules_protocol": pinned["protocol"]}), job["id"]))
+    except PermissionError:
+        with connection() as conn, conn.transaction():
+            current = conn.execute("SELECT * FROM creator_importance_jobs WHERE id=%s FOR UPDATE",
+                                   (job["id"],)).fetchone()
+            if current and current["claim_token"] == token and current["status"] == "preparing":
+                _pause_rules(conn, current, keep_material=False)
+        return True
     except Exception:
         with connection() as conn, conn.transaction():
             conn.execute("""UPDATE creator_importance_jobs SET status='failed',claim_token=NULL,lease_until=NULL,
@@ -664,7 +704,7 @@ def prepare_next(settings):
     return True
 
 
-def _current(conn, job, settings, *, lock=False):
+def _current(conn, job, settings, *, lock=False, check_rules=True):
     valid = _source_checks(conn, job["refs"], job["contact_id"], job["responsible_authorization_id"], lock=lock)
     config = _config(conn, lock=lock)
     current = conn.execute("SELECT * FROM creator_importance_jobs WHERE id=%s" + (" FOR UPDATE" if lock else ""),
@@ -677,6 +717,12 @@ def _current(conn, job, settings, *, lock=False):
             or not conn.execute("SELECT creator_importance_is_eligible(%s,%s) ok",
                 (job["contact_id"], job["responsible_authorization_id"])).fetchone()["ok"]):
         return None
+    if check_rules:
+        try:
+            _manual_access(conn, job["material"])
+        except PermissionError:
+            _pause_rules(conn, current)
+            return None
     return current
 
 
@@ -688,7 +734,9 @@ def claim():
             return None
         _recover(conn)
         candidate = conn.execute("""SELECT j.* FROM creator_importance_jobs j WHERE status IN ('ready','retry_wait')
-            AND not_before<=NOW() AND attempts<3
+            AND not_before<=NOW() AND (attempts<3 OR EXISTS(
+              SELECT 1 FROM creator_importance_requests r WHERE r.job_id=j.id AND r.fingerprint=j.fingerprint
+                AND r.error_code='' AND r.response_ciphertext IS NOT NULL))
             AND NOT EXISTS(SELECT 1 FROM creator_authorization_rescans r
               WHERE r.authorization_id=j.responsible_authorization_id)
             ORDER BY created_at,id LIMIT 1""").fetchone()
@@ -700,7 +748,30 @@ def claim():
             conn.execute("UPDATE creator_importance_jobs SET status='queued',reason_code='snapshot_changed' "
                          "WHERE id=%s AND status IN ('ready','retry_wait')", (candidate["id"],))
             return None
-        if not ai_dispatch.can_claim(conn):
+        current = conn.execute("SELECT * FROM creator_importance_jobs WHERE id=%s FOR UPDATE",
+                               (candidate["id"],)).fetchone()
+        if (not current or current["status"] not in {"ready", "retry_wait"}
+                or current["desired_version"] != candidate["snapshot_version"]
+                or current["snapshot_version"] != candidate["snapshot_version"]):
+            return None
+        if not conn.execute("SELECT creator_importance_is_eligible(%s,%s) ok",
+                (current["contact_id"], current["responsible_authorization_id"])).fetchone()["ok"]:
+            return None
+        material = json.loads(_cipher(settings).decrypt(current["pack_ciphertext"]))
+        try:
+            _manual_access(conn, material)
+        except PermissionError:
+            _pause_rules(conn, current)
+            return None
+        cached = conn.execute("""SELECT response_ciphertext FROM creator_importance_requests
+            WHERE job_id=%s AND fingerprint=%s AND error_code='' AND response_ciphertext IS NOT NULL
+            ORDER BY created_at DESC LIMIT 1""", (current["id"], current["fingerprint"])).fetchone()
+        if cached:
+            result = facts.validate(_cipher(settings).decrypt(cached["response_ciphertext"]),
+                                    material["pack"], material["state"]["facts"])
+            _finish_batch(conn, current, material, settings, result)
+            return None
+        if current["attempts"] >= 3 or not ai_dispatch.can_claim(conn):
             return None
         token = uuid4()
         job = conn.execute("""UPDATE creator_importance_jobs SET status='running',claim_token=%s,
@@ -712,7 +783,6 @@ def claim():
         if not job:
             return None
         reservation = uuid4()
-        material = json.loads(_cipher(settings).decrypt(job["pack_ciphertext"]))
         conn.execute("INSERT INTO creator_importance_requests(id,job_id,fingerprint,material_fingerprint) "
                      "VALUES(%s,%s,%s,%s)",
                      (reservation, job["id"], job["fingerprint"], _hash(material["pack"])))
@@ -725,6 +795,8 @@ def run(job, settings):
         if not _current(conn, job, settings):
             conn.execute("UPDATE creator_importance_requests SET error_code='not_sent',input_tokens=0,output_tokens=0,"
                          "finished_at=NOW() WHERE id=%s", (job["reservation_id"],))
+            conn.execute("UPDATE creator_importance_jobs SET attempts=GREATEST(attempts-1,0) "
+                         "WHERE id=%s AND status='cancelled' AND reason_code='rules_unavailable'", (job["id"],))
             return
     material = job["material"]
     pack = material["pack"]
@@ -732,7 +804,9 @@ def run(job, settings):
     try:
         key = ai_feature_config.api_key_cipher(settings.token_encryption_key).decrypt(
             job["config"]["api_key_ciphertext"])
-        response = api.call_openai(job["config"], key, pack, job["contact_id"], instructions=facts.instructions(),
+        response = api.call_openai(job["config"], key, pack, job["contact_id"],
+            instructions=(assistant_rules.importance_instructions(material["_rules"])
+                          if "_rules" in material else facts.instructions()),
             output_format=facts.output_format([m["ref"] for m in pack["messages"]
                 if m["role"] in {"creator", "cm"} and m["context_complete"]], material["state"]["facts"]),
             max_output_tokens=4_096, reasoning_effort="none", total_timeout=70)
@@ -761,7 +835,7 @@ def run(job, settings):
     if isinstance(error, api.OpenAIRequestError) and error.is_quota:
         ai_dispatch.pause_for_quota()
     with connection() as conn, conn.transaction():
-        current = _current(conn, job, settings, lock=True)
+        current = _current(conn, job, settings, lock=True, check_rules=error is None)
         if not current:
             return
         if error is None:
