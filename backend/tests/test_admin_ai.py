@@ -410,6 +410,25 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     assert assistant_rules.importance_snapshot(pg, settings)["digest"] != importance_pinned["digest"]
     assistant_rules.importance_validate_access(pg, importance_pinned)
     assert assistant_rules.snapshot(pg, settings, owner=True) == navigation_before
+    group_key = "group-purpose"
+    group_document = assistant_rules.library(pg, settings)[group_key]
+    group_pinned = assistant_rules.group_snapshot(pg, settings)
+    assert set(group_pinned["documents"]) == assistant_rules.GROUP_KEYS
+    assert all(doc["text"] in assistant_rules.group_instructions(group_pinned)
+               for doc in group_pinned["documents"].values())
+    group_page = client.get(path + '?document=' + group_key)
+    assert group_page.status_code == 200 and '固定用途：群用途分类' in group_page.text
+    assert 'id="reply-usable"' not in group_page.text and '不覆盖人工分类' in group_page.text
+    group_form = {"csrf_token": "csrf", "document": group_key, "revision": "0",
+        "content": group_document["text"] + "\n测试群用途规则。", "title": group_document["title"],
+        "description": group_document["description"], "kind": "manual", "status": "published",
+        "visibility": "owner"}
+    for field, value in (("kind", "knowledge"), ("visibility", "all"), ("reply_usable", "1")):
+        assert client.post(path, data={**group_form, field: value}).status_code == 400
+    assert client.post(path, data=group_form, follow_redirects=False).status_code == 303
+    assert assistant_rules.group_snapshot(pg, settings)["digest"] != group_pinned["digest"]
+    assistant_rules.group_validate_access(pg, group_pinned)
+    assert assistant_rules.snapshot(pg, settings, owner=True) == navigation_before
     creator_key = "creator-identity"
     creator_document = assistant_rules.library(pg, settings)[creator_key]
     creator_pinned = assistant_rules.creator_snapshot(pg, settings)
@@ -534,6 +553,11 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
         "content": importance_form["content"] + "\n文档管理员维护。"}, follow_redirects=False).status_code == 303
     saved_importance = assistant_rules.library(pg, settings)[importance_key]
     assert saved_importance["revision"] == 2 and saved_importance["updated_by"] == str(member)
+    assert client.get(path + '?document=' + group_key).status_code == 200
+    assert client.post(path, data={**group_form, "revision": "1",
+        "content": group_form["content"] + "\n文档管理员维护。"}, follow_redirects=False).status_code == 303
+    saved_group = assistant_rules.library(pg, settings)[group_key]
+    assert saved_group["revision"] == 2 and saved_group["updated_by"] == str(member)
     delegated = client.post(path, data={**draft_form, 'kind': 'knowledge', 'status': 'published',
         'visibility': 'owner', 'content': 'PRIVATE_DELEGATED_FACT'}, follow_redirects=False)
     assert delegated.status_code == 303
@@ -552,6 +576,7 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     assert client.get(path + '?document=' + delegated_key).status_code == 403
     assert client.get(path + '?document=' + responsibility_key).status_code == 403
     assert client.get(path + '?document=' + importance_key).status_code == 403
+    assert client.get(path + '?document=' + group_key).status_code == 403
     assert client.post(path, data={**draft_form, 'document': delegated_key, 'revision': '1'}).status_code == 403
     with pytest.raises(PermissionError):
         assistant_rules.save_document(pg, settings, member, delegated_key, stored['title'], stored['description'],
@@ -559,6 +584,7 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
     assert assistant_rules.library(pg, settings)[delegated_key] == stored
     assert assistant_rules.library(pg, settings)[responsibility_key] == saved_responsibility
     assert assistant_rules.library(pg, settings)[importance_key] == saved_importance
+    assert assistant_rules.library(pg, settings)[group_key] == saved_group
     session["auth"] = {"id": owner, "status": "active"}
     pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (owner,))
     assert client.get(path).status_code == 403 and client.post(path, data=form).status_code == 403

@@ -348,6 +348,7 @@ def create_admin_router(
         creator = key in assistant_rules.CREATOR_KEYS
         responsibility = key in assistant_rules.RESPONSIBILITY_KEYS
         importance = key in assistant_rules.IMPORTANCE_KEYS
+        group = key in assistant_rules.GROUP_KEYS
         reply = key in assistant_rules.REPLY_KEYS
         return render_template(request, "admin/assistant_rules.html", {
             **page_context(access_context, "assistant-rules"),
@@ -362,11 +363,13 @@ def create_admin_router(
                                 ("负责人匹配", [item for name, item in documents.items()
                                             if name in assistant_rules.RESPONSIBILITY_KEYS]),
                                 ("维护优先级", [item for name, item in documents.items()
-                                            if name in assistant_rules.IMPORTANCE_KEYS])],
+                                            if name in assistant_rules.IMPORTANCE_KEYS]),
+                                ("群用途分类", [item for name, item in documents.items()
+                                            if name in assistant_rules.GROUP_KEYS])],
             "document_key": key or "", "document": document, "edit": edit, "is_core": core, "is_event": event,
             "is_creator": creator, "is_reply": reply, "is_responsibility": responsibility,
-            "is_importance": importance,
-            "can_edit_reply_usage": not (core or event or creator or responsibility or importance or reply) and (
+            "is_importance": importance, "is_group": group,
+            "can_edit_reply_usage": not (core or key in assistant_rules.BACKEND_KEYS or reply) and (
                 not key or key.startswith("doc-") or document["kind"] == "knowledge"),
             "reply_usage": {"reply-policy": "回复边界", "reply-facts": "事实与来源", "reply-tone": "写作口吻",
                             "reply-desktop": "桌面回复", "reply-event": "事件回复", "reply-samples": "样品跟进",
@@ -376,6 +379,8 @@ def create_admin_router(
                                      "responsibility-linking": "关联条件与案例"}.get(key),
             "importance_usage": {"importance-facts": "事实提取", "importance-tiers": "分档说明（不送入模型）",
                                  "importance-cases": "判断案例"}.get(key),
+            "group_usage": {"group-purpose": "用途判断", "group-evidence": "取材与上下文",
+                            "group-admission": "入库条件与案例"}.get(key),
             "event_usage": {"event-extraction": "事项抽取", "event-state": "处理状态",
                             "event-priority": "紧急度分级", "event-merge": "跨群合并"}.get(key),
             "creator_usage": {"creator-recognition-flow": "入口与任务准备", "creator-identity": "身份判定",
@@ -385,7 +390,7 @@ def create_admin_router(
             "status_labels": {"draft": "草稿", "published": "已发布", "archived": "已停用"},
             "visibility_labels": {"all": "全体 CM", "owner": "仅 Owner"},
             "default_text": (assistant_rules.default_text(key)
-                             if core or event or creator or responsibility or importance or reply else None),
+                             if core or event or creator or responsibility or importance or group or reply else None),
             "max_document_chars": assistant_rules.MAX_DOCUMENT_CHARS,
             "current_text": document["text"] if conflict else None,
             "form_error": error, "saved": bool(key and request.query_params.get("saved") == key),

@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from app import ai_dispatch, ai_feature_config, config
+from app import ai_dispatch, ai_feature_config, assistant_rules, config
 from app import creator_group_evidence as evidence
 from app import creator_group_matching as matching
 from app import creator_matching_routes as routes
@@ -470,6 +470,138 @@ def test_creator_group_queue_real_authorization_manual_lock_and_billing_fences(p
     answer.update(purpose="support", confidence=.96, refs=["M1"])
     matching.run(fresh_material, settings)
     assert len(calls) == before + 1
+
+    # Editable manuals change future model material, never existing classifications or queue history.
+    def save_manual(key="group-purpose", *, status="published", append=""):
+        document = assistant_rules.library(pg, settings)[key]
+        assistant_rules.save_document(pg, settings, owner, key, document["title"], document["description"],
+            "manual", status, "owner", document["text"] + append, document["revision"])
+
+    def persisted():
+        return {table: pg.execute(f"SELECT to_jsonb(t) FROM {table} t ORDER BY to_jsonb(t)::text").fetchall()
+                for table in (
+            "chat_group_classifications", "creator_group_jobs", "creator_group_requests", "ai_feature_configs",
+            "contact_roles", "contact_assignments")}
+
+    legacy_id = seed_group("oc_legacy_manuals")
+    assert matching.prepare_next(settings)
+    legacy = pg.execute("SELECT * FROM creator_group_jobs WHERE id=%s", (legacy_id,)).fetchone()
+    legacy_pack = json.loads(storage.decrypt(legacy["pack_ciphertext"]))
+    del legacy_pack["_rules"]
+    pg.execute("UPDATE creator_group_jobs SET pack_ciphertext=%s WHERE id=%s",
+               (storage.encrypt(json.dumps(legacy_pack)), legacy_id))
+    matching.run(matching.claim(), settings)
+    assert calls[-1]["kwargs"]["instructions"] == evidence.instructions()
+    assert "_rules" not in calls[-1]["pack"]  # Legacy frozen tasks retain their actual paid protocol.
+
+    pinned_id = seed_group("oc_document_versions")
+    pinned_job = prepared()
+    assert pinned_job["id"] == pinned_id
+    pinned = pinned_job["_rules"]
+    before = persisted()
+    save_manual(append="\n测试：新版群用途判断手册。")
+    updated = assistant_rules.group_snapshot(pg, settings)
+    assert persisted() == before
+    assert set(updated["documents"]) == assistant_rules.GROUP_KEYS and updated["digest"] != pinned["digest"]
+    matching.run(pinned_job, settings)
+    assert calls[-1]["kwargs"]["instructions"] == assistant_rules.group_instructions(pinned)
+    assert "测试：新版群用途判断手册。" not in calls[-1]["kwargs"]["instructions"]
+    formal = classification("oc_document_versions")
+    assert formal["source"] == "ai" and formal["purpose"] == "support" and not formal["locked"]
+    assert classification("oc_group")["source"] == "manual" and classification("oc_group")["locked"]
+
+    next_id = pg.execute("SELECT enqueue_creator_group('oc_document_versions','history',TRUE) id").fetchone()["id"]
+    following = prepared()
+    assert following["id"] == next_id and following["_rules"]["digest"] == updated["digest"]
+    assert following["pack"] == pinned_job["pack"] and following["fingerprint"] != pinned_job["fingerprint"]
+    matching.run(following, settings)
+    assert calls[-1]["kwargs"]["instructions"] == assistant_rules.group_instructions(updated)
+    assert "_rules" not in calls[-1]["pack"]
+    before = len(calls)
+    cached = pg.execute("SELECT enqueue_creator_group('oc_document_versions','history',TRUE) id").fetchone()["id"]
+    assert matching.prepare_next(settings) and matching.claim() is None and len(calls) == before
+    assert pg.execute("SELECT status,reason_code FROM creator_group_jobs WHERE id=%s", (cached,)).fetchone() == {
+        "status": "completed", "reason_code": "cached",
+    }
+
+    blocked_id = seed_group("oc_manual_pause")
+    assert matching.prepare_next(settings)
+    before = len(calls)
+    requests = pg.execute("SELECT count(*) n FROM creator_group_requests").fetchone()["n"]
+    save_manual("group-evidence", status="archived")
+    assert matching.claim() is None and len(calls) == before
+    blocked = pg.execute("SELECT * FROM creator_group_jobs WHERE id=%s", (blocked_id,)).fetchone()
+    assert blocked["status"] == "waiting_evidence" and blocked["reason_code"] == "rules_unavailable"
+    assert blocked["pack_ciphertext"] and not blocked["result_ciphertext"]
+    assert pg.execute("SELECT count(*) n FROM creator_group_requests").fetchone()["n"] == requests
+
+    save_manual("group-evidence")
+    assert matching.prepare_next(settings)
+    resumed = matching.claim()
+    assert resumed is not None and resumed["id"] == blocked_id
+    assert resumed["_rules"] == updated  # Republishing does not silently rewrite the frozen input.
+    formal_before = pg.execute("SELECT * FROM chat_group_classifications ORDER BY chat_id").fetchall()
+
+    def archive_during_response(*args, **kwargs):
+        result = respond(*args, **kwargs)
+        save_manual("group-admission", status="archived")
+        return result
+
+    monkeypatch.setattr(matching.api, "call_openai", archive_during_response)
+    matching.run(resumed, settings)
+    paid = pg.execute("SELECT * FROM creator_group_requests WHERE id=%s", (resumed["reservation_id"],)).fetchone()
+    assert paid["input_tokens"] == 100 and paid["output_tokens"] == 50 and paid["response_ciphertext"]
+    assert paid["finished_at"] and not paid["error_code"]
+    assert pg.execute("SELECT * FROM chat_group_classifications ORDER BY chat_id").fetchall() == formal_before
+    paused = pg.execute("SELECT * FROM creator_group_jobs WHERE id=%s", (blocked_id,)).fetchone()
+    assert paused["status"] == "waiting_evidence" and paused["reason_code"] == "rules_unavailable"
+    assert paused["pack_ciphertext"] == blocked["pack_ciphertext"] and paused["result_ciphertext"]
+    pg.execute("UPDATE creator_group_jobs SET attempts=3 WHERE id=%s", (blocked_id,))
+    enable()
+    matching.configuration_changed(pg)
+    matching.touch_chats(pg, ["oc_manual_pause"], settings)
+    matching.touch_chats(pg, ["oc_manual_pause"], settings)
+    assert pg.execute("SELECT pack_ciphertext,result_ciphertext,attempts FROM creator_group_jobs WHERE id=%s",
+                      (blocked_id,)).fetchone() == {
+        "pack_ciphertext": paused["pack_ciphertext"], "result_ciphertext": paused["result_ciphertext"], "attempts": 3,
+    }
+    assert pg.execute("SELECT count(*) n FROM creator_group_jobs WHERE chat_id='oc_manual_pause'").fetchone()["n"] == 1
+    before = len(calls)
+    save_manual("group-admission")
+    matching.configuration_changed(pg)
+    assert matching.prepare_next(settings) and matching.claim() is None and len(calls) == before
+    assert pg.execute("SELECT status FROM creator_group_jobs WHERE id=%s", (blocked_id,)).fetchone() == {
+        "status": "completed",
+    }
+    assert classification("oc_manual_pause")["source_job_id"] == blocked_id
+    assert pg.execute("SELECT count(*) n FROM creator_group_requests").fetchone()["n"] == requests + 1
+    monkeypatch.setattr(matching.api, "call_openai", respond)
+
+    # A metadata-only SQL signal can create a new open job while an older paid admission is paused.
+    deferred_id = seed_group("oc_paused_local_admission")
+    monkeypatch.setattr(matching, "_auto_classify", lambda *args, **kwargs: None)
+    deferred_job = prepared()
+    assert deferred_job["id"] == deferred_id
+    matching.run(deferred_job, settings)
+    monkeypatch.setattr(matching, "_auto_classify", auto_classify)
+    save_manual("group-evidence", status="archived")
+    assert matching.prepare_next(settings)
+    paused_deferred = pg.execute("SELECT * FROM creator_group_jobs WHERE id=%s", (deferred_id,)).fetchone()
+    assert paused_deferred["status"] == "completed" and paused_deferred["stats"]["auto_deferred"]
+    assert paused_deferred["reason_code"] == "rules_unavailable"
+    pg.execute("UPDATE chat_messages SET message_update_time=NOW() WHERE chat_id='oc_paused_local_admission'")
+    assert evidence.still_valid(pg, paused_deferred["refs"], settings)
+    replacement = pg.execute("SELECT id FROM creator_group_jobs WHERE chat_id='oc_paused_local_admission' "
+                             "AND status='queued'").fetchone()["id"]
+    pg.execute("UPDATE creator_group_jobs SET not_before=NOW() WHERE id=%s", (replacement,))
+    before = len(calls)
+    save_manual("group-evidence")
+    assert matching.prepare_next(settings) and matching.claim() is None and len(calls) == before
+    assert classification("oc_paused_local_admission")["source_job_id"] == replacement
+    assert pg.execute("SELECT reason_code,stats->>'auto_deferred' AS deferred "
+                      "FROM creator_group_jobs WHERE id=%s", (deferred_id,)).fetchone() == {
+        "reason_code": "superseded", "deferred": "false",
+    }
 
     # The HTTP boundary also applies live owner checks, CSRF and independent manual classification.
     actor = {"id": owner, "status": "active"}

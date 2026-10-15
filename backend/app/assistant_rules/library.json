@@ -228,6 +228,21 @@
     "kind": "manual", "path": "manuals/importance-cases.md", "status": "published", "visibility": "owner"
   },
   {
+    "key": "group-purpose", "title": "群用途判断",
+    "description": "结合群名、成员结构和长期沟通判断客服、机构达人、培训、类目、活动或未确认，不按单条通知改变用途。",
+    "kind": "manual", "path": "manuals/group-purpose.md", "status": "published", "visibility": "owner"
+  },
+  {
+    "key": "group-evidence", "title": "群用途取材与完整上下文",
+    "description": "使用当前有效授权内的群名和消息，补齐完整问答，只引用允许的真实来源，区分缺口与用途不明。",
+    "kind": "manual", "path": "manuals/group-evidence.md", "status": "published", "visibility": "owner"
+  },
+  {
+    "key": "group-admission", "title": "群用途入库与边界案例",
+    "description": "明确高置信度、有效正文及授权的自动入库边界，保护人工分类与锁定结果，保留混合用途和范围外案例。",
+    "kind": "manual", "path": "manuals/group-admission.md", "status": "published", "visibility": "owner"
+  },
+  {
     "key": "reply-policy", "title": "回复事实与处理边界",
     "description": "三个回复入口的共同事实、权限、承诺与草稿边界，不发送或修改业务状态。",
     "kind": "manual", "path": "manuals/reply-policy.md", "status": "published", "visibility": "all"

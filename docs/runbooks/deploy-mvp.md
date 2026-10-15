@@ -97,6 +97,12 @@ curl --fail --silent --show-error https://larkbot.ttapp.help/healthz
 
 新准备的批次加密固定规则版本，已冻结批次仍用原版本，后续增量读取新版；不清空历史检查点、不全量重跑、不更改旧画像或人工值。事实或案例手册转为草稿／停用后暂停依赖批次，恢复发布后续跑；已有有效付费返回先本地复用，不重复请求。未知费用、来源、授权与配置变更仍走原有校验，不因改手册自动重试。后台手册不加入运营助手导航或回复资料，不增加查询权限、表、队列或 API Key。
 
+#### 群用途分类手册
+
+文档管理员在「助手文档 → 群用途分类」维护用途判断、取材与上下文、入库与案例三份手册；一次请求共同读取，不额外增加模型调用。现有五类与未确认、当前配置阈值、有效正文引用和授权校验保持，任何人工分类及锁定结果都不被自动覆盖，群用途不授予发送权限。
+
+新准备的任务加密固定手册版本，旧冻结任务继续原版本；普通编辑不重排历史、清除结果或触发全量重跑。草稿／停用暂停依赖处理，恢复后续跑并优先本地复用已付费有效返回；真正材料变化、结果未知和配置变化仍走现有校验。只使用原有队列和凭证，手册不加入运营助手导航或回复资料，不增加查询权限。
+
 #### 群发页面与正式发送
 
 采用按功能增量授权，参考 [Google](https://developers.google.com/identity/protocols/oauth2/resources/granular-permissions)、[Microsoft](https://learn.microsoft.com/en-us/entra/identity-platform/consent-types-developer) 和 [Slack](https://docs.slack.dev/authentication/installing-with-oauth/) 的官方流程。不把应用已开通的全部权限都要求用户授权。

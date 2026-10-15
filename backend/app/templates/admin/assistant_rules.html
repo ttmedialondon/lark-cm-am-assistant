@@ -24,16 +24,17 @@
       {% if is_creator %}<p class="text-secondary small">固定用途：达人识别 · {{ creator_usage }}</p>{% endif %}
       {% if is_responsibility %}<p class="text-secondary small">固定用途：负责人匹配 · {{ responsibility_usage }}</p>{% endif %}
       {% if is_importance %}<p class="text-secondary small">固定用途：维护优先级 · {{ importance_usage }}</p>{% endif %}
+      {% if is_group %}<p class="text-secondary small">固定用途：群用途分类 · {{ group_usage }}</p>{% endif %}
       {% if is_reply %}<p class="text-secondary small">固定用途：回复处理 · {{ reply_usage }}</p>{% endif %}
       <form method="post" action="/admin/assistant-rules">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="document" value="{{ document_key }}"><input type="hidden" name="revision" value="{{ document.revision }}">
         {% if is_reply %}<input type="hidden" name="reply_usable" value="1">{% endif %}
         <div class="mb-3"><label class="form-label" for="document-title">名称</label><input class="form-control" id="document-title" name="title" value="{{ edit.title }}" maxlength="160" required></div>
-        <div class="mb-3"><label class="form-label" for="document-description">{% if is_event or is_creator or is_responsibility or is_importance or is_reply %}用途说明{% else %}适用问题与说明{% endif %}</label><textarea class="form-control" id="document-description" name="description" rows="2" maxlength="1000" placeholder="{% if is_event or is_creator or is_responsibility or is_importance or is_reply %}说明这份手册的处理用途。{% else %}说明它适合回答什么问题，供助手选择相关文档。{% endif %}">{{ edit.description }}</textarea></div>
+        <div class="mb-3"><label class="form-label" for="document-description">{% if is_event or is_creator or is_responsibility or is_importance or is_group or is_reply %}用途说明{% else %}适用问题与说明{% endif %}</label><textarea class="form-control" id="document-description" name="description" rows="2" maxlength="1000" placeholder="{% if is_event or is_creator or is_responsibility or is_importance or is_group or is_reply %}说明这份手册的处理用途。{% else %}说明它适合回答什么问题，供助手选择相关文档。{% endif %}">{{ edit.description }}</textarea></div>
         <div class="row g-3 mb-3">
           <div class="col-md-4"><label class="form-label" for="document-kind">类型</label>
             {% if is_core %}<input type="hidden" name="kind" value="rule"><input class="form-control" id="document-kind" value="规则" readonly>
-            {% elif is_event or is_creator or is_responsibility or is_importance or is_reply %}<input type="hidden" name="kind" value="manual"><input class="form-control" id="document-kind" value="任务手册" readonly>
+            {% elif is_event or is_creator or is_responsibility or is_importance or is_group or is_reply %}<input type="hidden" name="kind" value="manual"><input class="form-control" id="document-kind" value="任务手册" readonly>
             {% else %}<select class="form-select" id="document-kind" name="kind">{% for key, label in kind_labels.items() if key != 'rule' %}<option value="{{ key }}"{% if edit.kind == key %} selected{% endif %}>{{ label }}</option>{% endfor %}</select>{% endif %}
           </div>
           <div class="col-md-4"><label class="form-label" for="document-status">状态</label>
@@ -42,7 +43,7 @@
           </div>
           <div class="col-md-4"><label class="form-label" for="document-visibility">发布范围</label>
             {% if is_core or is_reply %}<input type="hidden" name="visibility" value="all"><input class="form-control" id="document-visibility" value="全体 CM" readonly>
-            {% elif is_event or is_creator or is_responsibility or is_importance %}<input type="hidden" name="visibility" value="owner"><input class="form-control" id="document-visibility" value="后台专用" readonly>
+            {% elif is_event or is_creator or is_responsibility or is_importance or is_group %}<input type="hidden" name="visibility" value="owner"><input class="form-control" id="document-visibility" value="后台专用" readonly>
             {% else %}<select class="form-select" id="document-visibility" name="visibility">{% for key, label in visibility_labels.items() %}<option value="{{ key }}"{% if edit.visibility == key %} selected{% endif %}>{{ label }}</option>{% endfor %}</select>{% endif %}
           </div>
         </div>
@@ -53,8 +54,8 @@
         {% if is_core %}<p class="text-secondary small">基础规则始终发布给全体 CM，类型、状态和范围不可更改。核心与证据规则须保留原有主对话、分段归纳标题。</p>{% endif %}
         <label class="form-label" for="rule-content">Markdown 正文</label>
         <textarea class="form-control assistant-rules__editor" id="rule-content" name="content" rows="24" maxlength="{{ max_document_chars }}" aria-describedby="document-scope-hint" required spellcheck="false">{{ edit.text }}</textarea>
-        <p class="text-secondary small mt-2 mb-0" id="document-scope-hint">{% if is_importance and document_key == 'importance-tiers' %}分档说明仅供查阅，不送入模型；编辑不改变现有算法、人工档位或任务。{% elif is_importance %}用于维护优先级事实提取，不参与助手导航或回复起草。修改用于新准备的批次，已冻结批次保留原版本；停用暂停依赖任务，恢复后复用已保存的有效返回。不全量重跑，不覆盖人工档位。{% elif is_reply %}已接入桌面回复、事件回复和运营助手。修改用于新草稿；草稿或停用会暂停相关阶段。只生成草稿，不发送。{% elif is_responsibility %}用于负责人自动匹配，不参与助手导航或回复起草。修改用于新准备的任务，不重跑旧名单、不修改已有确认关系。草稿或停用会暂停依赖任务；恢复发布只续跑尚未实际调用的暂停任务。{% elif is_creator and document_key == 'creator-regression' %}开发验收手册，不随生产请求发送全文。保存不触发识别或重跑；仅供文档管理员维护，不参与运营助手导航。{% elif is_creator %}已接入名单导入、新人员识别和账号补配。修改用于新准备的任务；草稿或停用会暂停依赖此手册的任务。不全量重跑，不修改已有确认关系。仅供文档管理员维护，不参与运营助手导航。{% elif is_event %}后台专用手册不参与普通助手导航；事件总结的人员范围仍由原有权限决定。修改用于新报告，不全量重跑；暂停请使用 AI 配置中的对应功能开关。{% else %}发布范围控制助手取材，文档管理员可维护库内文档。草稿和停用文档不参与处理；文档管理不增加聊天或仅 Owner 知识的助手查询权限。{% endif %}</p>
-        <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mt-3"><span class="text-secondary small">当前版本 {{ document.revision }}{% if is_core and document.revision == 0 %} · 默认规则{% elif (is_event or is_creator or is_responsibility or is_importance or is_reply) and document.revision == 0 %} · 默认手册{% endif %}{% if document.updated_at %} · {{ document.updated_at }}{% endif %}</span><button class="btn btn-primary" type="submit">保存文档</button></div>
+        <p class="text-secondary small mt-2 mb-0" id="document-scope-hint">{% if is_group %}三份手册共同用于一次群分类请求，不参与助手导航或回复起草。修改用于新准备的任务，已冻结任务保留原版本；停用暂停依赖任务，恢复后复用已保存的有效返回。保留分类与配置阈值，不覆盖人工分类、不全量重跑。{% elif is_importance and document_key == 'importance-tiers' %}分档说明仅供查阅，不送入模型；编辑不改变现有算法、人工档位或任务。{% elif is_importance %}用于维护优先级事实提取，不参与助手导航或回复起草。修改用于新准备的批次，已冻结批次保留原版本；停用暂停依赖任务，恢复后复用已保存的有效返回。不全量重跑，不覆盖人工档位。{% elif is_reply %}已接入桌面回复、事件回复和运营助手。修改用于新草稿；草稿或停用会暂停相关阶段。只生成草稿，不发送。{% elif is_responsibility %}用于负责人自动匹配，不参与助手导航或回复起草。修改用于新准备的任务，不重跑旧名单、不修改已有确认关系。草稿或停用会暂停依赖任务；恢复发布只续跑尚未实际调用的暂停任务。{% elif is_creator and document_key == 'creator-regression' %}开发验收手册，不随生产请求发送全文。保存不触发识别或重跑；仅供文档管理员维护，不参与运营助手导航。{% elif is_creator %}已接入名单导入、新人员识别和账号补配。修改用于新准备的任务；草稿或停用会暂停依赖此手册的任务。不全量重跑，不修改已有确认关系。仅供文档管理员维护，不参与运营助手导航。{% elif is_event %}后台专用手册不参与普通助手导航；事件总结的人员范围仍由原有权限决定。修改用于新报告，不全量重跑；暂停请使用 AI 配置中的对应功能开关。{% else %}发布范围控制助手取材，文档管理员可维护库内文档。草稿和停用文档不参与处理；文档管理不增加聊天或仅 Owner 知识的助手查询权限。{% endif %}</p>
+        <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mt-3"><span class="text-secondary small">当前版本 {{ document.revision }}{% if is_core and document.revision == 0 %} · 默认规则{% elif (is_event or is_creator or is_responsibility or is_importance or is_group or is_reply) and document.revision == 0 %} · 默认手册{% endif %}{% if document.updated_at %} · {{ document.updated_at }}{% endif %}</span><button class="btn btn-primary" type="submit">保存文档</button></div>
       </form>
       {% if current_text %}<details class="mt-3" open><summary>当前已保存版本（请核对后再保存编辑框）</summary><pre class="assistant-rules__preview mt-2">{{ current_text }}</pre></details>{% endif %}
       {% if default_text %}<details class="mt-3 text-secondary"><summary>查看默认规则</summary><pre class="assistant-rules__preview mt-2">{{ default_text }}</pre></details>{% endif %}
