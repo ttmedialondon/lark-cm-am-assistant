@@ -371,42 +371,57 @@ def test_token_refresh_records_actual_scope_without_inventing_missing_grants(pg,
 
 def test_old_credential_failures_retry_without_revoking_new_login(pg, monkeypatch):
     monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
+    monkeypatch.setattr(worker, "_usable_access_token", lambda *_args: "fixture-token")
     settings = SimpleNamespace(sync_lookback_days=0, sync_overlap_seconds=600, sync_interval_seconds=300,
                                lark_sync_per_authorization_max_inflight=2)
     monkeypatch.setattr(worker, "get_settings", lambda: settings)
     error = worker.LarkApiError(401, 99991668, "Expired fixture token")
-    for mode in ("page", "discovery", "unknown_credential"):
+    for mode in ("page", "discovery", "unknown_credential", "refresh"):
         actor, job_id = uuid4(), uuid4()
         pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,%s,'old-token')",
                    (actor, "ou_credential_" + mode))
-        pg.execute("""INSERT INTO sync_jobs(id,authorization_id,mode,status,discovery_status,discovery_generation)
-            VALUES(%s,%s,'backfill','running',%s,3)""",
-            (job_id, actor, "succeeded" if mode == "page" else "running"))
-        job = worker.SyncJob(job_id, actor, "backfill", 0, "succeeded" if mode == "page" else "running", 3)
+        state = "succeeded" if mode in {"page", "refresh"} else "running"
+        pg.execute("""INSERT INTO sync_jobs(id,authorization_id,mode,status,discovery_status,discovery_generation,
+            discovery_completed_at,lease_until) VALUES(%s,%s,'backfill','running',%s,3,
+            NOW()-INTERVAL '10 minutes',NOW()+INTERVAL '10 minutes')""", (job_id, actor, state))
+        job = worker.SyncJob(job_id, actor, "backfill", 0, state, 3)
         if mode == "page":
             pg.execute("INSERT INTO chats(chat_id) VALUES('oc_credential_page')")
             pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id,backfill_page_token) "
                        "VALUES(%s,'oc_credential_page','history-page-2')", (actor,))
             claim = worker._claim_next_page(job, worker._authorization(actor), settings)
             assert claim.access_token_ciphertext == "old-token" and "old-token" not in repr(claim)
-        pg.execute("UPDATE authorizations SET access_token_ciphertext='new-token' WHERE id=%s", (actor,))
+        if mode == "refresh":
+            def rotate_during_request(*_args, target=actor, **_kwargs):
+                pg.execute("UPDATE authorizations SET access_token_ciphertext='new-token' WHERE id=%s", (target,))
+                raise error
+            client = SimpleNamespace(list_chats=rotate_during_request)
+            assert worker._refresh_running_discovery(settings, client)
+        else:
+            pg.execute("UPDATE authorizations SET access_token_ciphertext='new-token' WHERE id=%s", (actor,))
         if mode == "page":
             worker._handle_claim_api_error(claim, error)
             page = pg.execute("SELECT * FROM authorization_chats WHERE authorization_id=%s", (actor,)).fetchone()
             assert page["page_claim_id"] is None and page["backfill_page_token"] == "history-page-2"
             assert not page["backfill_complete"]
-        else:
+        elif mode != "refresh":
             worker._handle_job_api_error(job, error, discovery=True,
                                         access_token_ciphertext=None if mode == "unknown_credential" else "old-token")
         assert worker._authorization(actor)["status"] == "active"
         pending = pg.execute("SELECT * FROM sync_jobs WHERE id=%s", (job_id,)).fetchone()
-        assert pending["status"] == ("running" if mode == "page" else "queued")
-        assert pending["discovery_generation"] == (3 if mode == "page" else 4)
+        assert pending["status"] == ("running" if mode in {"page", "refresh"} else "queued")
+        assert pending["discovery_generation"] == (3 if mode in {"page", "refresh"} else 4)
         # An error using the replacement credential still stops the account normally.
         if mode == "page":
             current = worker._claim_next_page(job, worker._authorization(actor), settings)
             assert current.access_token_ciphertext == "new-token"
             worker._handle_claim_api_error(current, error)
+        elif mode == "refresh":
+            pg.execute("UPDATE sync_jobs SET scheduled_at=NOW() WHERE id=%s", (job_id,))
+            def actual_credential_failure(*_args, **_kwargs):
+                raise error
+            client.list_chats = actual_credential_failure
+            assert worker._refresh_running_discovery(settings, client)
         else:
             pg.execute("UPDATE sync_jobs SET status='running',discovery_status='running' WHERE id=%s", (job_id,))
             current = worker.SyncJob(job_id, actor, "backfill", 1, "running", 4)
@@ -935,6 +950,7 @@ def test_all_due_accounts_rotate_through_three_page_slots_and_resume_cursors(pg,
         current = worker._begin_discovery(job)
         if current:
             worker._complete_discovery(current, 1)
+        return True
 
     monkeypatch.setattr(worker, "_prepare_job", prepare)
     for index in range(4):
@@ -1069,7 +1085,7 @@ def test_all_due_accounts_rotate_through_three_page_slots_and_resume_cursors(pg,
     assert worker._select_backfill_chat_for_claim(pg, job.authorization_id)["chat_id"] == "oc_backfill_denied"
 
 
-def test_discovery_is_single_flight_and_does_not_block_page_reaping(monkeypatch):
+def test_discovery_is_single_flight_and_does_not_block_page_reaping(pg, monkeypatch):
     settings = SimpleNamespace(worker_idle_seconds=3, token_encryption_key=b"r" * 32)
     submitted = []
     executor = SimpleNamespace(submit=lambda *args: submitted.append(args) or TaskFuture())
@@ -1092,6 +1108,29 @@ def test_discovery_is_single_flight_and_does_not_block_page_reaping(monkeypatch)
     assert worker._schedule_discovery(settings, object(), executor, future, next_check) == (None, 103)
     assert len(submitted) == 1
 
+    # Cross-process discovery and coordinator finish use a nonblocking lock, released with the session.
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
+    actor = UUID(int=1900)
+    lock_key = f'lark-chat-discovery:{actor}'
+    with psycopg.connect(pg.info.dsn, autocommit=True, row_factory=dict_row) as other:
+        with worker._discovery_lock(actor) as acquired:
+            assert acquired
+            assert not other.execute('SELECT pg_try_advisory_lock(hashtextextended(%s,0)) AS acquired',
+                                     (lock_key,)).fetchone()['acquired']
+            with monkeypatch.context() as another_worker:
+                another_worker.setattr(worker, 'connection', lambda: nullcontext(other))
+                another_worker.setattr(worker, 'lock_sync_material', lambda *_args: None)
+                another_worker.setattr(worker, 'get_settings', lambda: settings)
+                with worker._discovery_lock(actor) as second_acquired:
+                    assert not second_acquired
+                worker._finish_and_schedule_incremental(SimpleNamespace(authorization_id=actor))
+        assert other.execute('SELECT pg_try_advisory_lock(hashtextextended(%s,0)) AS acquired',
+                             (lock_key,)).fetchone()['acquired']
+        with worker._discovery_lock(actor) as acquired:
+            assert not acquired
+    with worker._discovery_lock(actor) as acquired:
+        assert acquired  # A terminated session leaves no lease or process-local retry deadlock.
+
 
 def test_new_coordinator_keeps_revocation_and_discovery_retry_fences(pg, monkeypatch):
     monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
@@ -1102,7 +1141,9 @@ def test_new_coordinator_keeps_revocation_and_discovery_retry_fences(pg, monkeyp
                VALUES(%s,'ou_discovery_fence','revoked','test')""", (actor,))
     pg.execute("""INSERT INTO sync_jobs(id,authorization_id,mode,status)
                VALUES(%s,%s,'incremental','queued')""", (job_id, actor))
-    settings = SimpleNamespace()
+    settings = SimpleNamespace(sync_interval_seconds=300, sync_lookback_days=0, sync_overlap_seconds=600,
+                               lark_sync_per_authorization_max_inflight=2)
+    monkeypatch.setattr(worker, "get_settings", lambda: settings)
     assert worker._start_pending_jobs(settings, object())
     assert pg.execute("SELECT status FROM sync_jobs WHERE id=%s", (job_id,)).fetchone()["status"] == "cancelled"
 
@@ -1151,6 +1192,104 @@ def test_new_coordinator_keeps_revocation_and_discovery_retry_fences(pg, monkeyp
         available = True
     assert pg.execute("SELECT backfill_page_token FROM authorization_chats WHERE authorization_id=%s", (actor,)
                       ).fetchone()["backfill_page_token"] == "keep-page-3"
+
+    # An ongoing page round can discover new groups without replacing any existing page/window.
+    pg.execute("UPDATE sync_jobs SET discovery_completed_at=NOW()-INTERVAL '10 minutes',scheduled_at=NOW() "
+               "WHERE id=%s", (job_id,))
+    job = next(job for job in worker._running_jobs() if job.id == job_id)
+    auth = worker._authorization(actor)
+    pg.execute("INSERT INTO chats(chat_id,chat_mode) VALUES('zz_departed','group')")
+    pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,last_seen_at,backfill_page_token,
+        member_snapshot_claim_id,member_snapshot_claimed_at,member_snapshot_lease_until)
+        VALUES(%s,'zz_departed',NOW()-INTERVAL '1 day','preserve-history-4',%s,NOW(),NOW()+INTERVAL '10 minutes')""",
+        (actor, uuid4()))
+    healthy, departed = (worker._claim_next_page(job, auth, settings) for _ in range(2))
+    assert healthy.chat_id == 'oc_discovery_resume' and departed.chat_id == 'zz_departed'
+
+    def page_state(chat):
+        row = pg.execute("SELECT * FROM authorization_chats WHERE authorization_id=%s AND chat_id=%s",
+                         (actor, chat)).fetchone()
+        return {key: value for key, value in row.items() if key.startswith((
+            'backfill_', 'incremental_', 'recent_', 'page_claim', 'page_lease', 'member_snapshot_claim',
+            'member_snapshot_lease')) or key in {'last_backfill_at', 'last_incremental_at', 'sync_generation'}}
+
+    before = {claim.chat_id: page_state(claim.chat_id) for claim in (healthy, departed)}
+    jobs_before = pg.execute("SELECT status,discovery_status,discovery_generation,attempts,discovery_completed_at "
+                             "FROM sync_jobs WHERE id=%s", (job_id,)).fetchone()
+    protected = {table: pg.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+                 for table in ('contact_roles', 'contact_assignments', 'contact_social_accounts')}
+    requests, fail_second_page = [], True
+
+    def refresh_groups(_token, page=None, *, types=None):
+        assert types is None  # Periodic group discovery does not repeat profile or optional P2P calls.
+        requests.append(page)
+        if page is None:
+            return {'items': [{'chat_id': healthy.chat_id}, {'chat_id': 'oc_new_during_backfill'}],
+                    'has_more': True, 'page_token': 'directory-2'}
+        assert page == 'directory-2'
+        if fail_second_page:
+            assert {chat: page_state(chat) for chat in before} == before
+            assert worker._record_claimed_page(healthy, [], 'healthy-page-2', None).committed
+            raise worker.LarkApiError(429, 99991400, 'fixture-only limit', retry_after=120)
+        return {'items': []}
+
+    client.list_chats = refresh_groups
+    assert worker._start_pending_jobs(settings, client)
+    assert pg.execute("SELECT is_visible FROM authorization_chats WHERE chat_id='zz_departed'").fetchone()[
+        'is_visible']  # A partial directory cannot hide groups or invalidate their claims.
+    assert page_state('zz_departed') == before['zz_departed']
+    assert pg.execute("SELECT status,discovery_status,discovery_generation,attempts,discovery_completed_at "
+                      "FROM sync_jobs WHERE id=%s", (job_id,)).fetchone() == jobs_before
+    assert pg.execute("SELECT scheduled_at>=NOW()+INTERVAL '120 seconds' AS delayed FROM sync_jobs WHERE id=%s",
+                      (job_id,)).fetchone()['delayed']
+    assert not worker._refresh_running_discovery(settings, client) and requests == [None, 'directory-2']
+    added = worker._claim_next_page(job, auth, settings)
+    assert added.chat_id == 'oc_new_during_backfill' and added.mode == 'incremental'
+    assert added.end_at - added.start_at == worker.timedelta(days=7)
+
+    fail_second_page = False
+    pg.execute('UPDATE sync_jobs SET scheduled_at=NOW() WHERE id=%s', (job_id,))
+    assert worker._refresh_running_discovery(settings, client)
+    hidden = pg.execute("SELECT * FROM authorization_chats WHERE chat_id='zz_departed'").fetchone()
+    assert not hidden['is_visible'] and hidden['sync_generation'] == departed.generation + 1
+    assert all(hidden[field] is None for field in (
+        'page_claim_id', 'page_claim_job_id', 'page_lease_until', 'member_snapshot_claim_id',
+        'member_snapshot_claimed_at', 'member_snapshot_lease_until'))
+    assert hidden['backfill_page_token'] == 'preserve-history-4'
+    assert hidden['incremental_page_token'] == before['zz_departed']['incremental_page_token']
+    assert not worker._record_claimed_page(departed, [], None, None).committed
+    assert worker._record_claimed_page(added, [], None, None).committed
+    assert pg.execute("SELECT incremental_page_token,backfill_page_token FROM authorization_chats "
+                      "WHERE chat_id='oc_discovery_resume'").fetchone() == {
+                          'incremental_page_token': 'healthy-page-2', 'backfill_page_token': 'keep-page-3'}
+    assert not worker._refresh_running_discovery(settings, client)
+    assert len(p2p_calls) == 2 and requests == [None, 'directory-2', None, 'directory-2']
+    assert pg.execute("SELECT last_error,last_error_code,last_http_status FROM sync_jobs WHERE id=%s",
+                      (job_id,)).fetchone() == {'last_error': None, 'last_error_code': None, 'last_http_status': None}
+    assert {table: pg.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall() for table in protected} == protected
+
+    # Invalid directories and stale/revoked responses never masquerade as an empty complete roster.
+    visible = pg.execute("SELECT chat_id,is_visible,sync_generation FROM authorization_chats "
+                         "WHERE authorization_id=%s ORDER BY chat_id", (actor,)).fetchall()
+    for boundary in ('malformed', 'new_generation', 'revoked'):
+        pg.execute("UPDATE sync_jobs SET scheduled_at=NOW(),discovery_completed_at=NOW()-INTERVAL '10 minutes' "
+                   "WHERE id=%s", (job_id,))
+
+        def stale_directory(*_args, scenario=boundary, **_kwargs):
+            if scenario == 'malformed':
+                return {'items': {'broken': 'shape'}}
+            if scenario == 'new_generation':
+                pg.execute('UPDATE sync_jobs SET discovery_generation=discovery_generation+1 WHERE id=%s', (job_id,))
+            else:
+                pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (actor,))
+            return {'items': [{'chat_id': 'oc_must_not_be_admitted'}]}
+
+        client.list_chats = stale_directory
+        assert worker._refresh_running_discovery(settings, client)
+        assert pg.execute("SELECT chat_id,is_visible,sync_generation FROM authorization_chats "
+                          "WHERE authorization_id=%s ORDER BY chat_id", (actor,)).fetchall() == visible
+        assert not pg.execute("SELECT 1 FROM chats WHERE chat_id='oc_must_not_be_admitted'").fetchone()
+    assert not worker._refresh_running_discovery(settings, client)
 
 
 

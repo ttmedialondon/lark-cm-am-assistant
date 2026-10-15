@@ -8,6 +8,7 @@ import time
 import uuid
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -525,19 +526,71 @@ def _start_pending_jobs(settings: Settings, client: LarkClient) -> bool:
     """Activate one coordinator; account count is not the HTTP concurrency limit."""
 
     for job in _running_jobs():
-        if job.discovery_status == "pending":
-            _prepare_job(job, settings, client)
+        if job.discovery_status == "pending" and _prepare_job(job, settings, client):
             return True
 
     job = _claim_job()
     if job:
-        _prepare_job(job, settings, client)
+        return _prepare_job(job, settings, client)
+    return _refresh_running_discovery(settings, client)
+
+
+@contextmanager
+def _discovery_lock(authorization_id: uuid.UUID):
+    # Keep discovery fenced across short transactions; a worker exit releases the lock.
+    with connection() as conn:
+        with conn.transaction():
+            acquired = conn.execute(
+                "SELECT pg_try_advisory_lock(hashtextextended(%s,0)) AS acquired",
+                (f"lark-chat-discovery:{authorization_id}",),
+            ).fetchone()["acquired"]
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                with conn.transaction():
+                    conn.execute("SELECT pg_advisory_unlock(hashtextextended(%s,0))",
+                                 (f"lark-chat-discovery:{authorization_id}",))
+
+
+def _refresh_running_discovery(settings: Settings, client: LarkClient) -> bool:
+    with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT j.id,j.authorization_id,j.mode,j.attempts,j.discovery_status,j.discovery_generation
+            FROM sync_jobs j JOIN authorizations a ON a.id=j.authorization_id
+            WHERE j.status='running' AND j.lease_until>NOW() AND j.discovery_status='succeeded'
+              AND a.status='active' AND j.scheduled_at<=NOW()
+              AND j.discovery_completed_at<=NOW()-(%s*INTERVAL '1 second')
+            ORDER BY j.discovery_completed_at,j.created_at LIMIT 1
+            """,
+            (settings.sync_interval_seconds,),
+        ).fetchone()
+    if not row:
+        return False
+    return _prepare_job(SyncJob(**row), settings, client, refresh=True)
+
+
+def _prepare_job(job: SyncJob, settings: Settings, client: LarkClient, *, refresh: bool = False) -> bool:
+    with _discovery_lock(job.authorization_id) as acquired:
+        if not acquired:
+            return False
+        if refresh:
+            with connection() as conn:
+                due = conn.execute(
+                    """SELECT 1 FROM sync_jobs WHERE id=%s AND status='running'
+                       AND discovery_status='succeeded' AND discovery_generation=%s AND lease_until>NOW()
+                       AND scheduled_at<=NOW() AND discovery_completed_at<=NOW()-(%s*INTERVAL '1 second')""",
+                    (job.id, job.discovery_generation, settings.sync_interval_seconds),
+                ).fetchone()
+            if not due:
+                return False
+        _run_discovery(job, settings, client, refresh=refresh)
         return True
-    return False
 
 
-def _prepare_job(job: SyncJob, settings: Settings, client: LarkClient) -> None:
-    current = _begin_discovery(job)
+def _run_discovery(job: SyncJob, settings: Settings, client: LarkClient, *, refresh: bool) -> None:
+    current = job if refresh else _begin_discovery(job)
     if not current:
         return
     authorization = None
@@ -547,10 +600,12 @@ def _prepare_job(job: SyncJob, settings: Settings, client: LarkClient) -> None:
             _finish_job(current, "cancelled", "Authorization is no longer active.")
             return
         access_token = _usable_access_token(current.authorization_id, authorization, client, settings)
-        _refresh_profile_name(current, authorization, access_token, client, settings)
+        if not refresh:
+            _refresh_profile_name(current, authorization, access_token, client, settings)
         discovered = _discover_chats(current, authorization, access_token, client, settings, chat_type="group")
         p2p_checked = authorization.get("p2p_last_checked_at")
-        if (authorization.get("body_consent_at") and authorization.get("p2p_discovery_status") != "attention_required"
+        if (not refresh and authorization.get("body_consent_at")
+                and authorization.get("p2p_discovery_status") != "attention_required"
                 and (authorization.get("p2p_discovery_status") != "unavailable" or not p2p_checked
                      or p2p_checked <= datetime.now(UTC) - timedelta(hours=1))):
             discovered += _discover_p2p(current, authorization, access_token, client, settings)
@@ -560,16 +615,43 @@ def _prepare_job(job: SyncJob, settings: Settings, client: LarkClient) -> None:
     except ReauthorizationRequired:
         if not _mark_attention(current, "Lark authorization must be renewed.",
                                access_token_ciphertext=(authorization or {}).get("access_token_ciphertext")):
-            _requeue(current, delay_seconds=0, reset_discovery=True)
+            if refresh:
+                _defer_discovery(current, delay_seconds=0)
+            else:
+                _requeue(current, delay_seconds=0, reset_discovery=True)
     except LarkApiError as exc:
-        _handle_job_api_error(current, exc, discovery=True,
-                             access_token_ciphertext=(authorization or {}).get("access_token_ciphertext"))
+        if refresh:
+            if exc.likely_auth_problem and _mark_attention(
+                current, "Lark authorization or permission needs attention.",
+                access_token_ciphertext=(authorization or {}).get("access_token_ciphertext"),
+            ):
+                return
+            _defer_discovery(current, delay_seconds=exc.retry_after if exc.retry_after is not None
+                             else settings.sync_interval_seconds, code=exc.lark_code, http_status=exc.status_code)
+        else:
+            _handle_job_api_error(current, exc, discovery=True,
+                                 access_token_ciphertext=(authorization or {}).get("access_token_ciphertext"))
     except (psycopg.Error, ValueError):
-        _requeue(
-            current,
-            delay_seconds=min(60 * (2 ** min(current.attempts, 4)), 900),
-            detail="Temporary service issue; retry scheduled.",
-            reset_discovery=True,
+        if refresh:
+            _defer_discovery(current, delay_seconds=settings.sync_interval_seconds)
+        else:
+            _requeue(
+                current,
+                delay_seconds=min(60 * (2 ** min(current.attempts, 4)), 900),
+                detail="Temporary service issue; retry scheduled.",
+                reset_discovery=True,
+            )
+
+
+def _defer_discovery(job: SyncJob, *, delay_seconds: int, code: int | None = None,
+                     http_status: int | None = None) -> None:
+    with connection() as conn, conn.transaction():
+        conn.execute(
+            """UPDATE sync_jobs SET scheduled_at=NOW()+(%s*INTERVAL '1 second'),
+                 last_error_code=%s,last_http_status=%s,
+                 last_error='Conversation discovery will retry; existing message sync continues.',updated_at=NOW()
+               WHERE id=%s AND status='running' AND discovery_status='succeeded' AND discovery_generation=%s""",
+            (max(delay_seconds, 1), code, http_status, job.id, job.discovery_generation),
         )
 
 
@@ -605,11 +687,12 @@ def _complete_discovery(job: SyncJob, discovered: int) -> None:
             UPDATE sync_jobs
             SET discovery_status = 'succeeded', discovery_completed_at = NOW(),
                 chats_discovered = %s, last_progress_at = NOW(),
+                last_error_code = NULL, last_http_status = NULL, last_error = NULL,
                 lease_until = NOW() + INTERVAL '10 minutes', updated_at = NOW()
             WHERE id = %s AND status = 'running'
-              AND discovery_status = 'running' AND discovery_generation = %s
+              AND discovery_status = %s AND discovery_generation = %s
             """,
-            (discovered, job.id, job.discovery_generation),
+            (discovered, job.id, job.discovery_status, job.discovery_generation),
         )
 
 
@@ -1195,6 +1278,10 @@ def _discover_chats(
     while True:
         _renew_lease(job)
         data = client.list_chats(access_token, page_token, types="p2p" if chat_type == "p2p" else None)
+        if not isinstance(data.get("items"), list) or any(
+            not isinstance(chat, dict) or not _text(chat.get("chat_id")) for chat in data["items"]
+        ):
+            raise LarkApiError(502, None, "Lark conversation list was incomplete")
         rows: list[
             tuple[
                 str,
@@ -1389,9 +1476,14 @@ def _discover_chats(
             SET is_visible = FALSE,
                 manual_backfill_requested_at = NULL,
                 manual_backfill_started_at = NULL,
-                sync_generation = sync_generation + 1
+                sync_generation = sync_generation + 1,
+                page_claim_id = NULL, page_claim_job_id = NULL, page_claim_mode = NULL,
+                page_claimed_at = NULL, page_lease_until = NULL,
+                member_snapshot_claim_id = NULL, member_snapshot_claimed_at = NULL,
+                member_snapshot_lease_until = NULL
             FROM chats AS c
             WHERE access.authorization_id = %s
+              AND access.is_visible
               AND access.chat_id = c.chat_id
               AND COALESCE(c.chat_mode, 'group') = %s
               AND access.last_seen_at < %s
@@ -1406,11 +1498,12 @@ def _assert_discovery_current(conn: psycopg.Connection, job: SyncJob) -> None:
         """
         SELECT 1
         FROM sync_jobs
-        WHERE id = %s AND status = 'running' AND discovery_status = 'running'
+        WHERE id = %s AND status = 'running' AND discovery_status = %s
           AND discovery_generation = %s
+          AND EXISTS (SELECT 1 FROM authorizations a WHERE a.id=sync_jobs.authorization_id AND a.status='active')
         FOR UPDATE
         """,
-        (job.id, job.discovery_generation),
+        (job.id, job.discovery_status, job.discovery_generation),
     ).fetchone()
     if not row:
         raise StaleSyncJob
@@ -2031,7 +2124,6 @@ def _select_incremental_chat_for_claim(
           AND (
             (access.incremental_job_id = %s AND access.incremental_window_end_at IS NOT NULL)
             OR access.incremental_job_id IS DISTINCT FROM %s
-            -- shortcut: discovery waits for this coordinator; decouple it if large rosters stay continuously due.
             OR access.last_incremental_at <= NOW() - (%s * INTERVAL '1 second')
           )
         ORDER BY
@@ -2630,6 +2722,11 @@ def _finish_and_schedule_incremental(job: SyncJob) -> None:
     settings = get_settings()
     with connection() as conn, conn.transaction():
         lock_sync_material(conn)
+        if not conn.execute(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS acquired",
+            (f"lark-chat-discovery:{job.authorization_id}",),
+        ).fetchone()["acquired"]:
+            return
         current = conn.execute(
             """
             SELECT mode
