@@ -244,6 +244,8 @@ def _recover(conn):
         reason_code='identity_removed',updated_at=NOW()
         WHERE j.status NOT IN ('completed','failed','cancelled') AND (
           j.purpose='identity' AND NOT creator_identity_eligible(j.contact_id)
+            AND NOT EXISTS(SELECT 1 FROM contact_roles r WHERE r.contact_id=j.contact_id
+              AND r.role='creator' AND r.status='confirmed')
           OR j.purpose='handles' AND NOT EXISTS(SELECT 1 FROM contact_roles r
             WHERE r.contact_id=j.contact_id AND r.role='creator' AND r.status='confirmed'))""")
 
@@ -988,16 +990,32 @@ def enqueue_history(conn, actor):
     return len(rows)
 
 
+_DISPLAY_STATUS = """CASE WHEN j.purpose='identity' AND j.status='review_required'
+    THEN CASE WHEN r.status='confirmed' THEN 'account_review_required' ELSE 'identity_review_required' END
+    WHEN j.purpose='identity' AND j.status='cancelled' AND j.reason_code='identity_removed'
+      AND r.status='confirmed' THEN CASE WHEN j.identity_confirmed='true' AND j.has_result
+        THEN 'account_review_required' ELSE 'completed' END ELSE j.status END"""
+
+
 def page_data(conn, actor, settings, page=1):
     access = admin_permissions.require_page(conn, actor, "ai")
-    counts = conn.execute("""SELECT status,count(*) n FROM (
-        SELECT DISTINCT ON(contact_id) status FROM creator_handle_jobs
-        ORDER BY contact_id,created_at DESC,id DESC) latest GROUP BY status""").fetchall()
+    counts = conn.execute("""SELECT CASE WHEN status='review_required' THEN 'account_review_required'
+        ELSE status END AS status,count(*) n FROM (SELECT """ + _DISPLAY_STATUS + """ AS status FROM (
+        SELECT DISTINCT ON(contact_id) contact_id,purpose,status,reason_code,
+          stats->>'identity_confirmed' AS identity_confirmed,result_ciphertext IS NOT NULL AS has_result
+        FROM creator_handle_jobs
+        ORDER BY contact_id,created_at DESC,id DESC) j
+        LEFT JOIN contact_roles r ON r.contact_id=j.contact_id AND r.role='creator'
+        ) latest_status GROUP BY 1""").fetchall()
     jobs = conn.execute(
-        """SELECT j.*,c.display_name,(SELECT r.error_code FROM creator_handle_requests r
-        WHERE r.job_id=j.id ORDER BY r.created_at DESC,r.id DESC LIMIT 1) AS validation_error
-        FROM (SELECT DISTINCT ON(contact_id) * FROM creator_handle_jobs
+        """SELECT j.*,c.display_name,r.status='confirmed' AS creator_confirmed,""" + _DISPLAY_STATUS
+        + """ AS display_status,
+        (SELECT receipt.error_code FROM creator_handle_requests receipt
+        WHERE receipt.job_id=j.id ORDER BY receipt.created_at DESC,receipt.id DESC LIMIT 1) AS validation_error
+        FROM (SELECT DISTINCT ON(contact_id) *,stats->>'identity_confirmed' AS identity_confirmed,
+                result_ciphertext IS NOT NULL AS has_result FROM creator_handle_jobs
               ORDER BY contact_id,created_at DESC,id DESC) j JOIN contacts c ON c.id=j.contact_id
+        LEFT JOIN contact_roles r ON r.contact_id=j.contact_id AND r.role='creator'
         ORDER BY j.updated_at DESC,j.id LIMIT 50 OFFSET %s""",
         ((page - 1) * 50,),
     ).fetchall()
@@ -1008,16 +1026,22 @@ def page_data(conn, actor, settings, page=1):
             {"handle": row["handle"], "human_confirmed": row["human_confirmed"]}
         )
     for job in jobs:
-        job['identity_state'] = job['stats'].get('identity_state')
+        job['identity_state'] = ('confirmed' if job['creator_confirmed'] else 'removed'
+            if job['stats'].get('identity_confirmed') else 'review'
+            if job['stats'].get('identity_state') in {'supported', 'known'} else job['stats'].get('identity_state'))
+        if job['display_status'] in {'account_review_required', 'identity_review_required'}:
+            job['display_reason_code'] = ''
+        elif job['purpose'] == 'identity' and job['status'] == 'cancelled' and job['creator_confirmed'] \
+                and job['reason_code'] == 'identity_removed':
+            job['display_reason_code'] = 'already_identified'
         job["associations"] = associations.get(str(job["contact_id"]), [])
         job["suggestions"] = []
         reused = job["source"] == "history" and job["reason_code"] == "already_confirmed"
         if reused:
             job["validation_error"] = None
-        if (
-            not reused and job["result_ciphertext"]
-            and evidence.still_valid(conn, job["refs"], settings, ciphertext_only=not access["is_owner"])
-        ):
+        material_valid = (not reused and job["result_ciphertext"]
+            and evidence.still_valid(conn, job["refs"], settings, ciphertext_only=not access["is_owner"]))
+        if material_valid:
             view = json.loads(storage.decrypt(job["result_ciphertext"]))
             job["suggestions"] = [
                 {
@@ -1026,6 +1050,9 @@ def page_data(conn, actor, settings, page=1):
                 }
                 for link in view["result"]["links"]
             ]
+        elif job['result_ciphertext'] and job['display_status'] in {
+                'account_review_required', 'identity_review_required'}:
+            job['display_reason_code'] = 'evidence_changed'
     suggestions = [(None, job["contact_id"], link["handle"]) for job in jobs for link in job["suggestions"]]
     conflicts = iter(creator_imports._conflicts(conn, suggestions))
     handles = sorted({handle for _, _, handle in suggestions})
@@ -1057,7 +1084,8 @@ def page_data(conn, actor, settings, page=1):
             if not row["associated"] or job["source"] == "manual" or link["conflict"]:
                 row.update(check=link, conflict=link["conflict"])
         job["handle_rows"] = [rows[h] for h in sorted(rows)]
-        if (job["source"] != "manual" and job["status"] in {"completed", "review_required"}
+        if (job['purpose'] == 'handles' and job["source"] != "manual"
+                and job["status"] in {"completed", "review_required"}
                 and job["suggestions"] and not job["stats"].get("candidates_omitted")
                 and all(rows[link["handle"]]["associated"] and rows[link["handle"]]["check"] is None
                         for link in job["suggestions"])):

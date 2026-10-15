@@ -3,6 +3,7 @@
 import json
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -159,6 +160,94 @@ def matching_flow(pg, pilot, monkeypatch):
 
 def _enqueue(pg, contact, source="manual"):
     return pg.execute("SELECT enqueue_creator_handle(%s,%s,TRUE) id", (contact, source)).fetchone()["id"]
+
+
+def test_material_round_debounce_and_targeted_schedule_repair_preserve_live_requests(pg, matching_flow):
+    flow = matching_flow
+    flow.enable()
+    protected = _snapshot(pg, ('contact_roles', 'contact_assignments', 'contact_social_accounts'))
+    unknown = uuid4()
+    pg.execute("INSERT INTO contacts(id,created_at) VALUES(%s,NOW()-INTERVAL '30 days')", (unknown,))
+    pg.execute("INSERT INTO lark_identities(open_id,contact_id) VALUES('ou_debounce_identity',%s)", (unknown,))
+    signals = iter(range(1, 100))
+    now = pg.execute('SELECT NOW() now').fetchone()['now']
+
+    def wake(purpose, contact, immediate=False):
+        if purpose == 'identity':
+            return pg.execute("SELECT enqueue_creator_identity(%s,NOW()+(%s*INTERVAL '1 second'),%s) id",
+                              (contact, next(signals), immediate)).fetchone()['id']
+        return pg.execute("SELECT enqueue_creator_handle(%s,'incremental',%s) id",
+                          (contact, immediate)).fetchone()['id']
+
+    for purpose, contact in (('handles', flow.contact), ('identity', unknown)):
+        job = wake(purpose, contact, True)
+        for status in ('waiting_evidence', 'review_required', 'ready'):
+            pg.execute("""UPDATE creator_handle_jobs SET status=%s,prepared_at=NOW()-INTERVAL '20 minutes',
+                debounce_started_at=NOW()-INTERVAL '20 minutes',not_before=NOW()-INTERVAL '18 minutes'
+                WHERE id=%s""", (status, job))
+            assert wake(purpose, contact) == job
+            row = pg.execute('SELECT * FROM creator_handle_jobs WHERE id=%s', (job,)).fetchone()
+            assert row['status'] == 'queued' and row['debounce_started_at'] == now
+            assert row['not_before'] == now + timedelta(seconds=30)
+        pg.execute("UPDATE creator_handle_jobs SET status='retry_wait',not_before=NOW()+INTERVAL '5 minutes' "
+                   "WHERE id=%s", (job,))
+        wake(purpose, contact)
+        assert pg.execute('SELECT not_before FROM creator_handle_jobs WHERE id=%s',
+                          (job,)).fetchone()['not_before'] == now + timedelta(minutes=5)
+        pg.execute("UPDATE creator_handle_jobs SET debounce_started_at=NOW()-INTERVAL '110 seconds',"
+                   "not_before=NOW()+INTERVAL '5 seconds' WHERE id=%s", (job,))
+        wake(purpose, contact)
+        assert pg.execute('SELECT debounce_started_at,not_before FROM creator_handle_jobs WHERE id=%s',
+                          (job,)).fetchone() == {
+                              'debounce_started_at': now - timedelta(seconds=110),
+                              'not_before': now + timedelta(seconds=10)}
+        pg.execute("UPDATE creator_handle_jobs SET debounce_started_at=NOW()-INTERVAL '20 minutes',"
+                   "not_before=NOW() WHERE id=%s", (job,))
+        wake(purpose, contact)
+        assert pg.execute('SELECT not_before FROM creator_handle_jobs WHERE id=%s',
+                          (job,)).fetchone()['not_before'] == now
+        pg.execute("INSERT INTO creator_handle_requests(id,job_id,error_code) VALUES(%s,%s,'request_unknown')",
+                   (uuid4(), job))
+        receipts = _snapshot(pg, ('creator_handle_requests',))
+        for status in ('preparing', 'running'):
+            token = uuid4()
+            pg.execute("""UPDATE creator_handle_jobs SET status=%s,claim_token=%s,
+                lease_until=NOW()+INTERVAL '5 minutes',snapshot_version=desired_version,
+                pack_ciphertext='frozen-synthetic-material' WHERE id=%s""", (status, token, job))
+            wake(purpose, contact)
+            row = pg.execute('SELECT * FROM creator_handle_jobs WHERE id=%s', (job,)).fetchone()
+            assert row['status'] == status and row['claim_token'] == token
+            assert row['lease_until'] == now + timedelta(minutes=5)
+            assert row['pack_ciphertext'] == 'frozen-synthetic-material'
+            assert row['desired_version'] == row['snapshot_version'] + 1
+        assert _snapshot(pg, receipts.keys()) == receipts
+
+    affected = set()
+    for purpose, source, prepared, version in (
+        ('handles', 'incremental', True, 2), ('identity', 'incremental', True, 2),
+        ('handles', 'incremental', False, 2), ('handles', 'manual', True, 2), ('handles', 'incremental', True, 1),
+    ):
+        contact = uuid4()
+        pg.execute('INSERT INTO contacts(id) VALUES(%s)', (contact,))
+        job = pg.execute("""INSERT INTO creator_handle_jobs(contact_id,purpose,source,desired_version,snapshot_version,
+            prepared_at,debounce_started_at,not_before,updated_at)
+            VALUES(%s,%s,%s,%s,1,CASE WHEN %s THEN NOW()-INTERVAL '20 minutes' END,
+              NOW()-INTERVAL '20 minutes',NOW()-INTERVAL '18 minutes',NOW()-INTERVAL '1 minute') RETURNING id""",
+            (contact, purpose, source, version, prepared)).fetchone()['id']
+        if source == 'incremental' and prepared and version == 2:
+            affected.add(job)
+    before = {row['id']: row for row in pg.execute('SELECT * FROM creator_handle_jobs').fetchall()}
+    migration = (Path(__file__).parents[1] / 'migrations/110_creator_matching_debounce_windows.sql').read_text()
+    for _ in range(2):
+        pg.execute(migration)
+        for row in pg.execute('SELECT * FROM creator_handle_jobs').fetchall():
+            expected = before[row['id']]
+            if row['id'] in affected:
+                expected = {**expected, 'not_before': expected['updated_at'] + timedelta(seconds=30),
+                            'debounce_started_at': expected['updated_at']}
+            assert row == expected
+    assert _snapshot(pg, protected.keys()) == protected
+    assert not flow.calls
 
 
 def test_page_signals_wake_actual_people_and_reply_context_not_all_group_members(pg, matching_flow, pilot):
@@ -1386,7 +1475,7 @@ def test_formal_pairs_skip_paid_matching_without_freezing_new_handles_or_manual_
         assert len(row["handle_rows"]) == 2
         assert {item["handle"] for item in row["handle_rows"]} == {"first.handle", "backup_2"}
         assert all(item["associated"] and item["check"] is not None for item in row["handle_rows"])
-        assert "display_status" not in row  # Explicit manual review is never silently presented as completed.
+        assert row["display_status"] == "review_required"  # Explicit manual review is never presented as completed.
 
     # Historical weak reproof is hidden on the existing handle row, not duplicated or shown as a false conflict.
     pg.execute("UPDATE creator_handle_jobs SET source='history' WHERE id=%s", (job["id"],))

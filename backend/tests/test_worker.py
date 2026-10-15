@@ -19,6 +19,12 @@ from app.worker import (
 )
 
 
+@pytest.fixture(autouse=True)
+def fresh_recent_page_turns(monkeypatch):
+    monkeypatch.setattr(worker, "_recent_page_claims", Counter())
+    monkeypatch.setattr(worker, "_recent_chat_rounds", {})
+
+
 def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg, monkeypatch):
     monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
     signals = []
@@ -39,7 +45,7 @@ def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg
     claim = worker._claim_next_page(job, authorization, config)
     other = worker._claim_next_page(job, authorization, config)
     assert claim.mode == "incremental" and claim.end_at - claim.start_at == worker.timedelta(days=7)
-    assert other.mode == "backfill" and other.expected_page_token == "page-2" and other.start_at is None
+    assert other.mode == "incremental" and other.expected_page_token is None
     assert claim.chat_id != other.chat_id
     assert worker._claim_next_page(job, authorization, config) is None
     body = '{"text":"hello"}'
@@ -69,6 +75,9 @@ def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg
     assert identities["ou_cm"]["contact_id"] != identities["ou_external"]["contact_id"]
     assert identities["ou_external"]["tenant_classification"] == "known_external"
     assert identities["ou_mentioned"]["tenant_classification"] == "unresolved"
+    fresh = worker._claim_next_page(job, authorization, config)
+    assert fresh.mode == 'incremental' and fresh.chat_id == 'oc_ingest_3'
+    assert worker._record_claimed_page(fresh, [], None, None).committed
     replay = worker._claim_next_page(job, authorization, config)
     assert replay.chat_id == claim.chat_id and replay.expected_page_token == "page-3"
     duplicate = worker._record_claimed_page(replay, messages, None, cipher, fingerprint_key=b"i" * 32)
@@ -85,6 +94,7 @@ def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg
     pg.execute("UPDATE authorization_message_observations SET observed_at=NOW()-INTERVAL '1 day'")
     pg.execute("UPDATE authorizations SET body_consent_at=NOW() WHERE id=%s", (actor,))
     authorization["body_consent_at"] = pg.execute("SELECT NOW() consent").fetchone()["consent"]
+    worker._recent_page_claims[actor] = 4
     granted = worker._claim_next_page(job, authorization, config)
     assert granted.chat_id == claim.chat_id and granted.mode == "backfill"
     restored = worker._record_claimed_page(granted, messages, "history-3", cipher, fingerprint_key=b"i" * 32)
@@ -131,12 +141,17 @@ def test_new_cm_interleaves_recent_and_history_without_losing_either_window(pg, 
     assert worker._record_claimed_page(recent, [], "recent-2", None).committed
     assert pg.execute("SELECT recent_coverage_start_at FROM authorization_chats").fetchone()[
         "recent_coverage_start_at"] is None
+    for page in range(2, 5):
+        continued = worker._claim_next_page(job, auth, settings)
+        assert (continued.mode, continued.expected_page_token, continued.start_at, continued.end_at) == (
+            "incremental", f"recent-{page}", recent.start_at, recent.end_at)
+        assert worker._record_claimed_page(continued, [], f"recent-{page + 1}", None).committed
     history = worker._claim_next_page(job, auth, settings)
     assert history.mode == "backfill" and history.start_at is None
     assert worker._record_claimed_page(history, [], "history-2", None).committed
     resumed = worker._claim_next_page(job, auth, settings)
     assert (resumed.mode, resumed.expected_page_token, resumed.start_at, resumed.end_at) == (
-        "incremental", "recent-2", recent.start_at, recent.end_at)
+        "incremental", "recent-5", recent.start_at, recent.end_at)
     assert worker._record_claimed_page(resumed, [], None, None).committed
     row = pg.execute("SELECT * FROM authorization_chats WHERE chat_id='oc_long_history'").fetchone()
     assert row["last_incremental_at"] == recent.end_at and not row["backfill_complete"]
@@ -144,13 +159,13 @@ def test_new_cm_interleaves_recent_and_history_without_losing_either_window(pg, 
     assert row["backfill_page_token"] == "history-2"
     pg.execute("UPDATE authorization_chats SET last_incremental_at=NOW()-INTERVAL '6 minutes'")
     waterline = pg.execute("SELECT last_incremental_at FROM authorization_chats").fetchone()["last_incremental_at"]
+    updated = worker._claim_next_page(job, auth, settings)
+    assert updated.mode == "incremental" and updated.start_at == waterline - worker.timedelta(seconds=600)
+    assert worker._record_claimed_page(updated, [], None, None).committed
     resumed_history = worker._claim_next_page(job, auth, settings)
     assert (resumed_history.mode, resumed_history.expected_page_token, resumed_history.end_at) == (
         "backfill", "history-2", history.end_at)
     assert worker._record_claimed_page(resumed_history, [], "history-3", None).committed
-    updated = worker._claim_next_page(job, auth, settings)
-    assert updated.mode == "incremental" and updated.start_at == waterline - worker.timedelta(seconds=600)
-    assert worker._record_claimed_page(updated, [], None, None).committed
     last_history = worker._claim_next_page(job, auth, settings)
     assert last_history.mode == "backfill" and last_history.expected_page_token == "history-3"
     assert worker._record_claimed_page(last_history, [], None, None).committed
@@ -178,6 +193,35 @@ def test_new_cm_interleaves_recent_and_history_without_losing_either_window(pg, 
     following = pg.execute("SELECT * FROM sync_jobs WHERE status='queued'").fetchone()
     assert following["mode"] == "incremental" and following["scheduled_at"] == pg.execute(
         "SELECT NOW()+INTERVAL '300 seconds' due").fetchone()["due"]
+
+    # Two long recent windows must not keep an untouched due chat waiting for their last page.
+    pg.execute("UPDATE sync_jobs SET status='running',discovery_status='succeeded' WHERE id=%s",
+               (following['id'],))
+    next_job = worker.SyncJob(following['id'], actor, 'incremental', 0, 'succeeded', 0)
+    for chat in ('oc_recent_a', 'oc_recent_b', 'oc_cold_due'):
+        pg.execute("INSERT INTO chats(chat_id) VALUES(%s)", (chat,))
+        pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,backfill_complete,
+            last_incremental_at,incremental_job_id,incremental_window_start_at,incremental_window_end_at,
+            incremental_page_token) VALUES(%s,%s,TRUE,NOW()-INTERVAL '2 hours',%s,
+            CASE WHEN %s THEN NOW()-INTERVAL '7 days' END,CASE WHEN %s THEN NOW() END,%s)""",
+            (actor, chat, next_job.id, chat != 'oc_cold_due', chat != 'oc_cold_due',
+             None if chat == 'oc_cold_due' else chat + '-2'))
+    worker._recent_page_claims[actor] = 0
+    order = []
+    for index in range(3):
+        claim = worker._claim_next_page(next_job, auth, settings)
+        order.append(claim.chat_id)
+        if index < 2:
+            assert claim.expected_page_token == claim.chat_id + '-2'
+        assert worker._record_claimed_page(claim, [], claim.chat_id + '-3' if index < 2 else None, None).committed
+    assert order == ['oc_recent_a', 'oc_recent_b', 'oc_cold_due']
+    served_current = worker._claim_next_page(next_job, auth, settings)
+    assert served_current.chat_id == 'oc_long_history' and served_current.mode == 'incremental'
+    assert worker._record_claimed_page(served_current, [], None, None).committed
+    continued = worker._claim_next_page(next_job, auth, settings)
+    assert continued.chat_id == 'oc_recent_a' and continued.expected_page_token == 'oc_recent_a-3'
+    assert worker._record_claimed_page(continued, [], None, None).committed
+    assert worker._recent_page_claims[actor] == 1  # An empty history fallback does not get probed on every page.
 
 
 def test_p2p_contact_discovery_skips_bots(pg, monkeypatch) -> None:
@@ -963,6 +1007,14 @@ def test_all_due_accounts_rotate_through_three_page_slots_and_resume_cursors(pg,
         "status"] == "active"
     assert not worker._has_claimable_page_in_connection(pg, job)
     assert not worker._yield_job_to_retry_if_idle(pg, job)
+    pg.execute("INSERT INTO chats(chat_id,chat_status) VALUES('oc_still_readable','normal')")
+    pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,backfill_complete,
+               last_backfill_at,last_incremental_at,sync_status)
+               VALUES(%s,'oc_still_readable',TRUE,NOW()-INTERVAL '1 day',NOW()-INTERVAL '1 hour','succeeded')""",
+               (job.authorization_id,))
+    healthy = worker._claim_next_page(job, authorization, settings)
+    assert healthy.chat_id == 'oc_still_readable' and healthy.mode == 'incremental'
+    assert worker._record_claimed_page(healthy, [], None, None).committed
     worker._finish_and_schedule_incremental(job)
     assert pg.execute("SELECT status FROM sync_jobs WHERE id=%s", (job.id,)).fetchone()["status"] == "succeeded"
     following = pg.execute("SELECT * FROM sync_jobs WHERE authorization_id=%s AND status='queued'",
@@ -992,6 +1044,7 @@ def test_all_due_accounts_rotate_through_three_page_slots_and_resume_cursors(pg,
                backfill_window_start_at,backfill_window_end_at)
                VALUES(%s,'oc_backfill_denied','keep-history-page',NOW()-INTERVAL '7 days',NOW())""",
                (job.authorization_id,))
+    worker._recent_page_claims[job.authorization_id] = 4
     denied = worker._claim_next_page(next_job, authorization, settings)
     assert denied.mode == "backfill" and denied.expected_page_token == "keep-history-page"
     worker._handle_claim_api_error(denied, worker.LarkApiError(400, 231203, "Other refusal; private raw body"))
@@ -1000,6 +1053,15 @@ def test_all_due_accounts_rotate_through_three_page_slots_and_resume_cursors(pg,
     assert denied_row["last_error"] == "Lark暂不允许读取此会话消息（错误码 231203）"
     assert not worker._has_pending_backfill_in_connection(pg, job.authorization_id)
     assert worker._select_backfill_chat_for_claim(pg, job.authorization_id) is None
+    worker._finish_and_schedule_incremental(next_job)
+    assert pg.execute("SELECT status FROM sync_jobs WHERE id=%s", (next_job.id,)).fetchone()["status"] == "running"
+    refreshed_chats = set()
+    for _ in range(2):
+        refreshed = worker._claim_next_page(next_job, authorization, settings)
+        assert refreshed.mode == 'incremental'
+        refreshed_chats.add(refreshed.chat_id)
+        assert worker._record_claimed_page(refreshed, [], None, None).committed
+    assert refreshed_chats == {'oc_fair_7_0', 'oc_still_readable'}
     worker._finish_and_schedule_incremental(next_job)
     assert pg.execute("SELECT status FROM sync_jobs WHERE id=%s", (next_job.id,)).fetchone()["status"] == "succeeded"
     pg.execute("UPDATE authorization_chats SET page_retry_at=NOW() WHERE chat_id='oc_backfill_denied'")

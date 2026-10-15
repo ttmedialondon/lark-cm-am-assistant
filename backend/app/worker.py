@@ -41,6 +41,8 @@ from .lark_api import LarkApiError, LarkClient, TokenBundle
 from .lark_sync_admission import LarkSyncAdmission
 
 LOGGER = logging.getLogger("lark_message_stats.worker")
+_recent_page_claims: Counter[uuid.UUID] = Counter()
+_recent_chat_rounds: dict[uuid.UUID, tuple[tuple[uuid.UUID, int, int], set[str]]] = {}
 
 
 class ReauthorizationRequired(RuntimeError):
@@ -1837,15 +1839,21 @@ def _claim_next_page(
         ).fetchone()
         if int(active_claims["count"]) >= claim_limit:
             return None
-        # Keep recent messages moving even while the same account has years of history left.
-        modes = ("incremental", "backfill") if current["mode"] == "backfill" else ("backfill", "incremental")
+        round_key = job.id, job.discovery_generation, job.attempts
+        previous_round, served = _recent_chat_rounds.get(job.authorization_id, (round_key, set()))
+        if previous_round != round_key:
+            served = set()
+            _recent_page_claims[job.authorization_id] = 0
+        # Recent work gets four turns; spare capacity and every fifth turn still advance history.
+        history_turn = _recent_page_claims[job.authorization_id] >= 4
+        modes = ("backfill", "incremental") if history_turn else ("incremental", "backfill")
         for mode in modes:
             if mode == "backfill":
                 _reset_one_requested_backfill(conn, job.authorization_id)
                 chat = _select_backfill_chat_for_claim(conn, job.authorization_id)
             else:
                 chat = _select_incremental_chat_for_claim(conn, job.authorization_id, job.id,
-                                                           settings.sync_interval_seconds)
+                                                           settings.sync_interval_seconds, served)
             if chat:
                 break
         if not chat:
@@ -1927,6 +1935,14 @@ def _claim_next_page(
             ),
         )
     assert end_at is not None
+    _recent_page_claims[job.authorization_id] = (
+        1 if history_turn else _recent_page_claims[job.authorization_id] + 1
+    ) if mode == "incremental" else 0
+    if mode == "incremental":
+        if chat["chat_id"] in served:
+            served.clear()
+        served.add(chat["chat_id"])
+        _recent_chat_rounds[job.authorization_id] = round_key, served
     return PageClaim(
         job=job,
         chat_id=chat["chat_id"],
@@ -2000,7 +2016,8 @@ def _select_backfill_chat_for_claim(conn: psycopg.Connection, authorization_id: 
 
 
 def _select_incremental_chat_for_claim(
-    conn: psycopg.Connection, authorization_id: uuid.UUID, job_id: uuid.UUID, interval_seconds: int
+    conn: psycopg.Connection, authorization_id: uuid.UUID, job_id: uuid.UUID, interval_seconds: int,
+    served_chats=(),
 ) -> dict[str, Any] | None:
     return conn.execute(
         """
@@ -2014,15 +2031,17 @@ def _select_incremental_chat_for_claim(
           AND (
             (access.incremental_job_id = %s AND access.incremental_window_end_at IS NOT NULL)
             OR access.incremental_job_id IS DISTINCT FROM %s
+            -- shortcut: discovery waits for this coordinator; decouple it if large rosters stay continuously due.
             OR access.last_incremental_at <= NOW() - (%s * INTERVAL '1 second')
           )
         ORDER BY
+            access.chat_id=ANY(%s::text[]),
             CASE WHEN access.incremental_job_id = %s AND access.incremental_window_end_at IS NOT NULL THEN 0 ELSE 1 END,
             COALESCE(access.last_incremental_at, access.last_backfill_at) NULLS FIRST, access.chat_id
         FOR UPDATE SKIP LOCKED
         LIMIT 1
         """,
-        (authorization_id, job_id, job_id, interval_seconds, job_id),
+        (authorization_id, job_id, job_id, interval_seconds, sorted(served_chats), job_id),
     ).fetchone()
 
 
@@ -2649,11 +2668,11 @@ def _finish_and_schedule_incremental(job: SyncJob) -> None:
                        OR access.page_retry_at IS NULL OR access.page_retry_at <= NOW())
                   AND (
                     (access.incremental_job_id = %s AND access.incremental_window_end_at IS NOT NULL)
-                    OR (%s='incremental' AND access.incremental_job_id IS DISTINCT FROM %s)
+                    OR access.incremental_job_id IS DISTINCT FROM %s
                   )
             ) AS pending
             """,
-            (job.authorization_id, job.id, current["mode"], job.id),
+            (job.authorization_id, job.id, job.id),
         ).fetchone()
         if incremental_pending["pending"]:
             return

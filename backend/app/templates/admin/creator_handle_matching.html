@@ -3,13 +3,16 @@
 {% block body %}
 {% set status_labels = {
   'queued': '待处理', 'preparing': '整理证据', 'ready': '待调用', 'running': '匹配中',
-  'retry_wait': '等待重试', 'waiting_evidence': '等待证据', 'review_required': '待核实',
+  'retry_wait': '等待重试', 'waiting_evidence': '等待证据', 'review_required': '账号待核',
+  'identity_review_required': '身份待核', 'account_review_required': '账号待核',
   'completed': '已完成', 'failed': '失败', 'cancelled': '已取消'
 } %}
 {% set reason_labels = {
   'ready': '证据已准备', 'cached': '复用已有结果', 'suggestions_saved': '匹配结果已保存',
   'no_text': '没有可读消息', 'no_candidates': '未找到新的账号线索', 'restricted': '不在处理范围',
   'no_account_evidence': '缺少可用关联证据',
+  'evidence_changed': '原识别材料已变化，需要重新核实',
+  'already_identified': '已有正式身份，无需重复识别',
   'rules_unavailable': '处理手册未发布，等待恢复',
   'material_limit': '证据超出处理上限', 'catalog_unavailable': 'Curva 名单暂不可用',
   'preparation_failed': '证据准备失败', 'snapshot_changed': '证据或配置已更新',
@@ -58,7 +61,7 @@
   <div class="card table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>人员</th><th>状态</th><th>识别结果</th><th>Token</th><th>操作</th></tr></thead><tbody>
     {% for job in matching.jobs %}{% set display_status = job.display_status|default(job.status) %}{% set display_reason = job.display_reason_code|default(job.reason_code) %}<tr><td>{{ job.display_name or '未命名' }}</td><td>{{ status_labels.get(display_status, display_status) }}{% if display_reason %}<div class="text-secondary small">{{ reason_labels.get(display_reason, display_reason) }}</div>{% endif %}{% if job.validation_error and job.validation_error != display_reason %}<div class="text-secondary small">{{ error_labels.get(job.validation_error, job.validation_error) }}</div>{% endif %}</td>
       <td>
-        {% if job.purpose == 'identity' %}<div class="mb-1">{{ {'supported':'达人身份已确认','known':'复用已确认身份','review':'达人身份待核实','not_supported':'本轮未支持达人身份'}.get(job.identity_state, '达人身份识别') }}</div>{% endif %}
+        {% if job.purpose == 'identity' %}<div class="mb-1">{{ {'confirmed':'达人身份已确认','removed':'达人身份当前未确认','review':'达人身份待核实','not_supported':'本轮未支持达人身份'}.get(job.identity_state, '达人身份识别') }}</div>{% endif %}
         {% for item in job.handle_rows %}<div class="{{ 'text-danger' if item.conflict else 'text-secondary' }}"><a class="text-reset" href="https://www.tiktok.com/@{{ item.handle }}" rel="noopener noreferrer" target="_blank">@{{ item.handle }}</a>{% if item.associated %} · {{ '人工已核准' if item.human_confirmed else '已关联' }}{% endif %}{% if item.conflict %} · 归属冲突{% endif %}{% if item.check %} · 本轮：{{ decision_labels.get(item.check.decision, item.check.decision) }}{% if not item.associated or item.check.decision != 'supported' or item.conflict %}<div class="small">{{ relation_labels.get(item.check.relation, item.check.relation) }} · {{ code_labels.get(item.check.code, item.check.code) }} · {{ period_labels.get(item.check.period, '时点不明') }}{% if item.check.validation_error %} · {{ error_labels.get(item.check.validation_error, item.check.validation_error) }}{% endif %}</div>{% endif %}{% endif %}</div>{% else %}—{% endfor %}
       </td>
       <td>{{ job.input_tokens + job.output_tokens }}</td><td><div class="d-flex gap-2">

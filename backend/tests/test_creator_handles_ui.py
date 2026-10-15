@@ -20,6 +20,8 @@ from app import (
     contact_handles,
     creator_broadcast,
     creator_broadcast_delivery,
+    creator_data,
+    creator_handle_matching,
     creator_handles_routes,
     creator_importance,
     creator_imports,
@@ -27,6 +29,77 @@ from app import (
 )
 from app.crypto import TokenCipher
 from app.lark_api import LarkApiError, LarkProfile, TokenBundle
+
+
+def test_identity_success_and_account_review_survive_recovery_without_reopening_jobs(pg, monkeypatch):
+    matching = creator_handle_matching
+    settings = SimpleNamespace(token_encryption_key=b"i" * 32)
+    storage = creator_data.cipher(settings)
+    access = {"is_owner": True, "permissions": {"ai"}, "landing_path": "/admin/ai"}
+    monkeypatch.setattr(admin_permissions, "require_page", lambda *_: access)
+    monkeypatch.setattr(matching.evidence, "still_valid", lambda _conn, refs, *_args, **_kwargs: refs[0]["valid"])
+    for name, status, confirmed, admitted, valid in (
+        ("Legacy success", "cancelled", True, True, True),
+        ("Current success", "review_required", True, True, True),
+        ("Revoked creator", "cancelled", False, True, True),
+        ("Unconfirmed person", "review_required", False, False, True),
+        ("Changed source", "cancelled", True, True, False),
+        ("Manual confirmation", "cancelled", True, False, True),
+        ("Existing account", "review_required", True, False, True),
+        ("Paid running", "running", True, False, True),
+        ("API failure", "failed", False, False, True),
+    ):
+        person, job = uuid4(), uuid4()
+        pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)", (person, name))
+        pg.execute("INSERT INTO lark_identities(open_id,contact_id,identity_type) VALUES(%s,%s,'user')",
+                   ("ou_" + person.hex, person))
+        if confirmed or admitted:
+            pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) VALUES(%s,'creator',%s,'manual')",
+                       (person, "confirmed" if confirmed else "rejected"))
+        result = {"handles": {"H1": "sample.creator"}, "result": {"creator": {"state": "supported"}, "links": [{
+            "h": "H1", "decision": "review", "relation": "uncertain", "period": "unknown",
+            "code": "no_link_evidence", "needed": ["account_context"], "refs": []}]}}
+        reason = "identity_removed" if status == "cancelled" else "provider_failed" if status == "failed" else ""
+        pg.execute("""INSERT INTO creator_handle_jobs(id,contact_id,purpose,status,reason_code,stats,refs,
+            result_ciphertext,claim_token,lease_until) VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,
+            NOW()+INTERVAL '1 hour')""", (
+            job, person, "handles" if name == "Existing account" else "identity", status, reason,
+            json.dumps({"identity_confirmed": admitted, "identity_state": "supported"}),
+            json.dumps([{"valid": valid}]), storage.encrypt(json.dumps(result)) if admitted else None, uuid4()))
+    snapshots = {table: pg.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+                 for table in ("creator_handle_jobs", "contact_roles", "creator_handle_requests")}
+    matching._recover(pg)
+    assert {table: pg.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall() for table in snapshots} == snapshots
+    data = matching.page_data(pg, uuid4(), settings)
+    jobs = {job["display_name"]: job for job in data["jobs"]}
+    assert {row["status"]: row["n"] for row in data["counts"]} == {
+        "account_review_required": 4, "identity_review_required": 1, "cancelled": 1, "running": 1,
+        "failed": 1, "completed": 1}
+    for name in ("Legacy success", "Current success", "Changed source"):
+        assert jobs[name]["identity_state"] == "confirmed"
+        assert jobs[name]["display_status"] == "account_review_required"
+        assert jobs[name]["display_reason_code"] != "identity_removed"
+    assert jobs["Changed source"]["display_reason_code"] == "evidence_changed"
+    assert not jobs["Changed source"]["suggestions"]
+    assert jobs["Revoked creator"]["display_status"] == "cancelled"
+    assert jobs["Revoked creator"]["identity_state"] == "removed"
+    assert jobs["Unconfirmed person"]["display_status"] == "identity_review_required"
+    assert jobs["Unconfirmed person"]["identity_state"] == "review"
+    assert jobs["Manual confirmation"]["display_status"] == "completed"
+    assert jobs["Manual confirmation"]["display_reason_code"] == "already_identified"
+    assert jobs["Existing account"]["display_status"] == "review_required"
+    assert jobs["Paid running"]["status"] == "running" and jobs["API failure"]["reason_code"] == "provider_failed"
+    environment = Environment(loader=FileSystemLoader(Path(__file__).parents[1] / "app/templates"),
+                              autoescape=select_autoescape())
+    html = environment.get_template("admin/creator_handle_matching.html").render(
+        matching=data, authorization={"display_name": "Owner"}, admin_role="owner", csrf_token="test",
+        admin_permissions={"ai"}, permission_pages=admin_permissions.PAGES)
+    legacy = next(row for row in html.split("</tr>") if "Legacy success" in row)
+    assert "账号待核" in legacy and "达人身份已确认" in legacy and "达人身份已取消" not in legacy
+    revoked = next(row for row in html.split("</tr>") if "Revoked creator" in row)
+    assert "达人身份当前未确认" in revoked and "达人身份已确认" not in revoked
+    assert html.count("账号待核：") == 1
+    assert {table: pg.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall() for table in snapshots} == snapshots
 
 
 def browser(monkeypatch, *, owner=False, active=True):
