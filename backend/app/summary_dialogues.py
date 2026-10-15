@@ -152,7 +152,7 @@ def _blocked_people(chats, tasks, *, material_chats=()):
     return {str(person) for chat in chats if chat["chat_id"] in pending for person in chat["contact_ids"]}
 
 
-def schedule_merges(conn, settings):
+def schedule_merges(conn, settings, *, run_ids=None):
     inserted = 0
     # The material lock keeps each CM's source scope stable for this scheduling pass.
     related_scopes = {}
@@ -165,9 +165,10 @@ def schedule_merges(conn, settings):
         AND ((r.origin='scheduled' AND (s.run_id=r.id OR (s.recurring_enabled AND r.period IS NOT NULL))
           AND (r.period IS NULL OR r.report_date >= (NOW() AT TIME ZONE 'Europe/London')::date-6))
           OR (r.origin='assistant' AND aturn.status IN ('queued','running','waiting')))
+        AND (%s::uuid[] IS NULL OR r.id=ANY(%s::uuid[]))
         AND r.coverage->>'policy'=%s AND EXISTS(SELECT 1 FROM offhours_summary_tasks t
             WHERE t.run_id=r.id AND t.is_current AND t.chat_id IS NOT NULL)""",
-        (core.POLICY_VERSION,),
+        (run_ids, run_ids, core.POLICY_VERSION),
     ).fetchall()
     for run in runs:
         try:
@@ -190,22 +191,43 @@ def schedule_merges(conn, settings):
                 related_scopes[cm_id] = roster, chats
             blocked = _blocked_people(chats, tasks, material_chats=material_chats)
         people = {}
+        saved_sources = {}
         for task in tasks:
             if task["status"] != "succeeded":
                 continue
             result = decode(task["result_ciphertext"], settings)
+            saved_sources[task['id']] = result
             for user in result["users"].values():
                 people.setdefault(user["contact_id"], []).append(task)
         existing_merges = {str(row['contact_id']): row for row in conn.execute(
-            "SELECT id,contact_id,input_fingerprint,status,event_rules_ciphertext,event_rules_digest "
+            "SELECT id,contact_id,input_fingerprint,status,error_message,checkpoint_ciphertext,created_at,"
+            "event_rules_ciphertext,event_rules_digest "
             "FROM offhours_summary_tasks "
             "WHERE run_id=%s AND is_current AND contact_id IS NOT NULL", (run['id'],),
         ).fetchall()}
-        fingerprints = {person: core._hash(_source_hashes(run, sources))
+        fingerprints = {person: _merge_fingerprint(run, sources, person, settings, saved_sources)
                         for person, sources in people.items()}
+        legacy = {person: core._hash(_source_hashes(run, sources)) for person, sources in people.items()}
+        held = {person for person, task in existing_merges.items() if task['status'] == 'running'
+                or (task.get('error_message') or '').startswith('请求结果未知')}
+        progress_by_person = {}
+        for person, task in existing_merges.items():
+            if task['checkpoint_ciphertext']:
+                try:
+                    progress = decode(task['checkpoint_ciphertext'], settings) or {}
+                except (InvalidTag, ValueError, TypeError):
+                    held.add(person)
+                    continue
+                progress_by_person[person] = progress
+                if (progress.get('provider_call') and not progress.get('response_received')
+                        or task['status'] == 'queued'
+                           and (progress.get('response_received') or progress.get('receipts'))):
+                    held.add(person)
         candidates = {person: sources for person, sources in people.items() if person not in blocked and (
             person not in existing_merges or existing_merges[person]['status'] == 'cancelled'
-            or existing_merges[person]['input_fingerprint'] != fingerprints[person])}
+            or existing_merges[person]['input_fingerprint'] not in {fingerprints[person], legacy[person]}
+            or existing_merges[person]['status'] == 'queued'
+               and existing_merges[person]['input_fingerprint'] != fingerprints[person]) and person not in held}
         cancelled_sources = [task for task in tasks if task['status'] == 'cancelled']
         if candidates or cancelled_sources:
             if roster is None:
@@ -243,13 +265,24 @@ def schedule_merges(conn, settings):
             "SELECT id FROM offhours_summary_tasks WHERE run_id=%s AND is_current "
             "AND contact_id=ANY(%s::uuid[])", (run["id"], sorted(blocked)),
         ).fetchall()] if blocked else []
+        selected.extend(existing_merges[person]['id'] for person in held)
+        history = {}
         for person, sources in people.items():
             if str(person) in blocked:
                 continue
             fingerprint = fingerprints[person]
             existing = existing_merges.get(person)
-            if existing and existing["input_fingerprint"] == fingerprint and existing["status"] != "cancelled":
+            if existing and (person in held or existing['status'] != 'cancelled'
+                    and existing['input_fingerprint'] in {fingerprint, legacy[person]}
+                    and not (existing['status'] == 'queued' and existing['input_fingerprint'] != fingerprint)):
                 selected.append(existing["id"])
+                continue
+            if existing and existing['status'] == 'cancelled' and progress_by_person.get(person, {}).get(
+                    'response_received') and _same_legacy_material(conn, run, existing, sources, person,
+                                                                   settings, saved_sources, history):
+                conn.execute("""UPDATE offhours_summary_tasks SET status='queued',error_message=NULL,
+                    lease_until=NULL,scheduled_at=NOW(),finished_at=NULL WHERE id=%s""", (existing['id'],))
+                selected.append(existing['id'])
                 continue
             conn.execute(
                 """UPDATE offhours_summary_tasks SET is_current=FALSE,
@@ -266,11 +299,15 @@ def schedule_merges(conn, settings):
                 ORDER BY (t.status='succeeded') DESC,t.created_at DESC LIMIT 1""",
                 (run["requested_by_authorization_id"], run["responsible_authorization_id"], person, fingerprint)
             ).fetchone() if core.run_feature(run) == core.ASSISTANT_FEATURE else None
+            if cached is None:
+                cached = _saved_merge(conn, run, person, sources, settings, saved_sources, history,
+                                      merge_rules_digest=core._task_run(run, existing).get('event_rules_digest'))
             task = conn.execute(
                 """INSERT INTO offhours_summary_tasks(id,run_id,contact_id,input_fingerprint,cutoff,
                 status,error_message,checkpoint_ciphertext,result_ciphertext,model,response_id,
+                processed_messages,total_messages,finished_at,
                 event_rules_ciphertext,event_rules_digest)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT(run_id,contact_id,input_fingerprint) WHERE contact_id IS NOT NULL
                 DO UPDATE SET is_current=TRUE,
                 status=CASE WHEN offhours_summary_tasks.status='cancelled' THEN 'queued'
@@ -280,6 +317,8 @@ def schedule_merges(conn, settings):
                  cached["status"] if cached else "queued", cached["error_message"] if cached else None,
                  cached["checkpoint_ciphertext"] if cached else None, cached["result_ciphertext"] if cached else None,
                  cached["model"] if cached else None, cached["response_id"] if cached else None,
+                 cached['processed_messages'] if cached else 0, cached['total_messages'] if cached else 0,
+                 datetime.now(UTC) if cached and cached['status'] == 'succeeded' else None,
                  existing.get("event_rules_ciphertext") if existing else None,
                  existing.get("event_rules_digest") if existing else None),
             ).fetchone()
@@ -298,6 +337,75 @@ def _source_hashes(run, sources):
     values = [(t["chat_id"] if core.run_feature(run) == core.ASSISTANT_FEATURE else str(t["id"]),
                t["input_fingerprint"]) for t in sources]
     return sorted(values) if core.run_feature(run) == core.ASSISTANT_FEATURE else values
+
+
+def _person_material(sources, person, settings, saved):
+    profiles, events = {}, []
+    for source in sources:
+        if source['id'] not in saved:
+            saved[source['id']] = decode(source['result_ciphertext'], settings)
+        result = saved[source['id']]
+        users = {key: value for key, value in result['users'].items() if value['contact_id'] == str(person)}
+        for profile in users.values():
+            profiles[core._hash(profile)] = profile
+        for event in result['events']:
+            if event['user'] not in users:
+                continue
+            value = deepcopy(event)
+            value['user'] = 'creator'
+            # These batch-local labels already have exact, resolved message evidence below.
+            for key in ('evidence_refs', 'handling_evidence_refs', 'reply_evidence_refs', 'waiting_since_ref'):
+                value.pop(key, None)
+            for key in ('evidence', 'handling_evidence', 'reply_evidence', 'waiting_evidence'):
+                for message in value.get(key, []):
+                    if message.get('speaker') in users:
+                        message['speaker'] = 'creator'
+            events.append(value)
+    return [profiles[key] for key in sorted(profiles)], sorted(events, key=core._hash)
+
+
+def _merge_fingerprint(run, sources, person, settings, saved):
+    return core._hash(['creator-material-v1', str(run['responsible_authorization_id']),
+                       run['window_start'], run['window_end'], run.get('selected_contact_ids'),
+                       sorted({str(source.get('event_rules_digest') or run.get('event_rules_digest'))
+                               for source in sources}),
+                       _person_material(sources, person, settings, saved)])
+
+
+def _saved_merge(conn, run, person, sources, settings, saved, history, *, merge_rules_digest):
+    """Reuse a paid legacy merge only after proving its exact old source set and unchanged personal facts."""
+    if 'merges' not in history:
+        history['merges'] = {str(row['contact_id']): row for row in conn.execute("""SELECT DISTINCT ON(contact_id) *
+            FROM offhours_summary_tasks WHERE run_id=%s AND contact_id IS NOT NULL AND status='succeeded'
+            ORDER BY contact_id,created_at DESC,id DESC""", (run['id'],)).fetchall()}
+    cached = history['merges'].get(str(person))
+    if not cached or core._task_run(run, cached).get('event_rules_digest') != merge_rules_digest:
+        return None
+    return cached if _same_legacy_material(conn, run, cached, sources, person, settings, saved, history) else None
+
+
+def _legacy_sources(conn, run, task, person, settings, saved, history):
+    if 'sources' not in history:
+        history['sources'] = conn.execute("""SELECT id,chat_id,input_fingerprint,result_ciphertext,
+            event_rules_digest,created_at FROM offhours_summary_tasks
+            WHERE run_id=%s AND chat_id IS NOT NULL AND status='succeeded'
+            ORDER BY created_at DESC,id DESC""", (run['id'],)).fetchall()
+    old = {}
+    for source in history['sources']:
+        if source['created_at'] <= task['created_at']:
+            old.setdefault(source['chat_id'], source)
+    old = sorted(old.values(), key=lambda row: row['id'])
+    old = [source for source in old if _person_material([source], person, settings, saved)[0]]
+    if task['input_fingerprint'] not in {
+            core._hash(_source_hashes(run, old)), _merge_fingerprint(run, old, person, settings, saved)}:
+        return None
+    return old
+
+
+def _same_legacy_material(conn, run, task, sources, person, settings, saved, history):
+    old = _legacy_sources(conn, run, task, person, settings, saved, history)
+    return old is not None and (_merge_fingerprint(run, old, person, settings, saved)
+                               == _merge_fingerprint(run, sources, person, settings, saved))
 
 
 def merge_input(conn, run, task, settings, roster=None, chats=None, *, read_cache=None):
@@ -323,7 +431,8 @@ def merge_input(conn, run, task, settings, roster=None, chats=None, *, read_cach
         chats, sources, material_chats=(run.get('coverage') or {}).get('material_chats', [])
     ):
         raise core.SummaryInputError("会话尚未完成。")
-    events, source_hashes, person = [], [], None
+    events, source_hashes, person, selected_sources = [], [], None, []
+    saved_sources = cache.setdefault(('personal_sources', run['id']), {})
     for source in sources:
         if source["status"] != "succeeded":
             continue
@@ -334,6 +443,8 @@ def merge_input(conn, run, task, settings, roster=None, chats=None, *, read_cach
         users = {k: u for k, u in saved["users"].items() if UUID(u["contact_id"]) == task["contact_id"]}
         if not users:
             continue
+        selected_sources.append(source)
+        saved_sources[source['id']] = saved
         key = ("fingerprint", source["id"])
         if key not in cache:
             try:
@@ -354,8 +465,24 @@ def merge_input(conn, run, task, settings, roster=None, chats=None, *, read_cach
                 events.append(event)
     if core.run_feature(run) == core.ASSISTANT_FEATURE:
         source_hashes.sort()
-    if core._hash(source_hashes) != task["input_fingerprint"] or person is None:
+    if person is None:
         raise core.SummaryInputError("合并资料已变化。")
+    if core._hash(source_hashes) == task['input_fingerprint']:
+        return events, person  # Keep already-paid legacy checkpoint order unchanged.
+    if (_merge_fingerprint(run, selected_sources, task['contact_id'], settings, saved_sources)
+            != task['input_fingerprint']):
+        history = cache.setdefault(('merge_history', run['id']), {})
+        if not _same_legacy_material(conn, run, task, selected_sources, task['contact_id'], settings,
+                                     saved_sources, history):
+            raise core.SummaryInputError("合并资料已变化。")
+        # Replay the exact old ordering/aliases of a known paid checkpoint, not its newly sorted equivalent.
+        old = _legacy_sources(conn, run, task, task['contact_id'], settings, saved_sources, history)
+        events = [event for source in old for event in saved_sources[source['id']]['events'] if any(
+            event['user'] == alias and user['contact_id'] == str(task['contact_id'])
+            for alias, user in saved_sources[source['id']]['users'].items())]
+        return events, person
+    # A regenerated shared source must not reorder an in-progress personal checkpoint.
+    _, events = _person_material(selected_sources, task['contact_id'], settings, saved_sources)
     return events, person
 
 

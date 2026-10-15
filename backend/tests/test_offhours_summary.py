@@ -2010,6 +2010,107 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
     assert pg.execute("SELECT id,input_fingerprint,status FROM offhours_summary_tasks WHERE is_current "
                       "ORDER BY id").fetchall() == completed
     assert ai.claim_next_summary() is None
+    # A silent creator changes the shared conversation, not everyone else's already-paid merge input.
+    with pg.transaction(force_rollback=True):
+        old_sources = pg.execute('SELECT * FROM offhours_summary_tasks WHERE run_id=%s '
+                                 'AND chat_id IS NOT NULL AND is_current ORDER BY id', (saved_run['id'],)).fetchall()
+        old_merges = pg.execute('SELECT * FROM offhours_summary_tasks WHERE run_id=%s '
+                                'AND contact_id IS NOT NULL AND is_current', (saved_run['id'],)).fetchall()
+        pg.execute("UPDATE offhours_summary_tasks SET created_at=NOW()-INTERVAL '2 minutes' WHERE run_id=%s "
+                   'AND chat_id IS NOT NULL', (saved_run['id'],))
+        for old in old_merges:
+            relevant = [row for row in old_sources if any(u['contact_id'] == str(old['contact_id']) for u in
+                summary_dialogues.decode(row['result_ciphertext'], s.settings)['users'].values())]
+            legacy = ai._hash(summary_dialogues._source_hashes(saved_run, relevant))
+            pg.execute("UPDATE offhours_summary_tasks SET input_fingerprint=%s,created_at=NOW()-INTERVAL '1 minute' "
+                       'WHERE id=%s', (legacy, old['id']))
+        assert summary_dialogues.schedule_merges(pg, s.settings, run_ids=[saved_run['id']]) == 0
+        paid = next(row for row in old_merges if row['contact_id'] == s.ids['person'])
+        assert summary_dialogues.decode(paid['checkpoint_ciphertext'], s.settings)['receipts']
+        pg.execute("UPDATE offhours_summary_tasks SET status='queued' WHERE id=%s", (paid['id'],))
+        pending_paid = pg.execute('SELECT * FROM offhours_summary_tasks WHERE id=%s', (paid['id'],)).fetchone()
+        assert summary_dialogues.schedule_merges(pg, s.settings, run_ids=[saved_run['id']]) == 0
+        assert pg.execute('SELECT * FROM offhours_summary_tasks WHERE id=%s', (paid['id'],)).fetchone() == pending_paid
+        pg.execute("UPDATE offhours_summary_tasks SET status='succeeded' WHERE id=%s", (paid['id'],))
+        paid_legacy = pg.execute('SELECT * FROM offhours_summary_tasks WHERE id=%s', (paid['id'],)).fetchone()
+        paid_events, _ = summary_dialogues.merge_input(pg, saved_run, paid_legacy, s.settings)
+        silent = uuid4()
+        pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,'A newly admitted silent creator')", (silent,))
+        pg.execute("INSERT INTO lark_identities(open_id,contact_id,display_name,tenant_classification) "
+                   "VALUES('ou_silent',%s,'Silent creator','known_external')", (silent,))
+        pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) "
+                   "VALUES(%s,'creator','confirmed','manual')", (silent,))
+        pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
+                   "VALUES(%s,%s,%s,'manual')", (uuid4(), silent, s.ids['cm']))
+        pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('second','ou_silent')")
+        old_shared = next(row for row in old_sources if row['chat_id'] == 'second')
+        data = ai._load_chat(pg, saved_run, 'second', old_shared['cutoff'], settings=s.settings)
+        old_result = summary_dialogues.decode(old_shared['result_ciphertext'], s.settings)
+        aliases = {key: next(k for k, u in data['users'].items() if u['contact_id'] == value['contact_id'])
+                   for key, value in old_result['users'].items()}
+        shifted = json.loads(json.dumps(old_result['events']))
+        for event in shifted:
+            event['user'] = aliases[event['user']]
+            for key in ('evidence', 'handling_evidence', 'reply_evidence', 'waiting_evidence'):
+                for message in event.get(key, []):
+                    message['speaker'] = aliases.get(message.get('speaker'), message.get('speaker'))
+        pg.execute('UPDATE offhours_summary_tasks SET is_current=FALSE WHERE id=%s', (old_shared['id'],))
+        replacement = uuid4()
+        pg.execute('''INSERT INTO offhours_summary_tasks(id,run_id,chat_id,input_fingerprint,cutoff,status,
+            result_ciphertext,checkpoint_ciphertext) VALUES(%s,%s,'second',%s,%s,'succeeded',%s,%s)''',
+            (replacement, saved_run['id'], data['fingerprint'], old_shared['cutoff'],
+             summary_dialogues.encode({'users': data['users'], 'events': shifted}, s.settings),
+             old_shared['checkpoint_ciphertext']))
+        with pg.transaction(force_rollback=True):
+            received = summary_dialogues.decode(paid['checkpoint_ciphertext'], s.settings)
+            received.update(provider_call={'id': 'known-paid'}, response_received={'signature': 'already-received'})
+            encoded = summary_dialogues.encode(received, s.settings)
+            pg.execute("UPDATE offhours_summary_tasks SET status='cancelled',checkpoint_ciphertext=%s WHERE id=%s",
+                       (encoded, paid['id']))
+            # Source UUIDs/aliases changed, but the original paid order remains valid and reusable.
+            assert summary_dialogues.merge_input(pg, saved_run, paid_legacy, s.settings)[0] == paid_events
+            summary_dialogues.schedule_merges(pg, s.settings, run_ids=[saved_run['id']])
+            resumed = pg.execute('SELECT status,checkpoint_ciphertext FROM offhours_summary_tasks WHERE id=%s',
+                                  (paid['id'],)).fetchone()
+            assert resumed == {'status': 'queued', 'checkpoint_ciphertext': encoded}
+        before = len(calls)
+        assert summary_dialogues.schedule_merges(pg, s.settings, run_ids=[saved_run['id']]) == 3
+        restored = pg.execute('SELECT * FROM offhours_summary_tasks WHERE run_id=%s '
+                              'AND contact_id IS NOT NULL AND is_current', (saved_run['id'],)).fetchall()
+        for old in old_merges:
+            current = next(row for row in restored if row['contact_id'] == old['contact_id'])
+            assert current['id'] != old['id'] and current['status'] == 'succeeded'
+            assert current['result_ciphertext'] == old['result_ciphertext'] and current['usage'] == {}
+        finish_merges(pg, s)
+        assert len(calls) == before
+        assert len(ai.get_summary_view(pg, s.ids['cm'])['events']) == 1
+        # A real event change still invalidates only that creator, while a paid queued legacy phase is held.
+        selected = next(row for row in restored if row['contact_id'] == s.ids['person'])
+        pg.execute("UPDATE offhours_summary_tasks SET status='queued',checkpoint_ciphertext=%s WHERE id=%s",
+            (summary_dialogues.encode({'provider_call': {'id': 'paid-unknown'}}, s.settings), selected['id']))
+        frozen = pg.execute('SELECT * FROM offhours_summary_tasks WHERE id=%s', (selected['id'],)).fetchone()
+        pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE chat_id='second' AND message_id='person'",
+                   (s.cipher.encrypt(json.dumps({'text': 'Sample order ABC-123 arrived and confirmed'})),))
+        changed_data = ai._load_chat(pg, saved_run, 'second', old_shared['cutoff'], settings=s.settings)
+        for event in shifted:
+            event['summary'] += '订单已确认。'
+            for key in ('evidence', 'handling_evidence', 'reply_evidence', 'waiting_evidence'):
+                for message in event.get(key, []):
+                    if message['message_id'] == 'person':
+                        message['text'] = 'Sample order ABC-123 arrived and confirmed'
+        pg.execute('UPDATE offhours_summary_tasks SET input_fingerprint=%s,result_ciphertext=%s WHERE id=%s',
+                   (changed_data['fingerprint'], summary_dialogues.encode({'users': data['users'],
+                    'events': shifted}, s.settings), replacement))
+        summary_dialogues.schedule_merges(pg, s.settings, run_ids=[saved_run['id']])
+        assert pg.execute('SELECT * FROM offhours_summary_tasks WHERE id=%s', (selected['id'],)).fetchone() == frozen
+        pg.execute("UPDATE offhours_summary_tasks SET status='succeeded',checkpoint_ciphertext=%s WHERE id=%s",
+                   (selected['checkpoint_ciphertext'], selected['id']))
+        assert summary_dialogues.schedule_merges(pg, s.settings, run_ids=[saved_run['id']]) == 1
+        changed = pg.execute('SELECT * FROM offhours_summary_tasks WHERE run_id=%s AND contact_id=%s AND is_current',
+                             (saved_run['id'], s.ids['person'])).fetchone()
+        assert changed['id'] != selected['id'] and changed['status'] == 'queued'
+        pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='second'")
+        assert not ai.get_summary_view(pg, s.ids['cm'])['events'] and len(calls) == before
     # Replace one source/its affected merges only; mixed versions must remain readable together.
     with pg.transaction(force_rollback=True):
         expected_rules = assistant_rules.event_snapshot(pg, s.settings)
