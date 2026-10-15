@@ -12,7 +12,7 @@ from . import admin_permissions, ai_dispatch, ai_feature_config, assistant_rules
 from . import creator_responsibility_evidence as evidence
 from . import openai_client as api
 from .creator_access import require_owner
-from .db import connection
+from .db import connection, lock_sync_material
 
 FEATURE = "creator_responsibility_matching"
 LEASE_SECONDS = 180
@@ -67,6 +67,7 @@ REASONS = {
     "owner_cancelled": "已取消",
     "lease_expired": "任务租约已过期",
     "request_unknown": "请求结果未知，需核实后重新检查",
+    "application_pending": "结果已返回，等待本地保存",
     "cached": "复用相同材料的结果",
     "suggestions_saved": "结果已保存",
     "failure_cached": "相同材料上次调用失败",
@@ -258,11 +259,19 @@ def enqueue(conn, actor):
 
 
 def _recover(conn):
-    conn.execute("""UPDATE creator_responsibility_jobs SET status=CASE
-        WHEN status='preparing' AND source<>'sample' THEN 'queued' ELSE 'failed' END,
-        reason_code=CASE WHEN status='running' THEN 'request_unknown' ELSE 'lease_expired' END,
+    conn.execute("""WITH expired AS (
+        SELECT j.id,r.error_code='' AND r.finished_at IS NOT NULL AND r.response_ciphertext IS NOT NULL
+          AND r.created_at>=j.prepared_at AS saved
+        FROM creator_responsibility_jobs j LEFT JOIN LATERAL (
+          SELECT * FROM creator_responsibility_requests WHERE job_id=j.id
+          ORDER BY created_at DESC,id DESC LIMIT 1) r ON TRUE
+        WHERE j.status IN ('running','preparing') AND j.lease_until<NOW() FOR UPDATE OF j)
+        UPDATE creator_responsibility_jobs j SET status=CASE
+        WHEN (j.status='preparing' OR expired.saved) AND j.source<>'sample' THEN 'queued' ELSE 'failed' END,
+        reason_code=CASE WHEN j.status='running' AND expired.saved THEN 'application_pending'
+          WHEN j.status='running' THEN 'request_unknown' ELSE 'lease_expired' END,
         claim_token=NULL,lease_until=NULL,not_before=NOW(),updated_at=NOW()
-        WHERE status IN ('running','preparing') AND lease_until<NOW()""")
+        FROM expired WHERE j.id=expired.id""")
     conn.execute("""UPDATE creator_responsibility_requests r SET error_code='request_unknown',finished_at=NOW()
         FROM creator_responsibility_jobs j WHERE r.job_id=j.id AND j.reason_code='request_unknown'
         AND r.finished_at IS NULL""")
@@ -299,14 +308,15 @@ def _pause_rules(conn, job):
         (job["id"],))
 
 
-def _store_prepared(conn, job, material, config, settings):
+def _store_prepared(conn, job, material, config, settings, *, saved_only=False):
     # Rotation fences an in-flight request, but does not invalidate a semantic result cache.
     pack = material["pack"]
     try:
         _manual_access(conn, pack)
     except PermissionError:
-        _pause_rules(conn, job)
-        return
+        if not saved_only:
+            _pause_rules(conn, job)
+        return False
     fingerprint = _hash(
         [material["fingerprint"], config["provider"], config["project_id"], config["model"], evidence.PROMPT_VERSION]
     )
@@ -323,10 +333,25 @@ def _store_prepared(conn, job, material, config, settings):
         else None
     )
     if pack and not evidence.still_valid(conn, material["refs"], settings):
-        _invalidate(conn, job)
-        return
+        if not saved_only:
+            _invalidate(conn, job)
+        return False
     storage = creator_data.cipher(settings)
     envelope = {"pack": pack, "candidate_ids": material["candidate_ids"]}
+    if pack and not cache:
+        receipt = conn.execute("""SELECT r.response_ciphertext FROM creator_responsibility_requests r
+            JOIN creator_responsibility_jobs j ON j.id=r.job_id
+            WHERE j.contact_id=%s AND j.fingerprint=%s AND r.material_fingerprint=%s
+              AND r.created_at>=j.prepared_at AND r.finished_at IS NOT NULL AND r.error_code=''
+              AND r.response_ciphertext IS NOT NULL ORDER BY r.created_at DESC,r.id DESC LIMIT 1""",
+            (job["contact_id"], fingerprint, _hash(_payment_material(envelope)))).fetchone()
+        if receipt:
+            diagnostic = json.loads(storage.decrypt(receipt["response_ciphertext"]))
+            if diagnostic.get("validated"):
+                cache = {"result_ciphertext": storage.encrypt(creator_data.encode({
+                    "candidate_ids": material["candidate_ids"], "result": diagnostic["validated"]}))}
+    if saved_only and not cache:
+        return False
     unknown = False
     if pack and job["source"] != "manual" and not cache:
         unknown = conn.execute("""SELECT r.error_code FROM creator_responsibility_requests r
@@ -347,8 +372,9 @@ def _store_prepared(conn, job, material, config, settings):
         cached["candidate_ids"] = material["candidate_ids"]
         applied = _apply_assignments(conn, job, material, cached["result"], config, settings)
         if applied is None:
-            _invalidate(conn, job)
-            return
+            if not saved_only:
+                _invalidate(conn, job)
+            return False
         cached["result"], material["refs"], stats["auto_linked"] = applied
         cache["result_ciphertext"] = storage.encrypt(creator_data.encode(cached))
     conn.execute(
@@ -373,6 +399,37 @@ def _store_prepared(conn, job, material, config, settings):
             job["id"],
         ),
     )
+    return True
+
+
+def _build_material(conn, settings, contact_id):
+    pinned = assistant_rules.responsibility_snapshot(conn, settings)
+    assistant_rules.responsibility_validate_access(conn, pinned)
+    material = evidence.build(conn, settings, contact_id)
+    if material["pack"]:
+        material["pack"]["_rules"] = pinned
+        material["fingerprint"] = _hash([material["fingerprint"], pinned["digest"]])
+    material["stats"] = {**material["stats"], "rules_digest": pinned["digest"],
+                         "rules_protocol": pinned["protocol"]}
+    return material
+
+
+def recover_saved_result(conn, settings, job_id):
+    """Targeted local recovery only; changed material never schedules another paid request."""
+    lock_sync_material(conn)
+    config = _config(conn, lock=True)
+    job = conn.execute("SELECT * FROM creator_responsibility_jobs WHERE id=%s FOR UPDATE", (job_id,)).fetchone()
+    if (not _enabled(config) or not job or job["source"] == "sample" or job["status"] != "failed"
+            or job["reason_code"] not in {"request_unknown", "application_pending"}):
+        return False
+    if conn.execute("""SELECT 1 FROM creator_responsibility_jobs WHERE contact_id=%s AND id<>%s
+        AND status NOT IN ('completed','failed','cancelled')""", (job["contact_id"], job_id)).fetchone():
+        return False
+    material = _build_material(conn, settings, job["contact_id"])
+    if not _store_prepared(conn, job, material, config, settings, saved_only=True):
+        return False
+    conn.execute("UPDATE creator_responsibility_jobs SET snapshot_version=desired_version WHERE id=%s", (job_id,))
+    return True
 
 
 def prepare_next(settings):
@@ -396,14 +453,7 @@ def prepare_next(settings):
     try:
         with connection() as conn, conn.transaction():
             conn.execute("SET LOCAL statement_timeout='90s'")
-            pinned = assistant_rules.responsibility_snapshot(conn, settings)
-            assistant_rules.responsibility_validate_access(conn, pinned)
-            material = evidence.build(conn, settings, job["contact_id"])
-            if material["pack"]:
-                material["pack"]["_rules"] = pinned
-                material["fingerprint"] = _hash([material["fingerprint"], pinned["digest"]])
-            material["stats"] = {**material["stats"], "rules_digest": pinned["digest"],
-                                 "rules_protocol": pinned["protocol"]}
+            material = _build_material(conn, settings, job["contact_id"])
     except PermissionError:
         with connection() as conn, conn.transaction():
             current = conn.execute("SELECT * FROM creator_responsibility_jobs WHERE id=%s FOR UPDATE",
@@ -421,6 +471,7 @@ def prepare_next(settings):
             )
         raise
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn)
         current_config = _config(conn, lock=True)
         current = conn.execute(
             "SELECT * FROM creator_responsibility_jobs WHERE id=%s FOR UPDATE", (job["id"],)
@@ -660,6 +711,7 @@ def _apply_assignments(conn, job, material, result, config, settings):
 
 def run(job, settings):
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn)
         current = _current(conn, job)
         if not current:
             _no_request(conn, job)
@@ -707,6 +759,7 @@ def run(job, settings):
         elif error.retryable:
             ai_dispatch.throttle(delay)
     with connection() as conn, conn.transaction():
+        lock_sync_material(conn)
         current = _current(conn, job)
         if not current:
             return

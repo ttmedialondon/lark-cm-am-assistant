@@ -711,6 +711,22 @@ def test_paid_retry_cache_and_stale_results_keep_billing_without_repeat(pg, rank
     stats = pg.execute("SELECT stats FROM creator_importance_jobs WHERE id=%s", (incomplete["id"],)).fetchone()["stats"]
     assert "PRIVATE PROVIDER DETAIL" not in str(stats) and importance.claim() is None
 
+    pg.execute("UPDATE creator_importance_jobs SET status='ready',attempts=0 WHERE id=%s", (incomplete["id"],))
+    rejected = importance.claim()
+    flow.error = openai_client.OpenAIRequestError("HTTP 400", telemetry={
+        "http_status": 400, "provider_error": {"code": "invalid_prompt"}},
+        provider_diagnostic={"code": "invalid_prompt", "message": "PRIVATE REJECTION DETAIL"})
+    importance.run(rejected, flow.settings)
+    assert pg.execute("SELECT status,reason_code FROM creator_importance_jobs WHERE id=%s",
+                      (rejected["id"],)).fetchone() == {"status": "failed", "reason_code": "provider_rejected"}
+    assert importance.view_for(pg, rejected["contact_id"], rejected["responsible_authorization_id"],
+                               flow.settings, details=False)["gap_label"] == "评估请求未通过，需人工处理"
+    calls = len(flow.calls)
+    importance.configuration_changed(pg)
+    assert importance.claim() is None and len(flow.calls) == calls
+    assert pg.execute("SELECT reason_code FROM creator_importance_jobs WHERE id=%s",
+                      (rejected["id"],)).fetchone()["reason_code"] == "provider_rejected"
+
 
 def test_document_versions_preserve_incremental_ranking_and_reuse_paused_paid_work(pg, ranking_flow):
     flow = ranking_flow

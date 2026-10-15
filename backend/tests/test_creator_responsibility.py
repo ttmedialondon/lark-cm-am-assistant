@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 from jinja2 import Environment, FileSystemLoader, select_autoescape
-from psycopg.errors import DivisionByZero, RaiseException
+from psycopg.errors import DeadlockDetected, DivisionByZero, RaiseException
 
 from app import ai_dispatch, ai_feature_config, assistant_rules, config, creator_data, openai_client
 from app import creator_handle_evidence as handle_evidence
@@ -762,6 +762,7 @@ def test_stale_queue_version_prompt_and_revocation_fence_publication(pg, pilot, 
     usage = pg.execute("SELECT input_tokens,output_tokens FROM creator_responsibility_requests").fetchone()
     assert usage == {"input_tokens": 100, "output_tokens": 50}
     flow.before_response = None
+    flow.material_version += 1  # A real material change cannot reuse the earlier successful response.
     assert matching.prepare_next(flow.settings)
     next_job = matching.claim()
     flow.valid = False
@@ -784,6 +785,7 @@ def test_stale_queue_version_prompt_and_revocation_fence_publication(pg, pilot, 
         is None
     )
     flow.valid, flow.before_response = True, None
+    flow.material_version += 1
     with monkeypatch.context() as rules:
         changed_rules = _prepared_job(pg, flow)
         flow.before_response = lambda: rules.setattr(evidence, "PROMPT_VERSION", version + "-next")
@@ -933,6 +935,9 @@ def test_retry_ledger_and_disabled_config_keep_suggestions_isolated(pg, responsi
                       (unknown["id"],)).fetchone() == {"status": "failed", "reason_code": "request_unknown"}
     assert pg.execute("SELECT error_code,finished_at FROM creator_responsibility_requests WHERE id=%s",
                       (unknown["reservation_id"],)).fetchone()["error_code"] == "request_unknown"
+    frozen = _snapshot(pg, ("creator_responsibility_jobs", "creator_responsibility_requests", "contact_assignments"))
+    assert not matching.recover_saved_result(pg, flow.settings, unknown["id"])
+    assert _snapshot(pg, frozen.keys()) == frozen and len(flow.calls) == 3
     # Rotation and unrelated signals cannot turn an unknown paid attempt into an automatic retry.
     flow.enable("sk-rotated-after-unknown")
     blocked = _enqueue(pg, flow.contact, "history")
@@ -1112,21 +1117,34 @@ def test_document_versions_pause_only_affected_work_without_rewriting_relationsh
     assert _snapshot(pg, formal.keys()) == formal  # Legacy frozen input can be read without changing relationships.
 
 
-def test_post_response_sql_failure_keeps_usage_and_never_redispatches_unknown_or_sample_tasks(
+def test_post_response_sql_failure_recovers_saved_success_without_redispatching_or_stale_writes(
     pg, pilot, responsibility_flow, monkeypatch
 ):
     flow = responsibility_flow
     flow.enable()
     job = _prepared_job(pg, flow)
 
-    def valid_until_after_response(*_, **__):
-        if flow.calls:
-            pg.execute("SELECT 1/0")
-        return True
+    order = []
+    original_lock, original_current = matching.lock_sync_material, matching._current
+
+    def source_lock(conn):
+        order.append('material')
+        return original_lock(conn)
+
+    def current(conn, job):
+        assert order[-1] == 'material'  # The source gate is taken BEFORE config/job/source row locks.
+        order.append('current')
+        return original_current(conn, job)
+
+    def failed_apply(*_, **__):
+        assert order[-1] == 'current'
+        pg.execute("DO $$ BEGIN RAISE EXCEPTION 'synthetic application deadlock' USING ERRCODE='40P01'; END $$")
 
     with monkeypatch.context() as failed_source:
-        failed_source.setattr(matching.evidence, "still_valid", valid_until_after_response)
-        with pytest.raises(DivisionByZero):
+        failed_source.setattr(matching, "lock_sync_material", source_lock)
+        failed_source.setattr(matching, "_current", current)
+        failed_source.setattr(matching, "_apply_assignments", failed_apply)
+        with pytest.raises(DeadlockDetected):
             matching.run(job, flow.settings)
     ledger = pg.execute(
         "SELECT input_tokens,output_tokens,response_id,finished_at FROM creator_responsibility_requests WHERE id=%s",
@@ -1139,8 +1157,24 @@ def test_post_response_sql_failure_keeps_usage_and_never_redispatches_unknown_or
     recovered = pg.execute(
         "SELECT status,reason_code,result_ciphertext FROM creator_responsibility_jobs WHERE id=%s", (job["id"],)
     ).fetchone()
-    assert recovered == {"status": "failed", "reason_code": "request_unknown", "result_ciphertext": None}
+    assert recovered == {"status": "queued", "reason_code": "application_pending", "result_ciphertext": None}
     assert len(flow.calls) == 1
+    # Legacy rows were mislabeled unknown; a changed desired_version alone does not prove changed material.
+    pg.execute("UPDATE creator_responsibility_jobs SET status='failed',reason_code='request_unknown',"
+               "desired_version=desired_version+1 WHERE id=%s", (job["id"],))
+    frozen = _snapshot(pg, ("creator_responsibility_jobs", "creator_responsibility_requests", "contact_assignments"))
+    flow.material_version += 1
+    assert not matching.recover_saved_result(pg, flow.settings, job["id"])
+    assert _snapshot(pg, frozen.keys()) == frozen and len(flow.calls) == 1
+    flow.material_version -= 1
+    assert matching.recover_saved_result(pg, flow.settings, job["id"])
+    completed = pg.execute("SELECT status,reason_code,snapshot_version=desired_version AS current "
+                           "FROM creator_responsibility_jobs WHERE id=%s", (job["id"],)).fetchone()
+    assert completed == {"status": "completed", "reason_code": "cached", "current": True}
+    assert pg.execute("SELECT count(*) n FROM contact_assignments WHERE contact_id=%s AND ended_at IS NULL",
+                      (flow.contact,)).fetchone()['n'] == 2
+    assert not matching.recover_saved_result(pg, flow.settings, job["id"]) and len(flow.calls) == 1
+    flow.material_version += 1
     admission_job = _prepared_job(pg, flow)
 
     def failed_admission(_telemetry):
@@ -1161,6 +1195,11 @@ def test_post_response_sql_failure_keeps_usage_and_never_redispatches_unknown_or
         (admission_job["id"],),
     )
     assert matching.claim() is None and len(flow.calls) == 2
+    pairs = _snapshot(pg, ("contact_assignments",))
+    assert matching.prepare_next(flow.settings) and matching.claim() is None
+    assert pg.execute("SELECT status,reason_code FROM creator_responsibility_jobs WHERE id=%s",
+                      (admission_job['id'],)).fetchone() == {'status': 'completed', 'reason_code': 'cached'}
+    assert _snapshot(pg, pairs.keys()) == pairs and len(flow.calls) == 2
     # Borrowed-key diagnostics are explicitly isolated even if the native feature is enabled.
     sample = _enqueue(pg, flow.contact, "sample")
     assert not matching.prepare_next(flow.settings) and matching.claim() is None
@@ -1180,6 +1219,7 @@ def test_post_response_sql_failure_keeps_usage_and_never_redispatches_unknown_or
     )
     assert len(flow.calls) == 2
     explicit_sample = _enqueue(pg, flow.contact, "sample")
+    flow.material_version += 1
     matching.action(pg, pilot.ids["owner"], explicit_sample, "recheck")
     assert pg.execute(
         "SELECT source,status FROM creator_responsibility_jobs WHERE id=%s", (explicit_sample,)

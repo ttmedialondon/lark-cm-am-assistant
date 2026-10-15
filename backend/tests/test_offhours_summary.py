@@ -1644,6 +1644,114 @@ def test_creator_enrollment_backfills_closed_periods_without_repaying_or_replaci
     assert len(s.calls) == 3 and old_tasks() == original
     pg.execute('ROLLBACK TO SAVEPOINT backfill_ancient_execution')
 
+    # Newly visible conversations and later pages also fill closed reports, without a new enrollment.
+    untouched = pg.execute('SELECT id,status,result_ciphertext,checkpoint_ciphertext,attempts,usage '
+                           'FROM offhours_summary_tasks WHERE run_id=%s ORDER BY id',
+                           (second_run['id'],)).fetchall()
+    earlier = day - timedelta(days=1)
+    earlier_start, _ = summary_periods.window(earlier, 'work')
+    add_private('late-new-scope', s.ids['cm'], 'late-new-message')
+    pg.execute("UPDATE chat_messages SET message_create_time=%s WHERE message_id='late-new-message'",
+               (earlier_start + timedelta(hours=1),))
+    pg.execute("DELETE FROM authorization_message_observations WHERE message_id='late-new-message'")
+    assert summary_periods.touch_chats(pg, s.ids['cm'], ['late-new-scope']) == 0
+    pg.execute('''INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+        VALUES(%s,'late-new-scope','late-new-message')''', (s.ids['cm'],))
+    pg.execute('SAVEPOINT event_touch_authorization')
+    pg.execute('UPDATE authorizations SET body_consent_at=NULL WHERE id=%s', (s.ids['cm'],))
+    assert summary_periods.touch_chats(pg, s.ids['cm'], ['late-new-scope']) == 0
+    pg.execute('ROLLBACK TO SAVEPOINT event_touch_authorization')
+    pg.execute('SAVEPOINT event_touch_assignment')
+    pg.execute('UPDATE contact_assignments SET ended_at=NOW() WHERE contact_id=%s '
+               'AND responsible_authorization_id=%s', (s.ids['other'], s.ids['cm']))
+    assert summary_periods.touch_chats(pg, s.ids['cm'], ['late-new-scope']) == 0
+    pg.execute('ROLLBACK TO SAVEPOINT event_touch_assignment')
+    assert summary_periods.touch_chats(pg, s.ids['cm'], ['late-new-scope']) == 1
+    pending = pg.execute('SELECT * FROM offhours_summary_backfills').fetchone()
+    assert pending['contact_id'] == s.ids['other'] and pending['responsible_authorization_id'] == s.ids['cm']
+    assert summary_periods.touch_chats(pg, s.ids['cm'], ['late-new-scope']) == 0
+    assert summary_periods.touch_chats(pg, s.ids['cm'], ['late-new-scope'], message_ids=[]) == 0
+    assert pg.execute('SELECT * FROM offhours_summary_backfills').fetchone() == pending
+    assert summary_periods.backfill_due(pg, pending['not_before'] - timedelta(seconds=1)) == 0
+    summary_periods.backfill_due(pg, now + timedelta(seconds=31))
+    finish()
+    summary_periods.backfill_due(pg, now + timedelta(seconds=62))
+    assert not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
+    late_run = pg.execute("SELECT * FROM offhours_summary_runs WHERE responsible_authorization_id=%s "
+                          "AND report_date=%s AND period='work'", (s.ids['cm'], earlier)).fetchone()
+    late_source = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s "
+                             "AND chat_id='late-new-scope' AND is_current", (late_run['id'],)).fetchone()
+    assert late_source['status'] == 'succeeded' and late_source['processed_messages'] == 1
+    assert late_run['next_check_at'] is None and late_run['refresh_until'] <= now
+    assert old_tasks() == original
+
+    # Membership can arrive after the messages; no new message is required to discover the formal creator.
+    pg.execute('SAVEPOINT event_touch_late_members')
+    add_private('late-members', s.ids['cm'], 'late-member-message')
+    pg.execute("UPDATE chats SET chat_mode='group' WHERE chat_id='late-members'")
+    pg.execute("UPDATE authorization_chats SET p2p_counterpart_open_id=NULL WHERE chat_id='late-members'")
+    pg.execute("UPDATE chat_messages SET sender_open_id='ou_cm' WHERE chat_id='late-members'")
+    assert summary_periods.touch_chats(pg, s.ids['cm'], ['late-members']) == 0
+    pg.execute("INSERT INTO chat_members(chat_id,open_id,member_type) VALUES('late-members','ou_other','user')")
+    assert summary_periods.touch_chats(pg, s.ids['cm'], ['late-members']) == 1
+    assert summary_periods.touch_chats(pg, s.ids['cm'], ['late-members']) == 0
+    pg.execute('ROLLBACK TO SAVEPOINT event_touch_late_members')
+
+    # A later historical page wakes the same bounded queue after its previous signal has drained.
+    oldest = earlier - timedelta(days=1)
+    oldest_start, _ = summary_periods.window(oldest, 'work')
+    pg.execute('''INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,
+        body_ciphertext,message_create_time) VALUES('late-new-scope','late-history','ou_other','text',%s,%s)''',
+        (s.cipher.encrypt(json.dumps({'text': 'Earlier sample enquiry'})), oldest_start + timedelta(hours=1)))
+    pg.execute('''INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+        VALUES(%s,'late-new-scope','late-history')''', (s.ids['cm'],))
+    assert summary_periods.touch_chats(pg, s.ids['cm'], ['late-new-scope'], message_ids=['late-history']) == 1
+    assert summary_periods.touch_chats(pg, s.ids['cm'], ['late-new-scope'], message_ids=['late-history']) == 0
+    summary_periods.backfill_due(pg, now + timedelta(seconds=93))
+    finish()
+    summary_periods.backfill_due(pg, now + timedelta(seconds=124))
+    assert not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
+    assert pg.execute("SELECT t.status FROM offhours_summary_tasks t JOIN offhours_summary_runs r ON r.id=t.run_id "
+                      "WHERE r.report_date=%s AND r.period='work' AND r.responsible_authorization_id=%s "
+                      "AND t.chat_id='late-new-scope' AND t.is_current", (oldest, s.ids['cm'])).fetchone() == {
+                          'status': 'succeeded'}
+    assert pg.execute('SELECT status,result_ciphertext,checkpoint_ciphertext,attempts,usage '
+                      'FROM offhours_summary_tasks WHERE id=%s', (late_source['id'],)).fetchone() == {
+                          key: late_source[key] for key in
+                          ('status', 'result_ciphertext', 'checkpoint_ciphertext', 'attempts', 'usage')}
+    assert pg.execute('SELECT id,status,result_ciphertext,checkpoint_ciphertext,attempts,usage '
+                      'FROM offhours_summary_tasks WHERE run_id=%s ORDER BY id',
+                      (second_run['id'],)).fetchall() == untouched
+    assert old_tasks() == original
+
+    # Waking a conversation is not permission to repeat a request with unknown paid outcome.
+    current = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s "
+                         "AND chat_id='late-new-scope' AND is_current", (late_run['id'],)).fetchone()
+    pg.execute("UPDATE offhours_summary_tasks SET status='failed',error_message='请求结果未知，未自动重复调用。' "
+               'WHERE id=%s', (current['id'],))
+    calls_before = len(s.calls)
+    assert summary_periods.touch_chats(pg, s.ids['cm'], ['late-new-scope']) == 1
+    summary_periods.backfill_due(pg, now + timedelta(seconds=155))
+    finish()
+    assert pg.execute('SELECT status,attempts,result_ciphertext,usage FROM offhours_summary_tasks WHERE id=%s',
+                      (current['id'],)).fetchone() == {
+                          **{key: current[key] for key in ('attempts', 'result_ciphertext', 'usage')},
+                          'status': 'failed'}
+    assert len(s.calls) == calls_before and old_tasks() == original
+    checkpoint = summary_dialogues.decode(current['checkpoint_ciphertext'], s.settings)
+    checkpoint['provider_call'] = {'id': str(uuid4()), 'signature': 'unknown-paid-request', 'model': 'test-model'}
+    pg.execute('UPDATE offhours_summary_tasks SET checkpoint_ciphertext=%s WHERE id=%s',
+               (summary_dialogues.encode(checkpoint, s.settings), current['id']))
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='late-new-message'",
+               (s.cipher.encrypt(json.dumps({'text': 'Updated sample request after unknown call'})),))
+    assert summary_periods.touch_chats(pg, s.ids['cm'], ['late-new-scope'], message_ids=['late-new-message']) == 0
+    summary_periods.backfill_due(pg, now + timedelta(minutes=16))
+    finish()
+    unknown = pg.execute("SELECT status,error_message FROM offhours_summary_tasks WHERE run_id=%s "
+                         "AND chat_id='late-new-scope' AND is_current", (late_run['id'],)).fetchone()
+    assert unknown['status'] == 'failed' and unknown['error_message'].startswith('请求结果未知')
+    assert len(s.calls) == calls_before and old_tasks() == original
+
 
 
 

@@ -246,7 +246,10 @@ def view_for(conn, contact_id, cm_id, settings, *, actor_id=None, details=True):
             if row["manual_reason_ciphertext"] else ""
     if not row["valid"]:
         if row["job_status"] == "failed":
-            return {**output, "gap_label": "上次评估未完成，等待处理"}
+            return {**output, "gap_label": {
+                "request_unknown": "评估结果未确认，未自动重试",
+                "provider_rejected": "评估请求未通过，需人工处理",
+            }.get(row["job_reason"], "上次评估未完成，等待处理")}
         return {**output, "gap_label": "历史分析中" if row["evaluated_at"]
                 and not row["coverage"].get("history_complete") else
                 "依据已变化，等待更新" if row["evaluated_at"] else "尚未自动评估"}
@@ -319,7 +322,7 @@ def configuration_changed(conn):
     conn.execute("""UPDATE creator_importance_jobs SET claim_token=NULL,lease_until=NULL,
         status=CASE WHEN %s THEN 'queued' ELSE 'cancelled' END,attempts=0,
         reason_code='configuration_changed',not_before=NOW(),updated_at=NOW()
-        WHERE status<>'completed' AND reason_code NOT IN ('request_unknown','rules_unavailable')
+        WHERE status<>'completed' AND reason_code NOT IN ('request_unknown','rules_unavailable','provider_rejected')
         AND (%s OR status NOT IN ('failed','cancelled'))""", (enabled, enabled))
     if enabled:
         conn.execute("""SELECT enqueue_creator_importance(pair.contact_id,pair.responsible_authorization_id)
@@ -328,7 +331,7 @@ def configuration_changed(conn):
               AND NOT EXISTS(SELECT 1 FROM creator_importance_jobs j WHERE j.contact_id=pair.contact_id
                 AND j.responsible_authorization_id=pair.responsible_authorization_id
                 AND (j.status NOT IN ('failed','cancelled')
-                  OR j.reason_code IN ('request_unknown','rules_unavailable')))""")
+                  OR j.reason_code IN ('request_unknown','rules_unavailable','provider_rejected')))""")
 
 
 _READABLE = f"""FROM chat_messages m JOIN authorization_message_observations o USING(chat_id,message_id)
@@ -865,7 +868,9 @@ def run(job, settings):
             conn.execute("""UPDATE creator_importance_jobs SET status=%s,reason_code=%s,claim_token=NULL,
                 lease_until=NULL,not_before=NOW()+(%s*INTERVAL '1 second'),finished_at=CASE WHEN %s THEN NOW() END,
                 stats=stats||%s::jsonb,updated_at=NOW() WHERE id=%s""",
-                ("retry_wait" if retry else "failed", code,
+                ("retry_wait" if retry else "failed",
+                 "provider_rejected" if telemetry.get("provider_error", {}).get("code")
+                    in {"invalid_prompt", "content_policy_violation"} else code,
                  api.retry_delay(error.retry_after_seconds, job["attempts"]) if retry else 0, not retry,
                  creator_data.encode({"output_error": output_error, "output_shape": telemetry.get("output_shape", []),
                      "response_status": telemetry.get("response_status"),

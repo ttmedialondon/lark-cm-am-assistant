@@ -1,7 +1,7 @@
 """Repair an explicit initialization manifest; dry-run unless --apply.
 
-Stop the worker and verify a backup before applying. Never reset history, retry
-unknown requests, or write confirmed identities, handles or responsibilities.
+Stop the worker and verify a backup before applying. Never reset history or
+resend unknown requests; saved successful replies still require current validation.
 """
 from __future__ import annotations
 
@@ -17,12 +17,14 @@ REPAIRABLE_ERRORS = ('invalid_output', 'http_400')
 
 
 def repair(conn, manifest, settings, *, apply=False):
-    from app import creator_data
+    from app import creator_data, summary_periods
     from app import creator_handle_matching as handles
     from app import creator_importance as importance
     from app import creator_responsibility_matching as responsibility
+    from app.db import lock_sync_material
     from app.evidence_access import _READABLE, BODY_READ_SCOPE_SQL
 
+    lock_sync_material(conn)
     cm = UUID(manifest['cm_id'])
     groups = {name: sorted({UUID(value) for value in manifest[name]}) for name in
               ('identity_contact_ids', 'importance_job_ids', 'responsibility_job_ids')}
@@ -33,7 +35,9 @@ def repair(conn, manifest, settings, *, apply=False):
     if not actor:
         raise ValueError('The selected CM does not have a current reading grant.')
     counts = Counter()
-    contacts = groups['identity_contact_ids']
+    retries = {row['id']: row for row in conn.execute("""SELECT * FROM creator_handle_jobs
+        WHERE id=ANY(%s::uuid[])""", (manifest.get('identity_retry_job_ids', []),)).fetchall()}
+    contacts = sorted(set(groups['identity_contact_ids']) | {row['contact_id'] for row in retries.values()})
     processed = {row['contact_id'] for row in conn.execute("""SELECT DISTINCT contact_id
         FROM creator_handle_jobs WHERE contact_id=ANY(%s::uuid[]) AND purpose='identity'""", (contacts,))}
     eligible = {row['id'] for row in conn.execute("""SELECT id FROM contacts
@@ -59,12 +63,111 @@ def repair(conn, manifest, settings, *, apply=False):
                 raise ValueError('Selected contact could not enter recognition.')
         counts['identity_enrolled'] += 1
 
+    for job in retries.values():
+        if conn.execute("""SELECT 1 FROM audit_events WHERE action='creator_initialization_repaired'
+            AND metadata->'identity_retry_jobs' ? %s LIMIT 1""", (str(job['id']),)).fetchone():
+            counts['identity_retry_unchanged'] += 1
+            continue
+        receipt = conn.execute("""SELECT error_code FROM creator_handle_requests
+            WHERE job_id=%s ORDER BY created_at DESC,id DESC LIMIT 1""", (job['id'],)).fetchone()
+        if (job['purpose'] != 'identity' or job['status'] != 'failed' or not receipt
+                or receipt['error_code'] != 'http_400' or job['reason_code'] == 'provider_rejected'):
+            counts['identity_retry_unchanged'] += 1
+            continue
+        if conn.execute("""SELECT 1 FROM creator_handle_jobs WHERE contact_id=%s AND id<>%s
+            AND purpose='identity' AND status NOT IN ('completed','failed','cancelled')""",
+            (job['contact_id'], job['id'])).fetchone():
+            counts['identity_retry_unchanged'] += 1
+            continue
+        if conn.execute("SELECT 1 FROM creator_handle_requests WHERE job_id=%s "
+                        "AND error_code='request_unknown'", (job['id'],)).fetchone():
+            counts['identity_unknown_preserved'] += 1
+            continue
+        if job['contact_id'] not in eligible or job['contact_id'] not in readable:
+            counts['identity_retry_no_longer_eligible'] += 1
+            continue
+        if not handles._enabled(config) or job['attempts'] >= 3:
+            counts['identity_retry_unavailable'] += 1
+            continue
+        pack = json.loads(creator_data.cipher(settings).decrypt(job['pack_ciphertext'])) \
+            if job['pack_ciphertext'] else None
+        valid = bool(pack and job['snapshot_version'] == job['desired_version']
+                     and job['config_fingerprint'] == handles._job_config_hash(config, 'identity')
+                     and handles.evidence.still_valid(conn, job['refs'], settings))
+        if valid:
+            handles._manual_access(conn, pack)
+        status = 'ready' if valid else 'queued'
+        if apply:
+            conn.execute("""UPDATE creator_handle_jobs SET status=%s,reason_code='targeted_retry',
+                source=CASE WHEN %s='queued' THEN 'manual' ELSE source END,
+                claim_token=NULL,lease_until=NULL,finished_at=NULL,not_before=NOW(),updated_at=NOW()
+                WHERE id=%s AND status='failed'""", (status, status, job['id']))
+        counts['identity_retry_' + status] += 1
+
+    for job_id in sorted({UUID(value) for value in manifest.get('responsibility_saved_job_ids', [])}):
+        job = conn.execute('SELECT * FROM creator_responsibility_jobs WHERE id=%s', (job_id,)).fetchone()
+        envelope = json.loads(creator_data.cipher(settings).decrypt(job['pack_ciphertext'])) \
+            if job and job['pack_ciphertext'] else None
+        if not actor['contact_id'] or not envelope:
+            counts['responsibility_saved_not_reusable'] += 1
+            continue
+        if str(actor['contact_id']) not in {str(v) for v in envelope['candidate_ids'].values()}:
+            raise ValueError('Responsibility job does not include the selected CM.')
+        with conn.transaction(force_rollback=not apply):
+            restored = responsibility.recover_saved_result(conn, settings, job_id)
+        if restored:
+            counts['responsibility_saved_restored'] += 1
+            continue
+        receipt = conn.execute("""SELECT * FROM creator_responsibility_requests WHERE job_id=%s
+            ORDER BY created_at DESC,id DESC LIMIT 1""", (job_id,)).fetchone()
+        diagnostic = json.loads(creator_data.cipher(settings).decrypt(receipt['response_ciphertext'])) \
+            if receipt and receipt['response_ciphertext'] else {}
+        if (not job or job['status'] != 'failed' or job['source'] == 'sample'
+                or job['reason_code'] not in {'request_unknown', 'application_pending'}
+                or not receipt or receipt['error_code'] or not receipt['finished_at']
+                or not receipt['request_id'] or not receipt['response_id'] or not diagnostic.get('validated')
+                or receipt['input_tokens'] is None or receipt['output_tokens'] is None
+                or not envelope or not job['prepared_at'] or receipt['created_at'] < job['prepared_at']
+                or receipt['material_fingerprint'] != responsibility._hash(responsibility._payment_material(envelope))
+                or not responsibility._enabled(responsibility._config(conn))
+                or conn.execute("""SELECT 1 FROM creator_responsibility_jobs WHERE contact_id=%s
+                    AND id<>%s AND status NOT IN ('completed','failed','cancelled')""",
+                    (job['contact_id'], job_id)).fetchone()):
+            counts['responsibility_saved_not_reusable'] += 1
+            continue
+        current = responsibility._build_material(conn, settings, job['contact_id'])
+        current_envelope = {'pack': current['pack'], 'candidate_ids': current['candidate_ids']}
+        changed = bool(current['pack'] and responsibility.evidence.still_valid(conn, current['refs'], settings)
+                       and responsibility._payment_material(current_envelope)
+                           != responsibility._payment_material(envelope))
+        if not changed:
+            counts['responsibility_saved_not_reusable'] += 1
+            continue
+        if apply:
+            conn.execute("""UPDATE creator_responsibility_jobs SET status='queued',reason_code='application_pending',
+                claim_token=NULL,lease_until=NULL,finished_at=NULL,not_before=NOW(),updated_at=NOW()
+                WHERE id=%s AND status='failed'""", (job_id,))
+        counts['responsibility_new_material_queued'] += 1
+
     for feature, module, table, key in (
         ('importance', importance, 'creator_importance_jobs', 'importance_job_ids'),
         ('responsibility', responsibility, 'creator_responsibility_jobs', 'responsibility_job_ids'),
     ):
         for job_id in groups[key]:
             job = conn.execute(f'SELECT * FROM {table} WHERE id=%s', (job_id,)).fetchone()
+            if job and job['status'] == 'failed' and job['reason_code'] == 'request_unknown':
+                counts[feature + '_unknown_preserved'] += 1
+                continue
+            if (feature == 'importance' and job and job['status'] == 'failed'
+                    and job['stats'].get('provider_error', {}).get('code')
+                    in {'invalid_prompt', 'content_policy_violation'}):
+                if job['responsible_authorization_id'] != cm:
+                    raise ValueError('Importance job belongs to another CM.')
+                if apply:
+                    conn.execute("UPDATE creator_importance_jobs SET reason_code='provider_rejected',updated_at=NOW() "
+                                 "WHERE id=%s", (job_id,))
+                counts['importance_provider_rejected'] += 1
+                continue
             if not job or job['status'] != 'failed' or job['reason_code'] not in REPAIRABLE_ERRORS:
                 counts[feature + '_unchanged'] += 1
                 continue
@@ -99,13 +202,19 @@ def repair(conn, manifest, settings, *, apply=False):
                 if changed != 1:
                     raise ValueError('Selected failed job changed during repair.')
             counts[feature + '_' + status] += 1
+    if manifest.get('event_chat_ids'):
+        with conn.transaction(force_rollback=not apply):
+            counts['event_pairs_enqueued'] = summary_periods.touch_chats(conn, cm, manifest['event_chat_ids'])
     if apply:
         conn.execute("""INSERT INTO audit_events(id,authorization_id,action,metadata)
             VALUES(%s,%s,'creator_initialization_repaired',%s::jsonb)""",
             (uuid4(), cm, json.dumps({'manifest_created_at': manifest['created_at'], 'counts': dict(counts),
                                      'identity_contacts': [str(v) for v in groups['identity_contact_ids']],
                                      'importance_jobs': [str(v) for v in groups['importance_job_ids']],
-                                     'responsibility_jobs': [str(v) for v in groups['responsibility_job_ids']]})))
+                                     'responsibility_jobs': [str(v) for v in groups['responsibility_job_ids']],
+                                     'identity_retry_jobs': sorted(str(v) for v in retries),
+                                     'responsibility_saved_jobs': manifest.get('responsibility_saved_job_ids', []),
+                                     'event_chats': manifest.get('event_chat_ids', [])})))
     return dict(counts)
 
 

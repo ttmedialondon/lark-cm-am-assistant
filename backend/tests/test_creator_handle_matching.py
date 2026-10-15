@@ -732,6 +732,23 @@ def test_provider_delay_quota_pause_and_uncertain_usage_survive_retries(pg, matc
     matching.run(retried, flow.settings)
     assert len(flow.calls) == 4
 
+    flow.material_version += 1
+    rejected = _prepared_job(pg, flow)
+    flow.error = openai_client.OpenAIRequestError("HTTP 400", telemetry={
+        "http_status": 400, "provider_error": {"code": "invalid_prompt"}},
+        provider_diagnostic={"code": "invalid_prompt", "message": "PRIVATE REJECTION DETAIL"})
+    matching.run(rejected, flow.settings)
+    assert pg.execute("SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s",
+                      (rejected["id"],)).fetchone() == {"status": "failed", "reason_code": "provider_rejected"}
+    receipt = pg.execute("SELECT error_code,response_ciphertext FROM creator_handle_requests WHERE id=%s",
+                         (rejected["reservation_id"],)).fetchone()
+    assert receipt["error_code"] == "http_400"
+    diagnostic = json.loads(creator_data.cipher(flow.settings).decrypt(receipt["response_ciphertext"]))
+    assert diagnostic["provider_diagnostic"]["message"] == "PRIVATE REJECTION DETAIL"
+    assert "PRIVATE REJECTION DETAIL" not in str(pg.execute(
+        "SELECT stats FROM creator_handle_jobs WHERE id=%s", (rejected["id"],)).fetchone())
+    assert matching.claim() is None and len(flow.calls) == 5
+
 
 def test_config_change_during_unknown_call_does_not_redispatch_same_material(pg, matching_flow, monkeypatch):
     flow = matching_flow

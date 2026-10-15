@@ -844,6 +844,10 @@ def review(pack, config, contact_id, settings):
     except Exception as exc:
         error = exc
         telemetry = getattr(exc, "telemetry", {}) or telemetry
+        if isinstance(exc, api.OpenAIRequestError):
+            diagnostic = {"provider_error": telemetry.get("provider_error", {})}
+            if exc.provider_diagnostic:
+                diagnostic["provider_diagnostic"] = exc.provider_diagnostic
     return result, telemetry, error, diagnostic
 
 
@@ -925,6 +929,8 @@ def run(job, settings):
                 if retry
                 else "invalid_output"
                 if isinstance(error, api.ModelOutputError)
+                else "provider_rejected"
+                if telemetry.get("provider_error", {}).get("code") in {"invalid_prompt", "content_policy_violation"}
                 else "provider_failed"
             )
             conn.execute(

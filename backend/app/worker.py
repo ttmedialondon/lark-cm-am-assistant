@@ -31,6 +31,7 @@ from . import (
     message_materials,
     offhours_summary,
     organization_sync,
+    summary_periods,
     summary_replies,
 )
 from .config import Settings, get_settings
@@ -44,6 +45,7 @@ from .lark_sync_admission import LarkSyncAdmission
 LOGGER = logging.getLogger("lark_message_stats.worker")
 _recent_page_claims: Counter[uuid.UUID] = Counter()
 _recent_chat_rounds: dict[uuid.UUID, tuple[tuple[uuid.UUID, int, int], set[str]]] = {}
+_recent_active_chats: dict[uuid.UUID, tuple[tuple[uuid.UUID, int, int], float, set[str]]] = {}
 
 
 class ReauthorizationRequired(RuntimeError):
@@ -1319,11 +1321,13 @@ def _discover_chats(
             lock_sync_material(conn)
             _assert_discovery_current(conn, job)
             internal_tenant_keys = _internal_tenant_keys(conn)
-            previous = {row["chat_id"]: row["is_visible"] for row in conn.execute(
-                "SELECT chat_id,is_visible FROM authorization_chats WHERE authorization_id=%s AND chat_id=ANY(%s)",
+            previous = {row["chat_id"]: row for row in conn.execute(
+                "SELECT chat_id,is_visible,p2p_counterpart_open_id FROM authorization_chats "
+                "WHERE authorization_id=%s AND chat_id=ANY(%s)",
                 (job.authorization_id, [row[0] for row in rows]),
             ).fetchall()}
             new_scopes = []
+            changed_counterparts = []
             for (
                 chat_id,
                 name,
@@ -1445,6 +1449,12 @@ def _discover_chats(
                            WHERE authorization_id=%s AND chat_id=%s""",
                         (counterpart_open_id, seen_at, authorization["id"], chat_id),
                     )
+                previous_counterpart = previous.get(chat_id, {}).get("p2p_counterpart_open_id")
+                if chat_type == "p2p" and (
+                    counterpart_open_id and counterpart_open_id != previous_counterpart
+                    or counterpart_type and counterpart_type != "user" and previous_counterpart
+                ):
+                    changed_counterparts.append(chat_id)
                 if measurement:
                     _store_member_snapshot(
                         conn,
@@ -1455,12 +1465,14 @@ def _discover_chats(
                         internal_tenant_keys,
                     )
                 discovered += 1
-                if not previous.get(chat_id):
+                if not previous.get(chat_id, {}).get("is_visible"):
                     new_scopes.append(chat_id)
             _ensure_internal_contact_roles(conn)
             if new_scopes:
                 creator_responsibility_matching.touch_chats(conn, new_scopes,
                     authorization_id=job.authorization_id, new_scope=True)
+            if new_scopes or changed_counterparts:
+                summary_periods.touch_chats(conn, job.authorization_id, sorted(set(new_scopes + changed_counterparts)))
         if not _has_more(data):
             break
         page_token = _text(data.get("page_token"))
@@ -1634,6 +1646,9 @@ def _store_member_snapshot(
     seen_at: datetime,
     internal_tenant_keys: set[str],
 ) -> None:
+    previous_members = {row["open_id"]: row["member_type"] for row in conn.execute(
+        "SELECT open_id,member_type FROM chat_members WHERE chat_id=%s", (chat_id,),
+    ).fetchall()}
     # OAuth-owned profiles have a separate verified refresh path. A group API's
     # display variant must not replace their original/English profile fields.
     authorized = {row["open_id"] for row in conn.execute(
@@ -1692,6 +1707,16 @@ def _store_member_snapshot(
         )
 
     creator_group_matching.touch_chats(conn, [chat_id])
+    if any(previous_members.get(member["open_id"]) != (member["member_type"] or "user")
+           for member in measurement.members):
+        # Membership is shared, so the first reader must wake every CM who can read this group.
+        for scope in conn.execute(
+            """SELECT access.authorization_id FROM authorization_chats access
+               JOIN authorizations a ON a.id=access.authorization_id
+               WHERE access.chat_id=%s AND access.is_visible AND access.sync_enabled AND a.status='active'
+               ORDER BY access.authorization_id""", (chat_id,),
+        ).fetchall():
+            summary_periods.touch_chats(conn, scope["authorization_id"], [chat_id])
 
 
 def _upsert_lark_identity(
@@ -1939,6 +1964,8 @@ def _claim_next_page(
             _recent_page_claims[job.authorization_id] = 0
         # Recent work gets four turns; spare capacity and every fifth turn still advance history.
         history_turn = _recent_page_claims[job.authorization_id] >= 4
+        # Only one recent turn may bypass the cold round for an active conversation.
+        priority_turn = _recent_page_claims[job.authorization_id] % 4 == 0
         modes = ("backfill", "incremental") if history_turn else ("incremental", "backfill")
         for mode in modes:
             if mode == "backfill":
@@ -1946,7 +1973,8 @@ def _claim_next_page(
                 chat = _select_backfill_chat_for_claim(conn, job.authorization_id)
             else:
                 chat = _select_incremental_chat_for_claim(conn, job.authorization_id, job.id,
-                                                           settings.sync_interval_seconds, served)
+                    settings.sync_interval_seconds, served,
+                    _active_recent_chats(conn, job, settings.sync_interval_seconds) if priority_turn else None)
             if chat:
                 break
         if not chat:
@@ -2032,7 +2060,7 @@ def _claim_next_page(
         1 if history_turn else _recent_page_claims[job.authorization_id] + 1
     ) if mode == "incremental" else 0
     if mode == "incremental":
-        if chat["chat_id"] in served:
+        if chat["chat_id"] in served and not chat["recent_priority"]:
             served.clear()
         served.add(chat["chat_id"])
         _recent_chat_rounds[job.authorization_id] = round_key, served
@@ -2108,13 +2136,40 @@ def _select_backfill_chat_for_claim(conn: psycopg.Connection, authorization_id: 
     ).fetchone()
 
 
+def _active_recent_chats(conn: psycopg.Connection, job: SyncJob, interval_seconds: int) -> set[str]:
+    key = job.id, job.discovery_generation, job.attempts
+    cached_key, expires_at, chats = _recent_active_chats.get(job.authorization_id, (None, 0, set()))
+    if key != cached_key or time.monotonic() >= expires_at:
+        chats = {row["chat_id"] for row in conn.execute(
+            """
+            SELECT access.chat_id
+            FROM authorization_chats access JOIN chats c ON c.chat_id=access.chat_id
+            JOIN LATERAL (
+                SELECT m.message_create_time FROM chat_messages m
+                WHERE m.chat_id=access.chat_id AND NOT m.is_deleted AND m.message_create_time IS NOT NULL
+                ORDER BY m.message_create_time DESC LIMIT 1
+            ) latest ON TRUE
+            WHERE access.authorization_id=%s AND access.is_visible AND access.sync_enabled
+              AND COALESCE(c.chat_status,'normal')='normal'
+              AND (latest.message_create_time>=NOW()-INTERVAL '3 hours'
+                   OR latest.message_create_time>COALESCE(access.last_incremental_at,access.last_backfill_at))
+            """, (job.authorization_id,),
+        ).fetchall()}
+        _recent_active_chats[job.authorization_id] = key, time.monotonic() + interval_seconds, chats
+    return chats
+
+
 def _select_incremental_chat_for_claim(
     conn: psycopg.Connection, authorization_id: uuid.UUID, job_id: uuid.UUID, interval_seconds: int,
-    served_chats=(),
+    served_chats=(), active_chats: set[str] | None = None,
 ) -> dict[str, Any] | None:
     return conn.execute(
         """
-        SELECT access.*
+        SELECT access.*, %s AND (
+            (access.last_incremental_at IS NULL AND access.recent_coverage_start_at IS NULL)
+            OR (access.incremental_job_id=%s AND access.incremental_window_end_at IS NOT NULL)
+            OR access.chat_id=ANY(%s::text[])
+        ) AS recent_priority
         FROM authorization_chats access
         JOIN chats c ON c.chat_id = access.chat_id
         WHERE access.authorization_id = %s AND access.sync_enabled AND access.is_visible
@@ -2127,13 +2182,15 @@ def _select_incremental_chat_for_claim(
             OR access.last_incremental_at <= NOW() - (%s * INTERVAL '1 second')
           )
         ORDER BY
+            recent_priority DESC,
             access.chat_id=ANY(%s::text[]),
             CASE WHEN access.incremental_job_id = %s AND access.incremental_window_end_at IS NOT NULL THEN 0 ELSE 1 END,
             COALESCE(access.last_incremental_at, access.last_backfill_at) NULLS FIRST, access.chat_id
         FOR UPDATE SKIP LOCKED
         LIMIT 1
         """,
-        (authorization_id, job_id, job_id, interval_seconds, sorted(served_chats), job_id),
+        (active_chats is not None, job_id, sorted(active_chats or ()),
+         authorization_id, job_id, job_id, interval_seconds, sorted(served_chats), job_id),
     ).fetchone()
 
 
@@ -2499,6 +2556,8 @@ def _record_claimed_page(
             creator_responsibility_matching.touch_chats(conn, [claim.chat_id],
                 authorization_id=claim.job.authorization_id, message_ids=changed,
                 observed_message_ids=observed, new_scope=bool(observed))
+            summary_periods.touch_chats(conn, claim.job.authorization_id, [claim.chat_id],
+                                       message_ids=sorted(set(changed) | set(observed)))
     return PageCommit(True, inserted, own_inserted)
 
 

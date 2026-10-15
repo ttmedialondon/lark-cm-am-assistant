@@ -23,13 +23,17 @@ from app.worker import (
 def fresh_recent_page_turns(monkeypatch):
     monkeypatch.setattr(worker, "_recent_page_claims", Counter())
     monkeypatch.setattr(worker, "_recent_chat_rounds", {})
+    monkeypatch.setattr(worker, "_recent_active_chats", {})
 
 
 def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg, monkeypatch):
     monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
     signals = []
+    summary_signals = []
     monkeypatch.setattr(worker.creator_responsibility_matching, "touch_chats",
                         lambda _conn, _chats, **signal: signals.append(signal))
+    monkeypatch.setattr(worker.summary_periods, "touch_chats", lambda _conn, cm, chats, **signal:
+                        summary_signals.append((cm, chats, signal)))
     actor, job_id = UUID(int=1), UUID(int=2)
     pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,'ou_cm','fixture')", (actor,))
     pg.execute("""INSERT INTO sync_jobs(id,authorization_id,mode,status,discovery_status,discovery_generation)
@@ -86,6 +90,7 @@ def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg
     assert synced["last_incremental_at"] == replay.end_at and not synced["backfill_complete"]
     assert synced["backfill_page_token"] == "page-2" and synced["sync_status"] != "succeeded"
     assert len(signals) == 1 and set(signals[0]["message_ids"]) == {m["message_id"] for m in messages}
+    assert summary_signals == [(actor, [claim.chat_id], {'message_ids': sorted(m['message_id'] for m in messages)})]
     assert signals[0]["authorization_id"] == actor and signals[0]["new_scope"]
     assert set(signals[0]["observed_message_ids"]) == {m["message_id"] for m in messages}
     assert pg.execute("SELECT count(*) n FROM authorization_message_observations").fetchone()["n"] == 4
@@ -101,6 +106,7 @@ def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg
     assert restored.committed and restored.messages == 0
     assert len(signals) == 2 and not signals[-1]["message_ids"] and signals[-1]["new_scope"]
     assert set(signals[-1]["observed_message_ids"]) == {m["message_id"] for m in messages}
+    assert len(summary_signals) == 2 and summary_signals[-1][2]['message_ids'] == summary_signals[0][2]['message_ids']
     pg.execute("UPDATE authorization_chats SET sync_enabled=FALSE WHERE chat_id='oc_ingest_3'")
     edited = {**messages[0], "body": {"content": '{"text":"updated"}'}}
     history = worker._claim_next_page(job, authorization, config)
@@ -108,6 +114,7 @@ def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg
     assert worker._record_claimed_page(history, [edited], None, cipher, fingerprint_key=b"i" * 32).committed
     assert len(signals) == 3 and signals[-1]["message_ids"] == ["om_cm"] and not signals[-1]["new_scope"]
     assert signals[-1]["observed_message_ids"] == []
+    assert len(summary_signals) == 3 and summary_signals[-1][2]['message_ids'] == ['om_cm']
     pg.execute("UPDATE authorization_chats SET sync_enabled=TRUE WHERE chat_id='oc_ingest_3'")
     current = worker._claim_next_page(job, authorization, config)
     pg.execute("UPDATE authorization_chats SET sync_generation=sync_generation+1 WHERE chat_id=%s", (current.chat_id,))
@@ -223,11 +230,57 @@ def test_new_cm_interleaves_recent_and_history_without_losing_either_window(pg, 
     assert worker._record_claimed_page(continued, [], None, None).committed
     assert worker._recent_page_claims[actor] == 1  # An empty history fallback does not get probed on every page.
 
+    # A due active chat can bypass an unfinished cold round, but only one of four turns gets that boost.
+    pg.execute("UPDATE authorization_chats SET sync_enabled=FALSE WHERE authorization_id=%s", (actor,))
+    for chat in ('oc_active_a', 'oc_active_b', *(f'oc_idle_{i:02}' for i in range(10))):
+        pg.execute("INSERT INTO chats(chat_id) VALUES(%s)", (chat,))
+        pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,backfill_complete,
+            recent_coverage_start_at,last_incremental_at,incremental_job_id)
+            VALUES(%s,%s,TRUE,NOW()-INTERVAL '7 days',NOW()-INTERVAL '2 hours',%s)""",
+            (actor, chat, next_job.id))
+        pg.execute("""INSERT INTO chat_messages(chat_id,message_id,message_create_time)
+            VALUES(%s,%s,NOW()-(%s*INTERVAL '1 hour'))""",
+            (chat, chat + '-message', 1 if chat.startswith('oc_active') else 48))
+    worker._recent_chat_rounds[actor] = ((next_job.id, 0, 0), {'oc_active_a', 'oc_active_b'})
+    worker._recent_page_claims[actor] = 0
+    worker._recent_active_chats.clear()
+    boosted = worker._claim_next_page(next_job, auth, settings)
+    assert boosted.chat_id == 'oc_active_a' and worker._record_claimed_page(boosted, [], None, None).committed
+    active_cache = worker._recent_active_chats[actor]
+    cold = []
+    for _ in range(3):
+        claim = worker._claim_next_page(next_job, auth, settings)
+        cold.append(claim.chat_id)
+        assert worker._record_claimed_page(claim, [], None, None).committed
+    assert cold == ['oc_idle_00', 'oc_idle_01', 'oc_idle_02']
+    boosted_again = worker._claim_next_page(next_job, auth, settings)
+    assert boosted_again.chat_id == 'oc_active_b'
+    assert worker._record_claimed_page(boosted_again, [], None, None).committed
+    # Finished active windows wait until due, even if there is no history to fill the fifth turn.
+    for _ in range(7):
+        claim = worker._claim_next_page(next_job, auth, settings)
+        cold.append(claim.chat_id)
+        assert worker._record_claimed_page(claim, [], None, None).committed
+    assert cold == [f'oc_idle_{i:02}' for i in range(10)]
+    assert worker._claim_next_page(next_job, auth, settings) is None
+    assert worker._recent_active_chats[actor] is active_cache
+    # Later shared observations can activate older chats after the bounded metadata cache expires.
+    pg.execute("UPDATE chat_messages SET message_create_time=NOW()-INTERVAL '4 hours' WHERE chat_id='oc_idle_00'")
+    pg.execute("UPDATE authorization_chats SET last_incremental_at=NOW()-INTERVAL '5 hours' "
+               "WHERE authorization_id=%s AND chat_id='oc_idle_00'", (actor,))
+    monkeypatch.setattr(worker.time, 'monotonic', lambda: active_cache[1] + 1)
+    worker._recent_page_claims[actor] = 0
+    known_change = worker._claim_next_page(next_job, auth, settings)
+    assert known_change.chat_id == 'oc_idle_00' and 'oc_idle_00' in worker._recent_active_chats[actor][2]
+
 
 def test_p2p_contact_discovery_skips_bots(pg, monkeypatch) -> None:
     assert _p2p_counterpart_open_id("ou_person", "user") == "ou_person"
     assert _p2p_counterpart_open_id("cli_bot", "bot") is None
     monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
+    summary_scopes = []
+    monkeypatch.setattr(worker.summary_periods, "touch_chats",
+                        lambda _conn, cm, chats, **_kw: summary_scopes.append((cm, chats)))
     job = worker.SyncJob(UUID(int=1), UUID(int=2), "incremental", 1, "running", 1)
     pg.execute(
         "INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,'ou_cm','test')",
@@ -286,6 +339,7 @@ def test_p2p_contact_discovery_skips_bots(pg, monkeypatch) -> None:
             pg.execute("DELETE FROM p2p_open_id_changes")
         else:
             assert pg.execute("SELECT old_id,new_id FROM p2p_open_id_changes").fetchall() == []
+    assert summary_scopes == [(job.authorization_id, ['oc_bot', 'oc_person'])]
 
     client.target_id = "ou_other_person"
     worker._discover_chats(
@@ -294,6 +348,7 @@ def test_p2p_contact_discovery_skips_bots(pg, monkeypatch) -> None:
     assert pg.execute("SELECT old_id,new_id FROM p2p_open_id_changes").fetchall() == [
         {"old_id": "ou_person", "new_id": "ou_other_person"}
     ]
+    assert summary_scopes[-1] == (job.authorization_id, ['oc_person']) and len(summary_scopes) == 2
     pg.execute("DELETE FROM p2p_open_id_changes")
 
     client.target_id, client.target_type = "cli_bot", "bot"
@@ -308,6 +363,22 @@ def test_p2p_contact_discovery_skips_bots(pg, monkeypatch) -> None:
     ).fetchone() == {"p2p_counterpart_open_id": None, "p2p_counterpart_seen_at": None}
     assert pg.execute("SELECT contact_id FROM lark_identities WHERE open_id='ou_person'").fetchone()[
         "contact_id"] == contact_id
+    assert len(summary_scopes) == 3
+    pg.execute("INSERT INTO chats(chat_id) VALUES('oc_members_later')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'oc_members_later')",
+               (job.authorization_id,))
+    other_cm = UUID(int=3)
+    pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,'ou_shared_cm','test')",
+               (other_cm,))
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'oc_members_later')",
+               (other_cm,))
+    measured = worker.MemberSnapshotMeasurement(1, 'succeeded', 'succeeded', worker.datetime.now(worker.UTC),
+        ({'open_id': 'ou_member_later', 'tenant_key': None, 'member_type': 'user'},))
+    for cm in (job.authorization_id, other_cm):
+        worker._store_member_snapshot(pg, cm, 'oc_members_later',
+                                      measured, measured.checked_at, set())
+    assert summary_scopes[3:] == [(job.authorization_id, ['oc_members_later']),
+                                  (other_cm, ['oc_members_later'])]
 
 
 def test_token_refresh_records_actual_scope_without_inventing_missing_grants(pg, monkeypatch):

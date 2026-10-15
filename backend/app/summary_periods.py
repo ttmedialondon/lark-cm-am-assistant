@@ -80,6 +80,50 @@ def seed_due(conn, now):
                  (now + timedelta(minutes=15),))
 
 
+def touch_chats(conn, authorization_id, chat_ids, *, message_ids=None):
+    """Coalesce newly readable material under the caller's existing sync-material lock."""
+    if not chat_ids or message_ids is not None and not message_ids:
+        return 0
+    # Include the existing seven-day context of the seven visible report dates.
+    queued = conn.execute("""WITH material AS MATERIALIZED (
+        SELECT ac.chat_id,a.id AS authorization_id,a.body_consent_at,ac.p2p_counterpart_open_id
+        FROM authorization_chats ac JOIN authorizations a ON a.id=ac.authorization_id
+        JOIN chats c ON c.chat_id=ac.chat_id
+        WHERE a.id=%s AND a.status='active' AND a.body_consent_at IS NOT NULL
+          AND """ + summaries.BODY_READ_SCOPE_SQL + """
+          AND ac.chat_id=ANY(%s::text[]) AND ac.is_visible AND ac.sync_enabled
+          AND ac.sync_status IS DISTINCT FROM 'not_readable' AND COALESCE(c.chat_status,'normal')='normal'
+          AND EXISTS(SELECT 1 FROM chat_messages m WHERE m.chat_id=ac.chat_id
+            AND NOT m.is_deleted AND m.body_ciphertext IS NOT NULL
+            AND m.message_type IN ('text','post','share_chat','share_user','interactive','merge_forward','image','file')
+            AND (%s::text[] IS NULL OR m.message_id=ANY(%s::text[]))
+            AND m.message_create_time>=((NOW() AT TIME ZONE 'Europe/London')::date-13)::timestamp
+                AT TIME ZONE 'Europe/London' AND m.message_create_time<NOW()
+            AND EXISTS(SELECT 1 FROM authorization_message_observations o
+              WHERE o.authorization_id=a.id AND o.chat_id=m.chat_id AND o.message_id=m.message_id
+                AND o.observed_at>=a.body_consent_at OFFSET 0))
+        ) INSERT INTO offhours_summary_backfills(contact_id,responsible_authorization_id,not_before)
+        SELECT DISTINCT x.contact_id,material.authorization_id,NOW()+INTERVAL '30 seconds'
+        FROM material JOIN contact_assignments x ON x.responsible_authorization_id=material.authorization_id
+          AND x.ended_at IS NULL
+        JOIN contact_roles r ON r.contact_id=x.contact_id AND r.role='creator' AND r.status='confirmed'
+        WHERE EXISTS(SELECT 1 FROM lark_identities i WHERE i.contact_id=x.contact_id AND i.identity_type='user' AND (
+          i.open_id=material.p2p_counterpart_open_id OR EXISTS(
+            SELECT 1 FROM chat_members member WHERE member.chat_id=material.chat_id
+              AND member.open_id=i.open_id AND member.member_type='user') OR EXISTS(
+            SELECT 1 FROM chat_messages own
+            WHERE own.chat_id=material.chat_id AND own.sender_open_id=i.open_id
+              AND NOT own.is_deleted AND own.body_ciphertext IS NOT NULL
+              AND EXISTS(SELECT 1 FROM authorization_message_observations observed
+                WHERE observed.chat_id=own.chat_id AND observed.message_id=own.message_id
+                  AND observed.authorization_id=material.authorization_id
+                  AND observed.observed_at>=material.body_consent_at OFFSET 0))))
+        ORDER BY x.contact_id,material.authorization_id
+        ON CONFLICT(contact_id,responsible_authorization_id) DO NOTHING RETURNING contact_id""",
+        (authorization_id, sorted(set(chat_ids)), message_ids, message_ids)).fetchall()
+    return len(queued)
+
+
 def backfill_due(conn, now):
     """Consume one durable admission signal without reopening unrelated old reports."""
     state = conn.execute("SELECT recurring_enabled FROM offhours_summary_settings WHERE id").fetchone()
