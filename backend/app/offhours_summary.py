@@ -355,14 +355,16 @@ def _related_chats(conn, roster, *, settings=None, cm_id=REMI_ID):
         person = identities.get(chat["p2p_counterpart_open_id"])
         if person is not None:
             chat["contact_ids"].add(person)
+    # OFFSET 0 keeps the consent lookup correlated instead of scanning every CM observation first.
     related = conn.execute(
         """SELECT chat_id,open_id FROM chat_members
            WHERE chat_id=ANY(%s::text[]) AND open_id=ANY(%s::text[])
              AND member_type='user'
            UNION
            SELECT m.chat_id,m.sender_open_id FROM chat_messages m
-           JOIN authorization_message_observations o USING(chat_id,message_id)
-           WHERE o.authorization_id=%s AND o.observed_at>=%s
+           WHERE EXISTS(SELECT 1 FROM authorization_message_observations o
+             WHERE o.authorization_id=%s AND o.observed_at>=%s
+               AND o.chat_id=m.chat_id AND o.message_id=m.message_id OFFSET 0)
              AND m.chat_id=ANY(%s::text[]) AND m.sender_open_id=ANY(%s::text[])
              AND NOT m.is_deleted AND m.body_ciphertext IS NOT NULL""",
         (list(chats), list(identities), cm_id, cm["body_consent_at"], list(chats), list(identities)),

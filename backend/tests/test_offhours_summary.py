@@ -788,6 +788,33 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
     view = ai.get_summary_view(pg, s.ids["owner"])
     assert not any(ref["chat_id"] == "group_ai" for event in view["events"] for ref in event["evidence"])
 
+    # Historical speech can connect a group without a member snapshot, but only
+    # through this CM's current-consent observations of live readable messages.
+    consent = cm["body_consent_at"]
+    for kind in ("valid", "other_cm", "old_consent", "deleted", "no_body"):
+        chat = "history_" + kind
+        pg.execute("INSERT INTO chats(chat_id,chat_mode) VALUES(%s,'group')", (chat,))
+        pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,%s)",
+                   (s.ids["cm"], chat))
+        observer = s.ids["reviewer"] if kind == "other_cm" else s.ids["cm"]
+        if kind == "other_cm":
+            pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,%s)",
+                       (observer, chat))
+        for index in range(2 if kind == "valid" else 1):
+            message = f"{chat}_{index}"
+            pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,
+                body_ciphertext,message_create_time,is_deleted) VALUES(%s,%s,'ou_person','text',%s,%s,%s)""",
+                (chat, message, None if kind == "no_body" else s.cipher.encrypt('{"text":"Old update"}'),
+                 s.start - timedelta(days=8), kind == "deleted"))
+            pg.execute("""INSERT INTO authorization_message_observations(
+                authorization_id,chat_id,message_id,observed_at) VALUES(%s,%s,%s,%s)""",
+                (observer, chat, message,
+                 consent - timedelta(seconds=1) if kind == "old_consent" else datetime.now(UTC)))
+    historical = [chat for chat in ai._related_chats(pg, ai._roster(pg), settings=s.settings)
+                  if chat["chat_id"].startswith("history_")]
+    assert len(historical) == 1 and historical[0]["chat_id"] == "history_valid"
+    assert historical[0]["contact_ids"] == {s.ids["person"]}
+
 
 def test_current_acl_hides_already_generated_results(pg, seeded, monkeypatch):
     s = seeded
@@ -838,7 +865,7 @@ def test_current_acl_hides_already_generated_results(pg, seeded, monkeypatch):
     assert not view["events"] and view["run"]["counts"]["failed"] == 1
 
 
-def test_relevant_chats_are_filtered_before_limit(pg, seeded):
+def test_relevant_chats_are_filtered_before_limit_and_merge_scopes_are_reused(pg, seeded, monkeypatch):
     s = seeded
     for i in range(301):
         chat = f"aaa-unrelated-{i}"
@@ -846,6 +873,32 @@ def test_relevant_chats_are_filtered_before_limit(pg, seeded):
         pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,%s)", (s.ids["cm"], chat))
     assert s.save()["queued"] == 1
     assert ai.claim_next_summary()["chat_id"] == "chat"
+    run = pg.execute("SELECT r.* FROM offhours_summary_runs r JOIN offhours_summary_settings s "
+                     "ON s.run_id=r.id").fetchone()
+    second = uuid4()
+    pg.execute("UPDATE offhours_summary_settings SET recurring_enabled=TRUE")
+    pg.execute("""INSERT INTO offhours_summary_runs(id,requested_by_authorization_id,
+        responsible_authorization_id,window_start,window_end,report_date,period,coverage)
+        VALUES(%s,%s,%s,%s,%s,%s,'work',%s::jsonb)""",
+        (second, s.ids["owner"], s.ids["cm"], run["window_start"], run["window_end"],
+         datetime.now(ai.LONDON).date(), json.dumps(run["coverage"])))
+    pg.execute("""INSERT INTO offhours_summary_tasks(id,run_id,chat_id,input_fingerprint,cutoff)
+        SELECT gen_random_uuid(),%s,chat_id,input_fingerprint,cutoff
+        FROM offhours_summary_tasks WHERE run_id=%s AND chat_id IS NOT NULL""", (second, run["id"]))
+    scopes = []
+    related = ai._related_chats
+
+    def related_once(*args, **kwargs):
+        value = related(*args, **kwargs)
+        scopes.append(value)
+        return value
+
+    monkeypatch.setattr(ai, "_related_chats", related_once)
+    summary_dialogues.schedule_merges(pg, s.settings)
+    assert len(scopes) == 1 and {chat["chat_id"] for chat in scopes[0]} == {"chat"}
+    pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE chat_id='chat'")
+    summary_dialogues.schedule_merges(pg, s.settings)
+    assert len(scopes) == 2 and scopes[-1] == []
 
 
 def test_open_window_watermark_refresh_does_not_invalidate_identical_pack(pg, seeded):

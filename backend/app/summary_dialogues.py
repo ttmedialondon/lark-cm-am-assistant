@@ -154,6 +154,8 @@ def _blocked_people(chats, tasks, *, material_chats=()):
 
 def schedule_merges(conn, settings):
     inserted = 0
+    # The material lock keeps each CM's source scope stable for this scheduling pass.
+    related_scopes = {}
     runs = conn.execute(
         """SELECT r.* FROM offhours_summary_runs r LEFT JOIN offhours_summary_settings s ON s.id
         JOIN ai_feature_configs cfg ON cfg.feature=CASE WHEN r.origin='assistant'
@@ -178,12 +180,14 @@ def schedule_merges(conn, settings):
             (run["id"],),
         ).fetchall()
         blocked = set()
-        roster, chats = None, None
+        cm_id = run["responsible_authorization_id"]
+        roster, chats = related_scopes.get(cm_id, (None, None))
         material_chats = (run.get('coverage') or {}).get('material_chats', [])
         if material_chats or any(task["status"] != "succeeded" for task in tasks):
-            roster = core._roster(conn, run["responsible_authorization_id"])
-            chats = core._related_chats(conn, roster, settings=settings,
-                                       cm_id=run["responsible_authorization_id"])
+            if roster is None:
+                roster = core._roster(conn, cm_id)
+                chats = core._related_chats(conn, roster, settings=settings, cm_id=cm_id)
+                related_scopes[cm_id] = roster, chats
             blocked = _blocked_people(chats, tasks, material_chats=material_chats)
         people = {}
         for task in tasks:
@@ -205,9 +209,9 @@ def schedule_merges(conn, settings):
         cancelled_sources = [task for task in tasks if task['status'] == 'cancelled']
         if candidates or cancelled_sources:
             if roster is None:
-                roster = core._roster(conn, run['responsible_authorization_id'])
-                chats = core._related_chats(conn, roster, settings=settings,
-                                           cm_id=run['responsible_authorization_id'])
+                roster = core._roster(conn, cm_id)
+                chats = core._related_chats(conn, roster, settings=settings, cm_id=cm_id)
+                related_scopes[cm_id] = roster, chats
             current_people = {str(row['contact_id']) for row in roster}
             related = {chat['chat_id']: chat for chat in chats}
             blocked.update(set(candidates) - current_people)

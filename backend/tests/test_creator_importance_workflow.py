@@ -190,6 +190,31 @@ def test_history_coverage_requires_successful_full_sync(pg, ranking_flow, missin
     assert not flow.calls
 
 
+def test_history_batches_yield_to_other_waiting_jobs(pg, ranking_flow):
+    flow = ranking_flow
+    flow.enable()
+    pg.execute("""UPDATE creator_importance_jobs SET created_at=NOW()-CASE
+        WHEN responsible_authorization_id=%s THEN INTERVAL '7 days' ELSE INTERVAL '1 day' END""", (flow.owner,))
+    flow.due()
+    assert importance.prepare_next(flow.settings)
+    first = importance.claim()
+    assert first and first["responsible_authorization_id"] == flow.owner
+    importance.run(first, flow.settings)
+    assert pg.execute("SELECT status,reason_code FROM creator_importance_jobs WHERE id=%s",
+                      (first["id"],)).fetchone() == {"status": "queued", "reason_code": "next_batch"}
+
+    assert importance.prepare_next(flow.settings)
+    assert pg.execute("SELECT status FROM creator_importance_jobs WHERE id=%s",
+                      (first["id"],)).fetchone()["status"] == "queued"
+    assert importance.prepare_next(flow.settings)
+    # Both are ready, but the older job's next batch must not jump the CM already waiting.
+    following = importance.claim()
+    assert following and following["responsible_authorization_id"] == flow.other
+    importance.run(following, flow.settings)
+    flow.drain()
+    assert pg.execute("SELECT count(*) n FROM creator_importance_jobs WHERE status<>'completed'").fetchone()["n"] == 0
+
+
 def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_flow):
     flow = ranking_flow
     assert not importance.prepare_next(flow.settings) and importance.claim() is None
