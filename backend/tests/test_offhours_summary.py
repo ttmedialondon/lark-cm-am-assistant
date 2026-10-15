@@ -2024,7 +2024,23 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
             legacy = ai._hash(summary_dialogues._source_hashes(saved_run, relevant))
             pg.execute("UPDATE offhours_summary_tasks SET input_fingerprint=%s,created_at=NOW()-INTERVAL '1 minute' "
                        'WHERE id=%s', (legacy, old['id']))
-        assert summary_dialogues.schedule_merges(pg, s.settings, run_ids=[saved_run['id']]) == 0
+        material, decrypt = summary_dialogues._person_material, summary_dialogues.decode
+        checkpoints = {row['checkpoint_ciphertext'] for row in old_merges}
+        work = {'personal_material': 0, 'completed_checkpoint': 0}
+
+        def measured_material(*args, **kwargs):
+            work['personal_material'] += 1
+            return material(*args, **kwargs)
+
+        def measured_decode(value, settings):
+            work['completed_checkpoint'] += value in checkpoints
+            return decrypt(value, settings)
+
+        with monkeypatch.context() as measured:
+            measured.setattr(summary_dialogues, '_person_material', measured_material)
+            measured.setattr(summary_dialogues, 'decode', measured_decode)
+            assert summary_dialogues.schedule_merges(pg, s.settings, run_ids=[saved_run['id']]) == 0
+        assert work == {'personal_material': 0, 'completed_checkpoint': 0}
         paid = next(row for row in old_merges if row['contact_id'] == s.ids['person'])
         assert summary_dialogues.decode(paid['checkpoint_ciphertext'], s.settings)['receipts']
         pg.execute("UPDATE offhours_summary_tasks SET status='queued' WHERE id=%s", (paid['id'],))

@@ -629,6 +629,16 @@ def prepare_next(settings):
                          "WHERE id=%s",
                          (job["id"],))
             return True
+        # A topology reset must not erase the paid batch's unknown outcome and restart its history.
+        if not job["pack_ciphertext"] and job["needs_history"] and job["cursor_time"] is None:
+            receipt = conn.execute("""SELECT (error_code='request_unknown' OR finished_at IS NULL)
+                AND NOT(error_code='' AND response_ciphertext IS NOT NULL) AS unknown
+                FROM creator_importance_requests WHERE job_id=%s ORDER BY created_at DESC,id DESC LIMIT 1""",
+                (job["id"],)).fetchone()
+            if receipt and receipt["unknown"]:
+                conn.execute("""UPDATE creator_importance_jobs SET status='failed',reason_code='request_unknown',
+                    claim_token=NULL,lease_until=NULL,finished_at=NOW(),updated_at=NOW() WHERE id=%s""", (job["id"],))
+                return True
         # New-message signals may wake a paused job; finish its frozen paid batch before preparing new material.
         if (job["reason_code"] == "rules_unavailable" and job["pack_ciphertext"]
                 and job["snapshot_version"] == job["desired_version"]):

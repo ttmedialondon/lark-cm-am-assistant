@@ -200,14 +200,17 @@ def schedule_merges(conn, settings, *, run_ids=None):
             for user in result["users"].values():
                 people.setdefault(user["contact_id"], []).append(task)
         existing_merges = {str(row['contact_id']): row for row in conn.execute(
-            "SELECT id,contact_id,input_fingerprint,status,error_message,checkpoint_ciphertext,created_at,"
+            "SELECT id,contact_id,input_fingerprint,status,error_message,created_at,"
+            "CASE WHEN status='succeeded' THEN NULL ELSE checkpoint_ciphertext END AS checkpoint_ciphertext,"
             "event_rules_ciphertext,event_rules_digest "
             "FROM offhours_summary_tasks "
             "WHERE run_id=%s AND is_current AND contact_id IS NOT NULL", (run['id'],),
         ).fetchall()}
-        fingerprints = {person: _merge_fingerprint(run, sources, person, settings, saved_sources)
-                        for person, sources in people.items()}
         legacy = {person: core._hash(_source_hashes(run, sources)) for person, sources in people.items()}
+        fingerprints = {person: legacy[person] if (existing_merges.get(person, {}).get('status') == 'succeeded'
+                            and existing_merges[person]['input_fingerprint'] == legacy[person])
+                        else _merge_fingerprint(run, sources, person, settings, saved_sources)
+                        for person, sources in people.items()}
         held = {person for person, task in existing_merges.items() if task['status'] == 'running'
                 or (task.get('error_message') or '').startswith('请求结果未知')}
         progress_by_person = {}

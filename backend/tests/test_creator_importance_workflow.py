@@ -640,17 +640,20 @@ def test_paid_retry_cache_and_stale_results_keep_billing_without_repeat(pg, rank
     pg.execute("UPDATE creator_importance_jobs SET status='cancelled' WHERE responsible_authorization_id=%s",
                (flow.other,))
     assert not importance.prepare_next(flow.settings) and importance.claim() is None
-    # A metadata-only edit clears the old job pack via the source-reset trigger, not the old request ledger.
-    source = last["material"]["sources"][0]
-    pg.execute("UPDATE chat_messages SET message_update_time=NOW() WHERE chat_id=%s AND message_id=%s",
-               (source["chat_id"], source["message_id"]))
-    pg.execute("UPDATE creator_importance_jobs SET status='cancelled' WHERE responsible_authorization_id=%s",
-               (flow.other,))
-    for _ in range(20):
-        flow.due()
-        if not importance.prepare_next(flow.settings):
-            break
-        assert importance.claim() is None and len(flow.calls) == calls
+    # A real topology reset loses the frozen batch; it must not repay earlier history to rediscover the unknown.
+    pg.execute("UPDATE creator_importance_requests SET material_fingerprint=%s,created_at=NOW()+INTERVAL '1 second' "
+               "WHERE id=%s", (importance._hash(last["material"]["pack"]), last["reservation_id"]))
+    receipts = pg.execute("SELECT * FROM creator_importance_requests ORDER BY id").fetchall()
+    pg.execute("SELECT enqueue_creator_importance(%s,%s,TRUE)", (flow.person, flow.owner))
+    reset = pg.execute("SELECT * FROM creator_importance_jobs WHERE id=%s", (last["id"],)).fetchone()
+    assert reset["status"] == "queued" and reset["reason_code"] == "source_changed"
+    assert reset["needs_history"] and not reset["pack_ciphertext"] and reset["cursor_time"] is None
+    with monkeypatch.context() as patch:
+        patch.setattr(importance, "build_batch", lambda *_args: pytest.fail("unknown reset restarted history"))
+        assert importance.prepare_next(flow.settings)
+    assert importance.claim() is None and len(flow.calls) == calls
+    assert not importance.prepare_next(flow.settings)
+    assert pg.execute("SELECT * FROM creator_importance_requests ORDER BY id").fetchall() == receipts
     assert pg.execute("SELECT status,reason_code FROM creator_importance_jobs WHERE id=%s",
                       (last["id"],)).fetchone() == {"status": "failed", "reason_code": "request_unknown"}
     # An HTTP 200 with incomplete model output is still billed, but must not publish facts or retry.

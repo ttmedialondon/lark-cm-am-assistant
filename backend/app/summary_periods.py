@@ -197,7 +197,7 @@ def backfill_due(conn, now):
                 waiting_sync |= any(not summaries._covers_window(chat, start, end) for chat in affected)
     from . import summary_dialogues
 
-    summary_dialogues.schedule_merges(conn, summaries.get_settings())
+    summary_dialogues.schedule_merges(conn, summaries.get_settings(), run_ids=run_ids)
     deferred |= bool(conn.execute("""SELECT 1 FROM offhours_summary_runs r WHERE r.id=ANY(%s::uuid[]) AND (
         EXISTS(SELECT 1 FROM offhours_summary_tasks t WHERE t.run_id=r.id AND t.contact_id=%s
             AND t.is_current AND t.status IN ('queued','running')) OR (
