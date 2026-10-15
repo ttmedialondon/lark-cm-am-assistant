@@ -227,6 +227,49 @@ def test_personnel_counts_preserve_deleted_hidden_and_paginated_scope(pg, monkey
     assert admin_reporting.message_users(source_ids=[])["items"] == []
     assert {item["id"] for item in admin_reporting.message_users(source_ids=[actor, other])["items"]} == {actor, other}
 
+    joined = datetime.now(UTC) - timedelta(days=3)
+    pg.execute("UPDATE authorizations SET authorized_at=%s,body_consent_at=%s WHERE id=%s",
+               (joined, joined, actor))
+    pg.execute("INSERT INTO sync_jobs(id,authorization_id,mode,status,discovery_status) "
+               "VALUES(%s,%s,'backfill','running','succeeded')", (uuid4(), actor))
+
+    def reported():
+        rows = [admin_reporting.users(query="Reporting")["items"][0],
+                admin_reporting.user_detail(actor, include_conversations=False, include_jobs=False)["user"],
+                next(row for row in admin_reporting.overview()["attention"] if row["id"] == actor)]
+        assert len({(row["sync_state_label"], row["sync_progress_label"]) for row in rows}) == 1
+        return rows[0]
+
+    assert reported()["sync_state_label"] == "首次准备中"
+    pg.execute("UPDATE authorization_chats SET sync_status='not_readable' WHERE chat_id='reporting_00'")
+    pg.execute("UPDATE authorization_chats SET sync_enabled=FALSE WHERE chat_id='reporting_01'")
+    pg.execute("UPDATE authorization_chats SET recent_coverage_start_at=NOW()-INTERVAL '7 days',"
+               "last_incremental_at=NOW() WHERE authorization_id=%s", (actor,))
+    ready = reported()
+    assert ready["sync_state_label"] == "补充历史中"
+    assert ready["sync_progress_label"] == "0 / 8" and ready["recent_ready_count"] == 8
+    assert ready["not_readable_conversation_count"] == 1
+    assert "1 个 Lark 未允许读取" in ready["sync_state_detail"]
+    old_job = uuid4()
+    pg.execute("INSERT INTO sync_jobs(id,authorization_id,mode,status,created_at,finished_at) "
+               "VALUES(%s,%s,'incremental','succeeded',%s,%s)",
+               (old_job, actor, joined, joined + timedelta(hours=1)))
+    pg.execute("UPDATE authorizations SET body_consent_at=%s WHERE id=%s", (joined + timedelta(days=1), actor))
+    pg.execute("UPDATE authorization_chats SET recent_coverage_start_at=NULL,last_incremental_at=NULL "
+               "WHERE authorization_id=%s", (actor,))
+    assert reported()["sync_state_label"] == "重新授权后更新"
+    pg.execute("UPDATE sync_jobs SET finished_at=NOW() WHERE id=%s", (old_job,))
+    assert reported()["sync_state_label"] == "补充历史中"
+    pg.execute("UPDATE authorization_chats SET backfill_complete=TRUE WHERE authorization_id=%s "
+               "AND sync_enabled AND sync_status<>'not_readable'", (actor,))
+    completed = reported()
+    assert completed["sync_state_label"] == "已接入（部分不可读）"
+    assert completed["sync_progress_label"] == "8 / 8"
+    assert "不计入历史读取进度" in completed["sync_state_detail"]
+    assert admin_reporting.user_detail(actor)["jobs"]["items"][0]["mode_label"] == "历史读取"
+    assert admin_reporting.jobs()["items"][0]["mode_label"] == "历史读取"
+    assert admin_reporting.overview()["recent_jobs"][0]["mode_label"] == "历史读取"
+
 
 def test_contact_detail_skips_ungranted_conversation_queries(monkeypatch):
     calls = _empty_reporting_database(monkeypatch, {"contact_id": uuid4(), "tenant_key": None})

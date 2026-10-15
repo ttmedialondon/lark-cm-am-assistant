@@ -242,7 +242,8 @@ def test_named_frontend_testers_do_not_require_a_retired_admin_grant() -> None:
 
 
 
-def test_oauth_reauthorization_defers_creator_scans_for_a_large_existing_roster(pg, monkeypatch):  # noqa: F811
+@pytest.mark.parametrize("reconnect", ("login", "revoked", "read_scope", "consent"))
+def test_oauth_login_preserves_roster_and_real_reconnection_defers_scans(pg, monkeypatch, reconnect):  # noqa: F811
     scopes = ("offline_access", "im:chat:read", "im:message:readonly", "im:chat.members:read")
     settings = Settings(
         database_url="fixture", lark_app_id="fixture-app", lark_app_secret="fixture-secret",
@@ -287,6 +288,19 @@ def test_oauth_reauthorization_defers_creator_scans_for_a_large_existing_roster(
         pg.execute(f"CREATE OR REPLACE FUNCTION {signature} RETURNS {return_type} LANGUAGE plpgsql "
                    "AS $$ BEGIN RAISE EXCEPTION 'creator scan ran inside OAuth'; END $$")
 
+    if reconnect == "revoked":
+        pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (actor,))
+    elif reconnect == "read_scope":
+        pg.execute("UPDATE authorizations SET scopes=array_remove(scopes,'im:message:readonly') WHERE id=%s", (actor,))
+    elif reconnect == "consent":
+        pg.execute("UPDATE authorizations SET body_consent_at=NULL WHERE id=%s", (actor,))
+    previous_rescan = pg.execute("SELECT * FROM creator_authorization_rescans WHERE authorization_id=%s",
+                                 (actor,)).fetchone()
+    previous_chats = pg.execute("SELECT * FROM authorization_chats WHERE authorization_id=%s ORDER BY chat_id",
+                                (actor,)).fetchall()
+    previous_job = pg.execute("SELECT * FROM sync_jobs WHERE id=%s", (job,)).fetchone()
+    previous_consent = pg.execute("SELECT body_consent_at FROM authorizations WHERE id=%s", (actor,)).fetchone()
+
     class FakeLark:
         def __init__(self, received):
             assert received == settings
@@ -321,10 +335,27 @@ def test_oauth_reauthorization_defers_creator_scans_for_a_large_existing_roster(
     assert not pg.execute("SELECT 1 FROM oauth_states").fetchone()
     pending = pg.execute("SELECT * FROM creator_authorization_rescans WHERE authorization_id=%s",
                          (actor,)).fetchone()
-    assert pending["generation"] == 8 and pending["stage"] == "importance"
+    chats = pg.execute("SELECT * FROM authorization_chats WHERE authorization_id=%s ORDER BY chat_id",
+                       (actor,)).fetchall()
+    queued = pg.execute("SELECT * FROM sync_jobs WHERE id=%s", (job,)).fetchone()
+    if reconnect == "login":
+        assert pending == previous_rescan and chats == previous_chats and queued == previous_job
+        assert pg.execute("SELECT body_consent_at FROM authorizations WHERE id=%s",
+                          (actor,)).fetchone() == previous_consent
+        assert pg.execute("SELECT action FROM audit_events WHERE authorization_id=%s",
+                          (actor,)).fetchone()["action"] == "oauth_login"
+        old_state = uuid4().hex
+        pg.execute("""INSERT INTO oauth_states(state_hash,code_verifier_ciphertext,expires_at,created_at)
+            VALUES(%s,%s,NOW()+INTERVAL '10 minutes',NOW()-INTERVAL '1 minute')""",
+            (main._sha256(old_state), cipher.encrypt("older-verifier")))
+        rejected = client.get("/auth/lark/callback", params={"state": old_state, "code": "fixture-code"},
+            headers={"cookie": f"{main.OAUTH_STATE_COOKIE}={old_state}"}, follow_redirects=False)
+        assert rejected.status_code == 409
+        assert pg.execute("SELECT * FROM sync_jobs WHERE id=%s", (job,)).fetchone() == previous_job
+        return
+    assert pending["generation"] == previous_rescan["generation"] + 1 and pending["stage"] == "importance"
     assert pending["contact_cursor"] is pending["chat_cursor"] is None
     assert pending["last_error_code"] == "" and pending["not_before"] <= datetime.now(UTC)
-    chats = pg.execute("SELECT * FROM authorization_chats WHERE authorization_id=%s", (actor,)).fetchall()
     assert len(chats) == 2933
     for chat in chats:
         assert chat["sync_generation"] == 18 and not chat["backfill_complete"]
@@ -332,7 +363,6 @@ def test_oauth_reauthorization_defers_creator_scans_for_a_large_existing_roster(
         assert chat["recent_coverage_start_at"] is None
         assert all(chat[field] is None for field in ("backfill_page_token", "incremental_page_token",
                                                     "incremental_job_id", "member_snapshot_checked_at"))
-    queued = pg.execute("SELECT * FROM sync_jobs WHERE id=%s", (job,)).fetchone()
     assert queued["status"] == "queued" and queued["mode"] == "backfill" and queued["discovery_generation"] == 10
 
 
@@ -510,7 +540,7 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
                  upgrade_scopes, actor),
                 ({"send": "1", "media": "1", "account_id": str(actor)},
                  tuple(dict.fromkeys((*upgrade_scopes, "im:resource"))), actor),
-                ({}, scopes, None),
+                ({}, tuple(dict.fromkeys((*scopes, *current["scopes"]))), None),
             ):
                 response = client.get("/auth/lark/start", params=params, follow_redirects=False)
                 assert response.status_code == 303
@@ -616,10 +646,7 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
     provider = upgraded["identity_profile_providers"][0]
     assert provider["scopes"] == list(upgrade_scopes)
     assert provider["status"] == "pending" and provider["error_code"] is None
-    if send:
-        assert upgraded["sync_jobs"] == original["sync_jobs"]
-    else:
-        assert upgraded["sync_jobs"][0]["id"] == job and upgraded["sync_jobs"][0]["mode"] == "incremental"
+    assert upgraded["sync_jobs"] == original["sync_jobs"]
     session = response.cookies[main.SESSION_COOKIE]
     assert upgraded["web_sessions"][0]["session_hash"] == main._sha256(session)
     assert upgraded["web_sessions"][0]["authorization_id"] == actor
@@ -640,16 +667,13 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
     assert ordinary_response.status_code == 303
     ordinary = snapshot()
     assert ordinary["authorizations"][0]["id"] == actor and ordinary["admin_roles"] == original["admin_roles"]
-    assert ordinary["authorizations"][0]["body_consent_at"] > auth["body_consent_at"]
-    assert ordinary["authorizations"][0]["p2p_discovery_status"] == "pending"
-    assert ordinary["authorizations"][0]["p2p_last_checked_at"] is None
-    assert ordinary["authorizations"][0]["p2p_last_error"] is None
-    for current, previous in zip(ordinary["authorization_chats"], original["authorization_chats"], strict=True):
-        assert current["sync_generation"] == previous["sync_generation"] + 1 and not current["backfill_complete"]
-        assert current["sync_status"] == current["member_snapshot_status"] == "pending"
-        for field in ("backfill_page_token", "incremental_page_token", "backfill_window_start_at",
-                      "backfill_window_end_at", "incremental_job_id", "incremental_window_start_at",
-                      "incremental_window_end_at", "page_claim_id", "page_claim_job_id", "page_claim_mode",
-                      "page_claimed_at", "page_lease_until", "member_snapshot_checked_at"):
-            assert current[field] is None
-    assert ordinary["sync_jobs"][0]["mode"] == "backfill" and len(ordinary["web_sessions"]) == 2
+    for field in ("body_consent_at", "p2p_discovery_status", "p2p_last_checked_at", "p2p_last_error"):
+        assert ordinary["authorizations"][0][field] == auth[field]
+    assert ordinary["authorization_chats"] == original["authorization_chats"]
+    assert ordinary["sync_jobs"] == original["sync_jobs"] and len(ordinary["web_sessions"]) == 2
+    assert any(row["action"] == "oauth_login" for row in ordinary["audit_events"])
+    pg.execute("UPDATE sync_jobs SET status='attention_required',lease_until=NULL WHERE id=%s", (job,))
+    assert callback(state(fresh=True, upgraded=False), "ordinary").status_code == 303
+    assert pg.execute("SELECT mode,status FROM sync_jobs WHERE id<>%s", (job,)).fetchone() == {
+        "mode": "incremental", "status": "queued"}
+    assert snapshot()["authorization_chats"] == original["authorization_chats"]

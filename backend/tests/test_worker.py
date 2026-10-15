@@ -296,14 +296,16 @@ def test_token_refresh_records_actual_scope_without_inventing_missing_grants(pg,
         pg.execute("UPDATE authorizations SET status='active',access_token_expires_at=NOW()-INTERVAL '1 hour' "
                    "WHERE id=%s", (actor,))
         client.scope = scope
+        snapshot = worker._authorization(actor)
         if scope is not None and not worker.BODY_READ_SCOPES.issubset(expected):
             with pytest.raises(worker.ReauthorizationRequired):
-                worker._usable_access_token(actor, worker._authorization(actor), client,
+                worker._usable_access_token(actor, snapshot, client,
                                             SimpleNamespace(token_encryption_key=key))
         else:
-            assert worker._usable_access_token(actor, worker._authorization(actor), client,
+            assert worker._usable_access_token(actor, snapshot, client,
                                                SimpleNamespace(token_encryption_key=key)) == f"access-{client.calls}"
         row = pg.execute("SELECT * FROM authorizations WHERE id=%s", (actor,)).fetchone()
+        assert snapshot["access_token_ciphertext"] == row["access_token_ciphertext"]
         assert row["scopes"] == expected and row["body_consent_at"] == consent
         assert row["status"] == ("active" if scope is None or worker.BODY_READ_SCOPES.issubset(expected)
                                  else "attention_required")
@@ -321,6 +323,53 @@ def test_token_refresh_records_actual_scope_without_inventing_missing_grants(pg,
     row = pg.execute("SELECT * FROM authorizations WHERE id=%s", (actor,)).fetchone()
     assert row["status"] == "active" and row["body_consent_at"] == consent
     assert row["scopes"] == before["scopes"] and row["refresh_token_ciphertext"] == before["refresh_token_ciphertext"]
+
+
+def test_old_credential_failures_retry_without_revoking_new_login(pg, monkeypatch):
+    monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
+    settings = SimpleNamespace(sync_lookback_days=0, sync_overlap_seconds=600, sync_interval_seconds=300,
+                               lark_sync_per_authorization_max_inflight=2)
+    monkeypatch.setattr(worker, "get_settings", lambda: settings)
+    error = worker.LarkApiError(401, 99991668, "Expired fixture token")
+    for mode in ("page", "discovery", "unknown_credential"):
+        actor, job_id = uuid4(), uuid4()
+        pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) VALUES(%s,%s,'old-token')",
+                   (actor, "ou_credential_" + mode))
+        pg.execute("""INSERT INTO sync_jobs(id,authorization_id,mode,status,discovery_status,discovery_generation)
+            VALUES(%s,%s,'backfill','running',%s,3)""",
+            (job_id, actor, "succeeded" if mode == "page" else "running"))
+        job = worker.SyncJob(job_id, actor, "backfill", 0, "succeeded" if mode == "page" else "running", 3)
+        if mode == "page":
+            pg.execute("INSERT INTO chats(chat_id) VALUES('oc_credential_page')")
+            pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id,backfill_page_token) "
+                       "VALUES(%s,'oc_credential_page','history-page-2')", (actor,))
+            claim = worker._claim_next_page(job, worker._authorization(actor), settings)
+            assert claim.access_token_ciphertext == "old-token" and "old-token" not in repr(claim)
+        pg.execute("UPDATE authorizations SET access_token_ciphertext='new-token' WHERE id=%s", (actor,))
+        if mode == "page":
+            worker._handle_claim_api_error(claim, error)
+            page = pg.execute("SELECT * FROM authorization_chats WHERE authorization_id=%s", (actor,)).fetchone()
+            assert page["page_claim_id"] is None and page["backfill_page_token"] == "history-page-2"
+            assert not page["backfill_complete"]
+        else:
+            worker._handle_job_api_error(job, error, discovery=True,
+                                        access_token_ciphertext=None if mode == "unknown_credential" else "old-token")
+        assert worker._authorization(actor)["status"] == "active"
+        pending = pg.execute("SELECT * FROM sync_jobs WHERE id=%s", (job_id,)).fetchone()
+        assert pending["status"] == ("running" if mode == "page" else "queued")
+        assert pending["discovery_generation"] == (3 if mode == "page" else 4)
+        # An error using the replacement credential still stops the account normally.
+        if mode == "page":
+            current = worker._claim_next_page(job, worker._authorization(actor), settings)
+            assert current.access_token_ciphertext == "new-token"
+            worker._handle_claim_api_error(current, error)
+        else:
+            pg.execute("UPDATE sync_jobs SET status='running',discovery_status='running' WHERE id=%s", (job_id,))
+            current = worker.SyncJob(job_id, actor, "backfill", 1, "running", 4)
+            worker._handle_job_api_error(current, error, discovery=True, access_token_ciphertext="new-token")
+        assert worker._authorization(actor)["status"] == "attention_required"
+        assert pg.execute("SELECT status FROM sync_jobs WHERE id=%s", (job_id,)).fetchone()[
+            "status"] == "attention_required"
 
 
 def test_member_snapshot_follows_lark_pagination_and_keeps_member_facts() -> None:
@@ -603,6 +652,20 @@ def test_authorization_rescan_failure_retries_and_cannot_back_off_a_new_generati
     pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'oc_retry')", (actor,))
     pg.execute("DELETE FROM rescan_calls")
     pg.execute("INSERT INTO creator_authorization_rescans(authorization_id,stage) VALUES(%s,'chats')", (actor,))
+    existing = pg.execute("SELECT * FROM creator_authorization_rescans").fetchone()
+    pg.execute("""UPDATE authorizations SET scopes=scopes||ARRAY['im:message','im:message.send_as_user',
+        'im:resource','im:chat.members:read','contact:contact.base:readonly','contact:user.base:readonly']::text[]
+        WHERE id=%s""", (actor,))
+    assert pg.execute("SELECT * FROM creator_authorization_rescans").fetchone() == existing
+    pg.execute("UPDATE authorizations SET scopes=ARRAY(SELECT scope FROM unnest(scopes) scope ORDER BY scope DESC) "
+               "WHERE id=%s", (actor,))
+    assert pg.execute("SELECT * FROM creator_authorization_rescans").fetchone() == existing
+    pg.execute("SAVEPOINT read_scope_change")
+    pg.execute("UPDATE authorizations SET scopes=array_remove(scopes,'im:message:readonly') WHERE id=%s", (actor,))
+    assert pg.execute("SELECT generation FROM creator_authorization_rescans").fetchone()["generation"] == 2
+    pg.execute("UPDATE authorizations SET scopes=array_append(scopes,'im:message:readonly') WHERE id=%s", (actor,))
+    assert pg.execute("SELECT generation FROM creator_authorization_rescans").fetchone()["generation"] == 3
+    pg.execute("ROLLBACK TO SAVEPOINT read_scope_change")
     pg.execute("""CREATE OR REPLACE FUNCTION creator_handle_chat_signal(chat TEXT)
                RETURNS VOID LANGUAGE plpgsql AS $$ BEGIN
                  RAISE EXCEPTION 'private fixture body and token';
@@ -635,7 +698,7 @@ def test_authorization_rescan_failure_retries_and_cannot_back_off_a_new_generati
         connections += 1
         if connections == 2:
             # A new authorization arrives after rollback, before recording the old batch failure.
-            pg.execute("UPDATE authorizations SET scopes=array_append(scopes,'new-scope') WHERE id=%s", (actor,))
+            pg.execute("UPDATE authorizations SET body_consent_at=NOW() WHERE id=%s", (actor,))
         return nullcontext(pg)
 
     monkeypatch.setattr(creator_authorization_rescans, "connection", connection)
@@ -730,7 +793,7 @@ def test_authorization_rescan_serializes_workers_without_blocking_reauthorizatio
                     monkeypatch.setattr(creator_authorization_rescans, "connection", lambda: nullcontext(other))
                     assert not creator_authorization_rescans.prepare_next(SimpleNamespace())
                     other.execute("SET LOCAL lock_timeout='500ms'")
-                    other.execute("UPDATE authorizations SET scopes=array_append(scopes,'new-scope') WHERE id=%s",
+                    other.execute("UPDATE authorizations SET body_consent_at=NOW() WHERE id=%s",
                                   (actor,))
                     other.commit()
                 finally:

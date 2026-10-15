@@ -14,7 +14,7 @@
       <div class="alert alert-{{ user.sync_state_badge }} mt-3 mb-0" role="status"><strong>{{ user.sync_state_label }}</strong><span class="ms-2">{{ user.sync_state_detail }}</span></div>
       <div class="row row-cards mt-2">
         <div class="col-sm-6 col-lg-3"><div class="subheader">可同步会话</div><div class="h2">{{ user.syncable_conversation_count }}</div><div class="text-secondary small">群聊 {{ user.group_count }} · 私聊 {{ user.p2p_count }}</div></div>
-        <div class="col-sm-6 col-lg-3"><div class="subheader">首次回填</div><div class="h2">{{ user.sync_progress_label }}</div><div class="text-secondary small">群聊 {{ user.group_content_progress_label }} · 私聊 {{ user.p2p_content_progress_label }}</div></div>
+        <div class="col-sm-6 col-lg-3"><div class="subheader">历史读取</div><div class="h2">{{ user.sync_progress_label }}</div><div class="text-secondary small">群聊 {{ user.group_content_progress_label }} · 私聊 {{ user.p2p_content_progress_label }}</div></div>
         <div class="col-sm-6 col-lg-3"><div class="subheader">可见消息索引</div><div class="h2">{{ user.message_count }}</div><div class="text-secondary small">本人 {{ user.own_message_count }}</div></div>
         <div class="col-sm-6 col-lg-3"><div class="subheader">私聊目录</div><div class="h5 mb-1">{{ user.p2p_status_label }}</div></div>
       </div>

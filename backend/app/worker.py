@@ -8,7 +8,7 @@ import time
 import uuid
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -75,6 +75,7 @@ class PageClaim:
     end_at: datetime
     author_open_id: str
     body_consent_at: datetime | None
+    access_token_ciphertext: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -537,6 +538,7 @@ def _prepare_job(job: SyncJob, settings: Settings, client: LarkClient) -> None:
     current = _begin_discovery(job)
     if not current:
         return
+    authorization = None
     try:
         authorization = _authorization(current.authorization_id)
         if not authorization or authorization["status"] != "active":
@@ -554,9 +556,12 @@ def _prepare_job(job: SyncJob, settings: Settings, client: LarkClient) -> None:
     except StaleSyncJob:
         return
     except ReauthorizationRequired:
-        _mark_attention(current, "Lark authorization must be renewed.")
+        if not _mark_attention(current, "Lark authorization must be renewed.",
+                               access_token_ciphertext=(authorization or {}).get("access_token_ciphertext")):
+            _requeue(current, delay_seconds=0, reset_discovery=True)
     except LarkApiError as exc:
-        _handle_job_api_error(current, exc, discovery=True)
+        _handle_job_api_error(current, exc, discovery=True,
+                             access_token_ciphertext=(authorization or {}).get("access_token_ciphertext"))
     except (psycopg.Error, ValueError):
         _requeue(
             current,
@@ -606,9 +611,12 @@ def _complete_discovery(job: SyncJob, discovered: int) -> None:
         )
 
 
-def _handle_job_api_error(job: SyncJob, exc: LarkApiError, *, discovery: bool) -> None:
+def _handle_job_api_error(job: SyncJob, exc: LarkApiError, *, discovery: bool,
+                          access_token_ciphertext: str | None) -> None:
     if exc.likely_auth_problem:
-        _mark_attention(job, "Lark authorization or permission needs attention.")
+        if not _mark_attention(job, "Lark authorization or permission needs attention.",
+                               access_token_ciphertext=access_token_ciphertext):
+            _requeue(job, delay_seconds=0, reset_discovery=discovery)
     elif exc.retryable:
         _requeue(
             job,
@@ -692,11 +700,14 @@ def _dispatch_lark_turn(
                     access_token = _usable_access_token(job.authorization_id, authorization, client, settings)
                     cached = (authorization, access_token)
                 except ReauthorizationRequired:
-                    _mark_attention(job, "Lark authorization must be renewed.")
+                    if not _mark_attention(job, "Lark authorization must be renewed.",
+                                           access_token_ciphertext=authorization["access_token_ciphertext"]):
+                        _requeue(job, delay_seconds=0)
                     authorization_cache[job.authorization_id] = None
                     continue
                 except LarkApiError as exc:
-                    _handle_job_api_error(job, exc, discovery=False)
+                    _handle_job_api_error(job, exc, discovery=False,
+                                         access_token_ciphertext=authorization["access_token_ciphertext"])
                     authorization_cache[job.authorization_id] = None
                     continue
                 except (psycopg.Error, ValueError):
@@ -1010,7 +1021,9 @@ def _handle_claim_api_error(claim: PageClaim, exc: LarkApiError) -> None:
     if exc.lark_code == 231203:
         _mark_chat_not_readable(claim, code=exc.lark_code, restricted="restricted mode" in str(exc).lower())
     elif exc.likely_auth_problem:
-        _mark_attention(claim.job, "Lark authorization or permission needs attention.", claim=claim)
+        if not _mark_attention(claim.job, "Lark authorization or permission needs attention.", claim=claim,
+                               access_token_ciphertext=claim.access_token_ciphertext):
+            _release_retryable_page_claim(claim, delay_seconds=0, detail="Credentials updated; retrying this page.")
     elif exc.retryable:
         _release_retryable_page_claim(
             claim,
@@ -1065,6 +1078,8 @@ def _usable_access_token(
             """,
             (authorization_id,),
         ).fetchone()
+        if row:
+            authorization["access_token_ciphertext"] = row["access_token_ciphertext"]
         if not row or row["status"] != "active" or not row["refresh_token_ciphertext"]:
             raise ReauthorizationRequired
         if row["access_token_expires_at"] and row["access_token_expires_at"] > now + timedelta(minutes=2):
@@ -1075,7 +1090,7 @@ def _usable_access_token(
         bundle = client.refresh_token(cipher.decrypt(row["refresh_token_ciphertext"]))
         if not bundle.refresh_token:
             raise ReauthorizationRequired
-        _store_refreshed_tokens(conn, authorization_id, bundle, cipher)
+        authorization["access_token_ciphertext"] = _store_refreshed_tokens(conn, authorization_id, bundle, cipher)
     # Persist the actual reduced grant before stopping this sync pass.
     if bundle.scope is not None and not BODY_READ_SCOPES.issubset(bundle.scope.split()):
         raise ReauthorizationRequired
@@ -1084,9 +1099,10 @@ def _usable_access_token(
 
 def _store_refreshed_tokens(
     conn: psycopg.Connection, authorization_id: uuid.UUID, bundle: TokenBundle, cipher: TokenCipher
-) -> None:
+) -> str:
     scopes = list(dict.fromkeys(bundle.scope.split())) if bundle.scope is not None else None
     readable = scopes is None or BODY_READ_SCOPES.issubset(scopes)
+    access_token_ciphertext = cipher.encrypt(bundle.access_token)
     conn.execute(
         """
         UPDATE authorizations
@@ -1097,7 +1113,7 @@ def _store_refreshed_tokens(
         WHERE id = %s
         """,
         (
-            cipher.encrypt(bundle.access_token),
+            access_token_ciphertext,
             cipher.encrypt(bundle.refresh_token or ""),
             _expiry(bundle.expires_in),
             _expiry(bundle.refresh_expires_in),
@@ -1107,6 +1123,7 @@ def _store_refreshed_tokens(
             authorization_id,
         ),
     )
+    return access_token_ciphertext
 
 
 def _refresh_profile_name(
@@ -1921,6 +1938,7 @@ def _claim_next_page(
         end_at=end_at,
         author_open_id=authorization["open_id"],
         body_consent_at=authorization.get("body_consent_at"),
+        access_token_ciphertext=authorization.get("access_token_ciphertext"),
     )
 
 
@@ -2784,7 +2802,8 @@ def _finish_job(job: SyncJob, status: str, detail: str, code: int | None = None)
             )
 
 
-def _mark_attention(job: SyncJob, detail: str, *, claim: PageClaim | None = None) -> None:
+def _mark_attention(job: SyncJob, detail: str, *, access_token_ciphertext: str | None,
+                    claim: PageClaim | None = None) -> bool:
     with connection() as conn, conn.transaction():
         lock_sync_material(conn)
         current_job = conn.execute(
@@ -2796,9 +2815,14 @@ def _mark_attention(job: SyncJob, detail: str, *, claim: PageClaim | None = None
             (job.id, job.discovery_generation),
         ).fetchone()
         if not current_job:
-            return
+            return True
         if claim and not _locked_current_page_claim(conn, claim):
-            return
+            return True
+        authorization = conn.execute("SELECT access_token_ciphertext FROM authorizations WHERE id=%s FOR UPDATE",
+                                     (job.authorization_id,)).fetchone()
+        # Ordinary login keeps running jobs: an old token's failure must not revoke the replacement token.
+        if authorization and authorization["access_token_ciphertext"] != access_token_ciphertext:
+            return False
         row = conn.execute(
             """
             UPDATE sync_jobs SET status = 'attention_required', finished_at = NOW(), lease_until = NULL,
@@ -2809,9 +2833,7 @@ def _mark_attention(job: SyncJob, detail: str, *, claim: PageClaim | None = None
             (detail, job.id, job.discovery_generation),
         ).fetchone()
         if row:
-            # Do this only after the job fence succeeds.  A reauthorization
-            # increments the generation, so an old request can never turn the
-            # freshly authorized account back into an attention state.
+            # Both the job generation and the request's credential are still current.
             conn.execute(
                 """
                 UPDATE authorizations
@@ -2834,6 +2856,7 @@ def _mark_attention(job: SyncJob, detail: str, *, claim: PageClaim | None = None
                 """,
                 (job.id,),
             )
+    return True
 
 
 def _items(data: dict[str, Any]) -> list[dict[str, Any]]:

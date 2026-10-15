@@ -37,6 +37,7 @@ from . import (
 from .config import get_settings
 from .crypto import TokenCipher
 from .db import connection, database_is_ready, lock_sync_material
+from .evidence_access import BODY_READ_SCOPES
 from .identity_names import update_identity_names
 from .identity_profiles import safe_avatar_url, store_profile_avatar
 from .lark_api import LarkApiError, LarkClient
@@ -150,7 +151,7 @@ def start_lark_authorization(request: Request, send: bool = False, account_id: s
         )
 
     try:
-        authorization = _current_authorization(request) if send else None
+        authorization = _current_authorization(request)
     except psycopg.Error as error:
         return _oauth_database_unavailable(request, error, request_id, stage="start_session")
     if send:
@@ -164,9 +165,10 @@ def start_lark_authorization(request: Request, send: bool = False, account_id: s
                 request, "error.html",
                 {"title": "发送授权账号不一致", "detail": "请目标人员使用本人账号登录后授权。"}, 403,
             )
+    if authorization and authorization["status"] in {"active", "attention_required"}:
         settings = replace(settings, oauth_scopes=tuple(dict.fromkeys((
-            *settings.oauth_scopes, *(authorization.get("scopes") or ()), *SEND_OAUTH_SCOPES,
-            *(("im:resource",) if media else ()),
+            *settings.oauth_scopes, *(authorization.get("scopes") or ()),
+            *(SEND_OAUTH_SCOPES if send else ()), *(("im:resource",) if media else ()),
         ))))
 
     state = secrets.token_urlsafe(32)
@@ -316,7 +318,8 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 lock_sync_material(conn)
                 stage = "authorization_lock"
                 previous = conn.execute(
-                    "SELECT id,status,last_error,body_consent_at FROM authorizations WHERE open_id=%s FOR UPDATE",
+                    "SELECT id,status,last_error,body_consent_at,scopes FROM authorizations "
+                    "WHERE open_id=%s FOR UPDATE",
                     (profile.open_id,),
                 ).fetchone()
                 diagnostic_authorization_id = previous["id"] if previous else authorization_id
@@ -330,9 +333,10 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                              "detail": "请使用发起增权的本人账号重新授权，原有授权保持不变。"},
                             403,
                         )
-                if previous and (send_upgrade or previous["status"] == "active") and conn.execute(
+                if previous and conn.execute(
                     """SELECT 1 FROM audit_events WHERE authorization_id=%s
-                       AND action IN ('oauth_profile_permissions_upgraded','oauth_send_permissions_upgraded')
+                       AND action IN ('oauth_authorized','oauth_login',
+                         'oauth_profile_permissions_upgraded','oauth_send_permissions_upgraded')
                        AND created_at>=%s LIMIT 1""",
                     (previous["id"], state_row["created_at"]),
                 ).fetchone():
@@ -344,7 +348,10 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                     previous and previous["status"] == "attention_required"
                     and previous["last_error"] == PROFILE_SCOPE_UPGRADE_REASON and previous["body_consent_at"]
                 )
-                preserve_sync = profile_upgrade or send_upgrade
+                preserve_sync = bool(previous and previous["body_consent_at"]
+                    and previous["status"] in {"active", "attention_required"}
+                    and BODY_READ_SCOPES.issubset(previous["scopes"] or ())
+                    and BODY_READ_SCOPES.issubset(scopes))
                 stage = "authorization_save"
                 row = conn.execute(
                     """
@@ -392,8 +399,8 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 # that order here so OAuth reauthorization cannot deadlock with a
                 # late page response.
                 stage = "sync_queue"
-                if not send_upgrade:
-                    _queue_job(conn, authorization_id, "incremental" if profile_upgrade else "backfill")
+                _queue_job(conn, authorization_id, "incremental" if preserve_sync else "backfill",
+                           reset=not preserve_sync)
                 stage = "identity_cache"
                 conn.execute(
                     """INSERT INTO lark_identities (open_id, display_name, first_seen_at, last_seen_at)
@@ -413,13 +420,14 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 if not preserve_sync:
                     _reset_chat_backfill(conn, authorization_id)
                 stage = "profile_provider"
-                # A new consent is the opportunity to retry previously denied profile reads.
+                # Fresh credentials can retry profile reads without resetting message history.
                 conn.execute(
                     """UPDATE identity_profile_providers SET scopes=%s,status='pending',error_code=NULL,retry_at=NOW()
                        WHERE authorization_id=%s""", (scopes, authorization_id),
                 )
                 _audit(conn, authorization_id, "oauth_send_permissions_upgraded" if send_upgrade else
-                       "oauth_profile_permissions_upgraded" if profile_upgrade else "oauth_authorized")
+                       "oauth_profile_permissions_upgraded" if profile_upgrade else
+                       "oauth_login" if preserve_sync else "oauth_authorized")
                 destination = "/dashboard"
                 if send_upgrade:
                     try:
@@ -468,7 +476,7 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
 
 
 def _reset_chat_backfill(conn, authorization_id):
-    # Ordinary reauthorization remains a fresh content-consent boundary.
+    # Only a new or changed reading grant starts a fresh content-consent boundary.
     conn.execute(
         """
         UPDATE authorization_chats
@@ -576,7 +584,7 @@ def _dashboard_stats(authorization_id: uuid.UUID) -> dict[str, Any]:
         return user_preparation.status_for(conn, authorization_id)
 
 
-def _queue_job(conn: psycopg.Connection, authorization_id: uuid.UUID, mode: str) -> bool:
+def _queue_job(conn: psycopg.Connection, authorization_id: uuid.UUID, mode: str, *, reset: bool = True) -> bool:
     existing = conn.execute(
         """
         UPDATE sync_jobs
@@ -591,7 +599,7 @@ def _queue_job(conn: psycopg.Connection, authorization_id: uuid.UUID, mode: str)
         RETURNING id
         """,
         (mode, authorization_id),
-    ).fetchone()
+    ).fetchone() if reset else None
     if existing:
         return True
     row = conn.execute(

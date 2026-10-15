@@ -58,7 +58,12 @@ def test_admin_users_uses_server_pagination(monkeypatch):
         admin_reporting,
         "users",
         lambda page, q, permission_filter: pages.append((page, q, permission_filter))
-        or _page([], page=page, has_next=True, summary={}),
+        or _page([admin_reporting._decorate_user({
+            "id": uuid4(),
+            "authorization_status": "active", "job_status": "running", "job_mode": "backfill",
+            "syncable_conversation_count": 3, "backfill_complete_count": 2, "recent_ready_count": 3,
+            "has_completed_sync": True, "has_completed_current_consent_sync": True,
+        })], page=page, has_next=True, summary={}),
     )
 
     response = _client(lambda _request: {"id": uuid4(), "status": "active"}, contexts).get("/admin/users?page=2")
@@ -67,6 +72,8 @@ def test_admin_users_uses_server_pagination(monkeypatch):
     assert pages == [(2, "", "all")]
     assert contexts[-1][1]["user_page"]["previous_url"] == "/admin/users?page=1"
     assert contexts[-1][1]["user_page"]["next_url"] == "/admin/users?page=3"
+    assert contexts[-1][1]["users"][0]["sync_state_label"] == "补充历史中"
+    assert contexts[-1][1]["users"][0]["sync_progress_label"] == "2 / 3"
 
 
 def test_people_directory_filters_name_and_category_without_legacy_organization_filters(monkeypatch):

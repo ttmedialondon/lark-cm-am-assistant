@@ -321,18 +321,30 @@ def sync_status(conn, actor_id, context, args, settings, *, now=None, read_cache
     now = now or datetime.now(UTC)
     cm = authorize_all(conn, actor_id, context["scope"]["cm_id"], read_cache=read_cache)
     chats = _chat_states(conn, cm["id"])
-    job = conn.execute("""SELECT status,mode,scheduled_at,discovery_status,last_http_status,last_error_code
-        FROM sync_jobs WHERE authorization_id=%s ORDER BY created_at DESC LIMIT 1""", (cm["id"],)).fetchone()
+    job = conn.execute("""SELECT status,mode,scheduled_at,discovery_status,last_http_status,last_error_code,
+        EXISTS(SELECT 1 FROM sync_jobs past WHERE past.authorization_id=latest.authorization_id
+            AND past.status='succeeded') has_completed_sync,
+        EXISTS(SELECT 1 FROM sync_jobs past WHERE past.authorization_id=latest.authorization_id
+            AND past.status='succeeded' AND past.finished_at>=%s) has_completed_current_consent_sync
+        FROM sync_jobs latest WHERE authorization_id=%s ORDER BY created_at DESC LIMIT 1""",
+        (cm["body_consent_at"], cm["id"])).fetchone()
     normal = [chat for chat in chats if chat["chat_status"] == "normal" and chat["sync_enabled"]]
-    counts = {"discovered_conversation_count": len(chats), "syncable_conversation_count": len(normal),
+    readable = [chat for chat in normal if chat["sync_status"] != "not_readable"]
+    counts = {"discovered_conversation_count": len(chats), "syncable_conversation_count": len(readable),
         "archived_conversation_count": sum(chat["chat_status"] != "normal" for chat in chats),
         "sync_disabled_count": sum(not chat["sync_enabled"] for chat in chats),
-        "backfill_complete_count": sum(chat["backfill_complete"] for chat in normal),
+        "backfill_complete_count": sum(chat["backfill_complete"] for chat in readable),
+        "recent_ready_count": sum(bool(chat["backfill_complete"] or
+            (chat["recent_coverage_start_at"] is not None and chat["last_incremental_at"] is not None))
+            for chat in readable),
         "syncing_conversation_count": sum(chat["sync_status"] == "syncing" for chat in normal),
         "waiting_conversation_count": sum(chat["sync_status"] in {"pending", "failed_retryable"}
                                           for chat in normal),
         "not_readable_conversation_count": sum(chat["sync_status"] == "not_readable" for chat in normal)}
-    facts = {**counts, "authorization_status": cm["status"]}
+    facts = {**counts, "authorization_status": cm["status"], "authorized_at": cm["authorized_at"],
+        "body_consent_at": cm["body_consent_at"],
+        **{key: (job or {}).get(key, False)
+           for key in ("has_completed_sync", "has_completed_current_consent_sync")}}
     facts.update({"job_" + key: value for key, value in (job or {}).items()})
     label, _badge, detail = admin_reporting.sync_summary(facts, now=now)
     watermarks, gaps = _coverage(chats)

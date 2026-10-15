@@ -177,11 +177,11 @@ def test_oauth_and_discovery_serialize_before_source_locks_and_fence_old_jobs(pg
         def list_chats(self, access_token, page_token, *, types=None):
             return {"items": [{"chat_id": self.chat_id, "name": "Fixture group"}], "has_more": False}
 
-    def queue(conn, *args):
+    def queue(conn, *args, **kwargs):
         if oauth_first:
             ready.set()
             assert release.wait(5), "first OAuth transaction was not released"
-        return original_queue(conn, *args)
+        return original_queue(conn, *args, **kwargs)
 
     def current(conn, *args):
         original_assert(conn, *args)

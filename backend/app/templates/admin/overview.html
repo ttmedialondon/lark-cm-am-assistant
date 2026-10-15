@@ -24,7 +24,7 @@
               <div class="card-header"><h3 class="card-title">接入进度与需要处理</h3></div>
               {% if attention %}
               <div class="table-responsive"><table class="table table-vcenter card-table">
-                <thead><tr><th>人员</th><th>接入状态</th><th>会话</th><th>首次回填</th><th>最近同步</th></tr></thead>
+                <thead><tr><th>人员</th><th>接入状态</th><th>会话</th><th>历史读取</th><th>最近同步</th></tr></thead>
                 <tbody>{% for item in attention %}<tr>
                   <td>{% if 'users' in admin_permissions %}<a href="/admin/users/{{ item.id }}">{{ item.display_name }}</a>{% else %}{{ item.display_name }}{% endif %}</td>
                   <td><span class="badge bg-{{ item.sync_state_badge }}-lt">{{ item.sync_state_label }}</span><div class="text-secondary small mt-1">{{ item.sync_state_detail }}</div></td>

@@ -115,44 +115,60 @@ CONVERSATION_COUNTS_SQL = """
         COUNT(*) AS discovered_conversation_count,
         COUNT(*) FILTER (
             WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND ac.sync_enabled AND ac.sync_status <> 'not_readable'
         ) AS syncable_conversation_count,
         COUNT(*) FILTER (
             WHERE COALESCE(c.chat_status, 'normal') <> 'normal'
         ) AS archived_conversation_count,
         COUNT(*) FILTER (
             WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND ac.sync_enabled AND ac.sync_status <> 'not_readable'
               AND COALESCE(c.chat_mode, 'group') <> 'p2p'
         ) AS group_count,
         COUNT(*) FILTER (
             WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND ac.sync_enabled AND ac.sync_status <> 'not_readable'
               AND c.chat_mode = 'p2p'
         ) AS p2p_count,
         COUNT(*) FILTER (
             WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND ac.sync_enabled AND ac.sync_status <> 'not_readable'
               AND ac.backfill_complete
         ) AS backfill_complete_count,
         COUNT(*) FILTER (
             WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND ac.sync_enabled AND ac.sync_status <> 'not_readable'
+              AND (ac.backfill_complete OR
+                   (ac.recent_coverage_start_at IS NOT NULL AND ac.last_incremental_at IS NOT NULL))
+        ) AS recent_ready_count,
+        COUNT(*) FILTER (
+            WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND ac.sync_enabled
               AND ac.sync_status = 'syncing'
         ) AS syncing_conversation_count,
         COUNT(*) FILTER (
             WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND ac.sync_enabled
               AND ac.sync_status IN ('pending', 'failed_retryable')
         ) AS waiting_conversation_count,
         COUNT(*) FILTER (
             WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND ac.sync_enabled
               AND ac.sync_status = 'not_readable'
         ) AS not_readable_conversation_count,
         COUNT(*) FILTER (
             WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND ac.sync_enabled AND ac.sync_status <> 'not_readable'
               AND c.chat_mode = 'p2p' AND ac.backfill_complete
         ) AS p2p_backfill_complete_count,
         COUNT(*) FILTER (
             WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND ac.sync_enabled AND ac.sync_status <> 'not_readable'
               AND COALESCE(c.chat_mode, 'group') <> 'p2p' AND ac.backfill_complete
         ) AS group_backfill_complete_count,
         MAX(COALESCE(ac.last_incremental_at, ac.last_backfill_at)) FILTER (
             WHERE COALESCE(c.chat_status, 'normal') = 'normal'
+              AND ac.sync_enabled AND ac.sync_status <> 'not_readable'
         ) AS last_synced_at
     FROM authorization_chats ac
     JOIN chats c ON c.chat_id = ac.chat_id
@@ -222,7 +238,13 @@ def overview() -> dict[str, Any]:
                 a.id,
                 a.display_name,
                 a.status AS authorization_status,
+                a.authorized_at,
                 a.body_consent_at,
+                EXISTS(SELECT 1 FROM sync_jobs past WHERE past.authorization_id=a.id
+                    AND past.status='succeeded') AS has_completed_sync,
+                EXISTS(SELECT 1 FROM sync_jobs past WHERE past.authorization_id=a.id
+                    AND past.status='succeeded' AND past.finished_at>=a.body_consent_at)
+                    AS has_completed_current_consent_sync,
                 a.scopes,
                 a.p2p_discovery_status,
                 COALESCE(g.group_count, 0) AS group_count,
@@ -231,6 +253,7 @@ def overview() -> dict[str, Any]:
                 COALESCE(g.syncable_conversation_count, 0) AS syncable_conversation_count,
                 COALESCE(g.archived_conversation_count, 0) AS archived_conversation_count,
                 COALESCE(g.backfill_complete_count, 0) AS backfill_complete_count,
+                COALESCE(g.recent_ready_count, 0) AS recent_ready_count,
                 COALESCE(g.syncing_conversation_count, 0) AS syncing_conversation_count,
                 COALESCE(g.waiting_conversation_count, 0) AS waiting_conversation_count,
                 COALESCE(g.not_readable_conversation_count, 0) AS not_readable_conversation_count,
@@ -252,6 +275,7 @@ def overview() -> dict[str, Any]:
             LEFT JOIN latest_jobs j ON j.authorization_id = a.id
             WHERE a.status <> 'active'
                OR COALESCE(g.backfill_complete_count, 0) < COALESCE(g.syncable_conversation_count, 0)
+               OR COALESCE(g.not_readable_conversation_count, 0) > 0
                OR j.status = 'running'
                OR (j.status = 'queued' AND (j.mode = 'backfill' OR j.scheduled_at <= NOW()))
                OR j.status IN ('failed', 'attention_required')
@@ -328,7 +352,7 @@ def overview() -> dict[str, Any]:
             "hint": "仅来自完成新版授权后的同步",
         },
         {
-            "label": "首次同步未完成会话",
+            "label": "待处理会话",
             "value": int(counts["pending_membership_count"] or 0),
             "hint": "不含 Lark 已归档/解散的会话",
         },
@@ -353,7 +377,7 @@ def runtime_settings() -> tuple[dict[str, str], ...]:
     settings = get_settings()
     history = "全部 API 可返回历史" if settings.sync_lookback_days == 0 else f"最近 {settings.sync_lookback_days} 天"
     return (
-        {"label": "首次回填范围", "value": history},
+        {"label": "历史读取范围", "value": history},
         {"label": "增量同步周期", "value": _seconds_label(settings.sync_interval_seconds)},
         {"label": "增量重叠窗口", "value": _seconds_label(settings.sync_overlap_seconds)},
         {"label": "成员数刷新周期", "value": _seconds_label(settings.member_count_refresh_seconds)},
@@ -440,6 +464,11 @@ def users(page: int = 1, query: str = "", permission_filter: str = "all") -> dic
                 a.authorized_at,
                 a.updated_at,
                 a.body_consent_at,
+                EXISTS(SELECT 1 FROM sync_jobs past WHERE past.authorization_id=a.id
+                    AND past.status='succeeded') AS has_completed_sync,
+                EXISTS(SELECT 1 FROM sync_jobs past WHERE past.authorization_id=a.id
+                    AND past.status='succeeded' AND past.finished_at>=a.body_consent_at)
+                    AS has_completed_current_consent_sync,
                 a.scopes,
                 a.p2p_discovery_status,
                 r.role AS admin_role,
@@ -449,6 +478,7 @@ def users(page: int = 1, query: str = "", permission_filter: str = "all") -> dic
                 COALESCE(g.syncable_conversation_count, 0) AS syncable_conversation_count,
                 COALESCE(g.archived_conversation_count, 0) AS archived_conversation_count,
                 COALESCE(g.backfill_complete_count, 0) AS backfill_complete_count,
+                COALESCE(g.recent_ready_count, 0) AS recent_ready_count,
                 COALESCE(g.syncing_conversation_count, 0) AS syncing_conversation_count,
                 COALESCE(g.waiting_conversation_count, 0) AS waiting_conversation_count,
                 COALESCE(g.not_readable_conversation_count, 0) AS not_readable_conversation_count,
@@ -520,6 +550,11 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
                 a.authorized_at,
                 a.updated_at,
                 a.body_consent_at,
+                EXISTS(SELECT 1 FROM sync_jobs past WHERE past.authorization_id=a.id
+                    AND past.status='succeeded') AS has_completed_sync,
+                EXISTS(SELECT 1 FROM sync_jobs past WHERE past.authorization_id=a.id
+                    AND past.status='succeeded' AND past.finished_at>=a.body_consent_at)
+                    AS has_completed_current_consent_sync,
                 a.scopes,
                 a.p2p_discovery_status,
                 r.role AS admin_role,
@@ -529,6 +564,7 @@ def user_detail(authorization_id: UUID, conversation_page: int = 1, job_page: in
                 COALESCE(g.syncable_conversation_count, 0) AS syncable_conversation_count,
                 COALESCE(g.archived_conversation_count, 0) AS archived_conversation_count,
                 COALESCE(g.backfill_complete_count, 0) AS backfill_complete_count,
+                COALESCE(g.recent_ready_count, 0) AS recent_ready_count,
                 COALESCE(g.syncing_conversation_count, 0) AS syncing_conversation_count,
                 COALESCE(g.waiting_conversation_count, 0) AS waiting_conversation_count,
                 COALESCE(g.not_readable_conversation_count, 0) AS not_readable_conversation_count,
@@ -1497,7 +1533,7 @@ def _decorate_job(row: dict[str, Any]) -> dict[str, Any]:
     item["display_name"] = item.get("display_name") or "未命名用户"
     for field in ("created_at", "started_at", "finished_at", "scheduled_at", "updated_at", "last_progress_at"):
         item[f"{field}_label"] = _format_time(item.get(field))
-    item["mode_label"] = "首次回填" if item.get("mode") == "backfill" else "定时更新"
+    item["mode_label"] = "历史读取" if item.get("mode") == "backfill" else "近期更新"
     item["status_label"], item["status_badge"] = _job_status(
         item.get("status"),
         item.get("mode"),
@@ -1641,6 +1677,11 @@ def sync_summary(facts: dict[str, Any], *, now: datetime | None = None) -> tuple
     waiting = int(facts.get("waiting_conversation_count") or 0)
     unreadable = int(facts.get("not_readable_conversation_count") or 0)
     archived = int(facts.get("archived_conversation_count") or 0)
+    recent_ready = int(facts.get("recent_ready_count") or 0)
+    established = bool(facts.get("has_completed_sync"))
+    consent, joined = facts.get("body_consent_at"), facts.get("authorized_at")
+    reconnecting = bool(established and not facts.get("has_completed_current_consent_sync")
+                        and isinstance(consent, datetime) and isinstance(joined, datetime) and consent > joined)
     job_mode = facts.get("job_mode")
     scheduled_at = facts.get("job_scheduled_at")
     current = now or datetime.now(UTC)
@@ -1651,17 +1692,23 @@ def sync_summary(facts: dict[str, Any], *, now: datetime | None = None) -> tuple
         return "Lark 限流暂停", "warning", "Lark 暂时要求降低请求速率；恢复后会自动继续。"
 
     if job_status == "running" and facts.get("job_discovery_status") in {"pending", "running"}:
-        return "正在发现会话", "primary", "正在建立当前可见会话目录；消息回填会在目录完成后并发开始。"
+        return ("重新授权后更新" if reconnecting else "正在更新会话" if established else "正在发现会话",
+                "primary", "正在更新当前可见会话目录，已有内容仍可使用。")
 
-    if total == 0:
+    if total == 0 and not unreadable:
         if job_status in {"queued", "running"}:
             return "正在发现会话", "primary", "正在从 Lark 建立可同步会话目录。"
         return "暂无可同步会话", "secondary", "Lark 尚未返回可同步的群聊或私聊。"
 
     if completed < total:
         delayed = job_status == "queued" and isinstance(scheduled_at, datetime) and scheduled_at > current
-        label = "首次同步中" if job_status == "running" else "等待会话重试" if delayed else "等待首次同步"
-        parts = [f"已完成 {completed}/{total} 个可同步会话"]
+        if reconnecting:
+            label = "重新授权后更新"
+        elif established or recent_ready >= total:
+            label = "补充历史中"
+        else:
+            label = "首次准备中" if job_status == "running" else "等待首次准备"
+        parts = [f"近期已读取 {recent_ready}/{total} 个会话", f"历史已完成 {completed}/{total} 个会话"]
         if syncing:
             parts.append(f"{syncing} 个正在读取")
         if waiting:
@@ -1675,19 +1722,21 @@ def sync_summary(facts: dict[str, Any], *, now: datetime | None = None) -> tuple
         return label, "primary", "；".join(parts) + "。"
 
     if unreadable:
-        detail = f"首次同步已完成；{unreadable} 个会话未获 Lark 读取许可。"
+        detail = f"{unreadable} 个会话未获 Lark 读取许可，不计入历史读取进度。"
+        if total:
+            detail = "其余会话已完成历史读取；" + detail
         if archived:
             detail += f"另有 {archived} 个已归档/解散会话不计划回填。"
         return "已接入（部分不可读）", "warning", detail
 
     if job_mode == "incremental" and job_status == "running":
-        return "定时更新中", "primary", "首次同步已完成，正在执行本轮增量检查。"
+        return "定时更新中", "primary", "正在检查新增消息。"
     if job_mode == "incremental" and job_status == "queued":
         if isinstance(scheduled_at, datetime) and scheduled_at > current:
-            return "已接入 · 定时同步", "success", f"首次同步已完成；下一轮检查将在 {_format_time(scheduled_at)}。"
-        return "准备定时更新", "primary", "首次同步已完成，worker 正在等待本轮增量检查执行。"
+            return "已接入 · 定时同步", "success", f"下一轮检查将在 {_format_time(scheduled_at)}。"
+        return "准备定时更新", "primary", "正在等待本轮新增消息检查。"
 
-    detail = "首次同步已完成，系统会每 5 分钟检查一次新增消息。"
+    detail = "历史读取已完成，系统会定时检查新增消息。"
     if archived:
         detail += f"另有 {archived} 个 Lark 已归档/解散会话不计划回填。"
     return "已接入 · 定时同步", "success", detail
@@ -1750,7 +1799,7 @@ def _is_lark_rate_limited(http_status: Any, error_code: Any) -> bool:
 
 def _sync_status(value: str | None) -> tuple[str, str]:
     mapping = {
-        "pending": ("等待首次回填", "secondary"),
+        "pending": ("等待读取", "secondary"),
         "syncing": ("正在同步", "primary"),
         "succeeded": ("已同步", "success"),
         "not_readable": ("Lark 未允许读取", "warning"),
