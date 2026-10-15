@@ -161,6 +161,55 @@ def _enqueue(pg, contact, source="manual"):
     return pg.execute("SELECT enqueue_creator_handle(%s,%s,TRUE) id", (contact, source)).fetchone()["id"]
 
 
+def test_page_signals_wake_actual_people_and_reply_context_not_all_group_members(pg, matching_flow, pilot):
+    flow = matching_flow
+    flow.enable()
+    protected = _snapshot(pg, ('contact_roles', 'contact_social_accounts', 'contact_assignments'))
+    pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('signal_group','Creator group','group'),"
+               "('other_group','Other group','group')")
+    pg.execute("INSERT INTO authorization_chats(authorization_id,chat_id) VALUES(%s,'signal_group')",
+               (pilot.ids['cm'],))
+    for name in ('creator', 'silent', 'legacy'):
+        pg.execute("INSERT INTO chat_members(chat_id,open_id,member_type) VALUES('signal_group',%s,'user')",
+                   ('ou_' + name,))
+    now = pg.execute('SELECT NOW() now').fetchone()['now']
+
+    def message(key, sender, minutes, *, parent=None, chat='signal_group', mentions=None):
+        pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,
+            message_create_time,parent_id,mentions_json) VALUES(%s,%s,%s,'user','text',%s,%s,%s::jsonb)""",
+            (chat, key, 'ou_' + sender, now + timedelta(minutes=minutes), parent, json.dumps(mentions)))
+
+    message('old_creator', 'creator', -1440)
+    message('unrelated_creator', 'legacy', 0, chat='other_group')
+    message('announcement', 'cm', 0)
+    matching.touch_chats(pg, ['signal_group'], recognition_message_ids=['announcement'])
+    assert not pg.execute('SELECT 1 FROM creator_handle_jobs').fetchone()
+    message('creator_answer', 'creator', 1)
+    matching.touch_chats(pg, ['signal_group'], recognition_message_ids=['creator_answer'])
+    assert pg.execute('SELECT contact_id FROM creator_handle_jobs').fetchall() == [{'contact_id': flow.contact}]
+    pg.execute("UPDATE creator_handle_jobs SET status='completed'")
+    message('cm_question', 'cm', 2)
+    matching.touch_chats(pg, ['signal_group'], recognition_message_ids=['cm_question'])
+    assert pg.execute('SELECT count(*) n FROM creator_handle_jobs WHERE contact_id=%s',
+                      (flow.contact,)).fetchone()['n'] == 2
+    # A late original question must wake its answer even outside the nearby-context window.
+    message('old_question', 'cm', -2880)
+    message('late_answer', 'silent', -1440, parent='old_question')
+    matching.touch_chats(pg, ['signal_group'], recognition_message_ids=['old_question'])
+    assert pg.execute('SELECT 1 FROM creator_handle_jobs WHERE contact_id=%s', (pilot.ids['silent'],)).fetchone()
+    message('new_handle', 'legacy', 1440)
+    matching.touch_chats(pg, ['signal_group'], recognition_message_ids=['new_handle'])
+    assert pg.execute('SELECT 1 FROM creator_handle_jobs WHERE contact_id=%s', (pilot.ids['legacy'],)).fetchone()
+    before = _snapshot(pg, ('creator_handle_jobs',))
+    matching.touch_chats(pg, ['signal_group'], recognition_message_ids=['unrelated_creator'])
+    assert _snapshot(pg, before.keys()) == before
+    pg.execute("UPDATE chats SET name='A new account & TT Media' WHERE chat_id='signal_group'")
+    assert all(row['desired_version'] > 1 for row in pg.execute(
+        "SELECT desired_version FROM creator_handle_jobs WHERE status='queued'").fetchall())
+    assert _snapshot(pg, protected.keys()) == protected
+    assert not flow.calls
+
+
 def test_new_person_identity_queue_admits_without_handle_and_preserves_existing_facts(
     pg, matching_flow, pilot, monkeypatch
 ):
@@ -323,6 +372,29 @@ def _prepared_job(pg, flow, source="manual"):
     job = matching.claim()
     assert job is not None
     return job
+
+
+def test_paid_handle_receipt_survives_inflight_signal_without_another_request(pg, matching_flow):
+    flow = matching_flow
+    flow.enable()
+    flow.review = True
+    job = _prepared_job(pg, flow, source='incremental')
+    flow.before_response = lambda: _enqueue(pg, flow.contact, source='incremental')
+    matching.run(job, flow.settings)
+    assert pg.execute('SELECT status,result_ciphertext FROM creator_handle_jobs WHERE id=%s',
+                      (job['id'],)).fetchone() == {'status': 'queued', 'result_ciphertext': None}
+    flow.before_response = None
+    flow.valid = False
+    assert matching.prepare_next(flow.settings)
+    assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
+    flow.valid = True
+    assert matching.prepare_next(flow.settings)
+    assert pg.execute('SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s',
+                      (job['id'],)).fetchone() == {'status': 'review_required', 'reason_code': 'cached'}
+    assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == ['first.handle']
+    assert matching.claim() is None and len(flow.calls) == 1
+    assert pg.execute('SELECT count(*) n FROM creator_handle_requests WHERE job_id=%s',
+                      (job['id'],)).fetchone()['n'] == 1
 
 
 def test_opt_in_coalescing_multi_handle_auto_links_and_exact_cache(pg, matching_flow):
@@ -1045,8 +1117,8 @@ def test_fixed_group_context_auto_links_with_live_scope_and_auditable_title(pg, 
     flow.before_response = None
     pg.execute("UPDATE chats SET name=%s WHERE chat_id='chat_creator'", (title,))
 
-    # Losing the actual readable grant before calling prevents a second paid request and any relation.
-    job = _prepared_job(pg, flow, "incremental")
+    # Explicit review still checks the actual grant before calling or creating a relation.
+    job = _prepared_job(pg, flow, "manual")
     pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (pilot.ids["cm"],))
     matching.run(job, flow.settings)
     assert len(flow.calls) == 1 and contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == []
@@ -1055,9 +1127,12 @@ def test_fixed_group_context_auto_links_with_live_scope_and_auditable_title(pg, 
     ).fetchone()["billed_tokens"] == 0
     pg.execute("UPDATE authorizations SET status='active' WHERE id=%s", (pilot.ids["cm"],))
 
-    job = _prepared_job(pg, flow, "incremental")
-    matching.run(job, flow.settings)
-    assert len(flow.calls) == 2 and contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == ["first.handle"]
+    _enqueue(pg, flow.contact, "incremental")
+    assert matching.prepare_next(flow.settings) and matching.claim() is None
+    job = pg.execute('SELECT * FROM creator_handle_jobs WHERE id=%s', (job['id'],)).fetchone()
+    job['pack'] = json.loads(creator_data.cipher(flow.settings).decrypt(job['pack_ciphertext']))
+    assert job['reason_code'] == 'cached' and len(flow.calls) == 1
+    assert contact_handles.for_contacts(pg, [flow.contact])[flow.contact] == ["first.handle"]
     saved = pg.execute("SELECT status,stats FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone()
     assert saved["status"] == "completed" and saved["stats"]["auto_linked_handles"] == ["first.handle"]
     audit = pg.execute("SELECT metadata FROM audit_events WHERE action='creator_handle_auto_linked'").fetchone()[

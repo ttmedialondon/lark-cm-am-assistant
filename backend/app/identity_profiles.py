@@ -17,6 +17,9 @@ MAX_WORKERS = 2
 DAILY_SECONDS = 86_400
 LEASE_SECONDS = 300
 SCOPE_ERRORS = {99991672, 99991679}
+GRANT_RECHECK_CODES = ('profile_scope_unavailable', 'avatar_field_unavailable', 'profile_probe_pending',
+                       'no_visible_authorization', 'authorization_changed', 'authorization_unavailable',
+                       'contact_not_visible')
 
 
 def safe_avatar_url(value) -> str | None:
@@ -61,13 +64,29 @@ def store_profile_avatar(conn, open_id, url, avatar_present=True) -> bool:
 
 def claim_next():
     with connection() as conn, conn.transaction():
+        providers = conn.execute("""SELECT COALESCE(BOOL_OR(provider.authorization_id IS NULL
+                OR provider.scopes IS DISTINCT FROM auth.scopes OR provider.status='available'
+                OR provider.retry_at<=NOW()),FALSE) ready,
+                MAX(GREATEST(auth.body_consent_at,CASE WHEN provider.status='pending' THEN provider.retry_at
+                    WHEN provider.scopes IS DISTINCT FROM auth.scopes THEN auth.updated_at END)) grant_at,
+                ARRAY(SELECT own.open_id FROM authorizations own WHERE own.status='active') own_ids
+            FROM authorizations auth LEFT JOIN identity_profile_providers provider
+              ON provider.authorization_id=auth.id
+            WHERE auth.status='active' AND auth.body_consent_at IS NOT NULL""").fetchone()
         row = conn.execute(
             """SELECT identity.open_id FROM lark_identities identity
-               WHERE identity.identity_type='user' AND identity.avatar_retry_at<=NOW()
-               ORDER BY EXISTS(SELECT 1 FROM authorizations auth WHERE auth.open_id=identity.open_id
-                               AND auth.status='active') DESC,
+               WHERE identity.identity_type='user'
+                 AND (identity.avatar_retry_at<=NOW() OR (identity.avatar_claim_id IS NULL
+                   AND identity.avatar_status='unavailable'
+                   AND identity.avatar_error_code=ANY(%s::text[])
+                   AND (identity.avatar_checked_at<%s OR (identity.avatar_error_code='no_visible_authorization'
+                       AND identity.last_seen_at>identity.avatar_checked_at))))
+                 AND (%s OR identity.open_id=ANY(%s::text[]))
+               ORDER BY (identity.open_id=ANY(%s::text[])) DESC,
                         identity.avatar_checked_at NULLS FIRST,identity.open_id
                FOR UPDATE OF identity SKIP LOCKED LIMIT 1""",
+            (list(GRANT_RECHECK_CODES), providers['grant_at'], providers['ready'],
+             providers['own_ids'], providers['own_ids']),
         ).fetchone()
         if not row:
             return None
@@ -184,6 +203,13 @@ def _provider_gate(source):
             return None
         if row["cooling"]:
             return row
+        if row["status"] == "pending":
+            # A new grant wakes denied caches once; each selected person still needs a current visibility proof.
+            conn.execute("""UPDATE lark_identities SET avatar_retry_at=NOW()
+                WHERE identity_type='user' AND avatar_claim_id IS NULL AND avatar_status='unavailable'
+                  AND avatar_error_code=ANY(%s::text[])
+                  AND avatar_retry_at>NOW() AND avatar_checked_at<GREATEST(%s,%s)""",
+                (list(GRANT_RECHECK_CODES), source['body_consent_at'], row['retry_at']))
         # Exactly one probe per CM may cross a denied/missing-field capability boundary.
         conn.execute(
             """UPDATE identity_profile_providers SET status='checking',
@@ -230,58 +256,7 @@ def _provider_result(conn, source, status, code, seconds):
     )
 
 
-def _skip_denied_directory():
-    """A known app-wide gap is one local update, not 7,000 forbidden HTTP requests."""
-    with connection() as conn, conn.transaction():
-        conn.execute(
-            """WITH visible AS (
-                 SELECT member.open_id,auth.id,auth.scopes FROM authorizations auth
-                 JOIN authorization_chats access ON access.authorization_id=auth.id
-                 JOIN chats chat USING(chat_id) JOIN chat_members member USING(chat_id)
-                 WHERE auth.status='active' AND auth.body_consent_at IS NOT NULL
-                   AND access.is_visible AND access.sync_enabled AND COALESCE(chat.chat_status,'normal')='normal'
-                   AND member.member_type='user' AND member.last_observed_by_authorization_id=auth.id
-                 UNION
-                 SELECT access.p2p_counterpart_open_id,auth.id,auth.scopes FROM authorizations auth
-                 JOIN authorization_chats access ON access.authorization_id=auth.id JOIN chats chat USING(chat_id)
-                 WHERE auth.status='active' AND auth.body_consent_at IS NOT NULL
-                   AND access.is_visible AND access.sync_enabled AND COALESCE(chat.chat_status,'normal')='normal'
-                   AND access.p2p_counterpart_type='user' AND access.p2p_counterpart_open_id IS NOT NULL
-                 UNION
-                 SELECT message.sender_open_id,auth.id,auth.scopes FROM authorizations auth
-                 JOIN authorization_chats access ON access.authorization_id=auth.id JOIN chats chat USING(chat_id)
-                 JOIN authorization_message_observations observation
-                   ON observation.authorization_id=auth.id AND observation.chat_id=access.chat_id
-                 JOIN chat_messages message ON message.chat_id=observation.chat_id
-                   AND message.message_id=observation.message_id
-                 WHERE auth.status='active' AND auth.body_consent_at IS NOT NULL
-                   AND access.is_visible AND access.sync_enabled AND COALESCE(chat.chat_status,'normal')='normal'
-                   AND observation.observed_at>=auth.body_consent_at AND NOT message.is_deleted
-               ), gaps AS (
-                 SELECT identity.open_id,COUNT(visible.id) AS sources,
-                   BOOL_AND(COALESCE(provider.status='unavailable' AND provider.retry_at>NOW()
-                            AND provider.scopes=visible.scopes,FALSE)) AS blocked,
-                   MIN(provider.retry_at) AS retry_at
-                 FROM lark_identities identity LEFT JOIN visible ON visible.open_id=identity.open_id
-                 LEFT JOIN identity_profile_providers provider ON provider.authorization_id=visible.id
-                 WHERE identity.identity_type='user'
-                   AND (identity.avatar_retry_at<=NOW() OR identity.avatar_error_code='profile_probe_pending')
-                   AND NOT EXISTS(SELECT 1 FROM authorizations auth
-                                  WHERE auth.open_id=identity.open_id AND auth.status='active')
-                 GROUP BY identity.open_id
-               )
-               UPDATE lark_identities identity SET avatar_status='unavailable',
-                 avatar_error_code=CASE WHEN gaps.sources=0 THEN 'no_visible_authorization'
-                                       ELSE 'profile_scope_unavailable' END,
-                 avatar_checked_at=NOW(),avatar_retry_at=COALESCE(gaps.retry_at,NOW()+INTERVAL '1 day'),
-                 avatar_claim_id=NULL FROM gaps WHERE identity.open_id=gaps.open_id
-                 AND (gaps.sources=0 OR gaps.blocked)
-                 AND (identity.avatar_retry_at<=NOW() OR identity.avatar_error_code='profile_probe_pending')""",
-        )
-
-
 def _finish_response(job, source, profile=None, error=None, *, defer_unavailable=False):
-    provider_denied = False
     with connection() as conn, conn.transaction():
         if not _scope_current(conn, source, job["open_id"], lock=True):
             _outcome(conn, job, "unavailable", "authorization_changed")
@@ -301,7 +276,6 @@ def _finish_response(job, source, profile=None, error=None, *, defer_unavailable
                 _outcome(conn, job, "unavailable" if unavailable else "failed", code, retry_seconds=delay)
             if not own and (denied or not unavailable):
                 _provider_result(conn, source, "unavailable" if denied else "failed", code, delay)
-                provider_denied = denied
         elif profile.open_id != job["open_id"]:
             _outcome(conn, job, "unavailable", "identity_mismatch")
         else:
@@ -317,13 +291,10 @@ def _finish_response(job, source, profile=None, error=None, *, defer_unavailable
                     _outcome(conn, job, "unavailable", "avatar_field_unavailable")
                 if not own:
                     _provider_result(conn, source, "unavailable", "avatar_field_unavailable", DAILY_SECONDS)
-                    provider_denied = True
             else:
                 store_profile_avatar(conn, job["open_id"], profile.avatar_url)
                 if not own:
                     _provider_result(conn, source, "available", None, 0)
-    if provider_denied:
-        _skip_denied_directory()
     return True
 
 
@@ -383,8 +354,6 @@ def run_claimed(job, client, settings):
                     return
                 status, code, retry_at = "unavailable", "avatar_field_unavailable", None
         _local_outcome(job, status, code, retry_at=retry_at)
-        if code == "no_visible_authorization":
-            _skip_denied_directory()
     except ReauthorizationRequired:
         _local_outcome(job, "unavailable", "authorization_unavailable")
     except Exception:

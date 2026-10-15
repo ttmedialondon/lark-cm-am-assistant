@@ -856,7 +856,7 @@ def test_stale_queue_version_prompt_and_revocation_fence_publication(pg, pilot, 
                       (flow.contact,)).fetchone()["n"] == 2
 
 
-def test_retry_ledger_and_disabled_config_keep_suggestions_isolated(pg, responsibility_flow):
+def test_retry_ledger_and_disabled_config_keep_suggestions_isolated(pg, responsibility_flow, monkeypatch):
     flow = responsibility_flow
     flow.enable()
     job = _prepared_job(pg, flow)
@@ -908,6 +908,24 @@ def test_retry_ledger_and_disabled_config_keep_suggestions_isolated(pg, responsi
     manual = _prepared_job(pg, flow)
     matching.run(manual, flow.settings)
     assert len(flow.calls) == 4
+    flow.material_version += 1
+    malformed_job = _prepared_job(pg, flow)
+    respond = matching.api.call_openai
+
+    def malformed(*args, **kwargs):
+        response = respond(*args, **kwargs)
+        return {**response, "text": response["text"] + " pruned" + response["text"]}
+
+    before = pg.execute("SELECT * FROM contact_assignments ORDER BY id").fetchall()
+    with monkeypatch.context() as broken:
+        broken.setattr(matching.api, "call_openai", malformed)
+        matching.run(malformed_job, flow.settings)
+    receipt = pg.execute("SELECT error_code,response_ciphertext FROM creator_responsibility_requests WHERE id=%s",
+                         (malformed_job["reservation_id"],)).fetchone()
+    assert receipt["error_code"] == "invalid_output" and receipt["response_ciphertext"]
+    diagnostic = json.loads(creator_data.cipher(flow.settings).decrypt(receipt["response_ciphertext"]))
+    assert " pruned" in diagnostic["raw"] and "Extra data" in diagnostic["error"]
+    assert pg.execute("SELECT * FROM contact_assignments ORDER BY id").fetchall() == before
     flow.enable(enabled=False)
     matching.configuration_changed(pg)
     assert _enqueue(pg, flow.contact) is None and matching.claim() is None

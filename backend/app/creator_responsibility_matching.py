@@ -532,13 +532,16 @@ def review(pack, config, contact_id, settings):
             total_timeout=70,
         )
         telemetry = {**response["telemetry"], "usage": response["usage"], "response_id": response["response_id"]}
-        parsed = json.loads(response["text"])
+        diagnostic = {"raw": response["text"][:64_000], "output_shape": telemetry.get("output_shape", [])}
+        parsed = api.parse_json(response["text"])
         result = evidence.validate(pack, parsed)
         # Only canonical, bounded result fields; no raw returned text in plaintext logs.
-        diagnostic = {"validated": result}
+        diagnostic = {"validated": result, "output_shape": telemetry.get("output_shape", [])}
     except Exception as exc:
         error = exc
         telemetry = getattr(exc, "telemetry", {}) or telemetry
+        diagnostic = {**(diagnostic or {}), "error": str(exc)[:160],
+                      "output_shape": telemetry.get("output_shape", [])}
         if isinstance(exc, json.JSONDecodeError | TypeError):
             error = api.ModelOutputError("invalid_json", telemetry=telemetry)
     return result, telemetry, error, diagnostic

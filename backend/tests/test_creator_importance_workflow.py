@@ -498,7 +498,7 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
     assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "dormant"
 
 
-def test_paid_retry_cache_and_stale_results_keep_billing_without_repeat(pg, ranking_flow):
+def test_paid_retry_cache_and_stale_results_keep_billing_without_repeat(pg, ranking_flow, monkeypatch):
     flow = ranking_flow
     flow.enable()
     pg.execute(
@@ -668,6 +668,27 @@ def test_paid_retry_cache_and_stale_results_keep_billing_without_repeat(pg, rank
     assert pg.execute("SELECT status,reason_code FROM creator_importance_jobs WHERE id=%s",
                       (incomplete["id"],)).fetchone() == {"status": "failed", "reason_code": "invalid_output"}
     assert importance.claim() is None and len(flow.calls) == calls + 1
+    view = importance.view_for(pg, incomplete["contact_id"], incomplete["responsible_authorization_id"],
+                               flow.settings, details=False)
+    assert view["gap_label"] == "上次评估未完成，等待处理"
+    pg.execute("DELETE FROM creator_importance_profiles WHERE contact_id=%s AND responsible_authorization_id=%s",
+               (incomplete["contact_id"], incomplete["responsible_authorization_id"]))
+    assert importance.view_for(pg, incomplete["contact_id"], incomplete["responsible_authorization_id"],
+                               flow.settings, details=False)["gap_label"] == "上次评估未完成，等待处理"
+    pg.execute("UPDATE creator_importance_jobs SET status='ready' WHERE id=%s", (incomplete["id"],))
+    restarted = importance.claim()
+    assert restarted and restarted["id"] == incomplete["id"]
+    checkpoint = pg.execute("SELECT checkpoint_ciphertext FROM creator_importance_jobs WHERE id=%s",
+                            (incomplete["id"],)).fetchone()
+    with monkeypatch.context() as malformed:
+        malformed.setattr(importance.api, "call_openai", lambda *_args, **_kwargs: {
+            "text": '{"facts":[]}HOOK\n {"facts":[]}', "telemetry": {"http_status": 200},
+            "usage": {"input_tokens": 11, "output_tokens": 9}, "response_id": "resp-bad-json"})
+        importance.run(restarted, flow.settings)
+    failed = pg.execute("SELECT status,stats,checkpoint_ciphertext FROM creator_importance_jobs WHERE id=%s",
+                        (restarted["id"],)).fetchone()
+    assert failed["status"] == "failed" and failed["stats"]["output_error"] == "json_extra_data"
+    assert failed["checkpoint_ciphertext"] == checkpoint["checkpoint_ciphertext"]
 
 
 def test_document_versions_preserve_incremental_ranking_and_reuse_paused_paid_work(pg, ranking_flow):

@@ -404,7 +404,7 @@ def test_member_name_refresh_retries_transaction_conflicts_without_aborting_batc
 
 
 def test_avatar_cache_permission_backoff_visibility_and_late_response_guards(pg, person, monkeypatch):
-    """One real queue workflow covers cache safety and a whole denied-provider sweep."""
+    """One real queue workflow covers permission cooldowns without a full-directory sweep."""
     profiles = identity_profiles
     key, own_id = b"x" * 32, person[1]
     settings, cipher = SimpleNamespace(token_encryption_key=key), TokenCipher(key)
@@ -429,7 +429,7 @@ def test_avatar_cache_permission_backoff_visibility_and_late_response_guards(pg,
     pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext,access_token_expires_at,body_consent_at) "
                "VALUES(%s,'ou_cm2',%s,NOW()+INTERVAL '1 hour',NOW()-INTERVAL '1 day')",
                (other_cm, cipher.encrypt("cm2-token")))
-    # A login-only CM has no external visibility and must not prevent the bulk denied-source pass.
+    # Login-only CMs still get their own profile without keeping external probes alive.
     pg.execute("INSERT INTO lark_identities(open_id) VALUES('ou_self_only')")
     pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext,access_token_expires_at) "
                "VALUES(%s,'ou_self_only',%s,NOW()+INTERVAL '1 hour')", (uuid4(), cipher.encrypt("self-token")))
@@ -482,12 +482,10 @@ def test_avatar_cache_permission_backoff_visibility_and_late_response_guards(pg,
     assert len(calls) == 5
     statuses = {r["open_id"]: r for r in pg.execute(
         "SELECT open_id,avatar_status,avatar_url,avatar_retry_at>NOW() AS delayed FROM lark_identities")}
-    assert all(row["delayed"] for row in statuses.values())
     assert statuses["ou_person"]["avatar_status"] == "succeeded"
-    assert statuses["ou_external_3"]["avatar_status"] == "unavailable"
-    assert statuses["ou_external_3"]["avatar_url"] == old_url  # Kept, but unavailable is hidden by the read model.
-    assert pg.execute("SELECT avatar_error_code FROM lark_identities WHERE open_id='ou_unreachable'").fetchone()[
-        "avatar_error_code"] == "no_visible_authorization"
+    assert statuses["ou_external_3"]["avatar_status"] == "pending" and not statuses["ou_external_3"]["delayed"]
+    assert statuses["ou_external_3"]["avatar_url"] == old_url  # Untouched caches are never marked successful.
+    assert profiles.claim_next() is None  # Known provider cooldowns stop work, not a scan of every person/group.
     assert pg.execute("SELECT open_id,contact_id,name,en_name,display_name,last_seen_at FROM lark_identities "
                       "ORDER BY open_id").fetchall() == before
 
@@ -497,16 +495,22 @@ def test_avatar_cache_permission_backoff_visibility_and_late_response_guards(pg,
         pg.execute("UPDATE lark_identities SET avatar_retry_at=NOW() WHERE open_id=%s", (target,))
         return profiles.claim_next()
 
-    retry = due()
+    assert due() is None
     assert pg.execute("SELECT avatar_status FROM lark_identities WHERE open_id=%s", (target,)).fetchone()[
         "avatar_status"] == "unavailable"  # A retry must not briefly reveal the old denied avatar.
-    profiles.run_claimed(retry, client, settings)
     assert len(calls) == 5  # Same-day retry only observes the persisted provider cooldown.
+    pg.execute("UPDATE lark_identities SET avatar_retry_at=NOW()+INTERVAL '1 day' WHERE open_id<>%s", (target,))
+    pg.execute("UPDATE lark_identities SET avatar_status='unavailable',avatar_error_code='profile_scope_unavailable',"
+               "avatar_checked_at=NOW()-INTERVAL '1 second' WHERE open_id=ANY(%s::text[])",
+               ([target, 'ou_external_1'],))
     pg.execute("UPDATE authorizations SET scopes=ARRAY['new-profile-scope'] WHERE id=%s", (own_id,))
     client.mode = "good"
     profiles.run_claimed(due(), client, settings)
     assert pg.execute("SELECT avatar_status FROM lark_identities WHERE open_id=%s", (target,)).fetchone()[
         "avatar_status"] == "succeeded"
+    resumed = profiles.claim_next()
+    assert resumed['open_id'] == 'ou_external_1'
+    profiles.run_claimed(resumed, client, settings)
     assert profiles.claim_next() is None
     # An otherwise working CM's per-person 41050 cannot hide another currently authorized reader.
     pg.execute("UPDATE identity_profile_providers SET status='available',retry_at=NOW()")
@@ -608,6 +612,31 @@ def test_avatar_cache_permission_backoff_visibility_and_late_response_guards(pg,
     profiles.store_profile_avatar(pg, target, None, avatar_present=True)
     assert (pg.execute("SELECT avatar_url FROM lark_identities WHERE open_id=%s", (target,)).fetchone()["avatar_url"]
             is None)
+    # A formerly invisible person can become readable in a new conversation, without waiting a day.
+    pg.execute("UPDATE authorizations SET body_consent_at=NOW() WHERE id=%s", (own_id,))
+    pg.execute("UPDATE identity_profile_providers SET status='available',retry_at=NOW() WHERE authorization_id=%s",
+               (own_id,))
+    pg.execute("UPDATE lark_identities SET avatar_status='unavailable',avatar_error_code='no_visible_authorization',"
+               "avatar_checked_at=NOW(),avatar_retry_at=NOW()+INTERVAL '1 day',"
+               "last_seen_at=NOW()+INTERVAL '1 second' WHERE open_id='ou_unreachable'")
+    pg.execute("INSERT INTO chat_members(chat_id,open_id,member_type,last_observed_by_authorization_id) "
+               "VALUES('chat_a','ou_unreachable','user',%s)", (own_id,))
+    discovered = profiles.claim_next()
+    assert discovered['open_id'] == 'ou_unreachable'
+    client.mode = 'good'
+    profiles.run_claimed(discovered, client, settings)
+    assert pg.execute("SELECT avatar_status FROM lark_identities WHERE open_id='ou_unreachable'").fetchone()[
+        'avatar_status'] == 'succeeded'
+    pg.execute("DELETE FROM chat_members WHERE open_id='ou_unreachable'")
+    pg.execute("UPDATE lark_identities SET avatar_status='unavailable',avatar_error_code='no_visible_authorization',"
+               "avatar_checked_at=NOW()-INTERVAL '1 second',avatar_retry_at=NOW()+INTERVAL '1 day',"
+               "last_seen_at=NOW()-INTERVAL '1 day' WHERE open_id='ou_unreachable'")
+    pg.execute("UPDATE authorizations SET scopes=ARRAY['new-grant'],updated_at=NOW() WHERE id=%s", (own_id,))
+    pg.execute("UPDATE identity_profile_providers SET retry_at=NOW()+INTERVAL '1 day' WHERE authorization_id=%s",
+               (own_id,))
+    started = len(calls)
+    profiles.run_claimed(profiles.claim_next(), client, settings)
+    assert len(calls) == started and profiles.claim_next() is None
 
 
 def test_avatar_provider_authorization_race_preserves_new_consent(monkeypatch):
@@ -627,6 +656,9 @@ def test_avatar_provider_authorization_race_preserves_new_consent(monkeypatch):
                           authorization_id uuid PRIMARY KEY REFERENCES authorizations(id) ON DELETE CASCADE,
                           scopes text[],status text NOT NULL DEFAULT 'pending',error_code text,
                           retry_at timestamptz NOT NULL DEFAULT NOW())""")
+            setup.execute("""CREATE TABLE lark_identities(open_id text PRIMARY KEY,identity_type text,
+                          avatar_claim_id uuid,avatar_status text,avatar_error_code text,
+                          avatar_retry_at timestamptz,avatar_checked_at timestamptz)""")
             setup.execute("INSERT INTO authorizations VALUES(%s,'ou_cm','active','old-token',ARRAY['read'],NOW())",
                           (actor,))
             setup.execute("INSERT INTO identity_profile_providers(authorization_id,scopes) VALUES(%s,ARRAY['read'])",
@@ -679,7 +711,10 @@ def test_avatar_provider_authorization_race_preserves_new_consent(monkeypatch):
             assert provider["scopes"] == ["read", "send"] and provider["status"] == "pending"
             current = setup.execute("SELECT id,open_id,access_token_ciphertext,scopes,body_consent_at "
                                     "FROM authorizations WHERE id=%s", (actor,)).fetchone()
-            assert identity_profiles._provider_gate(current) is None
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(identity_profiles._provider_gate, (current, current)))
+            assert results.count(None) == 1
+            assert next(row for row in results if row is not None)['status'] == 'checking'
             checking = setup.execute("SELECT * FROM identity_profile_providers").fetchone()
             assert checking["status"] == "checking" and checking["scopes"] == ["read", "send"]
             setup.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (actor,))

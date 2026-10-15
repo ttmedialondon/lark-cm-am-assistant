@@ -25,6 +25,7 @@ from . import creator_handle_evidence as evidence
 from . import openai_client as api
 from .creator_access import require_owner
 from .db import connection
+from .message_mentions import mention_targets
 
 FEATURE = "creator_handle_matching"
 LEASE_SECONDS = 120
@@ -185,19 +186,39 @@ def configuration_changed(conn):
 
 def touch_chats(conn, chat_ids, *, recognition_message_ids=()):
     """One lightweight signal per committed sync page, not a model call per message."""
-    if not chat_ids or not _enabled(_config(conn)):
+    if not chat_ids or not recognition_message_ids or not _enabled(_config(conn)):
         return
+    anchors = conn.execute("""SELECT chat_id,message_id,parent_id,sender_open_id,message_create_time,mentions_json
+        FROM chat_messages WHERE chat_id=ANY(%s::text[]) AND message_id=ANY(%s::text[]) AND NOT is_deleted""",
+        (chat_ids, list(recognition_message_ids))).fetchall()
+    mentioned = {target['open_id'] for row in anchors for target in mention_targets(row['mentions_json'])
+                 if target['open_id'] and not target['ambiguous']}
     conn.execute(
-        """SELECT enqueue_creator_handle(r.contact_id) FROM
-        (SELECT DISTINCT i.contact_id FROM lark_identities i
-         WHERE i.contact_id IS NOT NULL AND (EXISTS(SELECT 1 FROM chat_members m
-           WHERE m.open_id=i.open_id AND m.chat_id=ANY(%s::text[])) OR EXISTS(
-           SELECT 1 FROM chat_messages m WHERE m.sender_open_id=i.open_id AND m.chat_id=ANY(%s::text[])))) p
-        JOIN contact_roles r ON r.contact_id=p.contact_id AND r.role='creator' AND r.status='confirmed'""",
-        (chat_ids, chat_ids),
+        """WITH anchors AS MATERIALIZED(SELECT * FROM jsonb_to_recordset(%s::jsonb)
+            AS a(chat_id text,message_id text,parent_id text,sender_open_id text,message_create_time timestamptz)),
+        related AS (
+          SELECT sender_open_id FROM anchors
+          UNION SELECT m.sender_open_id FROM anchors a JOIN chat_messages m
+            ON m.chat_id=a.chat_id AND m.message_id=a.parent_id WHERE NOT m.is_deleted
+          UNION SELECT m.sender_open_id FROM anchors a JOIN chat_messages m
+            ON m.chat_id=a.chat_id AND m.parent_id=a.message_id
+            WHERE NOT m.is_deleted AND m.chat_id=ANY(%s::text[])
+          UNION SELECT m.sender_open_id FROM anchors a CROSS JOIN LATERAL (
+            SELECT sender_open_id FROM chat_messages m WHERE m.chat_id=a.chat_id AND NOT m.is_deleted
+              AND m.message_create_time BETWEEN a.message_create_time-INTERVAL '5 minutes'
+                AND a.message_create_time+INTERVAL '5 minutes'
+              -- Keep the bounded chat/time index scan for each page anchor.
+              OFFSET 0) m
+          UNION SELECT ac.p2p_counterpart_open_id FROM authorization_chats ac
+            JOIN (SELECT DISTINCT chat_id FROM anchors) a USING(chat_id)
+          UNION SELECT unnest(%s::text[]))
+        SELECT enqueue_creator_handle(p.contact_id) FROM (
+          SELECT DISTINCT i.contact_id FROM related JOIN lark_identities i ON i.open_id=related.sender_open_id
+          JOIN contact_roles r ON r.contact_id=i.contact_id AND r.role='creator' AND r.status='confirmed'
+          WHERE i.identity_type='user') p""",
+        (creator_data.encode(anchors), chat_ids, sorted(mentioned)),
     )
-    if recognition_message_ids:
-        conn.execute("""SELECT enqueue_creator_identity(i.contact_id,CASE WHEN bool_or(
+    conn.execute("""SELECT enqueue_creator_identity(i.contact_id,CASE WHEN bool_or(
               c.created_at>=f.creator_recognition_started_at AND m.message_type IN ('text','post')
               AND m.body_ciphertext IS NOT NULL AND EXISTS(SELECT 1 FROM creator_handle_jobs j
                 WHERE j.contact_id=i.contact_id AND j.purpose='identity' AND j.status='waiting_evidence'
@@ -346,13 +367,13 @@ def prepare_next(settings):
         storage = creator_data.cipher(settings)
         if pack and job["source"] != "manual" and not cached:
             request_fingerprint = evidence_hash(pack)
-            receipt = (conn.execute("""SELECT r.response_ciphertext FROM creator_handle_requests r
+            receipt = conn.execute("""SELECT r.response_ciphertext FROM creator_handle_requests r
                 JOIN creator_handle_jobs j ON j.id=r.job_id WHERE j.contact_id=%s
+                AND j.purpose=%s
                 AND r.material_fingerprint=%s AND r.config_fingerprint=%s
                 AND r.error_code='' AND r.billed_tokens IS NOT NULL
                 AND r.response_ciphertext IS NOT NULL ORDER BY r.created_at DESC LIMIT 1""",
-                (job['contact_id'], request_fingerprint, config_hash)).fetchone()
-                       if job['purpose'] == 'identity' else None)
+                (job['contact_id'], job['purpose'], request_fingerprint, config_hash)).fetchone()
             if receipt:
                 returned = json.loads(storage.decrypt(receipt['response_ciphertext'])).get('validated')
                 if returned:

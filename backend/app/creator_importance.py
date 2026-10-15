@@ -229,8 +229,12 @@ def _save_profile(conn, job, state, settings, *, cutoff=None, history_complete=F
 def view_for(conn, contact_id, cm_id, settings, *, actor_id=None, details=True):
     blank = {"tier": "pending", "tier_label": "待评估", "phase_label": "", "grounds": [],
              "cutoff_label": "", "gap_label": "尚未评估", "manual_tier": "", "manual_reason": "", "stale": False}
-    row = conn.execute("SELECT p.*, (" + _PROFILE_VALID + ") valid FROM creator_importance_profiles p "
-                       "WHERE contact_id=%s AND responsible_authorization_id=%s",
+    row = conn.execute("SELECT p.*,j.status job_status,j.reason_code job_reason, (" + _PROFILE_VALID + ") valid "
+                       "FROM (SELECT %s::uuid contact_id,%s::uuid cm_id) target "
+                       "LEFT JOIN creator_importance_profiles p ON p.contact_id=target.contact_id "
+                       "AND p.responsible_authorization_id=target.cm_id "
+                       "LEFT JOIN creator_importance_jobs j ON j.contact_id=target.contact_id "
+                       "AND j.responsible_authorization_id=target.cm_id",
                        (contact_id, cm_id)).fetchone()
     if not row or not conn.execute("SELECT creator_importance_is_eligible(%s,%s) ok",
                                    (contact_id, cm_id)).fetchone()["ok"]:
@@ -241,6 +245,8 @@ def view_for(conn, contact_id, cm_id, settings, *, actor_id=None, details=True):
         output["manual_reason"] = _cipher(settings).decrypt(row["manual_reason_ciphertext"]) \
             if row["manual_reason_ciphertext"] else ""
     if not row["valid"]:
+        if row["job_status"] == "failed":
+            return {**output, "gap_label": "上次评估未完成，等待处理"}
         return {**output, "gap_label": "历史分析中" if row["evaluated_at"]
                 and not row["coverage"].get("history_complete") else
                 "依据已变化，等待更新" if row["evaluated_at"] else "尚未自动评估"}
@@ -672,7 +678,8 @@ def prepare_next(settings):
                 WHERE job_id=%s AND fingerprint=%s AND error_code='' AND response_ciphertext IS NOT NULL
                 ORDER BY created_at DESC LIMIT 1""", (job["id"], fingerprint)).fetchone()
             if cached:
-                result = facts.validate(_cipher(settings).decrypt(cached["response_ciphertext"]), pack, state["facts"])
+                result = facts.validate(api.parse_json(_cipher(settings).decrypt(cached["response_ciphertext"])),
+                                        pack, state["facts"])
                 _finish_batch(conn, current, material, settings, result)
                 return True
             unknown = conn.execute("""SELECT 1 FROM creator_importance_requests WHERE job_id=%s
@@ -771,7 +778,7 @@ def claim():
             WHERE job_id=%s AND fingerprint=%s AND error_code='' AND response_ciphertext IS NOT NULL
             ORDER BY created_at DESC LIMIT 1""", (current["id"], current["fingerprint"])).fetchone()
         if cached:
-            result = facts.validate(_cipher(settings).decrypt(cached["response_ciphertext"]),
+            result = facts.validate(api.parse_json(_cipher(settings).decrypt(cached["response_ciphertext"])),
                                     material["pack"], material["state"]["facts"])
             _finish_batch(conn, current, material, settings, result)
             return None
@@ -804,7 +811,7 @@ def run(job, settings):
             return
     material = job["material"]
     pack = material["pack"]
-    result, raw, telemetry, error = None, None, {}, None
+    result, raw, telemetry, error, output_error = None, None, {}, None, None
     try:
         key = ai_feature_config.api_key_cipher(settings.token_encryption_key).decrypt(
             job["config"]["api_key_ciphertext"])
@@ -816,8 +823,15 @@ def run(job, settings):
             max_output_tokens=4_096, reasoning_effort="none", total_timeout=70)
         raw = response["text"]
         telemetry = {**response["telemetry"], "usage": response["usage"], "response_id": response["response_id"]}
-        result = facts.validate(raw, pack, material["state"]["facts"])
+        result = facts.validate(api.parse_json(raw), pack, material["state"]["facts"])
     except Exception as exc:
+        if isinstance(exc, json.JSONDecodeError):
+            output_error = "json_extra_data" if exc.msg == "Extra data" else "invalid_json"
+        elif isinstance(exc, api.ModelOutputError) and str(exc) in {
+                "refusal", "unfinished response", "unfinished message", "invalid response"}:
+            output_error = str(exc)
+        else:
+            output_error = type(exc).__name__
         error = api.ModelOutputError(str(exc), telemetry=telemetry) if isinstance(exc, ValueError) \
             and not isinstance(exc, api.OpenAIRequestError | api.ModelOutputError) else exc
         telemetry = getattr(error, "telemetry", {}) or telemetry
@@ -847,7 +861,10 @@ def run(job, settings):
         else:
             conn.execute("""UPDATE creator_importance_jobs SET status=%s,reason_code=%s,claim_token=NULL,
                 lease_until=NULL,not_before=NOW()+(%s*INTERVAL '1 second'),finished_at=CASE WHEN %s THEN NOW() END,
-                updated_at=NOW() WHERE id=%s""", ("retry_wait" if retry else "failed", code,
-                api.retry_delay(error.retry_after_seconds, job["attempts"]) if retry else 0, not retry, job["id"]))
+                stats=stats||%s::jsonb,updated_at=NOW() WHERE id=%s""",
+                ("retry_wait" if retry else "failed", code,
+                 api.retry_delay(error.retry_after_seconds, job["attempts"]) if retry else 0, not retry,
+                 creator_data.encode({"output_error": output_error, "output_shape": telemetry.get("output_shape", [])}),
+                 job["id"]))
         conn.execute("UPDATE ai_feature_configs SET last_tested_at=NOW(),last_test_status=%s WHERE feature=%s",
                      ("failed" if error else "succeeded", FEATURE))

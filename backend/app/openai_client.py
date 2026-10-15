@@ -200,8 +200,25 @@ def _read_response(response, started, *, full_output=False):
             "completed", "failed", "in_progress", "cancelled", "queued", "incomplete") else None,
         "incomplete_reason": reason if status == "incomplete" and reason in (
             "max_output_tokens", "content_filter") else None}
+    messages = [item for item in _json_list(data.get("output"))
+                if isinstance(item, Mapping) and item.get("type") == "message"]
+    telemetry["output_shape"] = [{
+        "phase": item.get("phase") if item.get("phase") in ("commentary", "final_answer") else None,
+        "status": item.get("status") if item.get("status") in ("completed", "in_progress", "incomplete") else None,
+        "text_parts": sum(part.get("type") == "output_text" for part in _json_list(item.get("content"))
+                          if isinstance(part, Mapping)),
+        "text_chars": sum(len(part.get("text", "")) for part in _json_list(item.get("content"))
+                          if isinstance(part, Mapping) and isinstance(part.get("text"), str)),
+        "refusals": sum(part.get("type") == "refusal" for part in _json_list(item.get("content"))
+                        if isinstance(part, Mapping)),
+    } for item in messages[:16]]
     if status not in (None, "completed"):
         raise ModelOutputError("unfinished response", telemetry=telemetry)
+    if any(item.get("status") not in (None, "completed") for item in messages):
+        raise ModelOutputError("unfinished message", telemetry=telemetry)
+    if any(part.get("type") == "refusal" for item in messages
+           for part in _json_list(item.get("content")) if isinstance(part, Mapping)):
+        raise ModelOutputError("refusal", telemetry=telemetry)
     try:
         if full_output and any(item.get('type') == 'function_call' for item in _json_list(data.get('output'))
                                if isinstance(item, Mapping)):
@@ -292,16 +309,29 @@ def _is_quota_response(response: httpx.Response) -> bool:
 
 
 def _response_text(data: Mapping[str, Any]) -> str:
-    if isinstance(data.get("output_text"), str):
-        return data["output_text"]
+    messages = [item for item in _json_list(data.get("output"))
+                if isinstance(item, Mapping) and item.get("type") == "message"]
+    # SDK output_text aggregates commentary too; an explicit final answer is authoritative.
+    final = [item for item in messages if item.get("phase") == "final_answer"]
+    messages = final or [item for item in messages if item.get("phase") != "commentary"]
     parts = []
-    for output in _json_list(data.get("output")):
-        for item in _json_list(output.get("content") if isinstance(output, Mapping) else None):
+    for output in messages:
+        for item in _json_list(output.get("content")):
             if isinstance(item, Mapping) and item.get("type") == "output_text" and isinstance(item.get("text"), str):
                 parts.append(item["text"])
     if parts:
         return "".join(parts)
+    if not _json_list(data.get("output")) and isinstance(data.get("output_text"), str):
+        return data["output_text"]
     raise KeyError("output_text")
+
+
+def parse_json(text: str):
+    """Allow a whole JSON code fence, never discard prose or extra objects."""
+    lines = text.strip().splitlines()
+    if len(lines) >= 3 and lines[0].strip().casefold() in ("```", "```json") and lines[-1].strip() == "```":
+        text = "\n".join(lines[1:-1])
+    return json.loads(text)
 
 
 def _nonnegative_int(value: object) -> int | None:

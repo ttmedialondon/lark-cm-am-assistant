@@ -85,11 +85,35 @@ def test_single_request_transport_preserves_retry_hints_and_safe_failure_metadat
 
     result = httpx.Response(200, json={"status": "completed", "output": [
         {"type": "reasoning", "summary": [{"type": "summary_text", "text": "PRIVATE REASONING"}]},
-        {"type": "message", "content": [{"type": "output_text", "text": '{"ready":'},
-            {"type": "refusal", "refusal": "PRIVATE REFUSAL"}]},
+        {"type": "message", "content": [{"type": "output_text", "text": '{"ready":'}]},
         {"type": "message", "content": [{"type": "output_text", "text": "true}"}]},
     ]})
     assert request()["text"] == '{"ready":true}'
+    result = httpx.Response(200, json={"status": "completed", "output_text": 'PRIVATE COMMENTARY{}', "output": [
+        {"type": "message", "phase": "commentary", "content": [{"type": "output_text", "text": "PRIVATE COMMENTARY"}]},
+        {"type": "message", "phase": "final_answer", "status": "completed",
+         "content": [{"type": "output_text", "text": '{"ready":'}, {"type": "output_text", "text": 'true}'}]},
+    ]})
+    final = request()
+    assert final["text"] == '{"ready":true}'
+    assert final["telemetry"]["output_shape"][1] == {
+        "phase": "final_answer", "status": "completed", "text_parts": 2, "text_chars": 14, "refusals": 0}
+    assert "PRIVATE COMMENTARY" not in str(final)
+    assert openai_client.parse_json('```json\n{"ready":true}\n```') == {"ready": True}
+    for malformed in ('{"facts":[]}HOOK\n {"facts":[]}', '{"facts":[]} pruned{"facts":[]}',
+                      '{"facts":[1]}\n⏹\n{"facts":[]}', '{} PRIVATE REFUSAL'):
+        with pytest.raises(ValueError):
+            openai_client.parse_json(malformed)
+    result = httpx.Response(200, json={"status": "completed", "output_text": "{}", "output": [
+        {"type": "message", "content": [{"type": "output_text", "text": "{}"},
+         {"type": "refusal", "refusal": "PRIVATE REFUSAL"}]}]})
+    with pytest.raises(openai_client.ModelOutputError, match="refusal") as stopped:
+        request()
+    assert "PRIVATE REFUSAL" not in str(stopped.value) + str(stopped.value.telemetry)
+    result = httpx.Response(200, json={"status": "completed", "output": [
+        {"type": "message", "status": "incomplete", "content": [{"type": "output_text", "text": "{}"}]}]})
+    with pytest.raises(openai_client.ModelOutputError, match="unfinished message"):
+        request()
     result = httpx.Response(200, json={"status": "completed", "output_text": "{}", "output": []})
 
     async def tool_post(headers, payload, total_timeout):
