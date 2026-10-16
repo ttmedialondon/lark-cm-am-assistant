@@ -15,7 +15,7 @@ from .crypto import TokenCipher, message_body_cipher, message_body_fingerprint
 from .db import connection
 from .lark_api import LarkApiError, LarkClient, build_chat_post_payload
 
-STATUSES = ("pending", "sending", "succeeded", "failed", "unknown", "cancelled")
+STATUSES = ("pending", "sending", "succeeded", "failed", "unknown", "cancelled", "duplicate")
 UNKNOWN_MESSAGE = "发送结果未知，请到 Lark 核实；不会自动重发"
 
 
@@ -27,6 +27,49 @@ def _body(ciphertext, snapshot, settings):
 def _images(conn, actor, body, settings):
     ids = broadcast_content.image_ids(body) if isinstance(body, dict) else []
     return broadcast_images.resolve(conn, actor, ids, settings)
+
+
+def _target_fingerprint(body, group, image_hashes, settings):
+    content = broadcast_content.post_rows(broadcast_content.normalize(body), image_hashes)
+    canonical = {"chat": group["id"], "content": content, "mention_all": bool(group.get("mention_all")),
+                 "mentions": sorted({item["id"] for item in group.get("mentions", [])})}
+    return message_body_fingerprint(settings.token_encryption_key, json.dumps(canonical, sort_keys=True))
+
+
+def _fingerprint_material(conn, actor, ciphertext, snapshot, settings):
+    body = _body(ciphertext, snapshot, settings)
+    ids = broadcast_content.image_ids(body) if isinstance(body, dict) else []
+    hashes = {str(row["id"]): "img_" + row["content_sha256"] for row in conn.execute(
+        """SELECT id,content_sha256 FROM creator_broadcast_images
+        WHERE owner_authorization_id=%s AND id=ANY(%s::uuid[])""",
+        (actor, ids)).fetchall()} if ids else {}
+    return body, hashes
+
+
+def _recent_duplicates(conn, actor, fingerprints, settings, *, exclude_batch=None):
+    recent = conn.execute(
+        """SELECT t.id,t.chat_id,t.batch_id,t.snapshot,p.body_ciphertext,p.snapshot AS preview_snapshot
+        FROM creator_broadcast_batches b
+        JOIN creator_broadcast_targets t ON t.batch_id=b.id
+        JOIN creator_broadcast_previews p ON p.id=b.preview_id
+        WHERE b.sender_authorization_id=%s AND t.chat_id=ANY(%s::text[])
+          AND b.created_at>NOW()-INTERVAL '10 minutes' AND t.status IN ('pending','sending','succeeded','unknown')
+          AND (%s::uuid IS NULL OR b.id<>%s)
+        ORDER BY b.created_at DESC""", (actor, list(fingerprints), exclude_batch, exclude_batch),
+    ).fetchall()
+    duplicates, legacy = {}, {}
+    for target in recent:
+        fingerprint = target["snapshot"].get("content_fingerprint")
+        if not fingerprint:
+            # Old receipts remain protected during the same ten-minute window without a data migration.
+            if target["batch_id"] not in legacy:
+                legacy[target["batch_id"]] = _fingerprint_material(
+                    conn, actor, target["body_ciphertext"], target["preview_snapshot"], settings)
+            old_body, old_hashes = legacy[target["batch_id"]]
+            fingerprint = _target_fingerprint(old_body, target["snapshot"], old_hashes, settings)
+        if fingerprint == fingerprints[target["chat_id"]]:
+            duplicates.setdefault(target["chat_id"], target)
+    return duplicates
 
 
 def _audit(conn, actor, action, metadata):
@@ -213,43 +256,15 @@ def prepare(actor_id, fields):
     rich = isinstance(data["message"], dict)
     content_version = 2 if rich else 1
     image_ids = broadcast_content.image_ids(data["message"]) if rich else []
-    groups = [{**group, "content_version": content_version, "image_ids": image_ids} for group in groups]
+    image_hashes = {key: "img_" + image["content_sha256"] for key, image in image_assets.items()}
+    groups = [{**group, "content_version": content_version, "image_ids": image_ids,
+               "content_fingerprint": _target_fingerprint(data["message"], group, image_hashes, settings)}
+              for group in groups]
     snapshot = {"groups": groups, "mention": fields["mention"], "content_version": content_version,
                 "image_ids": image_ids}
-    fingerprint_body = data["message"]
-    if rich and image_assets:
-        # Uploading identical bytes again must not bypass the same-message send guard.
-        fingerprint_body = {"version": 2, "ops": [
-            {"insert": {"image": image_assets[op["insert"]["image"]]["content_sha256"]}}
-            if isinstance(op["insert"], dict) else op for op in data["message"]["ops"]]}
-    if rich and all(isinstance(op["insert"], str) and not op.get("attributes") for op in data["message"]["ops"]):
-        fingerprint_body = broadcast_content.plain_text(data["message"])
-    canonical = {
-        "purpose": data["purpose"],
-        "message": fingerprint_body,
-        "groups": sorted(
-            [
-                {
-                    "id": group["id"],
-                    "mention_all": group["mention_all"],
-                    "people": sorted(person["id"] for person in group.get("people", [])),
-                    "mentions": sorted(mention["id"] for mention in group["mentions"]),
-                }
-                for group in groups
-            ],
-            key=lambda item: item["id"],
-        ),
-    }
     fingerprint = message_body_fingerprint(
-        settings.token_encryption_key, json.dumps(canonical, sort_keys=True, ensure_ascii=False)
+        settings.token_encryption_key, json.dumps(sorted(group["content_fingerprint"] for group in groups))
     )
-    # Quill's mandatory final newline must not resend the same pre-upgrade plain message.
-    fingerprints = [fingerprint]
-    if isinstance(fingerprint_body, str):
-        for text in {fingerprint_body.removesuffix("\n"), fingerprint_body.removesuffix("\n") + "\n"}:
-            fingerprints.append(message_body_fingerprint(settings.token_encryption_key, json.dumps(
-                {**canonical, "message": text}, sort_keys=True, ensure_ascii=False)))
-    snapshot["content_fingerprints"] = list(dict.fromkeys(fingerprints))
     with connection() as conn, conn.transaction():
         _unchanged(conn, actor, authorization)
         _images(conn, actor, data["message"], settings)
@@ -314,21 +329,25 @@ def _summary(conn, row, targets=None):
     can_retry = False
     if targets is None:
         targets = conn.execute(
-            """SELECT status,COUNT(*) AS n,BOOL_OR(retryable) AS retryable FROM creator_broadcast_targets
-            WHERE batch_id=%s GROUP BY status""", (row["id"],),
+            """SELECT CASE WHEN status='cancelled' AND snapshot ? 'duplicate_of' THEN 'duplicate'
+            ELSE status END AS status,COUNT(*) AS n,BOOL_OR(retryable) AS retryable FROM creator_broadcast_targets
+            WHERE batch_id=%s GROUP BY 1""", (row["id"],),
         ).fetchall()
     for item in targets:
         counts[item["status"]] += item.get("n", 1)
         can_retry = can_retry or bool(item["retryable"])
     total = sum(counts.values())
-    if counts["sending"]:
+    remaining = total - counts["duplicate"]
+    if not remaining:
+        status = "duplicate"
+    elif counts["sending"]:
         status = "sending"
     elif counts["pending"]:
-        status = "pending" if counts["pending"] == total else "sending"
+        status = "pending" if counts["pending"] == remaining else "sending"
     elif counts["unknown"]:
         status = "unknown"
     else:
-        status = next((key for key in ("succeeded", "failed", "cancelled") if counts[key] == total), "partial")
+        status = next((key for key in ("succeeded", "failed", "cancelled") if counts[key] == remaining), "partial")
     return {
         "id": str(row["id"]),
         "status": status,
@@ -369,33 +388,34 @@ def submit(actor_id, preview_id, request_id):
         authorization = _authorization(conn, actor)
         if authorization["open_id"] != preview["sender_open_id"]:
             raise PermissionError("发送账号已变化，请重新准备。")
-        existing = conn.execute(
-            """SELECT b.*,p.sender_name,p.purpose FROM creator_broadcast_batches b
-            JOIN creator_broadcast_previews p ON p.id=b.preview_id
-            WHERE b.sender_authorization_id=%s AND
-              (p.fingerprint=ANY(%s::text[]) OR p.snapshot->'content_fingerprints' ?| %s::text[])
-              AND b.created_at>NOW()-INTERVAL '10 minutes'
-              AND EXISTS(SELECT 1 FROM creator_broadcast_targets t WHERE t.batch_id=b.id
-                AND t.status IN ('pending','sending','succeeded','unknown'))
-            ORDER BY b.created_at DESC LIMIT 1""",
-            (actor, preview["snapshot"].get("content_fingerprints", [preview["fingerprint"]]),
-             preview["snapshot"].get("content_fingerprints", [preview["fingerprint"]])),
-        ).fetchone()
-        if existing:
-            return {"batch": _summary(conn, existing), "deduplicated": True}
         settings = get_settings()
-        _images(conn, actor, _body(preview["body_ciphertext"], preview["snapshot"], settings), settings)
-        _routes_current(conn, actor, preview["purpose"], preview["snapshot"]["groups"])
+        groups = preview["snapshot"]["groups"]
+        body = _body(preview["body_ciphertext"], preview["snapshot"], settings)
+        image_assets = _images(conn, actor, body, settings)
+        image_hashes = {key: "img_" + image["content_sha256"] for key, image in image_assets.items()}
+        fingerprints = {group["id"]: _target_fingerprint(body, group, image_hashes, settings) for group in groups}
+        duplicates = _recent_duplicates(conn, actor, fingerprints, settings)
+        if len(duplicates) == len(groups) and len({target["batch_id"] for target in duplicates.values()}) == 1:
+            existing = _owned_batch(conn, actor, next(iter(duplicates.values()))["batch_id"])
+            previous_chats = {row["chat_id"] for row in conn.execute(
+                "SELECT chat_id FROM creator_broadcast_targets WHERE batch_id=%s", (existing["id"],)).fetchall()}
+            if previous_chats == set(fingerprints):
+                return {"batch": _summary(conn, existing), "deduplicated": True}
+        _routes_current(conn, actor, preview["purpose"], groups)
         row = conn.execute(
             """INSERT INTO creator_broadcast_batches(sender_authorization_id,preview_id,request_id)
             VALUES(%s,%s,%s) RETURNING id""",
             (actor, preview_id, request_id),
         ).fetchone()
-        for group in preview["snapshot"]["groups"]:
+        for group in groups:
+            duplicate = duplicates.get(group["id"])
             conn.execute(
-                """INSERT INTO creator_broadcast_targets(batch_id,chat_id,chat_name,snapshot)
-                VALUES(%s,%s,%s,%s)""",
-                (row["id"], group["id"], group["name"], Jsonb(group)),
+                """INSERT INTO creator_broadcast_targets(batch_id,chat_id,chat_name,snapshot,status,error_message)
+                VALUES(%s,%s,%s,%s,%s,%s)""",
+                (row["id"], group["id"], group["name"],
+                 Jsonb({**group, "content_fingerprint": fingerprints[group["id"]],
+                        **({"duplicate_of": str(duplicate["id"])} if duplicate else {})}),
+                 "cancelled" if duplicate else "pending", "近期已有相同消息，未重复发送" if duplicate else None),
             )
         _audit(conn, actor, "submit", {"batch_id": str(row["id"]), "targets": len(preview["snapshot"]["groups"])})
         return {"batch": _summary(conn, _owned_batch(conn, actor, row["id"]))}
@@ -413,8 +433,10 @@ def history(actor_id):
         ).fetchall()
         targets = {row["id"]: [] for row in rows}
         if rows:
-            for item in conn.execute("""SELECT batch_id,status,COUNT(*) AS n,BOOL_OR(retryable) AS retryable
-                FROM creator_broadcast_targets WHERE batch_id=ANY(%s::uuid[]) GROUP BY batch_id,status""",
+            for item in conn.execute("""SELECT batch_id,
+                CASE WHEN status='cancelled' AND snapshot ? 'duplicate_of' THEN 'duplicate' ELSE status END AS status,
+                COUNT(*) AS n,BOOL_OR(retryable) AS retryable
+                FROM creator_broadcast_targets WHERE batch_id=ANY(%s::uuid[]) GROUP BY 1,2""",
                 (list(targets),)).fetchall():
                 targets[item["batch_id"]].append(item)
         return {"batches": [_summary(conn, row, targets[row["id"]]) for row in rows]}
@@ -425,7 +447,9 @@ def batch(actor_id, batch_id):
     with connection() as conn:
         row = _owned_batch(conn, actor, batch_id)
         targets = conn.execute(
-            """SELECT id,chat_id,chat_name,status,error_message,message_id,retryable
+            """SELECT id,chat_id,chat_name,
+            CASE WHEN status='cancelled' AND snapshot ? 'duplicate_of' THEN 'duplicate' ELSE status END AS status,
+            error_message,message_id,retryable
             FROM creator_broadcast_targets WHERE batch_id=%s ORDER BY created_at,id""",
             (batch_id,),
         ).fetchall()
@@ -464,6 +488,18 @@ def retry(actor_id, batch_id):
         conn.execute("SELECT id FROM authorizations WHERE id=%s FOR UPDATE", (actor,))
         _authorization(conn, actor)
         row = _owned_batch(conn, actor, batch_id)
+        targets = conn.execute("""SELECT id,chat_id,snapshot FROM creator_broadcast_targets
+            WHERE batch_id=%s AND status='failed' AND retryable""", (batch_id,)).fetchall()
+        if not targets:
+            raise ValueError("没有可重试的明确失败项；成功和结果未知的消息不会重发。")
+        settings = get_settings()
+        fingerprints = {target["chat_id"]: target["snapshot"].get("content_fingerprint") for target in targets}
+        if not all(fingerprints.values()):
+            preview = _owned_preview(conn, actor, row["preview_id"])
+            body, hashes = _fingerprint_material(conn, actor, preview["body_ciphertext"], preview["snapshot"], settings)
+            fingerprints = {target["chat_id"]: fingerprints[target["chat_id"]]
+                            or _target_fingerprint(body, target["snapshot"], hashes, settings) for target in targets}
+        duplicates = _recent_duplicates(conn, actor, fingerprints, settings, exclude_batch=batch_id)
         changed = conn.execute(
             """UPDATE creator_broadcast_targets SET status='pending',retryable=FALSE,
             next_attempt_at=NOW(),send_started_at=NULL,lease_token=NULL,lease_until=NULL,error_message=NULL,
@@ -471,10 +507,16 @@ def retry(actor_id, batch_id):
             WHERE batch_id=%s AND status='failed' AND retryable""",
             (batch_id,),
         ).rowcount
-        if not changed:
-            raise ValueError("没有可重试的明确失败项；成功和结果未知的消息不会重发。")
+        for target in targets:
+            duplicate = duplicates.get(target["chat_id"])
+            if duplicate:
+                conn.execute("""UPDATE creator_broadcast_targets SET status='cancelled',
+                    snapshot=snapshot||%s,error_message='近期已有相同消息，未重复发送'
+                    WHERE id=%s AND status='pending'""",
+                    (Jsonb({"duplicate_of": str(duplicate["id"])}), target["id"]))
         conn.execute("UPDATE creator_broadcast_batches SET cancel_requested_at=NULL WHERE id=%s", (batch_id,))
-        _audit(conn, actor, "retry", {"batch_id": str(batch_id), "targets": changed})
+        _audit(conn, actor, "retry", {"batch_id": str(batch_id), "targets": changed - len(duplicates),
+                                    "duplicates": len(duplicates)})
         return {"batch": _summary(conn, row)}
 
 

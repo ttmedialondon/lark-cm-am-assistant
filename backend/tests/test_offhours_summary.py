@@ -1724,6 +1724,74 @@ def test_creator_enrollment_backfills_closed_periods_without_repaying_or_replaci
                       (second_run['id'],)).fetchall() == untouched
     assert old_tasks() == original
 
+    # Withdrawals are invalidation signals, not model material, including the sole speaker in a group.
+    for lose_relationship in (False, True):
+        pg.execute('SAVEPOINT event_touch_withdrawal')
+        calls_before = len(s.calls)
+        before_withdrawal = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s "
+                                       "AND chat_id='late-new-scope' AND is_current", (late_run['id'],)).fetchone()
+        before_merge = pg.execute('SELECT * FROM offhours_summary_tasks WHERE run_id=%s '
+                                  'AND contact_id=%s AND is_current', (late_run['id'], s.ids['other'])).fetchone()
+        assert before_merge and before_merge['status'] == 'succeeded'
+        deleted_ids = ['late-history', 'late-new-message'] if lose_relationship else ['late-history']
+        if lose_relationship:
+            pg.execute("UPDATE chats SET chat_mode='group' WHERE chat_id='late-new-scope'")
+            pg.execute("UPDATE authorization_chats SET p2p_counterpart_open_id=NULL WHERE chat_id='late-new-scope'")
+        pg.execute('UPDATE chat_messages SET is_deleted=TRUE,body_ciphertext=NULL,body_fingerprint=NULL '
+                   'WHERE message_id=ANY(%s::text[])', (deleted_ids,))
+        pg.execute('SAVEPOINT event_touch_withdrawal_scope')
+        pg.execute('DELETE FROM authorization_message_observations WHERE message_id=ANY(%s::text[])', (deleted_ids,))
+        assert summary_periods.touch_chats(
+            pg, s.ids['cm'], ['late-new-scope'], message_ids=deleted_ids) == 0
+        pg.execute('ROLLBACK TO SAVEPOINT event_touch_withdrawal_scope')
+        assert summary_periods.touch_chats(pg, s.ids['cm'], ['late-new-scope'], message_ids=deleted_ids) == 1
+        assert summary_periods.touch_chats(pg, s.ids['cm'], ['late-new-scope'], message_ids=deleted_ids) == 0
+        if lose_relationship:
+            pg.execute('SAVEPOINT event_touch_withdrawal_inflight')
+            pg.execute("UPDATE offhours_summary_tasks SET status='running',lease_until=NOW()+INTERVAL '10 minutes' "
+                       'WHERE id=%s', (before_withdrawal['id'],))
+            summary_periods.backfill_due(pg, now + timedelta(seconds=155))
+            assert pg.execute('SELECT status,is_current FROM offhours_summary_tasks WHERE id=%s',
+                              (before_withdrawal['id'],)).fetchone() == {'status': 'running', 'is_current': True}
+            assert pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
+            pg.execute('ROLLBACK TO SAVEPOINT event_touch_withdrawal_inflight')
+            pg.execute('SAVEPOINT event_touch_withdrawal_unknown_merge')
+            pg.execute("UPDATE offhours_summary_tasks SET status='failed',"
+                       "error_message='请求结果未知，未自动重复调用。' WHERE id=%s", (before_merge['id'],))
+            summary_periods.backfill_due(pg, now + timedelta(seconds=155))
+            held_merge = pg.execute('SELECT is_current,status,result_ciphertext,checkpoint_ciphertext,attempts,usage '
+                                    'FROM offhours_summary_tasks WHERE id=%s', (before_merge['id'],)).fetchone()
+            assert held_merge == {**{key: before_merge[key] for key in
+                                      ('result_ciphertext', 'checkpoint_ciphertext', 'attempts', 'usage')},
+                                  'status': 'failed', 'is_current': True}
+            pg.execute('ROLLBACK TO SAVEPOINT event_touch_withdrawal_unknown_merge')
+        summary_periods.backfill_due(pg, now + timedelta(seconds=155))
+        finish()
+        summary_periods.backfill_due(pg, now + timedelta(seconds=186))
+        assert not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
+        assert 'Earlier sample enquiry' not in json.dumps(s.calls[calls_before:])
+        live = pg.execute("SELECT t.* FROM offhours_summary_tasks t JOIN offhours_summary_runs r ON r.id=t.run_id "
+                          "WHERE r.responsible_authorization_id=%s AND t.chat_id='late-new-scope' AND t.is_current",
+                          (s.ids['cm'],)).fetchall()
+        assert not live if lose_relationship else any(t['id'] != before_withdrawal['id'] for t in live)
+        if lose_relationship:
+            assert not pg.execute('SELECT 1 FROM offhours_summary_tasks WHERE run_id=%s '
+                                  'AND contact_id=%s AND is_current', (late_run['id'], s.ids['other'])).fetchone()
+            assert pg.execute('SELECT status,result_ciphertext,checkpoint_ciphertext,attempts,usage '
+                              'FROM offhours_summary_tasks WHERE id=%s', (before_merge['id'],)).fetchone() == {
+                                  key: before_merge[key] for key in
+                                  ('status', 'result_ciphertext', 'checkpoint_ciphertext', 'attempts', 'usage')}
+        assert pg.execute('SELECT status,result_ciphertext,checkpoint_ciphertext,attempts,usage '
+                          'FROM offhours_summary_tasks WHERE id=%s', (late_source['id'],)).fetchone() == {
+                              key: late_source[key] for key in
+                              ('status', 'result_ciphertext', 'checkpoint_ciphertext', 'attempts', 'usage')}
+        assert old_tasks() == original
+        assert pg.execute('SELECT id,status,result_ciphertext,checkpoint_ciphertext,attempts,usage '
+                          'FROM offhours_summary_tasks WHERE run_id=%s ORDER BY id',
+                          (second_run['id'],)).fetchall() == untouched
+        pg.execute('ROLLBACK TO SAVEPOINT event_touch_withdrawal')
+        del s.calls[calls_before:]
+
     # Waking a conversation is not permission to repeat a request with unknown paid outcome.
     current = pg.execute("SELECT * FROM offhours_summary_tasks WHERE run_id=%s "
                          "AND chat_id='late-new-scope' AND is_current", (late_run['id'],)).fetchone()

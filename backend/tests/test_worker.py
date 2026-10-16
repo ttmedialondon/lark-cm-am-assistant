@@ -1267,6 +1267,8 @@ def test_new_coordinator_keeps_revocation_and_discovery_retry_fences(pg, monkeyp
     # An ongoing page round can discover new groups without replacing any existing page/window.
     pg.execute("UPDATE sync_jobs SET discovery_completed_at=NOW()-INTERVAL '10 minutes',scheduled_at=NOW() "
                "WHERE id=%s", (job_id,))
+    pg.execute("UPDATE authorizations SET p2p_discovery_status='succeeded',"
+               "p2p_last_checked_at=NOW()-INTERVAL '10 minutes' WHERE id=%s", (actor,))
     job = next(job for job in worker._running_jobs() if job.id == job_id)
     auth = worker._authorization(actor)
     pg.execute("INSERT INTO chats(chat_id,chat_mode) VALUES('zz_departed','group')")
@@ -1292,7 +1294,12 @@ def test_new_coordinator_keeps_revocation_and_discovery_retry_fences(pg, monkeyp
     requests, fail_second_page = [], True
 
     def refresh_groups(_token, page=None, *, types=None):
-        assert types is None  # Periodic group discovery does not repeat profile or optional P2P calls.
+        if types == 'p2p':
+            p2p_calls.append(types)
+            if not available:
+                raise worker.LarkApiError(503, None, 'temporary P2P outage')
+            return {'items': [{'chat_id': 'oc_new_private_during_backfill', 'chat_mode': 'p2p',
+                               'p2p_target_type': 'user', 'p2p_target_id': 'ou_new_private_peer'}]}
         requests.append(page)
         if page is None:
             return {'items': [{'chat_id': healthy.chat_id}, {'chat_id': 'oc_new_during_backfill'}],
@@ -1334,10 +1341,35 @@ def test_new_coordinator_keeps_revocation_and_discovery_retry_fences(pg, monkeyp
                       "WHERE chat_id='oc_discovery_resume'").fetchone() == {
                           'incremental_page_token': 'healthy-page-2', 'backfill_page_token': 'keep-page-3'}
     assert not worker._refresh_running_discovery(settings, client)
-    assert len(p2p_calls) == 2 and requests == [None, 'directory-2', None, 'directory-2']
+    assert len(p2p_calls) == 3 and requests == [None, 'directory-2', None, 'directory-2']
+    private = pg.execute("SELECT is_visible,p2p_counterpart_open_id FROM authorization_chats "
+                         "WHERE chat_id='oc_new_private_during_backfill'").fetchone()
+    assert private == {'is_visible': True, 'p2p_counterpart_open_id': 'ou_new_private_peer'}
+    p2p_status = pg.execute("SELECT p2p_discovery_status,p2p_last_checked_at>=NOW() AS checked "
+                            "FROM authorizations WHERE id=%s", (actor,)).fetchone()
+    assert p2p_status == {'p2p_discovery_status': 'succeeded', 'checked': True}
     assert pg.execute("SELECT last_error,last_error_code,last_http_status FROM sync_jobs WHERE id=%s",
                       (job_id,)).fetchone() == {'last_error': None, 'last_error_code': None, 'last_http_status': None}
     assert {table: pg.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall() for table in protected} == protected
+
+    # Directory refreshes keep P2P's own interval/backoff and a failed list cannot hide existing private chats.
+    for status, checked, expected_calls in (
+        ('succeeded', 'NOW()', 3),
+        ('unavailable', "NOW()-INTERVAL '30 minutes'", 3),
+        ('unavailable', "NOW()-INTERVAL '2 hours'", 4),
+        ('unavailable', 'NOW()', 4),
+    ):
+        available = False
+        pg.execute("UPDATE sync_jobs SET scheduled_at=NOW(),discovery_completed_at=NOW()-INTERVAL '10 minutes' "
+                   "WHERE id=%s", (job_id,))
+        pg.execute(f"UPDATE authorizations SET p2p_discovery_status=%s,p2p_last_checked_at={checked} WHERE id=%s",
+                   (status, actor))
+        assert worker._refresh_running_discovery(settings, client)
+        assert len(p2p_calls) == expected_calls
+        assert pg.execute("SELECT is_visible FROM authorization_chats "
+                          "WHERE chat_id='oc_new_private_during_backfill'").fetchone()['is_visible']
+    assert pg.execute("SELECT p2p_discovery_status FROM authorizations WHERE id=%s", (actor,)).fetchone()[
+        'p2p_discovery_status'] == 'unavailable'
 
     # Invalid directories and stale/revoked responses never masquerade as an empty complete roster.
     visible = pg.execute("SELECT chat_id,is_visible,sync_generation FROM authorization_chats "

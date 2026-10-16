@@ -574,18 +574,21 @@ if (typeof document !== 'undefined' && document.getElementById('broadcast-app'))
     try {
       const result = await api('send',{preview_id:frozenPreview.preview_id,request_id:sendRequestId});
       $('confirm').close(); frozenPreview = null; sendRequestId = null;
-      notice(result.deduplicated ? '已显示已有发送任务，未重复创建。' : '已加入发送队列。');
+      notice(result.batch.status === 'duplicate' ? '已去重，未重复发送。'
+        : result.deduplicated ? '已显示已有发送任务，未重复创建。'
+        : result.batch.duplicate ? `已跳过 ${result.batch.duplicate} 个重复群，其余已加入发送队列。` : '已加入发送队列。');
       upsertBatch(result.batch); await openBatch(result.batch.id);
     } catch (error) {
       $('confirm-error').textContent = error.message;
       if (!sendReady()) $('confirm-state').textContent = '发送已暂停，预览和消息会保留';
     } finally { sending = false; syncGate(); }
   });
-  const statusLabels = {pending:'排队中',sending:'发送中',succeeded:'已发送',failed:'失败',unknown:'状态未知',cancelled:'已停止',partial:'部分完成'};
+  const statusLabels = {pending:'排队中',sending:'发送中',succeeded:'已发送',failed:'失败',unknown:'状态未知',cancelled:'已停止',duplicate:'已去重',partial:'部分完成'};
   const statusStyle = status => status === 'succeeded' ? 'bg-green-lt' : ['failed','unknown'].includes(status) ? 'bg-yellow-lt' : 'bg-secondary-lt';
   const batchActive = batch => ['pending','sending'].includes(batch.status) || batch.pending > 0 || batch.sending > 0;
   const progress = batch => [`${batch.total} 个群`, batch.succeeded ? `已发 ${batch.succeeded}` : '', batch.failed ? `失败 ${batch.failed}` : '',
-    batch.unknown ? `待核对 ${batch.unknown}` : '', batch.cancelled ? `已停 ${batch.cancelled}` : ''].filter(Boolean).join(' · ');
+    batch.unknown ? `待核对 ${batch.unknown}` : '', batch.cancelled ? `已停 ${batch.cancelled}` : '',
+    batch.duplicate ? `去重 ${batch.duplicate}` : ''].filter(Boolean).join(' · ');
   function upsertBatch(batch) {
     batches = [batch,...batches.filter(item => item.id !== batch.id)].slice(0,20);
     batches.sort((a,b) => String(b.created_at).localeCompare(String(a.created_at))); renderHistory();

@@ -81,7 +81,7 @@ def seed_due(conn, now):
 
 
 def touch_chats(conn, authorization_id, chat_ids, *, message_ids=None):
-    """Coalesce newly readable material under the caller's existing sync-material lock."""
+    """Coalesce changed source signals under the caller's existing sync-material lock."""
     if not chat_ids or message_ids is not None and not message_ids:
         return 0
     # Include the existing seven-day context of the seven visible report dates.
@@ -94,8 +94,16 @@ def touch_chats(conn, authorization_id, chat_ids, *, message_ids=None):
           AND ac.chat_id=ANY(%s::text[]) AND ac.is_visible AND ac.sync_enabled
           AND ac.sync_status IS DISTINCT FROM 'not_readable' AND COALESCE(c.chat_status,'normal')='normal'
           AND EXISTS(SELECT 1 FROM chat_messages m WHERE m.chat_id=ac.chat_id
-            AND NOT m.is_deleted AND m.body_ciphertext IS NOT NULL
-            AND m.message_type IN ('text','post','share_chat','share_user','interactive','merge_forward','image','file')
+            AND ((NOT m.is_deleted AND m.body_ciphertext IS NOT NULL
+              AND m.message_type IN
+                ('text','post','share_chat','share_user','interactive','merge_forward','image','file'))
+              OR (m.is_deleted AND m.message_id=ANY(%s::text[]) AND EXISTS(
+                SELECT 1 FROM offhours_summary_tasks t JOIN offhours_summary_runs run ON run.id=t.run_id
+                WHERE run.responsible_authorization_id=a.id AND run.origin='scheduled'
+                  AND run.period IS NOT NULL AND run.report_date>=(NOW() AT TIME ZONE 'Europe/London')::date-6
+                  AND t.chat_id=m.chat_id AND t.is_current
+                  AND m.message_create_time>=run.window_start-INTERVAL '7 days'
+                  AND m.message_create_time<t.cutoff)))
             AND (%s::text[] IS NULL OR m.message_id=ANY(%s::text[]))
             AND m.message_create_time>=((NOW() AT TIME ZONE 'Europe/London')::date-13)::timestamp
                 AT TIME ZONE 'Europe/London' AND m.message_create_time<NOW()
@@ -113,14 +121,15 @@ def touch_chats(conn, authorization_id, chat_ids, *, message_ids=None):
               AND member.open_id=i.open_id AND member.member_type='user') OR EXISTS(
             SELECT 1 FROM chat_messages own
             WHERE own.chat_id=material.chat_id AND own.sender_open_id=i.open_id
-              AND NOT own.is_deleted AND own.body_ciphertext IS NOT NULL
+              AND ((NOT own.is_deleted AND own.body_ciphertext IS NOT NULL)
+                OR (own.is_deleted AND own.message_id=ANY(%s::text[])))
               AND EXISTS(SELECT 1 FROM authorization_message_observations observed
                 WHERE observed.chat_id=own.chat_id AND observed.message_id=own.message_id
                   AND observed.authorization_id=material.authorization_id
                   AND observed.observed_at>=material.body_consent_at OFFSET 0))))
         ORDER BY x.contact_id,material.authorization_id
         ON CONFLICT(contact_id,responsible_authorization_id) DO NOTHING RETURNING contact_id""",
-        (authorization_id, sorted(set(chat_ids)), message_ids, message_ids)).fetchall()
+        (authorization_id, sorted(set(chat_ids)), message_ids, message_ids, message_ids, message_ids)).fetchall()
     return len(queued)
 
 
@@ -160,6 +169,21 @@ def backfill_due(conn, now):
         return 0
     # Retain the full roster in shared groups; only filter the conversations to visit.
     affected = [chat for chat in chats if person in chat['contact_ids']]
+    # A withdrawn sole speaker can remove the old relationship without leaving any readable replacement.
+    retired_chats = [row['chat_id'] for row in conn.execute("""SELECT DISTINCT t.chat_id
+        FROM offhours_summary_tasks t JOIN offhours_summary_runs r ON r.id=t.run_id
+        JOIN authorization_chats ac ON ac.authorization_id=r.responsible_authorization_id AND ac.chat_id=t.chat_id
+        JOIN chats c ON c.chat_id=ac.chat_id JOIN authorizations a ON a.id=ac.authorization_id
+        WHERE r.responsible_authorization_id=%s AND r.origin='scheduled' AND r.period IS NOT NULL
+          AND r.report_date>=(NOW() AT TIME ZONE 'Europe/London')::date-6 AND t.is_current
+          AND ac.is_visible AND ac.sync_enabled AND ac.sync_status IS DISTINCT FROM 'not_readable'
+          AND COALESCE(c.chat_status,'normal')='normal' AND NOT(t.chat_id=ANY(%s::text[]))
+          AND EXISTS(SELECT 1 FROM chat_messages m JOIN lark_identities i ON i.open_id=m.sender_open_id
+            WHERE m.chat_id=t.chat_id AND m.is_deleted AND i.contact_id=%s AND i.identity_type='user'
+              AND m.message_create_time>=r.window_start-INTERVAL '7 days' AND m.message_create_time<t.cutoff
+              AND EXISTS(SELECT 1 FROM authorization_message_observations o WHERE o.authorization_id=a.id
+                AND o.chat_id=m.chat_id AND o.message_id=m.message_id AND o.observed_at>=a.body_consent_at))""",
+        (cm, [chat['chat_id'] for chat in chats], person)).fetchall()]
     deferred, blocked, waiting_sync, inserted = False, False, False, 0
     event_rules, rules_digest = summaries._event_rules(conn, summaries.get_settings())
     run_ids = []
@@ -180,7 +204,8 @@ def backfill_due(conn, now):
                  now if now < end else None, end + timedelta(days=1) if now < end else end,
                  event_rules, rules_digest)).fetchone()
             run_ids.append(run['id'])
-            count = summaries._schedule_run(conn, run, now, contact_ids={person}, roster=roster, chats=chats)
+            count = summaries._schedule_run(conn, run, now, contact_ids={person}, roster=roster, chats=chats,
+                                            retired_chat_ids=retired_chats)
             deferred |= count is None
             inserted += count or 0
             # Keep the signal until affected analysis finishes. A later source change

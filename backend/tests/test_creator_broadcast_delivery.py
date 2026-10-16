@@ -335,6 +335,55 @@ def test_confirmed_delivery_is_scoped_idempotent_and_recoverable(pg, monkeypatch
         ambiguous = delivery.prepare(actor, support)
         assert not ambiguous["can_send"] and "身份不唯一" in ambiguous["issues"][0]["reason"]
 
+    # Overlapping batches, changed tags and pre-upgrade receipts cannot resend a shared target.
+    common = {**fields, "purpose": "custom", "message": "Announcement per-target guard"}
+    ab = delivery.prepare(actor, {**common, "selections": [{"chat_id": "oc_a"}, {"chat_id": "oc_b"}]})
+    ab_id = delivery.submit(actor, ab["preview_id"], uuid4())["batch"]["id"]
+    pg.execute("UPDATE creator_broadcast_targets SET snapshot=snapshot-'content_fingerprint' WHERE batch_id=%s",
+               (ab_id,))
+    pg.execute("UPDATE creator_broadcast_targets SET status='unknown' WHERE batch_id=%s AND chat_id='oc_b'", (ab_id,))
+    only_b = delivery.prepare(actor, {**common, "selections": [{"chat_id": "oc_b"}]})
+    only_b_result = delivery.submit(actor, only_b["preview_id"], uuid4())["batch"]
+    assert only_b_result["id"] != ab_id and only_b_result["status"] == 'duplicate' and only_b_result["total"] == 1
+    bc = delivery.prepare(actor, {**common, "purpose": "category",
+        "message": broadcast_content.normalize(common["message"]),
+        "selections": [{"chat_id": "oc_b"}, {"chat_id": "oc_c"}]})
+    bc_result = delivery.submit(actor, bc["preview_id"], uuid4())
+    bc_id = bc_result["batch"]["id"]
+    assert bc_result["batch"]["pending"] == bc_result["batch"]["duplicate"] == 1
+    assert {row["chat_id"]: row["status"] for row in delivery.batch(actor, bc_id)["targets"]} == {
+        "oc_b": "duplicate", "oc_c": "pending"}
+    assert next(row for row in delivery.history(actor)["batches"] if row["id"] == bc_id)["duplicate"] == 1
+    ac = delivery.prepare(actor, {**common, "selections": [{"chat_id": "oc_a"}, {"chat_id": "oc_c"}]})
+    ac_result = delivery.submit(actor, ac["preview_id"], uuid4())
+    assert ac_result["batch"]["status"] == "duplicate" and ac_result["batch"]["duplicate"] == 2
+    assert delivery.submit(actor, ac["preview_id"], uuid4())["batch"]["id"] == ac_result["batch"]["id"]
+    changed_at = delivery.prepare(actor, {**common, "mention": False, "selections": [{"chat_id": "oc_b"}]})
+    changed_at_id = delivery.submit(actor, changed_at["preview_id"], uuid4())["batch"]["id"]
+    assert delivery.batch(actor, changed_at_id)["batch"]["pending"] == 1
+    for pending_id in (ab_id, bc_id, changed_at_id):
+        delivery.cancel(actor, pending_id)
+    # Explicitly stopped targets are eligible again, but the unknown B is still protected.
+    resumed = delivery.prepare(actor, {**common, "selections": [{"chat_id": "oc_a"}, {"chat_id": "oc_c"}]})
+    resumed_id = delivery.submit(actor, resumed["preview_id"], uuid4())["batch"]["id"]
+    assert delivery.batch(actor, resumed_id)["batch"]["pending"] == 2
+    delivery.cancel(actor, resumed_id)
+
+    # Retrying an old explicit failure must not duplicate a newer send for the same group and content.
+    retry_fields = {**common, "message": "Announcement retry guard", "selections": [{"chat_id": "oc_a"}]}
+    old = delivery.prepare(actor, retry_fields)
+    old_id = delivery.submit(actor, old["preview_id"], uuid4())["batch"]["id"]
+    pg.execute("UPDATE creator_broadcast_targets SET status='failed',retryable=TRUE,"
+               "snapshot=snapshot-'content_fingerprint' WHERE batch_id=%s", (old_id,))
+    newer = delivery.prepare(actor, retry_fields)
+    newer_id = delivery.submit(actor, newer["preview_id"], uuid4())["batch"]["id"]
+    retried = delivery.retry(actor, old_id)["batch"]
+    assert retried["status"] == 'duplicate' and retried["duplicate"] == 1 and not retried["pending"]
+    assert delivery.batch(actor, newer_id)["batch"]["pending"] == 1
+    assert pg.execute("SELECT status FROM creator_broadcast_targets WHERE batch_id=%s AND chat_id='oc_b'",
+                      (ab_id,)).fetchone()["status"] == 'unknown'
+    delivery.cancel(actor, newer_id)
+
 
 def test_rich_content_upload_template_frozen_delivery_and_legacy_dedup(pg, tmp_path, monkeypatch):
     settings = SimpleNamespace(oauth_scopes=("offline_access", "im:chat:read", "im:message:readonly"),

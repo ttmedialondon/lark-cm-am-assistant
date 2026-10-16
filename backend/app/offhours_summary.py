@@ -790,7 +790,7 @@ def schedule_if_due(conn, *, force=False):
     return _schedule_run(conn, dict(state), now)
 
 
-def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None, chat_ids=None):
+def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None, chat_ids=None, retired_chat_ids=()):
     inserted = 0
     cm_id = state["responsible_authorization_id"]
     _authorize_run(conn, state, executing=True)
@@ -831,6 +831,9 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
                               roster=roster, related_chats=chats, prepare_materials=True)
         if not evidence:
             synced = synced and _covers_window(chat, state["window_start"], cutoff)
+            if active and previous['status'] == 'running':
+                selected_ids.append(previous['id'])
+                deferred = True
             continue
         count += 1
         private_count += evidence["pack"]["is_private"]
@@ -892,15 +895,21 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
         ).fetchone()
         inserted += selected["id"] == new_id
         selected_ids.append(selected["id"])
+    cleanup_chats = None if not partial_refresh else sorted(
+        {c['chat_id'] for c in selected_chats} | set(retired_chat_ids))
+    if retired_chat_ids:
+        held = conn.execute("""SELECT id FROM offhours_summary_tasks WHERE run_id=%s
+            AND chat_id=ANY(%s::text[]) AND is_current AND status='running'""",
+            (state['run_id'], retired_chat_ids)).fetchall()
+        selected_ids.extend(row['id'] for row in held)
+        deferred |= bool(held)
     conn.execute(
         """UPDATE offhours_summary_tasks SET is_current=FALSE,
                  status=CASE WHEN status IN ('queued','running') THEN 'cancelled' ELSE status END,
                  lease_until=CASE WHEN status IN ('queued','running') THEN NULL ELSE lease_until END
                  WHERE run_id=%s AND chat_id IS NOT NULL AND NOT(id=ANY(%s::uuid[]))
                    AND (%s::text[] IS NULL OR chat_id=ANY(%s::text[]))""",
-        (state["run_id"], selected_ids,
-         None if not partial_refresh else [c['chat_id'] for c in selected_chats],
-         None if not partial_refresh else [c['chat_id'] for c in selected_chats]),
+        (state["run_id"], selected_ids, cleanup_chats, cleanup_chats),
     )
     if partial_refresh and not assistant:
         # Accurate whole-report totals from authorized IDs/times only; never decrypt

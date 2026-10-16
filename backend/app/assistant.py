@@ -550,7 +550,6 @@ def _complete_window(checkpoint, model_result):
     _accept_tool(checkpoint, job['call'], first, model_result=model_result, record_result=False)
     checkpoint.setdefault('window_refs', []).append(first['query_ref'])
     checkpoint.setdefault('raw_window_calls', []).append(job['call']['call_id'])
-    checkpoint['window_final_pending'] = True
 
 
 def _collect_window(conn, row, checkpoint, settings, context, *, read_cache=None):
@@ -892,21 +891,12 @@ def step(job, settings):
             checkpoint['progress'] = '整理结果'
             _save(conn, job, checkpoint, settings)
             return
-        if (not window and not checkpoint.get('window_final_pending')
-                and checkpoint['model_steps'] >= MAX_MODEL_STEPS):
-            final = {'answer': '本轮处理步骤已达上限，以下是已取得的结果；剩余问题可以继续提问。',
-                     'event_refs': list(dict.fromkeys(event['event_ref']
-                         for result in checkpoint['tool_results'] for event in result.get('events', []))),
-                     'result_refs': list(dict.fromkeys(result['result_id']
-                         for result in checkpoint['tool_results'] if result.get('result_id'))),
-                     'data_refs': list(dict.fromkeys(result['query_ref']
-                         for result in checkpoint['tool_results'] if result.get('query_ref'))),
-                     'draft_ref': next((result['draft_ref'] for result in reversed(checkpoint['tool_results'])
-                                        if result.get('draft_ref')), None)}
-            tools.build_result(conn, row['actor_id'], row, final, settings, context, checkpoint['tool_results'],
-                               read_cache=read_cache)
+        if not window and checkpoint['model_steps'] >= MAX_MODEL_STEPS:
             checkpoint['progress'] = ''
-            _save(conn, job, checkpoint, settings, status='completed', final=final)
+            _save(conn, job, checkpoint, settings, status='failed')
+            conn.execute("UPDATE assistant_turns SET error_code='step_limit',finished_at=NOW() WHERE id=%s",
+                         (row['id'],))
+            _stop_dependents(conn, row['id'])
             return
         if not checkpoint['items']:
             history, results = _history(conn, row, settings, context, read_cache=read_cache)
@@ -967,13 +957,13 @@ def step(job, settings):
                        for message in result.get('messages', [])):
                 model_format = {**model_format, 'schema': {**model_format['schema'], 'properties': {
                     **model_format['schema']['properties'], 'sections': {**fields['sections'], 'maxItems': 0}}}}
-            if checkpoint.get('no_progress_calls', 0) >= 3:
+            if (checkpoint['model_steps'] >= MAX_MODEL_STEPS - 1
+                    or checkpoint.get('no_progress_calls', 0) >= 3):
                 checkpoint['final_only'] = True
                 model_tools = []
-                model_instructions += ('\n本轮连续补查未取得新资料，已结束检索。请依据已取得材料回答并说明'
+                model_instructions += ('\n本轮已结束检索。请依据已取得材料整理最终回答并说明'
                     '真正缺少的依据；不把没有材料当作没有发生，不再请求工具，不编造结论。')
             checkpoint['model_steps'] += 1
-            checkpoint.pop('window_final_pending', None)
         checkpoint['in_flight'] = True
         checkpoint['request_started_at'] = datetime.now(UTC).isoformat()
         checkpoint['progress'] = ({'stage': 'summarize', 'message': '正在按会话整理消息',

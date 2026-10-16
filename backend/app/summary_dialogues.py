@@ -166,9 +166,9 @@ def schedule_merges(conn, settings, *, run_ids=None):
           AND (r.period IS NULL OR r.report_date >= (NOW() AT TIME ZONE 'Europe/London')::date-6))
           OR (r.origin='assistant' AND aturn.status IN ('queued','running','waiting')))
         AND (%s::uuid[] IS NULL OR r.id=ANY(%s::uuid[]))
-        AND r.coverage->>'policy'=%s AND EXISTS(SELECT 1 FROM offhours_summary_tasks t
-            WHERE t.run_id=r.id AND t.is_current AND t.chat_id IS NOT NULL)""",
-        (run_ids, run_ids, core.POLICY_VERSION),
+        AND r.coverage->>'policy'=%s AND (%s OR EXISTS(SELECT 1 FROM offhours_summary_tasks t
+            WHERE t.run_id=r.id AND t.is_current AND t.chat_id IS NOT NULL))""",
+        (run_ids, run_ids, core.POLICY_VERSION, run_ids is not None),
     ).fetchall()
     for run in runs:
         try:

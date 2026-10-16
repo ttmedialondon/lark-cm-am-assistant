@@ -97,7 +97,7 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
     monkeypatch.setattr(assistant_search.message_materials, 'pending', materials_pending)
     monkeypatch.setattr(assistant_search, 'WINDOW_PAGE_SIZE', 1)
     monkeypatch.setattr(assistant_window, 'INPUT_CHARS', 6_000)
-    monkeypatch.setattr(assistant, 'MAX_MODEL_STEPS', 1)
+    monkeypatch.setattr(assistant, 'MAX_MODEL_STEPS', 2)
     empty_evidence = assistant_window.summary_format({})['schema']['properties']['evidence_refs']
     assert empty_evidence['maxItems'] == 0 and 'enum' not in empty_evidence['items']
     calls, parts, raw_ids, reduced = [], [], set(), []
@@ -105,8 +105,9 @@ def test_complete_window_loop_segments_long_text_and_pages_sources_without_jobs(
 
     def model(_cfg, _key, items, _actor, **kwargs):
         calls.append(kwargs['tools'])
-        assert kwargs['max_output_tokens'] == (16000 if not kwargs['tools'] else 8000)
-        if not kwargs['tools']:
+        is_summary = kwargs['output_format']['name'] != assistant.OUTPUT_FORMAT['name']
+        assert kwargs['max_output_tokens'] == (16000 if is_summary else 8000)
+        if is_summary:
             segment = json.loads(items[0]['content'])
             assert segment['task']['question'] == '总结全部授权聊天'
             assert segment['task']['scope']['cm_id'] == str(chat.ids['cm'])
@@ -700,12 +701,12 @@ def test_repeated_window_uses_validated_cache_and_history_does_not_double_source
                (chat.cipher.encrypt(json.dumps({'text': 'Repeated window facts ' + '业务明细' * 1000})),))
     monkeypatch.setattr(assistant_search, 'WINDOW_PAGE_SIZE', 1)
     monkeypatch.setattr(assistant_window, 'INPUT_CHARS', 3_200)
-    monkeypatch.setattr(assistant, 'MAX_MODEL_STEPS', 1)
+    monkeypatch.setattr(assistant, 'MAX_MODEL_STEPS', 3)
     calls, repeated = [], True
 
     def model(_cfg, _key, items, _actor, **kwargs):
-        calls.append(bool(kwargs['tools']))
-        if not kwargs['tools']:
+        calls.append(kwargs['output_format']['name'])
+        if kwargs['output_format']['name'] != assistant.OUTPUT_FORMAT['name']:
             segment = json.loads(items[0]['content'])
             messages = [message for conversation in segment.get('conversations', [])
                         for message in conversation['messages']]
@@ -714,7 +715,7 @@ def test_repeated_window_uses_validated_cache_and_history_does_not_double_source
                 'items': [{'summary': '保留这一事项的进展。', 'evidence_refs': refs}]}),
                     'output': [], 'usage': {}}
         outputs = [item for item in items if item.get('type') == 'function_call_output']
-        if not outputs or repeated:
+        if not outputs or (repeated and kwargs['tools']):
             return {'text': '', 'output': [{'type': 'function_call',
                 'call_id': 'repeat-call' if outputs else 'window-call', 'name': 'summarize_messages',
                 'arguments': json.dumps({'audience': 'all', 'start': chat.start.isoformat(),
@@ -732,10 +733,11 @@ def test_repeated_window_uses_validated_cache_and_history_does_not_double_source
         view = assistant.turn_view(pg, chat.ids['cm'], first['id'], chat.settings)
         if view['status'] not in assistant.ACTIVE:
             break
-    assert view['status'] == 'completed' and calls.count(True) == 2
+    assert view['status'] == 'completed' and calls.count(assistant.OUTPUT_FORMAT['name']) == 3
     saved = summary_dialogues.decode(assistant._turn(pg, chat.ids['cm'], first['id'])['checkpoint_ciphertext'],
                                     chat.settings)
-    assert len(saved['tool_results']) == 2 and saved['summary_steps'] == calls.count(False)
+    assert len(saved['tool_results']) == 2
+    assert saved['summary_steps'] == sum(name != assistant.OUTPUT_FORMAT['name'] for name in calls)
     assert saved['tool_outputs']['window-call']['query_ref'] == saved['tool_outputs']['repeat-call']['query_ref']
     repeated = False
     following = assistant.submit(pg, chat.ids['cm'], {
@@ -1350,17 +1352,39 @@ def test_repeated_tool_call_uses_current_turn_cache(pg, chat, monkeypatch):
                  'name': 'find_creators', 'arguments': json.dumps({'query': 'alice'})}], 'usage': {}}
 
     monkeypatch.setattr(openai_client, 'call_openai_tools', model)
-    turn = assistant.submit(pg, chat.ids['cm'], payload(), chat.settings)
-    for _ in range(4):
+    for limit, expected_calls in ((assistant.MAX_MODEL_STEPS, 5), (3, 3)):
+        monkeypatch.setattr(assistant, 'MAX_MODEL_STEPS', limit)
+        provider_calls.clear()
+        executions.clear()
+        turn = assistant.submit(pg, chat.ids['cm'], payload(), chat.settings)
+        for _ in range(limit * 2):
+            finish(chat)
+            view = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
+            if view['status'] not in assistant.ACTIVE:
+                break
+        assert view['status'] == 'completed' and view['result']['answer'] == '已找到 Alice，未取得更多资料。'
+        assert len(provider_calls) == expected_calls and provider_calls[-1] == [] and executions == [True]
+        row = assistant._turn(pg, chat.ids['cm'], turn['id'])
+        saved = summary_dialogues.decode(row['checkpoint_ciphertext'], chat.settings)
+        assert saved['model_steps'] == expected_calls and not saved.get('final_only')
+
+    # A saved final response is assembled before the bound; an exhausted old checkpoint makes no paid call.
+    for saved_response in (True, False):
+        turn = assistant.submit(pg, chat.ids['cm'], payload(), chat.settings)
+        row = assistant._turn(pg, chat.ids['cm'], turn['id'])
+        checkpoint = summary_dialogues.decode(row['checkpoint_ciphertext'], chat.settings)
+        checkpoint['model_steps'] = assistant.MAX_MODEL_STEPS
+        if saved_response:
+            checkpoint['response_received'] = {'text': json.dumps({'answer': '已保存的最终回答。',
+                'sections': [], 'event_refs': [], 'result_refs': [], 'data_refs': [], 'draft_ref': None}),
+                'output': [], 'usage': {}}
+        pg.execute('UPDATE assistant_turns SET checkpoint_ciphertext=%s WHERE id=%s',
+                   (summary_dialogues.encode(checkpoint, chat.settings), turn['id']))
         finish(chat)
-    assert executions == [True]
-    for _ in range(8):
-        finish(chat)
-        if assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)['status'] == 'completed':
-            break
-    view = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
-    assert view['status'] == 'completed' and len(provider_calls) == 5 and provider_calls[-1] == []
-    assert executions == [True]
+        view = assistant.turn_view(pg, chat.ids['cm'], turn['id'], chat.settings)
+        assert view['status'] == ('completed' if saved_response else 'failed')
+        assert view['error_code'] == (None if saved_response else 'step_limit')
+        assert len(provider_calls) == expected_calls
 
 
 def test_natural_queries_replace_stale_filters_and_keep_valid_followup_sources(pg, chat, monkeypatch):

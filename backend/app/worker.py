@@ -606,10 +606,11 @@ def _run_discovery(job: SyncJob, settings: Settings, client: LarkClient, *, refr
             _refresh_profile_name(current, authorization, access_token, client, settings)
         discovered = _discover_chats(current, authorization, access_token, client, settings, chat_type="group")
         p2p_checked = authorization.get("p2p_last_checked_at")
-        if (not refresh and authorization.get("body_consent_at")
+        p2p_interval = (3600 if authorization.get("p2p_discovery_status") == "unavailable"
+                        else settings.sync_interval_seconds)
+        if (authorization.get("body_consent_at")
                 and authorization.get("p2p_discovery_status") != "attention_required"
-                and (authorization.get("p2p_discovery_status") != "unavailable" or not p2p_checked
-                     or p2p_checked <= datetime.now(UTC) - timedelta(hours=1))):
+                and (not p2p_checked or p2p_checked <= datetime.now(UTC) - timedelta(seconds=p2p_interval))):
             discovered += _discover_p2p(current, authorization, access_token, client, settings)
         _complete_discovery(current, discovered)
     except StaleSyncJob:
@@ -1555,11 +1556,11 @@ def _set_p2p_discovery(job: SyncJob, status: str, detail: str | None) -> None:
             WHERE id = %s
               AND EXISTS (
                   SELECT 1 FROM sync_jobs
-                  WHERE id = %s AND status = 'running' AND discovery_status = 'running'
+                  WHERE id = %s AND status = 'running' AND discovery_status = %s
                     AND discovery_generation = %s
               )
             """,
-            (status, detail, job.authorization_id, job.id, job.discovery_generation),
+            (status, detail, job.authorization_id, job.id, job.discovery_status, job.discovery_generation),
         )
 
 
