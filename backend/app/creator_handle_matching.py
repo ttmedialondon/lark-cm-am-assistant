@@ -184,9 +184,50 @@ def configuration_changed(conn):
     )
 
 
-def touch_chats(conn, chat_ids, *, recognition_message_ids=()):
+def _touch_readable_identity(conn, chat_ids, message_ids, changed_message_ids):
+    material = conn.execute("""SELECT m.chat_id,m.message_id,m.sender_open_id,m.parent_id,m.mentions_json,
+        ac.p2p_counterpart_open_id,o.observed_at """ + evidence._COMPANY_READABLE + """
+        AND m.message_type IN ('text','post') AND m.chat_id=ANY(%s::text[])
+        AND m.message_id=ANY(%s::text[])""", (chat_ids, list(message_ids))).fetchall()
+    changed_ids = set(changed_message_ids)
+    for row in material:
+        row['changed'] = row['message_id'] in changed_ids
+        row['open_ids'] = sorted({who for who in (row['sender_open_id'], row['p2p_counterpart_open_id']) if who}
+            | {target['open_id'] for target in mention_targets(row.pop('mentions_json'))
+               if target['open_id'] and not target['ambiguous']})
+    # Revisit only already-assessed people; a historical backfill must not enrol the whole contact library.
+    conn.execute("""WITH material AS MATERIALIZED (
+        SELECT * FROM jsonb_to_recordset(%s::jsonb) AS m(chat_id text,message_id text,parent_id text,
+            open_ids text[],observed_at timestamptz,changed boolean)), related AS (
+          SELECT m.*,unnest(m.open_ids) AS open_id FROM material m
+          UNION SELECT m.*,r.sender_open_id FROM material m JOIN chat_messages r ON r.chat_id=m.chat_id
+            AND (r.message_id=m.parent_id OR r.parent_id=m.message_id) WHERE NOT r.is_deleted)
+        SELECT enqueue_creator_identity(j.contact_id,max(r.observed_at))
+        FROM related r JOIN lark_identities i ON i.open_id=r.open_id AND i.identity_type='user'
+        JOIN creator_handle_jobs j ON j.contact_id=i.contact_id AND j.purpose='identity'
+        WHERE j.status IN ('waiting_evidence','review_required','ready','preparing','running')
+          AND j.reason_code<>'request_unknown'
+          AND creator_identity_eligible(j.contact_id)
+          AND r.observed_at>COALESCE(j.prepared_at,'-infinity'::timestamptz)
+          AND (r.changed OR NOT(j.refs @> jsonb_build_array(jsonb_build_object(
+            'kind','message','chat_id',r.chat_id,'message_id',r.message_id))))
+          AND NOT EXISTS(SELECT 1 FROM creator_handle_requests receipt
+            JOIN creator_handle_jobs previous ON previous.id=receipt.job_id WHERE previous.contact_id=j.contact_id
+            AND (receipt.error_code='request_unknown' OR receipt.error_code='' AND receipt.billed_tokens IS NULL
+              AND receipt.response_ciphertext IS NULL AND NOT(previous.id=j.id AND previous.status='running'
+                AND COALESCE(previous.lease_until>NOW(),FALSE)
+                AND receipt.created_at>=previous.lease_until-(%s*INTERVAL '1 second'))))
+        GROUP BY j.contact_id""", (creator_data.encode(material), LEASE_SECONDS))
+
+
+def touch_chats(conn, chat_ids, *, recognition_message_ids=(), newly_readable_message_ids=(), changed_message_ids=()):
     """One lightweight signal per committed sync page, not a model call per message."""
-    if not chat_ids or not recognition_message_ids or not _enabled(_config(conn)):
+    readable_ids = set(newly_readable_message_ids) | set(changed_message_ids)
+    if not chat_ids or not (recognition_message_ids or readable_ids) or not _enabled(_config(conn)):
+        return
+    if readable_ids:
+        _touch_readable_identity(conn, chat_ids, readable_ids, changed_message_ids)
+    if not recognition_message_ids:
         return
     anchors = conn.execute("""SELECT chat_id,message_id,parent_id,sender_open_id,message_create_time,mentions_json
         FROM chat_messages WHERE chat_id=ANY(%s::text[]) AND message_id=ANY(%s::text[]) AND NOT is_deleted""",
@@ -911,6 +952,15 @@ def run(job, settings):
         elif error.retryable:
             ai_dispatch.throttle(delay)
     with connection() as conn, conn.transaction():
+        if isinstance(error, api.OpenAIRequestError) and error.request_unknown:
+            _config(conn, lock=True)
+            changed = conn.execute("""UPDATE creator_handle_jobs SET status='failed',reason_code='request_unknown',
+                lease_until=NULL,claim_token=NULL,updated_at=NOW() WHERE id=%s AND status='running'
+                AND claim_token=%s""", (job['id'], job['claim_token'])).rowcount
+            if changed:
+                conn.execute("UPDATE ai_feature_configs SET last_tested_at=NOW(),last_test_status='failed' "
+                             "WHERE feature=%s", (FEATURE,))
+            return
         current = _current(conn, job)
         if not current:
             return
@@ -921,9 +971,7 @@ def run(job, settings):
             retry = isinstance(error, api.OpenAIRequestError) and error.retryable and job["attempts"] < 3
             state = "retry_wait" if retry else "failed"
             reason = (
-                "request_unknown"
-                if isinstance(error, api.OpenAIRequestError) and error.request_unknown
-                else "quota_paused"
+                "quota_paused"
                 if getattr(error, "is_quota", False)
                 else "provider_retry"
                 if retry

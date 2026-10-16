@@ -2549,9 +2549,11 @@ def _record_claimed_page(
             ).fetchone()
         if not updated:
             raise StaleSyncJob
-        if inserted:
+        if changed or observed:
             creator_handle_matching.touch_chats(conn, [claim.chat_id],
-                recognition_message_ids=[m['message_id'] for m in messages if m.get('message_id')])
+                recognition_message_ids=[m['message_id'] for m in messages if m.get('message_id')] if inserted else [],
+                newly_readable_message_ids=observed, changed_message_ids=changed)
+        if inserted:
             creator_group_matching.touch_chats(conn, [claim.chat_id])
         if changed or observed:
             creator_responsibility_matching.touch_chats(conn, [claim.chat_id],

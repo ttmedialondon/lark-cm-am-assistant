@@ -30,6 +30,9 @@ def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg
     monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
     signals = []
     summary_signals = []
+    identity_signals = []
+    monkeypatch.setattr(worker.creator_handle_matching, "touch_chats", lambda _conn, chats, **signal:
+                        identity_signals.append((chats, signal)))
     monkeypatch.setattr(worker.creator_responsibility_matching, "touch_chats",
                         lambda _conn, _chats, **signal: signals.append(signal))
     monkeypatch.setattr(worker.summary_periods, "touch_chats", lambda _conn, cm, chats, **signal:
@@ -91,6 +94,10 @@ def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg
     assert synced["backfill_page_token"] == "page-2" and synced["sync_status"] != "succeeded"
     assert len(signals) == 1 and set(signals[0]["message_ids"]) == {m["message_id"] for m in messages}
     assert summary_signals == [(actor, [claim.chat_id], {'message_ids': sorted(m['message_id'] for m in messages)})]
+    assert identity_signals == [([claim.chat_id], {
+        'recognition_message_ids': [m['message_id'] for m in messages],
+        'newly_readable_message_ids': [m['message_id'] for m in messages],
+        'changed_message_ids': [m['message_id'] for m in messages]})]
     assert signals[0]["authorization_id"] == actor and signals[0]["new_scope"]
     assert set(signals[0]["observed_message_ids"]) == {m["message_id"] for m in messages}
     assert pg.execute("SELECT count(*) n FROM authorization_message_observations").fetchone()["n"] == 4
@@ -107,14 +114,21 @@ def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg
     assert len(signals) == 2 and not signals[-1]["message_ids"] and signals[-1]["new_scope"]
     assert set(signals[-1]["observed_message_ids"]) == {m["message_id"] for m in messages}
     assert len(summary_signals) == 2 and summary_signals[-1][2]['message_ids'] == summary_signals[0][2]['message_ids']
+    assert len(identity_signals) == 2 and identity_signals[-1] == ([claim.chat_id], {
+        'recognition_message_ids': [], 'newly_readable_message_ids': [m['message_id'] for m in messages],
+        'changed_message_ids': []})
     pg.execute("UPDATE authorization_chats SET sync_enabled=FALSE WHERE chat_id='oc_ingest_3'")
     edited = {**messages[0], "body": {"content": '{"text":"updated"}'}}
+    hydrated = {**messages[1], "msg_type": "text", "body": {"content": '{"text":"newly readable"}'}}
     history = worker._claim_next_page(job, authorization, config)
     assert history.chat_id == claim.chat_id and history.mode == "backfill"
-    assert worker._record_claimed_page(history, [edited], None, cipher, fingerprint_key=b"i" * 32).committed
-    assert len(signals) == 3 and signals[-1]["message_ids"] == ["om_cm"] and not signals[-1]["new_scope"]
+    assert worker._record_claimed_page(history, [edited, hydrated], None, cipher, fingerprint_key=b"i" * 32).committed
+    assert len(signals) == 3 and signals[-1]["message_ids"] == ["om_cm", "om_external"] and not signals[-1]["new_scope"]
     assert signals[-1]["observed_message_ids"] == []
-    assert len(summary_signals) == 3 and summary_signals[-1][2]['message_ids'] == ['om_cm']
+    assert len(summary_signals) == 3 and summary_signals[-1][2]['message_ids'] == ['om_cm', 'om_external']
+    assert len(identity_signals) == 3 and identity_signals[-1] == ([claim.chat_id], {
+        'recognition_message_ids': [], 'newly_readable_message_ids': [],
+        'changed_message_ids': ['om_cm', 'om_external']})
     pg.execute("UPDATE authorization_chats SET sync_enabled=TRUE WHERE chat_id='oc_ingest_3'")
     current = worker._claim_next_page(job, authorization, config)
     pg.execute("UPDATE authorization_chats SET sync_generation=sync_generation+1 WHERE chat_id=%s", (current.chat_id,))

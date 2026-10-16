@@ -342,6 +342,68 @@ def test_new_person_identity_queue_admits_without_handle_and_preserves_existing_
     pg.execute("UPDATE chat_messages SET body_fingerprint=%s WHERE message_id='old_hydration'", ('f' * 64,))
     assert pg.execute('SELECT desired_version FROM creator_handle_jobs WHERE contact_id=%s',
                       (old_id,)).fetchone()['desired_version'] == 1
+    # Late bodies and newly readable reply questions revisit only existing unresolved identity tasks.
+    for source in ('old_hydration', 'late_identity_question'):
+        pg.execute('SAVEPOINT identity_readable_source')
+        pg.execute("UPDATE creator_handle_jobs SET identity_signal_at=NOW()-INTERVAL '1 hour',"
+                   "prepared_at=NOW()-INTERVAL '1 hour' WHERE contact_id=%s", (old_id,))
+        pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='old_hydration'",
+                   (cipher.encrypt(json.dumps({'text': 'Yes, these are my own TikTok videos.'})),))
+        if source == 'late_identity_question':
+            pg.execute("INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,"
+                       "message_create_time,body_ciphertext) VALUES('new_private',%s,'ou_cm','text',"
+                       "NOW()-INTERVAL '2 days',%s)",
+                       (source, cipher.encrypt(json.dumps({'text': 'Are these your TikTok videos?'}))))
+            pg.execute("UPDATE chat_messages SET parent_id=%s WHERE message_id='old_hydration'", (source,))
+        before = _snapshot(pg, ('creator_handle_jobs',))
+        matching.touch_chats(pg, ['new_private'], newly_readable_message_ids=[source])
+        assert _snapshot(pg, before.keys()) == before
+        pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id,observed_at) "
+                   "SELECT id,'new_private',%s,body_consent_at-INTERVAL '1 second' FROM authorizations WHERE id=%s",
+                   (source, pilot.ids['cm']))
+        matching.touch_chats(pg, ['new_private'], newly_readable_message_ids=[source])
+        assert _snapshot(pg, before.keys()) == before
+        pg.execute('UPDATE authorization_message_observations SET observed_at=NOW() WHERE message_id=%s', (source,))
+        if source == 'late_identity_question':
+            pg.execute('UPDATE creator_handle_jobs SET refs=%s::jsonb WHERE contact_id=%s',
+                       (json.dumps([{'kind': 'message', 'chat_id': 'new_private', 'message_id': source}]), old_id))
+            before = _snapshot(pg, ('creator_handle_jobs',))
+            matching.touch_chats(pg, ['new_private'], newly_readable_message_ids=[source])
+            assert _snapshot(pg, before.keys()) == before
+        matching.touch_chats(pg, ['new_private'], newly_readable_message_ids=[source], changed_message_ids=[source])
+        renewed = pg.execute('SELECT * FROM creator_handle_jobs WHERE contact_id=%s', (old_id,)).fetchone()
+        assert renewed['status'] == 'queued' and renewed['desired_version'] == 2
+        for stage in ('ready', 'preparing'):
+            pg.execute('SAVEPOINT identity_readable_preparation')
+            token = uuid4()
+            pg.execute("UPDATE creator_handle_jobs SET status=%s,claim_token=%s,prepared_at=NULL,"
+                       "lease_until=NOW()+INTERVAL '10 minutes' WHERE id=%s", (stage, token, renewed['id']))
+            pg.execute("UPDATE authorization_message_observations SET observed_at=NOW()+INTERVAL '1 second' "
+                       'WHERE message_id=%s', (source,))
+            matching.touch_chats(pg, ['new_private'], changed_message_ids=[source])
+            changed = pg.execute('SELECT status,claim_token,desired_version FROM creator_handle_jobs WHERE id=%s',
+                                 (renewed['id'],)).fetchone()
+            assert changed == {'status': 'preparing' if stage == 'preparing' else 'queued',
+                               'claim_token': token, 'desired_version': 3}
+            pg.execute('ROLLBACK TO SAVEPOINT identity_readable_preparation')
+        matching.touch_chats(pg, ['new_private'], newly_readable_message_ids=[source])
+        assert pg.execute('SELECT desired_version FROM creator_handle_jobs WHERE contact_id=%s',
+                          (old_id,)).fetchone()['desired_version'] == 2
+        pg.execute("UPDATE creator_handle_jobs SET status='review_required' WHERE id=%s", (renewed['id'],))
+        matching.touch_chats(pg, ['new_private'], newly_readable_message_ids=[source])
+        assert pg.execute('SELECT desired_version FROM creator_handle_jobs WHERE id=%s',
+                          (renewed['id'],)).fetchone()['desired_version'] == 2
+        unknown_job = uuid4()
+        pg.execute("INSERT INTO creator_handle_jobs(id,contact_id,purpose,status,reason_code) "
+                   "VALUES(%s,%s,'identity','failed','request_unknown')", (unknown_job, old_id))
+        pg.execute("INSERT INTO creator_handle_requests(id,job_id,quota_scope,reserved_tokens,error_code) "
+                   "VALUES(%s,%s,'synthetic',1,'request_unknown')", (uuid4(), unknown_job))
+        pg.execute("UPDATE authorization_message_observations SET observed_at=NOW()+INTERVAL '1 second' "
+                   'WHERE message_id=%s', (source,))
+        before = _snapshot(pg, ('creator_handle_jobs', 'creator_handle_requests'))
+        matching.touch_chats(pg, ['new_private'], newly_readable_message_ids=[source], changed_message_ids=[source])
+        assert _snapshot(pg, before.keys()) == before
+        pg.execute('ROLLBACK TO SAVEPOINT identity_readable_source')
     pg.execute("UPDATE creator_handle_jobs SET not_before=NOW() WHERE contact_id=%s", (new_id,))
     calls = []
 
@@ -350,12 +412,53 @@ def test_new_person_identity_queue_admits_without_handle_and_preserves_existing_
         assert '_rules' not in payload and payload['handles'] == []
         assert '达人身份证据规则' in kwargs['instructions'] and '历史案例与识别验收' not in kwargs['instructions']
         own = next(m['id'] for m in payload['messages'] if m['speaker'] == payload['target'])
-        return {'text': json.dumps({'creator': {'state': 'supported', 'code': 'own_activity',
-            'confidence': 0.99, 'refs': [own]}, 'links': []}), 'response_id': 'resp_identity_synthetic',
+        if flow.before_response:
+            flow.before_response()
+        if flow.error:
+            raise flow.error
+        return {'text': json.dumps({'creator': {
+            'state': 'review' if flow.review else 'supported',
+            'code': 'insufficient' if flow.review else 'own_activity',
+            'confidence': 0.62 if flow.review else 0.99, 'refs': [own]}, 'links': []}),
+            'response_id': 'resp_identity_synthetic',
             'usage': {'input_tokens': 100, 'output_tokens': 50}, 'telemetry': {}}
 
     monkeypatch.setattr(matching.api, 'call_openai', identity_response)
     assert matching.prepare_next(flow.settings)
+    for outcome in ('review', 'unknown'):
+        pg.execute('SAVEPOINT identity_readable_inflight')
+
+        def late_material():
+            pg.execute("INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,"
+                       "message_create_time,body_ciphertext) VALUES('new_private','identity_race_context',"
+                       "'ou_new_creator','text',NOW()-INTERVAL '2 days',%s)",
+                       (cipher.encrypt(json.dumps({'text': 'I also film my own TikTok product reviews.'})),))
+            pg.execute("INSERT INTO authorization_message_observations"
+                       "(authorization_id,chat_id,message_id,observed_at) "
+                       "VALUES(%s,'new_private','identity_race_context',NOW()+INTERVAL '1 second')", (pilot.ids['cm'],))
+            matching.touch_chats(pg, ['new_private'], newly_readable_message_ids=['identity_race_context'])
+
+        flow.before_response, flow.review = late_material, True
+        flow.error = openai_client.OpenAIRequestError('synthetic unknown') if outcome == 'unknown' else None
+        race_job = matching.claim()
+        matching.run(race_job, flow.settings)
+        assert pg.execute('SELECT status FROM creator_handle_jobs WHERE id=%s', (race_job['id'],)).fetchone() == {
+            'status': 'failed' if outcome == 'unknown' else 'queued'}
+        receipt = pg.execute('SELECT error_code,billed_tokens,response_ciphertext '
+                             'FROM creator_handle_requests WHERE id=%s',
+                             (race_job['reservation_id'],)).fetchone()
+        if outcome == 'unknown':
+            assert receipt['error_code'] == 'request_unknown' and receipt['billed_tokens'] is None
+            assert not matching.prepare_next(flow.settings)
+        else:
+            assert receipt['response_ciphertext'] and receipt['billed_tokens'] == 150
+            assert matching.prepare_next(flow.settings)
+        assert len(calls) == 1
+        assert not pg.execute("SELECT 1 FROM contact_roles WHERE contact_id=%s AND role='creator'",
+                              (new_id,)).fetchone()
+        pg.execute('ROLLBACK TO SAVEPOINT identity_readable_inflight')
+        flow.before_response, flow.error, flow.review = None, None, False
+        calls.clear()
     job = matching.claim()
     assert job and job['purpose'] == 'identity'
     matching.run(job, flow.settings)
@@ -758,7 +861,7 @@ def test_config_change_during_unknown_call_does_not_redispatch_same_material(pg,
     flow.before_response = lambda: flow.enable("sk-rotated-during-call")
     matching.run(job, flow.settings)
     flow.before_response = None
-    assert matching.prepare_next(flow.settings) and matching.claim() is None
+    assert not matching.prepare_next(flow.settings) and matching.claim() is None
     assert len(flow.calls) == 1
     assert pg.execute("SELECT reason_code FROM creator_handle_jobs WHERE id=%s", (job["id"],)).fetchone() == {
         "reason_code": "request_unknown",

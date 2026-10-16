@@ -135,6 +135,62 @@ def test_targeted_initialization_repair_is_readonly_by_default_and_idempotent(pg
     assert repair(pg, {**targeted, 'importance_job_ids': [str(untouched_id)]}, settings, apply=True) == {
         'importance_unknown_preserved': 1}
     assert pg.execute('SELECT * FROM creator_importance_jobs WHERE id=%s', (untouched_id,)).fetchone() == unknown_before
+
+    # A fixed review task can resume once when newly readable own material enters its actual pack.
+    person, material_job, material_receipt = uuid4(), uuid4(), uuid4()
+    pg.execute("UPDATE ai_feature_configs SET enabled=FALSE WHERE feature='creator_handle_matching'")
+    pg.execute("INSERT INTO contacts(id,display_name,entity_type) VALUES(%s,'New material','person')", (person,))
+    pg.execute("INSERT INTO lark_identities(open_id,identity_type,contact_id) VALUES('ou_material','user',%s)",
+               (person,))
+    for message_id in ('material-old', 'material-new'):
+        pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_type,sender_open_id,message_type,
+            body_ciphertext,message_create_time) VALUES('oc_repair',%s,'user','ou_material','text','fixture',NOW())""",
+            (message_id,))
+        pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+                   "VALUES(%s,'oc_repair',%s)", (cm, message_id))
+    old_pack = {'target': 'U1', 'messages': [{'id': 'M1', 'speaker': 'U1', 'text': 'Old context'}]}
+    refs = [{'kind': 'message', 'label': 'M1', 'chat_id': 'oc_repair', 'message_id': 'material-old'}]
+    pg.execute("""INSERT INTO creator_handle_jobs(id,contact_id,purpose,status,snapshot_version,prepared_at,
+        identity_signal_at,pack_ciphertext,result_ciphertext,refs,attempts,input_tokens,output_tokens)
+        VALUES(%s,%s,'identity','review_required',1,NOW()-INTERVAL '10 minutes',NOW()-INTERVAL '10 minutes',
+        %s,'keep-saved-review',%s::jsonb,1,42,7)""",
+        (material_job, person, storage.encrypt(json.dumps(old_pack)), json.dumps(refs)))
+    pg.execute("UPDATE ai_feature_configs SET enabled=TRUE WHERE feature='creator_handle_matching'")
+    pg.execute("""INSERT INTO creator_handle_requests(id,job_id,error_code,billed_tokens,response_ciphertext)
+        VALUES(%s,%s,'',49,'keep-saved-receipt')""", (material_receipt, material_job))
+    manifest_time = pg.execute('SELECT NOW() AS now').fetchone()['now'].isoformat()
+    material_manifest = {**targeted, 'created_at': manifest_time, 'importance_job_ids': [],
+                         'identity_material_job_ids': [str(material_job)]}
+    fresh = {'pack': {**old_pack, 'messages': [*old_pack['messages'], {
+        'id': 'M2', 'speaker': 'U1', 'text': 'New creator evidence'}]}, 'refs': [*refs, {
+        'kind': 'message', 'label': 'M2', 'chat_id': 'oc_repair', 'message_id': 'material-new'}]}
+    monkeypatch.setattr(creator_handle_matching, 'reference_catalog', lambda: (frozenset(), 'fixture'))
+    monkeypatch.setattr(creator_handle_matching.evidence, 'build', lambda *_args, **kwargs: (
+        fresh if kwargs == {'purpose': 'identity', 'recheck': False} else None))
+    before_material = pg.execute('SELECT * FROM creator_handle_jobs WHERE id=%s', (material_job,)).fetchone()
+    before_receipt = pg.execute('SELECT * FROM creator_handle_requests WHERE id=%s', (material_receipt,)).fetchone()
+    assert repair(pg, material_manifest, settings) == {'identity_material_queued': 1}
+    assert pg.execute('SELECT * FROM creator_handle_jobs WHERE id=%s', (material_job,)).fetchone() == before_material
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE creator_handle_requests SET billed_tokens=NULL,response_ciphertext=NULL WHERE id=%s",
+                   (material_receipt,))
+        assert repair(pg, material_manifest, settings, apply=True) == {'identity_material_unknown_preserved': 1}
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE authorization_message_observations SET observed_at=NOW()-INTERVAL '20 minutes' "
+                   "WHERE message_id='material-new'")
+        assert repair(pg, material_manifest, settings) == {'identity_material_unchanged': 1}
+    with pg.transaction(force_rollback=True):
+        pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) VALUES(%s,'creator','confirmed','manual')",
+                   (person,))
+        assert repair(pg, material_manifest, settings, apply=True) == {'identity_material_unchanged': 1}
+    assert repair(pg, material_manifest, settings, apply=True) == {'identity_material_queued': 1}
+    repaired = pg.execute('SELECT * FROM creator_handle_jobs WHERE id=%s', (material_job,)).fetchone()
+    assert repaired['status'] == 'queued' and repaired['desired_version'] == 2
+    for key in ('source', 'pack_ciphertext', 'result_ciphertext', 'refs', 'attempts', 'input_tokens', 'output_tokens'):
+        assert repaired[key] == before_material[key]
+    assert pg.execute('SELECT * FROM creator_handle_requests WHERE id=%s',
+                      (material_receipt,)).fetchone() == before_receipt
+    assert repair(pg, material_manifest, settings, apply=True) == {'identity_material_unchanged': 1}
     assert {table: pg.execute(f'SELECT * FROM {table}').fetchall() for table in tables} == before
     pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (cm,))
     with pytest.raises(ValueError, match='reading grant'):

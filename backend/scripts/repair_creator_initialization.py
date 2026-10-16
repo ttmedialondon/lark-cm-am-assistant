@@ -9,6 +9,7 @@ import argparse
 import json
 import sys
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -37,7 +38,14 @@ def repair(conn, manifest, settings, *, apply=False):
     counts = Counter()
     retries = {row['id']: row for row in conn.execute("""SELECT * FROM creator_handle_jobs
         WHERE id=ANY(%s::uuid[])""", (manifest.get('identity_retry_job_ids', []),)).fetchall()}
-    contacts = sorted(set(groups['identity_contact_ids']) | {row['contact_id'] for row in retries.values()})
+    material_ids = sorted({UUID(value) for value in manifest.get('identity_material_job_ids', [])})
+    material_jobs = {row['id']: row for row in conn.execute("""SELECT * FROM creator_handle_jobs
+        WHERE id=ANY(%s::uuid[]) ORDER BY id FOR UPDATE""", (material_ids,)).fetchall()}
+    cutoff = datetime.fromisoformat(manifest['created_at']) if material_ids else None
+    if cutoff and cutoff.tzinfo is None:
+        raise ValueError('The material repair manifest requires a timezone-aware timestamp.')
+    contacts = sorted(set(groups['identity_contact_ids']) | {row['contact_id'] for row in
+                      [*retries.values(), *material_jobs.values()]})
     processed = {row['contact_id'] for row in conn.execute("""SELECT DISTINCT contact_id
         FROM creator_handle_jobs WHERE contact_id=ANY(%s::uuid[]) AND purpose='identity'""", (contacts,))}
     eligible = {row['id'] for row in conn.execute("""SELECT id FROM contacts
@@ -103,6 +111,59 @@ def repair(conn, manifest, settings, *, apply=False):
                 claim_token=NULL,lease_until=NULL,finished_at=NULL,not_before=NOW(),updated_at=NOW()
                 WHERE id=%s AND status='failed'""", (status, status, job['id']))
         counts['identity_retry_' + status] += 1
+
+    replayed_material = []
+    for job_id in material_ids:
+        job = material_jobs.get(job_id)
+        if (not job or job['purpose'] != 'identity' or job['source'] == 'manual'
+                or job['status'] not in {'review_required', 'waiting_evidence'}
+                or not job['prepared_at'] or job['prepared_at'] >= cutoff
+                or job['claim_token'] or job['lease_until'] or job['snapshot_version'] != job['desired_version']
+                or job['contact_id'] not in eligible or job['contact_id'] not in readable
+                or conn.execute("""SELECT 1 FROM creator_handle_jobs WHERE contact_id=%s
+                    AND (created_at,id)>(%s,%s) LIMIT 1""", (job['contact_id'], job['created_at'], job_id)).fetchone()
+                or conn.execute("""SELECT 1 FROM audit_events WHERE action='creator_initialization_repaired'
+                    AND metadata->>'manifest_created_at'=%s AND metadata->'identity_material_jobs' ? %s LIMIT 1""",
+                    (manifest['created_at'], str(job_id))).fetchone()):
+            counts['identity_material_unchanged'] += 1
+            continue
+        if conn.execute("""SELECT 1 FROM creator_handle_requests r JOIN creator_handle_jobs j ON j.id=r.job_id
+            WHERE j.contact_id=%s AND (r.error_code='request_unknown' OR r.error_code=''
+              AND r.billed_tokens IS NULL AND r.response_ciphertext IS NULL) LIMIT 1""",
+            (job['contact_id'],)).fetchone():
+            counts['identity_material_unknown_preserved'] += 1
+            continue
+        if not handles._enabled(config):
+            raise ValueError('Automatic creator recognition is not enabled.')
+        old = json.loads(creator_data.cipher(settings).decrypt(job['pack_ciphertext'])) \
+            if job['pack_ciphertext'] else {}
+        catalog, _ = handles.reference_catalog()
+        fresh = handles.evidence.build(conn, settings, job['contact_id'], catalog, purpose='identity', recheck=False)
+        pack = fresh['pack']
+        if not pack or {k: v for k, v in pack.items() if k != '_rules'} == {
+                k: v for k, v in old.items() if k != '_rules'}:
+            counts['identity_material_unchanged'] += 1
+            continue
+        own = {m['id'] for m in pack['messages'] if m['speaker'] == pack['target']}
+        related = own | {m.get(key) for m in pack['messages'] if m['id'] in own for key in ('reply', 'previous')}
+        related |= {m['id'] for m in pack['messages'] if m.get('reply') in own or m.get('previous') in own}
+        previous = {(ref['chat_id'], ref['message_id']) for ref in job['refs'] if ref['kind'] == 'message'}
+        added = [ref for ref in fresh['refs'] if ref['kind'] == 'message' and ref['label'] in related
+                 and (ref['chat_id'], ref['message_id']) not in previous]
+        changed = added and conn.execute("SELECT 1 " + _READABLE + """
+            AND m.message_type IN ('text','post') AND o.observed_at>%s
+            AND (m.chat_id,m.message_id) IN (SELECT * FROM unnest(%s::text[],%s::text[])) LIMIT 1""",
+            (cm, job['prepared_at'], [r['chat_id'] for r in added], [r['message_id'] for r in added])).fetchone()
+        if not changed:
+            counts['identity_material_unchanged'] += 1
+            continue
+        if apply:
+            queued = conn.execute('SELECT enqueue_creator_identity(%s,NOW(),TRUE) id',
+                                  (job['contact_id'],)).fetchone()['id']
+            if queued != job_id:
+                raise ValueError('Selected material job changed during repair.')
+        replayed_material.append(str(job_id))
+        counts['identity_material_queued'] += 1
 
     for job_id in sorted({UUID(value) for value in manifest.get('responsibility_saved_job_ids', [])}):
         job = conn.execute('SELECT * FROM creator_responsibility_jobs WHERE id=%s', (job_id,)).fetchone()
@@ -213,6 +274,7 @@ def repair(conn, manifest, settings, *, apply=False):
                                      'importance_jobs': [str(v) for v in groups['importance_job_ids']],
                                      'responsibility_jobs': [str(v) for v in groups['responsibility_job_ids']],
                                      'identity_retry_jobs': sorted(str(v) for v in retries),
+                                     'identity_material_jobs': replayed_material,
                                      'responsibility_saved_jobs': manifest.get('responsibility_saved_job_ids', []),
                                      'event_chats': manifest.get('event_chat_ids', [])})))
     return dict(counts)
