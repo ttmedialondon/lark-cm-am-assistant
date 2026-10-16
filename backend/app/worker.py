@@ -2563,10 +2563,11 @@ def _record_claimed_page(
                   AND run.report_date>=(NOW() AT TIME ZONE 'Europe/London')::date-6
                   AND t.chat_id=%s AND t.is_current
                   AND (%s OR (COALESCE(GREATEST(%s::timestamptz,%s::timestamptz),'-infinity')<run.window_end
-                    AND run.window_end<=%s AND %s::timestamptz<=run.window_start-INTERVAL '7 days'))
+                    AND run.window_end<=%s AND (%s::timestamptz IS NULL
+                      OR %s::timestamptz<=run.window_start-INTERVAL '7 days')))
                 LIMIT 1""", (claim.job.authorization_id, claim.chat_id, claim.mode == "backfill",
                     current_claim["last_backfill_at"], current_claim["last_incremental_at"], claim.end_at,
-                    current_claim["backfill_window_start_at"])).fetchone())
+                    current_claim["backfill_window_start_at"], current_claim["backfill_window_start_at"])).fetchone())
         if changed or observed:
             creator_handle_matching.touch_chats(conn, [claim.chat_id],
                 recognition_message_ids=[m['message_id'] for m in messages if m.get('message_id')] if inserted else [],

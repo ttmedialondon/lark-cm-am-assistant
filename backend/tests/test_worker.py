@@ -213,7 +213,7 @@ def test_new_cm_interleaves_recent_and_history_without_losing_either_window(pg, 
     assert row["backfill_complete"] and row["last_backfill_at"] == history.end_at
     assert row["last_incremental_at"] == updated.end_at
     pg.execute("""UPDATE authorization_chats SET last_incremental_at=NOW()-INTERVAL '10 days',
-        last_backfill_at=NOW()-INTERVAL '10 days',backfill_window_start_at=NOW()-INTERVAL '30 days',
+        last_backfill_at=NOW()-INTERVAL '10 days',backfill_window_start_at=NULL,
         incremental_window_start_at=NOW()-INTERVAL '3 days',incremental_window_end_at=NOW(),
         incremental_page_token='gap-1'""")
     gap = worker._claim_next_page(job, auth, settings)
