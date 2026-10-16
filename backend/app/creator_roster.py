@@ -50,10 +50,13 @@ def page_data(actor_id, cm_id=None, tab="", query="", page=1, sort="importance",
         order = "c.display_name,c.id"
         if can_view_importance:
             importance_join, join_args = creator_importance.roster_sql(cm_id)
+            importance_join += """ LEFT JOIN creator_importance_jobs importance_job
+                ON importance_job.contact_id=c.id AND importance_job.responsible_authorization_id=%s
+                LEFT JOIN ai_feature_configs importance_config ON importance_config.feature='creator_importance' """
             formal_base = formal_base.replace(
                 "FROM contacts c WHERE", f"FROM contacts c {importance_join} WHERE", 1,
             )
-            args = [*join_args, *args]
+            args = [*join_args, cm_id, *args]
             if tier:
                 formal_base += " AND COALESCE(ip.effective_tier,'pending')=%s"
                 args.append(tier)
@@ -75,7 +78,11 @@ def page_data(actor_id, cm_id=None, tab="", query="", page=1, sort="importance",
         page = min(page,pages)
         fields = "c.id,c.display_name"
         if can_view_importance:
-            fields += ",COALESCE(ip.effective_tier,'pending') effective_tier,ip.manual_tier,ip.manual_reason_ciphertext"
+            fields += """,COALESCE(ip.effective_tier,'pending') effective_tier,
+                ip.manual_tier,ip.manual_reason_ciphertext,
+                ip.history_complete,ip.profile_valid,importance_job.status job_status,
+                (importance_config.enabled AND importance_config.provider='openai'
+                    AND importance_config.api_key_ciphertext IS NOT NULL) importance_enabled"""
         people = conn.execute("SELECT " + fields + " " + formal_base
                               + f" ORDER BY {order} LIMIT 25 OFFSET %s", [*args,(page-1)*25]).fetchall()
         ids = [person["id"] for person in people]
@@ -92,10 +99,20 @@ def page_data(actor_id, cm_id=None, tab="", query="", page=1, sort="importance",
             chat_url = private_chat_url(identity["open_id"] if identity else None)
             importance = None
             if can_view_importance:
+                label = creator_importance.TIERS[person["effective_tier"]]
+                if not person["manual_tier"]:
+                    if person["importance_enabled"] and person["job_status"] in {
+                            "queued", "preparing", "ready", "running", "retry_wait"}:
+                        label = (label + " · 更新中" if person["effective_tier"] != "pending" else
+                                 "更新中" if person["history_complete"] else "首次评估中")
+                    elif person["effective_tier"] == "pending":
+                        label = ("资料不足" if person["profile_valid"] else
+                                 "待更新" if person["history_complete"] else "待评估")
                 importance = {
                     "tier": person["effective_tier"],
                     "tier_label": creator_importance.TIERS[person["effective_tier"]],
                     "manual_tier": person["manual_tier"] or "",
+                    "display_label": label,
                     "manual_reason": (creator_importance._cipher(get_settings()).decrypt(
                         person["manual_reason_ciphertext"],
                     ) if can_view_unassigned and person["manual_tier"] and person["manual_reason_ciphertext"] else ""),

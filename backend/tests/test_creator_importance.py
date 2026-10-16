@@ -1,11 +1,137 @@
 """Grounded cooperation lifecycle rules; queue and authorization checks extend this file."""
 
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import pytest
 
 from app import creator_importance_facts as facts
+
+
+def test_shared_group_changes_only_wake_real_targets_and_revoke_referenced_sources(pg):
+    cm1, cm2, creator1, creator2 = uuid4(), uuid4(), uuid4(), uuid4()
+    pg.execute("""INSERT INTO authorizations(id,open_id,access_token_ciphertext,body_consent_at)
+        VALUES(%s,'ou_cm1','synthetic',NOW()-INTERVAL '1 day'),
+        (%s,'ou_cm2','synthetic',NOW()-INTERVAL '1 day')""", (cm1, cm2))
+    for person, name in ((creator1, 'ou_creator1'), (creator2, 'ou_creator2')):
+        pg.execute("INSERT INTO contacts(id,display_name) VALUES(%s,%s)", (person, name))
+        pg.execute("""INSERT INTO lark_identities(open_id,contact_id,tenant_classification)
+            VALUES(%s,%s,'known_external')""", (name, person))
+        pg.execute("""INSERT INTO contact_roles(contact_id,role,status,source)
+            VALUES(%s,'creator','confirmed','manual')""", (person,))
+        for cm in (cm1, cm2):
+            pg.execute("""INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source)
+                VALUES(%s,%s,%s,'manual')""", (uuid4(), person, cm))
+    pg.execute("""INSERT INTO lark_identities(open_id,tenant_classification)
+        VALUES('ou_cm1','internal'),('ou_cm2','internal')""")
+    pg.execute("UPDATE ai_feature_configs SET provider='openai',enabled=TRUE,"
+               "api_key_ciphertext='synthetic',key_suffix='etic' "
+               "WHERE feature='creator_importance'")
+    pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('community','Large community','group')")
+    for cm in (cm1, cm2):
+        pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,member_snapshot_status,member_count)
+            VALUES(%s,'community','succeeded',4)""", (cm,))
+    for name in ('ou_cm1', 'ou_cm2', 'ou_creator1', 'ou_creator2'):
+        pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('community',%s)", (name,))
+    pg.execute("""INSERT INTO creator_importance_profiles(contact_id,responsible_authorization_id,auto_valid,
+        auto_tier,manual_tier,coverage) SELECT contact_id,responsible_authorization_id,TRUE,'priority','normal',
+        '{"history_complete":true}'::jsonb FROM creator_importance_jobs""")
+    pg.execute("UPDATE creator_importance_jobs SET status='completed',needs_history=FALSE,reason_code='evaluated'")
+
+    def jobs():
+        return {(row['contact_id'], row['responsible_authorization_id']): row for row in pg.execute(
+            "SELECT * FROM creator_importance_jobs").fetchall()}
+
+    def profiles():
+        return {(row['contact_id'], row['responsible_authorization_id']): row for row in pg.execute(
+            "SELECT * FROM creator_importance_profiles").fetchall()}
+
+    def message(mid, sender, *, age=1, kind='text', body='body', parent=None, mentions=None, readers=(cm1,)):
+        pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,sender_type,message_type,
+            body_ciphertext,body_fingerprint,message_create_time,parent_id,mentions_json)
+            VALUES('community',%s,%s,'user',%s,%s,%s,NOW()-(%s*INTERVAL '1 day'),%s,%s::jsonb)""",
+            (mid, sender, kind, body, hashlib.sha256(body.encode()).hexdigest() if body else None,
+             age, parent, json.dumps(mentions) if mentions else None))
+        for cm in readers:
+            pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+                VALUES(%s,'community',%s)""", (cm, mid))
+
+    initial = jobs()
+    message('march_system', 'ou_cm1', age=150, kind='system', readers=(cm1, cm2))
+    pg.execute("UPDATE chat_messages SET body_fingerprint=%s WHERE message_id='march_system'",
+               (hashlib.sha256(b'hydrated').hexdigest(),))
+    message('broadcast', 'ou_cm1', readers=(cm1, cm2))
+    pg.execute("UPDATE chat_messages SET body_fingerprint=%s WHERE message_id='broadcast'",
+               (hashlib.sha256(b'broadcast-edit').hexdigest(),))
+    assert all(row['status'] == 'completed' and row['desired_version'] == initial[key]['desired_version']
+               for key, row in jobs().items())
+    assert all(row['auto_valid'] for row in profiles().values())
+
+    # New own text and explicit CM targets are incremental; an unrelated shared reader is not a target.
+    message('own', 'ou_creator1')
+    pg.execute("UPDATE chat_messages SET body_fingerprint=%s WHERE message_id='own'",
+               (hashlib.sha256(b'own-edit').hexdigest(),))
+    message('direct', 'ou_cm1', mentions=[{'id': 'ou_creator2', 'id_type': 'open_id'}], readers=(cm1, cm2))
+    assert jobs()[creator1, cm1]['status'] == jobs()[creator2, cm1]['status'] == 'queued'
+    assert jobs()[creator1, cm2]['status'] == jobs()[creator2, cm2]['status'] == 'completed'
+    assert all(row['auto_valid'] for row in profiles().values())
+    assert all(row['desired_version'] == initial[key]['desired_version'] for key, row in jobs().items())
+
+    # Invalidating a frozen newer batch must not revoke an unrelated published profile.
+    pg.execute("SAVEPOINT job_only_source")
+    source = json.dumps([{'chat_id': 'community', 'message_id': 'direct'}])
+    for valid in (True, False):
+        pg.execute("UPDATE creator_importance_profiles SET auto_valid=%s "
+                   "WHERE contact_id=%s AND responsible_authorization_id=%s", (valid, creator2, cm1))
+        pg.execute("""UPDATE creator_importance_jobs SET status='ready',refs=%s::jsonb,pack_ciphertext='newer-batch'
+            WHERE contact_id=%s AND responsible_authorization_id=%s""", (source, creator2, cm1))
+        pg.execute("UPDATE chat_messages SET body_fingerprint=%s WHERE message_id='direct'",
+                   (hashlib.sha256(str(valid).encode()).hexdigest(),))
+        profile, changed = profiles()[creator2, cm1], jobs()[creator2, cm1]
+        assert profile['auto_valid'] is valid and not profile['sources'] and profile['manual_tier'] == 'normal'
+        assert changed['needs_history'] and changed['reason_code'] == 'source_changed'
+        assert not changed['pack_ciphertext'] and not changed['refs']
+        assert profiles()[creator1, cm1]['auto_valid'] and profiles()[creator2, cm2]['auto_valid']
+    pg.execute("ROLLBACK TO SAVEPOINT job_only_source")
+
+    # A late original question only invalidates the pair whose frozen answer depends on it.
+    message('question', 'ou_cm1', body=None, age=120)
+    message('answer', 'ou_creator1', parent='question')
+    source = json.dumps([{'chat_id': 'community', 'message_id': 'answer', 'parent_id': 'question'}])
+    pg.execute("UPDATE creator_importance_profiles SET sources=%s::jsonb "
+               "WHERE contact_id=%s AND responsible_authorization_id=%s", (source, creator1, cm1))
+    pg.execute("""UPDATE creator_importance_jobs SET status='ready',refs=%s::jsonb,pack_ciphertext='frozen',
+        fingerprint='frozen-fingerprint' WHERE contact_id=%s AND responsible_authorization_id=%s""",
+        (source, creator1, cm1))
+    target_job = jobs()[creator1, cm1]['id']
+    for code in ('', 'request_unknown'):
+        pg.execute("""INSERT INTO creator_importance_requests(job_id,fingerprint,response_ciphertext,error_code,
+            input_tokens,output_tokens,finished_at) VALUES(%s,'frozen-fingerprint',%s,%s,101,23,NOW())""",
+            (target_job, 'saved-response' if not code else None, code))
+    receipts = pg.execute("SELECT * FROM creator_importance_requests ORDER BY id").fetchall()
+    pg.execute("UPDATE chat_messages SET body_ciphertext='question restored',body_fingerprint=%s "
+               "WHERE message_id='question'", (hashlib.sha256(b'question restored').hexdigest(),))
+    assert not profiles()[creator1, cm1]['auto_valid']
+    assert all(row['auto_valid'] for key, row in profiles().items() if key != (creator1, cm1))
+    changed = jobs()[creator1, cm1]
+    assert changed['needs_history'] and changed['cursor_time'] is None and changed['reason_code'] == 'source_changed'
+    assert not changed['pack_ciphertext'] and not changed['refs']
+    assert pg.execute("SELECT * FROM creator_importance_requests ORDER BY id").fetchall() == receipts
+
+    # Reattribution wakes the new owner without invalidating that owner's unrelated existing facts.
+    pg.execute("UPDATE chat_messages SET sender_open_id='ou_creator2' WHERE message_id='answer'")
+    assert jobs()[creator2, cm1]['status'] == 'queued' and profiles()[creator2, cm1]['auto_valid']
+    assert jobs()[creator2, cm2]['status'] == 'completed' and profiles()[creator2, cm2]['auto_valid']
+    pg.execute("""UPDATE creator_importance_profiles SET sources='[{"chat_id":"community","message_id":"answer"}]'
+        WHERE contact_id=%s AND responsible_authorization_id=%s""", (creator2, cm1))
+    pg.execute("UPDATE chat_messages SET is_deleted=TRUE,body_ciphertext=NULL WHERE message_id='answer'")
+    assert not profiles()[creator2, cm1]['auto_valid'] and profiles()[creator2, cm2]['auto_valid']
+    pg.execute("UPDATE authorization_chats SET sync_enabled=FALSE WHERE authorization_id=%s", (cm2,))
+    assert not profiles()[creator1, cm2]['auto_valid'] and not profiles()[creator2, cm2]['auto_valid']
+    assert all(row['manual_tier'] == 'normal' for row in profiles().values())
+    assert pg.execute("SELECT * FROM creator_importance_requests ORDER BY id").fetchall() == receipts
 
 
 def _pack(*texts):

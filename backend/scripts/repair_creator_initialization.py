@@ -215,13 +215,49 @@ def repair(conn, manifest, settings, *, apply=False):
                 WHERE id=%s AND status='failed'""", (job_id,))
         counts['responsibility_new_material_queued'] += 1
 
+    restored_profiles = []
+    for contact, revision in sorted({(UUID(item['contact_id']), item['revision'])
+                                    for item in manifest.get('importance_profile_contacts', [])}):
+        profile = conn.execute("""SELECT * FROM creator_importance_profiles
+            WHERE contact_id=%s AND responsible_authorization_id=%s AND revision=%s""",
+            (contact, cm, revision)).fetchone()
+        if profile and apply:
+            importance._source_checks(conn, profile['sources'], contact, cm, lock=True)
+        # A shared-group CM broadcast is not enough to restore a particular creator's old profile.
+        predicate = """p.contact_id=%s AND p.responsible_authorization_id=%s AND p.revision=%s
+            AND NOT p.auto_valid AND p.manual_tier IS NULL
+            AND p.coverage->>'history_complete'='true' AND jsonb_array_length(p.sources)>0
+            AND (""" + importance._PROFILE_SOURCE_VALID + """)
+            AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(p.sources) s WHERE NOT (
+              EXISTS(SELECT 1 FROM lark_identities i WHERE i.open_id=s->>'sender_open_id'
+                AND i.contact_id=p.contact_id AND i.identity_type='user')
+              OR EXISTS(SELECT 1 FROM authorization_chats ac JOIN chats ch ON ch.chat_id=ac.chat_id
+                JOIN lark_identities i ON i.open_id=ac.p2p_counterpart_open_id
+                WHERE ac.authorization_id=p.responsible_authorization_id AND ac.chat_id=s->>'chat_id'
+                  AND ch.chat_mode='p2p' AND i.contact_id=p.contact_id AND i.identity_type='user')))"""
+        args = (contact, cm, revision)
+        reusable = conn.execute('SELECT 1 FROM creator_importance_profiles p WHERE ' + predicate, args).fetchone()
+        if not reusable:
+            counts['importance_profile_unchanged'] += 1
+            continue
+        if apply:
+            updated = conn.execute("""UPDATE creator_importance_profiles p
+                SET auto_valid=TRUE,revision=revision+1 WHERE """ + predicate + ' RETURNING revision', args).fetchone()
+            if not updated:
+                raise ValueError('Selected importance profile changed during repair.')
+        restored_profiles.append({'contact_id': str(contact), 'revision': revision})
+        counts['importance_profile_restored'] += 1
+
     for feature, module, table, key in (
         ('importance', importance, 'creator_importance_jobs', 'importance_job_ids'),
         ('responsibility', responsibility, 'creator_responsibility_jobs', 'responsibility_job_ids'),
     ):
         for job_id in groups[key]:
             job = conn.execute(f'SELECT * FROM {table} WHERE id=%s', (job_id,)).fetchone()
-            if job and job['status'] == 'failed' and job['reason_code'] == 'request_unknown':
+            if job and (job['reason_code'] == 'request_unknown' or feature == 'importance' and conn.execute(
+                    """SELECT 1 FROM creator_importance_requests WHERE job_id=%s
+                    AND (error_code='request_unknown' OR error_code='' AND finished_at IS NULL) LIMIT 1""",
+                    (job_id,)).fetchone()):
                 counts[feature + '_unknown_preserved'] += 1
                 continue
             if (feature == 'importance' and job and job['status'] == 'failed'
@@ -277,6 +313,7 @@ def repair(conn, manifest, settings, *, apply=False):
             (uuid4(), cm, json.dumps({'manifest_created_at': manifest['created_at'], 'counts': dict(counts),
                                      'identity_contacts': [str(v) for v in groups['identity_contact_ids']],
                                      'importance_jobs': [str(v) for v in groups['importance_job_ids']],
+                                     'importance_profiles': restored_profiles,
                                      'responsibility_jobs': [str(v) for v in groups['responsibility_job_ids']],
                                      'identity_retry_jobs': sorted(str(v) for v in retries),
                                      'identity_material_jobs': replayed_material,

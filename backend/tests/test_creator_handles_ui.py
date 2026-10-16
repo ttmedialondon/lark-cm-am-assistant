@@ -394,14 +394,24 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
     assert pending.status_code == 200 and pending.json()["total_count"] == 1
     assert pending.json()["preparing"] and pending.json()["can_link_people"]
     assert pending.json()["items"][0]["importance"]["tier"] == "pending"
-    assert set(pending.json()["items"][0]["importance"]) == {"tier", "tier_label", "manual_tier", "manual_reason"}
+    assert set(pending.json()["items"][0]["importance"]) == {
+        "tier", "tier_label", "manual_tier", "manual_reason", "display_label"}
+    assert pending.json()["items"][0]["importance"]["display_label"] == "待评估"
     assert "evidence_rows" not in pending.json()["items"][0]
     assert pending.json()["can_edit_handles"]
     assert not pending.json()["importance_running"]
     pg.execute("UPDATE ai_feature_configs SET enabled=TRUE,api_key_ciphertext='fixture-only',key_suffix='only' "
                "WHERE feature='creator_importance'")
     pg.execute("SELECT enqueue_creator_importance(%s,%s)", (assigned, cm))
-    assert client.get(f"/creators/data?tab=mine&cm_id={cm}").json()["importance_running"]
+    initializing = client.get(f"/creators/data?tab=mine&cm_id={cm}").json()
+    assert initializing["importance_running"]
+    assert initializing["items"][0]["importance"]["display_label"] == "首次评估中"
+    pg.execute("SAVEPOINT first_partial")
+    pg.execute("INSERT INTO creator_importance_profiles(contact_id,responsible_authorization_id,evaluated_at,coverage) "
+               "VALUES(%s,%s,NOW(),'{\"history_complete\":false}')", (assigned, cm))
+    assert client.get(f"/creators/data?tab=mine&cm_id={cm}").json()[
+        "items"][0]["importance"]["display_label"] == "首次评估中"
+    pg.execute("ROLLBACK TO SAVEPOINT first_partial")
     pg.execute("UPDATE ai_feature_configs SET enabled=FALSE WHERE feature='creator_importance'")
     url = f"/creators/people/{assigned}/importance"
     fields = {"csrf_token": "csrf", "cm_id": str(cm), "tier": "focus", "reason": "Owner reviewed cooperation"}
@@ -411,6 +421,7 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
     focus = client.get(f"/creators/data?tab=mine&cm_id={cm}&sort=importance&tier=focus")
     assert focus.status_code == 200 and focus.json()["total_count"] == 1
     assert focus.json()["items"][0]["importance"]["manual_tier"] == "focus"
+    assert focus.json()["items"][0]["importance"]["display_label"] == "重点"
     assert client.get(f"/creators/data?tab=mine&cm_id={cm}&tier=normal").json()["total_count"] == 0
     for added_tier in ("priority", "dormant"):
         assert client.post(url, data={**fields, "tier": added_tier}).status_code == 200
@@ -438,17 +449,24 @@ def test_importance_roster_filters_and_owner_adjustment_are_scoped(pg, monkeypat
     one_count = len(queries)
     assert sum("LEFT JOIN LATERAL" in sql and "creator_importance_profiles" in sql for sql in queries) == 1
     pg.execute("SAVEPOINT roster_validity")
-    pg.execute("""UPDATE creator_importance_profiles SET manual_tier=NULL,auto_valid=TRUE,
+    pg.execute("""UPDATE creator_importance_profiles SET manual_tier=NULL,auto_valid=TRUE,evaluated_at=NOW(),
         facts_ciphertext='not-a-ciphertext',prompt_version=%s,sources='[]',
-        coverage=jsonb_build_object('has_readable',TRUE,'priority',jsonb_build_object('primary_at',NOW()))
+        coverage=jsonb_build_object('history_complete',TRUE,'has_readable',TRUE,
+          'priority',jsonb_build_object('primary_at',NOW()))
         WHERE contact_id=%s AND responsible_authorization_id=%s""",
                (creator_importance.facts.PROMPT_VERSION, assigned, cm))
     automatic = creator_roster.page_data(actor["id"], cm, sort="name")["items"][0]["importance"]
     assert automatic["tier"] == "focus" and automatic["manual_tier"] == ""
+    assert automatic["display_label"] == "重点"
+    pg.execute("UPDATE ai_feature_configs SET enabled=TRUE WHERE feature='creator_importance'")
+    updating = creator_roster.page_data(actor["id"], cm, sort="importance", tier="focus")
+    assert updating["total_count"] == 1
+    assert updating["items"][0]["importance"]["display_label"] == "重点 · 更新中"
     pg.execute("UPDATE creator_importance_profiles SET sources=%s::jsonb "
                "WHERE contact_id=%s AND responsible_authorization_id=%s",
                (json.dumps([{"chat_id": "missing_chat", "message_id": "missing_message"}]), assigned, cm))
-    assert creator_roster.page_data(actor["id"], cm)["items"][0]["importance"]["tier"] == "pending"
+    invalid = creator_roster.page_data(actor["id"], cm)["items"][0]["importance"]
+    assert invalid["tier"] == "pending" and invalid["display_label"] == "更新中"
     pg.execute("UPDATE creator_importance_profiles SET manual_tier='focus' "
                "WHERE contact_id=%s AND responsible_authorization_id=%s", (assigned, cm))
     reviewed = creator_roster.page_data(actor["id"], cm)["items"][0]["importance"]

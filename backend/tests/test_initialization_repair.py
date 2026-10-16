@@ -135,6 +135,74 @@ def test_targeted_initialization_repair_is_readonly_by_default_and_idempotent(pg
     assert repair(pg, {**targeted, 'importance_job_ids': [str(untouched_id)]}, settings, apply=True) == {
         'importance_unknown_preserved': 1}
     assert pg.execute('SELECT * FROM creator_importance_jobs WHERE id=%s', (untouched_id,)).fetchone() == unknown_before
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE creator_importance_jobs SET reason_code='invalid_output' WHERE id=%s", (untouched_id,))
+        pg.execute("INSERT INTO creator_importance_requests(job_id,fingerprint,error_code) "
+                   "VALUES(%s,'unknown-still-held','request_unknown')", (untouched_id,))
+        unknown_before = pg.execute('SELECT * FROM creator_importance_jobs WHERE id=%s', (untouched_id,)).fetchone()
+        assert repair(pg, {**targeted, 'importance_job_ids': [str(untouched_id)]}, settings, apply=True) == {
+            'importance_unknown_preserved': 1}
+        assert pg.execute('SELECT * FROM creator_importance_jobs WHERE id=%s',
+                          (untouched_id,)).fetchone() == unknown_before
+
+    # Restore only the fixed complete, still-current profile; never advance a job or undo a manual choice.
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE chat_messages SET body_fingerprint=%s WHERE chat_id='oc_repair' AND message_id='m4'",
+                   ('f' * 64,))
+        source = pg.execute("""SELECT 'M1' ref,m.chat_id,m.message_id,m.sender_open_id,m.message_type,
+            m.body_fingerprint,m.message_create_time::text created_at,m.parent_id,m.root_id,m.thread_id,
+            md5(m.mentions_json::text) mentions_fingerprint,a.body_consent_at::text consent_at
+            FROM chat_messages m CROSS JOIN authorizations a
+            WHERE m.chat_id='oc_repair' AND m.message_id='m4' AND a.id=%s""", (cm,)).fetchone()
+        pg.execute("""INSERT INTO creator_importance_profiles(contact_id,responsible_authorization_id,
+            auto_tier,auto_valid,sources,coverage,prompt_version,evaluated_at)
+            VALUES(%s,%s,'normal',FALSE,%s::jsonb,'{"history_complete":true,"has_readable":true}',%s,NOW())""",
+            (creator, cm, json.dumps([source]), creator_importance.facts.PROMPT_VERSION))
+        fixed = {**targeted, 'importance_job_ids': [],
+                 'importance_profile_contacts': [{'contact_id': str(creator), 'revision': 1}]}
+        old_profile = pg.execute('SELECT * FROM creator_importance_profiles WHERE contact_id=%s',
+                                 (creator,)).fetchone()
+        jobs_before = pg.execute('SELECT * FROM creator_importance_jobs ORDER BY id').fetchall()
+        receipts_before = pg.execute('SELECT * FROM creator_importance_requests ORDER BY id').fetchall()
+        assert repair(pg, fixed, settings) == {'importance_profile_restored': 1}
+        assert pg.execute('SELECT * FROM creator_importance_profiles WHERE contact_id=%s',
+                          (creator,)).fetchone() == old_profile
+        for invalid in ({'coverage': {'history_complete': False}}, {'manual_tier': 'priority'},
+                        {'prompt_version': 'obsolete'}, {'sources': [{**source, 'sender_open_id': 'ou_repair_cm'}]}):
+            with pg.transaction(force_rollback=True):
+                key, value = next(iter(invalid.items()))
+                if key in {'coverage', 'sources'}:
+                    pg.execute(f'UPDATE creator_importance_profiles SET {key}=%s::jsonb WHERE contact_id=%s',
+                               (json.dumps(value), creator))
+                else:
+                    pg.execute(f'UPDATE creator_importance_profiles SET {key}=%s WHERE contact_id=%s', (value, creator))
+                assert repair(pg, fixed, settings, apply=True) == {'importance_profile_unchanged': 1}
+        with pg.transaction(force_rollback=True):
+            pg.execute("UPDATE chat_messages SET sender_open_id='ou_repair_cm' "
+                       "WHERE chat_id='oc_repair' AND message_id='m4'")
+            cm_source = {**source, 'sender_open_id': 'ou_repair_cm'}
+            pg.execute("UPDATE creator_importance_profiles SET sources=%s::jsonb,revision=1 WHERE contact_id=%s",
+                       (json.dumps([cm_source]), creator))
+            assert all(creator_importance._source_checks(pg, [cm_source], creator, cm).values())
+            assert repair(pg, fixed, settings, apply=True) == {'importance_profile_unchanged': 1}
+            pg.execute("UPDATE chats SET chat_mode='p2p' WHERE chat_id='oc_repair'")
+            pg.execute("UPDATE authorization_chats SET p2p_counterpart_open_id='ou_repair_4' "
+                       "WHERE authorization_id=%s AND chat_id='oc_repair'", (cm,))
+            pg.execute('UPDATE creator_importance_profiles SET revision=1 WHERE contact_id=%s', (creator,))
+            assert repair(pg, fixed, settings, apply=True) == {'importance_profile_restored': 1}
+        with pg.transaction(force_rollback=True):
+            pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (cm,))
+            assert repair(pg, fixed, settings, apply=True) == {'importance_profile_unchanged': 1}
+        assert repair(pg, fixed, settings, apply=True) == {'importance_profile_restored': 1}
+        assert pg.execute('SELECT * FROM creator_importance_profiles WHERE contact_id=%s',
+                          (creator,)).fetchone() == {**old_profile, 'auto_valid': True, 'revision': 2}
+        assert repair(pg, fixed, settings, apply=True) == {'importance_profile_unchanged': 1}
+        assert pg.execute('SELECT * FROM creator_importance_jobs ORDER BY id').fetchall() == jobs_before
+        assert pg.execute('SELECT * FROM creator_importance_requests ORDER BY id').fetchall() == receipts_before
+        assert pg.execute("SELECT metadata->'importance_profiles' restored FROM audit_events "
+                          "WHERE metadata->'importance_profiles' @> %s::jsonb", (
+                              json.dumps([{'contact_id': str(creator), 'revision': 1}]),)).fetchone()['restored'] == [
+                                  {'contact_id': str(creator), 'revision': 1}]
 
     # A fixed review task can resume once when newly readable own material enters its actual pack.
     person, material_job, material_receipt = uuid4(), uuid4(), uuid4()

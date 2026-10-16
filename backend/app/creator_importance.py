@@ -72,11 +72,12 @@ _VALID_SOURCE = f"""EXISTS(SELECT 1 FROM chat_messages m
       AND m.thread_id IS NOT DISTINCT FROM s->>'thread_id'
       AND md5(m.mentions_json::text) IS NOT DISTINCT FROM s->>'mentions_fingerprint'
       AND (m.sender_open_id=a.open_id OR i.contact_id=p.contact_id AND i.identity_type='user'))"""
-_PROFILE_VALID = "creator_importance_is_eligible(p.contact_id,p.responsible_authorization_id) AND p.auto_valid " \
+_PROFILE_SOURCE_VALID = "creator_importance_is_eligible(p.contact_id,p.responsible_authorization_id) " \
                  "AND NOT EXISTS(SELECT 1 FROM creator_authorization_rescans r " \
                  "WHERE r.authorization_id=p.responsible_authorization_id) " \
                  "AND p.prompt_version='" + facts.PROMPT_VERSION + "' " \
                  "AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(p.sources) s WHERE NOT " + _VALID_SOURCE + ")"
+_PROFILE_VALID = "p.auto_valid AND (" + _PROFILE_SOURCE_VALID + ")"
 
 
 def roster_sql(cm_id):
@@ -93,7 +94,8 @@ def roster_sql(cm_id):
         CASE WHEN v.valid THEN s.signal_at END last_substantive_progress_at,
         CASE WHEN v.valid THEN s.last_message_at END last_message_at,
         v.valid AND COALESCE((p.coverage->'priority'->>'historical')::boolean,FALSE) has_history,
-        p.manual_tier,p.manual_reason_ciphertext
+        p.manual_tier,p.manual_reason_ciphertext,v.valid profile_valid,
+        COALESCE((p.coverage->>'history_complete')::boolean,FALSE) history_complete
         FROM creator_importance_profiles p
         CROSS JOIN LATERAL(SELECT (""" + _PROFILE_VALID + f""") valid) v
         CROSS JOIN LATERAL(SELECT
@@ -207,6 +209,7 @@ def _save_profile(conn, job, state, settings, *, cutoff=None, history_complete=F
         selected.add(state["readable_ref"])
     sources = [s for ref, s in state["sources"].items() if ref in selected]
     result = facts.rank(state["facts"], readable=readable)
+    # Advance the rebuild checkpoint without publishing a partial replacement of the last complete profile.
     conn.execute("""INSERT INTO creator_importance_profiles(contact_id,responsible_authorization_id,
         auto_tier,phase,last_substantive_progress_at,facts_ciphertext,sources,auto_valid,coverage,
         window_start,cutoff,evaluated_at,prompt_version)
@@ -215,7 +218,9 @@ def _save_profile(conn, job, state, settings, *, cutoff=None, history_complete=F
         phase=EXCLUDED.phase,last_substantive_progress_at=EXCLUDED.last_substantive_progress_at,
         facts_ciphertext=EXCLUDED.facts_ciphertext,sources=EXCLUDED.sources,auto_valid=EXCLUDED.auto_valid,
         coverage=EXCLUDED.coverage,window_start=EXCLUDED.window_start,cutoff=EXCLUDED.cutoff,
-        evaluated_at=NOW(),prompt_version=EXCLUDED.prompt_version,revision=creator_importance_profiles.revision+1""",
+        evaluated_at=NOW(),prompt_version=EXCLUDED.prompt_version,revision=creator_importance_profiles.revision+1
+        WHERE EXCLUDED.auto_valid OR NOT COALESCE(
+            (creator_importance_profiles.coverage->>'history_complete')::boolean,FALSE)""",
         (job["contact_id"], job["responsible_authorization_id"], result["tier"], result["phase"],
          result.get("last_progress_at"), _cipher(settings).encrypt(creator_data.encode(state["facts"])),
          creator_data.encode(sources), history_complete, creator_data.encode({"history_complete": history_complete,
@@ -604,7 +609,10 @@ def _manual_access(conn, material):
 def _pause_rules(conn, job, *, keep_material=True):
     conn.execute("""UPDATE creator_importance_jobs SET status='cancelled',reason_code='rules_unavailable',
         pack_ciphertext=CASE WHEN %s THEN pack_ciphertext END,claim_token=NULL,lease_until=NULL,
-        updated_at=NOW() WHERE id=%s""", (keep_material, job["id"]))
+        updated_at=NOW() WHERE id=%s AND status=%s AND claim_token IS NOT DISTINCT FROM %s
+        AND desired_version=%s AND snapshot_version IS NOT DISTINCT FROM %s""",
+        (keep_material, job["id"], job["status"], job["claim_token"], job["desired_version"],
+         job["snapshot_version"]))
 
 
 def prepare_next(settings):

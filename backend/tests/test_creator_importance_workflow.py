@@ -302,6 +302,34 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
         assert all(m["chat_id"] == private for m in pack["messages"])
     assert importance.view_for(pg, flow.person, flow.owner, flow.settings)["tier"] == "priority"
     assert importance.view_for(pg, flow.person, flow.other, flow.settings)["tier"] == "dormant"
+    pg.execute("SAVEPOINT rebuilding_history")
+    calls = len(flow.calls)
+    pg.execute("""UPDATE creator_importance_jobs SET status='queued',needs_history=TRUE,
+        cursor_time=NULL,cursor_chat_id=NULL,cursor_message_id=NULL,checkpoint_ciphertext=NULL,
+        pending_messages='{}',not_before=NOW()-INTERVAL '1 second'
+        WHERE responsible_authorization_id=%s""", (flow.owner,))
+    assert importance.prepare_next(flow.settings)
+    if rebuilding := importance.claim():
+        importance.run(rebuilding, flow.settings)
+    progressed = pg.execute("SELECT * FROM creator_importance_jobs WHERE responsible_authorization_id=%s",
+                            (flow.owner,)).fetchone()
+    assert progressed["needs_history"] and progressed["cursor_time"] and progressed["checkpoint_ciphertext"]
+    assert pg.execute("SELECT * FROM creator_importance_profiles WHERE responsible_authorization_id=%s",
+                      (flow.owner,)).fetchone() == profiles[flow.owner]
+    assert importance.view_for(pg, flow.person, flow.owner, flow.settings)["tier"] == "priority"
+    pg.execute("UPDATE chat_messages SET is_deleted=TRUE,body_ciphertext=NULL WHERE message_id='a2'")
+    invalidated = pg.execute("SELECT * FROM creator_importance_profiles WHERE responsible_authorization_id=%s",
+                             (flow.owner,)).fetchone()
+    assert not invalidated["auto_valid"] and invalidated["coverage"]["history_complete"]
+    importance._save_profile(pg, progressed, importance._state(progressed, flow.settings), flow.settings,
+                             history_complete=False)
+    assert pg.execute("SELECT * FROM creator_importance_profiles WHERE responsible_authorization_id=%s",
+                      (flow.owner,)).fetchone() == invalidated
+    pg.execute("UPDATE authorization_chats SET is_visible=FALSE WHERE authorization_id=%s", (flow.owner,))
+    inaccessible = importance.view_for(pg, flow.person, flow.owner, flow.settings)
+    assert inaccessible["tier"] == "pending" and not inaccessible["grounds"]
+    pg.execute("ROLLBACK TO SAVEPOINT rebuilding_history")
+    del flow.calls[calls:]
     pg.execute("SAVEPOINT brief_roster")
     pg.execute("UPDATE creator_importance_profiles SET facts_ciphertext='not-a-ciphertext'")
     audits = pg.execute("SELECT count(*) n FROM audit_events").fetchone()["n"]
@@ -814,6 +842,13 @@ def test_document_versions_preserve_incremental_ranking_and_reuse_paused_paid_wo
     resumed = importance.claim()
     assert resumed is not None and resumed["id"] == waiting["id"]
     assert resumed["material"]["_rules"]["digest"] == updated["digest"]
+    pg.execute("SAVEPOINT stale_rule_pause")
+    pg.execute("UPDATE creator_importance_jobs SET status='queued',claim_token=NULL,desired_version=desired_version+1 "
+               "WHERE id=%s", (resumed["id"],))
+    replacement = pg.execute("SELECT * FROM creator_importance_jobs WHERE id=%s", (resumed["id"],)).fetchone()
+    importance._pause_rules(pg, resumed)
+    assert pg.execute("SELECT * FROM creator_importance_jobs WHERE id=%s", (resumed["id"],)).fetchone() == replacement
+    pg.execute("ROLLBACK TO SAVEPOINT stale_rule_pause")
     profile_before = pg.execute("SELECT * FROM creator_importance_profiles WHERE responsible_authorization_id=%s",
                                (flow.owner,)).fetchone()
     flow.before_response = lambda: save(status="archived")

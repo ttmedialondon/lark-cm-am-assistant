@@ -112,6 +112,10 @@ curl --fail --silent --show-error https://larkbot.ttapp.help/healthz
 
 重要度任务因来源变化清空冻结材料后，若最新费用回执仍为结果未知，保留暂停状态，不从头重新扫描历史。已有成功返回、有效冻结批次和正常消息增量仍沿用原流程。
 
+维护优先级消息信号仅撤下引用该消息或父问题的旧材料；近期本人发言、定向问答走原队列增量，不因补读无关旧消息重置整个大群。分批检查点保存在任务中，不能用未完成批次覆盖已有完整画像。权限、成员和关系真正变化仍沿用原有失效校验。
+
+定向恢复被误撤下的完整画像可在固定 manifest 中增加 `importance_profile_contacts: [{"contact_id":"UUID","revision":1}]`，沿用该文件的 `cm_id`。脚本只恢复当前版本、来源及授权仍有效，且全部依据为本人发言或该 CM 真实私聊的完整自动结果；人工分档、来源不明的群广播及未完成画像不恢复。不改任务游标、请求回执或负责人关系；版本变化则跳过。明确失败项使用原 `importance_job_ids` 定向入口；任何未知／未完成请求都保留，不直接重发，服务商政策拒绝不原样重试。
+
 结构化响应优先读取正式消息的 `final_answer`，不把 commentary 混入结果；拒答和未完成输出仍拒绝。只兼容完整 JSON 代码围栏，不截断 `HOOK`、`pruned` 或其他任意尾文，更不能从两个矛盾 JSON 中挑一个入库。负责人失败返回加密保留有界原文与校验错误，常规日志仅记录安全输出结构。协议依据 [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs) 和 [Responses 消息 phase](https://developers.openai.com/api/docs/guides/reasoning)。
 
 负责人和重要度只要求最终 JSON，不请求前言或中间说明；负责人按候选数量预留输出容量，重要度最多 8192 token。这是单次返回长度，不是每日预算或额外调用；未完成的返回仍不入库，并记录响应状态、截断原因和实际用量。身份／handle 共用队列保留历史轮转，按本次可执行时间排队；失效或新材料重排的旧任务不凭最初创建时间反复占先。

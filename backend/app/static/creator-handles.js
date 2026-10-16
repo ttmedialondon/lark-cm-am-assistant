@@ -448,7 +448,7 @@
       }
       if (importance) {
         parts.importanceBadge.dataset.tier = ["focus", "priority", "normal", "dormant"].includes(importance.tier) ? importance.tier : "pending";
-        parts.importanceBadge.textContent = [importance.tier_label || "待评估", importance.manual_tier ? "人工" : ""].filter(Boolean).join(" · ");
+        parts.importanceBadge.textContent = [importance.display_label || importance.tier_label || "待评估", importance.manual_tier ? "人工" : ""].filter(Boolean).join(" · ");
         if (parts.manualTier) {
           if (!parts.manualDirty) { parts.manualTier.value = importance.manual_tier || ""; parts.manualReason.value = importance.manual_reason || ""; }
           parts.manualReason.required = Boolean(parts.manualTier.value);
