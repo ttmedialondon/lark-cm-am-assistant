@@ -2,9 +2,12 @@
 
 import json
 from datetime import UTC, date, datetime, time, timedelta
+from time import monotonic
 from uuid import UUID, uuid4
 
 from . import offhours_summary as summaries
+
+_backfill_turn = 0
 
 
 def window(day, period):
@@ -134,18 +137,44 @@ def touch_chats(conn, authorization_id, chat_ids, *, message_ids=None):
 
 
 def backfill_due(conn, now):
-    """Consume one durable admission signal without reopening unrelated old reports."""
+    """Drain a small serial batch; new admissions and old retries both get a turn."""
+    global _backfill_turn
     state = conn.execute("SELECT recurring_enabled FROM offhours_summary_settings WHERE id").fetchone()
     if not state or not state['recurring_enabled'] or not summaries._enabled(conn):
         return 0
-    signal = conn.execute("""SELECT * FROM offhours_summary_backfills WHERE not_before<=%s
-        ORDER BY not_before,requested_at,contact_id,responsible_authorization_id LIMIT 1""", (now,)).fetchone()
-    if not signal:
+    signals = conn.execute("""WITH fresh AS (
+        SELECT * FROM offhours_summary_backfills WHERE not_before<=%s
+          AND not_before<=requested_at+INTERVAL '30 seconds'
+        ORDER BY requested_at DESC,contact_id,responsible_authorization_id LIMIT 1
+        ), oldest AS (
+        SELECT b.* FROM offhours_summary_backfills b WHERE b.not_before<=%s
+          AND NOT EXISTS(SELECT 1 FROM fresh f WHERE f.contact_id=b.contact_id
+            AND f.responsible_authorization_id=b.responsible_authorization_id)
+        ORDER BY b.not_before,b.requested_at,b.contact_id,b.responsible_authorization_id
+        LIMIT (4-(SELECT count(*) FROM fresh)))
+        SELECT TRUE AS admission_slot,fresh.* FROM fresh
+        UNION ALL SELECT FALSE AS admission_slot,oldest.* FROM oldest
+        ORDER BY admission_slot DESC,not_before,requested_at,contact_id,responsible_authorization_id""",
+        (now, now)).fetchall()
+    if not signals:
         return 0
     owner = conn.execute("""SELECT a.id FROM authorizations a JOIN admin_roles r ON r.authorization_id=a.id
         WHERE a.status='active' AND r.role='owner' AND r.is_active ORDER BY a.id LIMIT 1""").fetchone()
     if not owner:
         return 0
+    if signals[0]['admission_slot'] and _backfill_turn:
+        signals.insert(min(4 - _backfill_turn, len(signals) - 1), signals.pop(0))
+    scopes, event_rules = {}, summaries._event_rules(conn, summaries.get_settings())
+    total, deadline = 0, monotonic() + 2
+    for index, signal in enumerate(signals):
+        if index and monotonic() >= deadline:
+            break
+        total += _backfill_signal(conn, now, signal, owner, scopes, event_rules)
+        _backfill_turn = 1 if signal['admission_slot'] else (_backfill_turn + 1) % 4
+    return total
+
+
+def _backfill_signal(conn, now, signal, owner, scopes, event_rules):
     person, cm = signal['contact_id'], signal['responsible_authorization_id']
     params = (person, cm, signal['version'])
     eligible = conn.execute("""SELECT EXISTS(SELECT 1 FROM contact_roles WHERE contact_id=%s
@@ -157,12 +186,15 @@ def backfill_due(conn, now):
         conn.execute("""DELETE FROM offhours_summary_backfills WHERE contact_id=%s
             AND responsible_authorization_id=%s AND version=%s""", params)
         return 1
-    try:
-        summaries._authorize(conn, owner['id'], owner_only=True, cm_id=cm)
-        roster = summaries._roster(conn, cm)
-        chats = summaries._related_chats(conn, roster, cm_id=cm)
-    except (PermissionError, summaries.SummaryInputError):
-        roster, chats = [], []
+    if cm not in scopes:
+        try:
+            summaries._authorize(conn, owner['id'], owner_only=True, cm_id=cm)
+            roster = summaries._roster(conn, cm)
+            chats = summaries._related_chats(conn, roster, cm_id=cm)
+        except (PermissionError, summaries.SummaryInputError):
+            roster, chats = [], []
+        scopes[cm] = roster, chats
+    roster, chats = scopes[cm]
     if not any(row['contact_id'] == person for row in roster):
         conn.execute("""UPDATE offhours_summary_backfills SET not_before=%s WHERE contact_id=%s
             AND responsible_authorization_id=%s AND version=%s""", (now + timedelta(minutes=15), *params))
@@ -184,8 +216,8 @@ def backfill_due(conn, now):
               AND EXISTS(SELECT 1 FROM authorization_message_observations o WHERE o.authorization_id=a.id
                 AND o.chat_id=m.chat_id AND o.message_id=m.message_id AND o.observed_at>=a.body_consent_at))""",
         (cm, [chat['chat_id'] for chat in chats], person)).fetchall()]
-    deferred, blocked, waiting_sync, inserted = False, False, False, 0
-    event_rules, rules_digest = summaries._event_rules(conn, summaries.get_settings())
+    deferred, blocked, inserted = False, False, 0
+    event_rules, rules_digest = event_rules
     run_ids = []
     for offset in range(7):
         day = now.astimezone(summaries.LONDON).date() - timedelta(days=offset)
@@ -216,10 +248,6 @@ def backfill_due(conn, now):
             blocked |= bool(conn.execute("""SELECT 1 FROM offhours_summary_tasks WHERE run_id=%s
                 AND is_current AND chat_id=ANY(%s::text[]) AND status IN ('failed','invalid','cancelled') LIMIT 1""",
                 (run['id'], [chat['chat_id'] for chat in affected])).fetchone())
-            # Closed periods wait briefly for known conversations to finish syncing.
-            # The one-day grace is bounded; missing data remains a report gap, not a fact.
-            if end <= now and now < signal['requested_at'] + timedelta(days=1):
-                waiting_sync |= any(not summaries._covers_window(chat, start, end) for chat in affected)
     from . import summary_dialogues
 
     summary_dialogues.schedule_merges(conn, summaries.get_settings(), run_ids=run_ids)
@@ -237,7 +265,8 @@ def backfill_due(conn, now):
     blocked |= bool(conn.execute("""SELECT 1 FROM offhours_summary_tasks WHERE run_id=ANY(%s::uuid[])
         AND contact_id=%s AND is_current AND status IN ('failed','invalid','cancelled') LIMIT 1""",
         (run_ids, person)).fetchone())
-    if deferred or waiting_sync or (blocked and now < signal['requested_at'] + timedelta(days=1)):
+    # Missing history remains a coverage gap; each newly readable page wakes this pair again.
+    if deferred or (blocked and now < signal['requested_at'] + timedelta(days=1)):
         delay = timedelta(seconds=30) if deferred else timedelta(minutes=15)
         conn.execute("""UPDATE offhours_summary_backfills SET not_before=%s WHERE contact_id=%s
             AND responsible_authorization_id=%s AND version=%s""", (now + delay, *params))

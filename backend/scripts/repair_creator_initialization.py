@@ -115,13 +115,16 @@ def repair(conn, manifest, settings, *, apply=False):
     replayed_material = []
     for job_id in material_ids:
         job = material_jobs.get(job_id)
+        completed = bool(job and job['status'] == 'completed' and job['stats'].get('identity_state') == 'not_supported')
         if (not job or job['purpose'] != 'identity' or job['source'] == 'manual'
-                or job['status'] not in {'review_required', 'waiting_evidence'}
+                or not (completed or job['status'] in {'review_required', 'waiting_evidence'})
                 or not job['prepared_at'] or job['prepared_at'] >= cutoff
                 or job['claim_token'] or job['lease_until'] or job['snapshot_version'] != job['desired_version']
                 or job['contact_id'] not in eligible or job['contact_id'] not in readable
                 or conn.execute("""SELECT 1 FROM creator_handle_jobs WHERE contact_id=%s
-                    AND (created_at,id)>(%s,%s) LIMIT 1""", (job['contact_id'], job['created_at'], job_id)).fetchone()
+                    AND id<>%s AND ((created_at,id)>(%s,%s)
+                      OR status NOT IN ('completed','failed','cancelled')) LIMIT 1""",
+                    (job['contact_id'], job_id, job['created_at'], job_id)).fetchone()
                 or conn.execute("""SELECT 1 FROM audit_events WHERE action='creator_initialization_repaired'
                     AND metadata->>'manifest_created_at'=%s AND metadata->'identity_material_jobs' ? %s LIMIT 1""",
                     (manifest['created_at'], str(job_id))).fetchone()):
@@ -160,10 +163,12 @@ def repair(conn, manifest, settings, *, apply=False):
         if apply:
             queued = conn.execute('SELECT enqueue_creator_identity(%s,NOW(),TRUE) id',
                                   (job['contact_id'],)).fetchone()['id']
-            if queued != job_id:
+            if not queued or (queued == job_id if completed else queued != job_id):
                 raise ValueError('Selected material job changed during repair.')
         replayed_material.append(str(job_id))
         counts['identity_material_queued'] += 1
+        if completed:
+            counts['identity_material_completed_queued'] += 1
 
     for job_id in sorted({UUID(value) for value in manifest.get('responsibility_saved_job_ids', [])}):
         job = conn.execute('SELECT * FROM creator_responsibility_jobs WHERE id=%s', (job_id,)).fetchone()

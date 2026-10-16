@@ -147,6 +147,13 @@ def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg
 
 def test_new_cm_interleaves_recent_and_history_without_losing_either_window(pg, monkeypatch):
     monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
+    summary_signals, identity_signals, responsibility_signals = [], [], []
+    monkeypatch.setattr(worker.summary_periods, "touch_chats", lambda _conn, actor, chats, **signal:
+                        summary_signals.append((actor, chats, signal)))
+    monkeypatch.setattr(worker.creator_handle_matching, "touch_chats", lambda *_args, **signal:
+                        identity_signals.append(signal))
+    monkeypatch.setattr(worker.creator_responsibility_matching, "touch_chats", lambda *_args, **signal:
+                        responsibility_signals.append(signal))
     settings = SimpleNamespace(sync_lookback_days=0, sync_overlap_seconds=600, sync_interval_seconds=300,
                                lark_sync_per_authorization_max_inflight=2)
     monkeypatch.setattr(worker, "get_settings", lambda: settings)
@@ -187,17 +194,31 @@ def test_new_cm_interleaves_recent_and_history_without_losing_either_window(pg, 
     assert (resumed_history.mode, resumed_history.expected_page_token, resumed_history.end_at) == (
         "backfill", "history-2", history.end_at)
     assert worker._record_claimed_page(resumed_history, [], "history-3", None).committed
+    run_id = uuid4()
+    pg.execute("""INSERT INTO offhours_summary_runs(id,requested_by_authorization_id,
+        responsible_authorization_id,window_start,window_end,report_date,period)
+        VALUES(%s,%s,%s,NOW()-INTERVAL '2 hours',NOW()-INTERVAL '1 hour',
+        (NOW() AT TIME ZONE 'Europe/London')::date,'work')""", (run_id, actor, actor))
+    pg.execute("""INSERT INTO offhours_summary_tasks(id,run_id,chat_id,input_fingerprint,cutoff,status)
+        VALUES(%s,%s,'oc_long_history','incomplete-history',NOW()-INTERVAL '1 hour','succeeded')""",
+        (uuid4(), run_id))
     last_history = worker._claim_next_page(job, auth, settings)
     assert last_history.mode == "backfill" and last_history.expected_page_token == "history-3"
+    assert not summary_signals
     assert worker._record_claimed_page(last_history, [], None, None).committed
+    assert summary_signals == [(actor, ['oc_long_history'], {'message_ids': None})]
+    assert not worker._record_claimed_page(last_history, [], None, None).committed
+    assert len(summary_signals) == 1
     row = pg.execute("SELECT * FROM authorization_chats").fetchone()
     assert row["backfill_complete"] and row["last_backfill_at"] == history.end_at
     assert row["last_incremental_at"] == updated.end_at
     pg.execute("""UPDATE authorization_chats SET last_incremental_at=NOW()-INTERVAL '10 days',
+        last_backfill_at=NOW()-INTERVAL '10 days',backfill_window_start_at=NOW()-INTERVAL '30 days',
         incremental_window_start_at=NOW()-INTERVAL '3 days',incremental_window_end_at=NOW(),
         incremental_page_token='gap-1'""")
     gap = worker._claim_next_page(job, auth, settings)
     assert worker._record_claimed_page(gap, [], "gap-2", None).committed
+    assert len(summary_signals) == 1
     assert pg.execute("SELECT recent_coverage_start_at FROM authorization_chats").fetchone()[
         "recent_coverage_start_at"] == recent.start_at
     late = worker._claim_next_page(job, auth, settings)
@@ -208,6 +229,7 @@ def test_new_cm_interleaves_recent_and_history_without_losing_either_window(pg, 
     pg.execute("UPDATE authorization_chats SET page_claim_id=NULL,page_claim_job_id=NULL,page_lease_until=NULL")
     renewed = worker._claim_next_page(job, auth, settings)
     assert renewed.expected_page_token == "gap-2" and worker._record_claimed_page(renewed, [], None, None).committed
+    assert summary_signals == [(actor, ['oc_long_history'], {'message_ids': None})] * 2
     assert pg.execute("SELECT recent_coverage_start_at FROM authorization_chats").fetchone()[
         "recent_coverage_start_at"] == gap.start_at
     worker._finish_and_schedule_incremental(job)
@@ -239,6 +261,7 @@ def test_new_cm_interleaves_recent_and_history_without_losing_either_window(pg, 
     served_current = worker._claim_next_page(next_job, auth, settings)
     assert served_current.chat_id == 'oc_long_history' and served_current.mode == 'incremental'
     assert worker._record_claimed_page(served_current, [], None, None).committed
+    assert len(summary_signals) == 2 and not identity_signals and not responsibility_signals
     continued = worker._claim_next_page(next_job, auth, settings)
     assert continued.chat_id == 'oc_recent_a' and continued.expected_page_token == 'oc_recent_a-3'
     assert worker._record_claimed_page(continued, [], None, None).committed

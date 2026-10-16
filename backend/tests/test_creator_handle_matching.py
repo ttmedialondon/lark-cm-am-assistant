@@ -404,6 +404,56 @@ def test_new_person_identity_queue_admits_without_handle_and_preserves_existing_
         matching.touch_chats(pg, ['new_private'], newly_readable_message_ids=[source], changed_message_ids=[source])
         assert _snapshot(pg, before.keys()) == before
         pg.execute('ROLLBACK TO SAVEPOINT identity_readable_source')
+    # A terminal negative can acquire new evidence; keep its paid history and open only one replacement.
+    pg.execute('SAVEPOINT identity_completed_material')
+    frozen = creator_data.cipher(flow.settings).encrypt(json.dumps({'historical': 'preserved'}))
+    pg.execute("UPDATE creator_handle_jobs SET status='completed',stats=%s::jsonb,"
+               "created_at=NOW()-INTERVAL '1 day',prepared_at=NOW()-INTERVAL '1 hour',"
+               "identity_signal_at=NOW()-INTERVAL '1 hour',pack_ciphertext=%s,result_ciphertext=%s "
+               "WHERE contact_id=%s", (json.dumps({'identity_state': 'not_supported'}), frozen, frozen, old_id))
+    terminal = pg.execute('SELECT * FROM creator_handle_jobs WHERE contact_id=%s', (old_id,)).fetchone()
+    receipt_id = uuid4()
+    pg.execute("INSERT INTO creator_handle_requests(id,job_id,billed_tokens,response_ciphertext) VALUES(%s,%s,150,%s)",
+               (receipt_id, terminal['id'], frozen))
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='old_hydration'",
+               (cipher.encrypt(json.dumps({'text': 'I film my TikTok product reviews myself.'})),))
+    pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id) "
+               "VALUES(%s,'new_private','old_hydration')", (pilot.ids['cm'],))
+    for guard in ('confirmed', 'unknown', 'newer', 'open'):
+        pg.execute('SAVEPOINT identity_completed_guard')
+        if guard == 'confirmed':
+            pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) "
+                       "VALUES(%s,'creator','confirmed','manual')", (old_id,))
+        elif guard == 'unknown':
+            pg.execute("UPDATE creator_handle_requests SET error_code='request_unknown',billed_tokens=NULL,"
+                       'response_ciphertext=NULL WHERE id=%s', (receipt_id,))
+        else:
+            pg.execute("INSERT INTO creator_handle_jobs(contact_id,purpose,status,created_at) "
+                       "VALUES(%s,'handles',%s,NOW()-(%s*INTERVAL '1 minute'))",
+                       (old_id, 'queued' if guard == 'open' else 'completed', 2880 if guard == 'open' else 30))
+        before = _snapshot(pg, ('creator_handle_jobs', 'creator_handle_requests'))
+        matching.touch_chats(pg, ['new_private'], newly_readable_message_ids=['old_hydration'])
+        assert _snapshot(pg, before.keys()) == before
+        pg.execute('ROLLBACK TO SAVEPOINT identity_completed_guard')
+    receipts = _snapshot(pg, ('creator_handle_requests',))
+    matching.touch_chats(pg, ['new_private'], newly_readable_message_ids=['old_hydration'])
+    replacement = pg.execute("SELECT * FROM creator_handle_jobs WHERE contact_id=%s AND status='queued'",
+                             (old_id,)).fetchone()
+    assert replacement and replacement['id'] != terminal['id'] and replacement['purpose'] == 'identity'
+    pg.execute("INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,message_create_time,"
+               "body_ciphertext) VALUES('new_private','next_identity_page','ou_old_unread','text',"
+               "NOW()-INTERVAL '2 days',%s)", (cipher.encrypt(json.dumps({'text': 'I also livestream on TikTok.'})),))
+    pg.execute("INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id,observed_at) "
+               "VALUES(%s,'new_private','next_identity_page',NOW()+INTERVAL '1 second')", (pilot.ids['cm'],))
+    for message in ('old_hydration', 'next_identity_page', 'old_hydration'):
+        matching.touch_chats(pg, ['new_private'], newly_readable_message_ids=[message])
+    assert pg.execute('SELECT count(*) n FROM creator_handle_jobs WHERE contact_id=%s',
+                      (old_id,)).fetchone()['n'] == 2
+    assert pg.execute('SELECT * FROM creator_handle_jobs WHERE id=%s', (terminal['id'],)).fetchone() == terminal
+    assert pg.execute('SELECT * FROM creator_handle_jobs WHERE id=%s',
+                      (replacement['id'],)).fetchone() == replacement
+    assert _snapshot(pg, receipts.keys()) == receipts
+    pg.execute('ROLLBACK TO SAVEPOINT identity_completed_material')
     pg.execute("UPDATE creator_handle_jobs SET not_before=NOW() WHERE contact_id=%s", (new_id,))
     calls = []
 

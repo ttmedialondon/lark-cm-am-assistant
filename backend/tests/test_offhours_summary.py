@@ -1259,7 +1259,7 @@ def test_creator_enrollment_backfills_closed_periods_without_repaying_or_replaci
     add_private('empty-old-private', s.ids['cm'], 'empty-placeholder')
     pg.execute("DELETE FROM authorization_message_observations WHERE message_id='empty-placeholder'")
     pg.execute("DELETE FROM chat_messages WHERE message_id='empty-placeholder'")
-    pg.execute("""UPDATE authorization_chats SET p2p_counterpart_open_id='ou_person',backfill_complete=FALSE,
+    pg.execute("""UPDATE authorization_chats SET p2p_counterpart_open_id='ou_other',backfill_complete=FALSE,
                last_incremental_at=%s,last_backfill_at=NULL,recent_coverage_start_at=%s
                WHERE chat_id='empty-old-private'""", (end, start + timedelta(minutes=1)))
     pg.execute('''INSERT INTO offhours_summary_tasks(id,run_id,chat_id,input_fingerprint,cutoff,status)
@@ -1268,7 +1268,14 @@ def test_creator_enrollment_backfills_closed_periods_without_repaying_or_replaci
     coverage = pg.execute('SELECT coverage FROM offhours_summary_runs WHERE id=%s', (run['id'],)).fetchone()['coverage']
     assert coverage['conversations'] == 2 and coverage['messages'] == 2 and not coverage['synced']
     assert any('同步进度' in gap for gap in coverage['gaps'])
+    calls_before_gap = len(s.calls)
+    finish()
+    summary_periods.backfill_due(pg, now + timedelta(seconds=31))
+    assert not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
+    coverage = pg.execute('SELECT coverage FROM offhours_summary_runs WHERE id=%s', (run['id'],)).fetchone()['coverage']
+    assert not coverage['synced'] and any('同步进度' in gap for gap in coverage['gaps'])
     pg.execute('ROLLBACK TO SAVEPOINT backfill_zero_message_coverage')
+    del s.calls[calls_before_gap:]
 
     # A running source that changed is deferred, not cancelled or replaced by a second paid request.
     pg.execute('SAVEPOINT backfill_inflight')
@@ -1482,6 +1489,67 @@ def test_creator_enrollment_backfills_closed_periods_without_repaying_or_replaci
     assert len(view['events']) == 2
     tasks = pg.execute('SELECT id,input_fingerprint FROM offhours_summary_tasks WHERE run_id=%s AND is_current '
                        'ORDER BY id', (run['id'],)).fetchall()
+    # New admissions get one slot without starving old retries; one CM directory serves the whole batch.
+    pg.execute('SAVEPOINT backfill_batch_fairness')
+    batch_people = [uuid4() for _ in range(5)]
+    for index, person in enumerate(batch_people):
+        pg.execute("INSERT INTO contacts(id,display_name,entity_type) VALUES(%s,'Batch creator','person')", (person,))
+        pg.execute("INSERT INTO lark_identities(open_id,contact_id,identity_type) VALUES(%s,%s,'user')",
+                   (f'ou_batch_{index}', person))
+        pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) VALUES(%s,'creator','confirmed','manual')",
+                   (person,))
+        pg.execute("INSERT INTO contact_assignments(id,contact_id,responsible_authorization_id,source) "
+                   "VALUES(%s,%s,%s,'manual')", (uuid4(), person, s.ids['cm']))
+        pg.execute('UPDATE offhours_summary_backfills SET requested_at=%s,not_before=%s WHERE contact_id=%s',
+                   (now - timedelta(hours=1), now - timedelta(minutes=10 - index), person))
+    newest = batch_people[-1]
+    pg.execute('UPDATE offhours_summary_backfills SET requested_at=%s,not_before=%s WHERE contact_id=%s',
+               (now - timedelta(minutes=1), now - timedelta(seconds=30), newest))
+    roster_calls, directory_calls, scheduled_people = [], [], []
+    roster, directory, backfill = ai._roster, ai._related_chats, summary_periods._backfill_signal
+
+    def counted_roster(conn, cm_id):
+        roster_calls.append(cm_id)
+        return roster(conn, cm_id)
+
+    def counted_directory(conn, people, **kwargs):
+        directory_calls.append(kwargs['cm_id'])
+        return directory(conn, people, **kwargs)
+
+    def counted_backfill(conn, at, signal, *args):
+        scheduled_people.append(signal['contact_id'])
+        return backfill(conn, at, signal, *args)
+
+    pg.execute('SAVEPOINT backfill_batch_slow')
+    with monkeypatch.context() as patch:
+        patch.setattr(summary_periods, '_backfill_signal', counted_backfill)
+        patch.setattr(summary_periods, '_backfill_turn', 0)
+        for _ in range(2):
+            clock = iter((0, 3))
+            patch.setattr(summary_periods, 'monotonic', lambda clock=clock: next(clock))
+            assert summary_periods.backfill_due(pg, now) == 1
+        assert scheduled_people == [newest, batch_people[0]]
+        assert pg.execute('SELECT count(*) n FROM offhours_summary_backfills').fetchone()['n'] == 3
+    pg.execute('ROLLBACK TO SAVEPOINT backfill_batch_slow')
+    scheduled_people.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(ai, '_roster', counted_roster)
+        patch.setattr(ai, '_related_chats', counted_directory)
+        patch.setattr(summary_periods, '_backfill_signal', counted_backfill)
+        patch.setattr(summary_periods, 'monotonic', lambda: 0)
+        patch.setattr(summary_periods, '_backfill_turn', 0)
+        assert summary_periods.backfill_due(pg, now) == 4
+    assert scheduled_people == [newest, *batch_people[:3]]
+    assert roster_calls == directory_calls == [s.ids['cm']]
+    assert pg.execute('SELECT contact_id FROM offhours_summary_backfills').fetchall() == [
+        {'contact_id': batch_people[3]}]
+    with monkeypatch.context() as patch:
+        clock = iter((0, 3))
+        patch.setattr(summary_periods, 'monotonic', lambda: next(clock))
+        assert summary_periods.backfill_due(pg, now) == 1
+    assert not pg.execute('SELECT 1 FROM offhours_summary_backfills').fetchone()
+    assert old_tasks() == original and len(s.calls) == 2
+    pg.execute('ROLLBACK TO SAVEPOINT backfill_batch_fairness')
     # A failed unrelated creator cannot block this creator's merge or cause its private source to be reread.
     pg.execute('SAVEPOINT backfill_failure_isolation')
     pg.execute("UPDATE offhours_summary_tasks SET status='failed',result_ciphertext=NULL,attempts=3 "

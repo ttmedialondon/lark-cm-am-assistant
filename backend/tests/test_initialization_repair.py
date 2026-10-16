@@ -183,6 +183,38 @@ def test_targeted_initialization_repair_is_readonly_by_default_and_idempotent(pg
         pg.execute("INSERT INTO contact_roles(contact_id,role,status,source) VALUES(%s,'creator','confirmed','manual')",
                    (person,))
         assert repair(pg, material_manifest, settings, apply=True) == {'identity_material_unchanged': 1}
+    # A completed negative assessment gets a new automatic job, never an overwritten terminal receipt.
+    with pg.transaction(force_rollback=True):
+        pg.execute("UPDATE creator_handle_jobs SET status='completed',stats=%s::jsonb,"
+                   "created_at=NOW()-INTERVAL '20 minutes',finished_at=NOW()-INTERVAL '5 minutes' WHERE id=%s",
+                   (json.dumps({'identity_state': 'not_supported'}), material_job))
+        terminal = pg.execute('SELECT * FROM creator_handle_jobs WHERE id=%s', (material_job,)).fetchone()
+        expected = {'identity_material_queued': 1, 'identity_material_completed_queued': 1}
+        with pg.transaction(force_rollback=True):
+            older_open = uuid4()
+            pg.execute("INSERT INTO creator_handle_jobs(id,contact_id,purpose,status,created_at) "
+                       "VALUES(%s,%s,'identity','queued',NOW()-INTERVAL '30 minutes')", (older_open, person))
+            jobs_before = pg.execute('SELECT * FROM creator_handle_jobs WHERE contact_id=%s ORDER BY id',
+                                     (person,)).fetchall()
+            assert repair(pg, material_manifest, settings, apply=True) == {'identity_material_unchanged': 1}
+            assert pg.execute('SELECT * FROM creator_handle_jobs WHERE contact_id=%s ORDER BY id',
+                              (person,)).fetchall() == jobs_before
+            assert pg.execute('SELECT * FROM creator_handle_requests WHERE id=%s',
+                              (material_receipt,)).fetchone() == before_receipt
+        assert repair(pg, material_manifest, settings) == expected
+        assert pg.execute('SELECT * FROM creator_handle_jobs WHERE id=%s', (material_job,)).fetchone() == terminal
+        assert repair(pg, material_manifest, settings, apply=True) == expected
+        new_job = pg.execute("SELECT * FROM creator_handle_jobs WHERE contact_id=%s AND id<>%s",
+                             (person, material_job)).fetchone()
+        assert new_job['status'] == 'queued' and new_job['purpose'] == 'identity' and new_job['source'] == 'incremental'
+        assert pg.execute('SELECT * FROM creator_handle_jobs WHERE id=%s', (material_job,)).fetchone() == terminal
+        assert pg.execute('SELECT * FROM creator_handle_requests WHERE id=%s',
+                          (material_receipt,)).fetchone() == before_receipt
+        assert repair(pg, material_manifest, settings, apply=True) == {'identity_material_unchanged': 1}
+        assert pg.execute("SELECT metadata->'identity_material_jobs' AS jobs FROM audit_events "
+                          "WHERE action='creator_initialization_repaired' "
+                          "AND metadata->'identity_material_jobs' ? %s", (str(material_job),)).fetchone()['jobs'] == [
+                              str(material_job)]
     assert repair(pg, material_manifest, settings, apply=True) == {'identity_material_queued': 1}
     repaired = pg.execute('SELECT * FROM creator_handle_jobs WHERE id=%s', (material_job,)).fetchone()
     assert repaired['status'] == 'queued' and repaired['desired_version'] == 2

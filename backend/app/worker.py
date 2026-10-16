@@ -2284,7 +2284,8 @@ def _record_claimed_page(
             return PageCommit(False)
         current_claim = conn.execute(
             """
-            SELECT 1
+            SELECT access.backfill_complete, access.last_backfill_at, access.last_incremental_at,
+                   access.backfill_window_start_at
             FROM authorization_chats access
             WHERE access.authorization_id = %s AND access.chat_id = %s
               AND access.sync_generation = %s
@@ -2549,6 +2550,23 @@ def _record_claimed_page(
             ).fetchone()
         if not updated:
             raise StaleSyncJob
+        coverage_completed = False
+        if next_page_token is None and (
+            claim.mode == "backfill" and not current_claim["backfill_complete"]
+            or claim.mode == "incremental" and current_claim["backfill_complete"]
+        ):
+            # An empty final page can complete an existing report's source without changing a message.
+            coverage_completed = bool(conn.execute("""SELECT 1 FROM offhours_summary_tasks t
+                JOIN offhours_summary_runs run ON run.id=t.run_id
+                WHERE run.responsible_authorization_id=%s AND run.origin='scheduled'
+                  AND run.period IS NOT NULL AND run.window_end<=NOW()
+                  AND run.report_date>=(NOW() AT TIME ZONE 'Europe/London')::date-6
+                  AND t.chat_id=%s AND t.is_current
+                  AND (%s OR (COALESCE(GREATEST(%s::timestamptz,%s::timestamptz),'-infinity')<run.window_end
+                    AND run.window_end<=%s AND %s::timestamptz<=run.window_start-INTERVAL '7 days'))
+                LIMIT 1""", (claim.job.authorization_id, claim.chat_id, claim.mode == "backfill",
+                    current_claim["last_backfill_at"], current_claim["last_incremental_at"], claim.end_at,
+                    current_claim["backfill_window_start_at"])).fetchone())
         if changed or observed:
             creator_handle_matching.touch_chats(conn, [claim.chat_id],
                 recognition_message_ids=[m['message_id'] for m in messages if m.get('message_id')] if inserted else [],
@@ -2559,8 +2577,9 @@ def _record_claimed_page(
             creator_responsibility_matching.touch_chats(conn, [claim.chat_id],
                 authorization_id=claim.job.authorization_id, message_ids=changed,
                 observed_message_ids=observed, new_scope=bool(observed))
+        if changed or observed or coverage_completed:
             summary_periods.touch_chats(conn, claim.job.authorization_id, [claim.chat_id],
-                                       message_ids=sorted(set(changed) | set(observed)))
+                                       message_ids=None if coverage_completed else sorted(set(changed) | set(observed)))
     return PageCommit(True, inserted, own_inserted)
 
 

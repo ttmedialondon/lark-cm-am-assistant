@@ -204,8 +204,11 @@ def _touch_readable_identity(conn, chat_ids, message_ids, changed_message_ids):
             AND (r.message_id=m.parent_id OR r.parent_id=m.message_id) WHERE NOT r.is_deleted)
         SELECT enqueue_creator_identity(j.contact_id,max(r.observed_at))
         FROM related r JOIN lark_identities i ON i.open_id=r.open_id AND i.identity_type='user'
-        JOIN creator_handle_jobs j ON j.contact_id=i.contact_id AND j.purpose='identity'
-        WHERE j.status IN ('waiting_evidence','review_required','ready','preparing','running')
+        JOIN LATERAL(SELECT * FROM creator_handle_jobs candidate WHERE candidate.contact_id=i.contact_id
+            ORDER BY (candidate.status NOT IN ('completed','failed','cancelled')) DESC,
+              candidate.created_at DESC,candidate.id DESC LIMIT 1) j ON j.purpose='identity'
+        WHERE (j.status IN ('waiting_evidence','review_required','ready','preparing','running')
+          OR j.status='completed' AND j.stats->>'identity_state'='not_supported')
           AND j.reason_code<>'request_unknown'
           AND creator_identity_eligible(j.contact_id)
           AND r.observed_at>COALESCE(j.prepared_at,'-infinity'::timestamptz)
