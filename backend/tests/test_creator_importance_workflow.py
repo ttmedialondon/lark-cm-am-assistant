@@ -231,7 +231,7 @@ def test_history_batches_yield_to_other_waiting_jobs(pg, ranking_flow):
     assert pg.execute("SELECT count(*) n FROM creator_importance_jobs WHERE status<>'completed'").fetchone()["n"] == 0
 
 
-def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_flow):
+def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_flow, monkeypatch):
     flow = ranking_flow
     assert not importance.prepare_next(flow.settings) and importance.claim() is None
     assert pg.execute("SELECT count(*) n FROM creator_importance_jobs").fetchone()["n"] == 0
@@ -277,6 +277,26 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
     pg.execute("ROLLBACK TO SAVEPOINT importance_admission")
     flow.due()
     assert importance.prepare_next(flow.settings)
+    # An invalid old candidate must not requeue a newer prepared snapshot.
+    pg.execute("SAVEPOINT stale_importance_candidate")
+    ready = pg.execute("SELECT * FROM creator_importance_jobs WHERE status='ready'").fetchone()
+    source_checks = importance._source_checks
+    newer = {}
+
+    def replace_ready_candidate(*args, **kwargs):
+        checks = source_checks(*args, **kwargs)
+        assert checks
+        newer.update(pg.execute("""UPDATE creator_importance_jobs SET desired_version=desired_version+1,
+            snapshot_version=snapshot_version+1,pack_ciphertext=%s,fingerprint=%s WHERE id=%s RETURNING *""",
+            (importance._cipher(flow.settings).encrypt(importance._cipher(flow.settings).decrypt(
+                ready["pack_ciphertext"])), importance._hash("newer prepared batch"), ready["id"])).fetchone())
+        return {ref: False for ref in checks}
+
+    with monkeypatch.context() as stale:
+        stale.setattr(importance, "_source_checks", replace_ready_candidate)
+        assert importance.claim() is None
+    assert pg.execute("SELECT * FROM creator_importance_jobs WHERE id=%s", (ready["id"],)).fetchone() == newer
+    pg.execute("ROLLBACK TO SAVEPOINT stale_importance_candidate")
     first = importance.claim()
     assert first is not None
     importance.run(first, flow.settings)
@@ -329,6 +349,72 @@ def test_history_incremental_ranking_permissions_and_source_fences(pg, ranking_f
     inaccessible = importance.view_for(pg, flow.person, flow.owner, flow.settings)
     assert inaccessible["tier"] == "pending" and not inaccessible["grounds"]
     pg.execute("ROLLBACK TO SAVEPOINT rebuilding_history")
+
+    # A rebuilt fact exists only in the checkpoint while the previous full profile stays published.
+    pg.execute("SAVEPOINT checkpoint_source_retraction")
+    with monkeypatch.context() as limited:
+        limited.setattr(importance, "MAX_MESSAGES", 2)
+        flow.message("checkpoint_c1", "GAMMA new agreement: please film the autumn video",
+                     at=flow.now-timedelta(days=8))
+        flow.message("checkpoint_c2", "GAMMA I agree to film the autumn video", creator=True,
+                     at=flow.now-timedelta(days=8)+timedelta(minutes=1), parent="checkpoint_c1")
+        for n in range(4):
+            flow.message(f"checkpoint_gap{n}", "Thanks for the update", creator=True,
+                         at=flow.now-timedelta(days=7)+timedelta(hours=n))
+        flow.message("checkpoint_d", "No further business today", creator=True, at=flow.now-timedelta(hours=1))
+        pg.execute("SELECT enqueue_creator_importance(%s,%s,TRUE)", (flow.person, flow.owner))
+        pending = None
+        for _ in range(24):
+            flow.due()
+            progressed = importance.prepare_next(flow.settings)
+            candidate = importance.claim()
+            if candidate:
+                if any(m["message_id"] == "checkpoint_d" for m in candidate["material"]["pack"]["messages"]):
+                    pending = candidate
+                    break
+                importance.run(candidate, flow.settings)
+            else:
+                assert progressed
+        assert pending is not None and pending["material"]["done"]
+        checkpoint = importance._state(pending, flow.settings)
+        c_refs = {key for key, source in checkpoint["sources"].items() if source["message_id"] == "checkpoint_c2"}
+        assert c_refs and any(c_refs.intersection(fact["refs"]) for fact in checkpoint["facts"])
+        public = pg.execute("SELECT sources FROM creator_importance_profiles WHERE responsible_authorization_id=%s",
+                            (flow.owner,)).fetchone()
+        assert not any(ref["message_id"] == "checkpoint_c2" for ref in [*public["sources"], *pending["refs"]])
+
+        def retract_checkpoint_source():
+            before = pg.execute("SELECT desired_version,claim_token,status FROM creator_importance_jobs WHERE id=%s",
+                                (pending["id"],)).fetchone()
+            pg.execute("UPDATE chat_messages SET is_deleted=TRUE,body_ciphertext=NULL "
+                       "WHERE message_id='checkpoint_c2'")
+            assert pg.execute("SELECT desired_version,claim_token,status FROM creator_importance_jobs WHERE id=%s",
+                              (pending["id"],)).fetchone() == before
+
+        locked = []
+        source_checks = importance._source_checks
+
+        def check_sources(*args, **kwargs):
+            if kwargs.get("lock"):
+                locked.extend(source["message_id"] for source in kwargs.get("additional_refs", ()))
+            return source_checks(*args, **kwargs)
+
+        limited.setattr(importance, "_source_checks", check_sources)
+        flow.before_response = retract_checkpoint_source
+        paid_calls = len(flow.calls)
+        importance.run(pending, flow.settings)
+        assert len(flow.calls) == paid_calls+1 and "checkpoint_c2" in locked
+        finished = pg.execute("SELECT * FROM creator_importance_jobs WHERE id=%s", (pending["id"],)).fetchone()
+        assert finished["status"] == "completed" and finished["reason_code"] == "evaluated"
+        profile = pg.execute("SELECT p.*,(" + importance._PROFILE_VALID + ") AS current_valid "
+                             "FROM creator_importance_profiles p WHERE responsible_authorization_id=%s",
+                             (flow.owner,)).fetchone()
+        assert profile["auto_valid"] and profile["coverage"]["history_complete"] and profile["current_valid"]
+        assert not any(ref["message_id"] == "checkpoint_c2" for ref in profile["sources"])
+        remaining = importance._state(finished, flow.settings)["facts"]
+        assert not any(c_refs.intersection(fact["refs"]) for fact in remaining)
+        assert importance.view_for(pg, flow.person, flow.owner, flow.settings)["tier"] != "pending"
+    pg.execute("ROLLBACK TO SAVEPOINT checkpoint_source_retraction")
     del flow.calls[calls:]
     pg.execute("SAVEPOINT brief_roster")
     pg.execute("UPDATE creator_importance_profiles SET facts_ciphertext='not-a-ciphertext'")

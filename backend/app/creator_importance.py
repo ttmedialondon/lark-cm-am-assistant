@@ -161,24 +161,29 @@ def tier_order(conn, contact_ids, cm_id):
     return {str(row["id"]): TIER_ORDER[row["tier"]] for row in rows}
 
 
-def _source_checks(conn, refs, contact_id, cm_id, *, lock=False):
-    if not refs:
+def _source_checks(conn, refs, contact_id, cm_id, *, lock=False, additional_refs=()):
+    if not refs and not additional_refs:
         return {}
     if lock:
         # Sources precede jobs/profiles: source-update triggers take the same direction.
+        locked_refs = [*refs, *additional_refs]
         conn.execute("SELECT id FROM authorizations WHERE id=%s FOR SHARE", (cm_id,)).fetchall()
         conn.execute("SELECT chat_id FROM authorization_chats WHERE authorization_id=%s "
                      "AND chat_id=ANY(%s::text[]) ORDER BY chat_id FOR SHARE",
-                     (cm_id, sorted({r["chat_id"] for r in refs}))).fetchall()
+                     (cm_id, sorted({r["chat_id"] for r in locked_refs}))).fetchall()
         conn.execute("SELECT open_id FROM lark_identities WHERE open_id=ANY(%s::text[]) ORDER BY open_id FOR SHARE",
-                     (sorted({r["sender_open_id"] for r in refs}),)).fetchall()
+                     (sorted({r["sender_open_id"] for r in locked_refs}),)).fetchall()
         conn.execute("SELECT contact_id FROM contact_roles WHERE contact_id=%s ORDER BY role FOR SHARE",
                      (contact_id,)).fetchall()
         conn.execute("SELECT id FROM contact_assignments WHERE contact_id=%s AND responsible_authorization_id=%s "
                      "ORDER BY id FOR SHARE", (contact_id, cm_id)).fetchall()
         conn.execute("""SELECT m.message_id FROM chat_messages m JOIN jsonb_to_recordset(%s::jsonb)
             AS r(chat_id text,message_id text) ON r.chat_id=m.chat_id AND r.message_id=m.message_id
-            ORDER BY m.chat_id,m.message_id FOR SHARE OF m""", (creator_data.encode(refs),)).fetchall()
+            JOIN authorization_message_observations o ON o.chat_id=m.chat_id AND o.message_id=m.message_id
+              AND o.authorization_id=%s
+            ORDER BY m.chat_id,m.message_id FOR SHARE OF m,o""", (creator_data.encode(locked_refs), cm_id)).fetchall()
+    if not refs:
+        return {}
     rows = conn.execute("SELECT s->>'ref' ref," + _VALID_SOURCE + " valid FROM jsonb_array_elements(%s::jsonb) s "
                         "CROSS JOIN (SELECT %s::uuid contact_id,%s::uuid responsible_authorization_id) p",
                         (creator_data.encode(refs), contact_id, cm_id)).fetchall()
@@ -202,12 +207,16 @@ def _prune(conn, state, job):
     return state
 
 
-def _save_profile(conn, job, state, settings, *, cutoff=None, history_complete=False):
+def _retained_sources(state):
     selected = {ref for item in state["facts"] for ref in item["refs"]}
-    readable = state.get("readable_ref") in state["sources"]
-    if readable:
+    if state.get("readable_ref") in state["sources"]:
         selected.add(state["readable_ref"])
-    sources = [s for ref, s in state["sources"].items() if ref in selected]
+    return [source for ref, source in state["sources"].items() if ref in selected]
+
+
+def _save_profile(conn, job, state, settings, *, cutoff=None, history_complete=False):
+    sources = _retained_sources(state)
+    readable = state.get("readable_ref") in state["sources"]
     result = facts.rank(state["facts"], readable=readable)
     # Advance the rebuild checkpoint without publishing a partial replacement of the last complete profile.
     conn.execute("""INSERT INTO creator_importance_profiles(contact_id,responsible_authorization_id,
@@ -584,6 +593,8 @@ def _finish_batch(conn, job, material, settings, incoming=()):
                 if m["role"] in {"creator", "cm"} and m["context_complete"] and m["text"].strip()]
     if readable:
         state["readable_ref"] = readable[-1]
+    # A retained fact can lose its source while a later batch is at the provider.
+    _prune(conn, state, job)
     remaining = {key: value for key, value in job["pending_messages"].items() if key not in material["consumed"]}
     history_complete = not job["needs_history"] or material["done"]
     finished = history_complete and not remaining
@@ -678,7 +689,8 @@ def prepare_next(settings):
             if material["gap"]:
                 state["gaps"] += 1
             checks = _source_checks(conn, material["sources"], job["contact_id"],
-                                    job["responsible_authorization_id"], lock=True)
+                                    job["responsible_authorization_id"], lock=True,
+                                    additional_refs=_retained_sources(state))
             current_config = _config(conn, lock=True)
             current = conn.execute("SELECT * FROM creator_importance_jobs WHERE id=%s FOR UPDATE",
                                    (job["id"],)).fetchone()
@@ -735,7 +747,8 @@ def prepare_next(settings):
 
 
 def _current(conn, job, settings, *, lock=False, check_rules=True):
-    valid = _source_checks(conn, job["refs"], job["contact_id"], job["responsible_authorization_id"], lock=lock)
+    valid = _source_checks(conn, job["refs"], job["contact_id"], job["responsible_authorization_id"], lock=lock,
+                           additional_refs=_retained_sources(job["material"]["state"]))
     config = _config(conn, lock=lock)
     current = conn.execute("SELECT * FROM creator_importance_jobs WHERE id=%s" + (" FOR UPDATE" if lock else ""),
                            (job["id"],)).fetchone()
@@ -774,22 +787,29 @@ def claim():
                 not_before,created_at,id LIMIT 1""").fetchone()
         if not candidate:
             return None
+        material = json.loads(_cipher(settings).decrypt(candidate["pack_ciphertext"]))
         valid = _source_checks(conn, candidate["refs"], candidate["contact_id"],
-                               candidate["responsible_authorization_id"], lock=True)
+                               candidate["responsible_authorization_id"], lock=True,
+                               additional_refs=_retained_sources(material["state"]))
         if not all(valid.values()) or candidate["config_fingerprint"] != _config_hash(config):
             conn.execute("UPDATE creator_importance_jobs SET status='queued',reason_code='snapshot_changed' "
-                         "WHERE id=%s AND status IN ('ready','retry_wait')", (candidate["id"],))
+                         "WHERE id=%s AND status IN ('ready','retry_wait') AND desired_version=%s "
+                         "AND snapshot_version IS NOT DISTINCT FROM %s "
+                         "AND pack_ciphertext IS NOT DISTINCT FROM %s AND fingerprint IS NOT DISTINCT FROM %s",
+                         (candidate["id"], candidate["desired_version"], candidate["snapshot_version"],
+                          candidate["pack_ciphertext"], candidate["fingerprint"]))
             return None
         current = conn.execute("SELECT * FROM creator_importance_jobs WHERE id=%s FOR UPDATE",
                                (candidate["id"],)).fetchone()
         if (not current or current["status"] not in {"ready", "retry_wait"}
                 or current["desired_version"] != candidate["snapshot_version"]
-                or current["snapshot_version"] != candidate["snapshot_version"]):
+                or current["snapshot_version"] != candidate["snapshot_version"]
+                or current["pack_ciphertext"] != candidate["pack_ciphertext"]
+                or current["fingerprint"] != candidate["fingerprint"]):
             return None
         if not conn.execute("SELECT creator_importance_is_eligible(%s,%s) ok",
                 (current["contact_id"], current["responsible_authorization_id"])).fetchone()["ok"]:
             return None
-        material = json.loads(_cipher(settings).decrypt(current["pack_ciphertext"]))
         try:
             _manual_access(conn, material)
         except PermissionError:

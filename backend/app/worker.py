@@ -1011,7 +1011,8 @@ def _store_claimed_member_snapshot(claim: MemberSnapshotClaim, measurement: Memb
             conn.execute(
                 """
                 UPDATE authorization_chats
-                SET member_snapshot_status = 'pending',
+                SET member_snapshot_status = CASE WHEN member_snapshot_status='partial'
+                        THEN 'partial' ELSE 'pending' END,
                     member_snapshot_retry_at = NOW() + (%s * INTERVAL '1 second'),
                     member_snapshot_claim_id = NULL, member_snapshot_claimed_at = NULL,
                     member_snapshot_lease_until = NULL
@@ -1042,8 +1043,9 @@ def _store_claimed_member_snapshot(claim: MemberSnapshotClaim, measurement: Memb
         conn.execute(
             """
             UPDATE authorization_chats
-            SET member_count = %s, member_count_status = %s, member_count_checked_at = %s,
-                member_snapshot_status = %s, member_snapshot_checked_at = %s,
+            SET member_count = COALESCE(%s, member_count), member_count_status = %s, member_count_checked_at = %s,
+                member_snapshot_status = CASE WHEN member_snapshot_status='partial' AND %s IN ('pending','unavailable')
+                    THEN 'partial' ELSE %s END, member_snapshot_checked_at = %s,
                 member_snapshot_claim_id = NULL, member_snapshot_claimed_at = NULL,
                 member_snapshot_lease_until = NULL, member_snapshot_retry_at = NULL
             WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
@@ -1053,6 +1055,7 @@ def _store_claimed_member_snapshot(claim: MemberSnapshotClaim, measurement: Memb
                 measurement.count,
                 measurement.count_status,
                 measurement.checked_at,
+                measurement.snapshot_status,
                 measurement.snapshot_status,
                 measurement.checked_at,
                 claim.authorization_id,
@@ -1069,7 +1072,8 @@ def _release_member_snapshot_claim(claim: MemberSnapshotClaim, status: str) -> N
         conn.execute(
             """
             UPDATE authorization_chats
-            SET member_snapshot_status = %s,
+            SET member_snapshot_status = CASE WHEN member_snapshot_status='partial' AND %s IN ('pending','unavailable')
+                    THEN 'partial' ELSE %s END,
                 member_snapshot_checked_at = CASE WHEN %s = 'pending' THEN member_snapshot_checked_at ELSE NOW() END,
                 member_snapshot_retry_at = CASE
                     WHEN %s = 'pending' THEN NOW() + INTERVAL '5 minutes'
@@ -1080,7 +1084,7 @@ def _release_member_snapshot_claim(claim: MemberSnapshotClaim, status: str) -> N
             WHERE authorization_id = %s AND chat_id = %s AND sync_generation = %s
               AND member_snapshot_claim_id = %s
             """,
-            (status, status, status, claim.authorization_id, claim.chat_id, claim.generation, claim.claim_id),
+            (status, status, status, status, claim.authorization_id, claim.chat_id, claim.generation, claim.claim_id),
         )
 
 
@@ -1383,7 +1387,8 @@ def _discover_chats(
                         is_visible = TRUE,
                         last_seen_at = EXCLUDED.last_seen_at,
                         member_count = CASE
-                            WHEN EXCLUDED.member_count_checked_at IS NULL THEN authorization_chats.member_count
+                            WHEN EXCLUDED.member_count_checked_at IS NULL OR EXCLUDED.member_count IS NULL
+                                THEN authorization_chats.member_count
                             ELSE EXCLUDED.member_count
                         END,
                         member_count_status = CASE
@@ -1395,6 +1400,8 @@ def _discover_chats(
                         ),
                         member_snapshot_status = CASE
                             WHEN EXCLUDED.member_snapshot_checked_at IS NULL
+                                OR (authorization_chats.member_snapshot_status='partial'
+                                    AND EXCLUDED.member_snapshot_status IN ('pending','unavailable'))
                                 THEN authorization_chats.member_snapshot_status
                             ELSE EXCLUDED.member_snapshot_status
                         END,

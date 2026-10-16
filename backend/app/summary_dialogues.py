@@ -37,11 +37,15 @@ def decode(value, settings):
 def participant_messages(source, user, staff, unique=False, *, include_cm_broadcasts=False):
     related_ids = {m["message_id"] for m in source if m["speaker"] == user}
     previous_creator = None
+    interrupted = False
     selected = []
     for m in source:
         is_staff = m.get("is_staff") or m["speaker"] == "CM" or m["speaker"] in staff
+        if m.get("conversation_interrupted"):
+            previous_creator, interrupted = None, True
         if not is_staff:
             previous_creator = m["speaker"]
+            interrupted = m["speaker"] != user
         if m["speaker"] != user and not is_staff:
             continue
         if is_staff:
@@ -49,7 +53,7 @@ def participant_messages(source, user, staff, unique=False, *, include_cm_broadc
             addressed = user in targets or any(
                 m.get(k) in related_ids for k in ("parent_message_id", "root_message_id")
             )
-            anchored = addressed or ((unique or previous_creator == user) and
+            anchored = addressed or (((unique and not interrupted) or previous_creator == user) and
                                     not targets - {user, "CM", "unknown", *staff})
             # A group broadcast is not this creator's event without conversation context.
             if not anchored and not (include_cm_broadcasts and m["speaker"] == "CM"):
@@ -57,6 +61,11 @@ def participant_messages(source, user, staff, unique=False, *, include_cm_broadc
             if anchored:
                 related_ids.add(m["message_id"])
                 m = {**m, "addressed_user": user}
+                m.pop("conversation_interrupted", None)
+                if addressed:
+                    previous_creator, interrupted = user, False
+            elif interrupted:
+                m = {**m, "conversation_interrupted": True}
         selected.append(m)
     return selected
 
@@ -75,7 +84,8 @@ def parts(evidence, user):
             part = text[offset : offset + PART_CHARS]
             messages.append({**m, "ref": ref, "text": part})
             refs[ref] = {**evidence["refs"][m["ref"]], "text": part,
-                         **{key: m[key] for key in ("parent_message_id", "root_message_id") if m.get(key)}}
+                         **{key: m[key] for key in ("parent_message_id", "root_message_id",
+                                                    "conversation_interrupted") if m.get(key)}}
     return messages, refs
 
 
@@ -710,13 +720,17 @@ def step(job, settings):
                 "minItems": len(pending["pack"]["core_refs"]),
                 "maxItems": len(pending["pack"]["core_refs"]),
             }
+            boundary_instructions = ("\nconversation_interrupted=true 表示前面有未提供正文的其他人发言，"
+                "不能将此条未明确指向目标的员工消息当作达人答复、完成事实或自然问答承接；"
+                "unique_group_user也不能覆盖该边界。明确@/回复引用或达人重新发言可重新建立承接。"
+                if any(m.get("conversation_interrupted") for m in pending["pack"]["messages"]) else "")
             response = request(
                 job,
                 settings,
                 cfg,
                 pending["pack"],
                 schema,
-                instructions + "\n只分析 core_refs 中的本时段消息，其他消息仅是上下文。"
+                instructions + boundary_instructions + "\n只分析 core_refs 中的本时段消息，其他消息仅是上下文。"
                 "processed_refs 必须逐条完整列出 core_refs。不得输出仅有上下文依据的事项。",
                 checkpoint=checkpoint,
             )

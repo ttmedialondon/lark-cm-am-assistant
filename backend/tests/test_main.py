@@ -672,8 +672,15 @@ def test_profile_scope_upgrade_preserves_history_and_rejects_partial_or_overlapp
     assert ordinary["authorization_chats"] == original["authorization_chats"]
     assert ordinary["sync_jobs"] == original["sync_jobs"] and len(ordinary["web_sessions"]) == 2
     assert any(row["action"] == "oauth_login" for row in ordinary["audit_events"])
+    pg.execute("UPDATE authorizations SET p2p_discovery_status='attention_required',"
+               "p2p_last_checked_at=NOW(),p2p_last_error='old-token-failure' WHERE id=%s", (actor,))
     pg.execute("UPDATE sync_jobs SET status='attention_required',lease_until=NULL WHERE id=%s", (job,))
     assert callback(state(fresh=True, upgraded=False), "ordinary").status_code == 303
     assert pg.execute("SELECT mode,status FROM sync_jobs WHERE id<>%s", (job,)).fetchone() == {
         "mode": "incremental", "status": "queued"}
-    assert snapshot()["authorization_chats"] == original["authorization_chats"]
+    reconnected = snapshot()
+    assert reconnected["authorization_chats"] == original["authorization_chats"]
+    assert reconnected["authorizations"][0]["body_consent_at"] == auth["body_consent_at"]
+    assert reconnected["authorizations"][0]["p2p_discovery_status"] == "pending"
+    assert reconnected["authorizations"][0]["p2p_last_checked_at"] is None
+    assert reconnected["authorizations"][0]["p2p_last_error"] is None

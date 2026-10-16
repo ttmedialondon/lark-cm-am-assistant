@@ -1846,7 +1846,7 @@ def _organization_status(value: str | None) -> tuple[str, str]:
 
 def _member_count(count: int | None, status: str | None) -> str:
     if count is not None:
-        return str(count)
+        return str(count) if status == "succeeded" else f"{count}（上次）"
     if status == "pending":
         return "正在获取"
     return "Lark 未返回"

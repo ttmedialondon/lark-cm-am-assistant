@@ -318,7 +318,7 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                 lock_sync_material(conn)
                 stage = "authorization_lock"
                 previous = conn.execute(
-                    "SELECT id,status,last_error,body_consent_at,scopes FROM authorizations "
+                    "SELECT id,status,last_error,body_consent_at,scopes,p2p_discovery_status FROM authorizations "
                     "WHERE open_id=%s FOR UPDATE",
                     (profile.open_id,),
                 ).fetchone()
@@ -352,6 +352,7 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                     and previous["status"] in {"active", "attention_required"}
                     and BODY_READ_SCOPES.issubset(previous["scopes"] or ())
                     and BODY_READ_SCOPES.issubset(scopes))
+                preserve_p2p = preserve_sync and previous["p2p_discovery_status"] != "attention_required"
                 stage = "authorization_save"
                 row = conn.execute(
                     """
@@ -391,7 +392,7 @@ def lark_callback(request: Request, code: str | None = None, state: str | None =
                         token_expires_at,
                         refresh_expires_at,
                         scopes,
-                        preserve_sync, preserve_sync, preserve_sync, preserve_sync,
+                        preserve_sync, preserve_p2p, preserve_p2p, preserve_p2p,
                     ),
                 ).fetchone()
                 authorization_id = row["id"]

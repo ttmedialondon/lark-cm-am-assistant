@@ -480,6 +480,17 @@ _MESSAGE_SQL = f"""SELECT m.*,i.display_name AS sender_name,i.contact_id FROM ch
     ORDER BY m.message_create_time DESC,m.message_id DESC LIMIT %s FOR SHARE OF m,o"""
 
 
+def _dialogue_rows(conn, cm_id, chat_id, start, end, senders):
+    # Keep omitted speakers as boundaries, without fetching their body ciphertext.
+    sql = _MESSAGE_SQL.replace("m.*,i.display_name AS sender_name,i.contact_id", """
+        m.chat_id,m.message_id,m.message_create_time,m.sender_open_id,m.sender_type,m.message_type,
+        m.parent_id,m.root_id,m.thread_id,m.mentions_json,m.body_fingerprint,
+        CASE WHEN m.sender_open_id=ANY(%s::text[]) THEN m.body_ciphertext END AS body_ciphertext,
+        i.display_name AS sender_name,i.contact_id""").replace(
+            "      AND m.sender_open_id=ANY(%s::text[])\n", "")
+    return list(reversed(conn.execute(sql, (senders, cm_id, chat_id, start, end, None)).fetchall()))
+
+
 def _staff(conn, cm, *, read_cache=None):
     key = ("summary_staff", str(cm["id"]))
     if read_cache is not None and key in read_cache:
@@ -569,15 +580,12 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
         return None
     opens = {r["open_id"] for r in roster}
     staff = _staff(conn, cm, read_cache=read_cache)
-    all_senders = sorted(opens | set(staff))
-    recent = conn.execute(
-        _MESSAGE_SQL, (cm_id, chat_id, run["window_start"], cutoff, all_senders, None)
-    ).fetchall()
-    earlier = conn.execute(
-        _MESSAGE_SQL,
-        (cm_id, chat_id, run["window_start"] - timedelta(days=7), run["window_start"], all_senders, None),
-    ).fetchall()
-    rows = list(reversed(recent))
+    all_senders = opens | set(staff)
+    timeline = _dialogue_rows(conn, cm_id, chat_id, run["window_start"] - timedelta(days=7), cutoff,
+                              sorted(all_senders))
+    rows = [row for row in timeline if row["message_create_time"] >= run["window_start"]
+            and row["sender_open_id"] in all_senders]
+    earlier = [row for row in timeline if row["message_create_time"] < run["window_start"]]
     relevant_opens = {r["sender_open_id"] for r in rows if r["sender_open_id"] in opens}
     reply_ids = {r.get(key) for r in rows if r["sender_open_id"] in staff for key in ("parent_id", "root_id")}
     relevant_opens.update(
@@ -605,8 +613,15 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
             people[label]["open_ids"].append(row["open_id"])
     users = {f"U{i + 1}": person for i, person in enumerate(people.values())}
     speaker_labels = {openid: label for label, user in users.items() for openid in user["open_ids"]}
-    selected = [*reversed(earlier), *rows]
-    selected = [r for r in selected if r["sender_open_id"] in staff or r["sender_open_id"] in speaker_labels]
+    selected, interrupted = [], False
+    for row in timeline:
+        if row["sender_open_id"] not in staff and row["sender_open_id"] not in speaker_labels:
+            interrupted = True
+            continue
+        if interrupted and row["sender_open_id"] in staff and chat["chat_mode"] != "p2p":
+            row["conversation_interrupted"] = True
+        selected.append(row)
+        interrupted = False
     names = mention_names(conn, selected)
     settings = settings or get_settings()
     materials = message_materials.attach(conn, run["requested_by_authorization_id"], cm_id, selected, settings,
@@ -639,6 +654,8 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
                 "message_id": row["message_id"],
             }
         )
+        if row.get("conversation_interrupted"):
+            messages[-1]["conversation_interrupted"] = True
         targets = mention_targets(row.get("mentions_json"), names)
         if targets:
             # Labels come from explicit IDs, never from a person's display name.
@@ -1099,9 +1116,11 @@ _INSTRUCTIONS += HANDLING_INSTRUCTIONS
 
 
 def handling_fields(refs, messages, staff=(), *, customer_refs=None):
+    handling_refs = [ref for ref in refs if not messages.get(ref, {}).get("conversation_interrupted")]
     reply_refs = [ref for ref, message in messages.items()
                   if (message.get("is_staff", message.get("speaker") == "CM" or message.get("speaker") in staff)
                       or message.get("speaker") == "CM")
+                  and not message.get("conversation_interrupted")
                   and not message.get("unreadable") and message.get("text", "").strip()]
     reply_items = {"type": "string"}
     if reply_refs:
@@ -1118,7 +1137,7 @@ def handling_fields(refs, messages, staff=(), *, customer_refs=None):
                                              "无法核实或无需计算等待时间时填 null。"},
         "handling_status": {"type": "string", "enum": ["resolved", "unresolved", "uncertain", "not_required"]},
         "handling_reason": {"type": "string", "minLength": 1, "maxLength": 500},
-        "handling_evidence_refs": {"type": "array", "items": {"type": "string", "enum": list(refs)},
+        "handling_evidence_refs": {"type": "array", "items": {"type": "string", "enum": handling_refs},
                                    "minItems": 1, "maxItems": 20},
         "reply_evidence_refs": {"type": "array", "items": reply_items,
                                 "maxItems": 20 if reply_refs else 0,
@@ -1141,6 +1160,8 @@ def validate_handling(item, messages):
     if (not isinstance(reply_refs, list) or len(reply_refs) > 20
             or any(not isinstance(r, str) or r not in messages for r in reply_refs)):
         raise InvalidModelOutput("invalid reply evidence")
+    if any(messages[ref].get("conversation_interrupted") for ref in [*refs, *reply_refs]):
+        raise InvalidModelOutput("interrupted staff attribution")
     if any(not (messages[r].get("is_staff") or messages[r].get("speaker") == "CM") for r in reply_refs):
         raise InvalidModelOutput("reply evidence is not staff")
     item["reply_evidence_refs"] = [r for r in dict.fromkeys(reply_refs)
@@ -1285,6 +1306,7 @@ def _validate(raw, evidence):
                 list(evidence["users"]) == [item["user"]]
                 and evidence["pack"].get("unique_group_user") == item["user"]
                 and bool(cm_messages)
+                and not any(m.get("conversation_interrupted") and not m.get("addressed_user") for m in cm_messages)
                 and not any(
                     not t.get("ambiguous") and t["target"] not in {"CM", item["user"], "unknown", *staff}
                     for m in cm_messages for t in m.get("mentions", [])

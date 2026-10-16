@@ -137,16 +137,14 @@ def _collect(conn, actor_id, event_id, settings, selected, *, cutoff=None, featu
         if (chat["backfill_complete"] and (chat["sync_status"] != "succeeded" or not watermark)
                 or not core._covers_window(chat, start, min(now, watermark) if watermark else now)):
             gaps.append(chat["chat_id"])
-        rows = list(
-            reversed(
-                conn.execute(
-                    core._MESSAGE_SQL, (cm["id"], chat["chat_id"], start, now, sorted(speakers), None)
-                ).fetchall()
-            )
-        )
-        names = mention_names(conn, rows)
+        rows = core._dialogue_rows(conn, cm["id"], chat["chat_id"], start, now, sorted(speakers))
+        names = mention_names(conn, [row for row in rows if row["sender_open_id"] in speakers])
         dialogue = []
         for row in rows:
+            if row["sender_open_id"] not in speakers:
+                if chat["chat_mode"] != "p2p":
+                    dialogue.append({"message_id": row["message_id"], "speaker": "other"})
+                continue
             targets = core.mention_targets(row.get("mentions_json"), names)
             dialogue.append({
                 "message_id": row["message_id"], "speaker": speakers[row["sender_open_id"]],

@@ -2,15 +2,18 @@
 
 import hashlib
 import json
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
 
+from app import admin_reporting, worker
 from app import creator_importance_facts as facts
 
 
-def test_shared_group_changes_only_wake_real_targets_and_revoke_referenced_sources(pg):
+def test_shared_group_changes_only_wake_real_targets_and_revoke_referenced_sources(pg, monkeypatch):
+    monkeypatch.setattr(worker, 'connection', lambda: nullcontext(pg))
     cm1, cm2, creator1, creator2 = uuid4(), uuid4(), uuid4(), uuid4()
     pg.execute("""INSERT INTO authorizations(id,open_id,access_token_ciphertext,body_consent_at)
         VALUES(%s,'ou_cm1','synthetic',NOW()-INTERVAL '1 day'),
@@ -31,8 +34,9 @@ def test_shared_group_changes_only_wake_real_targets_and_revoke_referenced_sourc
                "WHERE feature='creator_importance'")
     pg.execute("INSERT INTO chats(chat_id,name,chat_mode) VALUES('community','Large community','group')")
     for cm in (cm1, cm2):
-        pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,member_snapshot_status,member_count)
-            VALUES(%s,'community','succeeded',4)""", (cm,))
+        pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,member_snapshot_status,member_count,
+            member_count_status,member_snapshot_checked_at)
+            VALUES(%s,'community','succeeded',4,'succeeded',NOW()-INTERVAL '1 day')""", (cm,))
     for name in ('ou_cm1', 'ou_cm2', 'ou_creator1', 'ou_creator2'):
         pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('community',%s)", (name,))
     pg.execute("""INSERT INTO creator_importance_profiles(contact_id,responsible_authorization_id,auto_valid,
@@ -59,6 +63,76 @@ def test_shared_group_changes_only_wake_real_targets_and_revoke_referenced_sourc
                 VALUES(%s,'community',%s)""", (cm, mid))
 
     initial = jobs()
+    initial_profiles = profiles()
+    for status in ('pending', 'unavailable', 'succeeded'):
+        pg.execute("UPDATE authorization_chats SET member_snapshot_status=%s WHERE authorization_id=%s",
+                   (status, cm1))
+        assert jobs() == initial and profiles() == initial_profiles
+    checked_at = pg.execute("SELECT NOW() AS checked_at").fetchone()['checked_at']
+
+    def claim_snapshot():
+        claim_id = uuid4()
+        access = pg.execute("""UPDATE authorization_chats SET member_snapshot_claim_id=%s,
+            member_snapshot_lease_until=NOW()+INTERVAL '10 minutes' WHERE authorization_id=%s
+            RETURNING sync_generation""", (claim_id, cm1)).fetchone()
+        return worker.MemberSnapshotClaim(cm1, 'community', access['sync_generation'], claim_id)
+
+    members = tuple({'open_id': name, 'member_type': 'user', 'tenant_key': None}
+                    for name in ('ou_cm1', 'ou_cm2', 'ou_creator1', 'ou_creator2'))
+    complete = worker.MemberSnapshotMeasurement(4, 'succeeded', 'succeeded', checked_at, members)
+    temporary = worker.MemberSnapshotMeasurement(None, 'pending', 'pending', None, retry_after_seconds=30)
+    unavailable_measurement = worker.MemberSnapshotMeasurement(None, 'unavailable', 'unavailable', checked_at)
+    pg.execute("SAVEPOINT unavailable_member_count")
+    worker._store_claimed_member_snapshot(claim_snapshot(), temporary)
+    retrying = pg.execute("SELECT * FROM authorization_chats WHERE authorization_id=%s", (cm1,)).fetchone()
+    assert retrying['member_snapshot_status'] == 'pending' and retrying['member_snapshot_retry_at'] > checked_at
+    worker._store_claimed_member_snapshot(claim_snapshot(), complete)
+    assert jobs() == initial and profiles() == initial_profiles
+    worker._store_claimed_member_snapshot(
+        claim_snapshot(), unavailable_measurement,
+    )
+    unavailable = pg.execute("SELECT * FROM authorization_chats WHERE authorization_id=%s", (cm1,)).fetchone()
+    assert unavailable['member_count'] == 4 and unavailable['member_count_status'] == 'unavailable'
+    assert unavailable['member_snapshot_status'] == 'unavailable'
+    assert unavailable['member_count_checked_at'] == checked_at
+    assert unavailable['member_snapshot_checked_at'] == checked_at and not unavailable['member_snapshot_claim_id']
+    assert admin_reporting._member_count(unavailable['member_count'], unavailable['member_count_status']) == '4（上次）'
+    assert admin_reporting._member_count(4, 'succeeded') == '4'
+    assert jobs() == initial and profiles() == initial_profiles
+    pg.execute("ROLLBACK TO SAVEPOINT unavailable_member_count")
+
+    # Incomplete saved evidence survives operational errors until an actually complete roster arrives.
+    pg.execute("SAVEPOINT partial_member_recovery")
+    pg.execute("UPDATE authorization_chats SET member_snapshot_status='partial' WHERE authorization_id=%s", (cm1,))
+    worker._store_claimed_member_snapshot(claim_snapshot(), temporary)
+    worker._release_member_snapshot_claim(claim_snapshot(), 'pending')
+    partial = pg.execute("SELECT * FROM authorization_chats WHERE authorization_id=%s", (cm1,)).fetchone()
+    assert partial['member_snapshot_status'] == 'partial' and partial['member_snapshot_retry_at'] > checked_at
+    worker._store_claimed_member_snapshot(claim_snapshot(), unavailable_measurement)
+    partial = pg.execute("SELECT * FROM authorization_chats WHERE authorization_id=%s", (cm1,)).fetchone()
+    assert partial['member_snapshot_status'] == 'partial' and partial['member_count_status'] == 'unavailable'
+    assert partial['member_count'] == 4
+    pg.execute("UPDATE authorization_chats SET member_snapshot_status='pending' WHERE authorization_id=%s", (cm2,))
+    worker._mark_one_member_snapshot_unavailable()
+    assert pg.execute("SELECT member_snapshot_status FROM authorization_chats WHERE authorization_id=%s",
+                      (cm1,)).fetchone()['member_snapshot_status'] == 'partial'
+    assert pg.execute("SELECT member_snapshot_status FROM authorization_chats WHERE authorization_id=%s",
+                      (cm2,)).fetchone()['member_snapshot_status'] == 'unavailable'
+    assert jobs() == initial and profiles() == initial_profiles
+    worker._store_claimed_member_snapshot(claim_snapshot(), complete)
+    recovered = jobs()
+    for key, job in recovered.items():
+        assert job['desired_version'] == initial[key]['desired_version'] + (key[1] == cm1)
+        assert profiles()[key]['auto_valid'] is (key[1] != cm1)
+        assert profiles()[key]['manual_tier'] == 'normal'
+    worker._store_claimed_member_snapshot(claim_snapshot(), complete)
+    assert jobs() == recovered
+    pg.execute("ROLLBACK TO SAVEPOINT partial_member_recovery")
+    pg.execute("SAVEPOINT actual_member_change")
+    pg.execute("UPDATE authorization_chats SET member_count=5 WHERE authorization_id=%s", (cm1,))
+    assert not profiles()[creator1, cm1]['auto_valid'] and not profiles()[creator2, cm1]['auto_valid']
+    assert profiles()[creator1, cm2]['auto_valid'] and profiles()[creator2, cm2]['auto_valid']
+    pg.execute("ROLLBACK TO SAVEPOINT actual_member_change")
     message('march_system', 'ou_cm1', age=150, kind='system', readers=(cm1, cm2))
     pg.execute("UPDATE chat_messages SET body_fingerprint=%s WHERE message_id='march_system'",
                (hashlib.sha256(b'hydrated').hexdigest(),))

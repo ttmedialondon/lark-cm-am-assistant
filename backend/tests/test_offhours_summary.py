@@ -764,6 +764,71 @@ def test_all_creator_conversations_include_cm_only_groups_and_recheck_access(pg,
         ai._load_chat(pg, run, 'group_restricted', s.end, settings=s.settings)
     assert not any("group_hidden" in json.dumps(p) or "group_unrelated" in json.dumps(p) for p in s.calls)
 
+    pg.execute("SAVEPOINT omitted_speaker_boundary")
+    from app import summary_replies
+    reply_source = summary_replies.source(pg, s.ids["cm"], view["events"][0]["id"], s.settings,
+                                          require_unresolved=False)
+    for index, (identifier, sender, text) in enumerate((
+        ("boundary_request", "ou_person", "Please check my sample A"),
+        ("boundary_other", "ou_other", "OMITTED_SPEAKER_BODY_SECRET: check my different order B"),
+        ("boundary_answer", "ou_cm", "Approved"),
+        ("boundary_more", "ou_cm", "This is complete"),
+        ("boundary_new_request", "ou_person", "What about sample C?"),
+        ("boundary_new_answer", "ou_cm", "I will check sample C"),
+    )):
+        pg.execute("""INSERT INTO chat_messages(chat_id,message_id,sender_open_id,message_type,
+            body_ciphertext,message_create_time) VALUES('group_named',%s,%s,'text',%s,%s)""",
+            (identifier, sender, s.cipher.encrypt(json.dumps({"text": text})),
+             s.start + timedelta(hours=2, minutes=index)))
+        pg.execute("""INSERT INTO authorization_message_observations(authorization_id,chat_id,message_id)
+            VALUES(%s,'group_named',%s)""", (s.ids["cm"], identifier))
+    evidence = ai._load_chat(pg, run, "group_named", s.end, settings=s.settings)
+    assert evidence["pack"]["unique_group_user"] == "U1"
+    assert len(evidence["users"]) == 1 and "OMITTED_SPEAKER_BODY_SECRET" not in json.dumps(evidence)
+    assert "ou_other" not in json.dumps(evidence)
+    timeline = ai._dialogue_rows(pg, s.ids["cm"], "group_named", s.start, s.end, ["ou_person", "ou_cm"])
+    assert next(row for row in timeline if row["message_id"] == "boundary_other")["body_ciphertext"] is None
+    selected, refs = summary_dialogues.parts(evidence, "U1")
+    messages = {message["message_id"]: message for message in selected}
+    for identifier in ("boundary_answer", "boundary_more"):
+        assert messages[identifier]["conversation_interrupted"] and not messages[identifier].get("addressed_user")
+        scoped = {**evidence, "pack": {**evidence["pack"], "messages": selected}, "refs": refs}
+        with pytest.raises(ai.InvalidModelOutput, match="attribution"):
+            ai._validate(json.dumps({"events": [sample_event(evidence_refs=[messages[identifier]["ref"]])]}), scoped)
+    request_ref, answer_ref = (messages[key]["ref"] for key in ("boundary_request", "boundary_answer"))
+    fields = ai._format(scoped)["schema"]["properties"]["events"]["items"]["properties"]
+    assert answer_ref not in fields["handling_evidence_refs"]["items"]["enum"]
+    assert answer_ref not in fields["reply_evidence_refs"]["items"].get("enum", [])
+    assert request_ref in fields["handling_evidence_refs"]["items"]["enum"]
+    assert refs[answer_ref]["conversation_interrupted"]
+    merge_fields = summary_dialogues.merge_format(refs)["schema"]["properties"]
+    assert answer_ref not in merge_fields["handling_evidence_refs"]["items"]["enum"]
+    assert answer_ref not in merge_fields["reply_evidence_refs"]["items"].get("enum", [])
+    with pytest.raises(ai.InvalidModelOutput, match="interrupted"):
+        ai._validate(json.dumps({"events": [sample_event(evidence_refs=[request_ref, answer_ref],
+            handling_status="resolved", handling_evidence_refs=[answer_ref],
+            reply_evidence_refs=[answer_ref])]}), scoped)
+    assert messages["boundary_new_answer"]["addressed_user"] == "U1"
+    reply = summary_replies._collect(pg, s.ids["cm"], view["events"][0]["id"], s.settings, reply_source)
+    assert not {"boundary_other", "boundary_answer", "boundary_more"} & {
+        message["message_id"] for message in reply["messages"]}
+    assert "boundary_new_answer" in {message["message_id"] for message in reply["messages"]}
+    # An explicit reference or @ can reconnect the CM to the creator across that boundary.
+    for relation in ("parent", "mention"):
+        pg.execute("""UPDATE chat_messages SET parent_id=%s,mentions_json=%s::jsonb
+            WHERE chat_id='group_named' AND message_id='boundary_answer'""",
+            ("boundary_request" if relation == "parent" else None, json.dumps([] if relation == "parent" else [
+                {"key": "@_user_1", "id": "ou_person", "id_type": "open_id", "name": "Alice"}])))
+        targeted = ai._load_chat(pg, run, "group_named", s.end, settings=s.settings)
+        chosen, chosen_refs = summary_dialogues.parts(targeted, "U1")
+        reconnected = next(message for message in chosen if message["message_id"] == "boundary_answer")
+        assert reconnected["addressed_user"] == "U1" and not reconnected.get("conversation_interrupted")
+        resolved = ai._validate(json.dumps({"events": [sample_event(evidence_refs=[reconnected["ref"]],
+            handling_status="resolved", reply_evidence_refs=[reconnected["ref"]])]}),
+            {**targeted, "pack": {**targeted["pack"], "messages": chosen}, "refs": chosen_refs})[0]
+        assert resolved["handling_status"] == "resolved" and resolved["replied_by"]
+    pg.execute("ROLLBACK TO SAVEPOINT omitted_speaker_boundary")
+
     # A second, unassigned creator still prevents a uniqueness inference. The
     # conversation remains relevant, but CM-only text needs an explicit target.
     pg.execute("INSERT INTO chat_members(chat_id,open_id) VALUES('group_named','ou_other')")
