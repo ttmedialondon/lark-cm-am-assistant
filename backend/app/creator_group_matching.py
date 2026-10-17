@@ -7,6 +7,7 @@ import json
 from decimal import Decimal
 from uuid import uuid4
 
+from cryptography.exceptions import InvalidTag
 from psycopg.errors import LockNotAvailable
 
 from . import admin_permissions, ai_dispatch, ai_feature_config, assistant_rules, creator_data
@@ -37,6 +38,7 @@ REASONS = {
     "superseded": "已有更新的结果", "admission_busy": "等待本地入库",
     "evidence_unavailable": "证据或授权已变化",
     "rules_unavailable": "群用途手册已停用",
+    "application_pending": "结果已返回，等待本地入库",
 }
 
 
@@ -302,10 +304,19 @@ def reprocess_unclassified(conn, actor, *, chat_ids=None):
 
 def _recover(conn):
     # Unknown network billing never causes an automatic second request.
-    conn.execute("""UPDATE creator_group_jobs SET status=CASE WHEN status='preparing' THEN 'queued' ELSE 'failed' END,
-        reason_code=CASE WHEN status='preparing' THEN 'lease_expired' ELSE 'request_unknown' END,
+    conn.execute("""WITH expired AS (
+        SELECT j.id,r.error_code='' AND r.finished_at IS NOT NULL
+          AND r.response_ciphertext IS NOT NULL AND r.created_at>=j.prepared_at AS saved
+        FROM creator_group_jobs j LEFT JOIN LATERAL (
+          SELECT * FROM creator_group_requests WHERE job_id=j.id
+          ORDER BY created_at DESC,id DESC LIMIT 1) r ON TRUE
+        WHERE j.status IN ('preparing','running') AND j.lease_until<NOW() FOR UPDATE OF j)
+        UPDATE creator_group_jobs j SET
+        status=CASE WHEN j.status='preparing' THEN 'queued' WHEN expired.saved THEN 'ready' ELSE 'failed' END,
+        reason_code=CASE WHEN j.status='preparing' THEN 'lease_expired'
+          WHEN expired.saved THEN 'application_pending' ELSE 'request_unknown' END,
         claim_token=NULL,lease_until=NULL,not_before=NOW(),updated_at=NOW()
-        WHERE status IN ('preparing','running') AND lease_until<NOW()""")
+        FROM expired WHERE j.id=expired.id""")
     conn.execute("""UPDATE creator_group_requests r SET error_code='request_unknown',finished_at=NOW()
         FROM creator_group_jobs j WHERE r.job_id=j.id AND j.reason_code='request_unknown'
         AND r.finished_at IS NULL""")
@@ -505,11 +516,11 @@ def claim():
         config = _config(conn, lock=True)
         if not _enabled(config):
             return None
+        can_send = ai_dispatch.can_claim(conn)
         _recover(conn)
-        if not ai_dispatch.can_claim(conn):
-            return None
         job = conn.execute("""SELECT * FROM creator_group_jobs WHERE status IN ('ready','retry_wait')
-            AND not_before<=NOW() AND attempts<3 ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1""").fetchone()
+            AND not_before<=NOW() AND (attempts<3 OR reason_code IN ('application_pending','rules_unavailable'))
+            ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1""").fetchone()
         if not job:
             return None
         if (job["stats"].get("prompt_version") != evidence.PROMPT_VERSION
@@ -526,13 +537,46 @@ def claim():
             _pause_rules(conn, job)
             return None
         pack = _business_pack(frozen)
-        conn.execute("INSERT INTO creator_group_requests(id,job_id,material_fingerprint) VALUES(%s,%s,%s)",
-                     (reservation, job["id"], _hash(pack)))
+        receipt = conn.execute("""SELECT * FROM creator_group_requests WHERE job_id=%s
+            AND created_at>=%s ORDER BY created_at DESC,id DESC LIMIT 1""",
+            (job['id'], job['prepared_at'])).fetchone() if job['reason_code'] in {
+                'application_pending', 'rules_unavailable'} else None
+        saved = bool(receipt and receipt['error_code'] == '' and receipt['finished_at']
+                     and receipt['response_ciphertext'] and receipt['material_fingerprint'] == _hash(pack))
+        if (job['reason_code'] == 'application_pending' and not saved
+                or receipt and receipt['error_code'] == 'request_unknown'):
+            conn.execute("UPDATE creator_group_jobs SET status='failed',reason_code='request_unknown',"
+                         "updated_at=NOW() WHERE id=%s", (job['id'],))
+            return None
+        blocked_error = (receipt and receipt['error_code'] and job['reason_code'] == 'rules_unavailable'
+                         and receipt['error_code'] not in {'not_sent'} | {
+                             f'http_{status}' for status in api.RETRYABLE_HTTP_STATUSES})
+        if not saved and (job['attempts'] >= 3 or blocked_error):
+            reason = 'invalid_output' if receipt and receipt['error_code'] == 'invalid_output' else 'provider_failed'
+            conn.execute("UPDATE creator_group_jobs SET status='failed',reason_code=%s,"
+                         "updated_at=NOW() WHERE id=%s", (reason, job['id']))
+            return None
+        if not saved and not can_send:
+            return None
+        if saved:
+            try:
+                result = evidence.validate(pack, json.loads(creator_data.cipher(settings).decrypt(
+                    receipt['response_ciphertext'])))
+            except (KeyError, TypeError, ValueError, InvalidTag):
+                conn.execute("UPDATE creator_group_jobs SET status='failed',reason_code='invalid_output',"
+                             "updated_at=NOW() WHERE id=%s", (job['id'],))
+                return None
+        else:
+            conn.execute("INSERT INTO creator_group_requests(id,job_id,material_fingerprint) VALUES(%s,%s,%s)",
+                         (reservation, job["id"], _hash(pack)))
         conn.execute("""UPDATE creator_group_jobs SET status='running',claim_token=%s,
-            lease_until=NOW()+INTERVAL '180 seconds',attempts=attempts+1,updated_at=NOW() WHERE id=%s""",
-                     (token, job["id"]))
+            lease_until=NOW()+INTERVAL '180 seconds',attempts=attempts+%s,updated_at=NOW() WHERE id=%s""",
+                     (token, 0 if saved else 1, job["id"]))
         return {**job, "pack": pack, **({"_rules": frozen["_rules"]} if "_rules" in frozen else {}),
-                "claim_token": token, "reservation_id": reservation, "attempts": job["attempts"] + 1, "config": config}
+                "claim_token": token, "reservation_id": receipt['id'] if saved else reservation,
+                **({'saved_response': (result, {'response_id': receipt['response_id'],
+                                              'openai_request_id': receipt['request_id']})} if saved else {}),
+                "attempts": job["attempts"] + (0 if saved else 1), "config": config}
 
 
 def _current(conn, job, settings, *, check_rules=True):
@@ -557,22 +601,26 @@ def _current(conn, job, settings, *, check_rules=True):
 def run(job, settings):
     with connection() as conn, conn.transaction():
         if not _current(conn, job, settings):
-            conn.execute("""UPDATE creator_group_requests SET error_code='not_sent',input_tokens=0,output_tokens=0,
-                finished_at=NOW() WHERE id=%s AND finished_at IS NULL""", (job["reservation_id"],))
-            conn.execute("UPDATE creator_group_jobs SET attempts=GREATEST(attempts-1,0) "
-                         "WHERE id=%s AND reason_code='rules_unavailable'", (job["id"],))
+            if 'saved_response' not in job:
+                conn.execute("""UPDATE creator_group_requests SET error_code='not_sent',input_tokens=0,output_tokens=0,
+                    finished_at=NOW() WHERE id=%s AND finished_at IS NULL""", (job["reservation_id"],))
+                conn.execute("UPDATE creator_group_jobs SET attempts=GREATEST(attempts-1,0) "
+                             "WHERE id=%s AND reason_code='rules_unavailable'", (job["id"],))
             return
     result, telemetry, error = None, {}, None
+    if 'saved_response' in job:
+        result, telemetry = job['saved_response']
     try:
-        key = ai_feature_config.api_key_cipher(settings.token_encryption_key).decrypt(
-            job["config"]["api_key_ciphertext"])
-        instructions = (assistant_rules.group_instructions(job["_rules"])
-                        if "_rules" in job else evidence.instructions())
-        response = api.call_openai(job["config"], key, job["pack"], job["id"], instructions=instructions,
-                                   output_format=evidence.output_format(job["pack"]), max_output_tokens=900,
-                                   reasoning_effort="none", total_timeout=70)
-        telemetry = {**response["telemetry"], "usage": response["usage"], "response_id": response["response_id"]}
-        result = evidence.validate(job["pack"], json.loads(response["text"]))
+        if 'saved_response' not in job:
+            key = ai_feature_config.api_key_cipher(settings.token_encryption_key).decrypt(
+                job["config"]["api_key_ciphertext"])
+            instructions = (assistant_rules.group_instructions(job["_rules"])
+                            if "_rules" in job else evidence.instructions())
+            response = api.call_openai(job["config"], key, job["pack"], job["id"], instructions=instructions,
+                                       output_format=evidence.output_format(job["pack"]), max_output_tokens=900,
+                                       reasoning_effort="none", total_timeout=70)
+            telemetry = {**response["telemetry"], "usage": response["usage"], "response_id": response["response_id"]}
+            result = evidence.validate(job["pack"], json.loads(response["text"]))
     except Exception as exc:
         error = (api.ModelOutputError("invalid_json", telemetry=telemetry)
                  if isinstance(exc, json.JSONDecodeError) else exc)
@@ -582,20 +630,21 @@ def run(job, settings):
     code = ("" if error is None else "request_unknown" if unknown else "invalid_output"
             if isinstance(error, api.ModelOutputError) else f"http_{status}"
             if isinstance(status, int) else "provider_failed")
-    with connection() as conn, conn.transaction():
-        usage = telemetry.get("usage", {})
-        conn.execute("""UPDATE creator_group_requests SET request_id=%s,response_id=%s,error_code=%s,input_tokens=%s,
-            output_tokens=%s,response_ciphertext=%s,finished_at=NOW() WHERE id=%s""", (
-                telemetry.get("openai_request_id"), telemetry.get("response_id"), code,
-                usage.get("input_tokens"), usage.get("output_tokens"),
-                creator_data.cipher(settings).encrypt(creator_data.encode(result)) if result is not None else None,
-                job["reservation_id"],
-            ))
-        conn.execute("""UPDATE creator_group_jobs SET input_tokens=input_tokens+%s,
-            output_tokens=output_tokens+%s WHERE id=%s""",
-                     (usage.get("input_tokens") or 0, usage.get("output_tokens") or 0, job["id"]))
-    # Actual usage commits before any subsequent authorization or admission failure.
-    ai_dispatch.observe_limits(telemetry)
+    if 'saved_response' not in job:
+        with connection() as conn, conn.transaction():
+            usage = telemetry.get("usage", {})
+            conn.execute("""UPDATE creator_group_requests SET request_id=%s,response_id=%s,error_code=%s,
+                input_tokens=%s,output_tokens=%s,response_ciphertext=%s,finished_at=NOW() WHERE id=%s""", (
+                    telemetry.get("openai_request_id"), telemetry.get("response_id"), code,
+                    usage.get("input_tokens"), usage.get("output_tokens"),
+                    creator_data.cipher(settings).encrypt(creator_data.encode(result)) if result is not None else None,
+                    job["reservation_id"],
+                ))
+            conn.execute("""UPDATE creator_group_jobs SET input_tokens=input_tokens+%s,
+                output_tokens=output_tokens+%s WHERE id=%s""",
+                         (usage.get("input_tokens") or 0, usage.get("output_tokens") or 0, job["id"]))
+        # Actual usage commits before any subsequent authorization or admission failure.
+        ai_dispatch.observe_limits(telemetry)
     retry = isinstance(error, api.OpenAIRequestError) and error.retryable and not unknown and job["attempts"] < 3
     delay = api.retry_delay(error.retry_after_seconds, job["attempts"]) if retry else 0
     if isinstance(error, api.OpenAIRequestError):

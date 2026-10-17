@@ -138,13 +138,18 @@ def test_shared_evidence_uses_connected_cm_roster_and_keeps_other_staff_as_conte
     with monkeypatch.context() as no_plaintext:
         no_plaintext.setattr(handle_evidence.text, "_decrypt_body", lambda *_: pytest.fail("list must not decrypt"))
         assert evidence.still_valid(pg, material["refs"], pilot.settings, lightweight=True)
-        pg.execute("SAVEPOINT changed_body")
-        pg.execute(
-            "UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='helper_new'",
-            (cipher.encrypt(json.dumps({"text": "Changed business responsibility"})),),
-        )
-        assert not evidence.still_valid(pg, material["refs"], pilot.settings, lightweight=True)
-        pg.execute("ROLLBACK TO SAVEPOINT changed_body")
+    pg.execute("SAVEPOINT changed_body")
+    original = pg.execute("SELECT body_ciphertext FROM chat_messages WHERE message_id='helper_new'").fetchone()
+    replacement = cipher.encrypt(cipher.decrypt(original["body_ciphertext"]))
+    assert replacement != original["body_ciphertext"]
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='helper_new'", (replacement,))
+    assert evidence.still_valid(pg, material["refs"], pilot.settings, lightweight=True)
+    assert evidence.still_valid(pg, material["refs"], pilot.settings)
+    pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id='helper_new'",
+               (cipher.encrypt(json.dumps({"text": "Changed business responsibility"})),))
+    assert not evidence.still_valid(pg, material["refs"], pilot.settings, lightweight=True)
+    assert not evidence.still_valid(pg, material["refs"], pilot.settings)
+    pg.execute("ROLLBACK TO SAVEPOINT changed_body")
     assert evidence.build(pg, pilot.settings, restricted)["pack"] is None
     pg.execute("SAVEPOINT revoked_permission")
     pg.execute("UPDATE authorizations SET body_consent_at=NULL WHERE id=%s", (cm,))

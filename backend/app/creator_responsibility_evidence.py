@@ -524,9 +524,11 @@ def still_valid(conn, refs, settings, *, lightweight=False):
     ref = state_refs[0]
     if access._hash(_state(conn, ref["contact_id"])) != ref["state_hash"]:
         return False
-    return source.still_valid(
-        conn, [r for r in refs if r["kind"] != "responsibility_state"], settings, ciphertext_only=lightweight
-    )
+    material_refs = [r for r in refs if r["kind"] != "responsibility_state"]
+    if lightweight and source.still_valid(conn, material_refs, settings, ciphertext_only=True):
+        return True
+    # Normal sync may re-encrypt the same body; keep the full source/access checks on fallback.
+    return source.still_valid(conn, material_refs, settings)
 
 
 def validate(pack, result):

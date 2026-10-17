@@ -8,6 +8,8 @@ import json
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from cryptography.exceptions import InvalidTag
+
 from . import ai_dispatch, ai_feature_config, assistant_rules, creator_access, creator_data, offhours_summary
 from . import creator_importance_facts as facts
 from . import openai_client as api
@@ -571,10 +573,20 @@ def build_batch(conn, job, settings, state):
 def _recover(conn):
     conn.execute("""UPDATE creator_importance_jobs SET status='queued',claim_token=NULL,lease_until=NULL,
         reason_code='preparation_recovered',updated_at=NOW() WHERE status='preparing' AND lease_until<NOW()""")
-    # An expired paid request may have reached the provider. Never silently submit it twice.
-    conn.execute("""UPDATE creator_importance_jobs SET status='failed',claim_token=NULL,lease_until=NULL,
-        reason_code='request_unknown',finished_at=NOW(),updated_at=NOW()
-        WHERE status='running' AND lease_until<NOW()""")
+    # Replay a complete receipt locally; an expired request without one remains unknown.
+    conn.execute("""WITH expired AS (
+        SELECT j.id,r.error_code='' AND r.finished_at IS NOT NULL AND r.response_ciphertext IS NOT NULL
+          AND r.fingerprint=j.fingerprint AND r.created_at>=j.prepared_at AND r.material_fingerprint IS NOT NULL
+          AND j.pack_ciphertext IS NOT NULL AND j.snapshot_version=j.desired_version AS saved
+        FROM creator_importance_jobs j LEFT JOIN LATERAL (
+          SELECT * FROM creator_importance_requests WHERE job_id=j.id
+          ORDER BY created_at DESC,id DESC LIMIT 1) r ON TRUE
+        WHERE j.status='running' AND j.lease_until<NOW() FOR UPDATE OF j)
+        UPDATE creator_importance_jobs j SET status=CASE WHEN expired.saved THEN 'ready' ELSE 'failed' END,
+        reason_code=CASE WHEN expired.saved THEN 'application_pending' ELSE 'request_unknown' END,
+        claim_token=NULL,lease_until=NULL,not_before=NOW(),
+        finished_at=CASE WHEN expired.saved THEN NULL ELSE NOW() END,updated_at=NOW()
+        FROM expired WHERE j.id=expired.id""")
     conn.execute("""UPDATE creator_importance_requests r SET error_code='request_unknown',finished_at=NOW()
         FROM creator_importance_jobs j WHERE r.job_id=j.id AND j.reason_code='request_unknown'
         AND r.finished_at IS NULL""")
@@ -708,7 +720,8 @@ def prepare_next(settings):
                 return True
             fingerprint = _hash([pack, _config_hash(config), pinned["digest"]])
             cached = conn.execute("""SELECT response_ciphertext FROM creator_importance_requests
-                WHERE job_id=%s AND fingerprint=%s AND error_code='' AND response_ciphertext IS NOT NULL
+                WHERE job_id=%s AND fingerprint=%s AND error_code='' AND finished_at IS NOT NULL
+                AND response_ciphertext IS NOT NULL
                 ORDER BY created_at DESC LIMIT 1""", (job["id"], fingerprint)).fetchone()
             if cached:
                 result = facts.validate(api.parse_json(_cipher(settings).decrypt(cached["response_ciphertext"])),
@@ -779,7 +792,7 @@ def claim():
         candidate = conn.execute("""SELECT j.* FROM creator_importance_jobs j WHERE status IN ('ready','retry_wait')
             AND not_before<=NOW() AND (attempts<3 OR EXISTS(
               SELECT 1 FROM creator_importance_requests r WHERE r.job_id=j.id AND r.fingerprint=j.fingerprint
-                AND r.error_code='' AND r.response_ciphertext IS NOT NULL))
+                AND r.error_code='' AND r.finished_at IS NOT NULL AND r.response_ciphertext IS NOT NULL))
             AND NOT EXISTS(SELECT 1 FROM creator_authorization_rescans r
               WHERE r.authorization_id=j.responsible_authorization_id)
             ORDER BY EXISTS(SELECT 1 FROM creator_importance_profiles p WHERE p.contact_id=j.contact_id
@@ -816,12 +829,25 @@ def claim():
             _pause_rules(conn, current)
             return None
         cached = conn.execute("""SELECT response_ciphertext FROM creator_importance_requests
-            WHERE job_id=%s AND fingerprint=%s AND error_code='' AND response_ciphertext IS NOT NULL
-            ORDER BY created_at DESC LIMIT 1""", (current["id"], current["fingerprint"])).fetchone()
+            WHERE job_id=%s AND fingerprint=%s AND error_code='' AND finished_at IS NOT NULL
+            AND response_ciphertext IS NOT NULL
+            AND (%s<>'application_pending' OR (created_at>=%s AND material_fingerprint=%s))
+            ORDER BY created_at DESC,id DESC LIMIT 1""",
+            (current["id"], current["fingerprint"], current["reason_code"], current["prepared_at"],
+             _hash(material["pack"]))).fetchone()
         if cached:
-            result = facts.validate(api.parse_json(_cipher(settings).decrypt(cached["response_ciphertext"])),
-                                    material["pack"], material["state"]["facts"])
+            try:
+                result = facts.validate(api.parse_json(_cipher(settings).decrypt(cached["response_ciphertext"])),
+                                        material["pack"], material["state"]["facts"])
+            except (KeyError, TypeError, ValueError, InvalidTag):
+                conn.execute("UPDATE creator_importance_jobs SET status='failed',reason_code='invalid_output',"
+                             "finished_at=NOW(),updated_at=NOW() WHERE id=%s", (current["id"],))
+                return None
             _finish_batch(conn, current, material, settings, result)
+            return None
+        if current["reason_code"] == "application_pending":
+            conn.execute("UPDATE creator_importance_jobs SET status='failed',reason_code='receipt_unavailable',"
+                         "finished_at=NOW(),updated_at=NOW() WHERE id=%s", (current["id"],))
             return None
         if current["attempts"] >= 3 or not ai_dispatch.can_claim(conn):
             return None

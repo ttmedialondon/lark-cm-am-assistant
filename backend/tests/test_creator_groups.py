@@ -483,6 +483,67 @@ def test_creator_group_queue_real_authorization_manual_lock_and_billing_fences(p
             "chat_group_classifications", "creator_group_jobs", "creator_group_requests", "ai_feature_configs",
             "contact_roles", "contact_assignments")}
 
+    # A saved provider success survives a local crash, quota pause and a document pause without another request.
+    crashed_id = seed_group('oc_saved_local_recovery')
+    crashed = prepared()
+    assert crashed['id'] == crashed_id
+    before = len(calls)
+    with monkeypatch.context() as interrupted:
+        def local_failure(_):
+            raise RuntimeError('local write interrupted after successful return')
+        interrupted.setattr(matching.ai_dispatch, 'observe_limits', local_failure)
+        with pytest.raises(RuntimeError, match='local write interrupted'):
+            matching.run(crashed, settings)
+    paid = pg.execute('SELECT * FROM creator_group_requests WHERE id=%s', (crashed['reservation_id'],)).fetchone()
+    assert paid['finished_at'] and not paid['error_code'] and paid['response_ciphertext']
+    pg.execute('UPDATE creator_group_requests SET input_tokens=NULL,output_tokens=NULL WHERE id=%s', (paid['id'],))
+    paid = pg.execute('SELECT * FROM creator_group_requests WHERE id=%s', (paid['id'],)).fetchone()
+    pg.execute("UPDATE creator_group_jobs SET lease_until=NOW()-INTERVAL '1 second',attempts=3 WHERE id=%s",
+               (crashed_id,))
+    pg.execute('SAVEPOINT mismatched_group_receipt')
+    pg.execute("UPDATE creator_group_requests SET material_fingerprint='different batch' WHERE id=%s", (paid['id'],))
+    assert matching.claim() is None
+    assert pg.execute('SELECT reason_code FROM creator_group_jobs WHERE id=%s',
+                      (crashed_id,)).fetchone()['reason_code'] == 'request_unknown'
+    pg.execute('ROLLBACK TO SAVEPOINT mismatched_group_receipt')
+    pg.execute('SAVEPOINT invalid_saved_group_receipt')
+    pg.execute('UPDATE creator_group_requests SET response_ciphertext=%s WHERE id=%s',
+               (storage.encrypt('{"purpose":"invalid"}'), paid['id']))
+    malformed = pg.execute('SELECT * FROM creator_group_requests WHERE id=%s', (paid['id'],)).fetchone()
+    assert matching.claim() is None
+    assert pg.execute('SELECT status,reason_code FROM creator_group_jobs WHERE id=%s',
+                      (crashed_id,)).fetchone() == {'status': 'failed', 'reason_code': 'invalid_output'}
+    assert pg.execute('SELECT * FROM creator_group_requests WHERE id=%s', (paid['id'],)).fetchone() == malformed
+    assert pg.execute('SELECT count(*) n FROM creator_group_requests WHERE job_id=%s',
+                      (crashed_id,)).fetchone()['n'] == 1 and len(calls) == before + 1
+    pg.execute('ROLLBACK TO SAVEPOINT invalid_saved_group_receipt')
+    with monkeypatch.context() as quota:
+        quota.setattr(matching.ai_dispatch, 'can_claim', lambda _: False)
+        replay = matching.claim()
+        assert replay and replay['saved_response'] and replay['attempts'] == 3
+        pg.execute('SAVEPOINT revoked_group_replay')
+        pg.execute("UPDATE authorizations SET status='revoked' WHERE id=%s", (owner,))
+        matching.run(replay, settings)
+        assert pg.execute('SELECT * FROM creator_group_requests WHERE id=%s', (paid['id'],)).fetchone() == paid
+        pg.execute('ROLLBACK TO SAVEPOINT revoked_group_replay')
+        save_manual('group-evidence', status='archived')
+        matching.run(replay, settings)
+        assert pg.execute('SELECT * FROM creator_group_requests WHERE id=%s', (paid['id'],)).fetchone() == paid
+        save_manual('group-evidence')
+        assert matching.prepare_next(settings)
+        resumed = matching.claim()
+        assert resumed and resumed['_rules'] == crashed['_rules']
+        matching.run(resumed, settings)
+    assert classification('oc_saved_local_recovery')['source_job_id'] == crashed_id
+    assert pg.execute('SELECT * FROM creator_group_requests WHERE id=%s', (paid['id'],)).fetchone() == paid
+    assert len(calls) == before + 1
+    assert pg.execute('SELECT status,attempts,input_tokens,output_tokens FROM creator_group_jobs WHERE id=%s',
+                      (crashed_id,)).fetchone() == {
+        'status': 'completed', 'attempts': 3, 'input_tokens': 100, 'output_tokens': 50,
+    }
+    assert pg.execute('SELECT count(*) n FROM creator_group_requests WHERE job_id=%s',
+                      (crashed_id,)).fetchone()['n'] == 1
+
     legacy_id = seed_group("oc_legacy_manuals")
     assert matching.prepare_next(settings)
     legacy = pg.execute("SELECT * FROM creator_group_jobs WHERE id=%s", (legacy_id,)).fetchone()

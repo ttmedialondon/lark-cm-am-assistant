@@ -16,6 +16,8 @@ from uuid import UUID
 
 import httpx
 
+RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
 
 class AIInputError(ValueError):
     """An AI request could not safely complete."""
@@ -196,7 +198,7 @@ def _read_response(response, started, *, full_output=False):
             f"AI 服务请求未完成（HTTP {response.status_code}）。",
             retry_after_seconds=_retry_after_header(response),
             is_quota=is_quota,
-            retryable=not is_quota and response.status_code in {408, 429, 500, 502, 503, 504},
+            retryable=not is_quota and response.status_code in RETRYABLE_HTTP_STATUSES,
             telemetry=telemetry,
             provider_diagnostic=provider_diagnostic,
         )

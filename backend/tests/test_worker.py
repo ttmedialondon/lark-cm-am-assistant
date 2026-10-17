@@ -31,8 +31,11 @@ def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg
     signals = []
     summary_signals = []
     identity_signals = []
+    group_signals = []
     monkeypatch.setattr(worker.creator_handle_matching, "touch_chats", lambda _conn, chats, **signal:
                         identity_signals.append((chats, signal)))
+    monkeypatch.setattr(worker.creator_group_matching, "touch_chats", lambda _conn, chats:
+                        group_signals.append(chats))
     monkeypatch.setattr(worker.creator_responsibility_matching, "touch_chats",
                         lambda _conn, _chats, **signal: signals.append(signal))
     monkeypatch.setattr(worker.summary_periods, "touch_chats", lambda _conn, cm, chats, **signal:
@@ -98,6 +101,7 @@ def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg
         'recognition_message_ids': [m['message_id'] for m in messages],
         'newly_readable_message_ids': [m['message_id'] for m in messages],
         'changed_message_ids': [m['message_id'] for m in messages]})]
+    assert group_signals == [[claim.chat_id]]
     assert signals[0]["authorization_id"] == actor and signals[0]["new_scope"]
     assert set(signals[0]["observed_message_ids"]) == {m["message_id"] for m in messages}
     assert pg.execute("SELECT count(*) n FROM authorization_message_observations").fetchone()["n"] == 4
@@ -122,13 +126,20 @@ def test_claimed_ingestion_keeps_identity_evidence_encrypted_and_deduplicates(pg
     hydrated = {**messages[1], "msg_type": "text", "body": {"content": '{"text":"newly readable"}'}}
     history = worker._claim_next_page(job, authorization, config)
     assert history.chat_id == claim.chat_id and history.mode == "backfill"
-    assert worker._record_claimed_page(history, [edited, hydrated], None, cipher, fingerprint_key=b"i" * 32).committed
+    assert worker._record_claimed_page(history, [edited, hydrated], "history-4", cipher,
+                                       fingerprint_key=b"i" * 32).committed
     assert len(signals) == 3 and signals[-1]["message_ids"] == ["om_cm", "om_external"] and not signals[-1]["new_scope"]
     assert signals[-1]["observed_message_ids"] == []
     assert len(summary_signals) == 3 and summary_signals[-1][2]['message_ids'] == ['om_cm', 'om_external']
     assert len(identity_signals) == 3 and identity_signals[-1] == ([claim.chat_id], {
-        'recognition_message_ids': [], 'newly_readable_message_ids': [],
+        'recognition_message_ids': ['om_cm', 'om_external'], 'newly_readable_message_ids': [],
         'changed_message_ids': ['om_cm', 'om_external']})
+    assert group_signals == [[claim.chat_id], [claim.chat_id]]
+    unchanged = worker._claim_next_page(job, authorization, config)
+    assert unchanged.chat_id == claim.chat_id and unchanged.expected_page_token == "history-4"
+    repeated = worker._record_claimed_page(unchanged, [edited, hydrated], None, cipher, fingerprint_key=b"i" * 32)
+    assert repeated.committed and repeated.messages == 0
+    assert len(identity_signals) == 3 and len(group_signals) == 2 and len(summary_signals) == 3
     pg.execute("UPDATE authorization_chats SET sync_enabled=TRUE WHERE chat_id='oc_ingest_3'")
     current = worker._claim_next_page(job, authorization, config)
     pg.execute("UPDATE authorization_chats SET sync_generation=sync_generation+1 WHERE chat_id=%s", (current.chat_id,))
@@ -481,7 +492,7 @@ def test_old_credential_failures_retry_without_revoking_new_login(pg, monkeypatc
     monkeypatch.setattr(worker, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(worker, "_usable_access_token", lambda *_args: "fixture-token")
     settings = SimpleNamespace(sync_lookback_days=0, sync_overlap_seconds=600, sync_interval_seconds=300,
-                               lark_sync_per_authorization_max_inflight=2)
+                               lark_sync_per_authorization_max_inflight=2, member_count_refresh_seconds=86400)
     monkeypatch.setattr(worker, "get_settings", lambda: settings)
     error = worker.LarkApiError(401, 99991668, "Expired fixture token")
     for mode in ("page", "discovery", "unknown_credential", "refresh"):
@@ -537,6 +548,43 @@ def test_old_credential_failures_retry_without_revoking_new_login(pg, monkeypatc
         assert worker._authorization(actor)["status"] == "attention_required"
         assert pg.execute("SELECT status FROM sync_jobs WHERE id=%s", (job_id,)).fetchone()[
             "status"] == "attention_required"
+
+    # A roster request started before a new login may fail after that login has succeeded.
+    actor = uuid4()
+    pg.execute("INSERT INTO authorizations(id,open_id,access_token_ciphertext) "
+               "VALUES(%s,'ou_member_credential','old-member-token')", (actor,))
+    pg.execute("INSERT INTO chats(chat_id) VALUES('oc_member_credential')")
+    pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,member_count,member_count_status,
+        member_count_checked_at,member_snapshot_status,member_snapshot_checked_at)
+        VALUES(%s,'oc_member_credential',3,'succeeded',NOW()-INTERVAL '2 days',
+        'succeeded',NOW()-INTERVAL '2 days')""", (actor,))
+    old_claim = worker.replace(worker._claim_member_snapshot(settings), access_token_ciphertext="old-member-token")
+    assert old_claim.authorization_id == actor and "old-member-token" not in repr(old_claim)
+    previous = pg.execute("SELECT member_count,member_count_status,member_count_checked_at,"
+        "member_snapshot_status,member_snapshot_checked_at FROM authorization_chats WHERE authorization_id=%s",
+        (actor,)).fetchone()
+    pg.execute("UPDATE authorizations SET access_token_ciphertext='new-member-token' WHERE id=%s", (actor,))
+    authorized = worker._authorization(actor)
+
+    def expired_roster(*_args, **_kwargs):
+        raise error
+
+    failed = worker._read_member_snapshot(SimpleNamespace(list_chat_members=expired_roster),
+                                         "old-access", old_claim.chat_id)
+    assert failed.authorization_failed
+    worker._store_claimed_member_snapshot(old_claim, failed)
+    assert worker._authorization(actor) == authorized
+    saved = pg.execute("SELECT * FROM authorization_chats WHERE authorization_id=%s", (actor,)).fetchone()
+    assert {key: saved[key] for key in previous} == previous
+    assert saved["member_snapshot_claim_id"] is None and saved["member_snapshot_retry_at"] is not None
+    current_claim = worker.replace(worker._claim_member_snapshot(settings), access_token_ciphertext="new-member-token")
+    worker._store_claimed_member_snapshot(old_claim, failed)
+    assert pg.execute("SELECT member_snapshot_claim_id FROM authorization_chats WHERE authorization_id=%s",
+                      (actor,)).fetchone()["member_snapshot_claim_id"] == current_claim.claim_id
+    worker._store_claimed_member_snapshot(current_claim, failed)
+    saved = pg.execute("SELECT * FROM authorization_chats WHERE authorization_id=%s", (actor,)).fetchone()
+    assert saved["member_count"] == 3 and saved["member_count_status"] == "unavailable"
+    assert saved["member_snapshot_status"] == "unavailable" and saved["member_snapshot_claim_id"] is None
 
 
 def test_member_snapshot_follows_lark_pagination_and_keeps_member_facts() -> None:
@@ -1465,16 +1513,22 @@ def test_delayed_only_job_yields_its_coordinator_slot(monkeypatch) -> None:
 
 
 def test_member_snapshot_runs_alongside_message_work_with_one_roster_slot(monkeypatch):
-    claim = SimpleNamespace(authorization_id="cm", chat_id="group")
+    claim = worker.MemberSnapshotClaim(UUID(int=1), "group", 7, UUID(int=2))
     monkeypatch.setattr(worker, "_claim_member_snapshot", lambda settings: claim)
-    monkeypatch.setattr(worker, "_authorization", lambda aid: {"status": "active"})
-    monkeypatch.setattr(worker, "_usable_access_token", lambda *args: "token")
+    monkeypatch.setattr(worker, "_authorization", lambda aid: {"status": "active", "access_token_ciphertext": "old"})
+
+    def refresh(_id, authorization, *_args):
+        authorization["access_token_ciphertext"] = "refreshed-member-token"
+        return "token"
+
+    monkeypatch.setattr(worker, "_usable_access_token", refresh)
     submitted = []
     executor = SimpleNamespace(submit=lambda *args: submitted.append(args) or "future")
     settings = SimpleNamespace(oauth_scopes=["im:chat.members:read"])
     members = {}
     worker._schedule_member_snapshot(settings, "client", executor, {"message": "running"}, members)
-    assert members == {"future": claim} and len(submitted) == 1
+    assert members == {"future": worker.replace(claim, access_token_ciphertext="refreshed-member-token")}
+    assert "refreshed-member-token" not in repr(members["future"]) and len(submitted) == 1
     worker._schedule_member_snapshot(settings, "client", executor, {"message": "running"}, members)
     assert len(submitted) == 1
 

@@ -507,7 +507,7 @@ def test_owner_rule_editor_encrypts_overrides_rejects_conflicts_and_live_revocat
             assistant_rules.creator_validate_access(pg, creator_pinned, "identity")
             resumed = pg.execute("SELECT status,desired_version FROM creator_handle_jobs WHERE id=%s",
                                  (paused_jobs["identity"],)).fetchone()
-            assert resumed == {"status": "queued", "desired_version": 2}
+            assert resumed == {"status": "queued", "desired_version": 1}
             for name, state in (("handles", "waiting_evidence"), ("no_text", "waiting_evidence"),
                                 ("running", "running"), ("closed", "completed")):
                 unchanged = pg.execute("SELECT status,desired_version FROM creator_handle_jobs WHERE id=%s",

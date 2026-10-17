@@ -509,8 +509,10 @@ def save_document(conn, settings, actor_id, key_or_none, title, description, kin
         for purpose, stage in (("identity", "match"), ("handles", "handle")):
             required = {"creator-recognition-flow", "creator-admission", *CREATOR_STAGES[stage]}
             if key in required and all(states[name] == "published" for name in required):
-                conn.execute("""UPDATE creator_handle_jobs SET status='queued',reason_code='',
-                    desired_version=desired_version+1,not_before=NOW(),updated_at=NOW()
+                conn.execute("""UPDATE creator_handle_jobs SET
+                    status=CASE WHEN pack_ciphertext IS NOT NULL AND snapshot_version=desired_version
+                      THEN 'ready' ELSE 'queued' END,
+                    not_before=NOW(),updated_at=NOW()
                     WHERE purpose=%s AND status='waiting_evidence' AND reason_code='rules_unavailable'""", (purpose,))
         required = {"creator-recognition-flow", "creator-admission", *CREATOR_STAGES["match"]}
         if key in required and all(states[name] == "published" for name in required):

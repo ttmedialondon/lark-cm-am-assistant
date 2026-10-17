@@ -11,7 +11,7 @@ import pytest
 from cap_fixtures import _snapshot
 from cap_fixtures import pilot as parent_pilot
 
-from app import ai_dispatch, ai_feature_config, config, contact_handles, creator_data, openai_client
+from app import ai_dispatch, ai_feature_config, assistant_rules, config, contact_handles, creator_data, openai_client
 from app import creator_handle_matching as matching
 from app.crypto import message_body_cipher
 
@@ -620,6 +620,94 @@ def test_paid_handle_receipt_survives_inflight_signal_without_another_request(pg
     flow = matching_flow
     flow.enable()
     flow.review = True
+    pg.execute('SAVEPOINT saved_local_recovery')
+    crashed = _prepared_job(pg, flow, source='incremental')
+    with monkeypatch.context() as interrupted:
+        def local_failure(_):
+            raise RuntimeError('local write interrupted after successful return')
+        interrupted.setattr(matching.ai_dispatch, 'observe_limits', local_failure)
+        with pytest.raises(RuntimeError, match='local write interrupted'):
+            matching.run(crashed, flow.settings)
+    paid = pg.execute('SELECT * FROM creator_handle_requests WHERE id=%s',
+                      (crashed['reservation_id'],)).fetchone()
+    assert paid['billed_tokens'] == 150 and not paid['error_code']
+    pg.execute('UPDATE creator_handle_requests SET billed_tokens=NULL,input_tokens=NULL,output_tokens=NULL WHERE id=%s',
+               (paid['id'],))
+    paid = pg.execute('SELECT * FROM creator_handle_requests WHERE id=%s', (paid['id'],)).fetchone()
+    pg.execute("UPDATE creator_handle_jobs SET lease_until=NOW()-INTERVAL '1 second',attempts=3 WHERE id=%s",
+               (crashed['id'],))
+    pg.execute('SAVEPOINT mismatched_receipt')
+    pg.execute("UPDATE creator_handle_requests SET material_fingerprint='different batch' WHERE id=%s", (paid['id'],))
+    assert matching.claim() is None
+    assert pg.execute('SELECT reason_code FROM creator_handle_jobs WHERE id=%s',
+                      (crashed['id'],)).fetchone()['reason_code'] == 'request_unknown'
+    pg.execute('ROLLBACK TO SAVEPOINT mismatched_receipt')
+    pg.execute('SAVEPOINT invalid_saved_receipt')
+    pg.execute('UPDATE creator_handle_requests SET response_ciphertext=%s WHERE id=%s',
+               (creator_data.cipher(flow.settings).encrypt('{"returned":{}}'), paid['id']))
+    malformed = pg.execute('SELECT * FROM creator_handle_requests WHERE id=%s', (paid['id'],)).fetchone()
+    assert matching.claim() is None
+    assert pg.execute('SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s',
+                      (crashed['id'],)).fetchone() == {'status': 'failed', 'reason_code': 'invalid_output'}
+    assert pg.execute('SELECT * FROM creator_handle_requests WHERE id=%s', (paid['id'],)).fetchone() == malformed
+    assert pg.execute('SELECT count(*) n FROM creator_handle_requests WHERE job_id=%s',
+                      (crashed['id'],)).fetchone()['n'] == 1 and len(flow.calls) == 1
+    pg.execute('ROLLBACK TO SAVEPOINT invalid_saved_receipt')
+    with monkeypatch.context() as quota:
+        quota.setattr(matching.ai_dispatch, 'can_claim', lambda _: False)
+        replay = matching.claim()
+        assert replay and replay['attempts'] == 3 and replay['saved_response']
+        pg.execute('SAVEPOINT changed_replay_source')
+        flow.valid = False
+        matching.run(replay, flow.settings)
+        assert pg.execute('SELECT * FROM creator_handle_requests WHERE id=%s', (paid['id'],)).fetchone() == paid
+        pg.execute('ROLLBACK TO SAVEPOINT changed_replay_source')
+        flow.valid = True
+        key = 'creator-handle-link'
+        document = assistant_rules.library(pg, flow.settings)[key]
+        owner = pg.execute("SELECT authorization_id FROM admin_roles WHERE role='owner'").fetchone()['authorization_id']
+
+        def publish(status, revision):
+            assistant_rules.save_document(pg, flow.settings, owner,
+                key, document['title'], document['description'], 'manual', status, 'owner', document['text'], revision)
+
+        for http_status in (400, 503):
+            pg.execute('SAVEPOINT provider_failure_rule_pause')
+            pg.execute("UPDATE creator_handle_jobs SET status='waiting_evidence',reason_code='rules_unavailable',"
+                       "attempts=1,claim_token=NULL,lease_until=NULL WHERE id=%s", (crashed['id'],))
+            pg.execute("UPDATE creator_handle_requests SET error_code=%s,response_ciphertext=NULL WHERE id=%s",
+                       (f'http_{http_status}', paid['id']))
+            publish('archived', document['revision'])
+            publish('published', document['revision'] + 1)
+            with monkeypatch.context() as available:
+                available.setattr(matching.ai_dispatch, 'can_claim', lambda _: True)
+                resumed_error = matching.claim()
+            if http_status == 400:
+                assert resumed_error is None
+                assert pg.execute('SELECT status,reason_code FROM creator_handle_jobs WHERE id=%s',
+                                  (crashed['id'],)).fetchone() == {'status': 'failed', 'reason_code': 'provider_failed'}
+                assert pg.execute('SELECT count(*) n FROM creator_handle_requests WHERE job_id=%s',
+                                  (crashed['id'],)).fetchone()['n'] == 1
+            else:
+                assert resumed_error and resumed_error['attempts'] == 2 and 'saved_response' not in resumed_error
+            assert len(flow.calls) == 1
+            pg.execute('ROLLBACK TO SAVEPOINT provider_failure_rule_pause')
+
+        publish('archived', document['revision'])
+        matching.run(replay, flow.settings)
+        assert pg.execute('SELECT * FROM creator_handle_requests WHERE id=%s', (paid['id'],)).fetchone() == paid
+        publish('published', document['revision'] + 1)
+        resumed = matching.claim()
+        assert resumed and resumed['pack']['_rules'] == crashed['pack']['_rules']
+        matching.run(resumed, flow.settings)
+    restored = pg.execute('SELECT status,attempts,input_tokens,output_tokens FROM creator_handle_jobs WHERE id=%s',
+                          (crashed['id'],)).fetchone()
+    assert restored == {'status': 'review_required', 'attempts': 3, 'input_tokens': 100, 'output_tokens': 50}
+    assert pg.execute('SELECT * FROM creator_handle_requests WHERE id=%s', (paid['id'],)).fetchone() == paid
+    assert pg.execute('SELECT count(*) n FROM creator_handle_requests WHERE job_id=%s',
+                      (crashed['id'],)).fetchone()['n'] == 1 and len(flow.calls) == 1
+    pg.execute('ROLLBACK TO SAVEPOINT saved_local_recovery')
+    flow.calls.clear()
     job = _prepared_job(pg, flow, source='incremental')
     flow.before_response = lambda: _enqueue(pg, flow.contact, source='incremental')
     matching.run(job, flow.settings)

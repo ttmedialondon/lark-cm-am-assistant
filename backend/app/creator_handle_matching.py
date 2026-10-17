@@ -10,6 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from uuid import uuid4
 
+from cryptography.exceptions import InvalidTag
 from psycopg import Rollback
 
 from . import (
@@ -275,15 +276,23 @@ def touch_chats(conn, chat_ids, *, recognition_message_ids=(), newly_readable_me
 
 
 def _recover(conn):
-    # A running request may already have been billed; only unfinished local preparation can restart.
-    conn.execute("""UPDATE creator_handle_jobs SET
-        status=CASE WHEN status='preparing' THEN 'queued' ELSE 'failed' END,
-        reason_code=CASE WHEN status='preparing' THEN 'lease_expired' ELSE 'request_unknown' END,
+    # A committed success resumes local admission; an unfinished request must never be sent twice.
+    conn.execute("""WITH expired AS (
+        SELECT j.id,r.error_code='' AND r.response_ciphertext IS NOT NULL
+          AND r.created_at>=j.prepared_at AS saved
+        FROM creator_handle_jobs j LEFT JOIN LATERAL (
+          SELECT * FROM creator_handle_requests WHERE job_id=j.id
+          ORDER BY created_at DESC,id DESC LIMIT 1) r ON TRUE
+        WHERE j.status IN ('running','preparing') AND j.lease_until<NOW() FOR UPDATE OF j)
+        UPDATE creator_handle_jobs j SET
+        status=CASE WHEN j.status='preparing' THEN 'queued' WHEN expired.saved THEN 'ready' ELSE 'failed' END,
+        reason_code=CASE WHEN j.status='preparing' THEN 'lease_expired'
+          WHEN expired.saved THEN 'application_pending' ELSE 'request_unknown' END,
         claim_token=NULL,lease_until=NULL,not_before=NOW(),updated_at=NOW()
-        WHERE status IN ('running','preparing') AND lease_until<NOW()""")
+        FROM expired WHERE j.id=expired.id""")
     conn.execute("""UPDATE creator_handle_requests r SET error_code='request_unknown'
         FROM creator_handle_jobs j WHERE r.job_id=j.id AND j.reason_code='request_unknown'
-        AND r.error_code='' AND r.billed_tokens IS NULL""")
+        AND r.error_code='' AND r.billed_tokens IS NULL AND r.response_ciphertext IS NULL""")
     conn.execute("""UPDATE creator_handle_jobs j SET status='cancelled',desired_version=desired_version+1,
         reason_code='identity_removed',updated_at=NOW()
         WHERE j.status NOT IN ('completed','failed','cancelled') AND (
@@ -708,8 +717,9 @@ def _apply_result(conn, job, pack, result, stats, refs, settings):
 def claim():
     with connection() as conn, conn.transaction():
         config = _config(conn, lock=True)
-        if not _enabled(config) or not ai_dispatch.can_claim(conn):
+        if not _enabled(config):
             return None
+        can_send = ai_dispatch.can_claim(conn)
         _recover(conn)
         # Four increments followed by an available history item; persisted across worker restarts.
         recent = conn.execute("""SELECT j.source FROM creator_handle_requests r
@@ -717,7 +727,8 @@ def claim():
         history_turn = len(recent) == 4 and all(r["source"] != "history" for r in recent)
         job = conn.execute(
             """SELECT * FROM creator_handle_jobs WHERE status IN ('ready','retry_wait')
-            AND not_before<=NOW() AND attempts<3 ORDER BY
+            AND not_before<=NOW() AND (attempts<3 OR reason_code IN ('application_pending','rules_unavailable'))
+            ORDER BY
               CASE WHEN source='history' THEN %s ELSE %s END,not_before,created_at,id
               FOR UPDATE SKIP LOCKED LIMIT 1""",
             (0 if history_turn else 1, 1 if history_turn else 0),
@@ -744,23 +755,60 @@ def claim():
         if _confirmation_changed(conn, job, pack):
             _invalidate(conn, job)
             return None
+        receipt = conn.execute("""SELECT * FROM creator_handle_requests WHERE job_id=%s
+            AND created_at>=%s ORDER BY created_at DESC,id DESC LIMIT 1""",
+            (job['id'], job['prepared_at'])).fetchone() if job['reason_code'] in {
+                'application_pending', 'rules_unavailable'} else None
+        saved = bool(receipt and receipt['error_code'] == '' and receipt['response_ciphertext']
+                     and receipt['material_fingerprint'] == evidence_hash(pack)
+                     and receipt['config_fingerprint'] == job['config_fingerprint'])
+        if (job['reason_code'] == 'application_pending' and not saved
+                or receipt and receipt['error_code'] == 'request_unknown'):
+            conn.execute("UPDATE creator_handle_jobs SET status='failed',reason_code='request_unknown',"
+                         "updated_at=NOW() WHERE id=%s", (job['id'],))
+            return None
+        blocked_error = (receipt and receipt['error_code'] and job['reason_code'] == 'rules_unavailable'
+                         and receipt['error_code'] not in {'not_sent'} | {
+                             f'http_{status}' for status in api.RETRYABLE_HTTP_STATUSES})
+        if not saved and (job['attempts'] >= 3 or blocked_error):
+            reason = ('invalid_output' if receipt and receipt['error_code'] in OUTPUT_ERRORS | {'invalid_output'}
+                      else 'provider_failed')
+            conn.execute("UPDATE creator_handle_jobs SET status='failed',reason_code=%s,"
+                         "updated_at=NOW() WHERE id=%s", (reason, job['id']))
+            return None
+        if not saved and not can_send:
+            return None
+        if saved:
+            try:
+                result = evidence.validate(pack, json.loads(storage.decrypt(
+                    receipt['response_ciphertext']))['validated'])
+            except (KeyError, TypeError, ValueError, InvalidTag):
+                conn.execute("UPDATE creator_handle_jobs SET status='failed',reason_code='invalid_output',"
+                             "updated_at=NOW() WHERE id=%s", (job['id'],))
+                return None
+            if not evidence.still_valid(conn, job['refs'], get_settings()):
+                _invalidate(conn, job)
+                return None
         reservation = uuid4()
-        conn.execute(
-            "INSERT INTO creator_handle_requests(id,job_id,material_fingerprint,config_fingerprint) "
-            "VALUES(%s,%s,%s,%s)",
-            (reservation, job["id"], evidence_hash(pack), job['config_fingerprint']),
-        )
+        if not saved:
+            conn.execute(
+                "INSERT INTO creator_handle_requests(id,job_id,material_fingerprint,config_fingerprint) "
+                "VALUES(%s,%s,%s,%s)",
+                (reservation, job["id"], evidence_hash(pack), job['config_fingerprint']),
+            )
         token = uuid4()
         conn.execute(
             """UPDATE creator_handle_jobs SET status='running',claim_token=%s,
-            lease_until=NOW()+(%s*INTERVAL '1 second'),attempts=attempts+1,updated_at=NOW() WHERE id=%s""",
-            (token, LEASE_SECONDS, job["id"]),
+            lease_until=NOW()+(%s*INTERVAL '1 second'),attempts=attempts+%s,updated_at=NOW() WHERE id=%s""",
+            (token, LEASE_SECONDS, 0 if saved else 1, job["id"]),
         )
         return {
             **job,
             "claim_token": token,
-            "attempts": job["attempts"] + 1,
-            "reservation_id": reservation,
+            "attempts": job["attempts"] + (0 if saved else 1),
+            "reservation_id": receipt['id'] if saved else reservation,
+            **({'saved_response': (result, {'response_id': receipt['response_id'],
+                                          'openai_request_id': receipt['request_id']})} if saved else {}),
             "config": config,
             "pack": pack,
         }
@@ -917,36 +965,43 @@ def run(job, settings):
         current = _current(conn, job)
         if not current:
             # No network call was started: reservation can be safely released.
-            conn.execute("UPDATE creator_handle_requests SET billed_tokens=0 WHERE id=%s", (job["reservation_id"],))
+            if 'saved_response' not in job:
+                conn.execute("UPDATE creator_handle_requests SET billed_tokens=0 WHERE id=%s", (job["reservation_id"],))
             return
         if not evidence.still_valid(conn, current["refs"], settings):
             _invalidate(conn, current)
-            conn.execute("UPDATE creator_handle_requests SET billed_tokens=0 WHERE id=%s", (job["reservation_id"],))
+            if 'saved_response' not in job:
+                conn.execute("UPDATE creator_handle_requests SET billed_tokens=0 WHERE id=%s", (job["reservation_id"],))
             return
     result, telemetry, error, diagnostic = None, {}, None, None
+    if 'saved_response' in job:
+        result, telemetry = job['saved_response']
     try:
-        result, telemetry, error, diagnostic = review(job["pack"], job["config"], job["contact_id"], settings)
+        if 'saved_response' not in job:
+            result, telemetry, error, diagnostic = review(job["pack"], job["config"], job["contact_id"], settings)
     except Exception as exc:
         error = exc
         telemetry = getattr(exc, "telemetry", {}) or telemetry
-    with connection() as conn, conn.transaction():
-        # Same lock order as settings saves: config, then jobs.
-        _config(conn, lock=True)
-        record_response(conn, job["reservation_id"], job["pack"], telemetry, error, diagnostic, settings)
-        usage = telemetry.get("usage", {})
-        input_tokens = int(usage.get("input_tokens", telemetry.get("input_tokens", 0)) or 0)
-        output_tokens = int(usage.get("output_tokens", telemetry.get("output_tokens", 0)) or 0)
-        if usage.get("input_tokens") is not None and usage.get("output_tokens") is not None:
+    if 'saved_response' not in job:
+        with connection() as conn, conn.transaction():
+            # Same lock order as settings saves: config, then jobs.
+            _config(conn, lock=True)
+            record_response(conn, job["reservation_id"], job["pack"], telemetry, error, diagnostic, settings)
+            usage = telemetry.get("usage", {})
+            input_tokens = int(usage.get("input_tokens", telemetry.get("input_tokens", 0)) or 0)
+            output_tokens = int(usage.get("output_tokens", telemetry.get("output_tokens", 0)) or 0)
+            if usage.get("input_tokens") is not None and usage.get("output_tokens") is not None:
+                conn.execute(
+                    "UPDATE creator_handle_requests SET billed_tokens=%s WHERE id=%s",
+                    (input_tokens + output_tokens, job["reservation_id"]),
+                )
             conn.execute(
-                "UPDATE creator_handle_requests SET billed_tokens=%s WHERE id=%s",
-                (input_tokens + output_tokens, job["reservation_id"]),
+                "UPDATE creator_handle_jobs SET input_tokens=input_tokens+%s,output_tokens=output_tokens+%s "
+                "WHERE id=%s",
+                (input_tokens, output_tokens, job["id"]),
             )
-        conn.execute(
-            "UPDATE creator_handle_jobs SET input_tokens=input_tokens+%s,output_tokens=output_tokens+%s WHERE id=%s",
-            (input_tokens, output_tokens, job["id"]),
-        )
-    # Commit actual usage before admission or source/authorization queries can fail.
-    ai_dispatch.observe_limits(telemetry)
+        # Commit actual usage before admission or source/authorization queries can fail.
+        ai_dispatch.observe_limits(telemetry)
     delay = (api.retry_delay(error.retry_after_seconds, job["attempts"])
              if isinstance(error, api.OpenAIRequestError) and error.retryable else 0)
     if isinstance(error, api.OpenAIRequestError):

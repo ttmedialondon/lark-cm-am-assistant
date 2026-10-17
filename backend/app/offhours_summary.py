@@ -692,8 +692,7 @@ def _load_chat(conn, run, chat_id, cutoff, *, settings=None, roster=None, relate
     history_start = chat["backfill_window_start_at"]
     complete = bool(
         chat["backfill_complete"]
-        and history_start
-        and history_start <= run["window_start"] - timedelta(days=7)
+        and (history_start is None or history_start <= run["window_start"] - timedelta(days=7))
         and watermark >= cutoff
         and chat["sync_status"] == "succeeded"
         and not incomplete

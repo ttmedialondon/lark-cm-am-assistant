@@ -337,6 +337,18 @@ def test_reply_and_resolution_remain_independent_through_context_and_merge(monke
         messages=[broadcast, reply, {**broadcast, "ref": "S", "message_id": "staff-answer",
                                      "text": "I'll check that campaign for you"}])
     assert summary_dialogues.segments(material)[0]["pack"]["core_refs"] == ["R.0", "S.0"]
+    independent = [{**reply, "ref": f"O{i}", "message_id": f"order-{i}",
+                    "text": f"Please check unrelated order ORDER-{i:03d}", "parent_message_id": None}
+                   for i in range(32)]
+    material["pack"].update(is_private=True, messages=independent)
+    material["refs"] = {message["ref"]: {} for message in independent}
+    chunks = summary_dialogues.segments(material)
+    assert len(chunks) == 2
+    assert sum(len(chunk["pack"]["core_refs"]) for chunk in chunks) == len(independent)
+    for chunk in chunks:
+        assert len(chunk["pack"]["core_refs"]) <= ai.MAX_EVENTS
+        assert len(ai._validate(json.dumps({"events": [sample_event(evidence_refs=[ref], handle=None)
+            for ref in chunk["pack"]["core_refs"]]}), chunk)) == len(chunk["pack"]["core_refs"])
 
 
 @pytest.fixture
@@ -976,6 +988,15 @@ def test_open_window_watermark_refresh_does_not_invalidate_identical_pack(pg, se
     after = ai._load_chat(pg, job, "chat", job["cutoff"], settings=s.settings)
     assert before["fingerprint"] == after["fingerprint"]
     assert not after["history_complete"]
+    pg.execute("SAVEPOINT complete_unbounded_history")
+    pg.execute("UPDATE authorization_chats SET backfill_window_start_at=NULL,last_backfill_at=%s",
+               (job["cutoff"],))
+    closed = {**job, "window_end": job["cutoff"]}
+    complete = ai._load_chat(pg, closed, "chat", job["cutoff"], settings=s.settings)
+    assert complete["synced"] and complete["history_complete"] and complete["pack"]["context_complete"]
+    pg.execute("UPDATE authorization_chats SET backfill_complete=FALSE")
+    assert not ai._load_chat(pg, closed, "chat", job["cutoff"], settings=s.settings)["history_complete"]
+    pg.execute("ROLLBACK TO SAVEPOINT complete_unbounded_history")
 
 
 
@@ -2094,6 +2115,12 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
         saved_receipt(*args, **kwargs)
         if kwargs.get('received'):
             if not crashed:
+                stored = pg.execute("SELECT checkpoint_ciphertext FROM offhours_summary_tasks WHERE id=%s",
+                                    (args[0]["id"],)).fetchone()
+                legacy = summary_dialogues.decode(stored["checkpoint_ciphertext"], s.settings)
+                assert legacy.pop("chunk_messages") == summary_dialogues.CHUNK_MESSAGES
+                pg.execute("UPDATE offhours_summary_tasks SET checkpoint_ciphertext=%s WHERE id=%s",
+                           (summary_dialogues.encode(legacy, s.settings), args[0]["id"]))
                 crashed = True
                 raise SystemExit('fixture interrupted after durable response')
             if not local_failed:
@@ -2147,6 +2174,10 @@ def test_full_shift_chunks_resume_filter_speakers_merge_and_recheck_access(pg, s
     assert saved_run["event_rules_digest"] == pinned_rules["digest"]
     assert summary_dialogues.decode(saved_run["event_rules_ciphertext"], s.settings) == pinned_rules
     assert pinned_rules["documents"]["event-extraction"]["text"] not in saved_run["event_rules_ciphertext"]
+    # Simulate tasks already pinned to the pre-upgrade batch size; their paid response must still replay.
+    pg.execute("UPDATE offhours_summary_tasks SET checkpoint_ciphertext=%s WHERE run_id=%s AND chat_id IS NOT NULL",
+               (summary_dialogues.encode({"chunk_messages": summary_dialogues.CHUNK_MESSAGES}, s.settings),
+                saved_run["id"]))
     with pg.transaction(force_rollback=True):
         old_job = ai.claim_next_summary()
         newer_lease = old_job['lease_until'] + timedelta(seconds=1)

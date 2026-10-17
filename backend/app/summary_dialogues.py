@@ -89,7 +89,8 @@ def parts(evidence, user):
     return messages, refs
 
 
-def segments(evidence):
+def segments(evidence, *, message_limit=None):
+    message_limit = message_limit or min(CHUNK_MESSAGES, core.MAX_EVENTS)
     result = []
     for user in evidence["users"]:
         selected = evidence.get("selected_contact_ids")
@@ -101,7 +102,7 @@ def segments(evidence):
         batches, batch, size = [], [], 0
         for m in current:
             length = len(json.dumps(m, ensure_ascii=False))
-            if batch and (len(batch) >= CHUNK_MESSAGES or size + length > CHUNK_CHARS):
+            if batch and (len(batch) >= message_limit or size + length > CHUNK_CHARS):
                 batches.append(batch)
                 batch, size = [], 0
             batch.append(m)
@@ -696,17 +697,23 @@ quote_a_ref 来自所选候选，quote_b_ref 来自 candidate，状态和其他�
 
 
 def step(job, settings):
+    checkpoint = decode(job.get("checkpoint_ciphertext"), settings) or {}
     with core.connection() as conn, conn.transaction():
         cfg = core._config(conn, core.run_feature(job))
         instructions = _event_instructions(job, settings, "extract" if job["chat_id"] else "merge")
         if job["chat_id"]:
             data = checked_chat(conn, job, settings)
-            chunks = segments(data)
+            # Paid legacy batches keep their original size; only fresh tasks adopt the event capacity.
+            limit = checkpoint.get("chunk_messages", CHUNK_MESSAGES if any(checkpoint.get(key)
+                for key in ("chunks", "receipts", "provider_call", "response_received"))
+                else min(CHUNK_MESSAGES, core.MAX_EVENTS))
+            chunks = segments(data, message_limit=limit)
+            if chunks:
+                checkpoint.setdefault("chunk_messages", limit)
         else:
             core._current(conn, job)
             run = conn.execute("SELECT * FROM offhours_summary_runs WHERE id=%s", (job["run_id"],)).fetchone()
             source_events, person = merge_input(conn, run, job, settings)
-    checkpoint = decode(job.get("checkpoint_ciphertext"), settings) or {}
     response = None
     if job["chat_id"]:
         completed = checkpoint.setdefault("chunks", {})

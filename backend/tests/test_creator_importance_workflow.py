@@ -632,6 +632,55 @@ def test_paid_retry_cache_and_stale_results_keep_billing_without_repeat(pg, rank
         pytest.fail("no payable batch was prepared")
 
     first = prepared()
+    pg.execute("SAVEPOINT paid_local_interruption")
+    calls = len(flow.calls)
+
+    def fail_local_save(*_args, **_kwargs):
+        raise RuntimeError("synthetic local save interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(importance, "_finish_batch", fail_local_save)
+        with pytest.raises(RuntimeError, match="local save interrupted"):
+            importance.run(first, flow.settings)
+    paid = pg.execute("SELECT * FROM creator_importance_requests WHERE id=%s",
+                      (first["reservation_id"],)).fetchone()
+    assert paid["finished_at"] and paid["response_ciphertext"] and not paid["error_code"]
+    requests = pg.execute("SELECT count(*) n FROM creator_importance_requests").fetchone()["n"]
+    pg.execute("UPDATE creator_importance_jobs SET lease_until=NOW()-INTERVAL '1 second',attempts=3 WHERE id=%s",
+               (first["id"],))
+    importance._recover(pg)
+    assert pg.execute("SELECT status,reason_code FROM creator_importance_jobs WHERE id=%s",
+                      (first["id"],)).fetchone() == {"status": "ready", "reason_code": "application_pending"}
+    pg.execute("SAVEPOINT mismatched_saved_receipt")
+    pg.execute("UPDATE creator_importance_requests SET material_fingerprint='different batch' WHERE id=%s",
+               (first["reservation_id"],))
+    assert importance.claim() is None and len(flow.calls) == calls + 1
+    assert pg.execute("SELECT status,reason_code FROM creator_importance_jobs WHERE id=%s",
+                      (first["id"],)).fetchone() == {"status": "failed", "reason_code": "receipt_unavailable"}
+    pg.execute("ROLLBACK TO SAVEPOINT mismatched_saved_receipt")
+    pg.execute("SAVEPOINT malformed_saved_receipt")
+    pg.execute("UPDATE creator_importance_requests SET response_ciphertext=%s WHERE id=%s",
+               (importance._cipher(flow.settings).encrypt('{"facts":"bad"}'), first["reservation_id"]))
+    malformed = pg.execute("SELECT * FROM creator_importance_requests WHERE id=%s",
+                           (first["reservation_id"],)).fetchone()
+    assert importance.claim() is None and len(flow.calls) == calls + 1
+    assert pg.execute("SELECT status,reason_code FROM creator_importance_jobs WHERE id=%s",
+                      (first["id"],)).fetchone() == {"status": "failed", "reason_code": "invalid_output"}
+    assert pg.execute("SELECT * FROM creator_importance_requests WHERE id=%s",
+                      (first["reservation_id"],)).fetchone() == malformed
+    assert pg.execute("SELECT count(*) n FROM creator_importance_requests").fetchone()["n"] == requests
+    pg.execute("ROLLBACK TO SAVEPOINT malformed_saved_receipt")
+    with monkeypatch.context() as patch:
+        patch.setattr(importance.ai_dispatch, "can_claim", lambda *_args: pytest.fail("local replay used admission"))
+        assert importance.claim() is None
+    assert pg.execute("SELECT status FROM creator_importance_jobs WHERE id=%s",
+                      (first["id"],)).fetchone()["status"] in {"queued", "completed"}
+    assert pg.execute("SELECT * FROM creator_importance_requests WHERE id=%s",
+                      (first["reservation_id"],)).fetchone() == paid
+    assert pg.execute("SELECT count(*) n FROM creator_importance_requests").fetchone()["n"] == requests
+    assert len(flow.calls) == calls + 1
+    pg.execute("ROLLBACK TO SAVEPOINT paid_local_interruption")
+    del flow.calls[calls:]
     flow.error = openai_client.OpenAIRequestError(
         "synthetic 503", retryable=True, telemetry={"http_status": 503, "usage": {"input_tokens": 2},
             "provider_error": {"code": "server_is_overloaded", "type": "server_error"}}

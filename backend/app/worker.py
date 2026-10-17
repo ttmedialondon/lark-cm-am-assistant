@@ -9,7 +9,7 @@ import uuid
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -100,6 +100,7 @@ class MemberSnapshotMeasurement:
     checked_at: datetime | None
     members: tuple[dict[str, Any], ...] = ()
     retry_after_seconds: int | None = None
+    authorization_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,7 @@ class MemberSnapshotClaim:
     chat_id: str
     generation: int
     claim_id: uuid.UUID
+    access_token_ciphertext: str | None = field(default=None, repr=False)
 
 
 def run_forever() -> None:
@@ -915,6 +917,7 @@ def _schedule_member_snapshot(
     except LarkApiError:
         _release_member_snapshot_claim(claim, "pending")
         return
+    claim = replace(claim, access_token_ciphertext=authorization["access_token_ciphertext"])
     member_futures[executor.submit(_read_member_snapshot, client, access_token, claim.chat_id)] = claim
 
 
@@ -995,6 +998,19 @@ def _reap_member_futures(
 def _store_claimed_member_snapshot(claim: MemberSnapshotClaim, measurement: MemberSnapshotMeasurement) -> None:
     with connection() as conn, conn.transaction():
         lock_sync_material(conn)
+        if measurement.authorization_failed:
+            authorization = conn.execute(
+                "SELECT access_token_ciphertext FROM authorizations WHERE id=%s FOR SHARE",
+                (claim.authorization_id,),
+            ).fetchone()
+            if not authorization or authorization["access_token_ciphertext"] != claim.access_token_ciphertext:
+                # A late old-token failure must not replace the new login's saved roster facts.
+                conn.execute("""UPDATE authorization_chats SET member_snapshot_retry_at=NOW(),
+                    member_snapshot_claim_id=NULL,member_snapshot_claimed_at=NULL,member_snapshot_lease_until=NULL
+                    WHERE authorization_id=%s AND chat_id=%s AND sync_generation=%s
+                      AND member_snapshot_claim_id=%s""",
+                    (claim.authorization_id, claim.chat_id, claim.generation, claim.claim_id))
+                return
         row = conn.execute(
             """
             SELECT member_snapshot_checked_at
@@ -1603,8 +1619,10 @@ def _read_member_snapshot(client: LarkClient, access_token: str, chat_id: str) -
                 snapshot_status="pending",
                 checked_at=None,
                 retry_after_seconds=exc.retry_after if exc.retry_after is not None else 300,
+                authorization_failed=exc.likely_auth_problem,
             )
-        return MemberSnapshotMeasurement(None, status, status, checked_at)
+        return MemberSnapshotMeasurement(None, status, status, checked_at,
+                                         authorization_failed=exc.likely_auth_problem)
 
     unique_members = {member["open_id"]: member for member in members}
     total = reported_total if reported_total is not None else len(unique_members) if unique_members else None
@@ -2577,9 +2595,9 @@ def _record_claimed_page(
                     current_claim["backfill_window_start_at"], current_claim["backfill_window_start_at"])).fetchone())
         if changed or observed:
             creator_handle_matching.touch_chats(conn, [claim.chat_id],
-                recognition_message_ids=[m['message_id'] for m in messages if m.get('message_id')] if inserted else [],
+                recognition_message_ids=changed,
                 newly_readable_message_ids=observed, changed_message_ids=changed)
-        if inserted:
+        if changed:
             creator_group_matching.touch_chats(conn, [claim.chat_id])
         if changed or observed:
             creator_responsibility_matching.touch_chats(conn, [claim.chat_id],
