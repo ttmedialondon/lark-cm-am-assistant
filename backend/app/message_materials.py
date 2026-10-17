@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from cryptography.exceptions import InvalidTag
 from psycopg.errors import DeadlockDetected, SerializationFailure
@@ -137,6 +137,20 @@ def attach(conn, actor_id, cm_id, rows, settings, *, feature='operations_assista
             raw = body_cipher.decrypt(row['body_ciphertext'])
         except (ValueError, UnicodeError, InvalidTag):
             continue
+        if feature == 'operations_assistant':
+            if kind in {'share_user', 'share_chat'}:
+                continue
+            local = message_material.text_material(raw, kind)
+            if kind in {'image', 'file'}:
+                local = {'text': '', 'notes': ['本次仅查询文字，未读取附件']}
+            elif message_material.resource_refs(raw, kind):
+                local['notes'].append('本次仅查询文字，未读取附件')
+            if kind == 'post':
+                if local['notes']:
+                    row['_material'] = {'text': '', 'notes': local['notes'], 'complete': False}
+            else:
+                row['_material'] = {**local, 'complete': bool(local['text']) and not local['notes']}
+            continue
         if needs_material(raw, kind):
             pair = (row['chat_id'], row['message_id'])
             row['_material'] = _waiting(kind)
@@ -164,6 +178,29 @@ def attach(conn, actor_id, cm_id, rows, settings, *, feature='operations_assista
     if not valid:
         return {'pending_ids': [], 'rows': rows}
     cached, configs = _cached(conn, cm, valid), _configs(conn)
+    if enqueue and feature == 'offhours_summary' and _enabled(configs.get(feature)):
+        for job in cached.values():
+            if job['feature'] != 'operations_assistant':
+                continue
+            previous = conn.execute("SELECT * FROM message_material_jobs WHERE id=%s "
+                "AND feature='operations_assistant' AND (status='queued' OR "
+                "(status='cancelled' AND error_code='text_only')) FOR UPDATE", (job['id'],)).fetchone()
+            if not previous:
+                continue
+            try:
+                checkpoint = _decode(previous['checkpoint_ciphertext'], settings)
+                if not isinstance(checkpoint, dict) or checkpoint.get('in_flight') and not checkpoint.get('received'):
+                    continue
+            except (ValueError, UnicodeError, InvalidTag):
+                continue
+            current = conn.execute("UPDATE message_material_jobs SET feature=%s,actor_id=%s,status='queued',"
+                "error_code=NULL,finished_at=NULL,lease_until=NULL,scheduled_at=NOW(),updated_at=NOW() "
+                "WHERE id=%s RETURNING *", (feature, actor_id, job['id'])).fetchone()
+            job.update(current, actor_valid=True)
+            conn.execute("INSERT INTO audit_events(id,authorization_id,action,metadata) VALUES(%s,%s,%s,%s::jsonb)",
+                (uuid4(), actor_id, 'message_material_feature_transferred', json.dumps({
+                    'job_id': str(job['id']), 'from': previous['feature'], 'to': feature,
+                    'previous_actor_id': str(previous['actor_id']), 'previous_usage': previous['usage']})))
     missing = [{**item, 'id': str(uuid4())} for item in valid if (item['chat_id'], item['message_id']) not in cached]
     if enqueue and missing and _enabled(configs.get(feature)):
         conn.execute("""INSERT INTO message_material_jobs(id,actor_id,cm_id,feature,chat_id,message_id,
@@ -190,28 +227,14 @@ def attach(conn, actor_id, cm_id, rows, settings, *, feature='operations_assista
                 row['_material']['notes'] = [_REASONS.get(job['error_code'], _REASONS['resource_failed'])]
         elif job and not job['actor_valid']:
             row['_material']['notes'] = [_REASONS['source_changed']]
+        elif job and job['feature'] == 'operations_assistant':
+            row['_material']['notes'] = ['原附件解析已停止，未自动重复调用']
         elif job and _enabled(configs.get(job['feature'])):
             if enqueue:
                 pending_ids.append(str(job['id']))
         else:
             row['_material']['notes'] = ['附件解析暂未启用' if not _enabled(configs.get(feature)) else '附件尚未解析']
     return {'pending_ids': sorted(set(pending_ids)), 'rows': rows}
-
-
-def pending(conn, actor, cm, ids):
-    if not ids:
-        return False
-    account = _authorize(conn, actor, cm)
-    jobs = conn.execute("SELECT j.* FROM message_material_jobs j JOIN ai_feature_configs c ON c.feature=j.feature "
-        "JOIN authorizations a ON a.id=j.actor_id "
-        "WHERE j.id=ANY(%s::uuid[]) AND j.cm_id=%s AND j.consent_at=%s AND j.status IN ('queued','running') "
-        "AND c.enabled AND c.provider='openai' AND c.api_key_ciphertext IS NOT NULL AND a.status='active' "
-        "AND (j.actor_id=j.cm_id OR EXISTS(SELECT 1 FROM admin_roles ar "
-        "WHERE ar.authorization_id=j.actor_id AND ar.role='owner' AND ar.is_active))",
-        ([UUID(str(value)) for value in ids], account['id'], account['body_consent_at'])).fetchall()
-    sources = _sources(conn, account['id'], jobs)
-    return any((job['chat_id'], job['message_id']) in sources and
-        _version(sources[(job['chat_id'], job['message_id'])]) == job['source_version'] for job in jobs)
 
 
 def _recover(conn, settings):
@@ -250,7 +273,8 @@ def claim():
             "SELECT 1 FROM message_material_jobs WHERE status='running' LIMIT 1").fetchone():
             return None
         candidate = conn.execute("""SELECT j.* FROM message_material_jobs j JOIN ai_feature_configs c
-            ON c.feature=j.feature WHERE j.status='queued' AND j.scheduled_at<=NOW() AND c.enabled
+            ON c.feature=j.feature WHERE j.feature='offhours_summary' AND j.status='queued'
+            AND j.scheduled_at<=NOW() AND c.enabled
             AND c.provider='openai' AND c.api_key_ciphertext IS NOT NULL
             ORDER BY j.scheduled_at,j.created_at,j.id LIMIT 1""").fetchone()
         if not candidate:

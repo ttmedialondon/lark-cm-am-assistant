@@ -40,7 +40,8 @@ def material(conn, actor_id, context, source, settings, *, cutoff=None, read_cac
         scope = data["scope"]
     else:
         data = summary_replies.collect(conn, actor_id, source["source"], settings,
-                                       require_unresolved=False, cutoff=cutoff)
+                                       require_unresolved=False, cutoff=cutoff,
+                                       feature=summaries.ASSISTANT_FEATURE)
         event = data["event"]
         chats = {item.get("chat_id") for item in event.get("evidence", []) if item.get("chat_id")}
         available = [item for item in data["messages"] if not chats or item["chat_id"] in chats]

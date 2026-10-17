@@ -111,6 +111,7 @@ def collect(conn, actor_id, event_id, settings, *, require_unresolved=True, cuto
 
 def _collect(conn, actor_id, event_id, settings, selected, *, cutoff=None, feature=None):
     task, run, cm, person, chats, event, roster = selected
+    feature = feature or core.run_feature(run)
     now = cutoff or datetime.now(UTC)
     if isinstance(now, str):
         now = datetime.fromisoformat(now)
@@ -158,7 +159,7 @@ def _collect(conn, actor_id, event_id, settings, selected, *, cutoff=None, featu
             chat["chat_mode"] == "p2p" or chat.get("unique_contact_id") == task["contact_id"])
         from . import message_materials
         message_materials.attach(conn, actor_id, cm['id'], [m['row'] for m in selected], settings,
-                                 feature=feature or core.run_feature(run))
+                                 feature=feature)
         for message in selected:
             row = message["row"]
             own = row["sender_open_id"] in opens
@@ -184,6 +185,16 @@ def _collect(conn, actor_id, event_id, settings, selected, *, cutoff=None, featu
     messages.sort(key=lambda m: (m["time"], m["chat_id"], m["message_id"], m["part"]))
     for i, message in enumerate(messages):
         message["ref"] = f"R{i + 1}"
+    if feature == core.ASSISTANT_FEATURE:
+        current = {}
+        for message in messages:
+            current.setdefault((message["chat_id"], message["message_id"]), []).append(message)
+        event = {**event}
+        for field in ("evidence", "handling_evidence", "reply_evidence", "waiting_evidence"):
+            event[field] = [{**item, "text": "".join(part["text"] for part in current[pair]),
+                "unavailable_or_truncated": any(part["unavailable"] for part in current[pair])}
+                for item in event.get(field, [])
+                if (pair := (item.get("chat_id"), item.get("message_id"))) in current]
     # Actual messages and access scope determine staleness, not the clock ticking.
     fingerprint = core._hash([event_id, person, messages, sorted(scopes), sorted(gaps)])
     return {
@@ -199,16 +210,16 @@ def _collect(conn, actor_id, event_id, settings, selected, *, cutoff=None, featu
     }
 
 
-def read_event_context(conn, actor_id, event_id, settings, *, mode="period", cutoff=None):
+def read_event_context(conn, actor_id, event_id, settings, *, mode="period", cutoff=None, feature=None):
     if mode not in ("period", "latest"):
         raise core.SummaryInputError("请选择原时段或最新进展。")
-    selected = source(conn, actor_id, event_id, settings, require_unresolved=False)
-    task, run, _, _, _, event, _ = selected
+    selected = source(conn, actor_id, event_id, settings, require_unresolved=False, feature=feature)
+    task, run, *_ = selected
     data = _collect(conn, actor_id, event_id, settings, selected,
-                    cutoff=task["cutoff"] if mode == "period" else cutoff)
+                    cutoff=task["cutoff"] if mode == "period" else cutoff, feature=feature)
     data.update(event_ref=event_id, version=task["input_fingerprint"], mode=mode,
                 original_window={"start": run["window_start"].isoformat(), "end": task["cutoff"].isoformat()},
-                original_evidence=event["evidence"], messages_are_candidates=mode == "latest")
+                original_evidence=data["event"]["evidence"], messages_are_candidates=mode == "latest")
     return data
 
 

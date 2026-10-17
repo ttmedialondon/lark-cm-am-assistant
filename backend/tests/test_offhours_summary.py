@@ -3047,7 +3047,7 @@ def test_message_material_cache_rechecks_access_and_recovers_one_paid_receipt(pg
     monkeypatch.setattr(materials, "connection", lambda: nullcontext(pg))
     monkeypatch.setattr(materials, "get_settings", lambda: s.settings)
     monkeypatch.setattr(worker, "_usable_access_token", lambda *_args: "synthetic-user-token")
-    save_feature_config(pg, api_key_cipher(s.settings.token_encryption_key), ai.ASSISTANT_FEATURE,
+    save_feature_config(pg, api_key_cipher(s.settings.token_encryption_key), ai.FEATURE,
         provider="openai", project_id="attachment-test", model="attachment-model", enabled=True,
         api_key="synthetic-attachment-key", updated_by_authorization_id=s.ids["owner"])
     image = io.BytesIO()
@@ -3081,7 +3081,8 @@ def test_message_material_cache_rechecks_access_and_recovers_one_paid_receipt(pg
                    (s.cipher.encrypt(json.dumps({"image_key": "img_" + message_id})), message_id))
         row = materials._sources(pg, s.ids["cm"], [{"chat_id": "chat", "message_id": message_id}])[
             ("chat", message_id)]
-        result = materials.attach(pg, actor or s.ids["cm"], s.ids["cm"], [row], s.settings, enqueue=True)
+        result = materials.attach(pg, actor or s.ids["cm"], s.ids["cm"], [row], s.settings,
+                                  feature=ai.FEATURE, enqueue=True)
         assert len(result["pending_ids"]) == 1
         return row, UUID(result["pending_ids"][0])
 
@@ -3100,19 +3101,23 @@ def test_message_material_cache_rechecks_access_and_recovers_one_paid_receipt(pg
     assert pg.execute(
         "SELECT status FROM message_material_jobs WHERE id=%s", (first_id,)
     ).fetchone()["status"] == "succeeded"
-    cached = materials.attach(pg, s.ids["owner"], s.ids["cm"], [dict(first_row)], s.settings, enqueue=True)
+    cached = materials.attach(pg, s.ids["owner"], s.ids["cm"], [dict(first_row)], s.settings,
+                              feature=ai.FEATURE, enqueue=True)
     assert cached["pending_ids"] == []
     assert cached["rows"][0]["_material"]["text"] == "[图片解析，非发言人原话]\n截图显示样品已寄出"
     assert cached["rows"][0]["_material"]["complete"] and len(called) == 1
+    text_only = materials.attach(pg, s.ids["cm"], s.ids["cm"], cached['rows'], s.settings, enqueue=True)
+    assert text_only['pending_ids'] == [] and text_only['rows'][0]['_material']['text'] == ''
     with pytest.raises(PermissionError):
-        materials.attach(pg, s.ids["tester"], s.ids["cm"], [dict(first_row)], s.settings)
+        materials.attach(pg, s.ids["tester"], s.ids["cm"], [dict(first_row)], s.settings, feature=ai.FEATURE)
 
     second = materials.claim()
     assert second["id"] == second_id
     materials.run(second, s.settings)
     saved = pg.execute("SELECT * FROM message_material_jobs WHERE id=%s", (second_id,)).fetchone()
     assert saved["status"] == "unknown" and len(called) == 2
-    frozen = materials.attach(pg, s.ids["cm"], s.ids["cm"], [dict(second_row)], s.settings, enqueue=True)
+    frozen = materials.attach(pg, s.ids["cm"], s.ids["cm"], [dict(second_row)], s.settings,
+                              feature=ai.FEATURE, enqueue=True)
     assert frozen["pending_ids"] == [] and not frozen["rows"][0]["_material"]["complete"]
     assert materials.claim() is None  # A new query must not repeat an unknown paid request.
     checkpoint = materials._decode(saved["checkpoint_ciphertext"], s.settings)
@@ -3137,7 +3142,7 @@ def test_message_material_cache_rechecks_access_and_recovers_one_paid_receipt(pg
     _, owner_job = add_image("om_owner_revoked", s.ids["owner"])
     pg.execute("UPDATE admin_roles SET is_active=FALSE WHERE authorization_id=%s", (s.ids["owner"],))
     with pytest.raises(PermissionError):
-        materials.attach(pg, s.ids["owner"], s.ids["cm"], [dict(first_row)], s.settings)
+        materials.attach(pg, s.ids["owner"], s.ids["cm"], [dict(first_row)], s.settings, feature=ai.FEATURE)
     assert materials.claim() is None
     assert pg.execute(
         "SELECT status FROM message_material_jobs WHERE id=%s", (owner_job,)
@@ -3146,12 +3151,68 @@ def test_message_material_cache_rechecks_access_and_recovers_one_paid_receipt(pg
     _, consent_job = add_image("om_consent_revoked")
     pg.execute("UPDATE authorizations SET body_consent_at=NULL WHERE id=%s", (s.ids["cm"],))
     with pytest.raises((PermissionError, ai.SummaryInputError)):
-        materials.attach(pg, s.ids["cm"], s.ids["cm"], [dict(first_row)], s.settings)
+        materials.attach(pg, s.ids["cm"], s.ids["cm"], [dict(first_row)], s.settings, feature=ai.FEATURE)
     assert materials.claim() is None
     assert pg.execute(
         "SELECT status FROM message_material_jobs WHERE id=%s", (consent_job,)
     ).fetchone()["status"] == "cancelled"
     assert len(called) == 2 and len(downloaded) == 3
+
+
+def test_text_only_assistant_stops_old_materials_and_offhours_resumes_only_known_work(pg, seeded, monkeypatch):
+    from app import message_materials as materials
+
+    s = seeded
+    monkeypatch.setattr(materials, 'connection', lambda: nullcontext(pg))
+    monkeypatch.setattr(materials, 'get_settings', lambda: s.settings)
+    save_feature_config(pg, api_key_cipher(s.settings.token_encryption_key), ai.FEATURE,
+        provider='openai', project_id='attachment-test', model='attachment-model', enabled=True,
+        api_key='synthetic-attachment-key', updated_by_authorization_id=s.ids['owner'])
+    for index, (status, checkpoint, transferable) in enumerate([
+        ('queued', {}, True),
+        ('cancelled', {'in_flight': {'id': 'saved-call'}, 'received': {'response': 'saved'}}, True),
+        ('unknown', {'in_flight': {'id': 'unknown-call'}}, False),
+        ('queued', {'in_flight': {'id': 'unknown-call'}}, False),
+    ]):
+        message_id = f'old-ops-material-{index}'
+        s.add(message_id, kind='image')
+        pg.execute("UPDATE chat_messages SET body_ciphertext=%s WHERE message_id=%s",
+                   (s.cipher.encrypt(json.dumps({'image_key': 'img_' + message_id})), message_id))
+        row = materials._sources(pg, s.ids['cm'], [{'chat_id': 'chat', 'message_id': message_id}])[
+            ('chat', message_id)]
+        result = materials.attach(pg, s.ids['owner'], s.ids['cm'], [row], s.settings,
+                                  feature=ai.FEATURE, enqueue=True)
+        job_id = UUID(result['pending_ids'][0])
+        pg.execute("UPDATE message_material_jobs SET feature='operations_assistant',actor_id=%s,status=%s,"
+                   "error_code=%s,scheduled_at=NOW()+INTERVAL '1 day',checkpoint_ciphertext=%s,"
+                   "usage=%s::jsonb,response_id='saved-response',attempts=2 WHERE id=%s",
+                   (s.ids['owner'], status, 'text_only' if status == 'cancelled' else None,
+                    materials._encode(checkpoint, s.settings), json.dumps({'input_tokens': 7}), job_id))
+        before = pg.execute('SELECT * FROM message_material_jobs WHERE id=%s', (job_id,)).fetchone()
+        with pg.transaction(force_rollback=True):
+            pg.execute("UPDATE message_material_jobs SET scheduled_at=NOW() WHERE id=%s", (job_id,))
+            assert materials.claim() is None  # A retired assistant task cannot consume an API slot.
+        result = materials.attach(pg, s.ids['cm'], s.ids['cm'], [row], s.settings, enqueue=True)
+        assert result['pending_ids'] == [] and result['rows'][0]['_material']['text'] == ''
+        result = materials.attach(pg, s.ids['cm'], s.ids['cm'], [row], s.settings,
+                                  feature=ai.FEATURE, enqueue=True)
+        after = pg.execute('SELECT * FROM message_material_jobs WHERE id=%s', (job_id,)).fetchone()
+        assert all(after[key] == before[key] for key in (
+            'checkpoint_ciphertext', 'result_ciphertext', 'usage', 'response_id', 'attempts'))
+        if transferable:
+            assert result['pending_ids'] == [str(job_id)] and after['feature'] == ai.FEATURE
+            assert after['actor_id'] == s.ids['cm'] and after['status'] == 'queued'
+            assert after['scheduled_at'] <= datetime.now(UTC) and after['error_code'] is None
+            materials.attach(pg, s.ids['cm'], s.ids['cm'], [row], s.settings,
+                             feature=ai.FEATURE, enqueue=True)
+            audit = pg.execute("SELECT metadata FROM audit_events WHERE action='message_material_feature_transferred' "
+                               "AND metadata->>'job_id'=%s", (str(job_id),)).fetchall()
+            assert len(audit) == 1 and audit[0]['metadata']['previous_usage'] == {'input_tokens': 7}
+            pg.execute("UPDATE message_material_jobs SET status='cancelled',error_code='fixture_done' WHERE id=%s",
+                       (job_id,))
+        else:
+            assert result['pending_ids'] == [] and after['feature'] == 'operations_assistant'
+            assert after['status'] == before['status'] and materials.claim() is None
 
 
 def test_pending_material_refresh_targets_one_chat_and_keeps_original_cutoff(pg, seeded, monkeypatch):

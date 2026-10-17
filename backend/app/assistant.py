@@ -513,13 +513,10 @@ def prepare(settings):
             conn.execute('UPDATE assistant_turns SET scheduled_at=NOW()+INTERVAL \'1 second\',checkpoint_ciphertext=%s '
                          'WHERE id=%s', (codec.encode(checkpoint, settings), row['id']))
             return False
-        if checkpoint['waiting']['kind'] == 'message_materials':
-            checkpoint.pop('waiting_cache_key', None)
-        else:
-            call = checkpoint['pending_calls'][0]
-            if checkpoint.get('waiting_cache_key'):
-                checkpoint.setdefault('tool_cache', {})[checkpoint.pop('waiting_cache_key')] = result
-            _accept_tool(checkpoint, call, result)
+        call = checkpoint['pending_calls'][0]
+        if checkpoint.get('waiting_cache_key'):
+            checkpoint.setdefault('tool_cache', {})[checkpoint.pop('waiting_cache_key')] = result
+        _accept_tool(checkpoint, call, result)
         checkpoint.pop('waiting', None)
         checkpoint['progress'] = '整理结果'
         conn.execute("UPDATE assistant_turns SET status='queued',scheduled_at=NOW(),checkpoint_ciphertext=%s "
@@ -559,10 +556,6 @@ def _collect_window(conn, row, checkpoint, settings, context, *, read_cache=None
     counts = {key: previous[0][key] for key in ('total_messages', 'total_conversations')} if previous else None
     result = tools.execute(conn, row['actor_id'], current_turn, 'summarize_messages',
                            window['args'], settings, context, read_cache=read_cache, window_counts=counts)
-    if result.get('waiting'):
-        checkpoint['waiting'] = result['waiting']
-        checkpoint['progress'] = '正在读取图片或附件'
-        return
     window['task'] = {'question': codec.decode(row['input_ciphertext'], settings)['message'],
                       'scope': result['scope'], 'window': result['window']}
     try:
@@ -883,8 +876,7 @@ def step(job, settings):
                 if result.get('waiting'):
                     checkpoint['waiting'] = result['waiting']
                     checkpoint['waiting_cache_key'] = cache_key
-                    checkpoint['progress'] = ('正在读取图片或附件' if result['waiting']['kind'] == 'message_materials'
-                                              else '正在分析记录')
+                    checkpoint['progress'] = '正在分析记录'
                     _save(conn, job, checkpoint, settings, status='waiting')
                     return
                 _accept_tool(checkpoint, call, result, cached=was_cached)
@@ -964,6 +956,9 @@ def step(job, settings):
                 model_instructions += ('\n本轮已结束检索。请依据已取得材料整理最终回答并说明'
                     '真正缺少的依据；不把没有材料当作没有发生，不再请求工具，不编造结论。')
             checkpoint['model_steps'] += 1
+        model_instructions += ('\n运营助手只读取消息自带的文字，包括富文本、卡片及已展开转发中的文字。'
+            '不读取图片、文件或其他附件，也不等待附件解析；不得声称已读取附件。'
+            '用户要求分析附件时，说明当前仅支持文字，可请其提供文字内容。')
         checkpoint['in_flight'] = True
         checkpoint['request_started_at'] = datetime.now(UTC).isoformat()
         checkpoint['progress'] = ({'stage': 'summarize', 'message': '正在按会话整理消息',

@@ -15,7 +15,6 @@ from . import (
     assistant_search,
     assistant_worklist,
     creator_importance,
-    message_materials,
     reply_rules,
     summary_replies,
 )
@@ -478,8 +477,7 @@ def _query(conn, actor_id, turn, name, args, settings, context, visible, *, read
         source = _saved_message(conn, actor_id, args["message_ref"], settings, read_cache=read_cache)
         mode = args.get("mode") or "period"
         result = assistant_search.read(conn, actor_id, context, {"message_ref": source, "mode": mode}, settings,
-                                       cutoff=turn["created_at"] if mode == "latest" else None, read_cache=read_cache,
-                                       enqueue_materials=True)
+                                       cutoff=turn["created_at"] if mode == "latest" else None, read_cache=read_cache)
         result["_source_ref"] = source
         result["message_ref"] = args["message_ref"]
         result["evidence_ref"] = args["message_ref"]
@@ -501,17 +499,11 @@ def _query(conn, actor_id, turn, name, args, settings, context, visible, *, read
                     if snapshot is not None:
                         break
         query_options = {"read_cache": read_cache}
-        if name in {"search_chat_history", "summarize_messages"}:
-            query_options["enqueue_materials"] = True
         if name == "summarize_messages":
             query_options["window_counts"] = window_counts
         result = (_QUERIES[name](conn, actor_id, context, args, settings, snapshot=snapshot, **query_options)
                   if name == "query_creators" else _QUERIES[name](conn, actor_id, context, args, settings,
                                                                 **query_options))
-    if result.get("material_pending_ids"):
-        return {"waiting": {"kind": "message_materials", "ids": result["material_pending_ids"],
-                            "scope": result["scope"]},
-                "scope": result["scope"], "window": result.get("window")}
     if name == "query_creators" and args["query"] and result["total"] == 1:
         ids = [person["id"] for person in result["creators"]]
         selected = context["scope"].get("creator_ids")
@@ -1164,7 +1156,7 @@ def execute(conn, actor_id, turn, name, args, settings, context, *, read_cache=N
     event_id = _event_id(conn, actor_id, args["event_ref"], context, read_cache=read_cache)
     if name == "read_event_context":
         result = summary_replies.read_event_context(conn, actor_id, event_id, settings, mode=args["mode"],
-                                                    cutoff=datetime.now(UTC))
+                                                    cutoff=datetime.now(UTC), feature=summaries.ASSISTANT_FEATURE)
         _audit_context(conn, actor_id, event_id, args["mode"], len(result.get("messages", [])))
         return {**result, "event_ref": args["event_ref"], "mode": args["mode"], "scope": context["scope"]}
     raise ValueError("工具无效。")
@@ -1196,16 +1188,12 @@ def _page(result, cursor):
 
 
 def resume_wait(conn, actor_id, turn, waiting, settings, context):
-    if waiting["kind"] not in {"summary", "message_materials"}:
+    if waiting["kind"] != "summary":
         raise ValueError("等待任务无效。")
     if waiting.get("scope"):
         context = context_for_scope(conn, actor_id, context, waiting["scope"])
-    elif waiting["kind"] == "summary":
+    else:
         context = _reference_context(conn, actor_id, context, {"result_id": _result_ref(waiting["ids"])}, settings)
-    if waiting["kind"] == "message_materials":
-        cm = assistant_search.authorize_all(conn, actor_id, context["scope"]["cm_id"])
-        return (None if message_materials.pending(conn, actor_id, cm["id"], waiting["ids"])
-                else {"materials_ready": True})
     result = _read_results(conn, actor_id, [UUID(value) for value in waiting["ids"]], settings, context)
     if result["pending"]:
         return None
@@ -1229,7 +1217,8 @@ def evidence(conn, actor_id, ref, settings):
     event_id = _event_id(conn, actor_id, ref, read_cache=read_cache)
     context = _reference_context(conn, actor_id, {"scope": {"cm_id": str(actor_id), "creator_ids": None}},
                                  {"event_ref": ref}, settings, read_cache=read_cache)
-    result = summary_replies.read_event_context(conn, actor_id, event_id, settings, mode="period")
+    result = summary_replies.read_event_context(conn, actor_id, event_id, settings, mode="period",
+                                                feature=summaries.ASSISTANT_FEATURE)
     messages = result.get("messages", result.get("event", {}).get("evidence", []))
     _audit_context(conn, actor_id, event_id, "evidence", len(messages))
     return {**result, "event_ref": ref, "scope": context["scope"], "messages": [{**message,
@@ -1381,6 +1370,7 @@ def _validate_scoped_tool_results(conn, actor_id, turn, results, settings, conte
                 fresh = summary_replies.read_event_context(
                     conn, actor_id, f"{task_id}:{index}", settings, mode=result["mode"],
                     cutoff=datetime.fromisoformat(cutoff) if cutoff else turn["created_at"],
+                    feature=summaries.ASSISTANT_FEATURE,
                 )
                 if result.get("fingerprint") and result["fingerprint"] != fresh.get("fingerprint"):
                     raise ValueError("原文材料已变化，请重新查询。")

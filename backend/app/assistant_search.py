@@ -230,25 +230,22 @@ def _scope_version(cm, roster, chats, selected, audience="creators"):
                       sorted(chat["chat_id"] for chat in chats)])
 
 
-def query(conn, actor_id, context, args, settings, *, read_cache=None, enqueue_materials=False):
+def query(conn, actor_id, context, args, settings, *, read_cache=None):
     terms = args.get("query")
     if (not isinstance(terms, list) or not 1 <= len(terms) <= 8
             or not all(isinstance(term, str) and term.strip() and len(term) <= 256 for term in terms)):
         raise ValueError("请提供一至八个有效检索词。")
     terms = list(dict.fromkeys(term.strip() for term in terms))
-    return _collect(conn, actor_id, context, args, settings, terms=terms, read_cache=read_cache,
-                    enqueue_materials=enqueue_materials)
+    return _collect(conn, actor_id, context, args, settings, terms=terms, read_cache=read_cache)
 
 
-def window_messages(conn, actor_id, context, args, settings, *, read_cache=None, window_counts=None,
-                    enqueue_materials=False):
+def window_messages(conn, actor_id, context, args, settings, *, read_cache=None, window_counts=None):
     """Read every permitted sender; page and body limits are explicit, not sampling."""
     return _collect(conn, actor_id, context, args, settings, terms=None, read_cache=read_cache,
-                    window_counts=window_counts, enqueue_materials=enqueue_materials)
+                    window_counts=window_counts)
 
 
-def _collect(conn, actor_id, context, args, settings, *, terms, read_cache=None, window_counts=None,
-             enqueue_materials=False):
+def _collect(conn, actor_id, context, args, settings, *, terms, read_cache=None, window_counts=None):
     audience = _audience(args.get("audience", "all"))
     kind = "window_messages" if terms is None else "messages"
     page_size = WINDOW_PAGE_SIZE if terms is None else PAGE_SIZE
@@ -274,14 +271,11 @@ def _collect(conn, actor_id, context, args, settings, *, terms, read_cache=None,
             raise ValueError("分页引用无效，请重新检索。")
     cipher = message_body_cipher(settings.token_encryption_key)
     messages, scanned, readable, unreadable, non_text, unreadable_text, truncated, more = [], 0, 0, 0, 0, 0, 0, False
-    pending_ids = []
     material_notes = {}
     while scanned < scan_limit and len(messages) < page_size:
         size = min(BATCH_SIZE, scan_limit - scanned)
         rows = _rows(conn, cm["id"], sorted(by_chat), start, end, speakers, limit=size + 1, after=after)
-        materials = message_materials.attach(conn, actor_id, cm["id"], rows[:size], settings,
-                                            enqueue=enqueue_materials)
-        pending_ids.extend(materials["pending_ids"])
+        message_materials.attach(conn, actor_id, cm["id"], rows[:size], settings)
         names = mention_names(conn, rows[:size])
         consumed = 0
         for row in rows[:size]:
@@ -347,8 +341,6 @@ def _collect(conn, actor_id, context, args, settings, *, terms, read_cache=None,
         result.update(window_counts if window_counts is not None else
                       _totals(conn, cm["id"], sorted(by_chat), start, end, speakers),
                       returned=len(messages), counts_scope="window_total")
-    if pending_ids:
-        result["material_pending_ids"] = list(dict.fromkeys(pending_ids))
     return result
 
 
@@ -438,7 +430,7 @@ def validate_result(conn, actor_id, context, result, settings, *, history_only=F
                          "source_complete": (bool(chats) or audience == "all") and not gaps}}
 
 
-def read(conn, actor_id, context, args, settings, *, cutoff=None, read_cache=None, enqueue_materials=False):
+def read(conn, actor_id, context, args, settings, *, cutoff=None, read_cache=None):
     mode = args.get("mode") or "period"
     if mode not in {"period", "latest"}:
         raise ValueError("请选择原时段或最新进展。")
@@ -501,7 +493,7 @@ def read(conn, actor_id, context, args, settings, *, cutoff=None, read_cache=Non
     if any(message_id and message_id not in visited for message_id, _ in pending):
         gaps.append({"reason": "引用链超过本次上下文上限"})
     rows = [row for row, _ in collected.values()]
-    materials = message_materials.attach(conn, actor_id, cm["id"], rows, settings, enqueue=enqueue_materials)
+    message_materials.attach(conn, actor_id, cm["id"], rows, settings)
     names, cipher = mention_names(conn, rows), message_body_cipher(settings.token_encryption_key)
     messages = []
     for row, relation in sorted(collected.values(), key=lambda item: (
@@ -536,6 +528,4 @@ def read(conn, actor_id, context, args, settings, *, cutoff=None, read_cache=Non
     if mode == "latest":
         result.update(latest_window={"start": end.isoformat(), "end": read_end.isoformat()},
                       context_scope="referenced_messages_and_bounded_latest", latest_limit=20)
-    if materials["pending_ids"]:
-        result["material_pending_ids"] = materials["pending_ids"]
     return result
