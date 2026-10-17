@@ -1166,7 +1166,7 @@ def test_rich_mentions_keep_full_text_and_credentials_redacted():
     assert text.startswith("@Remi（Original） ") and len(text) > 2000 and not incomplete
 
 
-def test_recurring_periods_keep_history_and_cm_scope_separate(pg, seeded):
+def test_recurring_periods_keep_history_and_cm_scope_separate(pg, seeded, monkeypatch):
     s = seeded
     s.save()
     pg.execute('UPDATE offhours_summary_settings SET recurring_enabled=TRUE,next_period_check_at=NULL')
@@ -1221,6 +1221,64 @@ def test_recurring_periods_keep_history_and_cm_scope_separate(pg, seeded):
     pg.execute('DELETE FROM admin_page_permissions WHERE authorization_id=%s', (s.ids['tester'],))
     with pytest.raises(PermissionError):
         summary_periods.selection(pg, s.ids['tester'], second_cm)
+
+    # Permanent stop conditions finish idle work, not paused/current work or live provider calls.
+    with pg.transaction(force_rollback=True):
+        pg.execute('UPDATE offhours_summary_settings SET recurring_enabled=FALSE')
+        manual_run = pg.execute('SELECT run_id FROM offhours_summary_settings').fetchone()['run_id']
+        turns = {}
+        for state in ('completed', 'waiting'):
+            session, turn = uuid4(), uuid4()
+            pg.execute('INSERT INTO assistant_sessions(id,actor_id) VALUES(%s,%s)', (session, s.ids['cm']))
+            pg.execute('''INSERT INTO assistant_turns(id,session_id,client_request_id,status,input_ciphertext)
+                VALUES(%s,%s,%s,%s,'fixture')''', (turn, session, uuid4(), state))
+            turns[state] = turn
+        progress = {'chunks': [{'fingerprint': 'paid-part'}], 'receipts': [{'call_id': 'paid-call'}]}
+        specifications = (
+            ('stopped', 'assistant', None, 'queued', 'completed', progress),
+            ('unknown', 'assistant', None, 'queued', 'completed', {**progress, 'provider_call': {'id': 'unknown'}}),
+            ('held', 'assistant', None, 'failed', 'completed', {**progress, 'provider_call': {'id': 'held'}}),
+            ('live', 'assistant', None, 'running', 'completed', {**progress, 'provider_call': {'id': 'in-flight'}}),
+            ('active', 'assistant', None, 'queued', 'waiting', progress),
+            ('expired', 'scheduled', 'work', 'queued', None, progress),
+            ('manual', 'scheduled', None, 'queued', None, progress),
+            ('paused', 'scheduled', target['period'], 'queued', None, progress),
+        )
+        before = {}
+        for label, origin, period, state, parent, checkpoint in specifications:
+            run_id = manual_run if label == 'manual' else target['id'] if label == 'paused' else uuid4()
+            if label not in ('manual', 'paused'):
+                pg.execute('''INSERT INTO offhours_summary_runs(id,requested_by_authorization_id,
+                    responsible_authorization_id,window_start,window_end,origin,assistant_turn_id,period,report_date)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,(NOW() AT TIME ZONE 'Europe/London')::date-8)''',
+                    (run_id, s.ids['owner'], s.ids['cm'], s.start, s.end, origin, turns.get(parent), period))
+            chat, task_id = 'cleanup-' + label, uuid4()
+            pg.execute('INSERT INTO chats(chat_id) VALUES(%s)', (chat,))
+            pg.execute('''INSERT INTO offhours_summary_tasks(id,run_id,chat_id,input_fingerprint,cutoff,status,
+                checkpoint_ciphertext,usage,response_id,result_ciphertext,processed_messages,total_messages,
+                lease_until,error_message)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,'{"input_tokens":17}','resp-kept',%s,1,2,
+                    CASE WHEN %s='running' THEN NOW()+INTERVAL '5 minutes' END,%s)''',
+                (task_id, run_id, chat, label, s.end, state, summary_dialogues.encode(checkpoint, s.settings),
+                 summary_dialogues.encode({'events': []}, s.settings), state,
+                 '请求结果未知，未自动重复调用。' if label == 'held' else None))
+            before[label] = pg.execute('SELECT * FROM offhours_summary_tasks WHERE id=%s', (task_id,)).fetchone()
+        monkeypatch.setattr(ai.ai_dispatch, 'can_claim', lambda *_args, **_kwargs: False)
+        assert ai.claim_next_summary() is None
+        for label, old in before.items():
+            current = pg.execute('SELECT * FROM offhours_summary_tasks WHERE id=%s', (old['id'],)).fetchone()
+            expected = ('cancelled' if label in ('stopped', 'expired') else
+                        'failed' if label == 'unknown' else old['status'])
+            assert current['status'] == expected
+            if label in ('stopped', 'expired', 'unknown'):
+                assert current['finished_at'] and current['error_message']
+                changed_fields = ('status', 'finished_at', 'error_message')
+                assert {key: value for key, value in current.items() if key not in changed_fields} \
+                    == {key: value for key, value in old.items() if key not in changed_fields}
+            else:
+                assert current == old
+            if label in ('unknown', 'held'):
+                assert current['error_message'].startswith('请求结果未知')
 
 
 def test_creator_enrollment_backfills_closed_periods_without_repaying_or_replacing_others(

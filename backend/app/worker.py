@@ -45,6 +45,7 @@ from .lark_sync_admission import LarkSyncAdmission
 LOGGER = logging.getLogger("lark_message_stats.worker")
 _recent_page_claims: Counter[uuid.UUID] = Counter()
 _recent_chat_rounds: dict[uuid.UUID, tuple[tuple[uuid.UUID, int, int], set[str]]] = {}
+_backfill_chat_rounds: dict[uuid.UUID, tuple[tuple[uuid.UUID, int, int], set[str]]] = {}
 _recent_active_chats: dict[uuid.UUID, tuple[tuple[uuid.UUID, int, int], float, set[str]]] = {}
 
 
@@ -1988,6 +1989,10 @@ def _claim_next_page(
         if previous_round != round_key:
             served = set()
             _recent_page_claims[job.authorization_id] = 0
+        previous_backfill_round, history_served = _backfill_chat_rounds.get(
+            job.authorization_id, (round_key, set()))
+        if previous_backfill_round != round_key:
+            history_served = set()
         # Recent work gets four turns; spare capacity and every fifth turn still advance history.
         history_turn = _recent_page_claims[job.authorization_id] >= 4
         # Only one recent turn may bypass the cold round for an active conversation.
@@ -1996,7 +2001,7 @@ def _claim_next_page(
         for mode in modes:
             if mode == "backfill":
                 _reset_one_requested_backfill(conn, job.authorization_id)
-                chat = _select_backfill_chat_for_claim(conn, job.authorization_id)
+                chat = _select_backfill_chat_for_claim(conn, job.authorization_id, history_served)
             else:
                 chat = _select_incremental_chat_for_claim(conn, job.authorization_id, job.id,
                     settings.sync_interval_seconds, served,
@@ -2090,6 +2095,11 @@ def _claim_next_page(
             served.clear()
         served.add(chat["chat_id"])
         _recent_chat_rounds[job.authorization_id] = round_key, served
+    else:
+        if chat["chat_id"] in history_served:
+            history_served.clear()
+        history_served.add(chat["chat_id"])
+        _backfill_chat_rounds[job.authorization_id] = round_key, history_served
     return PageClaim(
         job=job,
         chat_id=chat["chat_id"],
@@ -2141,7 +2151,9 @@ def _reset_one_requested_backfill(conn: psycopg.Connection, authorization_id: uu
     )
 
 
-def _select_backfill_chat_for_claim(conn: psycopg.Connection, authorization_id: uuid.UUID) -> dict[str, Any] | None:
+def _select_backfill_chat_for_claim(
+    conn: psycopg.Connection, authorization_id: uuid.UUID, served_chats=(),
+) -> dict[str, Any] | None:
     return conn.execute(
         """
         SELECT access.*
@@ -2154,11 +2166,12 @@ def _select_backfill_chat_for_claim(conn: psycopg.Connection, authorization_id: 
           AND (access.manual_backfill_requested_at IS NOT NULL OR NOT access.backfill_complete)
         ORDER BY
             CASE WHEN access.manual_backfill_requested_at IS NOT NULL THEN 0 ELSE 1 END,
-            access.manual_backfill_requested_at NULLS LAST, access.discovered_at, access.chat_id
+            access.manual_backfill_requested_at NULLS LAST,
+            access.chat_id=ANY(%s::text[]), access.discovered_at, access.chat_id
         FOR UPDATE SKIP LOCKED
         LIMIT 1
         """,
-        (authorization_id,),
+        (authorization_id, sorted(served_chats)),
     ).fetchone()
 
 

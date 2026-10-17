@@ -1008,13 +1008,31 @@ def _schedule_run(conn, state, now, *, contact_ids=None, roster=None, chats=None
 def claim_next_summary(*, interactive=False):
     with connection() as conn, conn.transaction():
         from . import summary_dialogues
-        for row in conn.execute("SELECT id,checkpoint_ciphertext FROM offhours_summary_tasks "
-                                "WHERE status='running' AND lease_until<NOW() FOR UPDATE SKIP LOCKED").fetchall():
+        for row in conn.execute("""SELECT t.id,t.status,t.error_message,t.checkpoint_ciphertext,
+                CASE WHEN r.origin='assistant' THEN '助手请求已结束，未继续处理。'
+                     ELSE '超出最近七天范围，未继续处理。' END AS stop_reason
+                FROM offhours_summary_tasks t JOIN offhours_summary_runs r ON r.id=t.run_id
+                LEFT JOIN assistant_turns aturn ON aturn.id=r.assistant_turn_id
+                WHERE (t.status='running' AND t.lease_until<NOW())
+                  OR (t.status='queued' AND t.lease_until IS NULL AND (
+                    r.origin='assistant' AND aturn.status IN ('completed','failed','cancelled','unknown')
+                    OR r.origin='scheduled' AND r.period IS NOT NULL
+                      AND r.report_date < (NOW() AT TIME ZONE 'Europe/London')::date-6))
+                FOR UPDATE OF t SKIP LOCKED""").fetchall():
             try:
-                pending = (summary_dialogues.decode(row["checkpoint_ciphertext"], get_settings()) or {}) \
-                    .get("response_received")
+                checkpoint = summary_dialogues.decode(row["checkpoint_ciphertext"], get_settings()) or {}
+                pending = checkpoint.get("response_received")
+                unknown = bool(checkpoint.get("provider_call") and not pending)
             except (InvalidTag, ValueError, TypeError, AttributeError):
-                pending = None
+                pending, unknown = None, True
+            if row["status"] == "queued":
+                # A stopped report keeps its paid material, including an unresolved request fence.
+                unknown = unknown or (row["error_message"] or "").startswith("请求结果未知")
+                conn.execute("""UPDATE offhours_summary_tasks SET status=%s,finished_at=NOW(),error_message=%s
+                    WHERE id=%s""", ("failed" if unknown else "cancelled",
+                    row["error_message"] if (row["error_message"] or "").startswith("请求结果未知") else
+                    "请求结果未知，未自动重复调用；请核实后重新生成。" if unknown else row["stop_reason"], row["id"]))
+                continue
             conn.execute("UPDATE offhours_summary_tasks SET status=%s,lease_until=NULL,finished_at=%s,"
                          "error_message=%s WHERE id=%s", ("queued" if pending else "failed",
                 None if pending else datetime.now(UTC), None if pending else

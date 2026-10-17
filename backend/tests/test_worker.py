@@ -23,6 +23,7 @@ from app.worker import (
 def fresh_recent_page_turns(monkeypatch):
     monkeypatch.setattr(worker, "_recent_page_claims", Counter())
     monkeypatch.setattr(worker, "_recent_chat_rounds", {})
+    monkeypatch.setattr(worker, "_backfill_chat_rounds", {})
     monkeypatch.setattr(worker, "_recent_active_chats", {})
 
 
@@ -320,6 +321,38 @@ def test_new_cm_interleaves_recent_and_history_without_losing_either_window(pg, 
     worker._recent_page_claims[actor] = 0
     known_change = worker._claim_next_page(next_job, auth, settings)
     assert known_change.chat_id == 'oc_idle_00' and 'oc_idle_00' in worker._recent_active_chats[actor][2]
+
+    # A paginating large group gets one automatic history page per round, not every history turn.
+    pg.execute("UPDATE authorization_chats SET sync_enabled=FALSE WHERE authorization_id=%s", (actor,))
+    for index, chat in enumerate(('oc_history_large', 'oc_history_small_a', 'oc_history_small_b')):
+        pg.execute("INSERT INTO chats(chat_id) VALUES(%s)", (chat,))
+        pg.execute("""INSERT INTO authorization_chats(authorization_id,chat_id,discovered_at,
+            incremental_job_id,last_incremental_at,recent_coverage_start_at,backfill_page_token,
+            backfill_window_start_at,backfill_window_end_at)
+            VALUES(%s,%s,NOW()-(%s*INTERVAL '1 day'),%s,NOW(),NOW()-INTERVAL '7 days',%s,
+                CASE WHEN %s THEN NOW()-INTERVAL '30 days' END,
+                CASE WHEN %s THEN NOW()-INTERVAL '1 hour' END)""",
+            (actor, chat, 3-index, next_job.id, 'large-2' if index == 0 else None, index == 0, index == 0))
+    large = worker._claim_next_page(next_job, auth, settings)
+    assert large.chat_id == 'oc_history_large' and large.mode == 'backfill'
+    assert large.expected_page_token == 'large-2'
+    assert worker._record_claimed_page(large, [], 'large-3', None).committed
+    pg.execute("SAVEPOINT manual_history_priority")
+    pg.execute("""UPDATE authorization_chats SET manual_backfill_requested_at=NOW(),
+        manual_backfill_started_at=NOW() WHERE chat_id='oc_history_large'""")
+    manual = worker._claim_next_page(next_job, auth, settings)
+    assert manual.chat_id == large.chat_id and manual.mode == 'backfill'
+    assert manual.expected_page_token == 'large-3' and manual.end_at == large.end_at
+    assert worker._record_claimed_page(manual, [], 'large-4', None).committed
+    pg.execute("ROLLBACK TO SAVEPOINT manual_history_priority")
+    for chat in ('oc_history_small_a', 'oc_history_small_b'):
+        small = worker._claim_next_page(next_job, auth, settings)
+        assert small.chat_id == chat and small.mode == 'backfill'
+        assert worker._record_claimed_page(small, [], None, None).committed
+    continued_large = worker._claim_next_page(next_job, auth, settings)
+    assert (continued_large.chat_id, continued_large.expected_page_token, continued_large.end_at) == (
+        large.chat_id, 'large-3', large.end_at)
+    assert worker._record_claimed_page(continued_large, [], None, None).committed
 
 
 def test_p2p_contact_discovery_skips_bots(pg, monkeypatch) -> None:
